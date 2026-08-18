@@ -719,6 +719,15 @@ impl Plan {
             }
         ));
         let minimum_scalars = self.word_minimum_scalars();
+        // This value-only route is entered only after the caller has
+        // authenticated the retained plan and admitted the complete finite
+        // input/work envelope. Every Unicode scalar occupies at least one
+        // byte, while malformed bytes are non-word context, so a shorter byte
+        // domain cannot contain the required scalar run and needs no source
+        // inspection.
+        if haystack.len() < minimum_scalars {
+            return false;
+        }
         let mut run_scalars = 0_usize;
         let mut position = 0_usize;
         while position < haystack.len() {
@@ -2876,6 +2885,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn prepared_unicode_word_minimum_byte_domain_is_exact_at_the_boundary() {
+        let plan = Plan::new(25, WordMode::Unicode);
+
+        assert!(!plan.is_match_full_prepared(&vec![b'a'; 24]));
+        assert!(!plan.is_match_full_prepared("abcdefghijklmnopqrstuvé".as_bytes()));
+        assert!(!plan.is_match_full_prepared(&vec![0xff; 24]));
+
+        assert!(plan.is_match_full_prepared(&vec![b'a'; 25]));
+        assert!(plan.is_match_full_prepared("abcdefghijklmnopqrstuvwxyzα".as_bytes()));
+
+        let exact_bytes_but_broken_run = [vec![b'a'; 24], vec![0xff]].concat();
+        assert_eq!(exact_bytes_but_broken_run.len(), 25);
+        assert!(!plan.is_match_full_prepared(&exact_bytes_but_broken_run));
+
+        let multibyte_but_too_few_scalars = "α".repeat(13);
+        assert!(multibyte_but_too_few_scalars.len() >= 25);
+        let multibyte_bytes = multibyte_but_too_few_scalars.as_bytes();
+        assert!(!plan.is_match_full_prepared(multibyte_bytes));
     }
 
     #[test]

@@ -34157,6 +34157,180 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn prepared_unicode_word_run_rejects_short_domains_after_finite_admission() {
+        const PATTERN: &str = r"\b\w{25,}\b";
+        let regex = current_fre_rebar_portable_builder(PATTERN, true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+
+        let mut haystack = Vec::new();
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&vec![b'a'; 25]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice("α".repeat(25).as_bytes());
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\xff\n");
+        assert_eq!(haystack.lines().count(), 4);
+
+        let rust = rust_compile_options(&[PATTERN.to_string()], true, false).unwrap();
+        let expected = grep(&rust, &haystack, RunLimits::default().reducer_steps).unwrap();
+        assert_eq!(expected, 2);
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+        assert!(session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+
+        // The source-free result is available only inside an admitted token
+        // invocation. An over-envelope short domain still replays the
+        // unchanged finite-limit facade and retains its refusal.
+        let refusal_line = b"---";
+        let one_below = SearchLimits {
+            max_work: 2,
+            max_scratch_bytes: 0,
+        };
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(refusal_line.len(), one_below);
+        assert_eq!(token.maximum_warm_input_bytes(), Some(1));
+        let prepared = search.is_match_value_prepared(refusal_line, token);
+        let incumbent = regex.is_match_value(refusal_line, one_below);
+        assert!(prepared.is_err());
+        assert_eq!(prepared, incumbent);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_long_words_unicode_short_domain_opportunity_exceeds_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-unicode-word-short-domain".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const PATTERN: &str = r"\b\w{25,}\b";
+                const EXPECTED: u64 = 5_075;
+                const DEFINITION_SHA256: &str =
+                    "5bf4b0eafb59f8c3210b0164a297d0322079bb49529009e1a29b0e59fb8a4463";
+                const PATTERN_SHA256: &str =
+                    "fc8ac2dd7d0956da04a9837cc773ef39fcc597b02a9baee03733d2bf3ce3d5fd";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/grep.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public grep definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                assert_eq!(sha256(PATTERN.as_bytes()), PATTERN_SHA256);
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public grep haystack");
+                assert_eq!(haystack.len(), 7_384_531);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+
+                let mut line_domains = 0_usize;
+                let mut content_bytes = 0_usize;
+                let mut short_domains = 0_usize;
+                let mut short_content_bytes = 0_usize;
+                let mut short_decoded_units = 0_usize;
+                for line in haystack.lines() {
+                    line_domains = line_domains.checked_add(1).expect("line-domain count");
+                    content_bytes = content_bytes
+                        .checked_add(line.len())
+                        .expect("line-content bytes");
+                    if line.len() < 25 {
+                        short_domains = short_domains.checked_add(1).expect("short domains");
+                        short_content_bytes = short_content_bytes
+                            .checked_add(line.len())
+                            .expect("short-domain bytes");
+                        short_decoded_units = short_decoded_units
+                            .checked_add(
+                                core::str::from_utf8(line)
+                                    .expect("public short line is valid UTF-8")
+                                    .chars()
+                                    .count(),
+                            )
+                            .expect("short-domain decoded units");
+                    }
+                }
+                assert_eq!(line_domains, 239_963);
+                assert_eq!(content_bytes, 7_144_486);
+                assert_eq!(short_domains, 123_882);
+                assert_eq!(short_content_bytes, 1_235_627);
+                assert_eq!(short_decoded_units, 1_235_472);
+
+                // One complete LF traversal plus one complete matcher byte
+                // volume is a conservative source-access denominator. The
+                // incumbent necessarily decodes all short-domain source bytes;
+                // the source-free rejection examines none of them.
+                let source_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes)
+                    .expect("complete source proxy");
+                assert!(
+                    short_content_bytes.checked_mul(100).unwrap()
+                        > source_proxy.checked_mul(5).unwrap()
+                );
+
+                // Count the prepared token's full two-work-per-byte envelope,
+                // every outer line event, and every successful count event.
+                // Credit only one incumbent loop/classification unit per
+                // decoded short-domain scalar. On each short line the new
+                // guard replaces, rather than adds to, the incumbent terminal
+                // while predicate; debit the genuinely added guard comparison
+                // only on each non-short domain. The opportunity remains above
+                // five percent under that stricter whole-operation proxy.
+                let work_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes.checked_mul(2).unwrap())
+                    .and_then(|work| work.checked_add(line_domains))
+                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED).ok()?))
+                    .expect("complete work proxy");
+                let non_short_domains = line_domains
+                    .checked_sub(short_domains)
+                    .expect("short domains are a subset");
+                assert_eq!(non_short_domains, 116_081);
+                let net_avoided_units = short_decoded_units
+                    .checked_sub(non_short_domains)
+                    .expect("decoded opportunity covers the added guards");
+                assert_eq!(net_avoided_units, 1_119_391);
+                assert!(
+                    net_avoided_units.checked_mul(100).unwrap()
+                        > work_proxy.checked_mul(5).unwrap()
+                );
+
+                let regex = current_fre_rebar_portable_builder(PATTERN, true, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+                assert_eq!(
+                    regex.runtime_implementation_id(),
+                    "unicode-word-run-linear-v1"
+                );
+                let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert!(session.uses_prepared_unicode_word_run_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+            })
+            .expect("spawn public Unicode-word grep canary")
+            .join()
+            .expect("public Unicode-word grep canary");
+    }
+
+    #[test]
     fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
         let limits = RunLimits::default();
         let grep_pattern = r"^ab$";
