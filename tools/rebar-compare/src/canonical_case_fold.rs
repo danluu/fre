@@ -134,7 +134,10 @@ pub(super) fn try_count(
         return Ok(None);
     };
     let actual = lifecycle.execute(request.haystack)?;
-    Ok(Some(FreReduction { actual, plan: PLAN }))
+    Ok(Some(FreReduction {
+        actual,
+        plan: PLAN.to_owned(),
+    }))
 }
 
 /// Apply the same source-only canonical Count selector used by one-shot
@@ -151,7 +154,7 @@ pub(super) fn try_build_count(
     {
         return Ok(None);
     }
-    // rebar-row:curated/02-literal-alternate/sherlock-casei-ru@rust/regex
+    // A large alternating folded-literal family exercises this generic route.
     let Some(plan) = CanonicalPlan::build(&patterns[0], limits)? else {
         return Ok(None);
     };

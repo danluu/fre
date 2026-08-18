@@ -228,7 +228,10 @@ pub(super) fn try_count(
         return Ok(None);
     };
     let actual = plan.count(request.haystack)?;
-    Ok(Some(FreReduction { actual, plan: PLAN }))
+    Ok(Some(FreReduction {
+        actual,
+        plan: PLAN.to_owned(),
+    }))
 }
 
 fn exact_scan_limits(upper: FoldedLiteralTrieScanUpperBounds) -> FoldedLiteralTrieScanLimits {
@@ -427,7 +430,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!((raw.actual, raw.plan), (expected, PLAN));
+        assert_eq!((raw.actual, raw.plan.as_str()), (expected, PLAN));
 
         let retained = current_fre_rebar_aggregate_operation_lifecycle(
             "count",

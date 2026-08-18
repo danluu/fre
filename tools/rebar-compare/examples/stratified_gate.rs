@@ -68,6 +68,7 @@ const FRE_EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-desc
 const FRE_EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v2";
 const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
 const FORMAL_COMPILE_PLAN: &str = "compile-aggregate-continuation-program";
+#[cfg(test)]
 const FORMAL_AGGREGATE_OPERATION_PLAN: &str = "aggregate-continuation-program";
 const FORMAL_GREP_PLAN: &str = "rebar-lines-is-match-v3";
 const RUNNER_WALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -266,7 +267,7 @@ fn main() -> Result<(), DynError> {
         warmup_iterations_per_process: 0,
         measured_iterations_per_process: 1,
         retry_policy: "none: any child/identity/guard failure aborts the whole campaign",
-        timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked match counting; count-spans=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked end-start summation; grep=PortableRegex::is_match over bstr lines",
+        timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute through the source-independent certified Count portfolio with Aggregate Auto fallback; count-spans=the retained complete-span session visiting every start/end bound with checked end-start summation; grep=PortableRegex::is_match over bstr lines",
         qualification,
         guard_before,
         guard_after,
@@ -1017,8 +1018,13 @@ fn require_preregistered_invariant_identity(
     validate_fre_description(canonical, expectations)?;
     match (expectations.model, canonical.candidate_plan.as_str()) {
         ("compile", FORMAL_COMPILE_PLAN) if canonical.candidate_runtime.is_none() => Ok(()),
-        ("count" | "count-spans", FORMAL_AGGREGATE_OPERATION_PLAN)
-            if canonical.candidate_runtime.is_none() =>
+        ("count", plan)
+            if canonical.candidate_runtime.is_none() && preregistered_count_plan(plan) =>
+        {
+            Ok(())
+        }
+        ("count-spans", plan)
+            if canonical.candidate_runtime.is_none() && preregistered_complete_spans_plan(plan) =>
         {
             Ok(())
         }
@@ -1035,6 +1041,61 @@ fn require_preregistered_invariant_identity(
                 .into(),
         ),
     }
+}
+
+fn preregistered_count_plan(plan: &str) -> bool {
+    matches!(
+        plan,
+        "aggregate-ascii-casefold-literal-alternation-v1"
+            | "aggregate-fixed-unicode-class-sequence-v1"
+            | "aggregate-terminal-byte-frontier-count-v1"
+            | "aggregate-unicode-folded-literal-v4"
+            | "aggregate-casefold-canonical-bytes-sparse-v2"
+            | "aggregate-exact-literal"
+            | "aggregate-unicode-scalar-class"
+            | "aggregate-word-run-v1"
+            | "aggregate-fixed-class-chunks-v1"
+            | "aggregate-literal-assertions-v1"
+            | "aggregate-blocking-delimiter-v1"
+            | "aggregate-token-phrase-v2"
+            | "aggregate-fixed-class-sandwich"
+            | "aggregate-literal-class-run-literal-v2"
+            | "aggregate-reverse-inner-independent-v1"
+            | "aggregate-reverse-inner-adaptive-union-v2"
+            | "aggregate-reverse-inner-grouped-union-v2"
+            | "aggregate-grapheme-scalar-dfa"
+            | "aggregate-bounded-class-sequence"
+            | "aggregate-bounded-separated-fields"
+            | "aggregate-delimiter-field-spans"
+            | "aggregate-prefix-class-alternation"
+            | "aggregate-bounded-context"
+            | "aggregate-bounded-affix"
+            | "aggregate-fixed-absolute-domain"
+            | "aggregate-bounded-literal-pair-v1"
+            | "aggregate-bounded-literal-pair-v2"
+            | "aggregate-finite-literal-bucket-trie-count-v1"
+            | "aggregate-finite-literal-sparse"
+            | "aggregate-finite-literal-dfa"
+            | "aggregate-finite-literal-packed-v3"
+            | "aggregate-guarded-ascii-word"
+            | "aggregate-guarded-unicode-word"
+            | "aggregate-fixed-predicate-word64"
+            | "aggregate-url"
+            | "aggregate-continuation-program"
+            | "aggregate-many-ordered-literal"
+            | "aggregate-many-continuation-program"
+    )
+}
+
+fn preregistered_complete_spans_plan(plan: &str) -> bool {
+    matches!(
+        plan,
+        "aggregate-many-ordered-literal"
+            | "aggregate-many-continuation-program"
+            | "aggregate-many-ascii-word-shadow-continuation-sweep-v1"
+    ) || plan.starts_with("rebar-complete-spans-aggregate-visit-v1-")
+        || plan.starts_with("rebar-complete-spans-portable-find-v2-")
+        || plan.starts_with("rebar-complete-spans-portable-visit-v1-")
 }
 
 fn rebar_klv(rebar_bin: &Path, checkout: &Path, benchmark: &str) -> Result<Vec<u8>, DynError> {

@@ -524,7 +524,7 @@ mod tests {
         };
         let folded = unicode_folded_literal_build_limits(&exact).unwrap();
         let raw = fre_aggregate_count_with_folded_limits(request, &exact, &exact, folded).unwrap();
-        assert_eq!((raw.actual, raw.plan), (expected, PLAN));
+        assert_eq!((raw.actual, raw.plan.as_str()), (expected, PLAN));
         let retained = build_current_fre_count_lifecycle_with_folded_limits(
             &patterns,
             true,
@@ -598,7 +598,7 @@ mod tests {
             &RunLimits::default(),
         )
         .unwrap();
-        assert_eq!((raw.actual, raw.plan), (expected, PLAN));
+        assert_eq!((raw.actual, raw.plan.as_str()), (expected, PLAN));
 
         let retained = current_fre_rebar_aggregate_operation_lifecycle(
             "count",
