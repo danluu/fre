@@ -829,7 +829,7 @@ fn targets(inst: &Inst) -> Result<impl Iterator<Item = usize>, Error> {
                 "terminal frontier reached an unfilled state",
             ));
         }
-        Inst::ConsumeScalar { .. } => {
+        Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
             return Err(Error::InternalInvariant(
                 "terminal frontier reached a scalar state",
             ));
@@ -1318,9 +1318,11 @@ impl Machine<'_> {
         accounting: &mut ExecutionAccounting,
     ) -> Result<usize, Error> {
         match self.program.instruction(pc)? {
-            Inst::Unfilled | Inst::ConsumeScalar { .. } => Err(Error::InternalInvariant(
-                "terminal frontier reached an unsupported state",
-            )),
+            Inst::Unfilled | Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
+                Err(Error::InternalInvariant(
+                    "terminal frontier reached an unsupported state",
+                ))
+            }
             Inst::Fail => Ok(0),
             Inst::Match => encode(position),
             Inst::Consume { .. } => {

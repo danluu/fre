@@ -16644,41 +16644,56 @@ impl AggregateBuilder {
             AggregateConstructionStage::Continuation,
             AggregateConstructionEffect::default(),
         );
-        let compile_attempt =
-            match CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+        // Only the public Compile operation opts into large-scalar owner
+        // sharing. Execution-facing Count/Span builders and every ordinary
+        // compiler constructor retain their incumbent allocation/refusal and
+        // exact-persistence reports.
+        let continuation_attempt = if matches!(operation, AggregateOperation::Compile) {
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
                 &rust.hir,
                 continuation_profile,
                 limits.continuation,
-            ) {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    if !error.closes() {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "continuation compiler terminal failed closure",
-                        });
-                    }
-                    let (source, receipt) = error.into_parts();
-                    construction.pending_terminal_effect =
-                        continuation_compile_effect(receipt.actual);
-                    return Err(AggregateBuildError::ContinuationCompile {
+            )
+        } else {
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &rust.hir,
+                continuation_profile,
+                limits.continuation,
+            )
+        };
+        let compile_attempt = match continuation_attempt {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                if !error.closes() {
+                    return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        strategy,
-                        source,
+                        detail: "continuation compiler terminal failed closure",
                     });
                 }
-            };
+                let (source, receipt) = error.into_parts();
+                construction.pending_terminal_effect = continuation_compile_effect(receipt.actual);
+                return Err(AggregateBuildError::ContinuationCompile {
+                    operation,
+                    selection,
+                    strategy,
+                    source,
+                });
+            }
+        };
         let (engine, compile_actual) = compile_attempt.into_parts();
         let terminal_effect = continuation_compile_effect(compile_actual);
         construction.pending_terminal_effect = terminal_effect;
         let compile = engine.compile_accounting();
-        if compile.hir_nodes != expected_nodes || compile.captures_erased != expected_captures {
+        if compile.hir_nodes != expected_nodes
+            || compile.captures_erased != expected_captures
+            || compile_actual.live_program_bytes > compile.program_bytes
+            || compile_actual.construction_peak_bytes > compile.construction_peak_bytes
+        {
             return Err(AggregateBuildError::InternalInvariant {
                 operation,
                 selection,
-                detail: "syntax summary differs from aggregate compiler traversal",
+                detail: "aggregate compiler traversal or physical/logical closure differs",
             });
         }
         let publication_effect = include_selected_plan_owner_effect(terminal_effect).ok_or(
@@ -16741,7 +16756,7 @@ impl AggregateBuilder {
             sealed_bounded_separated_fields_identity: None,
             sealed_required_internal_anchor_identity,
             sealed_url_aggregate_identity,
-            retained_capacity_bytes: compile.program_bytes,
+            retained_capacity_bytes: compile_actual.live_program_bytes,
         };
         Ok(AggregatePlan {
             engine: AggregateEngine::Continuation(engine),
@@ -26273,6 +26288,47 @@ mod tests {
         assert!(effect.allocated_bytes > 0);
         assert!(effect.initialized_bytes > 0);
         assert!(effect.co_live_bytes > 0);
+    }
+
+    #[test]
+    fn compile_only_continuation_shares_large_scalar_progress_owners() {
+        const PATTERN: &str = r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*";
+
+        let compiled = AggregateBuilder::new(PATTERN)
+            .unicode(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .workload_specific_intrinsics(false)
+            .build_compile_attempt()
+            .unwrap();
+        let counted = AggregateBuilder::new(PATTERN)
+            .unicode(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .workload_specific_intrinsics(false)
+            .build_count_attempt()
+            .unwrap();
+        let compile_report = compiled.build_report();
+        let count_report = counted.build_report();
+        let AggregateBuildAccounting::Continuation(compile_accounting) = compile_report.build
+        else {
+            panic!("compile fixture must select a continuation program")
+        };
+        let AggregateBuildAccounting::Continuation(count_accounting) = count_report.build else {
+            panic!("count fixture must select a continuation program")
+        };
+
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_accounting, count_accounting);
+        assert_eq!(compile_report.plan_identity, count_report.plan_identity);
+        assert!(compile_report.retained_capacity_bytes < compile_accounting.program_bytes);
+        assert_eq!(count_report.retained_capacity_bytes, count_accounting.program_bytes);
+
+        let haystack = "/// \u{100},\u{102}\u{104}".as_bytes();
+        let limits = AggregateRunLimits::default();
+        let verified = compiled.verify_count(haystack, limits).unwrap();
+        let ordinary = counted.count(haystack, limits).unwrap();
+        assert_eq!(verified.value(), 1);
+        assert_eq!(verified.value(), ordinary.value());
     }
 
     #[test]

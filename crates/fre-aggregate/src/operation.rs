@@ -9943,10 +9943,8 @@ impl FullTable {
                             0
                         }
                     }
-                    Inst::ConsumeScalar {
-                        scalars,
-                        next_by_width,
-                    } => {
+                    inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                    | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                         charge_transition::<OBSERVED_WORK>(
                             accounting,
                             requirements.work_bound,
@@ -9956,6 +9954,7 @@ impl FullTable {
                             row[pc] = 0;
                             continue;
                         };
+                        let scalars = program.scalar_set_for_inst(inst)?;
                         let matches = scalars.contains_with(scalar, || {
                             charge_transition::<OBSERVED_WORK>(
                                 accounting,
@@ -10151,12 +10150,11 @@ fn cached_compute_row(
                     cached_symbol_byte(symbol).is_some_and(|byte| bytes.contains(byte))
                         && cached_candidate_bit(next_frontier, *next)?
                 }
-                Inst::ConsumeScalar {
-                    scalars,
-                    next_by_width,
-                } => {
+                inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                     try_charge_transition(accounting, admitted_work_bound)?;
                     if let Some(scalar) = cached_symbol_scalar(symbol) {
+                        let scalars = program.scalar_set_for_inst(inst)?;
                         let matches = scalars.contains_with(scalar, || {
                             try_charge_transition(accounting, admitted_work_bound)
                         })?;
@@ -10926,12 +10924,10 @@ impl CachedFrontierStore {
                     )?;
                     pc = *next;
                 }
-                Inst::ConsumeScalar {
-                    scalars,
-                    next_by_width,
-                } => {
+                inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                     pc = cached_replay_scalar(
-                        scalars,
+                        program.scalar_set_for_inst(inst)?,
                         next_by_width,
                         haystack,
                         position,
@@ -11854,10 +11850,8 @@ impl RowStore {
                             0
                         }
                     }
-                    Inst::ConsumeScalar {
-                        scalars,
-                        next_by_width,
-                    } => {
+                    inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                    | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                         try_charge_transition(accounting, admitted_work_bound)?;
                         if !next_any {
                             row[pc] = 0;
@@ -11867,6 +11861,7 @@ impl RowStore {
                             row[pc] = 0;
                             continue;
                         };
+                        let scalars = program.scalar_set_for_inst(inst)?;
                         let matches = scalars.contains_with(scalar, || {
                             try_charge_transition(accounting, admitted_work_bound)
                         })?;
@@ -12012,7 +12007,9 @@ impl RowStore {
                         row[*fallback]
                     }
                 }
-                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                Inst::ConsumeScalarOwned { .. }
+                | Inst::ConsumeScalarShared { .. }
+                | Inst::Assert { .. } => {
                     return Err(Error::InternalInvariant(
                         "byte-row kernel received a non-byte state",
                     ));
@@ -12095,10 +12092,8 @@ impl RowStore {
                             0
                         }
                     }
-                    Inst::ConsumeScalar {
-                        scalars,
-                        next_by_width,
-                    } => {
+                    inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                    | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                         charge_transition::<OBSERVED_WORK>(
                             accounting,
                             admitted_work_bound,
@@ -12108,6 +12103,7 @@ impl RowStore {
                             row[pc] = 0;
                             continue;
                         };
+                        let scalars = program.scalar_set_for_inst(inst)?;
                         let matches = scalars.contains_with(scalar, || {
                             charge_transition::<OBSERVED_WORK>(
                                 accounting,
@@ -12259,10 +12255,8 @@ impl RowStore {
                     position = add(position, 1, Resource::Boundaries)?;
                     pc = *next;
                 }
-                Inst::ConsumeScalar {
-                    scalars,
-                    next_by_width,
-                } => {
+                inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                     let source = haystack.get(position..).unwrap_or_default();
                     record_source_accesses(
                         accounting,
@@ -12272,6 +12266,7 @@ impl RowStore {
                     let scalar = decode_first_scalar(source).ok_or(Error::InternalInvariant(
                         "row log selected invalid Unicode scalar path",
                     ))?;
+                    let scalars = program.scalar_set_for_inst(inst)?;
                     let matches = scalars.contains_with(scalar, || {
                         charge_replay::<OBSERVED_WORK>(
                             accounting,
@@ -12378,10 +12373,8 @@ impl RowStore {
                     position = add(position, 1, Resource::Boundaries)?;
                     pc = *next;
                 }
-                Inst::ConsumeScalar {
-                    scalars,
-                    next_by_width,
-                } => {
+                inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. }) => {
                     let source = haystack.get(position..).unwrap_or_default();
                     record_source_accesses(
                         accounting,
@@ -12391,6 +12384,7 @@ impl RowStore {
                     let scalar = decode_first_scalar(source).ok_or(Error::InternalInvariant(
                         "sparse row log selected invalid Unicode scalar path",
                     ))?;
+                    let scalars = program.scalar_set_for_inst(inst)?;
                     let matches = scalars.contains_with(scalar, || {
                         try_charge_replay(accounting, admitted_work_bound)
                     })?;

@@ -34983,6 +34983,79 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn current_fre_shared_scalar_compile_closes_outer_identity() {
+        std::thread::Builder::new()
+            .name("current-fre-shared-scalar-compile-identity".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_current_fre_shared_scalar_compile_closes_outer_identity)
+            .expect("spawn shared scalar Compile identity")
+            .join()
+            .expect("shared scalar Compile identity thread");
+    }
+
+    fn assert_current_fre_shared_scalar_compile_closes_outer_identity() {
+        const PATTERN: &str = r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*";
+
+        let compiled = current_fre_rebar_aggregate_builder(PATTERN, true, false)
+            .build_compile()
+            .expect("shared scalar Compile artifact");
+        let counted = current_fre_rebar_aggregate_builder(PATTERN, true, false)
+            .build_count()
+            .expect("ordinary scalar Count artifact");
+        let compile_report = compiled.build_report();
+        let count_report = counted.build_report();
+        let AggregateBuildAccounting::Continuation(compile_accounting) = compile_report.build
+        else {
+            panic!("shared scalar Compile must retain a continuation program")
+        };
+        let AggregateBuildAccounting::Continuation(count_accounting) = count_report.build else {
+            panic!("ordinary scalar Count must retain a continuation program")
+        };
+
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_accounting, count_accounting);
+        assert_eq!(compile_report.plan_identity, count_report.plan_identity);
+        assert!(compile_report.retained_capacity_bytes < compile_accounting.program_bytes);
+        assert_eq!(
+            count_report.retained_capacity_bytes,
+            count_accounting.program_bytes
+        );
+        assert_eq!(compile_accounting.required_internal_anchors, 0);
+        assert_eq!(compile_accounting.url_aggregate_plans, 0);
+        assert!(compile_report.has_closed_required_internal_anchor_identity());
+        assert!(compile_report.has_closed_url_aggregate_identity());
+        current_fre_rebar_validate_aggregate_identity(compile_report, true, "compile")
+            .expect("shared scalar Compile outer identity");
+        current_fre_rebar_validate_aggregate_identity(count_report, true, "count")
+            .expect("ordinary scalar Count outer identity");
+
+        let haystack = "/// \u{100},\u{102}\u{104}".as_bytes();
+        let compile_limits = current_fre_rebar_compile_run_limits(haystack.len(), &compiled)
+            .expect("shared scalar Compile limits");
+        let count_limits = current_fre_rebar_count_run_limits(haystack.len(), &counted)
+            .expect("ordinary scalar Count limits");
+        let verified = compiled
+            .verify_count(haystack, compile_limits)
+            .expect("shared scalar Compile verification");
+        let ordinary = counted
+            .count(haystack, count_limits)
+            .expect("ordinary scalar Count");
+        assert_eq!(verified.value(), 1);
+        assert_eq!(verified.value(), ordinary.value());
+        assert_eq!(
+            verified.report().identity().operation,
+            AggregateOperation::Compile
+        );
+        assert!(
+            verified
+                .report()
+                .identity()
+                .has_closed_construction_attempt()
+        );
+    }
+
+    #[test]
     fn rust_reference_lifecycles_separate_fresh_compile_from_same_artifact_operations() {
         let patterns = vec![r"(a)(b)?".to_string()];
         let haystack = b"ab a\nzz\nab\n";

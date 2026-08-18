@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use fre_exact_alloc::{CopyError, ExactVec};
+use fre_exact_alloc::{CopyError, ExactVec, try_box_preserve};
 use fre_kernels::SimdDispatchContext;
 use regex_syntax::hir::{Class, Hir, HirKind, Look, Repetition};
 use regex_syntax::utf8::Utf8Sequences;
@@ -8,7 +8,10 @@ use regex_syntax::utf8::Utf8Sequences;
 use crate::accounting::CompileAccounting;
 use crate::candidate::{self, Draft as CandidateDraft, Entry as CandidateEntry};
 use crate::error::{add, enforce, mul};
-use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet, StartDomain};
+use crate::program::{
+    Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet, ScalarSetDiagnostics, ScalarSetId,
+    ScalarSetTable, StartDomain,
+};
 use crate::required_internal_anchor;
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
@@ -177,6 +180,11 @@ pub enum CompileAttemptKind {
     /// Capture annotations are transparent because the caller observes only
     /// whole-match values.
     EraseCapturesForWholeMatch,
+    /// Compile-operation-only construction policy that may publish shared
+    /// immutable scalar owners after an exact economy proof. Semantic program
+    /// identity is unchanged, but allocation/refusal receipts are not
+    /// interchangeable with the incumbent owned policy.
+    EraseCapturesForWholeMatchSharedScalarOwnersV1,
 }
 
 /// Immutable semantic identity of a receipt-bearing compiler attempt.
@@ -203,7 +211,7 @@ pub struct CompileAttemptReceipt {
     pub actual: CompileAccounting,
     /// Successful compiler-owned allocations committed through this attempt.
     pub actual_allocations: Option<usize>,
-    /// Logical construction bytes live immediately before the failure
+    /// Physical construction bytes live immediately before the failure
     /// unwinds and drops unpublished compiler-owned values.
     pub live_construction_bytes: usize,
     /// A terminal error never publishes a partial continuation program.
@@ -267,7 +275,10 @@ impl std::error::Error for CompileAttemptError {
 /// Initialization and copy counters are cumulative successful writes, while
 /// `live_program_bytes` and `live_construction_bytes` are terminal liveness
 /// snapshots. A refusal has no live program but retains the exact unpublished
-/// construction bytes that will be abandoned while the error unwinds.
+/// construction bytes that will be abandoned while the error unwinds. These
+/// liveness and peak fields are the physical-byte authority; the embedded
+/// `CompileAccounting` deliberately preserves its incumbent logical scalar
+/// admission semantics and object size.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompileConstructionActual {
     pub work: usize,
@@ -375,7 +386,9 @@ impl CompileConstructionAttemptReceipt {
             && self.accounting.construction_peak_bytes <= self.prospective.max_program_bytes
             && self.accounting.work <= self.prospective.max_work
             && self.actual.work == self.accounting.work
-            && self.actual.construction_peak_bytes == self.accounting.construction_peak_bytes
+            && self.actual.live_program_bytes <= self.accounting.program_bytes
+            && self.actual.construction_peak_bytes <= self.accounting.construction_peak_bytes
+            && self.actual.construction_peak_bytes <= self.prospective.max_program_bytes
             && match (self.allocation_limit, self.prospective_allocations) {
                 (Some(limit), Some(prospective)) => {
                     self.actual.allocations <= limit && self.actual.allocations <= prospective
@@ -1064,7 +1077,24 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
     ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
-        Self::compile_with_construction_receipt(hir, profile, limits, None)
+        Self::compile_with_construction_receipt(hir, profile, limits, None, false)
+    }
+
+    /// Compile-only construction policy that may promote repeated large
+    /// scalar owners after the exact object-neutral economy proof succeeds.
+    /// Ordinary selectors and execution-facing constructors deliberately keep
+    /// the incumbent owned representation, allocation census and refusals.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the typed terminal receipt preserves the complete bounded compiler ledger"
+    )]
+    pub fn from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+    ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
+        Self::compile_with_construction_receipt(hir, profile, limits, None, true)
     }
 
     /// Fixed-scalar residual compiler entry point combining the existing
@@ -1089,6 +1119,7 @@ impl CompiledRegex {
                 limit: allocation_limit,
                 prospective: prospective_allocations,
             }),
+            false,
         )
     }
 
@@ -1101,13 +1132,19 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
         allocation_scope: Option<AllocationScope>,
+        allow_scalar_sharing: bool,
     ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
         let simd_dispatch = SimdDispatchContext::capture();
         let identity = CompileAttemptIdentity {
             profile,
-            kind: CompileAttemptKind::EraseCapturesForWholeMatch,
+            kind: if allow_scalar_sharing {
+                CompileAttemptKind::EraseCapturesForWholeMatchSharedScalarOwnersV1
+            } else {
+                CompileAttemptKind::EraseCapturesForWholeMatch
+            },
         };
         let mut budget = CompileBudget::new_construction_receipt(limits, allocation_scope);
+        budget.allow_scalar_sharing = allow_scalar_sharing;
         let result = match allocation_scope {
             Some(scope) => enforce(scope.prospective, scope.limit, Resource::Allocations),
             None => Ok(()),
@@ -1127,7 +1164,11 @@ impl CompiledRegex {
             Ok(compiled) => {
                 let actual = budget.construction_actual(true);
                 if !actual.is_closed()
-                    || actual.live_program_bytes != compiled.compile_accounting().program_bytes
+                    || actual.work != compiled.compile_accounting().work
+                    || budget.certified_physical_program_bytes != Some(actual.live_program_bytes)
+                    || actual.live_program_bytes > compiled.compile_accounting().program_bytes
+                    || actual.construction_peak_bytes
+                        > compiled.compile_accounting().construction_peak_bytes
                     || allocation_scope.is_some_and(|scope| actual.allocations != scope.prospective)
                 {
                     return Err(CompileConstructionAttemptError::new(
@@ -1345,11 +1386,13 @@ impl CompiledRegex {
             limits.max_program_bytes,
             Resource::ProgramBytes,
         )?;
+        let mut scalar_owners = ScalarOwnerDraft::default();
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
             capture_policy,
             retained_program_bytes,
+            &mut scalar_owners,
             budget,
         );
         let accept = builder.push(Inst::Match)?;
@@ -1365,18 +1408,75 @@ impl CompiledRegex {
         };
         let scalar_range_bytes = builder.scalar_range_bytes;
         let insts = builder.finish()?;
+        let (shared_scalar_reference_bytes, owned_scalar_range_bytes) =
+            if scalar_owners.owners.is_empty() {
+                // Ordinary and byte-only compiles cannot contain shared
+                // scalar references, so retain their established finalization
+                // work instead of scanning every instruction again.
+                (0, scalar_range_bytes)
+            } else {
+                let shared_scalar_reference_bytes = inst_vec_shared_scalar_bytes(&insts)?;
+                let owned_scalar_range_bytes = scalar_range_bytes
+                    .checked_sub(shared_scalar_reference_bytes)
+                    .ok_or(Error::InternalInvariant(
+                        "shared scalar references exceed logical scalar storage",
+                    ))?;
+                (shared_scalar_reference_bytes, owned_scalar_range_bytes)
+            };
+        let scalar_sets = scalar_owners.finish(
+            shared_scalar_reference_bytes,
+            budget.scalar_reference_copies,
+            budget,
+        )?;
+        let scalar_set_slice = scalar_sets
+            .as_deref()
+            .map_or(&[][..], |scalar_sets| &scalar_sets.owners[..]);
+        let scalar_diagnostics = scalar_sets
+            .as_deref()
+            .map(|scalar_sets| scalar_sets.diagnostics);
+        let expected_scalar_owner_index_bytes = mul(
+            scalar_set_slice.len(),
+            core::mem::size_of::<ScalarSet>(),
+            Resource::ProgramBytes,
+        )?;
+        let expected_scalar_owner_table_bytes =
+            retained_scalar_owner_table_bytes(scalar_set_slice.len());
+        let physical_scalar_range_bytes = add(
+            owned_scalar_range_bytes,
+            scalar_diagnostics.map_or(0, |value| value.owner_range_bytes),
+            Resource::ProgramBytes,
+        )?;
+        if scalar_diagnostics.is_some() != !scalar_set_slice.is_empty()
+            || scalar_diagnostics.is_some_and(|value| {
+                value.representation != ScalarSetId::REPRESENTATION_V1
+                    || value.owner_index_bytes != expected_scalar_owner_index_bytes
+                    || value.logical_reference_bytes != shared_scalar_reference_bytes
+                    || value.reference_copies != budget.scalar_reference_copies
+            })
+            || (scalar_set_slice.is_empty() != (expected_scalar_owner_table_bytes == 0))
+        {
+            return Err(Error::InternalInvariant(
+                "retained scalar-owner index differs from physical accounting",
+            ));
+        }
         enforce(
             insts.len(),
             limits.max_program_states,
             Resource::ProgramStates,
         )?;
-        let certificate =
-            certify_program(&insts, scalar_range_bytes, retained_program_bytes, budget)?;
-        // `program_bytes` visits every instruction to include each deeply
-        // owned scalar-range box in the exact retained-byte total.
+        let certificate = certify_program(
+            &insts,
+            scalar_set_slice,
+            scalar_range_bytes,
+            physical_scalar_range_bytes,
+            retained_program_bytes,
+            budget,
+        )?;
+        // Preserve the established logical per-state scalar-range admission
+        // separately from exact physical retained liveness.
         budget.charge(insts.len())?;
-        let program_bytes = add(
-            program_bytes(
+        let logical_program_bytes = add(
+            logical_program_bytes(
                 &insts,
                 insts.len(),
                 certificate.epsilon_order.len(),
@@ -1385,21 +1485,50 @@ impl CompiledRegex {
             retained_program_bytes,
             Resource::ProgramBytes,
         )?;
+        let physical_program_bytes = add(
+            physical_program_bytes(
+                insts.len(),
+                certificate.epsilon_order.len(),
+                certificate.split_rank.len(),
+                physical_scalar_range_bytes,
+                scalar_set_slice.len(),
+            )?,
+            retained_program_bytes,
+            Resource::ProgramBytes,
+        )?;
         enforce(
-            program_bytes,
+            logical_program_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            physical_program_bytes,
             limits.max_program_bytes,
             Resource::ProgramBytes,
         )?;
         budget.accounting.program_states = insts.len();
-        budget.accounting.program_bytes = program_bytes;
+        if physical_program_bytes > logical_program_bytes {
+            return Err(Error::InternalInvariant(
+                "shared scalar physical program exceeds incumbent logical admission",
+            ));
+        }
+        // Preserve the exact incumbent logical admission/replay value. The
+        // promotion economy theorem above proves exact physical retention is
+        // no larger, and construction receipts remain its authority.
+        budget.accounting.program_bytes = logical_program_bytes;
         budget.accounting.execution_state_work = certificate.execution_state_work;
         budget.accounting.continuation_max_nonaccepting_run =
             certificate.continuation_nonaccepting_run;
         budget.accounting.predecessor_edges = certificate.predecessor_edges;
         budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
         budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
+        let continuation_nonaccepting_run = Program::encode_continuation_nonaccepting_run(
+            certificate.continuation_nonaccepting_run,
+            insts.len(),
+        )?;
         let mut program = Program {
             insts,
+            scalar_sets,
             entry,
             epsilon_order: certificate.epsilon_order,
             split_rank: certificate.split_rank,
@@ -1411,7 +1540,7 @@ impl CompiledRegex {
             has_scalar_transition: certificate.has_scalar_transition,
             has_assertion: certificate.has_assertion,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
-            continuation_nonaccepting_run: certificate.continuation_nonaccepting_run,
+            continuation_nonaccepting_run,
             has_unicode_word_boundary: false,
             start_domain: StartDomain::AnyBoundary,
             root_assertion: None,
@@ -1436,13 +1565,17 @@ impl CompiledRegex {
         if let Some(plan) = &ordered_bounded_span_sum {
             plan_id = ordered_bounded_span_sum::bind_plan_identity(plan_id, plan, budget)?;
         }
-        if budget.current_construction_bytes != program_bytes {
+        if budget.current_construction_bytes != physical_program_bytes
+            || budget.current_logical_construction_bytes != logical_program_bytes
+            || budget.physical_construction_peak_bytes > budget.accounting.construction_peak_bytes
+        {
             return Err(Error::InternalInvariant(
-                "compiler retained bytes differ from construction accounting",
+                "compiler retained bytes differ from physical/logical construction accounting",
             ));
         }
+        budget.certified_physical_program_bytes = Some(physical_program_bytes);
         let accounting = budget.accounting;
-        Ok(Self {
+        let compiled = Self {
             program,
             candidate,
             url_aggregate,
@@ -1455,7 +1588,13 @@ impl CompiledRegex {
             minimum_match_bytes,
             plan_id,
             accounting,
-        })
+        };
+        if compiled.physical_program_bytes()? != physical_program_bytes {
+            return Err(Error::InternalInvariant(
+                "published scalar diagnostics differ from certified physical program bytes",
+            ));
+        }
+        Ok(compiled)
     }
 
     #[must_use]
@@ -1466,6 +1605,45 @@ impl CompiledRegex {
     #[must_use]
     pub const fn compile_accounting(&self) -> CompileAccounting {
         self.accounting
+    }
+
+    /// Exact physical bytes retained by this compiled continuation.
+    ///
+    /// `CompileAccounting::program_bytes` remains the incumbent logical
+    /// admission value. Shared scalar programs replace their per-state
+    /// logical range charge with the unique owner ranges, exact owner index,
+    /// and boxed table value in constant time. Programs without a shared
+    /// table preserve the old exact equality.
+    #[doc(hidden)]
+    pub fn physical_program_bytes(&self) -> Result<usize, Error> {
+        let Some(diagnostics) = self.program.scalar_set_diagnostics() else {
+            return Ok(self.accounting.program_bytes);
+        };
+        if diagnostics.representation != ScalarSetId::REPRESENTATION_V1 {
+            return Err(Error::InternalInvariant(
+                "Unicode scalar owner representation differs from program",
+            ));
+        }
+        let without_shared_references = self
+            .accounting
+            .program_bytes
+            .checked_sub(diagnostics.logical_reference_bytes)
+            .ok_or(Error::InternalInvariant(
+                "shared scalar logical bytes exceed program accounting",
+            ))?;
+        add(
+            without_shared_references,
+            add(
+                add(
+                    diagnostics.owner_range_bytes,
+                    diagnostics.owner_index_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                core::mem::size_of::<ScalarSetTable>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )
     }
 
     #[must_use]
@@ -1509,6 +1687,21 @@ impl CompiledRegex {
         required_len: usize,
     ) -> Option<usize> {
         pinned_vec_capacity_after_push(current_capacity, required_len, core::mem::size_of::<Inst>())
+    }
+
+    /// Model one capacity-changing `Vec<ScalarSet>::try_reserve(1)` call in
+    /// the pinned Rust 1.93 compiler graph.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pinned_scalar_owner_capacity_after_push(
+        current_capacity: usize,
+        required_len: usize,
+    ) -> Option<usize> {
+        pinned_vec_capacity_after_push(
+            current_capacity,
+            required_len,
+            core::mem::size_of::<ScalarSet>(),
+        )
     }
 }
 
@@ -4579,14 +4772,25 @@ fn build_retained_components(
         budget.acquire_checked_construction_bytes(minimum_match_bytes_proof_bytes)?;
     }
     budget.record_initialization(minimum_match_bytes_proof_bytes, false)?;
-    let continuation_nonaccepting_run_proof_bytes = core::mem::size_of::<Option<usize>>();
+    let continuation_nonaccepting_run_proof_bytes = core::mem::size_of::<usize>();
+    let scalar_set_owner_table_handle_bytes = core::mem::size_of::<Option<Box<ScalarSetTable>>>();
+    let continuation_and_scalar_handle_bytes = add(
+        continuation_nonaccepting_run_proof_bytes,
+        scalar_set_owner_table_handle_bytes,
+        Resource::ProgramBytes,
+    )?;
+    // Preserve the incumbent public proof-slot breakdown. The physical layout
+    // is now one sentinel word plus the nullable scalar-table handle word.
     budget.accounting.continuation_nonaccepting_run_proof_bytes =
-        continuation_nonaccepting_run_proof_bytes;
+        continuation_and_scalar_handle_bytes;
     if budget.receipt_scope {
-        budget.preflight_receipt_construction_bytes(continuation_nonaccepting_run_proof_bytes)?;
-        budget.acquire_checked_construction_bytes(continuation_nonaccepting_run_proof_bytes)?;
+        // Keep the incumbent byte-only refusal point: the sentinel and the
+        // nullable scalar-table handle together occupy the former
+        // `Option<usize>` proof footprint and are admitted as one unit.
+        budget.preflight_receipt_construction_bytes(continuation_and_scalar_handle_bytes)?;
+        budget.acquire_checked_construction_bytes(continuation_and_scalar_handle_bytes)?;
     }
-    budget.record_initialization(continuation_nonaccepting_run_proof_bytes, false)?;
+    budget.record_initialization(continuation_and_scalar_handle_bytes, false)?;
     budget.charge(1)?;
     if budget.receipt_scope {
         budget.preflight_receipt_construction_bytes(RequiredLiteralSets::retained_bytes())?;
@@ -4628,7 +4832,7 @@ fn build_retained_components(
         add(
             add(
                 minimum_match_bytes_proof_bytes,
-                continuation_nonaccepting_run_proof_bytes,
+                continuation_and_scalar_handle_bytes,
                 Resource::ProgramBytes,
             )?,
             add(
@@ -4855,7 +5059,9 @@ fn partitioned_start_domain(
             // Scalar continuations are not eligible for the compact executor,
             // but treating them as unpartitioned keeps this retained proof
             // independently conservative.
-            Inst::ConsumeScalar { .. } => return Ok(StartDomain::AnyBoundary),
+            Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
+                return Ok(StartDomain::AnyBoundary);
+            }
             _ => {}
         }
     }
@@ -4902,7 +5108,25 @@ pub(crate) struct CompileBudget {
     actual_copied_bytes: usize,
     actual_initialized_bytes: usize,
     current_temporary_states: usize,
+    /// Exact physical bytes live in compiler-owned allocations.
     current_construction_bytes: usize,
+    /// Conservative compatibility ledger that charges scalar ranges once per
+    /// consuming state even when physical owners are shared.
+    current_logical_construction_bytes: usize,
+    /// Exact physical high-water mark. The public `CompileAccounting` keeps
+    /// its incumbent logical peak; construction receipts are the authority
+    /// for physical liveness and peak bytes.
+    physical_construction_peak_bytes: usize,
+    /// Scalar owner-ID copies made by progress-product translation. This
+    /// transient counter is published only inside the scalar-only owner box.
+    scalar_reference_copies: usize,
+    /// Compile-operation-only authority for object-neutral large-scalar
+    /// promotion. Every ordinary constructor leaves this disabled.
+    allow_scalar_sharing: bool,
+    /// Computed exact physical retained bytes after successful certification.
+    /// Construction-receipt publication must agree with this independent
+    /// result instead of treating the live ledger as self-authenticating.
+    certified_physical_program_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -5002,6 +5226,11 @@ impl CompileBudget {
             actual_initialized_bytes: 0,
             current_temporary_states: 0,
             current_construction_bytes: 0,
+            current_logical_construction_bytes: 0,
+            physical_construction_peak_bytes: 0,
+            scalar_reference_copies: 0,
+            allow_scalar_sharing: false,
+            certified_physical_program_bytes: None,
         }
     }
 
@@ -5206,7 +5435,7 @@ impl CompileBudget {
                 0
             },
             live_construction_bytes: self.current_construction_bytes,
-            construction_peak_bytes: self.accounting.construction_peak_bytes,
+            construction_peak_bytes: self.physical_construction_peak_bytes,
             abandonable_bytes: if published {
                 0
             } else {
@@ -5231,15 +5460,46 @@ impl CompileBudget {
     }
 
     pub(crate) fn acquire_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        let physical = add(
+            self.current_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        let logical = add(
+            self.current_logical_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        self.current_construction_bytes = physical;
+        self.current_logical_construction_bytes = logical;
+        self.physical_construction_peak_bytes = self.physical_construction_peak_bytes.max(physical);
+        self.accounting.construction_peak_bytes =
+            self.accounting.construction_peak_bytes.max(logical);
+        Ok(())
+    }
+
+    fn acquire_physical_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = add(
             self.current_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        self.physical_construction_peak_bytes = self
+            .physical_construction_peak_bytes
+            .max(self.current_construction_bytes);
+        Ok(())
+    }
+
+    fn acquire_logical_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        self.current_logical_construction_bytes = add(
+            self.current_logical_construction_bytes,
             amount,
             Resource::ProgramBytes,
         )?;
         self.accounting.construction_peak_bytes = self
             .accounting
             .construction_peak_bytes
-            .max(self.current_construction_bytes);
+            .max(self.current_logical_construction_bytes);
         Ok(())
     }
 
@@ -5247,13 +5507,23 @@ impl CompileBudget {
         &mut self,
         amount: usize,
     ) -> Result<(), Error> {
-        let required = add(
+        let physical_required = add(
             self.current_construction_bytes,
             amount,
             Resource::ProgramBytes,
         )?;
+        let logical_required = add(
+            self.current_logical_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
         enforce(
-            required,
+            physical_required,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            logical_required,
             self.limits.max_program_bytes,
             Resource::ProgramBytes,
         )?;
@@ -5266,23 +5536,92 @@ impl CompileBudget {
         if !self.receipt_scope {
             return Ok(());
         }
-        let required = add(
+        let physical_required = add(
             self.current_construction_bytes,
             amount,
             Resource::ProgramBytes,
         )?;
         enforce(
-            required,
+            physical_required,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        let logical_required = add(
+            self.current_logical_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            logical_required,
             self.limits.max_program_bytes,
             Resource::ProgramBytes,
         )
     }
+
+    fn preflight_receipt_physical_construction_bytes(&self, amount: usize) -> Result<(), Error> {
+        if !self.receipt_scope {
+            return Ok(());
+        }
+        enforce(
+            add(
+                self.current_construction_bytes,
+                amount,
+                Resource::ProgramBytes,
+            )?,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )
+    }
+
+    fn preflight_receipt_logical_construction_bytes(&self, amount: usize) -> Result<(), Error> {
+        if !self.receipt_scope {
+            return Ok(());
+        }
+        enforce(
+            add(
+                self.current_logical_construction_bytes,
+                amount,
+                Resource::ProgramBytes,
+            )?,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )
+    }
+
     pub(crate) fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        let physical =
+            self.current_construction_bytes
+                .checked_sub(amount)
+                .ok_or(Error::InternalInvariant(
+                    "compiler construction-byte accounting underflow",
+                ))?;
+        let logical = self
+            .current_logical_construction_bytes
+            .checked_sub(amount)
+            .ok_or(Error::InternalInvariant(
+                "compiler logical construction-byte accounting underflow",
+            ))?;
+        self.current_construction_bytes = physical;
+        self.current_logical_construction_bytes = logical;
+        Ok(())
+    }
+
+    fn release_physical_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = self
             .current_construction_bytes
             .checked_sub(amount)
             .ok_or(Error::InternalInvariant(
                 "compiler construction-byte accounting underflow",
+            ))?;
+        Ok(())
+    }
+
+    fn release_logical_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        self.current_logical_construction_bytes = self
+            .current_logical_construction_bytes
+            .checked_sub(amount)
+            .ok_or(Error::InternalInvariant(
+                "compiler logical construction-byte accounting underflow",
             ))?;
         Ok(())
     }
@@ -6322,9 +6661,191 @@ fn validate_repetition(repetition: &Repetition, budget: &mut CompileBudget) -> R
     enforce(required, limit, Resource::RepeatBound)
 }
 
+#[derive(Default)]
+struct ScalarOwnerDraft {
+    owners: Vec<ScalarSet>,
+    range_bytes: usize,
+    owner_index_allocations: usize,
+    owner_peak_bytes: usize,
+}
+
+impl ScalarOwnerDraft {
+    fn push(&mut self, owner: ScalarSet, budget: &mut CompileBudget) -> Result<ScalarSetId, Error> {
+        let index = self.owners.len();
+        let ranges = owner.len();
+        let owner_bytes = owner.allocated_bytes()?;
+        let required = add(index, 1, Resource::ProgramBytes)?;
+        let old_capacity = self.owners.capacity();
+        let needs_allocation = index == old_capacity;
+        let expected_capacity = if needs_allocation {
+            Some(
+                CompiledRegex::pinned_scalar_owner_capacity_after_push(old_capacity, required)
+                    .ok_or(Error::ArithmeticOverflow {
+                        resource: Resource::ProgramBytes,
+                    })?,
+            )
+        } else {
+            None
+        };
+        let expected_added_bytes = expected_capacity.map_or(Ok(0), |capacity| {
+            mul(
+                capacity
+                    .checked_sub(old_capacity)
+                    .ok_or(Error::InternalInvariant(
+                        "pinned scalar-owner capacity decreased",
+                    ))?,
+                core::mem::size_of::<ScalarSet>(),
+                Resource::ProgramBytes,
+            )
+        })?;
+        budget.preflight_receipt_physical_construction_bytes(expected_added_bytes)?;
+        let observed_capacity = compiler_allocation(
+            budget,
+            needs_allocation,
+            Resource::ProgramBytes,
+            1,
+            || {
+                self.owners
+                    .try_reserve(1)
+                    .map_err(|_| Error::AllocationFailed {
+                        resource: Resource::ProgramBytes,
+                        items: 1,
+                    })?;
+                Ok(self.owners.capacity())
+            },
+            |capacity| {
+                mul(
+                    capacity
+                        .checked_sub(old_capacity)
+                        .ok_or(Error::InternalInvariant(
+                            "scalar-owner capacity decreased during allocation",
+                        ))?,
+                    core::mem::size_of::<ScalarSet>(),
+                    Resource::ProgramBytes,
+                )
+            },
+        )?;
+        if observed_capacity != self.owners.capacity()
+            || expected_capacity.is_some_and(|capacity| capacity != observed_capacity)
+        {
+            return Err(Error::InternalInvariant(
+                "pinned scalar-owner capacity profile differs from Rust Vec",
+            ));
+        }
+        if needs_allocation {
+            self.owner_index_allocations =
+                add(self.owner_index_allocations, 1, Resource::Allocations)?;
+        }
+        budget.acquire_physical_construction_bytes(expected_added_bytes)?;
+        self.owners.push(owner);
+        budget.record_items::<ScalarSet>(1, false)?;
+        self.range_bytes = add(self.range_bytes, owner_bytes, Resource::ProgramBytes)?;
+        let draft_bytes = vector_capacity_bytes(&self.owners)?;
+        self.owner_peak_bytes =
+            self.owner_peak_bytes
+                .max(add(self.range_bytes, draft_bytes, Resource::ProgramBytes)?);
+        ScalarSetId::new(index, ranges)
+    }
+
+    fn finish(
+        mut self,
+        logical_reference_bytes: usize,
+        reference_copies: usize,
+        budget: &mut CompileBudget,
+    ) -> Result<Option<Box<ScalarSetTable>>, Error> {
+        if self.owners.is_empty() {
+            if self.range_bytes != 0
+                || self.owner_index_allocations != 0
+                || self.owner_peak_bytes != 0
+                || reference_copies != 0
+            {
+                return Err(Error::InternalInvariant(
+                    "empty scalar-owner draft retained diagnostics",
+                ));
+            }
+            return Ok(None);
+        }
+        let retained_index_bytes = mul(
+            self.owners.len(),
+            core::mem::size_of::<ScalarSet>(),
+            Resource::ProgramBytes,
+        )?;
+        let draft_bytes = vector_capacity_bytes(&self.owners)?;
+        let range_bytes = self.range_bytes;
+        let owner_table_bytes = core::mem::size_of::<ScalarSetTable>();
+        let final_overhead = add(
+            retained_index_bytes,
+            owner_table_bytes,
+            Resource::ProgramBytes,
+        )?;
+        let copy_peak_overhead = add(draft_bytes, retained_index_bytes, Resource::ProgramBytes)?;
+        let minimum_logical_references = mul(2, range_bytes, Resource::ProgramBytes)?;
+        if range_bytes < final_overhead
+            || range_bytes < copy_peak_overhead
+            || logical_reference_bytes < minimum_logical_references
+        {
+            return Err(Error::InternalInvariant(
+                "shared scalar owner economy proof does not dominate physical storage",
+            ));
+        }
+        budget.preflight_receipt_physical_construction_bytes(retained_index_bytes)?;
+        let retained = retain_exact_program_vec_metered(self.owners, budget)?;
+        if retained_index_bytes != 0 {
+            self.owner_index_allocations =
+                add(self.owner_index_allocations, 1, Resource::Allocations)?;
+        }
+        budget.acquire_physical_construction_bytes(retained_index_bytes)?;
+        self.owner_peak_bytes = self.owner_peak_bytes.max(add(
+            add(range_bytes, draft_bytes, Resource::ProgramBytes)?,
+            retained_index_bytes,
+            Resource::ProgramBytes,
+        )?);
+        // `retain_exact_program_vec_metered` has consumed and dropped the
+        // draft Vec before returning. Keep its exact co-live copy peak above,
+        // then release that capacity before allocating the boxed table value.
+        budget.release_physical_construction_bytes(draft_bytes)?;
+        self.owner_peak_bytes = self.owner_peak_bytes.max(add(
+            add(range_bytes, retained_index_bytes, Resource::ProgramBytes)?,
+            owner_table_bytes,
+            Resource::ProgramBytes,
+        )?);
+        let diagnostics = ScalarSetDiagnostics {
+            representation: ScalarSetId::REPRESENTATION_V1,
+            owner_index_allocations: self.owner_index_allocations,
+            owner_range_bytes: range_bytes,
+            owner_index_bytes: retained_index_bytes,
+            owner_peak_bytes: self.owner_peak_bytes,
+            logical_reference_bytes,
+            reference_copies,
+        };
+        let table = ScalarSetTable {
+            owners: retained,
+            diagnostics,
+        };
+        budget.preflight_receipt_physical_construction_bytes(owner_table_bytes)?;
+        let retained = compiler_allocation(
+            budget,
+            owner_table_bytes != 0,
+            Resource::ProgramBytes,
+            1,
+            || {
+                try_box_preserve(table).map_err(|(error, _table)| {
+                    exact_url_allocation_error(error, Resource::ProgramBytes, 1)
+                })
+            },
+            |_| Ok(owner_table_bytes),
+        )?;
+        budget.acquire_physical_construction_bytes(owner_table_bytes)?;
+        budget.record_items::<ScalarSetTable>(1, true)?;
+        Ok(Some(retained))
+    }
+}
+
 struct Builder<'a> {
     slots: Vec<Inst>,
+    scalar_owners: &'a mut ScalarOwnerDraft,
     scalar_range_bytes: usize,
+    owned_scalar_range_bytes: usize,
     retained_program_bytes: usize,
     state_limit: usize,
     profile: RustByteProfile,
@@ -6338,11 +6859,14 @@ impl<'a> Builder<'a> {
         profile: RustByteProfile,
         capture_policy: CapturePolicy,
         retained_program_bytes: usize,
+        scalar_owners: &'a mut ScalarOwnerDraft,
         budget: &'a mut CompileBudget,
     ) -> Self {
         Self {
             slots: Vec::new(),
+            scalar_owners,
             scalar_range_bytes: 0,
+            owned_scalar_range_bytes: 0,
             retained_program_bytes,
             state_limit,
             profile,
@@ -6351,7 +6875,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn enforce_program_shape(&self, states: usize, scalar_range_bytes: usize) -> Result<(), Error> {
+    fn enforce_program_shape_with_owners(
+        &self,
+        states: usize,
+        logical_scalar_range_bytes: usize,
+        physical_scalar_range_bytes: usize,
+        scalar_owner_count: usize,
+    ) -> Result<(), Error> {
         enforce(states, self.state_limit, Resource::ProgramStates)?;
         let state_metadata_bytes = mul(2, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
         let state_bytes = mul(
@@ -6363,12 +6893,45 @@ impl<'a> Builder<'a> {
             )?,
             Resource::ProgramBytes,
         )?;
-        enforce(
+        let logical_required = add(
             add(
-                add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
-                self.retained_program_bytes,
+                state_bytes,
+                logical_scalar_range_bytes,
                 Resource::ProgramBytes,
             )?,
+            self.retained_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            logical_required,
+            self.budget.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        let owner_index_bytes = mul(
+            scalar_owner_count,
+            core::mem::size_of::<ScalarSet>(),
+            Resource::ProgramBytes,
+        )?;
+        let owner_table_bytes = retained_scalar_owner_table_bytes(scalar_owner_count);
+        let physical_required = add(
+            add(
+                add(
+                    add(
+                        state_bytes,
+                        physical_scalar_range_bytes,
+                        Resource::ProgramBytes,
+                    )?,
+                    owner_index_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                owner_table_bytes,
+                Resource::ProgramBytes,
+            )?,
+            self.retained_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            physical_required,
             self.budget.limits.max_program_bytes,
             Resource::ProgramBytes,
         )
@@ -6388,11 +6951,12 @@ impl<'a> Builder<'a> {
         scalar_preaccounted: bool,
     ) -> Result<usize, Error> {
         let required = add(self.slots.len(), 1, Resource::ProgramStates)?;
-        let added_scalar_bytes = match &inst {
-            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+        let added_scalar_bytes = inst.scalar_logical_bytes()?;
+        let added_owned_scalar_bytes = match &inst {
+            Inst::ConsumeScalarOwned { scalars, .. } => scalars.allocated_bytes()?,
             _ => 0,
         };
-        if scalar_preaccounted != (self.budget.receipt_scope && added_scalar_bytes != 0) {
+        if scalar_preaccounted != (added_scalar_bytes != 0) {
             return Err(Error::InternalInvariant(
                 "compiler scalar state accounting scope differs from owned storage",
             ));
@@ -6402,7 +6966,21 @@ impl<'a> Builder<'a> {
             added_scalar_bytes,
             Resource::ProgramBytes,
         )?;
-        self.enforce_program_shape(required, scalar_range_bytes)?;
+        let owned_scalar_range_bytes = add(
+            self.owned_scalar_range_bytes,
+            added_owned_scalar_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape_with_owners(
+            required,
+            scalar_range_bytes,
+            add(
+                owned_scalar_range_bytes,
+                self.scalar_owners.range_bytes,
+                Resource::ProgramBytes,
+            )?,
+            self.scalar_owners.owners.len(),
+        )?;
         self.budget.acquire_state()?;
         let old_capacity = self.slots.capacity();
         let needs_allocation = self.slots.len() == self.slots.capacity();
@@ -6473,19 +7051,12 @@ impl<'a> Builder<'a> {
             Resource::ProgramBytes,
         )?;
         self.budget
-            .acquire_construction_bytes(if scalar_preaccounted {
-                state_capacity_bytes
-            } else {
-                add(
-                    state_capacity_bytes,
-                    added_scalar_bytes,
-                    Resource::ProgramBytes,
-                )?
-            })?;
+            .acquire_construction_bytes(state_capacity_bytes)?;
         let index = self.slots.len();
         self.slots.push(inst);
         self.budget.record_items::<Inst>(1, false)?;
         self.scalar_range_bytes = scalar_range_bytes;
+        self.owned_scalar_range_bytes = owned_scalar_range_bytes;
         Ok(index)
     }
 
@@ -6508,11 +7079,12 @@ impl<'a> Builder<'a> {
                 "compiler attempted to replace a filled state",
             ));
         }
-        let added_scalar_bytes = match &inst {
-            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+        let added_scalar_bytes = inst.scalar_logical_bytes()?;
+        let added_owned_scalar_bytes = match &inst {
+            Inst::ConsumeScalarOwned { scalars, .. } => scalars.allocated_bytes()?,
             _ => 0,
         };
-        if scalar_preaccounted != (self.budget.receipt_scope && added_scalar_bytes != 0) {
+        if scalar_preaccounted != (added_scalar_bytes != 0) {
             return Err(Error::InternalInvariant(
                 "compiler scalar fill accounting scope differs from owned storage",
             ));
@@ -6522,37 +7094,67 @@ impl<'a> Builder<'a> {
             added_scalar_bytes,
             Resource::ProgramBytes,
         )?;
-        self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
-        if !scalar_preaccounted {
-            self.budget.acquire_construction_bytes(added_scalar_bytes)?;
-        }
+        let owned_scalar_range_bytes = add(
+            self.owned_scalar_range_bytes,
+            added_owned_scalar_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape_with_owners(
+            self.slots.len(),
+            scalar_range_bytes,
+            add(
+                owned_scalar_range_bytes,
+                self.scalar_owners.range_bytes,
+                Resource::ProgramBytes,
+            )?,
+            self.scalar_owners.owners.len(),
+        )?;
         self.slots[index] = inst;
         self.scalar_range_bytes = scalar_range_bytes;
+        self.owned_scalar_range_bytes = owned_scalar_range_bytes;
         Ok(())
     }
 
-    /// Check both persistent space and construction work before cloning a
-    /// scalar range allocation into a progress-product state.
+    /// Check both logical persistent space and construction work before
+    /// sharing a scalar owner with a progress-product state.
     fn preflight_progress_fill(&mut self, index: usize, source: &Inst) -> Result<(), Error> {
         if !matches!(self.slots.get(index), Some(Inst::Unfilled)) {
             return Err(Error::InternalInvariant(
                 "compiler attempted to replace a filled state",
             ));
         }
-        let added_scalar_bytes = match source {
-            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
-            _ => 0,
-        };
+        let added_scalar_bytes = source.scalar_logical_bytes()?;
         let scalar_range_bytes = add(
             self.scalar_range_bytes,
             added_scalar_bytes,
             Resource::ProgramBytes,
         )?;
-        self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
-        if let Inst::ConsumeScalar { scalars, .. } = source {
-            self.budget.charge(scalars.len())?;
+        let added_owned_bytes = match source {
+            Inst::ConsumeScalarOwned { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        self.enforce_program_shape_with_owners(
+            self.slots.len(),
+            scalar_range_bytes,
+            add(
+                add(
+                    self.owned_scalar_range_bytes,
+                    added_owned_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                self.scalar_owners.range_bytes,
+                Resource::ProgramBytes,
+            )?,
+            self.scalar_owners.owners.len(),
+        )?;
+        if added_scalar_bytes != 0 {
+            self.budget.charge(source.scalar_range_count())?;
             self.budget
-                .preflight_receipt_construction_bytes(added_scalar_bytes)?;
+                .preflight_receipt_logical_construction_bytes(added_scalar_bytes)?;
+            if added_owned_bytes != 0 {
+                self.budget
+                    .preflight_receipt_physical_construction_bytes(added_owned_bytes)?;
+            }
         }
         Ok(())
     }
@@ -6560,14 +7162,30 @@ impl<'a> Builder<'a> {
     fn preflight_scalar_set(&self, range_count: usize) -> Result<(), Error> {
         let allocation_bytes = ScalarSet::required_bytes(range_count)?;
         let states = add(self.slots.len(), 1, Resource::ProgramStates)?;
-        let scalar_range_bytes = add(
+        let logical_scalar_range_bytes = add(
             self.scalar_range_bytes,
             allocation_bytes,
             Resource::ProgramBytes,
         )?;
-        self.enforce_program_shape(states, scalar_range_bytes)?;
+        let physical_scalar_range_bytes = add(
+            self.owned_scalar_range_bytes,
+            allocation_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape_with_owners(
+            states,
+            logical_scalar_range_bytes,
+            add(
+                physical_scalar_range_bytes,
+                self.scalar_owners.range_bytes,
+                Resource::ProgramBytes,
+            )?,
+            self.scalar_owners.owners.len(),
+        )?;
         self.budget
-            .preflight_receipt_construction_bytes(allocation_bytes)
+            .preflight_receipt_physical_construction_bytes(allocation_bytes)?;
+        self.budget
+            .preflight_receipt_logical_construction_bytes(allocation_bytes)
     }
 
     fn finish(self) -> Result<ExactVec<Inst>, Error> {
@@ -6785,19 +7403,13 @@ impl<'a> Builder<'a> {
                 ScalarSet::allocated_bytes,
             )?;
             let scalar_bytes = scalars.allocated_bytes()?;
-            if self.budget.receipt_scope {
-                self.budget.acquire_construction_bytes(scalar_bytes)?;
-            }
+            self.budget.acquire_construction_bytes(scalar_bytes)?;
             self.budget.record_initialization(scalar_bytes, false)?;
-            let inst = Inst::ConsumeScalar {
+            let inst = Inst::ConsumeScalarOwned {
                 scalars,
                 next_by_width,
             };
-            return if self.budget.receipt_scope {
-                self.push_preaccounted_scalar(inst)
-            } else {
-                self.push(inst)
-            };
+            return self.push_preaccounted_scalar(inst);
         }
 
         let mut entry = None;
@@ -6877,12 +7489,13 @@ impl<'a> Builder<'a> {
         let fail = self.push(Inst::Fail)?;
         let initial_loop = self.push(Inst::Unfilled)?;
         let progressed_loop = self.push(Inst::Unfilled)?;
-        let (fragment, fragment_entry) = {
+        let (mut fragment, fragment_entry) = {
             let mut fragment_builder = Builder::new(
                 self.state_limit,
                 self.profile,
                 self.capture_policy,
                 self.retained_program_bytes,
+                self.scalar_owners,
                 self.budget,
             );
             let accept = fragment_builder.push(Inst::Match)?;
@@ -6890,13 +7503,38 @@ impl<'a> Builder<'a> {
             (fragment_builder.finish()?, fragment_entry)
         };
         let fragment_len = fragment.len();
-        let fragment_bytes = inst_vec_owned_bytes(&fragment)?;
-        let initial_body =
-            self.import_progress_product(&fragment, fragment_entry, continuation, progressed_loop)?;
+        let fragment_state_bytes = inst_vec_state_bytes(&fragment)?;
+        let fragment_logical_bytes = inst_vec_logical_bytes(&fragment)?;
+        let fragment_scalar_bytes = fragment_logical_bytes
+            .checked_sub(fragment_state_bytes)
+            .ok_or(Error::InternalInvariant(
+                "fragment state storage exceeds logical storage",
+            ))?;
+        let initial_body = self.import_progress_product(
+            &mut fragment,
+            fragment_entry,
+            continuation,
+            progressed_loop,
+        )?;
         let progressed_body =
-            self.import_progress_product(&fragment, fragment_entry, fail, progressed_loop)?;
+            self.import_progress_product(&mut fragment, fragment_entry, fail, progressed_loop)?;
+        let fragment_owned_scalar_bytes = if self.scalar_owners.owners.is_empty() {
+            fragment_scalar_bytes
+        } else {
+            fragment_scalar_bytes
+                .checked_sub(inst_vec_shared_scalar_bytes(&fragment)?)
+                .ok_or(Error::InternalInvariant(
+                    "shared fragment scalar storage exceeds logical storage",
+                ))?
+        };
         drop(fragment);
-        self.budget.release_construction_bytes(fragment_bytes)?;
+        self.budget.release_physical_construction_bytes(add(
+            fragment_state_bytes,
+            fragment_owned_scalar_bytes,
+            Resource::ProgramBytes,
+        )?)?;
+        self.budget
+            .release_logical_construction_bytes(fragment_logical_bytes)?;
         self.budget.release_states(fragment_len)?;
         let (preferred, fallback) = if greedy {
             (initial_body, continuation)
@@ -6922,12 +7560,13 @@ impl<'a> Builder<'a> {
 
         // Required iterations are finite, but their aggregate progress must
         // select the right mode for the open tail.
-        let (required, required_entry) = {
+        let (mut required, required_entry) = {
             let mut fragment_builder = Builder::new(
                 self.state_limit,
                 self.profile,
                 self.capture_policy,
                 self.retained_program_bytes,
+                self.scalar_owners,
                 self.budget,
             );
             let accept = fragment_builder.push(Inst::Match)?;
@@ -6938,18 +7577,43 @@ impl<'a> Builder<'a> {
             (fragment_builder.finish()?, entry)
         };
         let required_len = required.len();
-        let required_bytes = inst_vec_owned_bytes(&required)?;
-        let entry =
-            self.import_progress_product(&required, required_entry, initial_loop, progressed_loop)?;
+        let required_state_bytes = inst_vec_state_bytes(&required)?;
+        let required_logical_bytes = inst_vec_logical_bytes(&required)?;
+        let required_scalar_bytes = required_logical_bytes
+            .checked_sub(required_state_bytes)
+            .ok_or(Error::InternalInvariant(
+                "required state storage exceeds logical storage",
+            ))?;
+        let entry = self.import_progress_product(
+            &mut required,
+            required_entry,
+            initial_loop,
+            progressed_loop,
+        )?;
+        let required_owned_scalar_bytes = if self.scalar_owners.owners.is_empty() {
+            required_scalar_bytes
+        } else {
+            required_scalar_bytes
+                .checked_sub(inst_vec_shared_scalar_bytes(&required)?)
+                .ok_or(Error::InternalInvariant(
+                    "shared required scalar storage exceeds logical storage",
+                ))?
+        };
         drop(required);
-        self.budget.release_construction_bytes(required_bytes)?;
+        self.budget.release_physical_construction_bytes(add(
+            required_state_bytes,
+            required_owned_scalar_bytes,
+            Resource::ProgramBytes,
+        )?)?;
+        self.budget
+            .release_logical_construction_bytes(required_logical_bytes)?;
         self.budget.release_states(required_len)?;
         Ok(entry)
     }
 
     fn import_progress_product(
         &mut self,
-        fragment: &[Inst],
+        fragment: &mut [Inst],
         fragment_entry: usize,
         zero_continuation: usize,
         consumed_continuation: usize,
@@ -6998,7 +7662,7 @@ impl<'a> Builder<'a> {
                 "pinned progress-map capacity profile differs from exact reserve",
             ));
         }
-        for inst in fragment {
+        for inst in fragment.iter() {
             if matches!(inst, Inst::Match) {
                 zero_map.push(zero_continuation);
                 consumed_map.push(consumed_continuation);
@@ -7008,21 +7672,40 @@ impl<'a> Builder<'a> {
             }
             self.budget.record_items::<usize>(2, false)?;
         }
-        for (pc, inst) in fragment.iter().enumerate() {
+        for (pc, inst) in fragment.iter_mut().enumerate() {
             self.budget.charge(1)?;
             if matches!(inst, Inst::Match) {
                 continue;
             }
+            // Preserve the incumbent first-copy logical/P refusal before a
+            // large owner is moved into the shared draft. Promotion then
+            // prepays exactly this admitted logical copy; the second fill is
+            // preflighted independently below.
             self.preflight_progress_fill(zero_map[pc], inst)?;
-            let zero = translate_progress(inst, &zero_map, &consumed_map, false, self.budget)?;
-            if self.budget.receipt_scope && matches!(&zero, Inst::ConsumeScalar { .. }) {
+            let zero_scalar_logical_preaccounted = self.promote_progress_scalar(inst)?;
+            let zero = translate_progress(
+                inst,
+                &zero_map,
+                &consumed_map,
+                false,
+                zero_scalar_logical_preaccounted,
+                self.budget,
+            )?;
+            if matches!(
+                &zero,
+                Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. }
+            ) {
                 self.fill_unfilled_preaccounted_scalar(zero_map[pc], zero)?;
             } else {
                 self.fill_unfilled(zero_map[pc], zero)?;
             }
             self.preflight_progress_fill(consumed_map[pc], inst)?;
-            let consumed = translate_progress(inst, &zero_map, &consumed_map, true, self.budget)?;
-            if self.budget.receipt_scope && matches!(&consumed, Inst::ConsumeScalar { .. }) {
+            let consumed =
+                translate_progress(inst, &zero_map, &consumed_map, true, false, self.budget)?;
+            if matches!(
+                &consumed,
+                Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. }
+            ) {
                 self.fill_unfilled_preaccounted_scalar(consumed_map[pc], consumed)?;
             } else {
                 self.fill_unfilled(consumed_map[pc], consumed)?;
@@ -7037,6 +7720,57 @@ impl<'a> Builder<'a> {
         self.budget.release_construction_bytes(map_bytes)?;
         Ok(entry)
     }
+
+    fn promote_progress_scalar(&mut self, inst: &mut Inst) -> Result<bool, Error> {
+        if !self.budget.allow_scalar_sharing || !matches!(inst, Inst::ConsumeScalarOwned { .. }) {
+            return Ok(false);
+        }
+        let owned = core::mem::replace(inst, Inst::Unfilled);
+        let Inst::ConsumeScalarOwned {
+            scalars,
+            next_by_width,
+        } = owned
+        else {
+            return Err(Error::InternalInvariant(
+                "progress scalar promotion lost owned instruction",
+            ));
+        };
+        let owner_bytes = scalars.allocated_bytes()?;
+        if owner_bytes < scalar_owner_promotion_minimum_bytes()? {
+            *inst = Inst::ConsumeScalarOwned {
+                scalars,
+                next_by_width,
+            };
+            return Ok(false);
+        }
+        let owner_count = add(self.scalar_owners.owners.len(), 1, Resource::ProgramBytes)?;
+        self.enforce_program_shape_with_owners(
+            self.slots.len(),
+            add(self.scalar_range_bytes, owner_bytes, Resource::ProgramBytes)?,
+            add(
+                add(
+                    self.owned_scalar_range_bytes,
+                    self.scalar_owners.range_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                owner_bytes,
+                Resource::ProgramBytes,
+            )?,
+            owner_count,
+        )?;
+        // Establish the first duplicate's incumbent logical credit before
+        // the owner-draft allocation. The following zero-state translation
+        // consumes this prepayment, so final logical liveness remains exact
+        // while every physical prefix stays below its legacy logical peak.
+        self.budget
+            .acquire_logical_construction_bytes(owner_bytes)?;
+        let scalars = self.scalar_owners.push(scalars, self.budget)?;
+        *inst = Inst::ConsumeScalarShared {
+            scalars,
+            next_by_width,
+        };
+        Ok(true)
+    }
 }
 
 fn translate_progress(
@@ -7044,6 +7778,7 @@ fn translate_progress(
     zero: &[usize],
     consumed: &[usize],
     has_consumed: bool,
+    scalar_logical_preaccounted: bool,
     budget: &mut CompileBudget,
 ) -> Result<Inst, Error> {
     let same = if has_consumed { consumed } else { zero };
@@ -7060,10 +7795,15 @@ fn translate_progress(
             bytes: *bytes,
             next: mapped(consumed, *next)?,
         }),
-        Inst::ConsumeScalar {
+        Inst::ConsumeScalarOwned {
             scalars,
             next_by_width,
         } => {
+            if scalar_logical_preaccounted {
+                return Err(Error::InternalInvariant(
+                    "owned scalar translation received shared logical prepayment",
+                ));
+            }
             let mut translated = [0_usize; 4];
             for (destination, source) in translated.iter_mut().zip(next_by_width) {
                 *destination = mapped(consumed, *source)?;
@@ -7076,12 +7816,31 @@ fn translate_progress(
                 || scalars.try_clone(),
                 ScalarSet::allocated_bytes,
             )?;
-            if budget.receipt_scope {
-                budget.acquire_construction_bytes(scalars.allocated_bytes()?)?;
-            }
-            budget.record_initialization(scalars.allocated_bytes()?, true)?;
-            Ok(Inst::ConsumeScalar {
+            let scalar_bytes = scalars.allocated_bytes()?;
+            budget.acquire_construction_bytes(scalar_bytes)?;
+            budget.record_initialization(scalar_bytes, true)?;
+            Ok(Inst::ConsumeScalarOwned {
                 scalars,
+                next_by_width: translated,
+            })
+        }
+        Inst::ConsumeScalarShared {
+            scalars,
+            next_by_width,
+        } => {
+            let mut translated = [0_usize; 4];
+            for (destination, source) in translated.iter_mut().zip(next_by_width) {
+                *destination = mapped(consumed, *source)?;
+            }
+            let scalar_bytes = scalars.logical_bytes()?;
+            if !scalar_logical_preaccounted {
+                budget.acquire_logical_construction_bytes(scalar_bytes)?;
+            }
+            budget.record_items::<ScalarSetId>(1, true)?;
+            budget.scalar_reference_copies =
+                add(budget.scalar_reference_copies, 1, Resource::ProgramBytes)?;
+            Ok(Inst::ConsumeScalarShared {
+                scalars: *scalars,
                 next_by_width: translated,
             })
         }
@@ -7128,7 +7887,9 @@ struct EpsilonParentIndex {
 
 fn certify_program(
     insts: &[Inst],
-    scalar_range_bytes: usize,
+    scalar_sets: &[ScalarSet],
+    logical_scalar_range_bytes: usize,
+    physical_scalar_range_bytes: usize,
     retained_program_bytes: usize,
     budget: &mut CompileBudget,
 ) -> Result<ProgramCertificate, Error> {
@@ -7136,11 +7897,13 @@ fn certify_program(
     preflight_certification_program_bytes(
         states,
         states,
-        scalar_range_bytes,
+        logical_scalar_range_bytes,
+        physical_scalar_range_bytes,
+        scalar_sets.len(),
         retained_program_bytes,
         budget.limits.max_program_bytes,
     )?;
-    certify_program_admitted(insts, budget)
+    certify_program_admitted(insts, scalar_sets, budget)
 }
 
 #[allow(
@@ -7261,6 +8024,7 @@ fn build_epsilon_parent_index(
 
 fn certify_program_admitted(
     insts: &[Inst],
+    scalar_sets: &[ScalarSet],
     budget: &mut CompileBudget,
 ) -> Result<ProgramCertificate, Error> {
     let states = insts.len();
@@ -7338,7 +8102,7 @@ fn certify_program_admitted(
     let continuation_nonaccepting_run =
         certify_continuation_nonaccepting_run(insts, &order, &mut outgoing, &mut queue, budget)?;
     let mut split_rank = outgoing;
-    let metadata = certify_execution_metadata(&mut split_rank, insts, budget)?;
+    let metadata = certify_execution_metadata(&mut split_rank, insts, scalar_sets, budget)?;
     drop(offsets);
     drop(parents);
     drop(queue);
@@ -7378,7 +8142,12 @@ fn certify_continuation_nonaccepting_run(
     let mut unsupported = false;
     for inst in insts {
         budget.charge(1)?;
-        unsupported |= matches!(inst, Inst::ConsumeScalar { .. } | Inst::Assert { .. });
+        unsupported |= matches!(
+            inst,
+            Inst::ConsumeScalarOwned { .. }
+                | Inst::ConsumeScalarShared { .. }
+                | Inst::Assert { .. }
+        );
     }
     if unsupported {
         // Avoid publishing a finite run proof for scalar and assertion
@@ -7421,7 +8190,9 @@ fn certify_continuation_nonaccepting_run(
                 ));
             }
             Inst::Fail | Inst::Consume { .. } => false,
-            Inst::ConsumeScalar { .. } | Inst::Assert { .. } => unreachable!(),
+            Inst::ConsumeScalarOwned { .. }
+            | Inst::ConsumeScalarShared { .. }
+            | Inst::Assert { .. } => unreachable!(),
         };
         *scratch.get_mut(pc).ok_or(Error::InternalInvariant(
             "rewind proof scratch outside program",
@@ -7473,7 +8244,9 @@ fn certify_continuation_nonaccepting_run(
                     ));
                 }
                 Inst::Fail | Inst::Match => [None, None],
-                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => unreachable!(),
+                Inst::ConsumeScalarOwned { .. }
+                | Inst::ConsumeScalarShared { .. }
+                | Inst::Assert { .. } => unreachable!(),
             };
             let mut pending = None;
             let mut distance = 0_usize;
@@ -7506,10 +8279,51 @@ fn certify_continuation_nonaccepting_run(
     Ok(Some(maximum))
 }
 
+const fn retained_scalar_owner_table_bytes(scalar_owner_count: usize) -> usize {
+    if scalar_owner_count == 0 {
+        0
+    } else {
+        core::mem::size_of::<ScalarSetTable>()
+    }
+}
+
+/// Minimum range-buffer bytes for object-neutral progress promotion.
+///
+/// One progress source is published at least twice. Final storage replaces
+/// two owned range buffers (`2R`) with one range owner plus its exact index
+/// and first boxed table (`R + I + T`), requiring `R >= I + T`. Later owner
+/// finalization can hold the range owner with both the draft and exact index
+/// (`R + D + I`) after the incumbent path would retain `2R`, requiring
+/// `R >= D + I`. The larger checked threshold proves both final P and every
+/// physical construction peak are non-increasing before promotion is allowed.
+/// Requiring every promoted owner to meet the first-owner threshold also
+/// dominates aggregate geometric draft growth: the first owner is checked
+/// above, and from two owners onward the pinned capacity is no more than twice
+/// the owner count, so `D + I <= 72N <= 120N <= sum(R)`.
+fn scalar_owner_promotion_minimum_bytes() -> Result<usize, Error> {
+    let index_bytes = core::mem::size_of::<ScalarSet>();
+    let table_bytes = core::mem::size_of::<ScalarSetTable>();
+    let first_capacity = CompiledRegex::pinned_scalar_owner_capacity_after_push(0, 1).ok_or(
+        Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        },
+    )?;
+    let draft_bytes = mul(
+        first_capacity,
+        core::mem::size_of::<ScalarSet>(),
+        Resource::ProgramBytes,
+    )?;
+    let final_threshold = add(index_bytes, table_bytes, Resource::ProgramBytes)?;
+    let peak_threshold = add(draft_bytes, index_bytes, Resource::ProgramBytes)?;
+    Ok(final_threshold.max(peak_threshold))
+}
+
 fn preflight_certification_program_bytes(
     retained_state_count: usize,
     states: usize,
-    scalar_range_bytes: usize,
+    logical_scalar_range_bytes: usize,
+    physical_scalar_range_bytes: usize,
+    scalar_owner_count: usize,
     retained_program_bytes: usize,
     limit: usize,
 ) -> Result<usize, Error> {
@@ -7524,8 +8338,12 @@ fn preflight_certification_program_bytes(
         core::mem::size_of::<usize>(),
         Resource::ProgramBytes,
     )?;
-    let required = add(
-        add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
+    let logical_required = add(
+        add(
+            state_bytes,
+            logical_scalar_range_bytes,
+            Resource::ProgramBytes,
+        )?,
         add(
             certificate_bytes,
             retained_program_bytes,
@@ -7533,8 +8351,36 @@ fn preflight_certification_program_bytes(
         )?,
         Resource::ProgramBytes,
     )?;
-    enforce(required, limit, Resource::ProgramBytes)?;
-    Ok(required)
+    enforce(logical_required, limit, Resource::ProgramBytes)?;
+    let owner_index_bytes = mul(
+        scalar_owner_count,
+        core::mem::size_of::<ScalarSet>(),
+        Resource::ProgramBytes,
+    )?;
+    let owner_table_bytes = retained_scalar_owner_table_bytes(scalar_owner_count);
+    let physical_required = add(
+        add(
+            add(
+                add(
+                    state_bytes,
+                    physical_scalar_range_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                owner_index_bytes,
+                Resource::ProgramBytes,
+            )?,
+            owner_table_bytes,
+            Resource::ProgramBytes,
+        )?,
+        add(
+            certificate_bytes,
+            retained_program_bytes,
+            Resource::ProgramBytes,
+        )?,
+        Resource::ProgramBytes,
+    )?;
+    enforce(physical_required, limit, Resource::ProgramBytes)?;
+    Ok(logical_required.max(physical_required))
 }
 
 struct ExecutionMetadata {
@@ -7550,6 +8396,7 @@ struct ExecutionMetadata {
 fn certify_execution_metadata(
     split_rank: &mut [usize],
     insts: &[Inst],
+    scalar_sets: &[ScalarSet],
     budget: &mut CompileBudget,
 ) -> Result<ExecutionMetadata, Error> {
     let mut metadata = ExecutionMetadata {
@@ -7575,6 +8422,7 @@ fn certify_execution_metadata(
         metadata.has_assertion |= matches!(inst, Inst::Assert { .. });
         let transitions = execution_transitions(
             inst,
+            scalar_sets,
             &mut metadata.has_scalar_transition,
             &mut metadata.max_scalar_search_checks,
         )?;
@@ -7597,12 +8445,13 @@ const fn predecessor_edge_count(inst: &Inst) -> usize {
         Inst::Unfilled | Inst::Fail | Inst::Match => 0,
         Inst::Consume { .. } | Inst::Assert { .. } => 1,
         Inst::Split { .. } | Inst::RootSplit { .. } => 2,
-        Inst::ConsumeScalar { .. } => 4,
+        Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => 4,
     }
 }
 
 fn execution_transitions(
     inst: &Inst,
+    scalar_sets: &[ScalarSet],
     has_scalar_transition: &mut bool,
     max_scalar_search_checks: &mut usize,
 ) -> Result<usize, Error> {
@@ -7610,9 +8459,14 @@ fn execution_transitions(
         Inst::Unfilled => Err(Error::InternalInvariant("unfilled execution state")),
         Inst::Fail | Inst::Match => Ok(0),
         Inst::Consume { .. } | Inst::Assert { .. } => Ok(1),
-        Inst::ConsumeScalar { scalars, .. } => {
+        Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
             *has_scalar_transition = true;
-            let checks = scalars.max_search_checks();
+            let checks = inst
+                .resolve_scalar_set(scalar_sets)?
+                .ok_or(Error::InternalInvariant(
+                    "scalar execution state has no scalar set",
+                ))?
+                .max_search_checks();
             *max_scalar_search_checks = (*max_scalar_search_checks).max(checks);
             add(1, checks, Resource::ExecutionWork)
         }
@@ -7635,12 +8489,13 @@ fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
         | Inst::Fail
         | Inst::Match
         | Inst::Consume { .. }
-        | Inst::ConsumeScalar { .. } => [None, None],
+        | Inst::ConsumeScalarOwned { .. }
+        | Inst::ConsumeScalarShared { .. } => [None, None],
     };
     targets.into_iter().flatten()
 }
 
-fn program_bytes(
+fn logical_program_bytes(
     insts: &[Inst],
     retained_inst_count: usize,
     retained_order_count: usize,
@@ -7652,11 +8507,7 @@ fn program_bytes(
         Resource::ProgramBytes,
     )?;
     let scalar_bytes = insts.iter().try_fold(0_usize, |total, inst| {
-        let bytes = match inst {
-            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
-            _ => 0,
-        };
-        add(total, bytes, Resource::ProgramBytes)
+        add(total, inst.scalar_logical_bytes()?, Resource::ProgramBytes)
     })?;
     let insts = add(state_bytes, scalar_bytes, Resource::ProgramBytes)?;
     let order = mul(
@@ -7676,19 +8527,97 @@ fn program_bytes(
     )
 }
 
-fn inst_vec_owned_bytes(insts: &[Inst]) -> Result<usize, Error> {
+fn physical_program_bytes(
+    retained_inst_count: usize,
+    retained_order_count: usize,
+    retained_rank_count: usize,
+    scalar_owner_range_bytes: usize,
+    scalar_owner_count: usize,
+) -> Result<usize, Error> {
+    let state_bytes = mul(
+        retained_inst_count,
+        core::mem::size_of::<Inst>(),
+        Resource::ProgramBytes,
+    )?;
+    let order_bytes = mul(
+        retained_order_count,
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
+    let rank_bytes = mul(
+        retained_rank_count,
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
+    let owner_index_bytes = mul(
+        scalar_owner_count,
+        core::mem::size_of::<ScalarSet>(),
+        Resource::ProgramBytes,
+    )?;
+    let owner_table_bytes = retained_scalar_owner_table_bytes(scalar_owner_count);
+    add(
+        add(
+            add(state_bytes, order_bytes, Resource::ProgramBytes)?,
+            rank_bytes,
+            Resource::ProgramBytes,
+        )?,
+        add(
+            add(
+                scalar_owner_range_bytes,
+                owner_index_bytes,
+                Resource::ProgramBytes,
+            )?,
+            owner_table_bytes,
+            Resource::ProgramBytes,
+        )?,
+        Resource::ProgramBytes,
+    )
+}
+
+fn inst_vec_state_bytes(insts: &[Inst]) -> Result<usize, Error> {
+    mul(
+        insts.len(),
+        core::mem::size_of::<Inst>(),
+        Resource::ProgramBytes,
+    )
+}
+
+fn inst_vec_logical_bytes(insts: &[Inst]) -> Result<usize, Error> {
     let state_bytes = mul(
         insts.len(),
         core::mem::size_of::<Inst>(),
         Resource::ProgramBytes,
     )?;
     insts.iter().try_fold(state_bytes, |total, inst| {
-        let scalar_bytes = match inst {
-            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+        add(total, inst.scalar_logical_bytes()?, Resource::ProgramBytes)
+    })
+}
+
+fn inst_vec_shared_scalar_bytes(insts: &[Inst]) -> Result<usize, Error> {
+    #[cfg(test)]
+    SHARED_SCALAR_SCAN_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    insts.iter().try_fold(0_usize, |total, inst| {
+        let shared_bytes = match inst {
+            Inst::ConsumeScalarShared { scalars, .. } => scalars.logical_bytes()?,
             _ => 0,
         };
-        add(total, scalar_bytes, Resource::ProgramBytes)
+        add(total, shared_bytes, Resource::ProgramBytes)
     })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SHARED_SCALAR_SCAN_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_shared_scalar_scan_calls() {
+    SHARED_SCALAR_SCAN_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn shared_scalar_scan_calls() -> usize {
+    SHARED_SCALAR_SCAN_CALLS.with(core::cell::Cell::get)
 }
 
 fn finalize_program(
@@ -7762,10 +8691,19 @@ fn finalize_program(
         if matches!(inst, Inst::Match) {
             accepting_state = Some(pc);
         }
-        if let Inst::ConsumeScalar { scalars, .. } = inst {
-            budget.charge(scalars.len())?;
+        if matches!(
+            inst,
+            Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. }
+        ) {
+            budget.charge(
+                inst.resolve_scalar_set(program.scalar_sets())?
+                    .ok_or(Error::InternalInvariant(
+                        "scalar identity state has no scalar set",
+                    ))?
+                    .len(),
+            )?;
         }
-        hash_inst_pair(&mut first, &mut second, inst);
+        hash_inst_pair(&mut first, &mut second, inst, program.scalar_sets())?;
     }
     program.has_unicode_word_boundary = has_unicode_word_boundary;
     program.root_assertion = match (entry_assertion, accepting_state) {
@@ -8253,7 +9191,12 @@ fn bind_state_byte_span_sum_identity(
     Ok(PlanId(bytes))
 }
 
-fn hash_inst_pair(first: &mut StableHash, second: &mut StableHash, inst: &Inst) {
+fn hash_inst_pair(
+    first: &mut StableHash,
+    second: &mut StableHash,
+    inst: &Inst,
+    scalar_sets: &[ScalarSet],
+) -> Result<(), Error> {
     match inst {
         Inst::Unfilled => hash_pair_byte(first, second, 0),
         Inst::Fail => hash_pair_byte(first, second, 1),
@@ -8265,10 +9208,13 @@ fn hash_inst_pair(first: &mut StableHash, second: &mut StableHash, inst: &Inst) 
             }
             hash_pair_usize(first, second, *next);
         }
-        Inst::ConsumeScalar {
-            scalars,
-            next_by_width,
-        } => {
+        Inst::ConsumeScalarOwned { next_by_width, .. }
+        | Inst::ConsumeScalarShared { next_by_width, .. } => {
+            let scalars = inst
+                .resolve_scalar_set(scalar_sets)?
+                .ok_or(Error::InternalInvariant(
+                    "scalar identity state has no scalar set",
+                ))?;
             hash_pair_byte(first, second, 6);
             hash_pair_usize(first, second, scalars.len());
             for (start, end) in scalars.ranges() {
@@ -8301,6 +9247,7 @@ fn hash_inst_pair(first: &mut StableHash, second: &mut StableHash, inst: &Inst) 
             hash_pair_usize(first, second, *fallback);
         }
     }
+    Ok(())
 }
 
 #[inline]
@@ -8618,6 +9565,129 @@ mod tests {
     use regex_syntax::{ParserBuilder, hir::Look};
 
     use super::*;
+
+    #[allow(dead_code)]
+    struct LegacyCompiledRegexLayout {
+        program: Program,
+        candidate: Option<candidate::Plan>,
+        url_aggregate: Option<fre_kernels::UrlAggregatePlan>,
+        state_byte_span_sum: Option<StateByteSpanSumPlan>,
+        ordered_bounded_span_sum: Option<OrderedBoundedSpanSumPlan>,
+        required_suffixes: RequiredSuffixes,
+        required_literals: RequiredLiteralSets,
+        required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
+        terminal_frontier: TerminalFrontierSeed,
+        minimum_match_bytes: Option<usize>,
+        plan_id: PlanId,
+        accounting: CompileAccounting,
+    }
+
+    #[test]
+    fn scalar_sharing_preserves_compiled_regex_outer_layout() {
+        assert_eq!(
+            core::mem::size_of::<CompiledRegex>(),
+            core::mem::size_of::<LegacyCompiledRegexLayout>()
+        );
+        assert_eq!(
+            core::mem::align_of::<CompiledRegex>(),
+            core::mem::align_of::<LegacyCompiledRegexLayout>()
+        );
+    }
+
+    #[test]
+    fn compile_only_scalar_policy_is_byte_only_effect_and_refusal_neutral() {
+        // Exercise the unbounded fragment path as well as final publication.
+        let hir = parse_bytes("a+");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        reset_shared_scalar_scan_calls();
+        let ordinary =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir,
+                profile,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(shared_scalar_scan_calls(), 0);
+        reset_shared_scalar_scan_calls();
+        let opted =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                profile,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(shared_scalar_scan_calls(), 0);
+        assert!(ordinary.compiled().program.scalar_sets().is_empty());
+        assert!(opted.compiled().program.scalar_sets().is_empty());
+        assert_eq!(opted.compiled().plan_id(), ordinary.compiled().plan_id());
+        assert_eq!(
+            opted.compiled().compile_accounting(),
+            ordinary.compiled().compile_accounting()
+        );
+        assert_eq!(opted.actual(), ordinary.actual());
+        let accounting = ordinary.compiled().compile_accounting();
+        assert_eq!(
+            accounting.continuation_nonaccepting_run_proof_bytes,
+            core::mem::size_of::<Option<usize>>()
+        );
+        assert_eq!(
+            ordinary.compiled().physical_program_bytes().unwrap(),
+            accounting.program_bytes
+        );
+        assert_eq!(
+            ordinary.actual().live_program_bytes,
+            accounting.program_bytes
+        );
+        assert_eq!(
+            ordinary.actual().construction_peak_bytes,
+            accounting.construction_peak_bytes
+        );
+
+        let one_below = accounting
+            .program_bytes
+            .max(accounting.construction_peak_bytes)
+            - 1;
+        let limits = CompileLimits {
+            max_program_bytes: one_below,
+            ..CompileLimits::default()
+        };
+        let ordinary_refusal =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir, profile, limits,
+            )
+            .unwrap_err();
+        let opted_refusal =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir, profile, limits,
+            )
+            .unwrap_err();
+        assert_eq!(opted_refusal.source(), ordinary_refusal.source());
+        assert_eq!(
+            opted_refusal.receipt().accounting,
+            ordinary_refusal.receipt().accounting
+        );
+        assert_eq!(
+            opted_refusal.receipt().actual,
+            ordinary_refusal.receipt().actual
+        );
+        assert_ne!(
+            opted_refusal.receipt().identity.kind,
+            ordinary_refusal.receipt().identity.kind
+        );
+        assert_eq!(
+            opted_refusal.receipt().identity.kind,
+            CompileAttemptKind::EraseCapturesForWholeMatchSharedScalarOwnersV1
+        );
+        assert_eq!(
+            ordinary_refusal.receipt().identity.kind,
+            CompileAttemptKind::EraseCapturesForWholeMatch
+        );
+        assert!(opted_refusal.closes());
+        assert!(ordinary_refusal.closes());
+        let mut transplanted = *opted_refusal.receipt();
+        transplanted.identity = ordinary_refusal.receipt().identity;
+        assert!(!transplanted.authenticates_canonical());
+    }
 
     const ADVERSARIAL_ANALYSIS_WORK: usize = 2_368;
     const ADVERSARIAL_ANALYSIS_ONE_BELOW: usize = 2_367;
@@ -9947,12 +11017,14 @@ mod tests {
             max_work: EXACT_WORK,
             ..CompileLimits::default()
         });
+        let mut exact_scalar_owners = ScalarOwnerDraft::default();
         {
             let mut builder = Builder::new(
                 CompileLimits::default().max_program_states,
                 RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
                 CapturePolicy::Reject,
                 0,
+                &mut exact_scalar_owners,
                 &mut exact,
             );
             builder.compile_unicode_class(class, 0).unwrap();
@@ -9964,11 +11036,13 @@ mod tests {
             max_work: EXACT_WORK - 1,
             ..CompileLimits::default()
         });
+        let mut one_below_scalar_owners = ScalarOwnerDraft::default();
         let error = Builder::new(
             CompileLimits::default().max_program_states,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CapturePolicy::Reject,
             0,
+            &mut one_below_scalar_owners,
             &mut one_below,
         )
         .compile_unicode_class(class, 0)
@@ -9993,16 +11067,474 @@ mod tests {
             max_work: 2,
             ..CompileLimits::default()
         });
+        let mut ascii_scalar_owners = ScalarOwnerDraft::default();
         Builder::new(
             CompileLimits::default().max_program_states,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CapturePolicy::Reject,
             0,
+            &mut ascii_scalar_owners,
             &mut ascii_budget,
         )
         .compile_unicode_class(ascii, 0)
         .unwrap();
         assert_eq!(ascii_budget.accounting.work, 2);
+    }
+
+    #[test]
+    fn scalar_progress_promotion_refuses_barely_uneconomic_owner_without_effects() {
+        const RANGES: usize = 14;
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(
+                r"[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}]+",
+            )
+            .unwrap();
+        assert_eq!(ScalarSet::required_bytes(RANGES).unwrap(), 112);
+        assert_eq!(scalar_owner_promotion_minimum_bytes().unwrap(), 120);
+        reset_shared_scalar_scan_calls();
+        let ordinary =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(shared_scalar_scan_calls(), 0);
+        reset_shared_scalar_scan_calls();
+        let opted =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(shared_scalar_scan_calls(), 0);
+        assert!(opted.compiled().program.scalar_sets().is_empty());
+        assert!(
+            opted
+                .compiled()
+                .program
+                .insts
+                .iter()
+                .all(|inst| { !matches!(inst, Inst::ConsumeScalarShared { .. }) })
+        );
+        assert_eq!(opted.compiled().plan_id(), ordinary.compiled().plan_id());
+        assert_eq!(
+            opted.compiled().compile_accounting(),
+            ordinary.compiled().compile_accounting()
+        );
+        assert_eq!(opted.actual(), ordinary.actual());
+
+        let accounting = ordinary.compiled().compile_accounting();
+        let one_below = accounting
+            .program_bytes
+            .max(accounting.construction_peak_bytes)
+            - 1;
+        let limits = CompileLimits {
+            max_program_bytes: one_below,
+            ..CompileLimits::default()
+        };
+        let ordinary_refusal =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                limits,
+            )
+            .unwrap_err();
+        let opted_refusal =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                limits,
+            )
+            .unwrap_err();
+        assert_eq!(opted_refusal.source(), ordinary_refusal.source());
+        assert_eq!(
+            opted_refusal.receipt().accounting,
+            ordinary_refusal.receipt().accounting
+        );
+        assert_eq!(
+            opted_refusal.receipt().actual,
+            ordinary_refusal.receipt().actual
+        );
+        assert_ne!(
+            opted_refusal.receipt().identity.kind,
+            ordinary_refusal.receipt().identity.kind
+        );
+        assert_eq!(
+            opted_refusal.receipt().identity.kind,
+            CompileAttemptKind::EraseCapturesForWholeMatchSharedScalarOwnersV1
+        );
+        assert_eq!(
+            ordinary_refusal.receipt().identity.kind,
+            CompileAttemptKind::EraseCapturesForWholeMatch
+        );
+        assert!(opted_refusal.closes());
+        assert!(ordinary_refusal.closes());
+    }
+
+    #[test]
+    fn shared_scalar_owner_publication_refusals_have_exact_physical_phases() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(
+                r"[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]",
+            )
+            .unwrap();
+        let HirKind::Class(Class::Unicode(class)) = hir.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+        let range_bytes = ScalarSet::required_bytes(class.ranges().len()).unwrap();
+        let draft_bytes = CompiledRegex::pinned_scalar_owner_capacity_after_push(0, 1).unwrap()
+            * core::mem::size_of::<ScalarSet>();
+        let index_bytes = core::mem::size_of::<ScalarSet>();
+        let table_bytes = core::mem::size_of::<ScalarSetTable>();
+        assert_eq!(
+            (range_bytes, draft_bytes, index_bytes, table_bytes),
+            (120, 96, 24, 80)
+        );
+
+        for (ordinal, expected_live, expected_allocated, expected_peak) in [
+            (0, range_bytes, 0, range_bytes),
+            (
+                1,
+                range_bytes + draft_bytes,
+                draft_bytes,
+                range_bytes + draft_bytes,
+            ),
+            (
+                2,
+                range_bytes + index_bytes,
+                draft_bytes + index_bytes,
+                range_bytes + draft_bytes + index_bytes,
+            ),
+        ] {
+            let mut budget = CompileBudget::new_construction_receipt(
+                CompileLimits::default(),
+                Some(AllocationScope {
+                    limit: 3,
+                    prospective: 3,
+                }),
+            );
+            budget.acquire_construction_bytes(range_bytes).unwrap();
+            budget
+                .acquire_logical_construction_bytes(range_bytes)
+                .unwrap();
+            let owner = ScalarSet::from_unicode_class(class).unwrap();
+            let mut draft = ScalarOwnerDraft::default();
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let result = draft
+                .push(owner, &mut budget)
+                .and_then(|_| draft.finish(2 * range_bytes, 2, &mut budget));
+            drop(fault);
+            assert!(matches!(result, Err(Error::AllocationFailed { .. })));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.actual_allocated_bytes, expected_allocated);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.physical_construction_peak_bytes, expected_peak);
+            assert_eq!(budget.accounting.construction_peak_bytes, 2 * range_bytes);
+        }
+
+        let mut budget = CompileBudget::new_construction_receipt(
+            CompileLimits::default(),
+            Some(AllocationScope {
+                limit: 3,
+                prospective: 3,
+            }),
+        );
+        budget.acquire_construction_bytes(range_bytes).unwrap();
+        budget
+            .acquire_logical_construction_bytes(range_bytes)
+            .unwrap();
+        let mut draft = ScalarOwnerDraft::default();
+        draft
+            .push(ScalarSet::from_unicode_class(class).unwrap(), &mut budget)
+            .unwrap();
+        let table = draft
+            .finish(2 * range_bytes, 2, &mut budget)
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.actual_allocations, 3);
+        assert_eq!(
+            budget.actual_allocated_bytes,
+            draft_bytes + index_bytes + table_bytes
+        );
+        assert_eq!(
+            budget.current_construction_bytes,
+            range_bytes + index_bytes + table_bytes
+        );
+        assert_eq!(
+            budget.physical_construction_peak_bytes,
+            range_bytes + draft_bytes + index_bytes
+        );
+        assert_eq!(budget.accounting.construction_peak_bytes, 2 * range_bytes);
+        assert_eq!(
+            table.diagnostics.owner_peak_bytes,
+            range_bytes + draft_bytes + index_bytes
+        );
+    }
+
+    #[test]
+    fn repeated_scalar_progress_states_share_exact_physical_owners() {
+        const RANGES_PER_OWNER: usize = 15;
+        const OWNERS: usize = 4;
+        const SCALAR_STATES: usize = 30;
+        const REFERENCE_COPIES: usize = 36;
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(
+                r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*",
+            )
+            .unwrap();
+        reset_shared_scalar_scan_calls();
+        let ordinary =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(shared_scalar_scan_calls(), 0);
+        assert!(ordinary.compiled().program.scalar_sets().is_empty());
+        assert!(
+            ordinary
+                .compiled()
+                .program
+                .insts
+                .iter()
+                .all(|inst| { !matches!(inst, Inst::ConsumeScalarShared { .. }) })
+        );
+        assert_eq!(
+            ordinary.actual().live_program_bytes,
+            ordinary.compiled().compile_accounting().program_bytes
+        );
+        assert_eq!(
+            ordinary.actual().construction_peak_bytes,
+            ordinary
+                .compiled()
+                .compile_accounting()
+                .construction_peak_bytes
+        );
+        reset_shared_scalar_scan_calls();
+        let mut attempt =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert!(shared_scalar_scan_calls() > 0);
+        let compiled = attempt.compiled();
+        let accounting = compiled.compile_accounting();
+        let scalar_states = compiled
+            .program
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. }
+                )
+            })
+            .count();
+        let one_owner_bytes = ScalarSet::required_bytes(RANGES_PER_OWNER).unwrap();
+        let owner_range_bytes = OWNERS * one_owner_bytes;
+        let owner_index_bytes = OWNERS * core::mem::size_of::<ScalarSet>();
+        let owner_table_bytes = core::mem::size_of::<ScalarSetTable>();
+        let owner_capacity = CompiledRegex::pinned_scalar_owner_capacity_after_push(0, 1).unwrap();
+        let owner_draft_bytes = owner_capacity * core::mem::size_of::<ScalarSet>();
+        let draft_copy_peak = owner_range_bytes + owner_draft_bytes + owner_index_bytes;
+        let boxed_table_peak = owner_range_bytes + owner_index_bytes + owner_table_bytes;
+
+        assert_eq!(core::mem::size_of::<Inst>(), 56);
+        assert_eq!(core::mem::size_of::<ScalarSetId>(), 16);
+        assert_eq!(core::mem::size_of::<ScalarSetTable>(), 80);
+        assert_eq!(scalar_owner_promotion_minimum_bytes().unwrap(), 120);
+        assert_eq!(
+            one_owner_bytes,
+            scalar_owner_promotion_minimum_bytes().unwrap()
+        );
+        assert_eq!(compiled.program.scalar_sets().len(), OWNERS);
+        assert_eq!(scalar_states, SCALAR_STATES);
+        let diagnostics = compiled.program.scalar_set_diagnostics().unwrap();
+        assert_eq!(diagnostics.representation, ScalarSetId::REPRESENTATION_V1);
+        assert_eq!(diagnostics.owner_index_allocations, 2);
+        assert_eq!(diagnostics.owner_range_bytes, owner_range_bytes);
+        assert_eq!(diagnostics.owner_index_bytes, owner_index_bytes);
+        assert_eq!(
+            diagnostics.owner_peak_bytes,
+            draft_copy_peak.max(boxed_table_peak)
+        );
+        assert!(draft_copy_peak > boxed_table_peak);
+        assert_eq!(
+            diagnostics.logical_reference_bytes,
+            SCALAR_STATES * one_owner_bytes
+        );
+        assert_eq!(diagnostics.reference_copies, REFERENCE_COPIES);
+        assert_eq!(
+            accounting.program_bytes - diagnostics.logical_reference_bytes,
+            attempt.actual().live_program_bytes
+                - owner_range_bytes
+                - owner_index_bytes
+                - owner_table_bytes
+        );
+        assert!(attempt.actual().live_program_bytes < accounting.program_bytes);
+        assert!(attempt.actual().construction_peak_bytes >= diagnostics.owner_peak_bytes);
+        assert_eq!(
+            attempt.actual().live_construction_bytes,
+            attempt.actual().live_program_bytes
+        );
+        assert!(attempt.actual().allocated_bytes >= attempt.actual().live_program_bytes);
+        assert!(
+            attempt.actual().copied_bytes >= REFERENCE_COPIES * core::mem::size_of::<ScalarSetId>()
+        );
+        assert!(attempt.actual().is_closed());
+        assert_eq!(compiled.plan_id(), ordinary.compiled().plan_id());
+        assert_eq!(accounting, ordinary.compiled().compile_accounting());
+        assert_eq!(
+            ordinary.compiled().physical_program_bytes().unwrap(),
+            accounting.program_bytes
+        );
+        assert_eq!(
+            compiled.physical_program_bytes().unwrap(),
+            attempt.actual().live_program_bytes
+        );
+        let added_shared_allocations = diagnostics.owner_index_allocations + 1;
+        assert_eq!(
+            ordinary.actual().allocations,
+            attempt.actual().allocations + REFERENCE_COPIES - added_shared_allocations
+        );
+        let added_shared_bytes = owner_draft_bytes + owner_index_bytes + owner_table_bytes;
+        assert_eq!(
+            ordinary.actual().allocated_bytes,
+            attempt.actual().allocated_bytes + REFERENCE_COPIES * one_owner_bytes
+                - added_shared_bytes
+        );
+        let added_shared_copy_bytes =
+            REFERENCE_COPIES * core::mem::size_of::<ScalarSetId>() + owner_table_bytes;
+        assert_eq!(
+            ordinary.actual().copied_bytes,
+            attempt.actual().copied_bytes + REFERENCE_COPIES * one_owner_bytes
+                - added_shared_copy_bytes
+        );
+
+        let replay_ceiling = accounting
+            .program_bytes
+            .max(accounting.construction_peak_bytes);
+        assert!(attempt.actual().live_program_bytes <= accounting.program_bytes);
+        assert!(attempt.actual().construction_peak_bytes <= accounting.construction_peak_bytes);
+        let exact_replay =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits {
+                    max_program_bytes: replay_ceiling,
+                    ..CompileLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(exact_replay.compiled().plan_id(), compiled.plan_id());
+        assert_eq!(exact_replay.compiled().compile_accounting(), accounting);
+
+        let one_below =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits {
+                    max_program_bytes: replay_ceiling - 1,
+                    ..CompileLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: replay_ceiling,
+                limit: replay_ceiling - 1,
+            }
+        );
+        assert!(one_below.receipt.contains_actual());
+        assert!(!one_below.receipt.actual.published);
+
+        let compiled = &mut attempt.compiled;
+        compiled
+            .program
+            .scalar_sets
+            .as_mut()
+            .expect("shared program retains an owner table")
+            .diagnostics
+            .representation = ScalarSetId::REPRESENTATION_V1 + 1;
+        let shared = compiled
+            .program
+            .insts
+            .iter()
+            .find(|inst| matches!(inst, Inst::ConsumeScalarShared { .. }))
+            .expect("shared program retains a shared scalar instruction");
+        assert!(matches!(
+            compiled.program.scalar_set_for_inst(shared),
+            Err(Error::InternalInvariant(
+                "Unicode scalar owner representation differs from program"
+            ))
+        ));
+        assert!(matches!(
+            compiled.physical_program_bytes(),
+            Err(Error::InternalInvariant(
+                "Unicode scalar owner representation differs from program"
+            ))
+        ));
+    }
+
+    #[test]
+    fn scalar_owner_indices_are_not_program_identity_input() {
+        let target = four_range_unicode_class();
+        let HirKind::Class(Class::Unicode(target)) = target.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+        let dummy = ascii_unicode_class();
+        let HirKind::Class(Class::Unicode(dummy)) = dummy.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+        let owners_at_zero = vec![ScalarSet::from_unicode_class(target).unwrap()];
+        let owners_at_one = vec![
+            ScalarSet::from_unicode_class(dummy).unwrap(),
+            ScalarSet::from_unicode_class(target).unwrap(),
+        ];
+        let at_zero = Inst::ConsumeScalarShared {
+            scalars: ScalarSetId::new(0, target.ranges().len()).unwrap(),
+            next_by_width: [1, 2, 3, 4],
+        };
+        let at_one = Inst::ConsumeScalarShared {
+            scalars: ScalarSetId::new(1, target.ranges().len()).unwrap(),
+            next_by_width: [1, 2, 3, 4],
+        };
+        let mut zero_first = StableHash::new(0x1234);
+        let mut zero_second = StableHash::new(0x5678);
+        hash_inst_pair(&mut zero_first, &mut zero_second, &at_zero, &owners_at_zero).unwrap();
+        let mut one_first = StableHash::new(0x1234);
+        let mut one_second = StableHash::new(0x5678);
+        hash_inst_pair(&mut one_first, &mut one_second, &at_one, &owners_at_one).unwrap();
+        let zero_first = zero_first.finish();
+        let zero_second = zero_second.finish();
+        assert_eq!(zero_first, one_first.finish());
+        assert_eq!(zero_second, one_second.finish());
+
+        let owned = Inst::ConsumeScalarOwned {
+            scalars: ScalarSet::from_unicode_class(target).unwrap(),
+            next_by_width: [1, 2, 3, 4],
+        };
+        let mut owned_first = StableHash::new(0x1234);
+        let mut owned_second = StableHash::new(0x5678);
+        hash_inst_pair(&mut owned_first, &mut owned_second, &owned, &[]).unwrap();
+        assert_eq!(zero_first, owned_first.finish());
+        assert_eq!(zero_second, owned_second.finish());
     }
 
     #[test]
@@ -10039,15 +11571,17 @@ mod tests {
             let mut budget = CompileBudget::new_receipt(
                 limits,
                 Some(AllocationScope {
-                    limit: 2,
-                    prospective: 2,
+                    limit: 1,
+                    prospective: 1,
                 }),
             );
+            let mut scalar_owners = ScalarOwnerDraft::default();
             let error = Builder::new(
                 limits.max_program_states,
                 RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
                 CapturePolicy::Reject,
                 0,
+                &mut scalar_owners,
                 &mut budget,
             )
             .compile_unicode_class(class, 0)
@@ -10055,6 +11589,7 @@ mod tests {
             assert_eq!(error, expected);
             assert_eq!(budget.actual_allocations, 1);
             assert_eq!(budget.current_construction_bytes, scalar_bytes);
+            assert_eq!(budget.physical_construction_peak_bytes, scalar_bytes);
             assert_eq!(budget.accounting.construction_peak_bytes, scalar_bytes);
         }
 
@@ -10067,12 +11602,14 @@ mod tests {
                     prospective: 2,
                 }),
             );
+            let mut scalar_owners = ScalarOwnerDraft::default();
             let fault = compiler_allocation_probe::fail_at(ordinal);
             let error = Builder::new(
                 limits.max_program_states,
                 RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
                 CapturePolicy::Reject,
                 0,
+                &mut scalar_owners,
                 &mut budget,
             )
             .compile_unicode_class(class, 0)
@@ -10095,11 +11632,13 @@ mod tests {
                 prospective: 2,
             }),
         );
+        let mut scalar_owners = ScalarOwnerDraft::default();
         let mut builder = Builder::new(
             limits.max_program_states,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
             0,
+            &mut scalar_owners,
             &mut budget,
         );
         builder.push(Inst::Match).unwrap();
@@ -10144,11 +11683,13 @@ mod tests {
             ..CompileLimits::default()
         };
         let mut exact_budget = CompileBudget::new_receipt(exact_limits, None);
+        let mut exact_scalar_owners = ScalarOwnerDraft::default();
         let mut exact_builder = Builder::new(
             exact_limits.max_program_states,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
             0,
+            &mut exact_scalar_owners,
             &mut exact_budget,
         );
         exact_builder.push(Inst::Match).unwrap();
@@ -10161,11 +11702,13 @@ mod tests {
             ..CompileLimits::default()
         };
         let mut one_below_budget = CompileBudget::new_receipt(one_below_limits, None);
+        let mut one_below_scalar_owners = ScalarOwnerDraft::default();
         let mut one_below_builder = Builder::new(
             one_below_limits.max_program_states,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
             0,
+            &mut one_below_scalar_owners,
             &mut one_below_budget,
         );
         one_below_builder.push(Inst::Match).unwrap();
@@ -10180,11 +11723,13 @@ mod tests {
         assert_eq!(one_below_budget.accounting.work, 1);
 
         let mut invalid_budget = CompileBudget::new_receipt(exact_limits, None);
+        let mut invalid_scalar_owners = ScalarOwnerDraft::default();
         let mut invalid_builder = Builder::new(
             exact_limits.max_program_states,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
             0,
+            &mut invalid_scalar_owners,
             &mut invalid_budget,
         );
         invalid_builder.push(Inst::Unfilled).unwrap();
@@ -11055,12 +12600,14 @@ mod tests {
             max_program_bytes: exact_limit,
             ..CompileLimits::default()
         });
+        let mut exact_scalar_owners = ScalarOwnerDraft::default();
         let exact_insts = {
             let mut builder = Builder::new(
                 CompileLimits::default().max_program_states,
                 RustByteProfile::PINNED_1_12_4,
                 CapturePolicy::Reject,
                 retained_bytes,
+                &mut exact_scalar_owners,
                 &mut exact,
             );
             assert_eq!(builder.slots.capacity(), 0);
@@ -11079,12 +12626,14 @@ mod tests {
             max_program_bytes: exact_limit - 1,
             ..CompileLimits::default()
         });
+        let mut one_below_scalar_owners = ScalarOwnerDraft::default();
         {
             let mut builder = Builder::new(
                 CompileLimits::default().max_program_states,
                 RustByteProfile::PINNED_1_12_4,
                 CapturePolicy::Reject,
                 retained_bytes,
+                &mut one_below_scalar_owners,
                 &mut one_below,
             );
             assert_eq!(
@@ -11107,6 +12656,8 @@ mod tests {
             insts.len(),
             insts.len(),
             0,
+            0,
+            0,
             retained_bytes,
             usize::MAX,
         )
@@ -11116,7 +12667,7 @@ mod tests {
             ..CompileLimits::default()
         });
         let certificate =
-            certify_program(&insts, 0, retained_bytes, &mut certificate_exact).unwrap();
+            certify_program(&insts, &[], 0, 0, retained_bytes, &mut certificate_exact).unwrap();
         assert_eq!(certificate.epsilon_order.len(), insts.len());
         assert_eq!(certificate.split_rank.len(), insts.len());
         assert_eq!(
@@ -11131,9 +12682,14 @@ mod tests {
             max_program_bytes: certificate_limit - 1,
             ..CompileLimits::default()
         });
-        let Err(certificate_error) =
-            certify_program(&insts, 0, retained_bytes, &mut certificate_one_below)
-        else {
+        let Err(certificate_error) = certify_program(
+            &insts,
+            &[],
+            0,
+            0,
+            retained_bytes,
+            &mut certificate_one_below,
+        ) else {
             panic!("one-below certificate admission must refuse");
         };
         assert_eq!(
@@ -11473,8 +13029,9 @@ mod tests {
             assert_eq!(accounting.state_byte_span_sum_plans, usize::from(eligible));
             assert_eq!(compiled.state_byte_span_sum.is_some(), eligible);
 
+            let admitted_program_bytes = accounting.program_bytes;
             let exact = CompileLimits {
-                max_program_bytes: accounting.program_bytes,
+                max_program_bytes: admitted_program_bytes,
                 ..CompileLimits::default()
             };
             let replay = compile_state_byte_slot_case(hir, profile, kind, exact).unwrap();
@@ -11485,15 +13042,15 @@ mod tests {
                     profile,
                     kind,
                     CompileLimits {
-                        max_program_bytes: accounting.program_bytes - 1,
+                        max_program_bytes: admitted_program_bytes - 1,
                         ..exact
                     },
                 )
                 .unwrap_err(),
                 Error::ResourceLimit {
                     resource: Resource::ProgramBytes,
-                    required: accounting.program_bytes,
-                    limit: accounting.program_bytes - 1,
+                    required: admitted_program_bytes,
+                    limit: admitted_program_bytes - 1,
                 }
             );
         }
@@ -11600,8 +13157,9 @@ mod tests {
             );
             assert_eq!(compiled.ordered_bounded_span_sum.is_some(), eligible);
 
+            let admitted_program_bytes = accounting.program_bytes;
             let exact = CompileLimits {
-                max_program_bytes: accounting.program_bytes,
+                max_program_bytes: admitted_program_bytes,
                 ..CompileLimits::default()
             };
             let replay = compile_state_byte_slot_case(hir, profile, kind, exact).unwrap();
@@ -11612,15 +13170,15 @@ mod tests {
                     profile,
                     kind,
                     CompileLimits {
-                        max_program_bytes: accounting.program_bytes - 1,
+                        max_program_bytes: admitted_program_bytes - 1,
                         ..exact
                     },
                 )
                 .unwrap_err(),
                 Error::ResourceLimit {
                     resource: Resource::ProgramBytes,
-                    required: accounting.program_bytes,
-                    limit: accounting.program_bytes - 1,
+                    required: admitted_program_bytes,
+                    limit: admitted_program_bytes - 1,
                 }
             );
         }

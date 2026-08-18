@@ -46,7 +46,12 @@ impl<E> AggregateInspectionAttemptError<E> {
 }
 
 /// Version of the aggregate construction transaction algorithm.
-pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 3;
+///
+/// Version 4 composes the linked-Compile construction transaction from
+/// version 3 with the Compile-only large-scalar owner-sharing policy and its
+/// distinct physical P/A/refusal ledger. Ordinary Count/Span continuation
+/// construction retains its incumbent scalar-owner policy.
+pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 4;
 
 /// Version of the aggregate construction prospective/actual accounting.
 pub const AGGREGATE_CONSTRUCTION_ACCOUNTING_VERSION: u32 = 1;

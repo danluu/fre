@@ -97,9 +97,10 @@ pub struct CompileAccounting {
     pub minimum_match_bytes: Option<usize>,
     /// Bytes in the retained maximum-nonaccepting-run proof.
     ///
-    /// The inline `Option<usize>` distinguishes a finite compiler certificate
-    /// from an unbounded or unsupported continuation graph without retaining
-    /// certification scratch.
+    /// The combined two-word slot stores one sentinel-encoded finite compiler
+    /// certificate and the nullable scalar-owner-table handle. This preserves
+    /// the incumbent `Option<usize>` byte charge without retaining
+    /// certification scratch or enlarging the outer program.
     pub continuation_nonaccepting_run_proof_bytes: usize,
     /// Bytes in the retained mandatory-start-domain proof.
     ///
@@ -116,9 +117,15 @@ pub struct CompileAccounting {
     pub root_assertion_proof_bytes: u8,
     pub program_states: usize,
     pub temporary_states_peak: usize,
+    /// Compatibility-logical retained program bytes used for admission and
+    /// exact replay. Repeated scalar references each retain their incumbent
+    /// range-byte charge even when the compile-only construction policy proves
+    /// that immutable physical owners may be shared. The construction receipt
+    /// is authoritative for exact physical retained bytes.
     pub program_bytes: usize,
-    /// Exact maximum logical bytes simultaneously owned by compilation.
-    /// This includes observed vector capacities, deeply owned scalar ranges,
+    /// Exact maximum compatibility-logical bytes simultaneously owned by
+    /// compilation. This includes observed vector capacities, per-state
+    /// scalar-range charges,
     /// retained required-suffix storage, and phase-local validation,
     /// repetition-product, and certification scratch.
     pub construction_peak_bytes: usize,
@@ -163,6 +170,19 @@ impl CompileAccounting {
     #[must_use]
     pub fn root_assertion_proof_bytes(self) -> usize {
         usize::from(self.root_assertion_proof_bytes)
+    }
+}
+
+#[cfg(test)]
+mod compile_accounting_layout_tests {
+    use super::CompileAccounting;
+
+    #[test]
+    fn scalar_sharing_preserves_legacy_compile_accounting_layout() {
+        // 50 `usize` fields, two `Option<usize>` fields and four byte fields,
+        // rounded to the eight-byte aggregate alignment.
+        assert_eq!(core::mem::size_of::<CompileAccounting>(), 440);
+        assert_eq!(core::mem::align_of::<CompileAccounting>(), 8);
     }
 }
 

@@ -705,7 +705,8 @@ fn deferred_cache_initialization_eligible(
         meter.charge_work(1)?;
         let descending = match inst {
             Inst::Consume { next, .. } => *next < pc,
-            Inst::ConsumeScalar { next_by_width, .. } => {
+            Inst::ConsumeScalarOwned { next_by_width, .. }
+            | Inst::ConsumeScalarShared { next_by_width, .. } => {
                 next_by_width.iter().all(|&next| next < pc)
             }
             Inst::Fail | Inst::Match => true,
@@ -1044,7 +1045,8 @@ impl Workspace {
                     meter.charge_work(1)?;
                     increment_edge_count(&mut self.reverse_consume_offsets, *next, states)?;
                 }
-                Inst::ConsumeScalar { next_by_width, .. } => {
+                Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. } => {
                     for (ordinal, &next) in next_by_width.iter().enumerate() {
                         if next_by_width[..ordinal].contains(&next) {
                             continue;
@@ -1104,7 +1106,8 @@ impl Workspace {
                 | Inst::Fail
                 | Inst::Match
                 | Inst::Consume { .. }
-                | Inst::ConsumeScalar { .. }
+                | Inst::ConsumeScalarOwned { .. }
+                | Inst::ConsumeScalarShared { .. }
                 | Inst::Assert { .. } => {}
             }
         }
@@ -1119,7 +1122,8 @@ impl Workspace {
                     meter.charge_work(1)?;
                     self.fill_reverse_consume(*next, pc, *bytes)?;
                 }
-                Inst::ConsumeScalar { next_by_width, .. } => {
+                Inst::ConsumeScalarOwned { next_by_width, .. }
+                | Inst::ConsumeScalarShared { next_by_width, .. } => {
                     for (ordinal, &next) in next_by_width.iter().enumerate() {
                         if next_by_width[..ordinal].contains(&next) {
                             continue;
@@ -1329,7 +1333,9 @@ impl Workspace {
             match program.instruction(pc)? {
                 Inst::Fail => {}
                 Inst::Match => return Ok(true),
-                Inst::Consume { .. } | Inst::ConsumeScalar { .. } => {
+                Inst::Consume { .. }
+                | Inst::ConsumeScalarOwned { .. }
+                | Inst::ConsumeScalarShared { .. } => {
                     self.push_scratch(u32::try_from(pc).map_err(|_| {
                         Error::InternalInvariant("program state does not fit lazy DFA item")
                     })?)?;
@@ -1724,12 +1730,14 @@ fn build_forward_transition(
                     break;
                 }
             }
-            Inst::ConsumeScalar {
-                scalars,
-                next_by_width,
-            } => {
-                if let Some(next) = scalar_successor(scalars, next_by_width, scalar, meter)?
-                    && workspace.expand_forward(program, next, meter)?
+            inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+            | Inst::ConsumeScalarShared { next_by_width, .. }) => {
+                if let Some(next) = scalar_successor(
+                    program.scalar_set_for_inst(inst)?,
+                    next_by_width,
+                    scalar,
+                    meter,
+                )? && workspace.expand_forward(program, next, meter)?
                 {
                     accepted = true;
                     break;
@@ -1815,12 +1823,14 @@ fn build_inline_forward_transition(
                     break;
                 }
             }
-            Inst::ConsumeScalar {
-                scalars,
-                next_by_width,
-            } => {
-                if let Some(next) = scalar_successor(scalars, next_by_width, scalar, meter)?
-                    && workspace.expand_forward(program, next, meter)?
+            inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+            | Inst::ConsumeScalarShared { next_by_width, .. }) => {
+                if let Some(next) = scalar_successor(
+                    program.scalar_set_for_inst(inst)?,
+                    next_by_width,
+                    scalar,
+                    meter,
+                )? && workspace.expand_forward(program, next, meter)?
                 {
                     accepted = true;
                     break;
@@ -2268,11 +2278,14 @@ fn reverse_consume_matches(
         .map_err(|_| Error::InternalInvariant("reverse consume source does not fit usize"))?;
     match program.instruction(source)? {
         Inst::Consume { .. } => Ok(byte_set.contains(byte)),
-        Inst::ConsumeScalar {
-            scalars,
+        inst @ (Inst::ConsumeScalarOwned { next_by_width, .. }
+        | Inst::ConsumeScalarShared { next_by_width, .. }) => Ok(scalar_successor(
+            program.scalar_set_for_inst(inst)?,
             next_by_width,
-        } => Ok(scalar_successor(scalars, next_by_width, scalar, meter)?
-            .is_some_and(|next| next == destination)),
+            scalar,
+            meter,
+        )?
+        .is_some_and(|next| next == destination)),
         Inst::Unfilled
         | Inst::Fail
         | Inst::Match
