@@ -16,7 +16,7 @@ pub const CAPTURE_RUN_ALTERNATION_PLAN_ID: &str = "capture-run-alternation-linea
 pub const CAPTURE_RUN_ALTERNATION_COUNT_OPERATION_ID: &str =
     "capture-run-alternation.participation-count.v1";
 pub const CAPTURE_RUN_ALTERNATION_ALGORITHM_VERSION: u32 = 1;
-pub const CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION: u32 = 2;
+pub const CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION: u32 = 3;
 
 const MAX_CLASS_RANGES: usize = 1_024;
 const MAX_EXACT_LENGTH: u32 = 31;
@@ -69,6 +69,9 @@ pub struct CaptureRunAlternationHirAccounting {
     pub class_ranges: usize,
     pub alternatives: usize,
     pub captures: usize,
+    /// Explicit captures carrying a canonical name. Record materializers that
+    /// do not retain names must prove this is zero before selecting the plan.
+    pub named_captures: usize,
     pub class_equality_work: usize,
     pub mask_initializations: usize,
     pub range_materializations: usize,
@@ -569,6 +572,7 @@ impl CaptureRunAlternationPlan {
             && hir.class_ranges == operation.class_ranges
             && hir.alternatives == operation.alternatives
             && hir.captures == operation.alternatives
+            && hir.named_captures <= hir.captures
             && hir.inspection_work == expected_inspection_work
             && retained_class_bytes == Some(report.retained_class_bytes)
             && size_of::<Self>()
@@ -803,6 +807,7 @@ fn base_accounting(
         class_ranges: 0,
         alternatives,
         captures: alternatives,
+        named_captures: 0,
         class_equality_work: 0,
         mask_initializations: 0,
         range_materializations: 0,
@@ -830,6 +835,11 @@ fn inspect_disjoint_byte_runs(
                 "every alternative must be one direct capture",
             ));
         };
+        if capture.name.is_some() {
+            accounting.named_captures = accounting.named_captures.checked_add(1).ok_or(
+                CaptureRunAlternationBuildError::ArithmeticOverflow("named capture count"),
+            )?;
+        }
         let HirKind::Repetition(repetition) = capture.sub.kind() else {
             return Err(CaptureRunAlternationBuildError::Unsupported(
                 "every capture must contain one singleton-byte run",
@@ -895,6 +905,11 @@ fn inspect_exact_class_runs(
                 "every alternative must be one direct capture",
             ));
         };
+        if capture.name.is_some() {
+            accounting.named_captures = accounting.named_captures.checked_add(1).ok_or(
+                CaptureRunAlternationBuildError::ArithmeticOverflow("named capture count"),
+            )?;
+        }
         let HirKind::Repetition(repetition) = capture.sub.kind() else {
             return Err(CaptureRunAlternationBuildError::Unsupported(
                 "every capture must contain one exact class repetition",

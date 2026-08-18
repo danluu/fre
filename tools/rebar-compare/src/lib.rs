@@ -272,11 +272,13 @@ const FRE_ADAPTER_V136: &str =
     "fre-current-aggregate-capture-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V137: &str =
     "fre-current-aggregate-capture-v137-formal-url-only-compile-owner-v1-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V138: &str =
+    "fre-current-aggregate-capture-v138-formal-fixed-schema-materialized-record-v1-v137-formal-url-only-compile-owner-v1-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V137
+    FRE_ADAPTER_V138
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -595,7 +597,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V137
+        FRE_ADAPTER_V138
     }
 
     #[allow(
@@ -613,7 +615,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V137.to_string(),
+            adapter: FRE_ADAPTER_V138.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1028,6 +1030,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the anonymous regex-redux response binds its scalar to fixed-size complete stage evidence; the trusted outer collector independently derives the same evidence with the pinned Rust regex engine and rejects absent or unequal receipts",
         );
         identity.identity.push_str(
+            "; formal-fixed-schema-materialized-record-v1 admits only source-independent construction-certified unnamed fixed numeric schemas for descending exact byte-class capture alternatives and bounded ASCII whole-word capture alternatives, then replaces tagged-history replay with direct exact record visitation inside each timed grep-captures operation",
+        );
+        identity.availability.push_str(
+            "; every timed operation retains the exact ByteSlice::lines and CRLF partition, allocates a fresh exact outer CaptureRecord array and one fresh exact complete numeric-group array per record for each line, initializes every present and absent slot, retains all records for one line through that line's complete materialization and inspection, then visits every record, numeric slot, and both endpoints of every present span; named or noncanonical HIRs and finite resource refusals retain the incumbent General capture regex and persistent history, malformed bytes retain each proved engine's existing semantics, and selection observes only HIR, options, limits, and the whole haystack length before source access without benchmark names, fixture hashes, expected results, or pre-timed source preparation",
+        );
+        identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
         );
         identity.availability.push_str(
@@ -1073,6 +1081,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; the public composed adapter supersedes ");
+        identity.availability.push_str(FRE_ADAPTER_V137);
+        identity
+            .availability
+            .push_str(" which extends ");
         identity.availability.push_str(FRE_ADAPTER_V136);
         identity
             .availability
@@ -6265,6 +6277,7 @@ enum CurrentFreCapturePreparation {
     MaterializedLines(CaptureAggregateLimits),
     AnchoredLineMaterialized,
     AnchoredWordMaterialized,
+    FixedSchemaMaterialized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6305,8 +6318,55 @@ struct AnchoredWordMaterializedPreparation {
     prospective: AnchoredWordMaterializationProspective,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedSchemaMaterializationProspective {
+    input_bytes: usize,
+    line_domains: usize,
+    matches: usize,
+    minimum_match_bytes: usize,
+    numeric_groups: usize,
+    capture_count: usize,
+    capture_events: usize,
+    endpoint_reads: usize,
+    output_bytes: usize,
+    allocations: usize,
+    scratch_bytes: usize,
+    work: usize,
+    sequential_bytes: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+enum FixedSchemaCapturePlan {
+    RunAlternation {
+        plan: CaptureRunAlternationPlan,
+        run_limits: CaptureRunAlternationRunLimits,
+    },
+    WordRun {
+        plan: CaptureWordRunPlan,
+        run_limits: CaptureWordRunRecordRunLimits,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct FixedSchemaMaterializedPreparation {
+    plan: FixedSchemaCapturePlan,
+    prospective: FixedSchemaMaterializationProspective,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedSchemaLineExecutionReport {
+    matches: usize,
+    capture_count: usize,
+    capture_events: usize,
+    endpoint_reads: usize,
+    work: usize,
+    sequential_bytes: usize,
+}
+
 const CURRENT_FRE_ANCHORED_WORD_MATERIALIZED_MIN_INPUT_BYTES: usize = 1_024;
 const CURRENT_FRE_ANCHORED_LINE_MATERIALIZED_MIN_INPUT_BYTES: usize = 1_024;
+const CURRENT_FRE_FIXED_SCHEMA_MATERIALIZED_MIN_INPUT_BYTES: usize = 1_024;
 
 // Retained by the generic capture-participation API below. The formal Rebar
 // lifecycle deliberately never constructs this batch shortcut.
@@ -6327,6 +6387,7 @@ enum CurrentFreCaptureRegex {
     General(Box<CaptureRegex>),
     AnchoredLineMaterialized(Box<AnchoredLineMaterializedPreparation>),
     AnchoredWordMaterialized(Box<AnchoredWordMaterializedPreparation>),
+    FixedSchemaMaterialized(Box<FixedSchemaMaterializedPreparation>),
 }
 
 impl CurrentFreCaptureModel {
@@ -7037,6 +7098,10 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::AnchoredWordMaterialized(prepared),
                 CurrentFreCapturePreparation::AnchoredWordMaterialized,
             ) => execute_materialized_anchored_word_captures(prepared, haystack, &self.limits),
+            (
+                CurrentFreCaptureRegex::FixedSchemaMaterialized(prepared),
+                CurrentFreCapturePreparation::FixedSchemaMaterialized,
+            ) => execute_materialized_fixed_schema_captures(prepared, haystack, &self.limits),
             _ => Err(ExecutionError::fault(
                 "FRE capture lifecycle owner and preparation do not agree",
             )),
@@ -7112,6 +7177,23 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                 case_insensitive,
                 haystack_len,
                 preparation: CurrentFreCapturePreparation::AnchoredLineMaterialized,
+            });
+        }
+        if let Some(prepared) = fixed_schema_materialized_preparation_one(
+            pattern,
+            unicode,
+            case_insensitive,
+            haystack_len,
+            &limits,
+        )? {
+            return Ok(CurrentFreCaptureLifecycle {
+                model,
+                regex: CurrentFreCaptureRegex::FixedSchemaMaterialized(Box::new(prepared)),
+                limits,
+                unicode,
+                case_insensitive,
+                haystack_len,
+                preparation: CurrentFreCapturePreparation::FixedSchemaMaterialized,
             });
         }
     }
@@ -8443,7 +8525,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V137
+        if receipt.adapter == FRE_ADAPTER_V138
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -13617,6 +13699,22 @@ fn capture_run_alternation_plan_one(
     case_insensitive: bool,
     limits: &RunLimits,
 ) -> Result<Option<CaptureRunAlternationPlan>, ExecutionError> {
+    capture_run_alternation_plan_one_with_resource_policy(
+        pattern,
+        unicode,
+        case_insensitive,
+        limits,
+        false,
+    )
+}
+
+fn capture_run_alternation_plan_one_with_resource_policy(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+    resource_is_optional: bool,
+) -> Result<Option<CaptureRunAlternationPlan>, ExecutionError> {
     if case_insensitive {
         return Ok(None);
     }
@@ -13643,6 +13741,9 @@ fn capture_run_alternation_plan_one(
             | CaptureRunAlternationBuildError::Unsupported(_),
         ) => return Ok(None),
         Err(error @ CaptureRunAlternationBuildError::Resource { .. }) => {
+            if resource_is_optional {
+                return Ok(None);
+            }
             return Err(ExecutionError::unsupported(format!(
                 "FRE capture run-alternation build refused execution: {error}"
             )));
@@ -13724,6 +13825,7 @@ fn authenticate_capture_run_alternation_plan(
         || report.hir.hir_nodes == 0
         || report.hir.alternatives != operation.alternatives
         || report.hir.captures != report.hir.alternatives
+        || report.hir.named_captures > report.hir.captures
         || report.hir.class_ranges != operation.class_ranges
         || report.hir.inspection_work < report.hir.hir_nodes
         || report.retained_class_bytes
@@ -13858,201 +13960,770 @@ fn execute_capture_run_alternation_with_limits(
         .map_err(|_| ExecutionError::fault("FRE capture run-alternation count does not fit u64"))
 }
 
-/// Execute Rebar's per-line capture-record boundary for a descending exact
-/// byte-class alternation. Every line and non-overlapping record is visited;
-/// every fixed numeric slot is queried before participating endpoints count.
-fn execute_capture_run_alternation_grep_records_with_limits(
-    plan: &CaptureRunAlternationPlan,
-    haystack: &[u8],
-    run_limits: CaptureRunAlternationRunLimits,
+fn fixed_schema_materialized_preparation_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
     limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
-    let operation = plan.build_report().identity.operation;
-    if !plan.authenticates_identity()
-        || operation.kind != fre::CaptureRunAlternationKind::DescendingExactByteClass
-        || operation.alternatives < 2
-        || operation.participating_captures_per_match != 1
-        || operation.groups_per_match != 2
-        || !operation.line_partition_invariant
-        || !operation.non_overlapping
-    {
-        return Err(ExecutionError::fault(
-            "FRE strict run-alternation record identity mismatch",
-        ));
-    }
-    let numeric_groups = operation.alternatives.checked_add(1).ok_or_else(|| {
-        ExecutionError::fault("FRE strict run-alternation numeric schema overflow")
-    })?;
-    let upper = plan.run_upper_bounds(haystack.len()).map_err(|error| {
-        ExecutionError::fault(format!(
-            "FRE strict run-alternation record preflight faulted: {error}"
-        ))
-    })?;
-    let line_scan = CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?;
-    let combined_work = checked_aggregate_add(
-        upper.work,
-        line_scan.work,
-        "FRE strict run-alternation record work",
-    )?;
-    let combined_sequential = checked_aggregate_add(
-        upper.sequential_bytes,
-        line_scan.sequential_bytes,
-        "FRE strict run-alternation record sequential bytes",
-    )?;
-    if combined_work > limits.fre_aggregate_operation_work {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE strict run-alternation records require {combined_work} work, limit is {}",
-            limits.fre_aggregate_operation_work
-        )));
-    }
-    if combined_sequential > limits.fre_aggregate_sequential_bytes {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE strict run-alternation records require {combined_sequential} sequential bytes, limit is {}",
-            limits.fre_aggregate_sequential_bytes
-        )));
+) -> Result<Option<FixedSchemaMaterializedPreparation>, CompareError> {
+    if haystack_len < CURRENT_FRE_FIXED_SCHEMA_MATERIALIZED_MIN_INPUT_BYTES || case_insensitive {
+        return Ok(None);
     }
 
-    let mut reducer_events = 0_u64;
-    let mut count = 0_u64;
-    let mut total_matches = 0_usize;
-    let mut total_capture_count = 0_usize;
-    let mut total_line_bytes = 0_usize;
-    for line in haystack.lines() {
-        charge(
-            &mut reducer_events,
-            1,
-            limits.reducer_steps,
-            "FRE strict run-alternation grep-captures line events",
-        )?;
-        total_line_bytes = checked_aggregate_add(
-            total_line_bytes,
-            line.len(),
-            "FRE strict run-alternation line bytes",
-        )?;
-        let count_before = count;
-        let mut records_seen = 0_usize;
-        let mut previous_end = 0_usize;
+    let run_plan = capture_run_alternation_plan_one_with_resource_policy(
+        pattern, unicode, false, limits, true,
+    )
+    .map_err(|error| CompareError::new(error.message))?;
+    if let Some(plan) = run_plan {
+        let report = plan.build_report();
+        let operation = report.identity.operation;
+        if operation.kind == fre::CaptureRunAlternationKind::DescendingExactByteClass
+            && report.hir.named_captures == 0
+        {
+            let upper = plan.run_upper_bounds(haystack_len).map_err(|error| {
+                CompareError::new(format!(
+                    "FRE fixed-schema run-alternation preflight faulted: {error}"
+                ))
+            })?;
+            let numeric_groups = operation.alternatives.checked_add(1).ok_or_else(|| {
+                CompareError::new("FRE fixed-schema run-alternation schema overflowed")
+            })?;
+            let minimum_match_bytes = usize::try_from(operation.minimum_length).map_err(|_| {
+                CompareError::new("FRE fixed-schema run-alternation minimum width does not fit")
+            })?;
+            let retained_class_bytes = report.retained_class_bytes;
+            let run_limits = CaptureRunAlternationRunLimits {
+                max_input_bytes: upper.input_bytes,
+                max_source_reads: upper.source_reads,
+                max_decoded_units: upper.decoded_units,
+                max_class_comparisons: upper.class_comparisons,
+                max_run_events: upper.run_events,
+                max_matches: upper.matches,
+                max_capture_count: upper.capture_count,
+                max_work: upper.work,
+                max_sequential_bytes: upper.sequential_bytes,
+                max_peak_bytes: upper.peak_bytes,
+            };
+            return finish_fixed_schema_materialized_preparation(
+                FixedSchemaCapturePlan::RunAlternation { plan, run_limits },
+                haystack_len,
+                upper.matches,
+                minimum_match_bytes,
+                numeric_groups,
+                upper.work,
+                upper.sequential_bytes,
+                retained_class_bytes,
+                limits,
+            );
+        }
+    }
+
+    if unicode {
+        return Ok(None);
+    }
+    let word_plan =
+        capture_word_run_plan_one_with_resource_policy(pattern, false, false, limits, true)
+            .map_err(|error| CompareError::new(error.message))?;
+    let Some(plan) = word_plan else {
+        return Ok(None);
+    };
+    let report = plan.build_report();
+    if report.hir.named_captures != 0
+        || report.identity.record_operation.mode != fre::CaptureWordRunMode::Ascii
+    {
+        return Ok(None);
+    }
+    let operation = report.identity.record_operation;
+    let upper = plan
+        .grep_capture_record_upper_bounds(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE fixed-schema word-run preflight faulted: {error}"
+            ))
+        })?;
+    let minimum_match_bytes = usize::try_from(operation.minimum_length)
+        .map_err(|_| CompareError::new("FRE fixed-schema word-run minimum width does not fit"))?;
+    let run_limits = CaptureWordRunRecordRunLimits {
+        max_input_bytes: upper.input_bytes,
+        max_line_domains: upper.line_domains,
+        max_source_reads: upper.source_reads,
+        max_decoded_units: upper.decoded_units,
+        max_block_events: upper.block_events,
+        max_class_comparisons: upper.class_comparisons,
+        max_boundary_probes: upper.boundary_probes,
+        max_matches: upper.matches,
+        max_capture_count: upper.capture_count,
+        max_capture_events: upper.capture_events,
+        max_endpoint_reads: upper.endpoint_reads,
+        max_reducer_events: upper.reducer_events,
+        max_work: upper.work,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    };
+    finish_fixed_schema_materialized_preparation(
+        FixedSchemaCapturePlan::WordRun { plan, run_limits },
+        haystack_len,
+        upper.matches,
+        minimum_match_bytes,
+        operation.numeric_groups,
+        upper.work,
+        upper.sequential_bytes,
+        0,
+        limits,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the source-free fixed-schema P bound is shared by two separately authenticated engines"
+)]
+fn finish_fixed_schema_materialized_preparation(
+    plan: FixedSchemaCapturePlan,
+    input_bytes: usize,
+    matches: usize,
+    minimum_match_bytes: usize,
+    numeric_groups: usize,
+    engine_work: usize,
+    engine_sequential_bytes: usize,
+    retained_heap_bytes: usize,
+    limits: &RunLimits,
+) -> Result<Option<FixedSchemaMaterializedPreparation>, CompareError> {
+    if minimum_match_bytes == 0 || numeric_groups < 2 || u32::try_from(numeric_groups).is_err() {
+        return Err(CompareError::new(
+            "FRE fixed-schema materialization received an invalid authenticated schema",
+        ));
+    }
+    let line_domains = input_bytes;
+    let capture_count = matches.checked_mul(2).ok_or_else(|| {
+        CompareError::new("FRE fixed-schema materialized capture bound overflowed")
+    })?;
+    let capture_events = matches
+        .checked_mul(numeric_groups)
+        .ok_or_else(|| CompareError::new("FRE fixed-schema materialized slot bound overflowed"))?;
+    let endpoint_reads = capture_count.checked_mul(2).ok_or_else(|| {
+        CompareError::new("FRE fixed-schema materialized endpoint bound overflowed")
+    })?;
+    let per_record_output = core::mem::size_of::<CaptureRecord>()
+        .checked_add(
+            numeric_groups
+                .checked_mul(core::mem::size_of::<CaptureGroupRecord>())
+                .ok_or_else(|| {
+                    CompareError::new("FRE fixed-schema materialized group bytes overflowed")
+                })?,
+        )
+        .ok_or_else(|| {
+            CompareError::new("FRE fixed-schema materialized record bytes overflowed")
+        })?;
+    let output_bytes = matches.checked_mul(per_record_output).ok_or_else(|| {
+        CompareError::new("FRE fixed-schema materialized output bound overflowed")
+    })?;
+    let allocations = matches.checked_add(line_domains).ok_or_else(|| {
+        CompareError::new("FRE fixed-schema materialized allocation bound overflowed")
+    })?;
+    let materialization_work = capture_events
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(endpoint_reads))
+        .and_then(|value| value.checked_add(matches))
+        .ok_or_else(|| {
+            CompareError::new("FRE fixed-schema materialization work bound overflowed")
+        })?;
+    let work = engine_work
+        .checked_add(input_bytes)
+        .and_then(|value| value.checked_add(materialization_work))
+        .ok_or_else(|| CompareError::new("FRE fixed-schema combined work bound overflowed"))?;
+    let sequential_bytes = output_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(engine_sequential_bytes))
+        .and_then(|value| value.checked_add(input_bytes))
+        .ok_or_else(|| {
+            CompareError::new("FRE fixed-schema combined sequential bound overflowed")
+        })?;
+    // Every per-line outer vector and every initialized group vector remain
+    // live until the line's complete numeric schema has been reduced. Both
+    // construction and reduction traverse these buffers monotonically, so
+    // they consume scratch and sequential bytes but no random-access budget.
+    let scratch_bytes = output_bytes;
+    let peak_bytes = core::mem::size_of::<FixedSchemaMaterializedPreparation>()
+        .checked_add(retained_heap_bytes)
+        .and_then(|value| value.checked_add(scratch_bytes))
+        .ok_or_else(|| CompareError::new("FRE fixed-schema combined peak bound overflowed"))?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| CompareError::new("FRE fixed-schema reducer limit does not fit usize"))?;
+    if work > limits.fre_aggregate_operation_work
+        || sequential_bytes > limits.fre_aggregate_sequential_bytes
+        || scratch_bytes > limits.fre_aggregate_scratch_bytes
+        || peak_bytes > limits.fre_aggregate_peak_bytes
+        || line_domains > reducer_limit
+        || matches > reducer_limit
+        || capture_count > reducer_limit
+        || capture_events > reducer_limit
+        || endpoint_reads > reducer_limit
+        || allocations > reducer_limit
+    {
+        return Ok(None);
+    }
+    Ok(Some(FixedSchemaMaterializedPreparation {
+        plan,
+        prospective: FixedSchemaMaterializationProspective {
+            input_bytes,
+            line_domains,
+            matches,
+            minimum_match_bytes,
+            numeric_groups,
+            capture_count,
+            capture_events,
+            endpoint_reads,
+            output_bytes,
+            allocations,
+            scratch_bytes,
+            work,
+            sequential_bytes,
+            peak_bytes,
+        },
+    }))
+}
+
+fn exact_fixed_schema_materialized_allocation_error(
+    context: &'static str,
+    error: ExactAllocationError,
+) -> ExecutionError {
+    match error {
+        ExactAllocationError::AllocationFailed => ExecutionError::unsupported(format!(
+            "FRE fixed-schema materialization allocation failed for {context}"
+        )),
+        ExactAllocationError::LayoutOverflow => ExecutionError::fault(format!(
+            "FRE fixed-schema materialization layout overflowed for {context}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod fixed_schema_group_allocation_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static FAIL_ON_CALL: Cell<Option<usize>> = const { Cell::new(None) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn arm(fail_on_call: Option<usize>) {
+        FAIL_ON_CALL.set(fail_on_call);
+        CALLS.set(0);
+    }
+
+    pub(super) fn should_fail() -> bool {
+        let call = CALLS.get();
+        CALLS.set(call.saturating_add(1));
+        FAIL_ON_CALL.get() == Some(call)
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
+fn exact_fixed_schema_group_array(
+    numeric_groups: usize,
+) -> Result<ExactVec<CaptureGroupRecord>, ExactAllocationError> {
+    #[cfg(test)]
+    if fixed_schema_group_allocation_probe::should_fail() {
+        return Err(ExactAllocationError::AllocationFailed);
+    }
+    ExactVec::try_with_capacity(numeric_groups)
+}
+
+fn push_fixed_schema_capture_record(
+    records: &mut ExactVec<CaptureRecord>,
+    line_len: usize,
+    numeric_groups: usize,
+    mut span_for_group: impl FnMut(usize) -> Option<(usize, usize)>,
+) -> Result<(), ExecutionError> {
+    let mut groups = exact_fixed_schema_group_array(numeric_groups).map_err(|error| {
+        exact_fixed_schema_materialized_allocation_error("numeric-group array", error)
+    })?;
+    let mut participating = 0_usize;
+    let mut overall = None;
+    for group in 0..numeric_groups {
+        let span = span_for_group(group)
+            .map(|(start, end)| {
+                if start > end || end > line_len {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema capture span escaped its semantic line",
+                    ));
+                }
+                participating = participating.checked_add(1).ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema participation count overflowed")
+                })?;
+                let span = CaptureSpan { start, end };
+                if group == 0 {
+                    overall = Some(span);
+                } else if overall != Some(span) {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema selected capture changed its overall span",
+                    ));
+                }
+                Ok(span)
+            })
+            .transpose()?;
+        let index = u32::try_from(group).map_err(|_| {
+            ExecutionError::fault("FRE fixed-schema capture index does not fit u32")
+        })?;
+        groups
+            .try_push(CaptureGroupRecord {
+                index,
+                name: None,
+                span,
+            })
+            .map_err(|_| {
+                ExecutionError::fault("FRE fixed-schema group array exceeded its preflight")
+            })?;
+    }
+    if participating != 2 || overall.is_none_or(|span| span.start == span.end) {
+        return Err(ExecutionError::fault(
+            "FRE fixed-schema record changed its participation theorem",
+        ));
+    }
+    records
+        .try_push(CaptureRecord {
+            groups: groups.into_vec(),
+        })
+        .map_err(|_| ExecutionError::fault("FRE fixed-schema record array exceeded its preflight"))
+}
+
+impl FixedSchemaCapturePlan {
+    fn materialize_line(
+        &self,
+        line: &[u8],
+        record_capacity: usize,
+        numeric_groups: usize,
+    ) -> Result<(ExactVec<CaptureRecord>, FixedSchemaLineExecutionReport), ExecutionError> {
+        let mut records = ExactVec::try_with_capacity(record_capacity).map_err(|error| {
+            exact_fixed_schema_materialized_allocation_error("line record array", error)
+        })?;
         let mut callback_error = None;
-        let result = plan
-            .visit_exact_byte_class_records(line, run_limits, |record| {
-                if callback_error.is_some() {
-                    return;
-                }
-                if record.len() != numeric_groups || record.is_empty() {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict run-alternation record changed its numeric schema",
-                    ));
-                    return;
-                }
-                let Some(overall) = record.span(0) else {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict run-alternation record omitted group zero",
-                    ));
-                    return;
-                };
-                if overall.start < previous_end
-                    || overall.start >= overall.end
-                    || overall.end > line.len()
-                {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict run-alternation record violated non-empty ordered spans",
-                    ));
-                    return;
-                }
-                previous_end = overall.end;
-                for group in 0..record.len() {
-                    if let Some(span) = record.span(group) {
-                        // Read both endpoints of every participating numeric
-                        // group at the formal record boundary.
-                        if span.start > span.end || span.end > line.len() {
+        let report = match self {
+            Self::RunAlternation { plan, run_limits } => {
+                let result = plan
+                    .visit_exact_byte_class_records(line, *run_limits, |record| {
+                        if callback_error.is_some() {
+                            return;
+                        }
+                        if record.len() != numeric_groups || record.is_empty() {
                             callback_error = Some(ExecutionError::fault(
-                                "FRE strict run-alternation participating span escaped its line",
+                                "FRE fixed-schema run-alternation record changed width",
                             ));
                             return;
                         }
-                        match count.checked_add(1) {
-                            Some(next) => count = next,
-                            None => {
-                                callback_error = Some(ExecutionError::fault(
-                                    "FRE strict run-alternation capture count overflow",
-                                ));
-                                return;
-                            }
+                        callback_error = push_fixed_schema_capture_record(
+                            &mut records,
+                            line.len(),
+                            numeric_groups,
+                            |group| record.span(group).map(|span| (span.start, span.end)),
+                        )
+                        .err();
+                    })
+                    .map_err(|error| match error {
+                        CaptureRunAlternationRunError::Resource { .. } => {
+                            ExecutionError::unsupported(format!(
+                                "FRE fixed-schema run-alternation visit refused: {error}"
+                            ))
                         }
-                    }
+                        _ => ExecutionError::fault(format!(
+                            "FRE fixed-schema run-alternation visit faulted: {error}"
+                        )),
+                    })?;
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
                 }
-                match records_seen.checked_add(1) {
-                    Some(next) => records_seen = next,
-                    None => {
-                        callback_error = Some(ExecutionError::fault(
-                            "FRE strict run-alternation record count overflow",
-                        ));
-                    }
+                if result.identity != plan.build_report().identity.operation
+                    || result.upper_bounds.input_bytes != line.len()
+                    || result.actual.matches != records.len()
+                    || result.capture_count != result.actual.capture_count
+                    || result.actual.matches.checked_mul(2) != Some(result.capture_count)
+                    || result.actual.work > result.upper_bounds.work
+                    || result.actual.sequential_bytes > result.upper_bounds.sequential_bytes
+                {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema run-alternation line accounting failed",
+                    ));
                 }
-            })
-            .map_err(|error| match error {
-                CaptureRunAlternationRunError::Resource { .. } => ExecutionError::unsupported(
-                    format!("FRE strict run-alternation record visit refused: {error}"),
-                ),
-                _ => ExecutionError::fault(format!(
-                    "FRE strict run-alternation record visit faulted: {error}"
-                )),
-            })?;
-        if let Some(error) = callback_error {
-            return Err(error);
-        }
-        let observed = usize::try_from(count.checked_sub(count_before).ok_or_else(|| {
-            ExecutionError::fault("FRE strict run-alternation capture count regressed")
-        })?)
-        .map_err(|_| {
-            ExecutionError::fault("FRE strict run-alternation capture count exceeds usize")
-        })?;
-        if result.identity != operation
-            || result.upper_bounds.input_bytes != line.len()
-            || result.actual.source_reads != line.len()
-            || result.actual.sequential_bytes != line.len()
-            || result.actual.matches != records_seen
-            || result.capture_count != observed
-            || result.capture_count != records_seen.saturating_mul(2)
-        {
+                let capture_events = result
+                    .actual
+                    .matches
+                    .checked_mul(numeric_groups)
+                    .ok_or_else(|| {
+                        ExecutionError::fault(
+                            "FRE fixed-schema run-alternation event count overflowed",
+                        )
+                    })?;
+                let endpoint_reads = result.capture_count.checked_mul(2).ok_or_else(|| {
+                    ExecutionError::fault(
+                        "FRE fixed-schema run-alternation endpoint count overflowed",
+                    )
+                })?;
+                FixedSchemaLineExecutionReport {
+                    matches: result.actual.matches,
+                    capture_count: result.capture_count,
+                    capture_events,
+                    endpoint_reads,
+                    work: result.actual.work,
+                    sequential_bytes: result.actual.sequential_bytes,
+                }
+            }
+            Self::WordRun { plan, run_limits } => {
+                let result = plan
+                    .visit_grep_capture_records(line, *run_limits, |_, line_len, record| {
+                        if callback_error.is_some() {
+                            return;
+                        }
+                        if line_len != line.len()
+                            || record.len() != numeric_groups
+                            || record.is_empty()
+                        {
+                            callback_error = Some(ExecutionError::fault(
+                                "FRE fixed-schema word-run record changed its line or width",
+                            ));
+                            return;
+                        }
+                        callback_error = push_fixed_schema_capture_record(
+                            &mut records,
+                            line_len,
+                            numeric_groups,
+                            |group| record.span(group).map(|span| (span.start, span.end)),
+                        )
+                        .err();
+                    })
+                    .map_err(|error| match error {
+                        CaptureWordRunRunError::Resource { .. } => ExecutionError::unsupported(
+                            format!("FRE fixed-schema word-run visit refused: {error}"),
+                        ),
+                        _ => ExecutionError::fault(format!(
+                            "FRE fixed-schema word-run visit faulted: {error}"
+                        )),
+                    })?;
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
+                let expected_capture_count = result.matches.checked_mul(2).ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema word-run capture count overflowed")
+                })?;
+                let expected_capture_events =
+                    result.matches.checked_mul(numeric_groups).ok_or_else(|| {
+                        ExecutionError::fault("FRE fixed-schema word-run event count overflowed")
+                    })?;
+                let expected_endpoint_reads =
+                    result.capture_count.checked_mul(2).ok_or_else(|| {
+                        ExecutionError::fault("FRE fixed-schema word-run endpoint count overflowed")
+                    })?;
+                if result.identity != plan.build_report().identity.record_operation
+                    || result.input_bytes != line.len()
+                    || result.matches != records.len()
+                    || result.capture_count != expected_capture_count
+                    || result.capture_events != expected_capture_events
+                    || result.endpoint_reads != expected_endpoint_reads
+                    || result.allocations != 0
+                    || result.scratch_bytes != 0
+                    || result.output_bytes != 0
+                    || result.persistent_bytes != plan.build_report().persistent_bytes
+                    || result.peak_bytes != plan.build_report().peak_bytes
+                {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema word-run line accounting failed",
+                    ));
+                }
+                FixedSchemaLineExecutionReport {
+                    matches: result.matches,
+                    capture_count: result.capture_count,
+                    capture_events: result.capture_events,
+                    endpoint_reads: result.endpoint_reads,
+                    work: result.work,
+                    sequential_bytes: result.sequential_bytes,
+                }
+            }
+        };
+        Ok((records, report))
+    }
+}
+
+fn inspect_fixed_schema_capture_records(
+    records: &[CaptureRecord],
+    line_len: usize,
+    numeric_groups: usize,
+) -> Result<(usize, usize, usize), ExecutionError> {
+    let mut capture_count = 0_usize;
+    let mut capture_events = 0_usize;
+    let mut endpoint_reads = 0_usize;
+    let mut previous_end = 0_usize;
+    for record in records {
+        if record.groups.len() != numeric_groups {
             return Err(ExecutionError::fault(
-                "FRE strict run-alternation record accounting failed to close",
+                "FRE fixed-schema materialized record changed width",
             ));
         }
-        total_matches = checked_aggregate_add(
-            total_matches,
-            result.actual.matches,
-            "FRE strict run-alternation matches",
-        )?;
-        total_capture_count = checked_aggregate_add(
-            total_capture_count,
-            result.capture_count,
-            "FRE strict run-alternation participating captures",
-        )?;
-        let group_events = result
-            .actual
-            .matches
-            .checked_mul(numeric_groups)
-            .ok_or_else(|| {
-                ExecutionError::fault("FRE strict run-alternation group events overflow")
+        let overall = record.overall().ok_or_else(|| {
+            ExecutionError::fault("FRE fixed-schema materialized record omitted group zero")
+        })?;
+        if overall.start < previous_end || overall.start >= overall.end || overall.end > line_len {
+            return Err(ExecutionError::fault(
+                "FRE fixed-schema materialized records overlapped or escaped their line",
+            ));
+        }
+        previous_end = overall.end;
+        let mut participating = 0_usize;
+        for (index, group) in record.groups.iter().enumerate() {
+            capture_events = capture_events.checked_add(1).ok_or_else(|| {
+                ExecutionError::fault("FRE fixed-schema inspected-slot count overflowed")
             })?;
-        charge(
-            &mut reducer_events,
-            u64::try_from(group_events).unwrap_or(u64::MAX),
-            limits.reducer_steps,
-            "FRE strict run-alternation numeric group events",
-        )?;
+            if usize::try_from(group.index) != Ok(index) || group.name.is_some() {
+                return Err(ExecutionError::fault(
+                    "FRE fixed-schema materialized slots changed order or names",
+                ));
+            }
+            if let Some(span) = group.span {
+                // Both endpoints are read from every participating retained
+                // slot, after the complete line-local outer array is sealed.
+                if span.start > span.end || span.end > line_len {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema retained span escaped its semantic line",
+                    ));
+                }
+                if index != 0 && span != overall {
+                    return Err(ExecutionError::fault(
+                        "FRE fixed-schema retained selected span changed its overall span",
+                    ));
+                }
+                endpoint_reads = endpoint_reads.checked_add(2).ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema endpoint count overflowed")
+                })?;
+                capture_count = capture_count.checked_add(1).ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema capture count overflowed")
+                })?;
+                participating = participating.checked_add(1).ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema record participation overflowed")
+                })?;
+            }
+        }
+        if participating != 2 {
+            return Err(ExecutionError::fault(
+                "FRE fixed-schema retained record changed participation",
+            ));
+        }
     }
-    if total_line_bytes > haystack.len()
-        || total_matches > upper.matches
-        || total_capture_count > upper.capture_count
-        || usize::try_from(count) != Ok(total_capture_count)
-    {
+    Ok((capture_count, capture_events, endpoint_reads))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "both authenticated engines share one formal per-line array lifecycle and one complete P/A closure"
+)]
+fn execute_materialized_fixed_schema_captures(
+    prepared: &FixedSchemaMaterializedPreparation,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let prospective = prepared.prospective;
+    if prospective.input_bytes != haystack.len() {
         return Err(ExecutionError::fault(
-            "FRE strict run-alternation whole-operation accounting failed to close",
+            "FRE fixed-schema materialization changed its bound input length",
         ));
     }
-    Ok(count)
+    let numeric_groups = prospective.numeric_groups;
+    let group_bytes = numeric_groups
+        .checked_mul(core::mem::size_of::<CaptureGroupRecord>())
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema actual group bytes overflowed"))?;
+    let per_record_output = core::mem::size_of::<CaptureRecord>()
+        .checked_add(group_bytes)
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema actual record bytes overflowed"))?;
+    let retained_heap_bytes = match &prepared.plan {
+        FixedSchemaCapturePlan::RunAlternation { plan, .. } => {
+            plan.build_report().retained_class_bytes
+        }
+        FixedSchemaCapturePlan::WordRun { .. } => 0,
+    };
+    let base_peak = core::mem::size_of::<FixedSchemaMaterializedPreparation>()
+        .checked_add(retained_heap_bytes)
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema actual base peak overflowed"))?;
+
+    let mut raw_cursor = 0_usize;
+    let mut line_domains = 0_usize;
+    let mut materialized_records = 0_usize;
+    let mut capture_count = 0_usize;
+    let mut capture_events = 0_usize;
+    let mut endpoint_reads = 0_usize;
+    let mut output_bytes = 0_usize;
+    let mut allocations = 0_usize;
+    let mut scratch_high_water = 0_usize;
+    let mut engine_matches = 0_usize;
+    let mut engine_capture_count = 0_usize;
+    let mut engine_capture_events = 0_usize;
+    let mut engine_endpoint_reads = 0_usize;
+    let mut engine_work = 0_usize;
+    let mut engine_sequential_bytes = 0_usize;
+
+    for raw_line in haystack.lines_with_terminator() {
+        raw_cursor = raw_cursor
+            .checked_add(raw_line.len())
+            .ok_or_else(|| ExecutionError::fault("FRE fixed-schema raw cursor overflowed"))?;
+        let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+            without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+        } else {
+            raw_line
+        };
+        line_domains =
+            checked_aggregate_add(line_domains, 1, "FRE fixed-schema semantic line domains")?;
+        let record_capacity = line
+            .len()
+            .checked_div(prospective.minimum_match_bytes)
+            .ok_or_else(|| ExecutionError::fault("FRE fixed-schema minimum width became zero"))?;
+        let (records, engine) =
+            prepared
+                .plan
+                .materialize_line(line, record_capacity, numeric_groups)?;
+        if record_capacity != 0 {
+            allocations =
+                checked_aggregate_add(allocations, 1, "FRE fixed-schema outer allocations")?;
+        }
+        engine_matches = checked_aggregate_add(
+            engine_matches,
+            engine.matches,
+            "FRE fixed-schema engine matches",
+        )?;
+        engine_capture_count = checked_aggregate_add(
+            engine_capture_count,
+            engine.capture_count,
+            "FRE fixed-schema engine captures",
+        )?;
+        engine_capture_events = checked_aggregate_add(
+            engine_capture_events,
+            engine.capture_events,
+            "FRE fixed-schema engine capture events",
+        )?;
+        engine_endpoint_reads = checked_aggregate_add(
+            engine_endpoint_reads,
+            engine.endpoint_reads,
+            "FRE fixed-schema engine endpoint reads",
+        )?;
+        engine_work =
+            checked_aggregate_add(engine_work, engine.work, "FRE fixed-schema engine work")?;
+        engine_sequential_bytes = checked_aggregate_add(
+            engine_sequential_bytes,
+            engine.sequential_bytes,
+            "FRE fixed-schema engine sequential bytes",
+        )?;
+        allocations = checked_aggregate_add(
+            allocations,
+            records.len(),
+            "FRE fixed-schema group allocations",
+        )?;
+        let line_outer_bytes = records
+            .capacity()
+            .checked_mul(core::mem::size_of::<CaptureRecord>())
+            .ok_or_else(|| ExecutionError::fault("FRE fixed-schema outer bytes overflowed"))?;
+        let line_group_bytes = records
+            .len()
+            .checked_mul(group_bytes)
+            .ok_or_else(|| ExecutionError::fault("FRE fixed-schema group storage overflowed"))?;
+        let line_scratch = line_outer_bytes
+            .checked_add(line_group_bytes)
+            .ok_or_else(|| ExecutionError::fault("FRE fixed-schema line scratch overflowed"))?;
+        scratch_high_water = scratch_high_water.max(line_scratch);
+        let (line_capture_count, line_capture_events, line_endpoint_reads) =
+            inspect_fixed_schema_capture_records(records.as_slice(), line.len(), numeric_groups)?;
+        materialized_records = checked_aggregate_add(
+            materialized_records,
+            records.len(),
+            "FRE fixed-schema materialized records",
+        )?;
+        capture_count = checked_aggregate_add(
+            capture_count,
+            line_capture_count,
+            "FRE fixed-schema inspected captures",
+        )?;
+        capture_events = checked_aggregate_add(
+            capture_events,
+            line_capture_events,
+            "FRE fixed-schema inspected slots",
+        )?;
+        endpoint_reads = checked_aggregate_add(
+            endpoint_reads,
+            line_endpoint_reads,
+            "FRE fixed-schema inspected endpoints",
+        )?;
+        output_bytes = checked_aggregate_add(
+            output_bytes,
+            records
+                .len()
+                .checked_mul(per_record_output)
+                .ok_or_else(|| {
+                    ExecutionError::fault("FRE fixed-schema line output bytes overflowed")
+                })?,
+            "FRE fixed-schema output bytes",
+        )?;
+    }
+
+    if raw_cursor != haystack.len() {
+        return Err(ExecutionError::fault(
+            "FRE fixed-schema line iterator did not consume the source",
+        ));
+    }
+    let materialization_work = capture_events
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(endpoint_reads))
+        .and_then(|value| value.checked_add(materialized_records))
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE fixed-schema actual materialization work overflowed")
+        })?;
+    let actual_work = haystack
+        .len()
+        .checked_add(engine_work)
+        .and_then(|value| value.checked_add(materialization_work))
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema actual work overflowed"))?;
+    let actual_sequential_bytes = output_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(engine_sequential_bytes))
+        .and_then(|value| value.checked_add(haystack.len()))
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE fixed-schema actual sequential bytes overflowed")
+        })?;
+    let actual_peak = base_peak
+        .checked_add(scratch_high_water)
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema actual peak overflowed"))?;
+    let expected_capture_events = materialized_records
+        .checked_mul(numeric_groups)
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema event closure overflowed"))?;
+    let expected_endpoint_reads = capture_count
+        .checked_mul(2)
+        .ok_or_else(|| ExecutionError::fault("FRE fixed-schema endpoint closure overflowed"))?;
+    if materialized_records != engine_matches
+        || capture_count != engine_capture_count
+        || materialized_records.checked_mul(2) != Some(capture_count)
+        || capture_events != expected_capture_events
+        || endpoint_reads != expected_endpoint_reads
+        || engine_capture_events != capture_events
+        || engine_endpoint_reads != endpoint_reads
+        || line_domains > prospective.line_domains
+        || materialized_records > prospective.matches
+        || capture_count > prospective.capture_count
+        || capture_events > prospective.capture_events
+        || endpoint_reads > prospective.endpoint_reads
+        || output_bytes > prospective.output_bytes
+        || allocations > prospective.allocations
+        || scratch_high_water > prospective.scratch_bytes
+        || actual_work > prospective.work
+        || actual_sequential_bytes > prospective.sequential_bytes
+        || actual_peak > prospective.peak_bytes
+        || scratch_high_water > limits.fre_aggregate_scratch_bytes
+        || actual_work > limits.fre_aggregate_operation_work
+        || actual_sequential_bytes > limits.fre_aggregate_sequential_bytes
+        || actual_peak > limits.fre_aggregate_peak_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE fixed-schema materialized record identity or P/A closure failed",
+        ));
+    }
+    u64::try_from(capture_count)
+        .map_err(|_| ExecutionError::fault("FRE fixed-schema capture count does not fit u64"))
 }
 
 fn capture_run_alternation_reduction(
@@ -14085,6 +14756,22 @@ fn capture_word_run_plan_one(
     case_insensitive: bool,
     limits: &RunLimits,
 ) -> Result<Option<CaptureWordRunPlan>, ExecutionError> {
+    capture_word_run_plan_one_with_resource_policy(
+        pattern,
+        unicode,
+        case_insensitive,
+        limits,
+        false,
+    )
+}
+
+fn capture_word_run_plan_one_with_resource_policy(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+    resource_is_optional: bool,
+) -> Result<Option<CaptureWordRunPlan>, ExecutionError> {
     if case_insensitive {
         return Ok(None);
     }
@@ -14110,6 +14797,9 @@ fn capture_word_run_plan_one(
             return Ok(None);
         }
         Err(error @ CaptureWordRunBuildError::Resource { .. }) => {
+            if resource_is_optional {
+                return Ok(None);
+            }
             return Err(ExecutionError::unsupported(format!(
                 "FRE capture word-run build refused execution: {error}"
             )));
@@ -14185,6 +14875,7 @@ fn authenticate_capture_word_run_plan(
         || report.hir.class_ranges != operation.class_ranges
         || report.hir.alternatives == 0
         || report.hir.captures != report.hir.alternatives
+        || report.hir.named_captures > report.hir.captures
         || report.hir.inspection_work < report.hir.hir_nodes
         || report.persistent_bytes != core::mem::size_of::<CaptureWordRunPlan>()
         || report.peak_bytes != report.persistent_bytes
@@ -14262,145 +14953,6 @@ fn capture_word_run_record_run_limits(
         max_sequential_bytes: upper.sequential_bytes,
         max_peak_bytes: upper.peak_bytes,
     })
-}
-
-fn execute_rebar_capture_word_run_records_with_limits(
-    plan: &CaptureWordRunPlan,
-    haystack: &[u8],
-    run_limits: CaptureWordRunRecordRunLimits,
-) -> Result<u64, ExecutionError> {
-    let identity = plan.build_report().identity.record_operation;
-    let mut count = 0_u64;
-    let mut previous_line = None;
-    let mut previous_end = 0_usize;
-    let mut callback_error = None;
-    let report = plan
-        .visit_grep_capture_records(haystack, run_limits, |line_index, line_len, record| {
-            if callback_error.is_some() {
-                return;
-            }
-            if record.len() != identity.numeric_groups || record.is_empty() {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE capture word-run record changed its fixed numeric schema",
-                ));
-                return;
-            }
-            if previous_line != Some(line_index) {
-                if previous_line.is_some_and(|previous| previous >= line_index) {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE capture word-run record changed line order",
-                    ));
-                    return;
-                }
-                previous_line = Some(line_index);
-                previous_end = 0;
-            }
-            let selected = record.participating_group();
-            if selected == 0 || selected >= record.len() {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE capture word-run selected group escaped its numeric schema",
-                ));
-                return;
-            }
-            let mut overall = None;
-            let mut participating = 0_usize;
-            for group in 0..record.len() {
-                let Some(span) = record.span(group) else {
-                    continue;
-                };
-                let start = span.start;
-                let end = span.end;
-                if start > end || end > line_len {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE capture word-run participating endpoint escaped its line",
-                    ));
-                    return;
-                }
-                if group == 0 {
-                    if start < previous_end {
-                        callback_error = Some(ExecutionError::fault(
-                            "FRE capture word-run records overlapped or changed order",
-                        ));
-                        return;
-                    }
-                    overall = Some(span);
-                    previous_end = end;
-                } else if group != selected || overall != Some(span) {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE capture word-run selected group did not share the overall span",
-                    ));
-                    return;
-                }
-                participating = match participating.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        callback_error = Some(ExecutionError::fault(
-                            "FRE capture word-run participating-group count overflow",
-                        ));
-                        return;
-                    }
-                };
-                count = match count.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        callback_error = Some(ExecutionError::fault(
-                            "FRE capture word-run capture count overflow",
-                        ));
-                        return;
-                    }
-                };
-            }
-            if participating != identity.participating_groups_per_match || overall.is_none() {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE capture word-run record changed participation",
-                ));
-            }
-        })
-        .map_err(|error| match error {
-            CaptureWordRunRunError::Resource { .. } => ExecutionError::unsupported(format!(
-                "FRE capture word-run record reducer refused execution: {error}"
-            )),
-            CaptureWordRunRunError::ArithmeticOverflow { .. }
-            | CaptureWordRunRunError::AccountingInvariant { .. } => ExecutionError::fault(format!(
-                "FRE capture word-run record reducer faulted: {error}"
-            )),
-            error => ExecutionError::fault(format!(
-                "FRE capture word-run record reducer returned an unknown failure: {error}"
-            )),
-        })?;
-    if let Some(error) = callback_error {
-        return Err(error);
-    }
-    let expected_capture_events = report
-        .matches
-        .checked_mul(identity.numeric_groups)
-        .ok_or_else(|| ExecutionError::fault("capture word-run event closure overflow"))?;
-    let expected_endpoint_reads = report
-        .capture_count
-        .checked_mul(identity.endpoints_per_participating_group)
-        .ok_or_else(|| ExecutionError::fault("capture word-run endpoint closure overflow"))?;
-    let expected_reducer_events = report
-        .line_domains
-        .checked_add(report.capture_events)
-        .ok_or_else(|| ExecutionError::fault("capture word-run reducer closure overflow"))?;
-    if report.identity != identity
-        || report.input_bytes != haystack.len()
-        || usize::try_from(count) != Ok(report.capture_count)
-        || report.capture_events != expected_capture_events
-        || report.endpoint_reads != expected_endpoint_reads
-        || report.reducer_events != expected_reducer_events
-        || report.source_reads != report.sequential_bytes
-        || report.allocations != 0
-        || report.scratch_bytes != 0
-        || report.output_bytes != 0
-        || report.persistent_bytes != plan.build_report().persistent_bytes
-        || report.peak_bytes != plan.build_report().peak_bytes
-    {
-        return Err(ExecutionError::fault(
-            "FRE capture word-run record identity or accounting mismatch",
-        ));
-    }
-    Ok(count)
 }
 
 fn capture_word_run_run_limits(
@@ -24705,6 +25257,10 @@ mod tests {
                         "grep-captures",
                         CurrentFreCaptureRegex::AnchoredWordMaterialized(_),
                         CurrentFreCapturePreparation::AnchoredWordMaterialized,
+                    ) | (
+                        "grep-captures",
+                        CurrentFreCaptureRegex::FixedSchemaMaterialized(_),
+                        CurrentFreCapturePreparation::FixedSchemaMaterialized,
                     )
                 );
                 if !materialized {
@@ -32305,7 +32861,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V137);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V138);
         assert!(
             current_identity
                 .identity
@@ -32346,6 +32902,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(
             "eligibility depends only on the supplied canonical HIR, Rust-byte options, Compile operation"
         ));
+        assert!(current_identity.identity.contains(
+            "formal-fixed-schema-materialized-record-v1 admits only source-independent construction-certified unnamed fixed numeric schemas"
+        ));
+        assert!(current_identity.availability.contains(
+            "allocates a fresh exact outer CaptureRecord array and one fresh exact complete numeric-group array per record"
+        ));
+        assert!(current_identity.availability.contains(
+            "initializes every present and absent slot"
+        ));
+        assert!(current_identity.availability.contains(
+            "retains all records for one line through that line's complete materialization and inspection"
+        ));
+        assert!(current_identity.availability.contains(
+            "the whole haystack length before source access"
+        ));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V137));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V136));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V134));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V133));
@@ -35700,6 +36272,346 @@ agggtaa[cgt]|[acg]ttaccct 0
                 CurrentFreCapturePreparation::MaterializedLines(_)
             ));
         }
+    }
+
+    #[test]
+    fn formal_fixed_schema_materialization_matches_both_record_oracles_and_controls() {
+        let run_pattern = r"([A-Za-z]{5})|([A-Za-z]{3})|([A-Za-z]{2})";
+        let word_pattern = r"\b(?:([A-Za-z]{5})|([A-Za-z]{3})|([A-Za-z]{2}))\b";
+        let mixed_unit =
+            b"\n\nabcde abc ab\r\n\r\nbare\rcarriage abcde\n\xffabc zzzzz\n";
+        let mut mixed_haystack = mixed_unit.repeat(32);
+        mixed_haystack.extend_from_slice(b"\n\nfinal zzzzz");
+        let fixtures = [run_pattern, word_pattern];
+
+        for pattern in fixtures {
+            let haystack = mixed_haystack.clone();
+            let rust = rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("Rust fixed-schema reference");
+            let expected = grep_captures(&rust, &haystack, u64::MAX)
+                .expect("Rust fixed-schema grep-captures result");
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("formal fixed-schema lifecycle");
+            let CurrentFreCaptureRegex::FixedSchemaMaterialized(prepared) = &lifecycle.regex else {
+                panic!("eligible fixed schema did not select formal materialization: {pattern}")
+            };
+            assert!(matches!(
+                lifecycle.preparation,
+                CurrentFreCapturePreparation::FixedSchemaMaterialized
+            ));
+            let prospective = prepared.prospective;
+            assert!(prospective.allocations > prospective.matches);
+            assert!(prospective.scratch_bytes > 0);
+            let mut semantic_domains = 0_usize;
+            let mut saw_unmatched_slot = false;
+            for raw_line in haystack.lines_with_terminator() {
+                let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+                    without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+                } else {
+                    raw_line
+                };
+                semantic_domains += 1;
+                let (records, report) = prepared
+                    .plan
+                    .materialize_line(
+                        line,
+                        line.len() / prospective.minimum_match_bytes,
+                        prospective.numeric_groups,
+                    )
+                    .expect("direct fixed-schema semantic-line materialization");
+                let actual_records = records
+                    .iter()
+                    .map(|record| {
+                        record
+                            .groups
+                            .iter()
+                            .map(|group| {
+                                (
+                                    group.index,
+                                    group.name.clone(),
+                                    group.span.map(|span| (span.start, span.end)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let oracle_records = rust
+                    .captures_iter(Input::new(line))
+                    .map(|captures| {
+                        (0..captures.group_len())
+                            .map(|group| {
+                                (
+                                    u32::try_from(group).expect("oracle group index"),
+                                    None::<String>,
+                                    captures
+                                        .get_group(group)
+                                        .map(|span| (span.start, span.end)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual_records, oracle_records, "semantic line {line:?}");
+                assert_eq!(report.matches, actual_records.len());
+                saw_unmatched_slot |= actual_records.iter().any(|groups| {
+                    groups.iter().any(|(_, _, span)| span.is_none())
+                });
+            }
+            assert!(semantic_domains > 32);
+            assert!(saw_unmatched_slot);
+            assert_eq!(lifecycle.execute(&haystack).expect("first"), expected);
+            assert_eq!(lifecycle.execute(&haystack).expect("steady"), expected);
+
+            for fail_on_call in [0_usize, 1] {
+                fixed_schema_group_allocation_probe::arm(Some(fail_on_call));
+                let mut failing = current_fre_rebar_capture_lifecycle(
+                    "grep-captures",
+                    pattern,
+                    false,
+                    false,
+                    haystack.len(),
+                )
+                .expect("allocation-fault fixed-schema lifecycle");
+                let error = failing
+                    .execute(&haystack)
+                    .expect_err("group allocation failure publishes no scalar");
+                assert!(error.to_string().contains(
+                    "FRE fixed-schema materialization allocation failed for numeric-group array"
+                ));
+                assert_eq!(
+                    fixed_schema_group_allocation_probe::calls(),
+                    fail_on_call + 1
+                );
+                fixed_schema_group_allocation_probe::arm(None);
+            }
+
+            let reducer_needed = [
+                prospective.line_domains,
+                prospective.matches,
+                prospective.capture_count,
+                prospective.capture_events,
+                prospective.endpoint_reads,
+                prospective.allocations,
+            ]
+            .into_iter()
+            .max()
+            .expect("nonempty fixed-schema reducer dimensions");
+            let reducer_exact =
+                u64::try_from(reducer_needed).expect("fixed-schema reducer bound fits u64");
+            let admission_limits = [
+                (
+                    "work",
+                    RunLimits {
+                        fre_aggregate_operation_work: prospective.work,
+                        ..RunLimits::default()
+                    },
+                    RunLimits {
+                        fre_aggregate_operation_work: prospective.work - 1,
+                        ..RunLimits::default()
+                    },
+                ),
+                (
+                    "sequential",
+                    RunLimits {
+                        fre_aggregate_sequential_bytes: prospective.sequential_bytes,
+                        ..RunLimits::default()
+                    },
+                    RunLimits {
+                        fre_aggregate_sequential_bytes: prospective.sequential_bytes - 1,
+                        ..RunLimits::default()
+                    },
+                ),
+                (
+                    "scratch",
+                    RunLimits {
+                        fre_aggregate_scratch_bytes: prospective.scratch_bytes,
+                        ..RunLimits::default()
+                    },
+                    RunLimits {
+                        fre_aggregate_scratch_bytes: prospective.scratch_bytes - 1,
+                        ..RunLimits::default()
+                    },
+                ),
+                (
+                    "peak",
+                    RunLimits {
+                        fre_aggregate_peak_bytes: prospective.peak_bytes,
+                        ..RunLimits::default()
+                    },
+                    RunLimits {
+                        fre_aggregate_peak_bytes: prospective.peak_bytes - 1,
+                        ..RunLimits::default()
+                    },
+                ),
+                (
+                    "reducer events",
+                    RunLimits {
+                        reducer_steps: reducer_exact,
+                        ..RunLimits::default()
+                    },
+                    RunLimits {
+                        reducer_steps: reducer_exact - 1,
+                        ..RunLimits::default()
+                    },
+                ),
+            ];
+            for (resource, exact, one_below) in admission_limits {
+                let exact = current_fre_rebar_capture_lifecycle_with_limits(
+                    "grep-captures",
+                    pattern,
+                    false,
+                    false,
+                    haystack.len(),
+                    exact,
+                )
+                .unwrap_or_else(|error| panic!("exact {resource} admission failed: {error}"));
+                assert!(matches!(
+                    &exact.regex,
+                    CurrentFreCaptureRegex::FixedSchemaMaterialized(_)
+                ));
+                let one_below = current_fre_rebar_capture_lifecycle_with_limits(
+                    "grep-captures",
+                    pattern,
+                    false,
+                    false,
+                    haystack.len(),
+                    one_below,
+                )
+                .unwrap_or_else(|error| panic!("one-below {resource} fallback failed: {error}"));
+                assert!(matches!(
+                    &one_below.regex,
+                    CurrentFreCaptureRegex::General(_)
+                ));
+                assert!(matches!(
+                    one_below.preparation,
+                    CurrentFreCapturePreparation::MaterializedLines(_)
+                ));
+            }
+
+            let mut forced_runtime = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("selected fixed-schema runtime-refusal control");
+            forced_runtime.limits.fre_aggregate_operation_work = haystack.len() - 1;
+            let error = forced_runtime
+                .execute(&haystack)
+                .expect_err("selected one-below runtime publishes no scalar");
+            assert!(error.to_string().contains(
+                "FRE fixed-schema materialized record identity or P/A closure failed"
+            ));
+            assert!(matches!(
+                &forced_runtime.regex,
+                CurrentFreCaptureRegex::FixedSchemaMaterialized(_)
+            ));
+
+            for (control, unicode, case_insensitive, haystack_len) in [
+                ("small", false, false, mixed_unit.len()),
+                ("case-insensitive", false, true, haystack.len()),
+                ("Unicode", true, false, haystack.len()),
+            ] {
+                let control_lifecycle = current_fre_rebar_capture_lifecycle(
+                    "grep-captures",
+                    pattern,
+                    unicode,
+                    case_insensitive,
+                    haystack_len,
+                )
+                .unwrap_or_else(|error| panic!("{control} control failed: {error}"));
+                assert!(matches!(
+                    &control_lifecycle.regex,
+                    CurrentFreCaptureRegex::General(_)
+                ));
+            }
+        }
+
+        let unicode_word_haystack = mixed_haystack.clone();
+        let unicode_word = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            word_pattern,
+            true,
+            false,
+            unicode_word_haystack.len(),
+        )
+        .expect("Unicode word-run control retains exact General records");
+        assert!(matches!(
+            &unicode_word.regex,
+            CurrentFreCaptureRegex::General(_)
+        ));
+        assert!(matches!(
+            unicode_word.preparation,
+            CurrentFreCapturePreparation::MaterializedLines(_)
+        ));
+
+        for pattern in [
+            r"(?P<long>[A-Za-z]{5})|(?P<medium>[A-Za-z]{3})|(?P<short>[A-Za-z]{2})",
+            r"\b(?:(?P<long>[A-Za-z]{5})|(?P<medium>[A-Za-z]{3})|(?P<short>[A-Za-z]{2}))\b",
+        ] {
+            let haystack = mixed_haystack.clone();
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("named fixed-schema control");
+            assert!(matches!(
+                &lifecycle.regex,
+                CurrentFreCaptureRegex::General(_)
+            ));
+            let rust = rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("Rust named fixed-schema reference");
+            let expected =
+                grep_captures(&rust, &haystack, u64::MAX).expect("Rust named fixed-schema result");
+            assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+        }
+
+        let duplicate_pattern =
+            r"\b(?:([A-Za-z]{3})|([A-Za-z]{3})|([A-Za-z]{2}))\b";
+        let duplicate_haystack = b"abc xyz ab\n".repeat(128);
+        let duplicate_lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            duplicate_pattern,
+            false,
+            false,
+            duplicate_haystack.len(),
+        )
+        .expect("duplicate-length word-run lifecycle");
+        let CurrentFreCaptureRegex::FixedSchemaMaterialized(prepared) =
+            &duplicate_lifecycle.regex
+        else {
+            panic!("duplicate-length word-run did not select fixed-schema records")
+        };
+        let line = b"abc xyz ab";
+        let (records, _) = prepared
+            .plan
+            .materialize_line(
+                line,
+                line.len() / prepared.prospective.minimum_match_bytes,
+                prepared.prospective.numeric_groups,
+            )
+            .expect("duplicate-length word-run records");
+        let mut three_byte_records = 0_usize;
+        for record in &records {
+            let overall = record.groups[0].span.expect("duplicate whole match");
+            if overall.end - overall.start == 3 {
+                three_byte_records += 1;
+                assert_eq!(record.groups[1].span, Some(overall));
+                assert_eq!(record.groups[2].span, None);
+                assert_eq!(record.groups[3].span, None);
+            }
+        }
+        assert_eq!(three_byte_records, 2);
     }
 
     #[test]
