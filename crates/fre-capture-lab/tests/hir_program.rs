@@ -67,6 +67,31 @@ fn direct_hir_build_preserves_named_nested_repeated_and_unmatched_groups() {
 }
 
 #[test]
+fn hir_build_returns_an_atomic_opaque_first_byte_proof() {
+    const ASCII_ALPHA_WORDS: [u64; 4] = [
+        0,
+        (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
+        0,
+        0,
+    ];
+
+    let hir = parse(r"[A-Za-z]+", false, false, false, b'\n');
+    let built = build_program_from_hir(&hir, b'\n', HirProgramBuildLimits::default())
+        .expect("ASCII alphabetic HIR build");
+    let report_before = built.report().clone();
+    let (program, report, proof) = built.into_parts_with_first_byte_proof();
+    assert_eq!(report, report_before);
+    assert_eq!(program.build_report(), &report.program);
+    assert!(proof.equals_nonnullable_words(ASCII_ALPHA_WORDS));
+
+    let nullable = parse(r"[A-Za-z]*", false, false, false, b'\n');
+    let nullable = build_program_from_hir(&nullable, b'\n', HirProgramBuildLimits::default())
+        .expect("nullable ASCII alphabetic HIR build");
+    let (_, _, proof) = nullable.into_parts_with_first_byte_proof();
+    assert!(!proof.equals_nonnullable_words(ASCII_ALPHA_WORDS));
+}
+
+#[test]
 fn direct_hir_build_preserves_custom_line_assertions_and_invalid_bytes() {
     let hir = parse(
         r"^(?P<raw>[\x80-\xFF]+)(?P<optional>x)?$",

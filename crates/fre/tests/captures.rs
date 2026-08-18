@@ -15,6 +15,15 @@ use regex::bytes::RegexBuilder;
 type GroupFixture = (u32, Option<String>, Option<(usize, usize)>);
 type CaptureFixture = Vec<GroupFixture>;
 
+fn iteration_start_classifier_receipt(
+    regex: &fre::CaptureRegex,
+) -> fre::CaptureIterationStartClassifierReceipt {
+    *regex
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt()
+}
+
 fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
     let regex = RegexBuilder::new(pattern)
         .unicode(false)
@@ -2869,8 +2878,13 @@ fn unicode_capture_classes_and_admitted_contextual_looks_execute() {
         .accounting
         .count;
     assert_eq!(actual, reference);
+    let classifier_receipt = iteration_start_classifier_receipt(&regex);
+    assert_eq!(
+        classifier_receipt.work_after(),
+        regex.build_report().hir.work
+    );
     let hir_starved = fre::CaptureBuildLimits {
-        max_hir_work: regex.build_report().hir.work.saturating_sub(1),
+        max_hir_work: classifier_receipt.work_before().saturating_sub(1),
         ..fre::CaptureBuildLimits::default()
     };
     assert!(matches!(
@@ -3144,18 +3158,33 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
             > nullable_without_proof.build_report().hir.work,
         "unsuccessful optional proof traversal must remain in cumulative compiler work"
     );
-    let nullable_exact_work = nullable_with_proof.build_report().hir.work;
-    build(
+    let nullable_receipt = iteration_start_classifier_receipt(&nullable_with_proof);
+    assert_eq!(
+        nullable_receipt.work_after(),
+        nullable_with_proof.build_report().hir.work
+    );
+    let nullable_mandatory_work = nullable_receipt.work_before();
+    let nullable_exact = build(
         "(?:AB|)",
         CaptureRequiredLiteralBuildLimits::default(),
-        nullable_exact_work,
+        nullable_mandatory_work,
     )
-    .expect("exact cumulative nullable HIR-work limit");
+    .expect("exact mandatory nullable HIR-work limit");
+    let nullable_exact_receipt = iteration_start_classifier_receipt(&nullable_exact);
+    assert_eq!(
+        nullable_exact_receipt.outcome(),
+        fre::CaptureIterationStartClassifierOutcome::NotAttempted
+    );
+    assert_eq!(nullable_exact_receipt.charged_work(), 0);
+    assert_eq!(
+        nullable_exact.build_report().hir.work,
+        nullable_mandatory_work
+    );
     assert!(
         build(
             "(?:AB|)",
             CaptureRequiredLiteralBuildLimits::default(),
-            nullable_exact_work - 1,
+            nullable_mandatory_work - 1,
         )
         .is_err()
     );
@@ -3300,25 +3329,46 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
             .accounting
             .count
     );
-    let raw_exact_hir_work = fallback.build_report().hir.work;
-    build(&raw64_effective2, post_loop_refusal, raw_exact_hir_work)
-        .expect("exact cumulative post-loop fallback HIR work");
+    let raw_receipt = iteration_start_classifier_receipt(&fallback);
+    assert_eq!(raw_receipt.work_after(), fallback.build_report().hir.work);
+    let raw_mandatory_hir_work = raw_receipt.work_before();
+    let raw_exact = build(&raw64_effective2, post_loop_refusal, raw_mandatory_hir_work)
+        .expect("exact mandatory post-loop fallback HIR work");
+    assert_eq!(
+        iteration_start_classifier_receipt(&raw_exact).outcome(),
+        fre::CaptureIterationStartClassifierOutcome::NotAttempted
+    );
     assert!(
-        build(&raw64_effective2, post_loop_refusal, raw_exact_hir_work - 1,).is_err(),
-        "one-below cumulative post-loop fallback HIR work must refuse"
+        build(
+            &raw64_effective2,
+            post_loop_refusal,
+            raw_mandatory_hir_work - 1,
+        )
+        .is_err(),
+        "one-below mandatory post-loop fallback HIR work must refuse"
     );
 
-    build(
+    let baseline_receipt = iteration_start_classifier_receipt(&baseline);
+    assert_eq!(
+        baseline_receipt.work_after(),
+        baseline.build_report().hir.work
+    );
+    let baseline_mandatory_hir_work = baseline_receipt.work_before();
+    let baseline_exact = build(
         "(?:AB|CD)",
         CaptureRequiredLiteralBuildLimits::default(),
-        baseline.build_report().hir.work,
+        baseline_mandatory_hir_work,
     )
-    .expect("exact cumulative HIR-work limit");
+    .expect("exact mandatory HIR-work limit");
+    assert_eq!(
+        iteration_start_classifier_receipt(&baseline_exact).outcome(),
+        fre::CaptureIterationStartClassifierOutcome::NotAttempted
+    );
     assert!(
         build(
             "(?:AB|CD)",
             CaptureRequiredLiteralBuildLimits::default(),
-            baseline.build_report().hir.work - 1,
+            baseline_mandatory_hir_work - 1,
         )
         .is_err()
     );

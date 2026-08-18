@@ -7,9 +7,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureProfile,
-    CaptureGroupSlot, CaptureRecord, Greed, GroupRecord, HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION,
-    HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION, HistoryRegex, InlineRegex,
+    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureGroupSlot,
+    CaptureProfile, CaptureRecord, Greed, GroupRecord, HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION,
+    HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION, HistoryRegex, InlineRegex, MaskedInclusiveRange,
     MatchKind as CaptureMatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind,
     SearchConfig, SearchError, SearchLimits, Span, Window,
 };
@@ -2114,13 +2114,7 @@ fn history_start_ceiling_is_an_explicit_filtered_domain() {
     let miss = b"xxxxxx";
     let miss_window = Window::all(miss);
     let ordinary_miss = history
-        .captures_from_with_config(
-            miss,
-            miss_window,
-            0,
-            SearchConfig::LEFTMOST,
-            limits,
-        )
+        .captures_from_with_config(miss, miss_window, 0, SearchConfig::LEFTMOST, limits)
         .unwrap();
     let capped_miss = history
         .captures_from_with_config_start_ceiling(
@@ -2177,7 +2171,10 @@ fn history_start_ceiling_is_an_explicit_filtered_domain() {
     assert_eq!(empty.report.history_nodes, 0);
     assert_eq!(empty.report.starts_injected, 0);
     assert_eq!(empty.report.bytes_examined, 0);
-    assert_eq!(empty.report.admitted_scratch_bytes, prospective.scratch_bytes);
+    assert_eq!(
+        empty.report.admitted_scratch_bytes,
+        prospective.scratch_bytes
+    );
 
     let cutoff_from = 7;
     let cutoff = 4;
@@ -2197,7 +2194,10 @@ fn history_start_ceiling_is_an_explicit_filtered_domain() {
     assert_eq!(empty.report.history_nodes, 0);
     assert_eq!(empty.report.starts_injected, 0);
     assert_eq!(empty.report.bytes_examined, 0);
-    assert_eq!(empty.report.admitted_scratch_bytes, prospective.scratch_bytes);
+    assert_eq!(
+        empty.report.admitted_scratch_bytes,
+        prospective.scratch_bytes
+    );
 
     let exact_admission = SearchLimits {
         max_state_visits: prospective.state_visits,
@@ -2267,11 +2267,229 @@ fn history_start_ceiling_is_an_explicit_filtered_domain() {
 }
 
 #[test]
+fn history_masked_start_filter_restricts_only_new_roots() {
+    let ast = Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'-'), Ast::Byte(b'b')]).capture(1);
+    let history = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let classifier = MaskedInclusiveRange::new(0x20, b'a', b'z').expect("ordered ASCII range");
+    assert!(MaskedInclusiveRange::new(0, b'z', b'a').is_none());
+    for byte in 0_u8..=u8::MAX {
+        assert_eq!(classifier.matches(byte), byte.is_ascii_alphabetic());
+    }
+
+    let haystack = b"--a-b--";
+    let window = Window::all(haystack);
+    let limits = SearchLimits::default();
+    let baseline = history
+        .captures_from_with_config(haystack, window, 0, SearchConfig::LEFTMOST, limits)
+        .unwrap();
+    let filtered = history
+        .captures_from_with_config_start_ceiling_filtered(
+            haystack,
+            window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(window.end),
+            classifier,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(filtered.captures, baseline.captures);
+    assert_eq!(
+        filtered.captures.as_ref().and_then(CaptureRecord::overall),
+        Some(Span { start: 2, end: 5 })
+    );
+    assert!(filtered.report.state_visits < baseline.report.state_visits);
+    assert!(filtered.report.history_nodes < baseline.report.history_nodes);
+    assert!(filtered.report.starts_injected < baseline.report.starts_injected);
+    assert_eq!(
+        filtered.report.bytes_examined,
+        baseline.report.bytes_examined
+    );
+
+    let tight_ceiling = history
+        .captures_from_with_config_start_ceiling_filtered(
+            haystack,
+            window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(2),
+            classifier,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(
+        tight_ceiling
+            .captures
+            .as_ref()
+            .and_then(CaptureRecord::overall),
+        Some(Span { start: 2, end: 5 }),
+        "the root at the ceiling must finish through an unrestricted live thread"
+    );
+    let one_below_ceiling = history
+        .captures_from_with_config_start_ceiling_filtered(
+            haystack,
+            window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(1),
+            classifier,
+            limits,
+        )
+        .unwrap();
+    assert!(one_below_ceiling.captures.is_none());
+
+    let false_classifier = MaskedInclusiveRange::new(0, b'0', b'9').expect("ordered digit range");
+    let restricted = history
+        .captures_from_with_config_start_ceiling_filtered(
+            haystack,
+            window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(window.end),
+            false_classifier,
+            limits,
+        )
+        .unwrap();
+    assert!(restricted.captures.is_none());
+
+    // A punctuation rejection with no live thread cannot be treated as
+    // future-domain exhaustion: the later alphabetic root must still match.
+    let later = b"-a-b";
+    let later_window = Window::all(later);
+    let later_filtered = history
+        .captures_from_with_config_start_ceiling_filtered(
+            later,
+            later_window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(later_window.end),
+            classifier,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(
+        later_filtered
+            .captures
+            .as_ref()
+            .and_then(CaptureRecord::overall),
+        Some(Span { start: 1, end: 4 })
+    );
+
+    // Validation and incumbent history admission still precede the admitted
+    // empty filtered domain.
+    let empty = b"";
+    let empty_window = Window::all(empty);
+    let prospective = history.search_prospective(empty_window, 0).unwrap();
+    let empty_outcome = history
+        .captures_from_with_config_start_ceiling_filtered(
+            empty,
+            empty_window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(0),
+            classifier,
+            limits,
+        )
+        .unwrap();
+    assert!(empty_outcome.captures.is_none());
+    assert_eq!(empty_outcome.report.state_visits, 0);
+    assert_eq!(empty_outcome.report.starts_injected, 0);
+    assert_eq!(
+        empty_outcome.report.admitted_scratch_bytes,
+        prospective.scratch_bytes
+    );
+    let exact_admission = SearchLimits {
+        max_state_visits: prospective.state_visits,
+        max_history_nodes: prospective.history_nodes,
+        max_history_walk: prospective.history_walk,
+        max_scratch_bytes: prospective.scratch_bytes,
+        ..limits
+    };
+    let empty_search = |limits| {
+        history.captures_from_with_config_start_ceiling_filtered(
+            empty,
+            empty_window,
+            0,
+            SearchConfig::LEFTMOST,
+            Some(0),
+            classifier,
+            limits,
+        )
+    };
+    let one_below = prospective.state_visits - 1;
+    assert_eq!(
+        empty_search(SearchLimits {
+            max_state_visits: one_below,
+            ..exact_admission
+        }),
+        Err(SearchError::Resource {
+            kind: ResourceKind::StateVisits,
+            required: prospective.state_visits,
+            limit: one_below,
+        })
+    );
+    let one_below = prospective.history_nodes - 1;
+    assert_eq!(
+        empty_search(SearchLimits {
+            max_history_nodes: one_below,
+            ..exact_admission
+        }),
+        Err(SearchError::Resource {
+            kind: ResourceKind::HistoryNodes,
+            required: prospective.history_nodes,
+            limit: one_below,
+        })
+    );
+    let one_below = prospective.history_walk - 1;
+    assert_eq!(
+        empty_search(SearchLimits {
+            max_history_walk: one_below,
+            ..exact_admission
+        }),
+        Err(SearchError::Resource {
+            kind: ResourceKind::HistoryWalk,
+            required: prospective.history_walk,
+            limit: one_below,
+        })
+    );
+    let one_below = prospective.scratch_bytes - 1;
+    assert_eq!(
+        empty_search(SearchLimits {
+            max_scratch_bytes: one_below,
+            ..exact_admission
+        }),
+        Err(SearchError::Resource {
+            kind: ResourceKind::ScratchBytes,
+            required: prospective.scratch_bytes,
+            limit: one_below,
+        })
+    );
+
+    assert_eq!(
+        history.captures_from_with_config_start_ceiling_filtered(
+            empty,
+            Window { start: 1, end: 0 },
+            0,
+            SearchConfig::LEFTMOST,
+            None,
+            classifier,
+            SearchLimits {
+                max_state_visits: 0,
+                max_history_nodes: 0,
+                max_history_walk: 0,
+                max_scratch_bytes: 0,
+                ..limits
+            },
+        ),
+        Err(SearchError::InvalidWindow),
+        "window validation precedes admission and an empty filtered domain"
+    );
+}
+
+#[test]
 fn retained_history_workspace_reuses_exact_group_slots_transactionally() {
     let ast = Ast::concat([
-        Ast::Byte(b'a')
-            .capture(1)
-            .repeat(0, Some(1), Greed::Greedy),
+        Ast::Byte(b'a').capture(1).repeat(0, Some(1), Greed::Greedy),
         Ast::Empty.capture(2),
         Ast::Byte(b'b'),
     ]);

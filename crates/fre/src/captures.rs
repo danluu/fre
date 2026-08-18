@@ -23,8 +23,9 @@ use fre_capture_lab::{
     CaptureGroupSlot, CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting,
     CaptureStreamDomains,
     CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
-    CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, HirProgramBuildError,
-    HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex, HistorySearchProspective,
+    CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, FirstByteProof,
+    HirProgramBuildError, HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex,
+    HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
     OnePassCapturePlan, OnePassCaptureWorkspace, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
@@ -65,9 +66,11 @@ use crate::capture_count_seal::{
 };
 use crate::capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
+    CAPTURE_ITERATION_ASCII_FOLD_RANGE, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
     CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
+    CaptureIterationStartClassifierOutcome, CaptureIterationStartClassifierReceipt,
 };
 use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
@@ -1863,6 +1866,48 @@ struct OptionalOnePassCaptureBuild {
     compile_work: usize,
 }
 
+const CAPTURE_ITERATION_ASCII_FOLD_WORDS: [u64; 4] = [
+    0,
+    (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
+    0,
+    0,
+];
+
+fn project_capture_iteration_start_classifier(
+    proof: FirstByteProof,
+    accounting: &mut CaptureHirAccounting,
+    max_hir_work: usize,
+) -> CaptureIterationStartClassifierReceipt {
+    let work_before = accounting.work;
+    let Some(work_after) = work_before
+        .checked_add(CAPTURE_ITERATION_START_CLASSIFIER_WORK)
+        .filter(|&work| work <= max_hir_work)
+    else {
+        return CaptureIterationStartClassifierReceipt::new(
+            work_before,
+            0,
+            work_before,
+            CaptureIterationStartClassifierOutcome::NotAttempted,
+        );
+    };
+
+    // This is the last HIR-budget transaction. The candidate and its exact
+    // four-word image are predetermined, so the fixed ledger is one attempt
+    // plus four comparisons with no scan, inference or allocation.
+    accounting.work = work_after;
+    let outcome = if proof.equals_nonnullable_words(CAPTURE_ITERATION_ASCII_FOLD_WORDS) {
+        CaptureIterationStartClassifierOutcome::Selected(CAPTURE_ITERATION_ASCII_FOLD_RANGE)
+    } else {
+        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+    };
+    CaptureIterationStartClassifierReceipt::new(
+        work_before,
+        CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+        work_after,
+        outcome,
+    )
+}
+
 fn build_optional_onepass_capture(
     program: Arc<Program>,
     engine_report: &EngineBuildReport,
@@ -2519,7 +2564,8 @@ impl CaptureBuilder {
             accounting,
         )
         .map_err(capture_hir_program_build_error)?;
-        let (program, hir_program_report) = hir_program.into_parts();
+        let (program, hir_program_report, first_byte_proof) =
+            hir_program.into_parts_with_first_byte_proof();
         accounting = hir_program_report.hir;
         let engine_report = hir_program_report.program;
         let program = Arc::new(program);
@@ -2533,6 +2579,11 @@ impl CaptureBuilder {
         };
         let onepass_capture = onepass_capture_build.plan;
         let onepass_capture_compile_work = onepass_capture_build.compile_work;
+        let iteration_start_classifier = project_capture_iteration_start_classifier(
+            first_byte_proof,
+            &mut accounting,
+            limits.max_hir_work,
+        );
         let participation_quotient = if ordered_root_capture_many.is_none()
             && prefix_class_participation.plan.is_none()
             && uniform_participating_captures.is_none()
@@ -2719,19 +2770,22 @@ impl CaptureBuilder {
             }
             _ => None,
         };
-        let iteration_owner = CaptureIterationOwnerSeal::new(CaptureIterationRouteIdentity {
-            syntax: Arc::clone(&plan_identity.syntax),
-            capture_profile: plan_identity.capture_profile,
-            operation: CaptureIterationOperation::MaterializeCaptureArray,
-            plan: CaptureIterationPlanKind::RestartedPersistentHistory,
-            backend: CaptureIterationBackend::PersistentHistory,
-            engine_shape: program.history_program_shape(),
-            minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
-            build_limits: limits,
-            algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
-            accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
-            declared_fallback: CaptureIterationDeclaredFallback::None,
-        });
+        let iteration_owner = CaptureIterationOwnerSeal::new(
+            CaptureIterationRouteIdentity {
+                syntax: Arc::clone(&plan_identity.syntax),
+                capture_profile: plan_identity.capture_profile,
+                operation: CaptureIterationOperation::MaterializeCaptureArray,
+                plan: CaptureIterationPlanKind::RestartedPersistentHistory,
+                backend: CaptureIterationBackend::PersistentHistory,
+                engine_shape: program.history_program_shape(),
+                minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
+                build_limits: limits,
+                algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
+                accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
+                declared_fallback: CaptureIterationDeclaredFallback::None,
+            },
+            iteration_start_classifier,
+        );
         let report = CaptureBuildReport {
             admission,
             syntax,
@@ -4958,6 +5012,9 @@ impl CaptureRegex {
         let minimum_match_bytes = self.iteration_owner.identity().minimum_match_bytes;
         let maximum_start = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
             .then(|| window.end.checked_sub(minimum_match_bytes));
+        let start_classifier = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
+            .then(|| self.iteration_owner.start_classifier_receipt().classifier())
+            .flatten();
 
         let mut captures = Vec::new();
         let mut total_state_visits = 0_usize;
@@ -5032,7 +5089,25 @@ impl CaptureRegex {
                     })?,
             );
 
-            let outcome = if let Some(maximum_start) = maximum_start {
+            let outcome = if let (Some(maximum_start), Some(start_classifier)) =
+                (maximum_start, start_classifier)
+            {
+                // The opaque first-byte proof was returned atomically with the
+                // same program, then selected only after incumbent one-pass
+                // construction. Exact set equality makes this restricted root
+                // domain equivalent for an ordinary positive-width LEFTMOST
+                // search; already-live threads remain unrestricted.
+                self.engine
+                    .captures_from_with_config_start_ceiling_filtered(
+                        haystack,
+                        window,
+                        cursor,
+                        config,
+                        maximum_start,
+                        start_classifier,
+                        per_search,
+                    )
+            } else if let Some(maximum_start) = maximum_start {
                 // The immutable iteration owner binds this byte minimum to the
                 // same canonical HIR and engine program. Therefore no complete
                 // match can begin after this inclusive ceiling. The low-level
