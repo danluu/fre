@@ -270,11 +270,13 @@ const FRE_ADAPTER_V135: &str =
     "fre-current-aggregate-capture-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V136: &str =
     "fre-current-aggregate-capture-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V137: &str =
+    "fre-current-aggregate-capture-v137-formal-url-only-compile-owner-v1-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V136
+    FRE_ADAPTER_V137
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -593,7 +595,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V136
+        FRE_ADAPTER_V137
     }
 
     #[allow(
@@ -611,7 +613,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V136.to_string(),
+            adapter: FRE_ADAPTER_V137.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1008,6 +1010,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; a compile plan label or detached verifier cannot authenticate formal compile evidence by itself; the retained timed artifact and the independent complete-bound lifecycle must both execute the supplied haystack and publish the same reducer",
         );
         identity.identity.push_str(
+            "; formal-url-only-compile-owner-v1 permits the existing strict canonical URL HIR certificate and exact ordered-TLD plan to become the complete semantic owner only for a fresh one-pattern Compile artifact with reverse-sequential verification, retaining a construction-accounted folded ordered-language identity and separately domain-authenticated minimal fail-closed continuation shell instead of lowering the redundant full program",
+        );
+        identity.availability.push_str(
+            "; eligibility depends only on the supplied canonical HIR, Rust-byte options, Compile operation, requested ReverseSequentialRows strategy, and finite construction policy; parsing, full HIR validation, URL certification, exact trie and ordered-language identity construction, accounting, sealing, and publication all remain inside each timed construct, ineligible HIRs and other strategies retain full continuation lowering, Count and CountSpans construction are unchanged, the URL-only artifact permits only sealed reverse-sequential Count verification, and formal qualification still executes both that retained owner and the independently built complete-match verifier on the supplied haystack outside the compile timer without benchmark names, fixture hashes, expected values, or source-dependent plan selection",
+        );
+        identity.identity.push_str(
             "; formal-ordered-many-workload-intrinsic-quarantine-v1 disables the ASCII word-shadow pruning theorem and every continuation workload intrinsic in formal multi-pattern builds while retaining complete ordered span enumeration",
         );
         identity.availability.push_str(
@@ -1065,18 +1073,22 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; the public composed adapter supersedes ");
-        identity.availability.push_str(FRE_ADAPTER_V135);
+        identity.availability.push_str(FRE_ADAPTER_V136);
         identity
             .availability
             .push_str(" which extends ");
-        identity.availability.push_str(FRE_ADAPTER_V134);
+        identity.availability.push_str(FRE_ADAPTER_V135);
         identity
             .availability
             .push_str(" while retaining the anchored-capture composition of ");
-        identity.availability.push_str(FRE_ADAPTER_V133);
+        identity.availability.push_str(FRE_ADAPTER_V134);
         identity
             .availability
             .push_str(" while preserving the complete-span routes of ");
+        identity.availability.push_str(FRE_ADAPTER_V133);
+        identity
+            .availability
+            .push_str(" while preserving the compact complete-span routes of ");
         identity.availability.push_str(FRE_ADAPTER_V132);
         identity
             .availability
@@ -5108,6 +5120,14 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         AggregateBuildAccounting::Continuation(compile)
             if compile.url_aggregate_plans == 1
     ) && report.authenticates_url_aggregate_identity();
+    let url_compile_owner = matches!(
+        (model, report.operation, report.build),
+        (
+            "compile",
+            AggregateOperation::Compile,
+            AggregateBuildAccounting::Continuation(compile)
+        ) if compile.url_only_compile_artifacts == 1
+    );
     let url_route = report.continuation_strategy == Some(AggregateStrategy::ReverseSequentialRows)
         && matches!(
             (model, report.operation),
@@ -5117,7 +5137,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
                     AggregateOperation::SpanSum | AggregateOperation::Spans
                 )
         );
-    if url_plan && (model == "compile" || url_route) {
+    if url_plan && (url_compile_owner || url_route) {
         return if model == "compile" {
             "compile-aggregate-url"
         } else {
@@ -8423,7 +8443,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V136
+        if receipt.adapter == FRE_ADAPTER_V137
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -18886,11 +18906,19 @@ fn aggregate_run_limits_with_fixed_absolute(
             )?,
         }),
         AggregateBuildAccounting::Continuation(compile) => {
+            let url_owner_matches_operation = match report.operation {
+                AggregateOperation::Compile => compile.url_only_compile_artifacts == 1,
+                AggregateOperation::Count
+                | AggregateOperation::SpanSum
+                | AggregateOperation::Spans => compile.url_only_compile_artifacts == 0,
+            };
             if report.authenticates_url_aggregate_identity()
+                && url_owner_matches_operation
                 && report.continuation_strategy == Some(AggregateStrategy::ReverseSequentialRows)
                 && matches!(
                     report.operation,
-                    AggregateOperation::Count
+                    AggregateOperation::Compile
+                        | AggregateOperation::Count
                         | AggregateOperation::SpanSum
                         | AggregateOperation::Spans
                 )
@@ -31443,7 +31471,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .strategy(AggregateStrategy::ReverseSequentialRows)
     }
 
-    fn assert_formal_rebar_quarantines_url_intrinsic_and_matches_oracle() {
+    fn assert_formal_rebar_url_owner_is_compile_only_and_matches_oracle() {
         const PATTERN: &str = r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){0,62}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){0,62}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:COM|ORG|XN--P1AI))(?::\d{2,5})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)";
         let haystack = b"noise HTTP://1.2.3.4 https://u:p@a.b.org/path?q xn--a.com ftp://a.com:8080/x#y\ninvalid://x.com trailing";
         let oracle = regex::bytes::RegexBuilder::new(PATTERN)
@@ -31482,50 +31510,203 @@ agggtaa[cgt]|[acg]ttaccct 0
         let spans = current_fre_rebar_aggregate_builder(PATTERN, false, true)
             .build_spans()
             .unwrap();
-        for report in [
-            compile.build_report(),
-            count.build_report(),
-            spans.build_report(),
+        let span_sum = current_fre_rebar_aggregate_builder(PATTERN, false, true)
+            .build_span_sum()
+            .unwrap();
+        for (operation, report) in [
+            ("compile", compile.build_report()),
+            ("count", count.build_report()),
+            ("spans", spans.build_report()),
+            ("span-sum", span_sum.build_report()),
         ] {
             assert!(
-                !report
+                report
                     .build_limits
                     .continuation
                     .allow_workload_specific_intrinsics
             );
-            assert!(!report.authenticates_url_aggregate_identity());
-            if let AggregateBuildAccounting::Continuation(compile) = report.build {
-                assert_eq!(compile.url_aggregate_plans, 0);
-            }
+            assert!(
+                report.authenticates_url_aggregate_identity(),
+                "{operation} did not authenticate its URL aggregate identity: {:?}",
+                report.build
+            );
         }
+        let AggregateBuildAccounting::Continuation(compile_accounting) =
+            compile.build_report().build
+        else {
+            panic!("formal URL Compile did not retain continuation accounting")
+        };
+        let AggregateBuildAccounting::Continuation(count_accounting) = count.build_report().build
+        else {
+            panic!("formal URL Count did not retain continuation accounting")
+        };
+        let AggregateBuildAccounting::Continuation(spans_accounting) = spans.build_report().build
+        else {
+            panic!("formal URL Spans did not retain continuation accounting")
+        };
+        let AggregateBuildAccounting::Continuation(span_sum_accounting) =
+            span_sum.build_report().build
+        else {
+            panic!("formal URL SpanSum did not retain continuation accounting")
+        };
+        assert_eq!(compile_accounting.url_only_compile_artifacts, 1);
+        assert_eq!(compile_accounting.program_states, 2);
+        assert_eq!(count_accounting.url_only_compile_artifacts, 0);
+        assert_eq!(spans_accounting.url_only_compile_artifacts, 0);
+        assert_eq!(span_sum_accounting.url_only_compile_artifacts, 0);
+        assert_eq!(
+            aggregate_single_plan_label("compile", compile.build_report()),
+            "compile-aggregate-url"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("count", count.build_report()),
+            "aggregate-url"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("count-spans", spans.build_report()),
+            "aggregate-url"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("count-spans", span_sum.build_report()),
+            "aggregate-url"
+        );
+
+        let compile_limits =
+            current_fre_rebar_compile_run_limits(haystack.len(), &compile).unwrap();
+        let compile_result = compile.verify_count(haystack, &compile_limits).unwrap();
+        assert_eq!(compile_result.value(), expected_count);
+        let AggregateExecutionDetails::Continuation { certificate, .. } =
+            compile_result.report().details()
+        else {
+            panic!("formal URL Compile verification did not publish continuation details")
+        };
+        assert_eq!(
+            certificate.physical_route,
+            fre::AggregateOperationPhysicalRoute::UrlAggregate
+        );
+        assert_eq!(
+            span_sum
+                .span_sum(haystack, fre::AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            expected_span_sum
+        );
+
+        let intrinsics_off = generic_url_aggregate_builder(PATTERN, true)
+            .workload_specific_intrinsics(false)
+            .build_compile()
+            .unwrap();
+        let AggregateBuildAccounting::Continuation(intrinsics_off_accounting) =
+            intrinsics_off.build_report().build
+        else {
+            panic!("intrinsics-off URL Compile did not retain continuation accounting")
+        };
+        assert_eq!(intrinsics_off_accounting.url_aggregate_plans, 0);
+        assert_eq!(intrinsics_off_accounting.url_only_compile_artifacts, 0);
+        assert!(intrinsics_off_accounting.program_states > 2);
+        let intrinsics_off_limits =
+            current_fre_rebar_compile_run_limits(haystack.len(), &intrinsics_off).unwrap();
+        assert_eq!(
+            intrinsics_off
+                .verify_count(haystack, &intrinsics_off_limits)
+                .unwrap()
+                .value(),
+            expected_count
+        );
 
         let patterns = [PATTERN.to_string()];
-        for (model, expected) in [
-            ("compile", expected_count),
-            ("count", expected_count),
-            ("count-spans", expected_span_sum),
-        ] {
-            let CandidateOutcome::ExecutedWithPlan { actual, plan } = current_fre(
-                model,
-                &patterns,
-                haystack,
-                false,
-                true,
-                &RunLimits::default(),
-            ) else {
-                panic!("formal URL {model} did not execute")
-            };
-            assert_eq!(actual, expected);
-            assert!(!plan.contains("aggregate-url"));
-        }
+        let compile_lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+            &patterns,
+            false,
+            true,
+            haystack.len(),
+        )
+        .unwrap();
+        let compile_artifact = compile_lifecycle.construct().unwrap();
+        assert_eq!(
+            compile_artifact.plan(&compile_lifecycle).unwrap(),
+            "compile-aggregate-url"
+        );
+        assert_eq!(
+            compile_artifact
+                .verify(&compile_lifecycle, haystack)
+                .unwrap(),
+            expected_count
+        );
+
+        let count_lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &patterns,
+            false,
+            true,
+            haystack.len(),
+        )
+        .unwrap();
+        assert_eq!(count_lifecycle.plan(), "aggregate-url");
+        assert_eq!(count_lifecycle.execute(haystack).unwrap(), expected_count);
+
+        let complete_spans = current_fre_rebar_complete_spans_regex_for_haystack(
+            PATTERN,
+            false,
+            true,
+            haystack.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            complete_spans.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN}-{}",
+                fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID
+            )
+        );
+        let mut complete_spans_session = complete_spans.session(haystack.len()).unwrap();
+        assert_eq!(
+            complete_spans_session.execute(haystack).unwrap(),
+            expected_span_sum
+        );
+
+        let near_miss = PATTERN.replacen(r"(?::\d{2,5})?", r"(?::\d{1,5})?", 1);
+        assert_ne!(near_miss, PATTERN);
+        let near_miss_oracle = regex::bytes::RegexBuilder::new(&near_miss)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let near_miss_expected =
+            u64::try_from(near_miss_oracle.find_iter(haystack).count()).unwrap();
+        let near_miss_compile = current_fre_rebar_aggregate_builder(&near_miss, false, true)
+            .build_compile()
+            .unwrap();
+        assert!(
+            near_miss_compile
+                .build_report()
+                .has_closed_construction_attempt()
+        );
+        let AggregateBuildAccounting::Continuation(near_miss_accounting) =
+            near_miss_compile.build_report().build
+        else {
+            panic!("URL near-miss did not retain continuation accounting")
+        };
+        assert_eq!(near_miss_accounting.url_aggregate_plans, 0);
+        assert_eq!(near_miss_accounting.url_only_compile_artifacts, 0);
+        assert!(near_miss_accounting.program_states > 2);
+        let near_miss_limits =
+            current_fre_rebar_compile_run_limits(haystack.len(), &near_miss_compile).unwrap();
+        assert_eq!(
+            near_miss_compile
+                .verify_count(haystack, &near_miss_limits)
+                .unwrap()
+                .value(),
+            near_miss_expected
+        );
     }
 
     #[test]
-    fn formal_rebar_quarantines_url_intrinsic_and_matches_oracle() {
+    fn formal_rebar_url_owner_is_compile_only_and_matches_oracle() {
         std::thread::Builder::new()
-            .name("formal-rebar-url-quarantine".to_string())
+            .name("formal-rebar-url-compile-owner".to_string())
             .stack_size(16 * 1024 * 1024)
-            .spawn(assert_formal_rebar_quarantines_url_intrinsic_and_matches_oracle)
+            .spawn(assert_formal_rebar_url_owner_is_compile_only_and_matches_oracle)
             .unwrap()
             .join()
             .unwrap();
@@ -31594,7 +31775,7 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     #[ignore = "requires authenticated Rebar URL pattern and haystack paths"]
-    fn formal_rebar_url_exact_fixture_uses_generic_execution() {
+    fn formal_rebar_url_exact_fixture_uses_certified_execution() {
         let pattern_path = std::env::var_os("FRE_TEST_URL_PATTERN")
             .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
         let haystack_path = std::env::var_os("FRE_TEST_URL_HAYSTACK")
@@ -31622,7 +31803,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             panic!("authenticated formal URL fixture did not execute")
         };
         assert_eq!(actual, 234_965);
-        assert_ne!(plan, "aggregate-url");
+        assert_eq!(plan, "aggregate-url");
     }
 
     #[test]
@@ -31669,9 +31850,32 @@ agggtaa[cgt]|[acg]ttaccct 0
         let compile = generic_url_aggregate_builder(source, true)
             .build_compile()
             .unwrap();
+        let AggregateBuildAccounting::Continuation(compile_accounting) =
+            compile.build_report().build
+        else {
+            panic!("URL compile route must retain continuation compile accounting")
+        };
+        assert_eq!(compile_accounting.url_only_compile_artifacts, 1);
+        assert_eq!(compile_accounting.program_states, 2);
         assert_eq!(
             aggregate_single_plan_label("compile", compile.build_report()),
             "compile-aggregate-url"
+        );
+
+        let full_table_compile = generic_url_aggregate_builder(source, true)
+            .strategy(AggregateStrategy::FullTable)
+            .build_compile()
+            .unwrap();
+        let AggregateBuildAccounting::Continuation(full_table_compile_accounting) =
+            full_table_compile.build_report().build
+        else {
+            panic!("FullTable URL compile must retain continuation compile accounting")
+        };
+        assert_eq!(full_table_compile_accounting.url_only_compile_artifacts, 0);
+        assert!(full_table_compile_accounting.program_states > 2);
+        assert_eq!(
+            aggregate_single_plan_label("compile", full_table_compile.build_report()),
+            "compile-aggregate-continuation-program"
         );
 
         let dormant = generic_url_aggregate_builder(source, true)
@@ -31744,23 +31948,45 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         let compile_limits =
             aggregate_run_limits(long_segment.len(), compile.build_report(), &policy).unwrap();
-        let AggregateBuildAccounting::Continuation(compile_accounting) =
-            compile.build_report().build
-        else {
-            panic!("URL compile route must retain continuation compile accounting");
-        };
-        let mut compile_shape = ContinuationProgramShape::from(compile_accounting);
-        compile_shape.required_internal_anchors = 0;
-        compile_shape.required_internal_anchor_bytes = 0;
-        compile_shape.required_internal_anchor_optional_stages = 0;
-        compile_shape.required_internal_anchor_persistent_bytes = 0;
+        assert_eq!(compile_limits.continuation, specialized);
+        let full_table_compile_limits = aggregate_run_limits(
+            long_segment.len(),
+            full_table_compile.build_report(),
+            &policy,
+        )
+        .unwrap();
+        let mut full_table_compile_shape =
+            ContinuationProgramShape::from(full_table_compile_accounting);
+        full_table_compile_shape.required_internal_anchors = 0;
+        full_table_compile_shape.required_internal_anchor_bytes = 0;
+        full_table_compile_shape.required_internal_anchor_optional_stages = 0;
+        full_table_compile_shape.required_internal_anchor_persistent_bytes = 0;
         assert_eq!(
-            compile_limits.continuation,
-            continuation_operation_limits(long_segment.len(), compile_shape, &policy).unwrap()
+            full_table_compile_limits.continuation,
+            continuation_operation_limits(
+                long_segment.len(),
+                full_table_compile_shape,
+                &policy,
+            )
+            .unwrap()
         );
-        assert_ne!(compile_limits.continuation, specialized);
+        assert_ne!(full_table_compile_limits.continuation, specialized);
 
         let result = count.count(&long_segment, count_limits).unwrap();
+        assert_eq!(
+            compile
+                .verify_count(&long_segment, compile_limits)
+                .unwrap()
+                .value(),
+            result.value()
+        );
+        assert_eq!(
+            full_table_compile
+                .verify_count(&long_segment, full_table_compile_limits)
+                .unwrap()
+                .value(),
+            result.value()
+        );
         let AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
@@ -31837,7 +32063,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             ));
         }
 
-        for field in 0..5 {
+        for field in 0..6 {
             let mut forged = count_report.clone();
             let AggregateBuildAccounting::Continuation(ref mut accounting) = forged.build else {
                 panic!("URL route must retain continuation accounting");
@@ -31848,6 +32074,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 2 => accounting.url_aggregate_tld_bytes += 1,
                 3 => accounting.url_aggregate_build_work += 1,
                 4 => accounting.url_aggregate_persistent_bytes += 1,
+                5 => accounting.url_only_compile_artifacts += 1,
                 _ => unreachable!(),
             }
             assert!(!forged.has_closed_url_aggregate_identity());
@@ -31857,6 +32084,24 @@ agggtaa[cgt]|[acg]ttaccct 0
             );
             assert!(aggregate_run_limits(128, &forged, &RunLimits::default()).is_err());
         }
+
+        let mut compile_marker_forgery = compile.build_report().clone();
+        let AggregateBuildAccounting::Continuation(ref mut accounting) =
+            compile_marker_forgery.build
+        else {
+            panic!("URL Compile route must retain continuation accounting");
+        };
+        accounting.url_only_compile_artifacts = 0;
+        assert!(!compile_marker_forgery.has_closed_url_aggregate_identity());
+        assert!(
+            current_fre_rebar_validate_aggregate_identity_with_options(
+                &compile_marker_forgery,
+                false,
+                true,
+                "compile",
+            )
+            .is_err()
+        );
 
         let mut capacity_forgery = count_report.clone();
         capacity_forgery.retained_capacity_bytes += 1;
@@ -32060,7 +32305,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V136);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V137);
         assert!(
             current_identity
                 .identity
@@ -32095,6 +32340,13 @@ agggtaa[cgt]|[acg]ttaccct 0
             "allocates one exact CaptureRecord array and one exact complete numeric-group array"
         ));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V135));
+        assert!(current_identity
+            .identity
+            .contains("formal-url-only-compile-owner-v1 permits"));
+        assert!(current_identity.availability.contains(
+            "eligibility depends only on the supplied canonical HIR, Rust-byte options, Compile operation"
+        ));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V136));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V134));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V133));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V132));
