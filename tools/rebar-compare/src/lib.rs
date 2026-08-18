@@ -42,7 +42,8 @@ use fre::{
     AggregateSpanVisitorRegex, AggregateSpansRegex, AggregateStrategy,
     AggregateUnicodeScalarCountAdmission, AggregateUnicodeScalarSemantics,
     AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
-    AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
+    AnchoredLineCapturePlan, AnchoredLineCaptureRecordUpperBounds, AnchoredLineCaptureRunError,
+    AnchoredLineCaptureRunLimits,
     AnchoredQuoteCaptureBuildError, AnchoredQuoteCaptureBuilder, AnchoredQuoteCapturePlan,
     AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
     AnchoredWordCapturePlan, AnchoredWordCaptureRecordUpperBounds,
@@ -267,11 +268,13 @@ const FRE_ADAPTER_V134: &str =
     "fre-current-aggregate-capture-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V135: &str =
     "fre-current-aggregate-capture-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V136: &str =
+    "fre-current-aggregate-capture-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V135
+    FRE_ADAPTER_V136
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -590,7 +593,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V135
+        FRE_ADAPTER_V136
     }
 
     #[allow(
@@ -608,7 +611,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V135.to_string(),
+            adapter: FRE_ADAPTER_V136.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -987,6 +990,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligibility is derived only from canonical HIR, regex options, input length, and caller limits, requires at least 1,024 input bytes, and closes the complete line, match, capture, endpoint, allocation, output, work, sequential, reducer-event, and per-line peak envelope before source access; every public operation then scans LF/CRLF domains, decodes and classifies the fixed prefix, allocates one exact CaptureRecord array and one exact numeric-group array per match, materializes group zero plus every mandatory numeric group with line-relative endpoints, and reads both endpoints of every group inside the timed operation; named, small, structurally unsupported, or policy-ineligible inputs retain the incumbent before source access, while a selected route never falls back after reading source or invoking its internal record delivery",
         );
         identity.identity.push_str(
+            "; formal-anchored-line-materialized-record-v1 admits the generic deterministic absolute-start byte-line theorem only when canonical construction additionally proves every contiguous mandatory direct-root capture is unnamed",
+        );
+        identity.availability.push_str(
+            "; eligible Unicode-off case-sensitive grep-captures inputs of at least 1,024 bytes publish their positive minimum width and deterministic greedy boundary proof before source access; each timed operation scans every LF/CRLF-stripped line, allocates one exact CaptureRecord array and one exact complete numeric-group array for each matched line, materializes group zero plus every mandatory or empty participating group with line-relative endpoints, and reads both endpoints of every group; a source-independent disjoint-line minimum-width bound closes allocation, logical-output, work, sequential-byte, reducer-event and peak policy before selection, while named, small, structurally ambiguous or policy-refused inputs retain exact tagged history before source access",
+        );
+        identity.identity.push_str(
             "; formal-large-continuation-raw-span-sweep-v1 extends the anonymous-v2 one-pattern CountSpans complete-bound owner with the same collision-checked persistent continuation sweep already authenticated for the forced aggregate lifecycle",
         );
         identity.availability.push_str(
@@ -1056,6 +1065,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; the public composed adapter supersedes ");
+        identity.availability.push_str(FRE_ADAPTER_V135);
+        identity
+            .availability
+            .push_str(" which extends ");
         identity.availability.push_str(FRE_ADAPTER_V134);
         identity
             .availability
@@ -6230,7 +6243,28 @@ enum CurrentFreCaptureModel {
 enum CurrentFreCapturePreparation {
     MaterializedWhole(CaptureAggregateLimits),
     MaterializedLines(CaptureAggregateLimits),
+    AnchoredLineMaterialized,
     AnchoredWordMaterialized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AnchoredLineMaterializationProspective {
+    record: AnchoredLineCaptureRecordUpperBounds,
+    materialized_matches: usize,
+    materialized_capture_count: usize,
+    groups_per_match: usize,
+    output_bytes: usize,
+    allocations: usize,
+    work: usize,
+    sequential_bytes: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AnchoredLineMaterializedPreparation {
+    plan: AnchoredLineCapturePlan,
+    run_limits: AnchoredLineCaptureRunLimits,
+    prospective: AnchoredLineMaterializationProspective,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6252,6 +6286,7 @@ struct AnchoredWordMaterializedPreparation {
 }
 
 const CURRENT_FRE_ANCHORED_WORD_MATERIALIZED_MIN_INPUT_BYTES: usize = 1_024;
+const CURRENT_FRE_ANCHORED_LINE_MATERIALIZED_MIN_INPUT_BYTES: usize = 1_024;
 
 // Retained by the generic capture-participation API below. The formal Rebar
 // lifecycle deliberately never constructs this batch shortcut.
@@ -6270,6 +6305,7 @@ struct LineBatchPreparation {
 #[derive(Clone, Debug)]
 enum CurrentFreCaptureRegex {
     General(Box<CaptureRegex>),
+    AnchoredLineMaterialized(Box<AnchoredLineMaterializedPreparation>),
     AnchoredWordMaterialized(Box<AnchoredWordMaterializedPreparation>),
 }
 
@@ -6974,6 +7010,10 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCapturePreparation::MaterializedLines(run_limits),
             ) => execute_materialized_grep_captures(regex, haystack, run_limits, &self.limits),
             (
+                CurrentFreCaptureRegex::AnchoredLineMaterialized(prepared),
+                CurrentFreCapturePreparation::AnchoredLineMaterialized,
+            ) => execute_materialized_anchored_line_captures(prepared, haystack, &self.limits),
+            (
                 CurrentFreCaptureRegex::AnchoredWordMaterialized(prepared),
                 CurrentFreCapturePreparation::AnchoredWordMaterialized,
             ) => execute_materialized_anchored_word_captures(prepared, haystack, &self.limits),
@@ -7035,6 +7075,23 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                 case_insensitive,
                 haystack_len,
                 preparation: CurrentFreCapturePreparation::AnchoredWordMaterialized,
+            });
+        }
+        if let Some(prepared) = anchored_line_materialized_preparation_one(
+            pattern,
+            unicode,
+            case_insensitive,
+            haystack_len,
+            &limits,
+        )? {
+            return Ok(CurrentFreCaptureLifecycle {
+                model,
+                regex: CurrentFreCaptureRegex::AnchoredLineMaterialized(Box::new(prepared)),
+                limits,
+                unicode,
+                case_insensitive,
+                haystack_len,
+                preparation: CurrentFreCapturePreparation::AnchoredLineMaterialized,
             });
         }
     }
@@ -8366,7 +8423,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V135
+        if receipt.adapter == FRE_ADAPTER_V136
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -12243,6 +12300,22 @@ fn anchored_line_capture_plan_one(
     case_insensitive: bool,
     limits: &RunLimits,
 ) -> Result<Option<AnchoredLineCapturePlan>, ExecutionError> {
+    anchored_line_capture_plan_one_with_resource_policy(
+        pattern,
+        unicode,
+        case_insensitive,
+        limits,
+        false,
+    )
+}
+
+fn anchored_line_capture_plan_one_with_resource_policy(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+    resource_is_optional: bool,
+) -> Result<Option<AnchoredLineCapturePlan>, ExecutionError> {
     if unicode || case_insensitive {
         return Ok(None);
     }
@@ -12269,6 +12342,9 @@ fn anchored_line_capture_plan_one(
             | AnchoredLineCaptureBuildError::Unsupported(_),
         ) => return Ok(None),
         Err(error @ AnchoredLineCaptureBuildError::Resource { .. }) => {
+            if resource_is_optional {
+                return Ok(None);
+            }
             return Err(ExecutionError::unsupported(format!(
                 "FRE anchored-line capture build refused execution: {error}"
             )));
@@ -12647,6 +12723,416 @@ fn anchored_word_capture_run_limits(
         max_sequential_bytes: upper.sequential_bytes,
         max_peak_bytes: upper.peak_bytes,
     })
+}
+
+fn anchored_line_materialized_preparation_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<Option<AnchoredLineMaterializedPreparation>, CompareError> {
+    if haystack_len < CURRENT_FRE_ANCHORED_LINE_MATERIALIZED_MIN_INPUT_BYTES {
+        return Ok(None);
+    }
+    let plan = anchored_line_capture_plan_one_with_resource_policy(
+        pattern,
+        unicode,
+        case_insensitive,
+        limits,
+        true,
+    )
+    .map_err(|error| CompareError::new(error.message))?;
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    let report = plan.build_report();
+    if !report.all_captures_unnamed {
+        return Ok(None);
+    }
+    let record = plan
+        .grep_capture_record_upper_bounds(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE anchored-line materialization preflight faulted: {error}"
+            ))
+        })?;
+    let materialized_matches = haystack_len / report.minimum_match_bytes;
+    if materialized_matches > record.matches {
+        return Err(CompareError::new(
+            "FRE anchored-line minimum-width match bound exceeded the record bound",
+        ));
+    }
+    let groups_per_match = report.groups_per_match;
+    let materialized_capture_count = materialized_matches
+        .checked_mul(groups_per_match)
+        .ok_or_else(|| {
+            CompareError::new("FRE anchored-line materialized capture-count bound overflowed")
+        })?;
+    if materialized_capture_count > record.capture_count {
+        return Err(CompareError::new(
+            "FRE anchored-line minimum-width capture bound exceeded the record bound",
+        ));
+    }
+    let per_record_output = core::mem::size_of::<CaptureRecord>()
+        .checked_add(
+            groups_per_match
+                .checked_mul(core::mem::size_of::<CaptureGroupRecord>())
+                .ok_or_else(|| {
+                    CompareError::new(
+                        "FRE anchored-line materialized group-byte bound overflowed",
+                    )
+                })?,
+        )
+        .ok_or_else(|| {
+            CompareError::new("FRE anchored-line materialized record-byte bound overflowed")
+        })?;
+    let output_bytes = materialized_matches
+        .checked_mul(per_record_output)
+        .ok_or_else(|| {
+            CompareError::new("FRE anchored-line materialized output bound overflowed")
+        })?;
+    let allocations = materialized_matches.checked_mul(2).ok_or_else(|| {
+        CompareError::new("FRE anchored-line materialized allocation bound overflowed")
+    })?;
+    let materialization_work = materialized_capture_count
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(materialized_matches))
+        .ok_or_else(|| {
+            CompareError::new("FRE anchored-line materialization work bound overflowed")
+        })?;
+    let work = record
+        .work
+        .checked_add(materialization_work)
+        .ok_or_else(|| CompareError::new("FRE anchored-line combined work bound overflowed"))?;
+    let sequential_bytes = output_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(record.sequential_bytes))
+        .ok_or_else(|| {
+            CompareError::new("FRE anchored-line combined sequential bound overflowed")
+        })?;
+    let peak_bytes = core::mem::size_of::<AnchoredLineMaterializedPreparation>()
+        .checked_add(per_record_output)
+        .ok_or_else(|| CompareError::new("FRE anchored-line combined peak bound overflowed"))?;
+    let reducer_limit = usize::try_from(limits.reducer_steps).map_err(|_| {
+        CompareError::new("anchored-line materialization reducer limit does not fit usize")
+    })?;
+    if work > limits.fre_aggregate_operation_work
+        || sequential_bytes > limits.fre_aggregate_sequential_bytes
+        || peak_bytes > limits.fre_aggregate_peak_bytes
+        || record.capture_count > reducer_limit
+        || record.reducer_events > reducer_limit
+        || materialized_capture_count > reducer_limit
+        || allocations > reducer_limit
+    {
+        return Ok(None);
+    }
+    let run_limits = anchored_line_capture_record_run_limits(&plan, haystack_len, limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    Ok(Some(AnchoredLineMaterializedPreparation {
+        plan,
+        run_limits,
+        prospective: AnchoredLineMaterializationProspective {
+            record,
+            materialized_matches,
+            materialized_capture_count,
+            groups_per_match,
+            output_bytes,
+            allocations,
+            work,
+            sequential_bytes,
+            peak_bytes,
+        },
+    }))
+}
+
+fn exact_anchored_line_materialized_allocation_error(
+    context: &'static str,
+    error: ExactAllocationError,
+) -> ExecutionError {
+    match error {
+        ExactAllocationError::AllocationFailed => ExecutionError::unsupported(format!(
+            "FRE anchored-line materialization allocation failed for {context}"
+        )),
+        ExactAllocationError::LayoutOverflow => ExecutionError::fault(format!(
+            "FRE anchored-line materialization layout overflowed for {context}"
+        )),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the formal deterministic record materialization and complete P/A closure form one timed transaction"
+)]
+fn execute_materialized_anchored_line_captures(
+    prepared: &AnchoredLineMaterializedPreparation,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let expected_groups = prepared.prospective.groups_per_match;
+    let per_record_output = core::mem::size_of::<CaptureRecord>()
+        .checked_add(
+            expected_groups
+                .checked_mul(core::mem::size_of::<CaptureGroupRecord>())
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "anchored-line actual materialized group-byte accounting overflowed",
+                    )
+                })?,
+        )
+        .ok_or_else(|| {
+            ExecutionError::fault(
+                "anchored-line actual materialized record-byte accounting overflowed",
+            )
+        })?;
+    let mut callback_error = None;
+    let mut materialized_records = 0_usize;
+    let mut inspected_groups = 0_usize;
+    let mut output_bytes = 0_usize;
+    let mut allocations = 0_usize;
+    let report = prepared
+        .plan
+        .visit_grep_capture_records(haystack, prepared.run_limits, |line_len, spans| {
+            if callback_error.is_some() {
+                return;
+            }
+            if spans.len() != expected_groups {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE anchored-line record changed its numeric schema",
+                ));
+                return;
+            }
+            let mut records = match ExactVec::try_with_capacity(1) {
+                Ok(records) => records,
+                Err(error) => {
+                    callback_error = Some(exact_anchored_line_materialized_allocation_error(
+                        "one-record array",
+                        error,
+                    ));
+                    return;
+                }
+            };
+            allocations = match allocations.checked_add(1) {
+                Some(value) => value,
+                None => {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line allocation accounting overflowed",
+                    ));
+                    return;
+                }
+            };
+            let mut groups = match ExactVec::try_with_capacity(expected_groups) {
+                Ok(groups) => groups,
+                Err(error) => {
+                    callback_error = Some(exact_anchored_line_materialized_allocation_error(
+                        "numeric-group array",
+                        error,
+                    ));
+                    return;
+                }
+            };
+            allocations = match allocations.checked_add(1) {
+                Some(value) => value,
+                None => {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line allocation accounting overflowed",
+                    ));
+                    return;
+                }
+            };
+            for (index, span) in spans.iter().copied().enumerate() {
+                if span.start > span.end || span.end > line_len {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line capture span escaped its semantic line",
+                    ));
+                    return;
+                }
+                let Ok(index) = u32::try_from(index) else {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line capture index does not fit u32",
+                    ));
+                    return;
+                };
+                if groups
+                    .try_push(CaptureGroupRecord {
+                        index,
+                        name: None,
+                        span: Some(CaptureSpan {
+                            start: span.start,
+                            end: span.end,
+                        }),
+                    })
+                    .is_err()
+                {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line group array exceeded its preflight",
+                    ));
+                    return;
+                }
+            }
+            if records
+                .try_push(CaptureRecord {
+                    groups: groups.into_vec(),
+                })
+                .is_err()
+            {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE anchored-line record array exceeded its preflight",
+                ));
+                return;
+            }
+            let records = records.into_vec();
+            for record in &records {
+                let Some(overall) = record.overall() else {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line record lacks group zero",
+                    ));
+                    return;
+                };
+                if overall.start == overall.end || record.groups.len() != expected_groups {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-line record violated its positive fixed schema",
+                    ));
+                    return;
+                }
+                for (index, group) in record.groups.iter().enumerate() {
+                    if usize::try_from(group.index) != Ok(index) || group.name.is_some() {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-line record changed numeric order or names",
+                        ));
+                        return;
+                    }
+                    let Some(span) = group.span else {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-line mandatory group did not participate",
+                        ));
+                        return;
+                    };
+                    if span.start > span.end || span.end > line_len {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-line inspected span escaped its semantic line",
+                        ));
+                        return;
+                    }
+                    inspected_groups = match inspected_groups.checked_add(1) {
+                        Some(value) => value,
+                        None => {
+                            callback_error = Some(ExecutionError::fault(
+                                "FRE anchored-line inspected-group count overflowed",
+                            ));
+                            return;
+                        }
+                    };
+                }
+                materialized_records = match materialized_records.checked_add(1) {
+                    Some(value) => value,
+                    None => {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-line materialized-record count overflowed",
+                        ));
+                        return;
+                    }
+                };
+                output_bytes = match output_bytes.checked_add(per_record_output) {
+                    Some(value) => value,
+                    None => {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-line output-byte accounting overflowed",
+                        ));
+                        return;
+                    }
+                };
+            }
+        })
+        .map_err(|error| match error {
+            AnchoredLineCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE anchored-line materialized reducer refused execution: {error}"
+            )),
+            AnchoredLineCaptureRunError::ArithmeticOverflow { .. }
+            | AnchoredLineCaptureRunError::AccountingInvariant { .. } => ExecutionError::fault(
+                format!("FRE anchored-line materialized reducer faulted: {error}"),
+            ),
+            error => ExecutionError::fault(format!(
+                "FRE anchored-line materialized reducer returned an unknown failure: {error}"
+            )),
+        })?;
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    let expected_source_digest = prepared.plan.build_report().identity.source_digest;
+    let expected_capture_count = report.matches.checked_mul(expected_groups).ok_or_else(|| {
+        ExecutionError::fault("FRE anchored-line report capture-count closure overflowed")
+    })?;
+    let expected_reducer_events = report
+        .line_domains
+        .checked_add(report.capture_count)
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE anchored-line report reducer-event closure overflowed")
+        })?;
+    let expected_endpoint_writes = report.capture_count.checked_mul(2).ok_or_else(|| {
+        ExecutionError::fault("FRE anchored-line report endpoint-write closure overflowed")
+    })?;
+    let actual_work = report
+        .capture_count
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(report.matches))
+        .and_then(|value| value.checked_add(report.work))
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE anchored-line materialized actual work overflowed")
+        })?;
+    let actual_sequential = output_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(report.sequential_bytes))
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE anchored-line materialized actual sequential overflowed")
+        })?;
+    let actual_peak = core::mem::size_of::<AnchoredLineMaterializedPreparation>()
+        .checked_add(if report.matches == 0 {
+            0
+        } else {
+            per_record_output
+        })
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE anchored-line materialized actual peak overflowed")
+        })?;
+    if report.operation_id != fre::ANCHORED_LINE_CAPTURE_RECORD_OPERATION_ID
+        || report.source_digest != expected_source_digest
+        || !prepared.plan.build_report().all_captures_unnamed
+        || report.input_loads != haystack.len()
+        || report.sequential_bytes != haystack.len()
+        || report.capture_count != expected_capture_count
+        || report.reducer_events != expected_reducer_events
+        || report.endpoint_writes != expected_endpoint_writes
+        || report.allocations != 0
+        || report.scratch_bytes != 0
+        || report.output_bytes != 0
+        || report.persistent_bytes != prepared.plan.build_report().persistent_bytes
+        || report.peak_bytes != prepared.plan.build_report().peak_bytes
+        || report.line_domains > prepared.prospective.record.line_domains
+        || report.matches > prepared.prospective.record.matches
+        || report.capture_count > prepared.prospective.record.capture_count
+        || report.reducer_events > prepared.prospective.record.reducer_events
+        || report.work > prepared.prospective.record.work
+        || report.sequential_bytes > prepared.prospective.record.sequential_bytes
+        || materialized_records != report.matches
+        || inspected_groups != report.capture_count
+        || materialized_records > prepared.prospective.materialized_matches
+        || inspected_groups > prepared.prospective.materialized_capture_count
+        || output_bytes > prepared.prospective.output_bytes
+        || allocations > prepared.prospective.allocations
+        || actual_work > prepared.prospective.work
+        || actual_sequential > prepared.prospective.sequential_bytes
+        || actual_peak > prepared.prospective.peak_bytes
+        || actual_work > limits.fre_aggregate_operation_work
+        || actual_sequential > limits.fre_aggregate_sequential_bytes
+        || actual_peak > limits.fre_aggregate_peak_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE anchored-line materialized record identity or P/A closure failed",
+        ));
+    }
+    u64::try_from(inspected_groups)
+        .map_err(|_| ExecutionError::fault("FRE anchored-line count does not fit u64"))
 }
 
 fn anchored_word_materialized_preparation_one(
@@ -24185,6 +24671,10 @@ mod tests {
                         CurrentFreCapturePreparation::MaterializedLines(_),
                     ) | (
                         "grep-captures",
+                        CurrentFreCaptureRegex::AnchoredLineMaterialized(_),
+                        CurrentFreCapturePreparation::AnchoredLineMaterialized,
+                    ) | (
+                        "grep-captures",
                         CurrentFreCaptureRegex::AnchoredWordMaterialized(_),
                         CurrentFreCapturePreparation::AnchoredWordMaterialized,
                     )
@@ -27647,6 +28137,61 @@ agggtaa[cgt]|[acg]ttaccct 0
         .expect("generic terminal anchored-line reduction");
         assert_eq!(delimited.actual, 32);
         assert_eq!(delimited.plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
+
+        let formal_line = b"0000;<control>;Cc;0;BN;;;;;N;NULL;;;;\n";
+        let formal_haystack = formal_line.repeat(128);
+        let mut formal = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            DELIMITED,
+            false,
+            false,
+            formal_haystack.len(),
+        )
+        .expect("formal deterministic anchored-line lifecycle");
+        let CurrentFreCaptureRegex::AnchoredLineMaterialized(materialized) = &formal.regex else {
+            panic!("large deterministic byte lines did not select formal record materialization")
+        };
+        assert!(matches!(
+            formal.preparation,
+            CurrentFreCapturePreparation::AnchoredLineMaterialized
+        ));
+        assert!(materialized.plan.build_report().all_captures_unnamed);
+        assert_eq!(materialized.prospective.groups_per_match, 16);
+        assert_eq!(
+            materialized.prospective.materialized_capture_count,
+            materialized.prospective.materialized_matches * 16
+        );
+        assert!(
+            materialized.prospective.materialized_matches
+                < materialized.prospective.record.matches
+        );
+        assert_eq!(
+            formal.execute(&formal_haystack).expect("first formal records"),
+            128 * 16
+        );
+        assert_eq!(
+            formal
+                .execute(&formal_haystack)
+                .expect("steady formal records"),
+            128 * 16
+        );
+
+        let named_pattern = r"^(?P<left>[a-z]+);(?P<right>[a-z]+)$";
+        let named_haystack = b"left;right\n".repeat(128);
+        let mut named = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            named_pattern,
+            false,
+            false,
+            named_haystack.len(),
+        )
+        .expect("named deterministic lines retain exact history");
+        assert!(matches!(&named.regex, CurrentFreCaptureRegex::General(_)));
+        assert!(matches!(
+            named.preparation,
+            CurrentFreCapturePreparation::MaterializedLines(_)
+        ));
+        assert_eq!(named.execute(&named_haystack).unwrap(), 128 * 3);
 
         let ambiguous_haystack = b"aaa\n";
         assert!(
@@ -31515,7 +32060,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V135);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V136);
         assert!(
             current_identity
                 .identity
@@ -31543,6 +32088,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(
             "PortableBoundLineTotalMatcher::try_is_match remains the ordinary LF-validating API"
         ));
+        assert!(current_identity
+            .identity
+            .contains("formal-anchored-line-materialized-record-v1 admits"));
+        assert!(current_identity.availability.contains(
+            "allocates one exact CaptureRecord array and one exact complete numeric-group array"
+        ));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V135));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V134));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V133));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V132));
