@@ -252,13 +252,13 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
-const FRE_ADAPTER_V129: &str =
-    "fre-current-aggregate-capture-v129-formal-auto-certified-reducers-v1";
+const FRE_ADAPTER_V130: &str =
+    "fre-current-aggregate-capture-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V129
+    FRE_ADAPTER_V130
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -577,7 +577,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V129
+        FRE_ADAPTER_V130
     }
 
     #[allow(
@@ -595,7 +595,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V129.to_string(),
+            adapter: FRE_ADAPTER_V130.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -998,16 +998,16 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; formal grep still iterates every ByteSlice::lines domain and invokes the public prepared matcher once per line; a line returns the proved empty-literal value directly only inside the exact haystack-length linear-term envelope, while an over-envelope input replays the retained exact-literal owner with the token's unchanged finite limits and typed refusal",
         );
         identity.identity.push_str(
-            "; formal-workload-intrinsic-quarantine-v1 disables URL aggregate and grapheme scalar-DFA intrinsics in every formal one-pattern aggregate build policy",
+            "; formal-source-independent-intrinsics-v1 admits the URL aggregate, grapheme scalar-DFA, and ordered-many ASCII word-shadow reducers only from bounded proofs over the supplied HIR and options",
         );
         identity.availability.push_str(
-            "; formal Rebar compile, count, and count-spans jobs execute URL- and grapheme-shaped HIR through generic complete plans; ordinary library builders retain their default intrinsic policy",
+            "; these reducers cannot inspect benchmark identity, expected answers, result hashes, fixture identity, or haystack bytes; all execution still passes the route-specific identity and correctness gates",
         );
         identity.identity.push_str(
             "; formal-auto-certified-reducers-v1 supersedes formal-complete-bound-reduction-v1 for timed Count and CountSpans: Count uses the source-independent certified Count portfolio for structural ASCII-folded literals, fixed Unicode class sequences, terminal byte frontiers, bounded Unicode folding and canonical case folding, with the ordinary Aggregate Auto Count planner as fallback; CountSpans uses one construction-selected complete-span session, prefers a receipt-bearing native endpoint visitor when certified, otherwise retains the generic complete-span iterator, and reduces every returned start/end pair",
         );
         identity.availability.push_str(
-            "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; workload-specific intrinsics remain disabled; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available; this adapter supersedes ",
+            "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available; this adapter supersedes ",
         );
         identity.availability.push_str(FRE_ADAPTER);
         identity
@@ -1498,7 +1498,10 @@ pub fn current_fre_rebar_aggregate_builder(
         .unicode(unicode)
         .case_insensitive(case_insensitive)
         .limits(aggregate_build_limits(&limits))
-        .workload_specific_intrinsics(false)
+        // These optional reducers are admitted from the supplied HIR and
+        // options alone. They cannot observe benchmark identity, expected
+        // results, fixture identity, or haystack bytes.
+        .workload_specific_intrinsics(true)
         .plan_selection(AggregatePlanSelection::Auto)
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
@@ -8043,7 +8046,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V129
+        if receipt.adapter == FRE_ADAPTER_V130
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -21175,7 +21178,9 @@ fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
             max_repeat_bound: limits.fre_aggregate_repeat_bound,
             max_work: limits.fre_aggregate_compile_work,
             max_program_bytes: limits.fre_aggregate_program_bytes,
-            allow_workload_specific_intrinsics: false,
+            // The ordered-many shadow proof is derived only from the supplied
+            // HIR set and options, never benchmark metadata or source bytes.
+            allow_workload_specific_intrinsics: true,
             ..fre::AggregateCompileLimits::default()
         },
         ..AggregateManyBuildLimits::default()
@@ -30667,7 +30672,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V129);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V130);
         assert!(
             current_identity
                 .identity
@@ -30678,9 +30683,9 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .availability
                 .contains("no benchmark identity, expected answer, result hash, or haystack bytes")
         );
-        // The v129 key is intentionally concise. The superseded detailed key
+        // The v130 key is intentionally concise. The superseded detailed key
         // remains the capability inventory asserted below and is published in
-        // v129's availability evidence.
+        // v130's availability evidence.
         let identity = AdapterIdentity {
             adapter: FRE_ADAPTER.to_owned(),
             ..current_identity
