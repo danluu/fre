@@ -263,11 +263,13 @@ const FRE_ADAPTER_V132: &str =
     "fre-current-aggregate-capture-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V133: &str =
     "fre-current-aggregate-capture-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V134: &str =
+    "fre-current-aggregate-capture-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V133
+    FRE_ADAPTER_V134
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -586,7 +588,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V133
+        FRE_ADAPTER_V134
     }
 
     #[allow(
@@ -604,7 +606,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V133.to_string(),
+            adapter: FRE_ADAPTER_V134.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -983,6 +985,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligibility is derived only from canonical HIR, regex options, input length, and caller limits, requires at least 1,024 input bytes, and closes the complete line, match, capture, endpoint, allocation, output, work, sequential, reducer-event, and per-line peak envelope before source access; every public operation then scans LF/CRLF domains, decodes and classifies the fixed prefix, allocates one exact CaptureRecord array and one exact numeric-group array per match, materializes group zero plus every mandatory numeric group with line-relative endpoints, and reads both endpoints of every group inside the timed operation; named, small, structurally unsupported, or policy-ineligible inputs retain the incumbent before source access, while a selected route never falls back after reading source or invoking its internal record delivery",
         );
         identity.identity.push_str(
+            "; formal-large-continuation-raw-span-sweep-v1 extends the anonymous-v2 one-pattern CountSpans complete-bound owner with the same collision-checked persistent continuation sweep already authenticated for the forced aggregate lifecycle",
+        );
+        identity.availability.push_str(
+            "; the anonymous-v2 route selects that sweep only from the retained aggregate continuation report, an exact minimum of 4,096 program states, a source-independent dense-work envelope above policy, an authenticated sweep upper bound, and fixed workspace admission before source access; bounded-pair and compact state-byte visitors, smaller continuations, unsupported sweep shapes, and policy refusals retain their incumbent complete-span route",
+        );
+        identity.identity.push_str(
             "; formal-compile-artifact-cross-check-v1 supersedes the earlier detached compile-verification claim: it executes each freshly constructed single- or multi-pattern compile artifact outside the timed construction boundary, independently enumerates every complete match bound through the formal verifier, and requires the two counts to agree",
         );
         identity.availability.push_str(
@@ -1040,6 +1048,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; the public composed adapter supersedes ");
+        identity.availability.push_str(FRE_ADAPTER_V133);
+        identity
+            .availability
+            .push_str(" while preserving the complete-span routes of ");
         identity.availability.push_str(FRE_ADAPTER_V132);
         identity
             .availability
@@ -2239,6 +2251,14 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_ASCII_WORD_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-guarded-unicode-word";
 
+/// Stable plan label for the source-independently admitted large generic
+/// continuation sweep at the anonymous-v2 one-pattern CountSpans boundary.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_LARGE_CONTINUATION_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-large-continuation-sweep";
+
+const FORMAL_LARGE_CONTINUATION_RAW_SPAN_SWEEP_RUNTIME_ID: &str =
+    "formal-large-continuation-raw-span-sweep-v1";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2434,6 +2454,7 @@ pub struct CurrentFreCompleteSpansRegex {
     inner: CurrentFreCompleteSpansRegexInner,
     plan: String,
     runtime_implementation_id: &'static str,
+    continuation_sweep: bool,
 }
 
 enum CurrentFreCompleteSpansRegexInner {
@@ -2458,7 +2479,10 @@ impl fmt::Debug for CurrentFreCompleteSpansRegex {
                     .field("runtime_implementation_id", &self.runtime_implementation_id);
             }
         }
-        debug.field("plan", &self.plan).finish()
+        debug
+            .field("plan", &self.plan)
+            .field("continuation_sweep", &self.continuation_sweep)
+            .finish()
     }
 }
 
@@ -2523,8 +2547,11 @@ impl CurrentFreCompleteSpansRegex {
                 let aggregate_limits =
                     complete_spans_run_limits_with_policy(haystack_len, regex, limits)
                         .map_err(|error| CompareError::new(error.message))?;
-                let aggregate_span_visit_workspace =
-                    regex.prepare_span_visit_workspace(haystack_len, aggregate_limits);
+                let aggregate_span_visit_workspace = if self.continuation_sweep {
+                    None
+                } else {
+                    regex.prepare_span_visit_workspace(haystack_len, aggregate_limits)
+                };
                 if self.runtime_implementation_id == fre::SPARSE_ORDERED_LITERAL_TRACE_ALGORITHM_ID
                     && aggregate_span_visit_workspace.is_none()
                 {
@@ -2532,11 +2559,37 @@ impl CurrentFreCompleteSpansRegex {
                         "FRE sparse complete-spans trace workspace preparation refused",
                     ));
                 }
+                let aggregate_continuation_span_visit_workspace = if self.continuation_sweep {
+                    if !formal_single_raw_span_sweep_preflight(regex, haystack_len, limits)
+                        .map_err(|error| CompareError::new(error.message))?
+                    {
+                        return Err(CompareError::new(
+                            "FRE large-continuation complete-spans sweep preflight refused",
+                        ));
+                    }
+                    Some(
+                        regex
+                            .prepare_continuation_span_visit_workspace()
+                            .map_err(|error| {
+                                CompareError::new(format!(
+                                    "FRE large-continuation complete-spans workspace preflight: {error}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                CompareError::new(
+                                    "FRE large-continuation complete-spans workspace is absent",
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 Ok(CurrentFreCompleteSpansSession {
                     search: None,
                     aggregate: Some(regex),
                     aggregate_limits: Some(aggregate_limits),
                     aggregate_span_visit_workspace,
+                    aggregate_continuation_span_visit_workspace,
                     fixed_absolute_value_success: regex.build_report().plan
                         == AggregatePlanKind::FixedAbsoluteDomain,
                     fixed_predicate_span_visit: false,
@@ -2570,6 +2623,7 @@ impl CurrentFreCompleteSpansRegex {
                     aggregate: None,
                     aggregate_limits: None,
                     aggregate_span_visit_workspace: None,
+                    aggregate_continuation_span_visit_workspace: None,
                     fixed_absolute_value_success: false,
                     fixed_predicate_span_visit: self.runtime_implementation_id
                         == FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID,
@@ -2597,6 +2651,7 @@ pub struct CurrentFreCompleteSpansSession<'r> {
     aggregate: Option<&'r AggregateSpanVisitorRegex>,
     aggregate_limits: Option<AggregateRunLimits>,
     aggregate_span_visit_workspace: Option<AggregateSpanVisitWorkspace>,
+    aggregate_continuation_span_visit_workspace: Option<AggregateContinuationSpanVisitWorkspace>,
     fixed_absolute_value_success: bool,
     fixed_predicate_span_visit: bool,
     runtime_implementation_id: &'static str,
@@ -2810,6 +2865,11 @@ impl CurrentFreCompleteSpansSession<'_> {
     /// reducer-event exhaustion, reversed endpoints, or sum overflow.
     pub fn execute_prevalidated(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
         if let (Some(regex), Some(limits)) = (self.aggregate, self.aggregate_limits.as_ref()) {
+            if let Some(workspace) = self.aggregate_continuation_span_visit_workspace.as_mut() {
+                return rebar_sum_streamed_single_match_bounds_with_workspace(
+                    regex, haystack, limits, workspace,
+                );
+            }
             if self.fixed_absolute_value_success {
                 if let Some(value) = regex.fixed_absolute_spans_value_success(haystack, limits) {
                     if let Some(span) = value.span() {
@@ -3217,7 +3277,41 @@ pub fn current_fre_rebar_complete_spans_regex(
     unicode: bool,
     case_insensitive: bool,
 ) -> Result<CurrentFreCompleteSpansRegex, CompareError> {
-    let pattern = pattern.into();
+    current_fre_rebar_complete_spans_regex_inner(pattern.into(), unicode, case_insensitive, None)
+}
+
+/// Build the exact single-pattern matcher used by the anonymous formal Rebar
+/// CountSpans boundary for one authenticated input length.
+///
+/// The input length is used only with construction-retained program facts to
+/// select the generic large-continuation sweep before source access. Every
+/// nonqualifying matcher retains the ordinary complete-span route selected by
+/// [`current_fre_rebar_complete_spans_regex`].
+///
+/// # Errors
+///
+/// Returns the same construction, policy, and identity errors as
+/// [`current_fre_rebar_complete_spans_regex`].
+pub fn current_fre_rebar_complete_spans_regex_for_haystack(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreCompleteSpansRegex, CompareError> {
+    current_fre_rebar_complete_spans_regex_inner(
+        pattern.into(),
+        unicode,
+        case_insensitive,
+        Some(haystack_len),
+    )
+}
+
+fn current_fre_rebar_complete_spans_regex_inner(
+    pattern: String,
+    unicode: bool,
+    case_insensitive: bool,
+    formal_haystack_len: Option<usize>,
+) -> Result<CurrentFreCompleteSpansRegex, CompareError> {
     let mut profile = rebar_profile();
     profile.options.unicode = unicode;
     profile.options.case_insensitive = case_insensitive;
@@ -3243,41 +3337,56 @@ pub fn current_fre_rebar_complete_spans_regex(
         regex.build_report().plan,
         PlanKind::K0 | PlanKind::ReverseInner
     ) {
-        match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive)
-            .build_span_visitor()
+        if let Ok(aggregate) =
+            current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive)
+                .build_span_visitor()
         {
-            Ok(aggregate)
-                if matches!(
-                    aggregate.build_report().plan,
-                    AggregatePlanKind::FixedAbsoluteDomain
-                        | AggregatePlanKind::LiteralAssertions
-                        | AggregatePlanKind::BlockingDelimiter
-                        | AggregatePlanKind::TokenPhrase
-                        | AggregatePlanKind::ReverseInner
-                        | AggregatePlanKind::DelimiterFieldSpans
-                        | AggregatePlanKind::BoundedLiteralPair
-                        | AggregatePlanKind::BoundedContext
-                        | AggregatePlanKind::GuardedAsciiWordDictionary
-                        | AggregatePlanKind::GuardedUnicodeWordLiteralSet
-                ) || sparse_finite_complete_spans_identity_matches(
-                    aggregate.build_report(),
-                    unicode,
-                    case_insensitive,
-                ) || dense_finite_complete_spans_identity_matches(
-                    aggregate.build_report(),
-                    unicode,
-                    case_insensitive,
-                ) || url_complete_spans_identity_matches(aggregate.build_report()) =>
-            {
+            let specialized = matches!(
+                aggregate.build_report().plan,
+                AggregatePlanKind::FixedAbsoluteDomain
+                    | AggregatePlanKind::LiteralAssertions
+                    | AggregatePlanKind::BlockingDelimiter
+                    | AggregatePlanKind::TokenPhrase
+                    | AggregatePlanKind::ReverseInner
+                    | AggregatePlanKind::DelimiterFieldSpans
+                    | AggregatePlanKind::BoundedLiteralPair
+                    | AggregatePlanKind::BoundedContext
+                    | AggregatePlanKind::GuardedAsciiWordDictionary
+                    | AggregatePlanKind::GuardedUnicodeWordLiteralSet
+            ) || sparse_finite_complete_spans_identity_matches(
+                aggregate.build_report(),
+                unicode,
+                case_insensitive,
+            ) || dense_finite_complete_spans_identity_matches(
+                aggregate.build_report(),
+                unicode,
+                case_insensitive,
+            ) || url_complete_spans_identity_matches(aggregate.build_report());
+            let continuation_sweep = if specialized {
+                false
+            } else if let Some(haystack_len) = formal_haystack_len {
+                formal_single_raw_span_sweep_preflight(
+                    &aggregate,
+                    haystack_len,
+                    &RunLimits::default(),
+                )
+                .map_err(|error| CompareError::new(error.message))?
+            } else {
+                false
+            };
+            if specialized || continuation_sweep {
                 require_rebar_complete_spans_identity(
                     aggregate.build_report(),
                     unicode,
                     case_insensitive,
                 )
                 .map_err(|error| CompareError::new(error.message))?;
-                let (plan_prefix, runtime_implementation_id) = if aggregate.build_report().plan
-                    == AggregatePlanKind::FixedAbsoluteDomain
-                {
+                let (plan_prefix, runtime_implementation_id) = if continuation_sweep {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_LARGE_CONTINUATION_PLAN,
+                        FORMAL_LARGE_CONTINUATION_RAW_SPAN_SWEEP_RUNTIME_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain {
                     (
                         CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN,
                         fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
@@ -3363,9 +3472,9 @@ pub fn current_fre_rebar_complete_spans_regex(
                     inner: CurrentFreCompleteSpansRegexInner::Aggregate(aggregate),
                     plan,
                     runtime_implementation_id,
+                    continuation_sweep,
                 });
             }
-            Ok(_) | Err(_) => {}
         }
     }
     let selected_plan_kind = regex.build_report().plan;
@@ -3401,6 +3510,7 @@ pub fn current_fre_rebar_complete_spans_regex(
         inner: CurrentFreCompleteSpansRegexInner::Portable(regex),
         plan,
         runtime_implementation_id,
+        continuation_sweep: false,
     })
 }
 
@@ -7029,6 +7139,30 @@ fn formal_single_span_sweep_eligible(
         .is_none_or(|dense_work| dense_work > limits.fre_aggregate_operation_work)
 }
 
+fn formal_single_raw_span_sweep_preflight(
+    regex: &AggregateSpanVisitorRegex,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<bool, ExecutionError> {
+    if !formal_single_span_sweep_eligible(regex, haystack_len, limits) {
+        return Ok(false);
+    }
+    let Some(sweep) = regex.continuation_sweep_upper_bounds().map_err(|error| {
+        ExecutionError::fault(format!(
+            "FRE complete-spans continuation-sweep eligibility preflight: {error}"
+        ))
+    })?
+    else {
+        return Ok(false);
+    };
+    let admitted = complete_spans_run_limits_with_policy(haystack_len, regex, limits)?;
+    Ok(sweep.table_cells != 0
+        && admitted.continuation.max_table_cells == sweep.table_cells
+        && admitted.continuation.max_random_access_bytes >= sweep.workspace_bytes
+        && admitted.continuation.max_scratch_bytes >= sweep.workspace_bytes
+        && admitted.continuation.max_peak_bytes >= sweep.workspace_bytes)
+}
+
 fn complete_spans_run_limits_with_policy(
     haystack_len: usize,
     regex: &AggregateSpanVisitorRegex,
@@ -8153,7 +8287,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V133
+        if receipt.adapter == FRE_ADAPTER_V134
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -23572,6 +23706,43 @@ mod tests {
                     above_dense_cap,
                     &limits,
                 ));
+                assert!(
+                    formal_single_raw_span_sweep_preflight(&large, above_dense_cap, &limits)
+                        .unwrap()
+                );
+
+                let compact =
+                    current_fre_rebar_complete_spans_builder("[A-Za-z]{8,13}", false, false)
+                        .build_span_visitor()
+                        .unwrap();
+                let AggregateBuildAccounting::Continuation(compact_compile) =
+                    compact.build_report().build
+                else {
+                    panic!("compact state-byte builder did not publish continuation accounting");
+                };
+                assert_eq!(compact_compile.state_byte_span_sum_plans, 1);
+                let compact_above_dense_cap = limits
+                    .fre_aggregate_operation_work
+                    .checked_div(compact_compile.execution_state_work)
+                    .unwrap()
+                    .saturating_add(1);
+                assert!(!formal_single_span_sweep_eligible(
+                    &compact,
+                    compact_above_dense_cap,
+                    &limits,
+                ));
+                assert!(
+                    compact.continuation_sweep_upper_bounds().unwrap().is_none(),
+                    "the compact state-byte owner must keep precedence over the sweep"
+                );
+                assert!(
+                    !formal_single_raw_span_sweep_preflight(
+                        &compact,
+                        compact_above_dense_cap,
+                        &limits,
+                    )
+                    .unwrap()
+                );
             })
             .unwrap()
             .join()
@@ -31265,7 +31436,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V133);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V134);
         assert!(
             current_identity
                 .identity
@@ -31279,9 +31450,20 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             current_identity
                 .adapter
-                .contains("-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1")
+                .contains("-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1")
         );
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V133));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V132));
+        assert!(
+            current_identity
+                .identity
+                .contains("formal-large-continuation-raw-span-sweep-v1 extends the anonymous-v2")
+        );
+        assert!(
+            current_identity
+                .availability
+                .contains("bounded-pair and compact state-byte visitors, smaller continuations")
+        );
         assert!(current_identity.availability.contains(FRE_ADAPTER_V131));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V130));
         // The superseded v128 key remains the detailed capability inventory

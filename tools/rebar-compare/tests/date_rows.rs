@@ -2,7 +2,9 @@ use std::fs;
 
 use bstr::ByteSlice;
 use rebar_compare::{
+    CURRENT_FRE_REBAR_COMPLETE_SPANS_LARGE_CONTINUATION_PLAN,
     CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX, current_fre_rebar_complete_spans_regex,
+    current_fre_rebar_complete_spans_regex_for_haystack,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,13 +45,26 @@ fn date_input() -> (String, Vec<u8>) {
     (pattern, haystack)
 }
 
-fn assert_exact_fixture_uses_generic_fallback(unicode: bool, row_id: &str, expected: u64) {
+fn assert_exact_fixture_uses_formal_large_continuation_sweep(
+    unicode: bool,
+    row_id: &str,
+    expected: u64,
+) {
     let (pattern, haystack) = date_input();
-    let regex = current_fre_rebar_complete_spans_regex(pattern, unicode, true)
+    let incumbent = current_fre_rebar_complete_spans_regex(pattern.clone(), unicode, true)
         .expect("Date lifecycle construction");
     assert_eq!(
-        regex.plan(),
+        incumbent.plan(),
         format!("{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-k0-k0")
+    );
+    let regex =
+        current_fre_rebar_complete_spans_regex_for_haystack(pattern, unicode, true, haystack.len())
+            .expect("formal Date lifecycle construction");
+    assert_eq!(
+        regex.plan(),
+        format!(
+            "{CURRENT_FRE_REBAR_COMPLETE_SPANS_LARGE_CONTINUATION_PLAN}-formal-large-continuation-raw-span-sweep-v1"
+        )
     );
     let mut session = regex.session(haystack.len()).expect("Date session");
     let actual = session.execute(&haystack).expect("Date execution");
@@ -62,11 +77,35 @@ fn assert_exact_fixture_uses_generic_fallback(unicode: bool, row_id: &str, expec
 #[test]
 #[ignore = "requires the separately authenticated exact Rebar fixture"]
 fn curated_03_date_ascii_exact_current_canary() {
-    assert_exact_fixture_uses_generic_fallback(false, "curated/03-date/ascii@rust/regex", 111_817);
+    std::thread::Builder::new()
+        .name("exact-date-ascii-canary".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            assert_exact_fixture_uses_formal_large_continuation_sweep(
+                false,
+                "curated/03-date/ascii@rust/regex",
+                111_817,
+            );
+        })
+        .expect("spawn exact Date ASCII canary")
+        .join()
+        .expect("exact Date ASCII canary");
 }
 
 #[test]
 #[ignore = "requires the separately authenticated exact Rebar fixture"]
 fn curated_03_date_unicode_exact_current_canary() {
-    assert_exact_fixture_uses_generic_fallback(true, "curated/03-date/unicode@rust/regex", 111_841);
+    std::thread::Builder::new()
+        .name("exact-date-unicode-canary".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            assert_exact_fixture_uses_formal_large_continuation_sweep(
+                true,
+                "curated/03-date/unicode@rust/regex",
+                111_841,
+            );
+        })
+        .expect("spawn exact Date Unicode canary")
+        .join()
+        .expect("exact Date Unicode canary");
 }

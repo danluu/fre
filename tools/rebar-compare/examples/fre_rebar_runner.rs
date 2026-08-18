@@ -29,7 +29,7 @@ use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, CurrentFreRegexReduxStageReceipt,
     REPORT_SCHEMA, current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_complete_spans_regex, current_fre_rebar_grep_session,
+    current_fre_rebar_complete_spans_regex_for_haystack, current_fre_rebar_grep_session,
     current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
     current_fre_rebar_search_limits,
 };
@@ -40,6 +40,7 @@ use rebar_compare::{
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
     current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_many_streaming_run_limits,
+    current_fre_rebar_complete_spans_regex,
     current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     current_fre_validate_generic_span_sum_identity,
@@ -1033,10 +1034,11 @@ fn describe_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorDescr
             (artifact.plan(&lifecycle)?.to_string(), None)
         }
         "count-spans" if matches!(benchmark.patterns.as_slice(), [_]) => {
-            let regex = current_fre_rebar_complete_spans_regex(
+            let regex = current_fre_rebar_complete_spans_regex_for_haystack(
                 benchmark.pattern().to_string(),
                 benchmark.unicode,
                 benchmark.case_insensitive,
+                benchmark.haystack.len(),
             )?;
             (regex.plan().to_string(), None)
         }
@@ -1150,10 +1152,11 @@ fn execute_anonymous_complete_spans(
     let [pattern] = benchmark.patterns.as_slice() else {
         return Err("complete-spans execution requires exactly one pattern".into());
     };
-    let regex = current_fre_rebar_complete_spans_regex(
+    let regex = current_fre_rebar_complete_spans_regex_for_haystack(
         pattern.clone(),
         benchmark.unicode,
         benchmark.case_insensitive,
+        benchmark.haystack.len(),
     )?;
     let mut session = regex.session(benchmark.haystack.len())?;
     session.validate_haystack(&benchmark.haystack)?;
