@@ -174,7 +174,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 ///
 /// Generic participation reducers remain available to library callers, but
 /// this route performs every capture search and inspects every numeric slot.
-pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v3";
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v4";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
@@ -253,7 +253,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-byte-frontier-count-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-byte-frontier-count-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -924,6 +924,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; formal count-captures and grep-captures preserve the complete pre-source prospective, validation and admission order, accounting v2, logical search count, charged byte/start ledger, capture records, numeric slots, refusal ordering, and receipt closure; a positive-minimum ordinary leftmost search skips only newly injected roots that cannot complete inside the window, while zero-minimum and non-LEFTMOST configured searches plus every other History caller retain their incumbent route; the formal adapter substitutes only the lower physical state-visit and history-node counters, while winning history walk and the logical charged byte/start ledger remain unchanged, and no required-literal proof or execution-time fallback is introduced",
+        );
+        identity.identity.push_str(
+            "; materialized-first-byte-root-filter-v1 binds capture-materialized-array-iteration-v4 and CaptureIteration algorithm v4/accounting v2 to an opaque exact nonnullable first-byte proof returned atomically with the same mandatory Program; only after the incumbent Program and optional one-pass capture construction finish unchanged may the last HIR-budget transaction spend exactly five units, one fixed attempt plus four predetermined word comparisons; Selected is sealed only when the proof is nonnullable and all four exact proof words equal the predetermined [A-Za-z] image, otherwise an admitted attempt seals AttemptedIneligible, while insufficient headroom seals NotAttempted; the selected generic MaskedInclusiveRange conceptually represents { or_mask: 0x20, inclusive: a..=z } and retains the equivalent private bytes { or_mask: 0x20, lower: a, width: 25 } inside the existing iteration-owner Arc; Program, State, engine BuildReport and capture-program V1 identity remain unchanged, while public CaptureBuildReport.hir.work advances by exactly five for every admitted Selected or AttemptedIneligible attempt and by zero only for NotAttempted",
+        );
+        identity.availability.push_str(
+            "; an exact ordinary LEFTMOST positive-minimum materialization composes the selected nonnullable [A-Za-z] classifier with materialized-positive-minimum-start-ceiling-v1 and filters only NEW root injection; validation and incumbent history admission precede source access, a rejected byte never closes the future domain, and already-live histories finish unchanged beyond either a rejected position or the inclusive start ceiling; fewer than five remaining HIR work units publish no classifier with zero charge and no refusal, while zero-minimum, non-LEFTMOST, ineligible, and unattempted constructions retain the incumbent route with no execution-time fallback; logical P, charged bytes, charged starts, captures, slots, winning history walk and refusal order remain unchanged, and the formal adapter substitutes only lower physical state-visit and history-node counters; the authenticated public comparison retains exact per-line span/count parity with pinned regex 1.12.4 over regex-automata 0.4.14 without attributing that comparator's opaque engine work to the FRE ledger",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v6 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage; grep-captures materializes the same exact records independently for every proof-surviving and post-cutover ByteSlice::lines domain after formal-materialized-capture-required-literal-lines-v1 has certified each pruned line record-empty; both preserve numeric group order, inspect every present or absent slot, and read both endpoints of every participating group; fixed-byte-capture-record-visit-v1 emits every unanchored record directly only when generic canonical-HIR inspection proves a positive Unicode-off fixed byte sequence, direct root captures and at most one greedy terminal optional capture, with nested captures, alternation, variable repetitions, assertions, Unicode mode and ambiguous optional boundaries retaining exact history; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan; absolute-full-domain-onepass-record-v1 may replay the complete input span directly only when the canonical HIR requires both absolute Start and absolute End and construction retained a complete one-pass capture plan; deterministic-anchored-line-record-visit-v1 emits the actual mandatory group endpoints only when generic HIR inspection proves absolute Start, byte-only atoms, direct root captures and unambiguous greedy boundaries, while Unicode, nested captures, alternation, lazy repetition, assertions and ambiguous boundaries retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
@@ -26931,7 +26937,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         clippy::too_many_lines,
         reason = "one authenticated public transaction binds row identity, semantic parity, physical reconstruction, receipt closure, and the whole-operation opportunity proof"
     )]
-    fn authenticated_positive_minimum_capture_start_ceiling_public_canary() {
+    fn authenticated_materialized_first_byte_root_filter_public_canary() {
         const JOB_ID: &str = "unicode/overlapping-words/ascii@rust/regex";
         const PATTERN: &str = r"([A-Za-z]{14})|([A-Za-z]{13})|([A-Za-z]{12})|([A-Za-z]{11})|([A-Za-z]{10})|([A-Za-z]{9})|([A-Za-z]{8})|([A-Za-z]{7})|([A-Za-z]{6})|([A-Za-z]{5})";
         const EXPECTED: u64 = 6_156;
@@ -26946,16 +26952,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         const EXECUTED_BOUNDARIES: usize = 62_882;
         const PRE_CEILING_STATE_VISITS: usize = 2_875_940;
         const CEILING_STATE_VISITS: usize = 2_459_250;
+        const FILTERED_STATE_VISITS: usize = 2_067_360;
         const PRE_CEILING_HISTORY_NODES: usize = 686_029;
         const CEILING_HISTORY_NODES: usize = 568_637;
+        const FILTERED_HISTORY_NODES: usize = 424_944;
         const HISTORY_WALK: usize = 12_312;
         const CHARGED_BYTES: usize = 104_794;
         const CHARGED_STARTS: usize = 110_042;
         const CAPTURE_EVENTS: usize = 33_858;
-        const WHOLE_OPERATION_DENOMINATOR: usize = 3_901_063;
-        const GROSS_REMOVED_ACTIONS: usize = 534_082;
-        const NET_REMOVED_ACTIONS: usize = 245_464;
-        const CROSS_PRODUCT_MARGIN: usize = 5_041_085;
+        const ROOT_OPPORTUNITIES: usize = 50_533;
+        const CLASSIFIER_MEMBERS: usize = 37_470;
+        const CLASSIFIER_REJECTIONS: usize = 13_063;
+        const WHOLE_OPERATION_DENOMINATOR: usize = 3_366_981;
+        const GROSS_REMOVED_ACTIONS: usize = 535_583;
+        const TOTAL_DEBIT: usize = 340_293;
+        const NET_REMOVED_ACTIONS: usize = 195_290;
+        const CROSS_PRODUCT_MARGIN: usize = 2_694_095;
         const DEFINITION_SHA256: &str =
             "20bc0c9bf64400b9c0334cd54038130eca8e3a7c744b55c806cff06295015517";
         const PATTERN_SHA256: &str =
@@ -27076,6 +27088,37 @@ agggtaa[cgt]|[acg]ttaccct 0
         let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
             .expect("derive overlapping-words capture limits")
             .aggregate;
+        let construction_identity = regex.iteration_identity(run_limits);
+        let construction_route = construction_identity.session_seal.route_identity();
+        let classifier_receipt = *construction_identity
+            .session_seal
+            .start_classifier_receipt();
+        assert!(classifier_receipt.closes(construction_route.build_limits.max_hir_work));
+        assert_eq!(
+            classifier_receipt.work_after(),
+            regex.build_report().hir.work
+        );
+        assert_eq!(
+            classifier_receipt.charged_work(),
+            fre::CAPTURE_ITERATION_START_CLASSIFIER_WORK
+        );
+        assert_eq!(classifier_receipt.charged_work(), 5);
+        let classifier = classifier_receipt
+            .classifier()
+            .expect("exact ASCII alphabetic first-byte classifier");
+        assert_eq!(classifier.or_mask(), 0x20);
+        assert_eq!(classifier.lower(), b'a');
+        assert_eq!(classifier.upper(), b'z');
+        for byte in 0_u8..=u8::MAX {
+            assert_eq!(classifier.matches(byte), byte.is_ascii_alphabetic());
+        }
+        assert_eq!(
+            classifier_receipt.outcome(),
+            fre::CaptureIterationStartClassifierOutcome::Selected(classifier)
+        );
+        assert_eq!(construction_route.minimum_match_bytes, 5);
+        assert_eq!(construction_route.algorithm_version, 4);
+        assert_eq!(construction_route.accounting_version, 2);
         let operation = execute_materialized_grep_captures_inner(
             None,
             &regex,
@@ -27093,9 +27136,15 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(operation.materialization.searches, LOGICAL_SEARCHES);
         assert_eq!(operation.materialization.materialized_records, RECORDS);
         assert_eq!(operation.materialization.results, RECORDS);
-        assert_eq!(operation.materialization.total_state_visits, CEILING_STATE_VISITS);
+        assert_eq!(
+            operation.materialization.total_state_visits,
+            FILTERED_STATE_VISITS
+        );
         assert_eq!(operation.materialization.total_slot_copies, 0);
-        assert_eq!(operation.materialization.total_history_nodes, CEILING_HISTORY_NODES);
+        assert_eq!(
+            operation.materialization.total_history_nodes,
+            FILTERED_HISTORY_NODES
+        );
         assert_eq!(operation.materialization.total_history_walk, HISTORY_WALK);
         assert_eq!(operation.materialization.capture_events, CAPTURE_EVENTS);
         assert_eq!(operation.materialization.bytes_examined, CHARGED_BYTES);
@@ -27117,9 +27166,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut short_pre_loop_searches = 0_usize;
         let mut entered_searches = 0_usize;
         let mut physical_byte_transitions = 0_usize;
+        let mut root_opportunities = 0_usize;
+        let mut classifier_members = 0_usize;
+        let mut classifier_rejections = 0_usize;
         let add = |left: usize, right: usize, what: &str| {
             left.checked_add(right)
                 .unwrap_or_else(|| panic!("{what} overflow"))
+        };
+        let census_root_range = |line: &[u8], start: usize, end: usize| {
+            let bytes = line
+                .get(start..=end)
+                .expect("root opportunity range stays inside its line");
+            let members = bytes
+                .iter()
+                .filter(|&&byte| classifier.matches(byte))
+                .count();
+            (bytes.len(), members, bytes.len() - members)
         };
         for line in input.haystack.lines() {
             lines = add(lines, 1, "line count");
@@ -27201,12 +27263,44 @@ agggtaa[cgt]|[acg]ttaccct 0
             charged_starts = add(charged_starts, actual.starts_injected, "charged starts");
 
             assert_eq!(report.searches, report.captures.len() + 1);
+            let maximum_start = line.len().checked_sub(5);
             let mut cursor = 0_usize;
             for record in &report.captures {
                 let span = record.overall().expect("capture record has group zero");
                 let width = span.end.checked_sub(span.start).expect("ordered capture span");
                 assert!((5..=14).contains(&width));
                 assert!(span.start >= cursor && span.end <= line.len());
+                if let Some(maximum_start) = maximum_start {
+                    // The lowest-priority `{5}` arm accepts first. It sets a
+                    // winner at this boundary and suppresses later NEW roots,
+                    // while the retained higher-priority arms continue until
+                    // the selected 5..=14-byte span is final.
+                    let first_accept = span
+                        .start
+                        .checked_add(5)
+                        .expect("first accepting boundary fits usize");
+                    assert!(first_accept <= span.end);
+                    let last_opportunity = first_accept.min(maximum_start);
+                    if cursor <= last_opportunity {
+                        let (opportunities, members, rejections) =
+                            census_root_range(line, cursor, last_opportunity);
+                        root_opportunities = add(
+                            root_opportunities,
+                            opportunities,
+                            "successful-search root opportunities",
+                        );
+                        classifier_members = add(
+                            classifier_members,
+                            members,
+                            "successful-search classifier members",
+                        );
+                        classifier_rejections = add(
+                            classifier_rejections,
+                            rejections,
+                            "successful-search classifier rejections",
+                        );
+                    }
+                }
                 entered_searches = add(entered_searches, 1, "entered successful searches");
                 physical_byte_transitions = add(
                     physical_byte_transitions,
@@ -27224,7 +27318,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 cursor = span.end;
             }
 
-            let Some(maximum_start) = line.len().checked_sub(5) else {
+            let Some(maximum_start) = maximum_start else {
                 short_pre_loop_searches = add(
                     short_pre_loop_searches,
                     1,
@@ -27241,6 +27335,23 @@ agggtaa[cgt]|[acg]ttaccct 0
                 continue;
             }
             entered_searches = add(entered_searches, 1, "entered terminal searches");
+            let (opportunities, members, rejections) =
+                census_root_range(line, cursor, maximum_start);
+            root_opportunities = add(
+                root_opportunities,
+                opportunities,
+                "terminal-search root opportunities",
+            );
+            classifier_members = add(
+                classifier_members,
+                members,
+                "terminal-search classifier members",
+            );
+            classifier_rejections = add(
+                classifier_rejections,
+                rejections,
+                "terminal-search classifier rejections",
+            );
             let mut pos = cursor;
             let mut live = false;
             let mut live_ascii_width = 0_usize;
@@ -27277,8 +27388,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(content_bytes, CONTENT_BYTES);
         assert_eq!(records, RECORDS);
         assert_eq!(logical_searches, LOGICAL_SEARCHES);
-        assert_eq!(physical_state_visits, CEILING_STATE_VISITS);
-        assert_eq!(physical_history_nodes, CEILING_HISTORY_NODES);
+        assert_eq!(physical_state_visits, FILTERED_STATE_VISITS);
+        assert_eq!(physical_history_nodes, FILTERED_HISTORY_NODES);
         assert_eq!(physical_history_walk, HISTORY_WALK);
         assert_eq!(charged_bytes, CHARGED_BYTES);
         assert_eq!(charged_starts, CHARGED_STARTS);
@@ -27291,11 +27402,27 @@ agggtaa[cgt]|[acg]ttaccct 0
             physical_byte_transitions + entered_searches,
             EXECUTED_BOUNDARIES
         );
+        assert_eq!(root_opportunities, ROOT_OPPORTUNITIES);
+        assert_eq!(classifier_members, CLASSIFIER_MEMBERS);
+        assert_eq!(classifier_rejections, CLASSIFIER_REJECTIONS);
+        assert_eq!(
+            classifier_members + classifier_rejections,
+            root_opportunities
+        );
 
-        let state_visits_removed = PRE_CEILING_STATE_VISITS - CEILING_STATE_VISITS;
-        let history_nodes_removed = PRE_CEILING_HISTORY_NODES - CEILING_HISTORY_NODES;
-        assert_eq!(state_visits_removed, 416_690);
-        assert_eq!(history_nodes_removed, 117_392);
+        // Preserve the authenticated v140 frontier separately; v141's claimed
+        // denominator and numerator begin only after that ceiling is present.
+        assert_eq!(
+            (PRE_CEILING_STATE_VISITS - CEILING_STATE_VISITS)
+                + (PRE_CEILING_HISTORY_NODES - CEILING_HISTORY_NODES),
+            534_082
+        );
+        let state_visits_removed = CEILING_STATE_VISITS - FILTERED_STATE_VISITS;
+        let history_nodes_removed = CEILING_HISTORY_NODES - FILTERED_HISTORY_NODES;
+        assert_eq!(state_visits_removed, 391_890);
+        assert_eq!(history_nodes_removed, 143_693);
+        assert_eq!(state_visits_removed, CLASSIFIER_REJECTIONS * 30);
+        assert_eq!(history_nodes_removed, CLASSIFIER_REJECTIONS * 11);
         assert_eq!(
             state_visits_removed + history_nodes_removed,
             GROSS_REMOVED_ACTIONS
@@ -27304,8 +27431,8 @@ agggtaa[cgt]|[acg]ttaccct 0
             HAYSTACK_BYTES,
             LINE_DOMAINS,
             LOGICAL_SEARCHES,
-            PRE_CEILING_STATE_VISITS,
-            PRE_CEILING_HISTORY_NODES,
+            CEILING_STATE_VISITS,
+            CEILING_HISTORY_NODES,
             HISTORY_WALK,
             CHARGED_BYTES,
             CHARGED_STARTS,
@@ -27318,30 +27445,33 @@ agggtaa[cgt]|[acg]ttaccct 0
             WHOLE_OPERATION_DENOMINATOR
         );
 
-        // Headline source-grounded stress debit. Every line-local facade
-        // invocation pays five route-setup units: minimum load, config
-        // comparison, positive-minimum comparison, checked subtraction, and
-        // nested route-option construction. Every logical search pays five
-        // initialization units: facade dispatch, restricted call, ceiling
-        // decode, end clamp, and below-from comparison. Every entered boundary
-        // pays four cutoff units. Injection adds at most two: one reusable
-        // ceiling comparison and one short-circuit conjunction. The terminal
-        // guard adds at most two by cases: a nonempty frontier is no dearer;
-        // empty plus winner takes the same three checks as the incumbent;
-        // empty without a winner adds the reused no-future-start condition and
-        // its conjunction. Thus the reordered empty-frontier check replaces
-        // the incumbent winner-first guard instead of adding a fifth action;
-        // charging all four units on every boundary strictly over-debits.
+        // Headline source-grounded stress debit against the complete post-v140
+        // operation. Each incumbent root opportunity pays at most six new
+        // actions: bounds check, byte load, OR, wrapping subtraction,
+        // comparison, and injection gate. The validated interval width is
+        // precomputed in the classifier's third byte. Because the classifier
+        // lives wholly inside the incumbent true injection arm, no debit is hidden
+        // on the 8,091 non-root transitions. Each line pays five owner /
+        // exact-config selection actions; each logical search pays five
+        // filtered-call, end-normalization and classifier-unwrapping actions;
+        // the atomic construction proof pays its sealed fixed five once.
+        let root_gate_debit = 6 * ROOT_OPPORTUNITIES;
         let route_setup_debit = 5 * LINE_DOMAINS;
         let search_initialization_debit = 5 * LOGICAL_SEARCHES;
-        let boundary_cutoff_debit = 4 * EXECUTED_BOUNDARIES;
+        let classifier_projection_debit = fre::CAPTURE_ITERATION_START_CLASSIFIER_WORK;
+        assert_eq!(
+            PHYSICAL_BYTE_TRANSITIONS - ROOT_OPPORTUNITIES,
+            8_091
+        );
+        assert_eq!(root_gate_debit, 303_198);
         assert_eq!(route_setup_debit, 10_850);
         assert_eq!(search_initialization_debit, 26_240);
-        assert_eq!(boundary_cutoff_debit, 251_528);
-        let total_debit = route_setup_debit
+        assert_eq!(classifier_projection_debit, 5);
+        let total_debit = root_gate_debit
+            + route_setup_debit
             + search_initialization_debit
-            + boundary_cutoff_debit;
-        assert_eq!(total_debit, 288_618);
+            + classifier_projection_debit;
+        assert_eq!(total_debit, TOTAL_DEBIT);
         assert_eq!(GROSS_REMOVED_ACTIONS - total_debit, NET_REMOVED_ACTIONS);
         let net_numerator = NET_REMOVED_ACTIONS * 100;
         let five_percent_threshold = WHOLE_OPERATION_DENOMINATOR * 5;
@@ -27350,6 +27480,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             CROSS_PRODUCT_MARGIN
         );
         assert!(net_numerator > five_percent_threshold);
+        // The exact ratio is 195_290 / 3_366_981 = 5.80015153% rounded
+        // to eight decimal places; the checked integer margin above is the
+        // portable authoritative threshold proof.
     }
 
     #[test]
@@ -31960,7 +32093,49 @@ agggtaa[cgt]|[acg]ttaccct 0
             "lifecycle construction creates only an empty workspace"
         ));
         assert!(identity.adapter.starts_with(
-            "fre-current-aggregate-capture-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+            "fre-current-aggregate-capture-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v141-materialized-first-byte-root-filter-v1-"));
+        assert!(identity.identity.contains(
+            "materialized-first-byte-root-filter-v1 binds capture-materialized-array-iteration-v4 and CaptureIteration algorithm v4/accounting v2"
+        ));
+        assert!(identity.identity.contains(
+            "opaque exact nonnullable first-byte proof returned atomically with the same mandatory Program"
+        ));
+        assert!(identity.identity.contains(
+            "one fixed attempt plus four predetermined word comparisons"
+        ));
+        assert!(identity.identity.contains(
+            "Selected is sealed only when the proof is nonnullable and all four exact proof words equal the predetermined [A-Za-z] image"
+        ));
+        assert!(identity.identity.contains(
+            "generic MaskedInclusiveRange conceptually represents { or_mask: 0x20, inclusive: a..=z }"
+        ));
+        assert!(identity.identity.contains(
+            "equivalent private bytes { or_mask: 0x20, lower: a, width: 25 }"
+        ));
+        assert!(identity.identity.contains(
+            "public CaptureBuildReport.hir.work advances by exactly five for every admitted Selected or AttemptedIneligible attempt and by zero only for NotAttempted"
+        ));
+        assert!(identity.availability.contains(
+            "composes the selected nonnullable [A-Za-z] classifier with materialized-positive-minimum-start-ceiling-v1"
+        ));
+        assert!(identity.availability.contains(
+            "filters only NEW root injection"
+        ));
+        assert!(identity.availability.contains(
+            "already-live histories finish unchanged beyond either a rejected position or the inclusive start ceiling"
+        ));
+        assert!(identity.availability.contains(
+            "fewer than five remaining HIR work units publish no classifier with zero charge and no refusal"
+        ));
+        assert!(identity.availability.contains(
+            "logical P, charged bytes, charged starts, captures, slots, winning history walk and refusal order remain unchanged"
+        ));
+        assert!(identity.availability.contains(
+            "pinned regex 1.12.4 over regex-automata 0.4.14"
         ));
         assert!(identity
             .adapter
@@ -32404,7 +32579,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "runner/schedule adapter key must version the persistent physical route"
         );
         assert!(current_fre_adapter_id().starts_with(
-            "fre-current-aggregate-capture-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
+            "fre-current-aggregate-capture-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
         ));
         assert!(!current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"));
         assert!(
@@ -36171,7 +36346,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn materialized_absolute_start_closure_preserves_pre_source_limits_and_receipts() {
         assert_eq!(
             CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
-            "capture-materialized-array-iteration-v3"
+            "capture-materialized-array-iteration-v4"
         );
         let regex = CaptureBuilder::new(r"^((a)?)(b?)")
             .unicode(false)
