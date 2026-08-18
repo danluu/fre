@@ -21,6 +21,8 @@ pub const PLAN_ID: &str = "url-aggregate.certified-factor.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "url-aggregate.span-sum.v1";
 pub const SPAN_VISIT_OPERATION_ID: &str = "url-aggregate.span-visit.v2";
 
+const LANGUAGE_ID_DOMAIN: &[u8] = b"url-aggregate.ordered-ascii-folded-tld-language.v1";
+
 const ALPHABET: usize = 37;
 const UNSET: u32 = u32::MAX;
 const NONE: usize = usize::MAX;
@@ -68,6 +70,22 @@ pub struct BuildAccounting {
     pub persistent_bytes: usize,
     pub scratch_bytes: usize,
     pub peak_bytes: usize,
+}
+
+/// Stable construction-authenticated identity of the exact ordered TLD
+/// language retained by one URL plan.
+///
+/// TLD bytes are ASCII-folded because the certified grammar is
+/// case-insensitive. Length prefixes preserve source alternation boundaries
+/// and order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LanguageId([u8; 16]);
+
+impl LanguageId {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,6 +313,7 @@ pub struct UrlAggregatePlan {
     transitions: ExactVec<u32>,
     terminal: ExactVec<bool>,
     max_tld_bytes: usize,
+    language_id: LanguageId,
     build: BuildAccounting,
 }
 
@@ -526,6 +545,19 @@ impl UrlAggregatePlan {
             }
         }
 
+        // The plan does not retain the packed source language. Authenticate
+        // that exact ordered, folded language while it is still available so
+        // callers can bind semantic identity without relying on trie shape or
+        // accounting coincidences. Every hash action is prepaid through the
+        // same authoritative construction meter.
+        let language_id = language_identity(
+            packed_tlds,
+            tld_ends,
+            authority,
+            &mut work,
+            limits.max_work,
+        )?;
+
         let states_upper_bound = build_add(tld_bytes, 1, "states")?;
         build_enforce("states", states_upper_bound, limits.max_states)?;
         let table_cells = build_mul(states_upper_bound, ALPHABET, "table cells")?;
@@ -613,6 +645,7 @@ impl UrlAggregatePlan {
                 transitions,
                 terminal,
                 max_tld_bytes,
+                language_id,
                 build: BuildAccounting {
                     tlds: tld_count,
                     tld_bytes,
@@ -642,6 +675,16 @@ impl UrlAggregatePlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    #[must_use]
+    pub const fn language_id(&self) -> LanguageId {
+        self.language_id
+    }
+
+    #[must_use]
+    pub const fn max_tld_bytes(&self) -> usize {
+        self.max_tld_bytes
     }
 
     /// Return count and matched-byte sum for the certified grammar.
@@ -1721,6 +1764,93 @@ const fn is_path(byte: u8) -> bool {
         )
 }
 
+fn language_identity(
+    packed_tlds: &[u8],
+    tld_ends: &[usize],
+    authority: &mut impl UrlAggregateBuildAuthority,
+    work: &mut usize,
+    work_limit: usize,
+) -> Result<LanguageId, BuildError> {
+    let encoded_lengths = build_mul(
+        tld_ends.len(),
+        size_of::<u64>(),
+        "language identity length bytes",
+    )?;
+    let payload = build_add(
+        build_add(
+            LANGUAGE_ID_DOMAIN.len(),
+            size_of::<u64>(),
+            "language identity bytes",
+        )?,
+        build_add(
+            encoded_lengths,
+            packed_tlds.len(),
+            "language identity bytes",
+        )?,
+        "language identity bytes",
+    )?;
+    charge_build(
+        authority,
+        work,
+        build_add(
+            build_mul(2, payload, "language identity hash work")?,
+            packed_tlds.len(),
+            "language identity fold work",
+        )?,
+        work_limit,
+    )?;
+
+    let mut first = LanguageHash::new(0xb27d_4e31_8c6a_f905);
+    let mut second = LanguageHash::new(0xf905_8c6a_4e31_b27d);
+    first.bytes(LANGUAGE_ID_DOMAIN);
+    second.bytes(LANGUAGE_ID_DOMAIN);
+    first.usize(tld_ends.len());
+    second.usize(tld_ends.len());
+    for index in 0..tld_ends.len() {
+        let tld = packed_tld(packed_tlds, tld_ends, index)?;
+        first.usize(tld.len());
+        second.usize(tld.len());
+        for &byte in tld {
+            let folded = byte.to_ascii_lowercase();
+            first.byte(folded);
+            second.byte(folded);
+        }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(LanguageId(bytes))
+}
+
+struct LanguageHash(u64);
+
+impl LanguageHash {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.0 ^= u64::from(byte);
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.byte(byte);
+        }
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.bytes(&u64::try_from(value).unwrap_or(u64::MAX).to_le_bytes());
+    }
+
+    const fn finish(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 struct LocalBuildAuthority {
     limits: BuildLimits,
@@ -2586,6 +2716,25 @@ mod tests {
             UrlAggregatePlan::build(b"COMcom", &[3, 6], BuildLimits::default()),
             Err(BuildError::DuplicateTld { .. })
         ));
+    }
+
+    #[test]
+    fn language_identity_binds_ordered_folded_bytes_not_accounting_shape() {
+        let first = UrlAggregatePlan::build(b"COMORG", &[3, 6], BuildLimits::default()).unwrap();
+        let same_shape =
+            UrlAggregatePlan::build(b"NETEDU", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.build_accounting(), same_shape.build_accounting());
+        assert_ne!(first.language_id(), same_shape.language_id());
+
+        let folded =
+            UrlAggregatePlan::build(b"comorg", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.language_id(), folded.language_id());
+        assert_eq!(first.max_tld_bytes(), 3);
+
+        let reordered =
+            UrlAggregatePlan::build(b"ORGCOM", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.build_accounting(), reordered.build_accounting());
+        assert_ne!(first.language_id(), reordered.language_id());
     }
 
     #[test]

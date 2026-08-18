@@ -1064,7 +1064,24 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
     ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
-        Self::compile_with_construction_receipt(hir, profile, limits, None)
+        Self::compile_with_construction_receipt(hir, profile, limits, None, false)
+    }
+
+    /// Compile a whole-match-only artifact that may let the authoritative URL
+    /// certificate become the complete compile owner before generic NFA
+    /// lowering. An ineligible HIR continues through the ordinary compiler in
+    /// the same receipt and resource ledger.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the typed terminal receipt preserves the complete bounded compiler ledger"
+    )]
+    pub fn from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+    ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
+        Self::compile_with_construction_receipt(hir, profile, limits, None, true)
     }
 
     /// Fixed-scalar residual compiler entry point combining the existing
@@ -1089,6 +1106,7 @@ impl CompiledRegex {
                 limit: allocation_limit,
                 prospective: prospective_allocations,
             }),
+            false,
         )
     }
 
@@ -1101,6 +1119,7 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
         allocation_scope: Option<AllocationScope>,
+        prefer_url_only: bool,
     ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
         let simd_dispatch = SimdDispatchContext::capture();
         let identity = CompileAttemptIdentity {
@@ -1119,6 +1138,7 @@ impl CompiledRegex {
                 limits,
                 CapturePolicy::EraseForWholeMatch,
                 false,
+                prefer_url_only,
                 simd_dispatch,
                 &mut budget,
             )
@@ -1181,6 +1201,7 @@ impl CompiledRegex {
                 limits,
                 CapturePolicy::EraseForWholeMatch,
                 false,
+                false,
                 simd_dispatch,
                 &mut budget,
             )
@@ -1230,6 +1251,7 @@ impl CompiledRegex {
             limits,
             capture_policy,
             ordered_root,
+            false,
             simd_dispatch,
             &mut budget,
         )
@@ -1245,17 +1267,27 @@ impl CompiledRegex {
         limits: CompileLimits,
         capture_policy: CapturePolicy,
         ordered_root: bool,
+        prefer_url_only: bool,
         simd_dispatch: SimdDispatchContext,
         budget: &mut CompileBudget,
     ) -> Result<Self, Error> {
         validate_hir(hir, profile, capture_policy, budget)?;
         let minimum_match_bytes = hir.properties().minimum_len();
         budget.accounting.minimum_match_bytes = minimum_match_bytes;
-        let url_aggregate = if ordered_root || !limits.allow_workload_specific_intrinsics {
+        let mut url_aggregate = if ordered_root || !limits.allow_workload_specific_intrinsics {
             None
         } else {
             build_url_aggregate_plan(hir, profile, capture_policy, limits, budget)?
         };
+        if prefer_url_only && let Some(url_aggregate) = url_aggregate.take() {
+            return Self::finish_url_only_compile(
+                profile,
+                limits,
+                minimum_match_bytes,
+                url_aggregate,
+                budget,
+            );
+        }
         let (
             required_suffixes,
             required_literals,
@@ -1451,6 +1483,120 @@ impl CompiledRegex {
             required_suffixes,
             required_literals,
             required_internal_anchor,
+            terminal_frontier,
+            minimum_match_bytes,
+            plan_id,
+            accounting,
+        })
+    }
+
+    /// Publish the authoritative URL plan behind a minimal continuation shell.
+    ///
+    /// The shell is deliberately fail-closed and never represents the regex:
+    /// `url_only_compile_artifacts` makes every non-URL execution terminal.
+    /// Its only purpose is to preserve the existing plan/cache/certificate
+    /// ownership surfaces while the strict URL certificate and plan remain the
+    /// complete semantic authority.
+    fn finish_url_only_compile(
+        profile: RustByteProfile,
+        limits: CompileLimits,
+        minimum_match_bytes: Option<usize>,
+        url_aggregate: fre_kernels::UrlAggregatePlan,
+        budget: &mut CompileBudget,
+    ) -> Result<Self, Error> {
+        let (
+            required_suffixes,
+            required_literals,
+            terminal_frontier,
+            retained_seed_bytes,
+        ) = retain_empty_url_compile_components(limits, budget)?;
+        let retained_program_bytes = add(
+            retained_seed_bytes,
+            url_aggregate.build_accounting().persistent_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            retained_program_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+
+        let mut builder = Builder::new(
+            limits.max_program_states,
+            profile,
+            CapturePolicy::EraseForWholeMatch,
+            retained_program_bytes,
+            budget,
+        );
+        let _accept = builder.push(Inst::Match)?;
+        let entry = builder.push(Inst::Fail)?;
+        let scalar_range_bytes = builder.scalar_range_bytes;
+        let insts = builder.finish()?;
+        let certificate =
+            certify_program(&insts, scalar_range_bytes, retained_program_bytes, budget)?;
+        budget.charge(insts.len())?;
+        let program_bytes = add(
+            program_bytes(
+                &insts,
+                insts.len(),
+                certificate.epsilon_order.len(),
+                certificate.split_rank.len(),
+            )?,
+            retained_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            program_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        budget.accounting.url_only_compile_artifacts = 1;
+        budget.accounting.program_states = insts.len();
+        budget.accounting.program_bytes = program_bytes;
+        budget.accounting.execution_state_work = certificate.execution_state_work;
+        budget.accounting.continuation_max_nonaccepting_run =
+            certificate.continuation_nonaccepting_run;
+        budget.accounting.predecessor_edges = certificate.predecessor_edges;
+        budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
+        budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
+        let mut program = Program {
+            insts,
+            entry,
+            epsilon_order: certificate.epsilon_order,
+            split_rank: certificate.split_rank,
+            split_count: certificate.split_count,
+            root_split_count: certificate.root_split_count,
+            root_alternation_arms: 0,
+            execution_state_work: certificate.execution_state_work,
+            predecessor_edges: certificate.predecessor_edges,
+            has_scalar_transition: certificate.has_scalar_transition,
+            has_assertion: certificate.has_assertion,
+            max_scalar_search_checks: certificate.max_scalar_search_checks,
+            continuation_nonaccepting_run: certificate.continuation_nonaccepting_run,
+            has_unicode_word_boundary: false,
+            start_domain: StartDomain::AnyBoundary,
+            root_assertion: None,
+        };
+        let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, budget)?;
+        plan_id = bind_start_domain_identity(plan_id, StartDomain::AnyBoundary, budget)?;
+        plan_id = bind_required_literal_identity(plan_id, required_literals, budget)?;
+        plan_id = bind_url_aggregate_identity(plan_id, &url_aggregate, budget)?;
+        plan_id = bind_url_only_compile_identity(plan_id, budget)?;
+        if budget.current_construction_bytes != program_bytes {
+            return Err(Error::InternalInvariant(
+                "URL-only compiler retained bytes differ from construction accounting",
+            ));
+        }
+        let accounting = budget.accounting;
+        Ok(Self {
+            program,
+            candidate: None,
+            url_aggregate: Some(url_aggregate),
+            state_byte_span_sum: None,
+            ordered_bounded_span_sum: None,
+            required_suffixes,
+            required_literals,
+            required_internal_anchor: None,
             terminal_frontier,
             minimum_match_bytes,
             plan_id,
@@ -4552,6 +4698,89 @@ type RetainedComponents = (
     usize,
 );
 
+/// Retain only the fixed proof slots physically present in a URL-only compile
+/// owner. The authoritative URL plan replaces every optional continuation
+/// seed, so no HIR analysis or dynamic seed allocation is performed here.
+fn retain_empty_url_compile_components(
+    limits: CompileLimits,
+    budget: &mut CompileBudget,
+) -> Result<
+    (
+        RequiredSuffixes,
+        RequiredLiteralSets,
+        TerminalFrontierSeed,
+        usize,
+    ),
+    Error,
+> {
+    if !budget.receipt_scope || !budget.construction_effect_scope {
+        return Err(Error::InternalInvariant(
+            "URL-only compilation requires the construction-receipt scope",
+        ));
+    }
+    let start_bytes = budget.current_construction_bytes;
+    let required_suffixes = RequiredSuffixes::default();
+    let required_literals = RequiredLiteralSets::empty();
+    let terminal_frontier = TerminalFrontierSeed::empty();
+
+    budget.accounting.required_literal_proof_bytes = RequiredLiteralSets::retained_bytes();
+    let minimum_match_bytes_proof_bytes = core::mem::size_of::<Option<usize>>();
+    budget.accounting.minimum_match_bytes_proof_bytes = minimum_match_bytes_proof_bytes;
+    let continuation_nonaccepting_run_proof_bytes = core::mem::size_of::<Option<usize>>();
+    budget.accounting.continuation_nonaccepting_run_proof_bytes =
+        continuation_nonaccepting_run_proof_bytes;
+    let start_domain_proof_bytes = core::mem::size_of::<StartDomain>();
+    budget.accounting.start_domain_proof_bytes =
+        u8::try_from(start_domain_proof_bytes).map_err(|_| Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        })?;
+    let root_assertion_proof_bytes = core::mem::size_of::<Option<Assertion>>();
+    budget.accounting.root_assertion_proof_bytes =
+        u8::try_from(root_assertion_proof_bytes).map_err(|_| Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        })?;
+    let state_byte_span_sum_slot_bytes = StateByteSpanSumPlan::retained_slot_bytes();
+    budget.accounting.state_byte_span_sum_persistent_bytes = state_byte_span_sum_slot_bytes;
+    let ordered_bounded_span_sum_slot_bytes = OrderedBoundedSpanSumPlan::retained_slot_bytes();
+    budget.accounting.ordered_bounded_span_sum_persistent_bytes =
+        ordered_bounded_span_sum_slot_bytes;
+
+    let components = [
+        TerminalFrontierSeed::retained_bytes(),
+        minimum_match_bytes_proof_bytes,
+        continuation_nonaccepting_run_proof_bytes,
+        RequiredLiteralSets::retained_bytes(),
+        start_domain_proof_bytes,
+        root_assertion_proof_bytes,
+        state_byte_span_sum_slot_bytes,
+        ordered_bounded_span_sum_slot_bytes,
+    ];
+    let mut retained_bytes = required_suffixes.retained_bytes()?;
+    for bytes in components {
+        budget.preflight_receipt_construction_bytes(bytes)?;
+        budget.acquire_checked_construction_bytes(bytes)?;
+        budget.record_initialization(bytes, false)?;
+        retained_bytes = add(retained_bytes, bytes, Resource::ProgramBytes)?;
+    }
+    let expected = add(start_bytes, retained_bytes, Resource::ProgramBytes)?;
+    if budget.current_construction_bytes != expected {
+        return Err(Error::InternalInvariant(
+            "URL-only fixed proof storage differs from construction accounting",
+        ));
+    }
+    enforce(
+        budget.current_construction_bytes,
+        limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    Ok((
+        required_suffixes,
+        required_literals,
+        terminal_frontier,
+        retained_bytes,
+    ))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "retained execution seeds are constructed and charged in one auditable accounting scope"
@@ -4958,6 +5187,7 @@ impl CompileBudget {
                 required_internal_anchor_build_work_upper_bound: 0,
                 required_internal_anchor_persistent_bytes: 0,
                 url_aggregate_plans: 0,
+                url_only_compile_artifacts: 0,
                 url_aggregate_tlds: 0,
                 url_aggregate_tld_bytes: 0,
                 url_aggregate_build_work: 0,
@@ -8153,7 +8383,9 @@ fn bind_url_aggregate_identity(
     let domain = fre_kernels::URL_AGGREGATE_PLAN_ID.as_bytes();
     let operation = fre_kernels::URL_AGGREGATE_SPAN_SUM_OPERATION_ID.as_bytes();
     let accounting = plan.build_accounting();
+    let language_id = plan.language_id();
     let fields = [
+        plan.max_tld_bytes(),
         accounting.tlds,
         accounting.tld_bytes,
         accounting.states_upper_bound,
@@ -8170,7 +8402,11 @@ fn bind_url_aggregate_identity(
     let payload = add(
         add(program.0.len(), domain.len(), Resource::CompileWork)?,
         add(
-            operation.len(),
+            add(
+                operation.len(),
+                language_id.as_bytes().len(),
+                Resource::CompileWork,
+            )?,
             mul(
                 fields.len(),
                 core::mem::size_of::<u64>(),
@@ -8187,9 +8423,29 @@ fn bind_url_aggregate_identity(
         hash.bytes(&program.0);
         hash.bytes(domain);
         hash.bytes(operation);
+        hash.bytes(language_id.as_bytes());
         for field in fields {
             hash_usize(hash, field);
         }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
+fn bind_url_only_compile_identity(
+    program: PlanId,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = b"fre.aggregate.url-only-compile-owner.v1";
+    let payload = add(program.0.len(), domain.len(), Resource::CompileWork)?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0x51e6_83b4_a72d_0fc9);
+    let mut second = StableHash::new(0x0fc9_a72d_83b4_51e6);
+    for hash in [&mut first, &mut second] {
+        hash.bytes(&program.0);
+        hash.bytes(domain);
     }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
@@ -8810,6 +9066,379 @@ mod tests {
             .build()
             .parse(pattern)
             .unwrap()
+    }
+
+    fn url_hir(tlds: &str) -> Hir {
+        let pattern = format!(
+            r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){{3}}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){{0,62}}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){{0,62}}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:{tlds}))(?::\d{{2,5}})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)"
+        );
+        ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .parse(&pattern)
+            .unwrap()
+    }
+
+    #[test]
+    fn url_only_compile_identity_binds_language_and_owner_mode() {
+        let first_hir = url_hir("COM|ORG");
+        let same_shape_hir = url_hir("NET|EDU");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        let limits = CompileLimits::default();
+
+        let ordinary =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &first_hir, profile, limits,
+            )
+            .unwrap()
+            .into_compiled();
+        let first = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+            &first_hir,
+            profile,
+            limits,
+        )
+        .unwrap()
+        .into_compiled();
+        let same_shape = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+            &same_shape_hir,
+            profile,
+            limits,
+        )
+        .unwrap()
+        .into_compiled();
+
+        assert_eq!(ordinary.compile_accounting().url_only_compile_artifacts, 0);
+        assert_eq!(first.compile_accounting().url_only_compile_artifacts, 1);
+        assert_eq!(first.state_count(), 2);
+        assert_ne!(ordinary.plan_id(), first.plan_id());
+        assert_eq!(
+            first.url_aggregate.as_ref().unwrap().build_accounting(),
+            same_shape
+                .url_aggregate
+                .as_ref()
+                .unwrap()
+                .build_accounting()
+        );
+        assert_ne!(first.plan_id(), same_shape.plan_id());
+
+        let haystack = b"visit http://example.com and ftp://x.org/y";
+        assert_eq!(
+            first
+                .count_value(
+                    haystack,
+                    0..haystack.len(),
+                    crate::Strategy::ReverseSequentialRows,
+                    crate::OperationLimits::default(),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(first
+            .count_value(
+                haystack,
+                0..haystack.len(),
+                crate::Strategy::FullTable,
+                crate::OperationLimits::default(),
+            )
+            .is_err());
+        assert!(first
+            .span_sum_value(
+                haystack,
+                0..haystack.len(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+            )
+            .is_err());
+        assert!(first
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+            )
+            .is_err());
+        assert!(first
+            .admit_count_with_receipt(
+                haystack,
+                0..haystack.len(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+            )
+            .is_err());
+        assert!(first
+            .cached_count_session_footprint(haystack.len())
+            .unwrap()
+            .is_none());
+        assert!(first
+            .fixed_scalar_dense_count_prospective(
+                haystack.len(),
+                crate::Strategy::ReverseSequentialRows,
+            )
+            .is_err());
+        let mut sweep = crate::ContinuationSweepWorkspace::default();
+        assert!(first
+            .count_value_with_sweep_workspace(
+                haystack,
+                0..haystack.len(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+                &mut sweep,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn url_only_compile_exact_limits_and_runtime_refusals_close() {
+        let hir = url_hir("COM|ORG");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        let baseline = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+            &hir,
+            profile,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = baseline.compiled().compile_accounting();
+        let actual = baseline.actual();
+        assert_eq!(accounting.url_only_compile_artifacts, 1);
+        assert_eq!(accounting.program_states, 2);
+        assert_eq!(actual.live_program_bytes, accounting.program_bytes);
+        assert!(actual.is_closed());
+        assert!(actual.published);
+
+        let exact = CompileLimits {
+            max_program_states: 2,
+            max_program_bytes: actual.construction_peak_bytes,
+            max_work: accounting.work,
+            ..CompileLimits::default()
+        };
+        let replay = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+            &hir, profile, exact,
+        )
+        .unwrap();
+        assert_eq!(replay.compiled().compile_accounting(), accounting);
+        assert_eq!(replay.actual(), actual);
+
+        for (limits, resource) in [
+            (
+                CompileLimits {
+                    max_work: accounting.work - 1,
+                    ..exact
+                },
+                Resource::CompileWork,
+            ),
+            (
+                CompileLimits {
+                    max_program_bytes: actual.construction_peak_bytes - 1,
+                    ..exact
+                },
+                Resource::ProgramBytes,
+            ),
+            (
+                CompileLimits {
+                    max_program_states: 1,
+                    ..exact
+                },
+                Resource::ProgramStates,
+            ),
+        ] {
+            let refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+                &hir, profile, limits,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                refusal.source(),
+                Error::ResourceLimit {
+                    resource: actual_resource,
+                    ..
+                } if *actual_resource == resource
+            ));
+            assert!(refusal.closes());
+            let receipt = refusal.receipt();
+            assert!(receipt.authenticates_canonical());
+            assert!(!receipt.actual.published);
+            assert_eq!(receipt.actual.live_program_bytes, 0);
+            assert_eq!(
+                receipt.actual.abandonable_bytes,
+                receipt.actual.live_construction_bytes
+            );
+            assert!(receipt.actual.live_construction_bytes > 0);
+            if resource != Resource::ProgramBytes {
+                assert_eq!(receipt.accounting.url_aggregate_plans, 1);
+            }
+        }
+
+        let compiled = baseline.into_compiled();
+        let haystack = b"visit http://example.com and ftp://x.org/y";
+        let range = 0..haystack.len();
+        let success = compiled
+            .count_value_attempt(
+                haystack,
+                range.clone(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(success.value, 2);
+        assert!(success.receipt.authenticates_success());
+        assert_eq!(
+            success.receipt.identity.physical_route,
+            Some(crate::OperationPhysicalRoute::UrlAggregate)
+        );
+        assert_eq!(
+            success.receipt.identity.prepublication_fallback,
+            crate::OperationPrepublicationFallback::None
+        );
+        let exact_work = success.receipt.actual.work;
+        let exact_runtime = compiled
+            .count_value_attempt(
+                haystack,
+                range.clone(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits {
+                    max_work: exact_work,
+                    ..crate::OperationLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(exact_runtime.value, success.value);
+        assert_eq!(exact_runtime.receipt.actual.work, exact_work);
+        let runtime_refusal = compiled
+            .count_value_attempt(
+                haystack,
+                range.clone(),
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits {
+                    max_work: exact_work - 1,
+                    ..crate::OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            runtime_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
+        assert!(runtime_refusal.closes());
+        assert_eq!(
+            runtime_refusal.receipt.identity.physical_route,
+            Some(crate::OperationPhysicalRoute::UrlAggregate)
+        );
+        assert_eq!(
+            runtime_refusal.receipt.identity.prepublication_fallback,
+            crate::OperationPrepublicationFallback::None
+        );
+
+        let invalid = compiled
+            .count_value_attempt(
+                haystack,
+                1..haystack.len() + 1,
+                crate::Strategy::ReverseSequentialRows,
+                crate::OperationLimits::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            invalid.source,
+            Error::InvalidRange {
+                start: 1,
+                end: haystack.len() + 1,
+                haystack_len: haystack.len(),
+            }
+        );
+        assert!(invalid.closes());
+        assert_eq!(invalid.receipt.identity.physical_route, None);
+        assert_eq!(invalid.receipt.prospective, None);
+    }
+
+    #[test]
+    fn url_only_compile_post_plan_allocation_faults_close() {
+        let hir = url_hir("COM|ORG");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        let census_guard = compiler_allocation_probe::fail_at(usize::MAX);
+        let census = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+            &hir,
+            profile,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let allocation_calls = compiler_allocation_probe::calls();
+        drop(census_guard);
+        assert!(allocation_calls > 2);
+        assert!(census.actual().allocations >= allocation_calls);
+
+        // The certificate and temporary packed language precede URL-plan
+        // publication. Once a fault receipt records the retained plan, every
+        // later compiler-owned allocation must remain in that phase.
+        let mut first_post_plan_ordinal = None;
+        for ordinal in 0..allocation_calls {
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_url_only_construction_receipt(
+                &hir,
+                profile,
+                CompileLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(compiler_allocation_probe::calls(), ordinal + 1);
+            drop(fault);
+            assert!(matches!(refusal.source(), Error::AllocationFailed { .. }));
+            assert!(refusal.closes());
+            let receipt = refusal.receipt();
+            assert!(receipt.authenticates_canonical());
+            assert!(!receipt.actual.published);
+            assert_eq!(receipt.actual.live_program_bytes, 0);
+            assert_eq!(
+                receipt.actual.abandonable_bytes,
+                receipt.actual.live_construction_bytes
+            );
+            if receipt.accounting.url_aggregate_plans == 1 {
+                first_post_plan_ordinal.get_or_insert(ordinal);
+                assert!(receipt.accounting.url_aggregate_persistent_bytes > 0);
+                assert!(receipt.actual.live_construction_bytes > 0);
+            } else {
+                assert!(first_post_plan_ordinal.is_none());
+            }
+        }
+        assert!(first_post_plan_ordinal.is_some());
+    }
+
+    #[test]
+    fn url_only_owner_discriminator_is_stable_and_precharged() {
+        let base = PlanId([0x5a; 16]);
+        let exact_work = 2 * (base.0.len() + b"fre.aggregate.url-only-compile-owner.v1".len());
+        let mut first_budget = CompileBudget::new(CompileLimits {
+            max_work: exact_work,
+            ..CompileLimits::default()
+        });
+        let first = bind_url_only_compile_identity(base, &mut first_budget).unwrap();
+        assert_ne!(first, base);
+        assert_eq!(first_budget.accounting.work, exact_work);
+
+        let mut replay_budget = CompileBudget::new(CompileLimits {
+            max_work: exact_work,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            bind_url_only_compile_identity(base, &mut replay_budget).unwrap(),
+            first
+        );
+
+        let mut one_below = CompileBudget::new(CompileLimits {
+            max_work: exact_work - 1,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            bind_url_only_compile_identity(base, &mut one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: exact_work,
+                limit: exact_work - 1,
+            }
+        );
+        assert_eq!(one_below.accounting.work, 0);
     }
 
     #[test]

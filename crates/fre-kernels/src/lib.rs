@@ -762,6 +762,7 @@ pub use unicode_scalar_aggregate::{
 pub use url_aggregate::{
     BuildAccounting as UrlAggregateBuildAccounting, BuildError as UrlAggregateBuildError,
     BuildLimits as UrlAggregateBuildLimits, PLAN_ID as URL_AGGREGATE_PLAN_ID,
+    LanguageId as UrlAggregateLanguageId,
     ReduceAccounting as UrlAggregateReduceAccounting,
     ReduceAttemptError as UrlAggregateReduceAttemptError, ReduceError as UrlAggregateReduceError,
     ReduceLimits as UrlAggregateReduceLimits, ReduceUpperBounds as UrlAggregateReduceUpperBounds,
