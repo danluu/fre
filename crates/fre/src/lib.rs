@@ -12950,12 +12950,22 @@ pub struct PortableBoundLineTotalMatcher {
 }
 
 impl PortableBoundLineTotalMatcher {
+    /// Return whether an input length fits the authenticated finite envelope.
+    ///
+    /// This is only a resource-admission predicate. It does not assert that
+    /// any source has the whole-line semantics proved by this handle.
+    #[must_use]
+    #[inline]
+    pub const fn admits_input_len(self, input_len: usize) -> bool {
+        input_len <= self.maximum_input_bytes
+    }
+
     /// Evaluate one complete LF-free input when it fits the authenticated
     /// envelope.
     #[must_use]
     #[inline]
     pub fn try_is_match(self, haystack: &[u8]) -> Option<bool> {
-        (haystack.len() <= self.maximum_input_bytes && memchr(b'\n', haystack).is_none())
+        (self.admits_input_len(haystack.len()) && memchr(b'\n', haystack).is_none())
             .then_some(true)
     }
 }

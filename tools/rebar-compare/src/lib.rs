@@ -5418,6 +5418,21 @@ impl CurrentFreGrepSession<'_> {
         )
     }
 
+    /// Whether the initialized strict line route retained the bound
+    /// LF-free-domain projection. Over-envelope domains still replay the
+    /// ordinary prepared matcher.
+    #[must_use]
+    pub fn uses_bound_line_total_lf_free_domain_projection(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                bound_line_total: Some(_),
+                ..
+            } if token.uses_line_total_route()
+        )
+    }
+
     /// Whether the initialized strict line route retained an admitted Unicode
     /// word-run token.
     #[must_use]
@@ -5873,7 +5888,9 @@ fn execute_rebar_line_grep(
             haystack,
             limits,
             line_events_prepaid,
-            |search, line| search.is_match_value_bound_k0_warm(line, bound_k0_warm),
+            |search, line| {
+                search.is_match_value_bound_k0_warm(line.as_bytes(), bound_k0_warm)
+            },
         );
     }
     if let Some(is_match_token) = is_match_token {
@@ -5884,10 +5901,10 @@ fn execute_rebar_line_grep(
                 limits,
                 line_events_prepaid,
                 |search, line| {
-                    if let Some(matched) = bound.try_is_match(line) {
+                    if let Some(matched) = line.try_matches_bound_line_total(bound) {
                         Ok(matched)
                     } else {
-                        search.is_match_value_prepared(line, is_match_token)
+                        search.is_match_value_prepared(line.as_bytes(), is_match_token)
                     }
                 },
             );
@@ -5899,6 +5916,7 @@ fn execute_rebar_line_grep(
                 limits,
                 line_events_prepaid,
                 |search, line| {
+                    let line = line.as_bytes();
                     if let Some(matched) = bound.try_is_match(line) {
                         Ok(matched)
                     } else {
@@ -5913,7 +5931,9 @@ fn execute_rebar_line_grep(
                 haystack,
                 limits,
                 line_events_prepaid,
-                |search, line| search.is_match_value_prepared(line, is_match_token),
+                |search, line| {
+                    search.is_match_value_prepared(line.as_bytes(), is_match_token)
+                },
             );
         }
     }
@@ -5922,7 +5942,7 @@ fn execute_rebar_line_grep(
         haystack,
         limits,
         line_events_prepaid,
-        |search, line| search.is_match_value(line, limits.search),
+        |search, line| search.is_match_value(line.as_bytes(), limits.search),
     )
 }
 
@@ -5938,17 +5958,53 @@ fn formal_rebar_prepared_is_match_token(token: PortableIsMatchValueToken) -> boo
         || token.uses_byte_class_delimiter_route()
 }
 
+/// One semantic domain yielded by pinned bstr 1.12.1 `ByteSlice::lines`.
+///
+/// Construction is private to the literal line iterator below. The iterator
+/// removes its LF terminator and an immediately preceding CR, so the wrapped
+/// bytes are an authenticated LF-free domain without another source scan.
+#[derive(Clone, Copy)]
+struct RebarLfFreeLine<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> RebarLfFreeLine<'a> {
+    #[inline]
+    fn from_bstr_line(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    #[inline]
+    fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Project the construction-proved LineTotal answer onto this LF-free
+    /// domain when its length fits the bound's authenticated envelope.
+    #[inline]
+    fn try_matches_bound_line_total(
+        self,
+        bound: PortableBoundLineTotalMatcher,
+    ) -> Option<bool> {
+        bound.admits_input_len(self.bytes.len()).then_some(true)
+    }
+}
+
 #[inline]
 fn execute_rebar_line_grep_with(
     search: &mut PortableSearchSession<'_>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
     line_events_prepaid: bool,
-    mut is_match: impl FnMut(&mut PortableSearchSession<'_>, &[u8]) -> Result<bool, fre::SearchError>,
+    mut is_match: impl FnMut(
+        &mut PortableSearchSession<'_>,
+        RebarLfFreeLine<'_>,
+    ) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
     if line_events_prepaid {
         for line in haystack.lines() {
+            let line = RebarLfFreeLine::from_bstr_line(line);
             let matched = is_match(search, line).map_err(|error| {
                 ExecutionError::unsupported(format!(
                     "FRE strict Rebar grep line search refused: {error}"
@@ -5965,6 +6021,7 @@ fn execute_rebar_line_grep_with(
 
     let mut line_events = 0_u64;
     for line in haystack.lines() {
+        let line = RebarLfFreeLine::from_bstr_line(line);
         charge(
             &mut line_events,
             1,
@@ -35776,9 +35833,9 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     #[ignore = "requires the pinned public Rebar checkout"]
-    fn authenticated_bound_line_total_opportunity_exceeds_five_percent() {
+    fn authenticated_bound_line_total_lf_free_domain_opportunity_exceeds_five_percent() {
         std::thread::Builder::new()
-            .name("formal-bound-line-total".to_string())
+            .name("formal-bound-line-total-lf-free".to_string())
             .stack_size(16 * 1_048_576)
             .spawn(|| {
                 const PATTERN: &str = r"(?m)^.*$";
@@ -35845,16 +35902,53 @@ agggtaa[cgt]|[acg]ttaccct 0
                 // The bound handle pays the five immutable authentication
                 // checks once, instead of once per line. Debit two additional
                 // one-time bookkeeping actions beyond that binding payment.
-                let avoided_work = line_domains
+                let v139_avoided_work = line_domains
                     .checked_sub(1)
                     .and_then(|domains| domains.checked_mul(5))
                     .and_then(|work| work.checked_sub(2))
                     .expect("bound line-total opportunity");
                 assert_eq!(post_v138_denominator, 19_568_241);
-                assert_eq!(avoided_work, 1_199_808);
+                assert_eq!(v139_avoided_work, 1_199_808);
                 assert!(
-                    avoided_work.checked_mul(100).unwrap()
+                    v139_avoided_work.checked_mul(100).unwrap()
                         > post_v138_denominator.checked_mul(5).unwrap()
+                );
+
+                // v139 deliberately retained the complete LF scan inside
+                // every bound call. v143 composes the bound length envelope
+                // with pinned bstr's LF-free `ByteSlice::lines` domain proof,
+                // removing exactly that duplicate content-byte traversal.
+                // Debit five new actions per domain plus five fixed setup
+                // actions, substantially more than the length check and
+                // branch in the private proof projection.
+                // v140 and v141 alter only capture materialization. v142
+                // composes a StateByte Count visitor and a generic K0-warm
+                // grep route; a LineTotal token selects neither. Therefore
+                // this row's post-v139 and post-v142 denominators are equal.
+                let post_v142_denominator = post_v138_denominator
+                    .checked_sub(v139_avoided_work)
+                    .expect("post-v142 whole-operation denominator");
+                let duplicate_lf_scan_bytes = content_bytes;
+                let v143_debit = line_domains
+                    .checked_mul(5)
+                    .and_then(|work| work.checked_add(5))
+                    .expect("v143 conservative proof debit");
+                let v143_net = duplicate_lf_scan_bytes
+                    .checked_sub(v143_debit)
+                    .expect("v143 net opportunity");
+                assert_eq!(post_v142_denominator, 18_368_433);
+                assert_eq!(duplicate_lf_scan_bytes, 7_144_486);
+                assert_eq!(v143_debit, 1_199_820);
+                assert_eq!(v143_net, 5_944_666);
+                // 5,944,666 / 18,368,433 = 32.363490125%.
+                assert_eq!(
+                    v143_net.checked_mul(100).unwrap()
+                        - post_v142_denominator.checked_mul(5).unwrap(),
+                    502_624_435,
+                );
+                assert!(
+                    v143_net.checked_mul(100).unwrap()
+                        > post_v142_denominator.checked_mul(5).unwrap()
                 );
 
                 let rust = rust_regex_reference_operation_lifecycle(
@@ -35878,13 +35972,15 @@ agggtaa[cgt]|[acg]ttaccct 0
                     current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
                 assert!(session.uses_prepaid_line_events());
                 assert!(!session.uses_prepared_line_total_is_match());
+                assert!(!session.uses_bound_line_total_lf_free_domain_projection());
                 assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
                 assert!(session.uses_prepared_line_total_is_match());
+                assert!(session.uses_bound_line_total_lf_free_domain_projection());
                 assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
             })
-            .expect("spawn public bound line-total canary")
+            .expect("spawn public bound line-total LF-free canary")
             .join()
-            .expect("public bound line-total canary");
+            .expect("public bound line-total LF-free canary");
     }
 
     #[test]
@@ -36931,11 +37027,29 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!session.has_reusable_k0_workspace());
         assert!(!session.has_required_literal_prefilter());
         assert!(!session.uses_required_literal_prefilter());
+        assert!(!session.uses_bound_line_total_lf_free_domain_projection());
         assert_eq!(session.execute(source).expect("first"), 4);
         assert!(session.has_reusable_k0_workspace());
         assert!(session.uses_prepared_k0_is_match());
         assert!(session.uses_prepared_line_total_is_match());
+        assert!(session.uses_bound_line_total_lf_free_domain_projection());
         assert_eq!(session.execute(source).expect("steady"), 4);
+
+        for (source, expected) in [
+            (b"".as_slice(), 0),
+            (b"\n".as_slice(), 1),
+            (b"\r\n".as_slice(), 1),
+            (b"\n\n".as_slice(), 2),
+            (b"\xff\n\r\nlast".as_slice(), 3),
+            (b"lone\r".as_slice(), 1),
+        ] {
+            let mut session = current_fre_rebar_grep_session(&regex, source.len())
+                .expect("line-total edge-domain session");
+            assert!(!session.uses_bound_line_total_lf_free_domain_projection());
+            assert_eq!(session.execute(source).expect("edge first"), expected);
+            assert!(session.uses_bound_line_total_lf_free_domain_projection());
+            assert_eq!(session.execute(source).expect("edge steady"), expected);
+        }
     }
 
     #[test]
@@ -36956,6 +37070,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         let bound = search
             .bind_line_total_is_match_value_token(token)
             .expect("authenticated bound whole-line matcher");
+        assert!(bound.admits_input_len(0));
+        assert!(bound.admits_input_len(64));
+        assert!(!bound.admits_input_len(65));
         for line in [
             b"".as_slice(),
             b"plain bytes",
@@ -36969,13 +37086,102 @@ agggtaa[cgt]|[acg]ttaccct 0
             );
         }
 
+        // Find the exact finite work boundary for one LF-free domain. The
+        // new proof projection admits it at the exact limit, while one below
+        // either retains a smaller bound or declines the bound entirely; in
+        // both cases the prepared path remains identical to the incumbent.
+        let boundary_line = [b'x'; 64];
+        let exact_work = {
+            let admits = |max_work| {
+                let token = search.prepare_is_match_value_token(
+                    boundary_line.len(),
+                    SearchLimits {
+                        max_work,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                );
+                search
+                    .bind_line_total_is_match_value_token(token)
+                    .is_some_and(|bound| bound.admits_input_len(boundary_line.len()))
+            };
+            assert!(admits(u64::MAX));
+            let mut low = 0_u64;
+            let mut high = u64::MAX;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if admits(middle) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            low
+        };
+        assert!(exact_work > 0);
+        let exact_limits = SearchLimits {
+            max_work: exact_work,
+            max_scratch_bytes: usize::MAX,
+        };
+        let exact_token =
+            search.prepare_is_match_value_token(boundary_line.len(), exact_limits);
+        let exact_bound = search
+            .bind_line_total_is_match_value_token(exact_token)
+            .expect("exact-work line-total bound");
+        let mut exact_domains = boundary_line.as_slice().lines();
+        let exact_domain = RebarLfFreeLine::from_bstr_line(
+            exact_domains.next().expect("exact-work LF-free domain"),
+        );
+        assert!(exact_domains.next().is_none());
+        assert_eq!(
+            exact_domain.try_matches_bound_line_total(exact_bound),
+            Some(true)
+        );
+        let mut exact_incumbent = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("exact-work incumbent session");
+        assert_eq!(
+            search.is_match_value_prepared(&boundary_line, exact_token),
+            exact_incumbent.is_match_value(&boundary_line, exact_limits),
+        );
+
+        let below_limits = SearchLimits {
+            max_work: exact_work - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let below_token =
+            search.prepare_is_match_value_token(boundary_line.len(), below_limits);
+        if let Some(below_bound) = search.bind_line_total_is_match_value_token(below_token) {
+            assert!(!below_bound.admits_input_len(boundary_line.len()));
+            assert_eq!(
+                exact_domain.try_matches_bound_line_total(below_bound),
+                None
+            );
+        }
+        let mut below_incumbent = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below incumbent session");
+        assert_eq!(
+            search.is_match_value_prepared(&boundary_line, below_token),
+            below_incumbent.is_match_value(&boundary_line, below_limits),
+        );
+
         // The structural theorem is line-domain specific. An LF forces the
         // same ordinary semantic matcher path, where absolute anchors reject
         // this multi-line input.
         let multi_line = b"left\nright";
         let over_envelope = [b'x'; 65];
+        assert!(bound.admits_input_len(multi_line.len()));
         assert_eq!(bound.try_is_match(multi_line), None);
         assert_eq!(bound.try_is_match(&over_envelope), None);
+        let mut proved_domains = over_envelope.as_slice().lines();
+        let proved_over_envelope = RebarLfFreeLine::from_bstr_line(
+            proved_domains.next().expect("one LF-free domain"),
+        );
+        assert!(proved_domains.next().is_none());
+        assert_eq!(
+            proved_over_envelope.try_matches_bound_line_total(bound),
+            None
+        );
         assert!(!regex.is_match_value(multi_line, limits).unwrap());
         assert!(!search.is_match_value_prepared(multi_line, token).unwrap());
         assert_eq!(
