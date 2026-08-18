@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v17() {
+fn receipt_records_selected_workspace_optimizer_identity_v18() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 17);
+    assert_eq!(OPTIMIZER_VERSION, 18);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -2922,6 +2922,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     const ORDERED_TERMINAL_LOW_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
+    const ASSERTION_CACHE_PATTERN: &str =
+        r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
     let target = if cfg!(target_arch = "x86_64") {
         if cfg!(target_os = "linux") {
             Target::x86_64_linux()
@@ -2983,6 +2985,19 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 b"foo bar".to_vec(),
                 b"xfoo foo!barz bar".to_vec(),
                 vec![0xff, b'f', b'o', b'o', 0xff, b'b', b'a', b'r', 0x80],
+            ],
+        ),
+        (
+            ASSERTION_CACHE_PATTERN,
+            CompileMode::Fast,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                b"a b cc dd eee ffff ggggg h".to_vec(),
+                b"za xb!ccz dd!eee ffff!ggggg".to_vec(),
+                vec![0xff, b'a', b' ', b'b', 0x80, b'c', b'c', b' ', b'h'],
             ],
         ),
         (
@@ -3213,6 +3228,25 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                         .iter()
                         .any(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v3"),
                     "wide-row fixture did not publish its composed V3 object",
+                );
+            }
+            if *pattern == ASSERTION_CACHE_PATTERN {
+                let image = crate::ordered_nfa_native::NativeOrderedNfaObjectImage::try_build(
+                    artifact
+                        .program()
+                        .native_ordered_nfa_view()
+                        .expect("assertion-cache fixture retains its Ordered-NFA view"),
+                    usize::MAX,
+                )
+                .expect("build assertion-cache object")
+                .expect("assertion-cache object remains native");
+                assert!(
+                    image.layout.cache_boundary_assertions,
+                    "assertion-cache fixture lost its dense exact-kind reuse",
+                );
+                assert_eq!(
+                    image.layout.assertion_kinds, 0x42,
+                    "assertion-cache fixture lost its Nosey-shaped two-kind mask",
                 );
             }
         } else {

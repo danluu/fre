@@ -12,7 +12,8 @@ use super::{
     aarch64_load_u64_constant, aarch64_load_w_imm, aarch64_load_w_uxtw, aarch64_load_x_imm,
     aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_mov_x, aarch64_orr_w, aarch64_store_pair_x,
     aarch64_lsr_x_imm,
-    aarch64_store_w, aarch64_store_x, aarch64_sub_x_imm, aarch64_sub_x_reg, Aarch64Assembler,
+    aarch64_store_w, aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm,
+    aarch64_sub_x_reg, Aarch64Assembler,
     ModuleRelocation, ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO,
     AARCH64_LS, AARCH64_NE, PARTIAL_TABLE_SYMBOL, PREPARED_FALLBACK_RUNTIME_SYMBOL, TEXT_SECTION,
 };
@@ -164,10 +165,13 @@ const L_ASSERT_LEFT: u16 = 184;
 const L_ASSERT_POSITION: u16 = 192;
 const L_ASSERT_RETURN: u16 = 200;
 const L_CLASS_RETURN: u16 = 208;
+const L_ASSERT_CACHE_KNOWN: u16 = 216;
+const L_ASSERT_CACHE_ENABLED: u16 = 224;
+const L_ASSERT_CACHE_BIT: u16 = 232;
 
 const _: () = assert!(FRAME_BYTES.is_multiple_of(16));
 const _: () = assert!(STACK_BYTES.is_multiple_of(16));
-const _: () = assert!(L_CLASS_RETURN + 8 <= FRAME_BYTES);
+const _: () = assert!(L_ASSERT_CACHE_BIT + 8 <= FRAME_BYTES);
 
 /// One complete AArch64 public/private Ordered-NFA text fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +308,10 @@ impl A<'_> {
         self.i(aarch64_sub_x_imm(destination, source, value))
     }
 
+    fn sub_w_imm(&mut self, destination: u8, source: u8, value: u16) -> Result<(), ObjectError> {
+        self.i(aarch64_sub_w_imm(destination, source, value))
+    }
+
     fn and_w(&mut self, destination: u8, left: u8, right: u8) -> Result<(), ObjectError> {
         self.i(aarch64_and_w(destination, left, right))
     }
@@ -325,6 +333,19 @@ impl A<'_> {
             0x5300_0000
                 | (u32::from(immr) << 16)
                 | (u32::from(imms) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+        )?;
+        Ok(())
+    }
+
+    fn lsl_w(&mut self, destination: u8, source: u8, shift: u8) -> Result<(), ObjectError> {
+        if destination > 31 || source > 31 || shift > 31 {
+            return Err(ObjectError::InvalidModule("AArch64 LSLV W register"));
+        }
+        self.raw(
+            0x1ac0_2000
+                | (u32::from(shift) << 16)
                 | (u32::from(source) << 5)
                 | u32::from(destination),
         )?;
@@ -1818,6 +1839,8 @@ fn emit_semantic_body(
     let split_edges = asm.label()?;
     let split_next = asm.label()?;
     let split_assertion_passed = asm.label()?;
+    let cached_assertion_miss = asm.label()?;
+    let cached_assertion_false = asm.label()?;
     let expand_pop = asm.label()?;
     let root_complete = asm.label()?;
     let after_roots = asm.label()?;
@@ -1844,6 +1867,10 @@ fn emit_semantic_body(
     a.store_x(31, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET)?;
     a.store_x(31, 31, usize::from(L_ROOT_INDEX))?;
     a.store_x(31, 31, usize::from(L_ROOT_MODE))?;
+    if layout.cache_boundary_assertions {
+        a.store_w(31, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.store_w(31, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+    }
 
     a.asm.bind(next_old_root)?;
     a.load_x(8, 31, usize::from(L_ROOT_INDEX))?;
@@ -1933,9 +1960,42 @@ fn emit_semantic_body(
     a.store_x(8, 31, usize::from(L_EDGE_INDEX))?;
     load_table_byte(&mut a, 0, 8, layout.edge_kinds_offset)?;
     a.cbz_w(0, split_assertion_passed)?;
+    if layout.cache_boundary_assertions {
+        a.cmp_w_imm(0, u16::from(EDGE_START_TEXT))?;
+        a.branch_cond(AARCH64_LO, runtime_failure)?;
+        a.cmp_w_imm(0, u16::from(EDGE_WORD_END_HALF_UNICODE))?;
+        a.branch_cond(AARCH64_HI, runtime_failure)?;
+        a.sub_w_imm(8, 0, u16::from(EDGE_START_TEXT))?;
+        a.constant32(9, 1)?;
+        a.lsl_w(9, 9, 8)?;
+        a.constant32(10, layout.assertion_kinds)?;
+        a.and_w(11, 10, 9)?;
+        a.cbz_w(11, runtime_failure)?;
+        a.store_w(9, 31, usize::from(L_ASSERT_CACHE_BIT))?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.and_w(11, 10, 9)?;
+        a.cbz_w(11, cached_assertion_miss)?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+        a.and_w(10, 10, 9)?;
+        a.cbz_w(10, split_next)?;
+        a.branch(split_assertion_passed)?;
+    }
+    a.asm.bind(cached_assertion_miss)?;
     a.load_x(1, 31, usize::from(L_POSITION))?;
     a.call(assertion)?;
     a.cbnz_w(1, runtime_failure)?;
+    if layout.cache_boundary_assertions {
+        a.load_w(9, 31, usize::from(L_ASSERT_CACHE_BIT))?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.orr_w(10, 10, 9)?;
+        a.store_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.cbz_w(0, cached_assertion_false)?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+        a.orr_w(10, 10, 9)?;
+        a.store_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+        a.branch(split_assertion_passed)?;
+    }
+    a.asm.bind(cached_assertion_false)?;
     a.cbz_w(0, split_next)?;
     a.asm.bind(split_assertion_passed)?;
     a.load_w(8, 31, usize::from(L_EDGE_INDEX))?;
@@ -2529,6 +2589,7 @@ mod tests {
                 closure_slots: 1,
                 start_state: 0,
                 assertion_kinds: 0,
+                cache_boundary_assertions: false,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
@@ -2545,6 +2606,14 @@ mod tests {
                 reverse_depth: 0,
             },
         );
+        image
+    }
+
+    fn cached_assertion_image() -> NativeOrderedNfaObjectImage {
+        let mut image = minimal_image();
+        image.layout.assertion_kinds =
+            (1 << (EDGE_END_TEXT - EDGE_START_TEXT)) | (1 << (EDGE_WORD_ASCII - EDGE_START_TEXT));
+        image.layout.cache_boundary_assertions = true;
         image
     }
 
@@ -2608,6 +2677,26 @@ mod tests {
                 _ => panic!("unexpected Ordered-NFA relocation"),
             }
         }
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_caches_repeated_assertions_once_per_boundary() {
+        let scalar = lower_aarch64(&minimal_image()).unwrap();
+        let cached = lower_aarch64(&cached_assertion_image()).unwrap();
+        assert!(cached.code.len() > scalar.code.len());
+        let instructions = cached
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let reset_known = aarch64_store_w(31, 31, L_ASSERT_CACHE_KNOWN).unwrap();
+        let reset_enabled = aarch64_store_w(31, 31, L_ASSERT_CACHE_ENABLED).unwrap();
+        let shift_bit = 0x1ac0_2000 | (u32::from(8_u8) << 16) | (u32::from(9_u8) << 5) | 9;
+        assert!(instructions.contains(&reset_known));
+        assert!(instructions.contains(&reset_enabled));
+        assert!(instructions.contains(&shift_bit));
+        assert!(instructions.contains(&aarch64_store_w(9, 31, L_ASSERT_CACHE_BIT).unwrap()));
+        assert_eq!(cached.relocations, scalar.relocations);
     }
 
     #[test]

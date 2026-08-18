@@ -242,6 +242,10 @@ impl X<'_> {
         self.rr(0x85, left, right, true)
     }
 
+    fn test32(&mut self, left: R, right: R) -> Result<(), ObjectError> {
+        self.rr(0x85, left, right, false)
+    }
+
     fn load64(&mut self, dst: R, base: R, disp: usize) -> Result<(), ObjectError> {
         let mut bytes = Vec::with_capacity(8);
         Self::mem(&mut bytes, dst, base, i32_disp(disp)?, true, &[0x8b]);
@@ -488,6 +492,14 @@ impl X<'_> {
         self.op(&bytes)
     }
 
+    fn shl32_cl(&mut self, reg: R) -> Result<(), ObjectError> {
+        let mut bytes = Vec::with_capacity(3);
+        Self::rex(&mut bytes, false, false, false, reg.hi());
+        bytes.push(0xd3);
+        Self::modrm(&mut bytes, 3, 4, reg.lo());
+        self.op(&bytes)
+    }
+
     fn shl64_imm(&mut self, reg: R, count: u8) -> Result<(), ObjectError> {
         let mut bytes = Vec::with_capacity(5);
         Self::rex(&mut bytes, true, false, false, reg.hi());
@@ -615,6 +627,10 @@ const L_ROOT_MODE: usize = 104;
 const L_HEADER: usize = 112;
 const L_BYTE: usize = 120;
 const L_ASSERT_LEFT_CLASS: usize = 128;
+const L_ASSERTION_KNOWN_MASK: usize = 136;
+const L_ASSERTION_ENABLED_MASK: usize = 144;
+const L_ASSERTION_BIT: usize = 152;
+const _: () = assert!(L_ASSERTION_BIT + 8 <= 0xa8);
 
 fn emit_epilogue(x: &mut X<'_>) -> Result<(), ObjectError> {
     x.op(&[0x48, 0x81, 0xc4, 0xa8, 0, 0, 0])?;
@@ -1883,6 +1899,10 @@ fn emit_semantic_body(
     x.jump(boundary)?;
 
     x.asm.bind(boundary)?;
+    if layout.cache_boundary_assertions {
+        x.store_mem32_value(R::Sp, L_ASSERTION_KNOWN_MASK, 0)?;
+        x.store_mem32_value(R::Sp, L_ASSERTION_ENABLED_MASK, 0)?;
+    }
     x.store_mem64_zero(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET)?;
     x.load64(
         R::Ax,
@@ -2026,12 +2046,54 @@ fn emit_semantic_body(
     x.load8_index(R::Ax, R::Bp, R::Cx, layout.edge_kinds_offset)?;
     x.cmp32_imm(R::Ax, EDGE_EPSILON.into())?;
     x.branch(0x84, split_assertion_passed)?;
-    x.load64(R::Cx, R::Sp, L_POSITION)?;
-    x.call(assertion)?;
-    x.test64(R::Dx, R::Dx)?;
-    x.branch(0x85, runtime_failure)?;
-    x.test64(R::Ax, R::Ax)?;
-    x.branch(0x84, split_next)?;
+    if layout.cache_boundary_assertions {
+        let cache_miss = x.asm.label()?;
+        x.cmp32_imm(R::Ax, 2)?;
+        x.branch(0x82, runtime_failure)?;
+        x.cmp32_imm(R::Ax, 19)?;
+        x.branch(0x87, runtime_failure)?;
+        x.mov32(R::Cx, R::Ax)?;
+        x.dec64(R::Cx)?;
+        x.dec64(R::Cx)?;
+        x.imm32(R::R8, 1)?;
+        x.shl32_cl(R::R8)?;
+        x.imm32(R::R9, layout.assertion_kinds)?;
+        x.test32(R::R9, R::R8)?;
+        x.branch(0x84, runtime_failure)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_KNOWN_MASK)?;
+        x.test32(R::R9, R::R8)?;
+        x.branch(0x84, cache_miss)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_ENABLED_MASK)?;
+        x.test32(R::R9, R::R8)?;
+        x.branch(0x84, split_next)?;
+        x.jump(split_assertion_passed)?;
+
+        x.asm.bind(cache_miss)?;
+        // The helper owns all caller-saved registers, so preserve the
+        // validated bit in the final free frame slot across the cold call.
+        x.store32(R::Sp, L_ASSERTION_BIT, R::R8)?;
+        x.load64(R::Cx, R::Sp, L_POSITION)?;
+        x.call(assertion)?;
+        x.test64(R::Dx, R::Dx)?;
+        x.branch(0x85, runtime_failure)?;
+        x.load32(R::R8, R::Sp, L_ASSERTION_BIT)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_KNOWN_MASK)?;
+        x.or32(R::R9, R::R8)?;
+        x.store32(R::Sp, L_ASSERTION_KNOWN_MASK, R::R9)?;
+        x.test64(R::Ax, R::Ax)?;
+        x.branch(0x84, split_next)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_ENABLED_MASK)?;
+        x.or32(R::R9, R::R8)?;
+        x.store32(R::Sp, L_ASSERTION_ENABLED_MASK, R::R9)?;
+        x.jump(split_assertion_passed)?;
+    } else {
+        x.load64(R::Cx, R::Sp, L_POSITION)?;
+        x.call(assertion)?;
+        x.test64(R::Dx, R::Dx)?;
+        x.branch(0x85, runtime_failure)?;
+        x.test64(R::Ax, R::Ax)?;
+        x.branch(0x84, split_next)?;
+    }
     x.asm.bind(split_assertion_passed)?;
     x.load64(R::Cx, R::Sp, L_EDGE_INDEX)?;
     x.load32_index(R::Dx, R::Bp, R::Cx, 2, layout.edge_targets_offset)?;
@@ -2679,6 +2741,7 @@ mod tests {
                 closure_slots: 1,
                 start_state: 0,
                 assertion_kinds: 0,
+                cache_boundary_assertions: false,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
@@ -2695,6 +2758,13 @@ mod tests {
                 reverse_depth: 0,
             },
         );
+        image
+    }
+
+    fn boundary_assertion_cache_image() -> NativeOrderedNfaObjectImage {
+        let mut image = minimal_image();
+        image.layout.assertion_kinds = 1 << 6;
+        image.layout.cache_boundary_assertions = true;
         image
     }
 
@@ -2814,5 +2884,93 @@ mod tests {
         let (branch_end, target) = matches[0];
         assert!(entry.code[branch_end..target].contains(&0xe8));
         assert_eq!(&entry.code[target..target + 8], &reload_edge_index);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_boundary_assertion_cache_is_lazy_and_boundary_scoped() {
+        let scalar = lower_x86_64(&minimal_image()).unwrap();
+        let cached = lower_x86_64(&boundary_assertion_cache_image()).unwrap();
+        assert!(cached.code.len() > scalar.code.len());
+
+        let known_reset = [0xc7, 0x84, 0x24, 0x88, 0, 0, 0, 0, 0, 0, 0];
+        let enabled_reset = [0xc7, 0x84, 0x24, 0x90, 0, 0, 0, 0, 0, 0, 0];
+        for reset in [&known_reset[..], &enabled_reset[..]] {
+            assert_eq!(
+                cached
+                    .code
+                    .windows(reset.len())
+                    .filter(|window| *window == reset)
+                    .count(),
+                1,
+            );
+            assert!(!scalar
+                .code
+                .windows(reset.len())
+                .any(|window| window == reset));
+        }
+
+        // `shl r8d, cl` constructs the validated kind bit once; the miss path
+        // spills and reloads it around the assertion helper call.
+        let variable_kind_shift = [0x41, 0xd3, 0xe0];
+        assert_eq!(
+            cached
+                .code
+                .windows(variable_kind_shift.len())
+                .filter(|window| *window == variable_kind_shift)
+                .count(),
+            1,
+        );
+        assert!(!scalar
+            .code
+            .windows(variable_kind_shift.len())
+            .any(|window| window == variable_kind_shift));
+
+        let asserted_kind_mask = [0x41, 0xb9, 0x40, 0, 0, 0, 0x45, 0x85, 0xc1];
+        assert_eq!(
+            cached
+                .code
+                .windows(asserted_kind_mask.len())
+                .filter(|window| *window == asserted_kind_mask)
+                .count(),
+            1,
+        );
+        assert!(!scalar
+            .code
+            .windows(asserted_kind_mask.len())
+            .any(|window| window == asserted_kind_mask));
+
+        let bit_spill = [0x44, 0x89, 0x84, 0x24, 0x98, 0, 0, 0];
+        let bit_reload = [0x44, 0x8b, 0x84, 0x24, 0x98, 0, 0, 0];
+        for access in [&bit_spill[..], &bit_reload[..]] {
+            assert_eq!(
+                cached
+                    .code
+                    .windows(access.len())
+                    .filter(|window| *window == access)
+                    .count(),
+                1,
+            );
+            assert!(!scalar
+                .code
+                .windows(access.len())
+                .any(|window| window == access));
+        }
+
+        let known_update = [0x44, 0x89, 0x8c, 0x24, 0x88, 0, 0, 0];
+        let enabled_update = [0x44, 0x89, 0x8c, 0x24, 0x90, 0, 0, 0];
+        for update in [&known_update[..], &enabled_update[..]] {
+            assert_eq!(
+                cached
+                    .code
+                    .windows(update.len())
+                    .filter(|window| *window == update)
+                    .count(),
+                1,
+            );
+            assert!(!scalar
+                .code
+                .windows(update.len())
+                .any(|window| window == update));
+        }
     }
 }

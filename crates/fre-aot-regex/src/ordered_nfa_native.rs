@@ -344,6 +344,10 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     pub(crate) closure_slots: usize,
     pub(crate) start_state: u32,
     pub(crate) assertion_kinds: u32,
+    /// Whether the canonical graph has enough duplicate assertion edges to
+    /// justify lazy boundary-local truth caching in native code. This is a
+    /// compiler-only decision and does not change the frozen object ABI.
+    pub(crate) cache_boundary_assertions: bool,
     pub(crate) line_terminator: u8,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
@@ -361,6 +365,16 @@ struct NativeOrderedEdgeDispatchShape {
     metadata_count: usize,
     transition_count: usize,
     encoding: NativeOrderedEdgeEncoding,
+}
+
+fn boundary_assertion_cache_is_profitable(assertion_edges: usize, assertion_kinds: u32) -> bool {
+    const MIN_ASSERTION_EDGES: usize = 4;
+    const MIN_DUPLICATE_EDGES: usize = 2;
+
+    let distinct_kinds = usize::try_from(assertion_kinds.count_ones())
+        .expect("at most 18 ordered-NFA assertion kinds fit usize");
+    assertion_edges >= MIN_ASSERTION_EDGES
+        && assertion_edges.saturating_sub(distinct_kinds) >= MIN_DUPLICATE_EDGES
 }
 
 fn validate_native_ordered_nfa_terminal_range(
@@ -647,8 +661,15 @@ impl NativeOrderedNfaObjectImage {
         let states = shape.states;
         let edges = shape.edges;
         let mut assertion_kinds = 0_u32;
+        let mut assertion_edges = 0_usize;
         for &kind in raw.edge_kinds.iter() {
             if kind != EdgeKind::Epsilon && kind != EdgeKind::ByteRange {
+                assertion_edges =
+                    assertion_edges
+                        .checked_add(1)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "ordered-NFA assertion edge count",
+                        ))?;
                 assertion_kinds |= assertion_bit(kind)
                     .ok_or(ObjectError::InvalidModule("ordered-NFA assertion encoding"))?;
             }
@@ -658,6 +679,8 @@ impl NativeOrderedNfaObjectImage {
                 "ordered-NFA assertion mask exceeds object ABI",
             ));
         }
+        let cache_boundary_assertions =
+            boundary_assertion_cache_is_profitable(assertion_edges, assertion_kinds);
         let terminal_range = view
             .terminal_range
             .map(|range| validate_native_ordered_nfa_terminal_range(range, edges))
@@ -1096,6 +1119,7 @@ impl NativeOrderedNfaObjectImage {
             closure_slots: shape.closure_slots,
             start_state: raw.start,
             assertion_kinds,
+            cache_boundary_assertions,
             line_terminator: view.line_terminator,
             ordered_edge_dispatch,
             terminal_range,
@@ -2561,6 +2585,39 @@ mod tests {
 
     fn limits(max_handle_bytes: usize) -> FrozenOrderedNfaLimitsV1 {
         FrozenOrderedNfaLimitsV1::new(max_handle_bytes)
+    }
+
+    #[test]
+    fn boundary_assertion_cache_requires_dense_exact_kind_reuse() {
+        let first = 1_u32;
+        let second = 1_u32 << 1;
+        assert!(!boundary_assertion_cache_is_profitable(0, 0));
+        assert!(!boundary_assertion_cache_is_profitable(3, first));
+        assert!(boundary_assertion_cache_is_profitable(4, first));
+        assert!(!boundary_assertion_cache_is_profitable(
+            4,
+            first | second | (1 << 2)
+        ));
+        assert!(boundary_assertion_cache_is_profitable(4, first | second));
+        assert!(boundary_assertion_cache_is_profitable(59, 0x42));
+    }
+
+    #[test]
+    fn boundary_assertion_cache_selection_is_compiler_only_and_deterministic() {
+        let program = span_program(
+            r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))",
+            b'\n',
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let second = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(first.layout.cache_boundary_assertions);
+        assert_eq!(first, second);
+        assert_eq!(first.layout.assertion_kinds, 0x42);
     }
 
     fn span_program(pattern: &str, line_terminator: u8) -> crate::CompiledProgram {

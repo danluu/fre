@@ -277,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 17;
+pub const OPTIMIZER_VERSION: u32 = 18;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
