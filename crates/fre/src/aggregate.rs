@@ -23525,18 +23525,19 @@ impl AggregateSpanVisitorRegex {
         })
     }
 
-    /// Visit through the persistent generic continuation sweep. `Ok(None)`
-    /// is a source-free structural or fixed-resource refusal and invokes no
-    /// callbacks; an admitted visit completes without replaying an earlier
-    /// source prefix even if its optional transition cache saturates.
+    /// Visit through the persistent generic continuation sweep and return its
+    /// receipt-free accounting projection. `Ok(None)` is a source-free
+    /// structural or fixed-resource refusal and invokes no callbacks; an
+    /// admitted visit completes without replaying an earlier source prefix
+    /// even if its optional transition cache saturates.
     #[doc(hidden)]
-    pub fn visit_spans_with_continuation_workspace<F>(
+    pub fn visit_spans_compact_with_continuation_workspace<F>(
         &self,
         haystack: &[u8],
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
         workspace: &mut AggregateContinuationSpanVisitWorkspace,
         mut visitor: F,
-    ) -> Result<Option<AggregateSpanVisit>, AggregateExecutionError>
+    ) -> Result<Option<AggregateSpanVisitProjection>, AggregateExecutionError>
     where
         F: FnMut(Match),
     {
@@ -23584,12 +23585,63 @@ impl AggregateSpanVisitorRegex {
             matches,
             span_sum,
         };
+        Ok(Some(AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        }))
+    }
+
+    /// Visit through the persistent generic continuation sweep. `Ok(None)`
+    /// is a source-free structural or fixed-resource refusal and invokes no
+    /// callbacks; an admitted visit completes without replaying an earlier
+    /// source prefix even if its optional transition cache saturates.
+    #[doc(hidden)]
+    pub fn visit_spans_with_continuation_workspace<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateContinuationSpanVisitWorkspace,
+        visitor: F,
+    ) -> Result<Option<AggregateSpanVisit>, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let Some(projected) = self.visit_spans_compact_with_continuation_workspace(
+            haystack, limits, workspace, visitor,
+        )?
+        else {
+            return Ok(None);
+        };
+        let AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        } = projected;
         let report = self.0.0.execution_report(limits, details)?;
         Ok(Some(AggregateSpanVisit {
             matches,
             span_sum,
             report,
         }))
+    }
+
+    /// Visit every complete span while omitting only success-report
+    /// construction. Typed failures retain the same lossless attempt receipt
+    /// as [`Self::visit_spans`] and are returned without replaying callbacks.
+    #[doc(hidden)]
+    pub fn visit_spans_compact<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        visitor: F,
+    ) -> Result<AggregateSpanVisitProjection, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        self.0
+            .visit_spans_compact_core(haystack, limits.borrow(), visitor)
     }
 
     /// Visit every complete non-overlapping match span in one scan without
@@ -23765,22 +23817,15 @@ impl AggregateSpansRegex {
         })
     }
 
-    /// Visit every complete non-overlapping match span in one scan without
-    /// allocating an output span vector.
-    ///
-    /// The visitor receives absolute half-open offsets in the original
-    /// haystack. The returned summary independently authenticates the number
-    /// of visited spans and their checked total width.
-    pub fn visit_spans<F>(
+    fn visit_spans_compact_core<F>(
         &self,
         haystack: &[u8],
-        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        limits: &AggregateRunLimits,
         mut visitor: F,
-    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    ) -> Result<AggregateSpanVisitProjection, AggregateExecutionError>
     where
         F: FnMut(Match),
     {
-        let limits = limits.borrow();
         let (matches, span_sum, details) = match &self.0.engine {
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 let (span, guard) = self.fixed_span(engine, haystack, limits)?;
@@ -24170,12 +24215,81 @@ impl AggregateSpansRegex {
                 ));
             }
         };
+        Ok(AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        })
+    }
+
+    /// Visit every complete non-overlapping match span in one scan without
+    /// allocating an output span vector.
+    ///
+    /// The visitor receives absolute half-open offsets in the original
+    /// haystack. The returned summary independently authenticates the number
+    /// of visited spans and their checked total width.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        visitor: F,
+    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let projected = self.visit_spans_compact_core(haystack, limits, visitor)?;
+        let AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        } = projected;
         let report = self.0.execution_report(limits, details)?;
         Ok(AggregateSpanVisit {
             matches,
             span_sum,
             report,
         })
+    }
+}
+
+/// Receipt-free success projection of a one-pass complete-span visit.
+///
+/// The projection retains the exact route accounting needed to authenticate
+/// the visit against its immutable build owner and invocation limits, but it
+/// deliberately omits [`AggregateExecutionReport`] construction. Its fields
+/// are private so callers cannot splice counters from another execution into
+/// a fabricated successful projection.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AggregateSpanVisitProjection {
+    matches: usize,
+    span_sum: usize,
+    details: AggregateExecutionDetails,
+}
+
+impl AggregateSpanVisitProjection {
+    /// Number of complete spans delivered to the visitor.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.matches == 0
+    }
+
+    /// Checked sum of every delivered span width.
+    #[must_use]
+    pub const fn span_sum(&self) -> usize {
+        self.span_sum
+    }
+
+    /// Route-specific accounting for validation against the retained owner.
+    #[must_use]
+    pub const fn details(&self) -> &AggregateExecutionDetails {
+        &self.details
     }
 }
 

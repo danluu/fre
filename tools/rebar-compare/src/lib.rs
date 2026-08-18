@@ -3541,11 +3541,13 @@ fn rebar_formal_count_visitor_amortizes(regex: &AggregateSpansRegex, haystack_le
     candidate_bound >= FORMAL_COUNT_VISITOR_MIN_CANDIDATES
 }
 
-fn rebar_streamed_single_span_accounting_closes(
+fn rebar_streamed_single_span_details_close(
     build_report: &AggregateBuildReport,
     haystack_len: usize,
     limits: &AggregateRunLimits,
-    visited: &fre::AggregateSpanVisit,
+    reported_matches: usize,
+    reported_span_sum: usize,
+    details: &fre::AggregateExecutionDetails,
 ) -> bool {
     let AggregatePlanIdentity::Continuation(identity) = build_report.plan_identity else {
         return false;
@@ -3556,21 +3558,21 @@ fn rebar_streamed_single_span_accounting_closes(
         limits: executed_limits,
         matches,
         span_sum,
-    } = visited.report().details()
+    } = details
     {
         return *plan_id == identity.program
             && range.start == 0
             && range.end == haystack_len
             && *executed_limits == limits.continuation
-            && *matches == visited.len()
-            && *span_sum == visited.span_sum()
+            && *matches == reported_matches
+            && *span_sum == reported_span_sum
             && *matches <= limits.continuation.max_output_matches
             && *span_sum <= limits.continuation.max_span_sum;
     }
     let fre::AggregateExecutionDetails::Continuation {
         certificate,
         accounting,
-    } = visited.report().details()
+    } = details
     else {
         return false;
     };
@@ -3615,9 +3617,41 @@ fn rebar_streamed_single_span_accounting_closes(
         && accounting.peak_bytes <= certificate.peak_bytes
         && accounting.work <= certificate.work_bound
         && accounting.successful_paths <= certificate.match_events
-        && accounting.emitted_matches == visited.len()
-        && visited.len() <= certificate.output_matches
-        && visited.span_sum() <= certificate.span_sum
+        && accounting.emitted_matches == reported_matches
+        && reported_matches <= certificate.output_matches
+        && reported_span_sum <= certificate.span_sum
+}
+
+fn rebar_streamed_single_span_projection_closes(
+    build_report: &AggregateBuildReport,
+    haystack_len: usize,
+    limits: &AggregateRunLimits,
+    visited: &fre::AggregateSpanVisitProjection,
+) -> bool {
+    rebar_streamed_single_span_details_close(
+        build_report,
+        haystack_len,
+        limits,
+        visited.len(),
+        visited.span_sum(),
+        visited.details(),
+    )
+}
+
+fn rebar_streamed_single_span_accounting_closes(
+    build_report: &AggregateBuildReport,
+    haystack_len: usize,
+    limits: &AggregateRunLimits,
+    visited: &fre::AggregateSpanVisit,
+) -> bool {
+    rebar_streamed_single_span_details_close(
+        build_report,
+        haystack_len,
+        limits,
+        visited.len(),
+        visited.span_sum(),
+        visited.report().details(),
+    )
 }
 
 fn rebar_count_streamed_single_match_bounds(
@@ -3658,14 +3692,14 @@ fn rebar_sum_streamed_single_match_bounds(
         .map_err(|_| CompareError::new("FRE complete-spans output-match limit does not fit u64"))?;
     let mut reducer = CompleteSpansReducer::new(max_matches);
     let visited = regex
-        .visit_spans(haystack, limits, |matched| reducer.observe(matched))
+        .visit_spans_compact(haystack, limits, |matched| reducer.observe(matched))
         .map_err(aggregate_lifecycle_complete_spans_error)?;
     let (matches, sum) = reducer.finish()?;
     let reported_matches = u64::try_from(visited.len())
         .map_err(|_| CompareError::new("FRE streamed single-span match count does not fit u64"))?;
     let reported_sum = u64::try_from(visited.span_sum())
         .map_err(|_| CompareError::new("FRE streamed single-span byte sum does not fit u64"))?;
-    if !rebar_streamed_single_span_accounting_closes(
+    if !rebar_streamed_single_span_projection_closes(
         regex.build_report(),
         haystack.len(),
         limits,
@@ -3691,9 +3725,12 @@ fn rebar_sum_streamed_single_match_bounds_with_workspace(
         .map_err(|_| CompareError::new("FRE complete-spans output-match limit does not fit u64"))?;
     let mut reducer = CompleteSpansReducer::new(max_matches);
     let visited = regex
-        .visit_spans_with_continuation_workspace(haystack, limits, workspace, |matched| {
-            reducer.observe(matched);
-        })
+        .visit_spans_compact_with_continuation_workspace(
+            haystack,
+            limits,
+            workspace,
+            |matched| reducer.observe(matched),
+        )
         .map_err(aggregate_lifecycle_complete_spans_error)?;
     let Some(visited) = visited else {
         let (matches, sum) = reducer.finish()?;
@@ -3709,7 +3746,7 @@ fn rebar_sum_streamed_single_match_bounds_with_workspace(
         .map_err(|_| CompareError::new("FRE swept single-span match count does not fit u64"))?;
     let reported_sum = u64::try_from(visited.span_sum())
         .map_err(|_| CompareError::new("FRE swept single-span byte sum does not fit u64"))?;
-    if !rebar_streamed_single_span_accounting_closes(
+    if !rebar_streamed_single_span_projection_closes(
         regex.build_report(),
         haystack.len(),
         limits,
@@ -23106,6 +23143,165 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn formal_test_model_count_spans_closes_compact_unswept_projection() {
+        std::thread::Builder::new()
+            .name("formal-test-model-compact-span-visit".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(formal_test_model_count_spans_closes_compact_unswept_projection_inner)
+            .expect("spawn compact test/model/count-spans test")
+            .join()
+            .expect("compact test/model/count-spans thread");
+    }
+
+    fn formal_test_model_count_spans_closes_compact_unswept_projection_inner() {
+        // Pinned Rebar 463d00f, benchmarks/definitions/test/model.toml:45-50.
+        const PATTERN: &str = "[a-z][a-z][a-z][a-z][a-z]";
+        const HAYSTACK: &[u8] = b"then as it was, then again it will be";
+        let patterns = [PATTERN.to_string()];
+        let lifecycle = build_current_fre_span_sum_lifecycle(
+            &patterns,
+            false,
+            false,
+            HAYSTACK.len(),
+        )
+        .expect("pinned test/model/count-spans lifecycle");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
+        let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) =
+            &lifecycle.inner
+        else {
+            panic!("six-state test/model/count-spans unexpectedly selected a sweep");
+        };
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("test/model/count-spans did not retain continuation accounting");
+        };
+        assert_eq!(compile.program_states, 6);
+        assert_eq!(regex.continuation_sweep_upper_bounds().unwrap(), None);
+
+        let mut rich_callbacks = Vec::new();
+        let rich = regex
+            .visit_spans(HAYSTACK, limits, |matched| {
+                rich_callbacks.push((matched.start(), matched.end()));
+            })
+            .expect("rich test/model/count-spans visit");
+        let mut callbacks = Vec::new();
+        let projected = regex
+            .visit_spans_compact(HAYSTACK, limits, |matched| {
+                callbacks.push((matched.start(), matched.end()));
+            })
+            .expect("compact test/model/count-spans visit");
+        assert_eq!(callbacks, vec![(21, 26)]);
+        assert_eq!(callbacks, rich_callbacks);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected.span_sum(), 5);
+        assert_eq!(projected.len(), rich.len());
+        assert_eq!(projected.span_sum(), rich.span_sum());
+        assert_eq!(projected.details(), rich.report().details());
+        assert_eq!(rich.report().identity(), &regex.cache_identity(limits));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            core::mem::size_of::<fre::AggregateSpanVisitProjection>(),
+            752
+        );
+        assert!(rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len(),
+            limits,
+            &projected,
+        ));
+        assert!(!rebar_streamed_single_span_details_close(
+            regex.build_report(),
+            HAYSTACK.len(),
+            limits,
+            projected.len() + 1,
+            projected.span_sum(),
+            projected.details(),
+        ));
+        assert!(!rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len() + 1,
+            limits,
+            &projected,
+        ));
+        let mut transplanted_limits = *limits;
+        transplanted_limits.continuation.max_output_matches += 1;
+        assert!(!rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len(),
+            &transplanted_limits,
+            &projected,
+        ));
+        let other = current_fre_rebar_complete_spans_builder(
+            "[a-z][a-z][a-z][a-z][0-9]",
+            false,
+            false,
+        )
+        .build_span_visitor()
+        .expect("distinct six-state owner");
+        assert!(!rebar_streamed_single_span_projection_closes(
+            other.build_report(),
+            HAYSTACK.len(),
+            limits,
+            &projected,
+        ));
+
+        let mut refused = *limits;
+        refused.continuation.max_output_matches = 0;
+        let mut compact_refusal_callbacks = 0_usize;
+        let compact_error = regex
+            .visit_spans_compact(HAYSTACK, refused, |_| compact_refusal_callbacks += 1)
+            .expect_err("compact output refusal");
+        let mut rich_refusal_callbacks = 0_usize;
+        let rich_error = regex
+            .visit_spans(HAYSTACK, refused, |_| rich_refusal_callbacks += 1)
+            .expect_err("rich output refusal");
+        assert_eq!(compact_refusal_callbacks, 0);
+        assert_eq!(rich_refusal_callbacks, 0);
+        assert_eq!(compact_error, rich_error);
+        assert!(compact_error.has_closed_continuation_attempt());
+
+        let mut workspace = AggregateContinuationSpanVisitWorkspace::default();
+        let mut workspace_callbacks = 0_usize;
+        let workspace_refusal = regex
+            .visit_spans_compact_with_continuation_workspace(
+                HAYSTACK,
+                limits,
+                &mut workspace,
+                |_| workspace_callbacks += 1,
+            )
+            .expect("small-program sweep refusal");
+        assert!(workspace_refusal.is_none());
+        assert_eq!(workspace_callbacks, 0);
+        assert_eq!(
+            rebar_sum_streamed_single_match_bounds_with_workspace(
+                regex,
+                HAYSTACK,
+                limits,
+                &mut workspace,
+            )
+            .expect("formal workspace refusal falls back to compact incumbent"),
+            5
+        );
+        assert_eq!(
+            rebar_sum_streamed_single_match_bounds(regex, HAYSTACK, limits)
+                .expect("formal compact streamed helper"),
+            5
+        );
+        assert_eq!(lifecycle.execute(HAYSTACK).unwrap(), 5);
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &patterns,
+                HAYSTACK,
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            5,
+            "aggregate-continuation-program",
+        );
     }
 
     #[test]
