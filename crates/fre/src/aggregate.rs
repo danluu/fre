@@ -15009,7 +15009,7 @@ impl AggregateBuilder {
                     detail: "syntax summary differs from borrowed root finite-language inspection",
                 });
             }
-            match proof.materialize_patterns_attempt(
+            match proof.materialize_patterns_exact_attempt(
                 limits.max_finite_planner_work,
                 limits.finite_literal.max_scratch_bytes,
                 limits.finite_literal.max_peak_bytes,
@@ -26726,6 +26726,10 @@ mod tests {
             );
             assert_eq!(root.effect.allocations, 1);
             assert_eq!(
+                root.effect.allocated_bytes,
+                2 * core::mem::size_of::<&[u8]>()
+            );
+            assert_eq!(
                 root.effect.retained_persistent_bytes,
                 root.effect.allocated_bytes
             );
@@ -27282,6 +27286,27 @@ mod tests {
             super::AggregatePlanKind::FiniteLiteralDfa
         );
         assert_eq!(count_report.plan, super::AggregatePlanKind::FiniteLiteralDfa);
+        let borrowed_stage = construction_stage_entry(
+            compile_report,
+            AggregateConstructionStage::SparseFiniteRoot,
+        );
+        assert_eq!(
+            borrowed_stage.disposition,
+            super::AggregateConstructionStageDisposition::Completed
+        );
+        assert_eq!(borrowed_stage.effect.allocations, 1);
+        assert_eq!(
+            borrowed_stage.effect.allocated_bytes,
+            20 * core::mem::size_of::<&[u8]>()
+        );
+        assert_eq!(
+            construction_stage_entry(
+                compile_report,
+                AggregateConstructionStage::GeneralFiniteExtraction,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::PolicySkipped
+        );
 
         let AggregateBuildAccounting::FiniteLiteral(compile_build) = compile_report.build else {
             panic!("wide compile should select the finite-literal kernel");
@@ -27338,6 +27363,61 @@ mod tests {
         let result = count.count(haystack, run_limits).unwrap();
         assert_eq!(result.value(), 3);
         assert!(result.report().has_closed_direct_attempt());
+
+        // Capture wrappers make the root-borrow proof ineligible, but general
+        // owned/capture-erased finite extraction must select the same linked
+        // Compile representation. Linked retention is not borrow-gated.
+        let owned_pattern = (0_u8..20)
+            .map(|suffix| format!("(word{suffix:02})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let owned_compile = AggregateBuilder::new(&owned_pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let owned_report = owned_compile.build_report();
+        assert_eq!(
+            construction_stage_entry(
+                owned_report,
+                AggregateConstructionStage::SparseFiniteRoot,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::SemanticIneligible
+        );
+        assert_eq!(
+            construction_stage_entry(
+                owned_report,
+                AggregateConstructionStage::GeneralFiniteExtraction,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::Completed
+        );
+        assert_eq!(owned_report.captures_erased, 20);
+        let AggregateBuildAccounting::FiniteLiteral(owned_build) = owned_report.build else {
+            panic!("owned wide Compile should retain the finite-literal kernel");
+        };
+        assert_eq!(
+            owned_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        let AggregatePlanIdentity::FiniteLiteral(owned_identity) = owned_report.plan_identity else {
+            panic!("owned wide Compile should publish a finite-literal identity");
+        };
+        assert_eq!(
+            owned_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+        );
+        assert_eq!(
+            owned_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        );
+        assert_eq!(
+            owned_compile
+                .verify_count(haystack, run_limits)
+                .unwrap()
+                .value(),
+            3
+        );
     }
 
     #[test]

@@ -2595,6 +2595,7 @@ fn performance_runner_route(
             | "compile-aggregate-unicode-scalar-class"
             | "compile-aggregate-finite-literal-dfa"
             | "compile-aggregate-finite-literal-packed-v3"
+            | "compile-aggregate-finite-literal-linked-bucket-trie-count-v1"
             | "compile-aggregate-continuation-program"
             | "compile-aggregate-url",
             1,
@@ -6059,6 +6060,26 @@ mod tests {
         assert!(
             performance_runner_route("count", "aggregate-finite-literal-packed-v3-alias", 1,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn linked_finite_compile_is_registered_only_for_its_exact_single_operation() {
+        const PLAN: &str = "compile-aggregate-finite-literal-linked-bucket-trie-count-v1";
+
+        assert_eq!(
+            performance_runner_route("compile", PLAN, 1)
+                .expect("linked finite Compile operation route"),
+            PerformanceRunnerRoute::AggregateSingle
+        );
+        for wrong_model in ["count", "count-spans", "grep"] {
+            assert!(performance_runner_route(wrong_model, PLAN, 1).is_err());
+        }
+        for wrong_multiplicity in [0, 2, 20] {
+            assert!(performance_runner_route("compile", PLAN, wrong_multiplicity).is_err());
+        }
+        assert!(
+            performance_runner_route("compile", &format!("{PLAN}-alias"), 1).is_err()
         );
     }
 

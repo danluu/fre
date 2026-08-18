@@ -9,6 +9,7 @@
 
 use core::mem::size_of;
 
+use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::OrderedLiteralAggregateBuildLimits;
 use regex_syntax::hir::{Hir, HirKind};
 
@@ -224,7 +225,7 @@ impl RootLiteralAlternation<'_> {
         work_limit: u64,
         scratch_limit: usize,
         peak_limit: usize,
-    ) -> Result<RootLiteralMaterialization<'_>, MaterializationError> {
+    ) -> Result<RootLiteralMaterialization<Vec<&[u8]>>, MaterializationError> {
         self.materialize_patterns_attempt(work_limit, scratch_limit, peak_limit)
             .map_err(RootLiteralMaterializationAttemptError::into_source)
     }
@@ -247,7 +248,45 @@ impl RootLiteralAlternation<'_> {
         work_limit: u64,
         scratch_limit: usize,
         peak_limit: usize,
-    ) -> Result<RootLiteralMaterialization<'_>, RootLiteralMaterializationAttemptError> {
+    ) -> Result<RootLiteralMaterialization<Vec<&[u8]>>, RootLiteralMaterializationAttemptError>
+    {
+        self.materialize_patterns_attempt_with::<Vec<&[u8]>>(
+            work_limit,
+            scratch_limit,
+            peak_limit,
+        )
+    }
+
+    /// Materialize the borrowed pointer staging used by general Compile into
+    /// allocator-independent exact-capacity storage.
+    ///
+    /// The pre-existing sparse route consumes a `Vec` and closes any observed
+    /// allocator overcapacity in its materialization receipt. General Compile
+    /// instead retains this staging across packed/dense construction, so its
+    /// candidate-owned capacity must equal the prospective pointer count.
+    pub(crate) fn materialize_patterns_exact_attempt(
+        &self,
+        work_limit: u64,
+        scratch_limit: usize,
+        peak_limit: usize,
+    ) -> Result<RootLiteralMaterialization<ExactVec<&[u8]>>, RootLiteralMaterializationAttemptError>
+    {
+        self.materialize_patterns_attempt_with::<ExactVec<&[u8]>>(
+            work_limit,
+            scratch_limit,
+            peak_limit,
+        )
+    }
+
+    fn materialize_patterns_attempt_with<'a, Storage>(
+        &'a self,
+        work_limit: u64,
+        scratch_limit: usize,
+        peak_limit: usize,
+    ) -> Result<RootLiteralMaterialization<Storage>, RootLiteralMaterializationAttemptError>
+    where
+        Storage: RootLiteralPatternStorage<'a>,
+    {
         let mut receipt = RootLiteralMaterializationAttemptReceipt::open(self.work);
         let projection_work = u64::try_from(self.children.len()).map_err(|_| {
             close_materialization_error(&mut receipt, MaterializationError::Overflow)
@@ -282,15 +321,9 @@ impl RootLiteralAlternation<'_> {
         if let Err(error) = check_source_capacity(requested, scratch_limit, peak_limit) {
             return Err(close_materialization_error(&mut receipt, error));
         }
-        let mut patterns = Vec::new();
-        if let Err(_error) = patterns.try_reserve_exact(self.children.len()) {
-            return Err(close_materialization_error(
-                &mut receipt,
-                MaterializationError::AllocationFailed {
-                    additional: self.children.len(),
-                },
-            ));
-        }
+        let mut patterns = Storage::try_with_capacity(self.children.len()).map_err(|source| {
+            close_materialization_error(&mut receipt, source)
+        })?;
         let observed = patterns
             .capacity()
             .checked_mul(size_of::<&[u8]>())
@@ -353,10 +386,59 @@ impl RootLiteralAlternation<'_> {
     }
 }
 
-pub(crate) struct RootLiteralMaterialization<'a> {
-    pub(crate) patterns: Vec<&'a [u8]>,
+pub(crate) struct RootLiteralMaterialization<Storage> {
+    pub(crate) patterns: Storage,
     pub(crate) work: u64,
     pub(crate) receipt: RootLiteralMaterializationAttemptReceipt,
+}
+
+trait RootLiteralPatternStorage<'a>: Sized {
+    fn try_with_capacity(capacity: usize) -> Result<Self, MaterializationError>;
+
+    fn capacity(&self) -> usize;
+
+    fn push(&mut self, pattern: &'a [u8]);
+}
+
+impl<'a> RootLiteralPatternStorage<'a> for Vec<&'a [u8]> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, MaterializationError> {
+        let mut patterns = Self::new();
+        patterns.try_reserve_exact(capacity).map_err(|_| {
+            MaterializationError::AllocationFailed {
+                additional: capacity,
+            }
+        })?;
+        Ok(patterns)
+    }
+
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+
+    fn push(&mut self, pattern: &'a [u8]) {
+        Vec::push(self, pattern);
+    }
+}
+
+impl<'a> RootLiteralPatternStorage<'a> for ExactVec<&'a [u8]> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, MaterializationError> {
+        ExactVec::try_with_capacity(capacity).map_err(|error| match error {
+            CopyError::LayoutOverflow => MaterializationError::Overflow,
+            CopyError::AllocationFailed => MaterializationError::AllocationFailed {
+                additional: capacity,
+            },
+        })
+    }
+
+    fn capacity(&self) -> usize {
+        ExactVec::capacity(self)
+    }
+
+    fn push(&mut self, pattern: &'a [u8]) {
+        if self.try_push(pattern).is_err() {
+            unreachable!("root literal proof initialized more pointers than its exact capacity");
+        }
+    }
 }
 
 fn abandon_materialization(receipt: &mut RootLiteralMaterializationAttemptReceipt) {
@@ -590,14 +672,48 @@ mod tests {
         assert_eq!(actual.peak_bytes, actual.allocated_bytes);
         assert_eq!(actual.abandoned_allocations, 0);
         assert_eq!(actual.abandoned_bytes, 0);
-        let exact = proof
+        let replayed = proof
             .materialize_patterns_attempt(
                 materialized.work,
                 actual.allocated_bytes,
                 actual.allocated_bytes,
             )
             .unwrap();
-        assert_eq!(exact.receipt.actual().allocated_bytes, actual.allocated_bytes);
+        assert_eq!(
+            replayed.receipt.actual().allocated_bytes,
+            actual.allocated_bytes
+        );
+        let exact = proof
+            .materialize_patterns_exact_attempt(
+                materialized.work,
+                prospective.initialized_bytes,
+                prospective.initialized_bytes,
+            )
+            .unwrap();
+        assert_eq!(exact.patterns.as_slice(), materialized.patterns.as_slice());
+        assert_eq!(
+            exact.receipt.actual().allocated_bytes,
+            prospective.initialized_bytes
+        );
+        assert_eq!(
+            exact.receipt.actual().live_scratch_bytes,
+            prospective.initialized_bytes
+        );
+        let Err(exact_preflight_refused) = proof.materialize_patterns_exact_attempt(
+            materialized.work,
+            prospective.initialized_bytes - 1,
+            prospective.initialized_bytes,
+        ) else {
+            panic!("one-below exact staging scratch must refuse");
+        };
+        assert!(exact_preflight_refused.receipt().is_closed());
+        assert_eq!(exact_preflight_refused.receipt().actual().allocations, 0);
+        assert!(matches!(
+            exact_preflight_refused.source(),
+            MaterializationError::ScratchLimit { needed, limit }
+                if *needed == prospective.initialized_bytes
+                    && *limit == prospective.initialized_bytes - 1
+        ));
         let Err(refused) = proof.materialize_patterns_attempt(proof.work, usize::MAX, usize::MAX)
         else {
             panic!("one-below materialization work limit should refuse");
