@@ -252,7 +252,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -779,6 +779,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; formal streamed single-pattern Rebar CountSpans success omits only AggregateExecutionReport/cache-identity construction for both incumbent and admitted continuation-workspace visits; rich diagnostic/full-report visitors are unchanged wrappers over the same projection, workspace structural or fixed-resource Ok(None) invokes zero callbacks before incumbent fallback, and every typed error retains its complete attempt receipt without callback replay",
+        );
+        identity.identity.push_str(
+            "; byte-set-word-range-fill-v1 materializes each canonical inclusive byte-class range into the unchanged four-word bitmap with boundary masks and whole interior-word fills while preserving exact logical per-byte compile work, program topology, PlanId, and allocation/resource receipts",
+        );
+        identity.availability.push_str(
+            "; every compiler ByteSet inclusive-range materialization uses the word-range physical fill; reversed ranges remain no-ops, singleton insertion and scalar-set ownership are unchanged, and exact or one-below compile admission, execution semantics, and published algorithm/accounting identities remain unchanged",
         );
         identity.identity.push_str(
             "; impossible-match-domain-v1 retains canonical HIR byte minimum/maximum plus mandatory absolute Start/End proof in the construction-owned cache identity, terminates Count/SpanSum full/value/workspace/counter APIs source-free for empty language, N<minimum, or absolute-whole N>maximum, records at most two compiler-bounded proof checks with zero source reads and operation allocations, and leaves Compile verification on its untimed Compile identity without this Count/SpanSum-only receipt",
@@ -30926,6 +30932,45 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn formal_unicode_compile_match_every_line_ascii_uses_word_range_fill_route() {
+        std::thread::Builder::new()
+            .name("formal-unicode-compile-word-range-fill".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                // Pinned Rebar 463d00f,
+                // benchmarks/definitions/unicode/compile.toml: match-every-line-ascii.
+                const PATTERN: &str = r"(?m)^.+$";
+                let regex = current_fre_rebar_aggregate_builder(PATTERN, false, false)
+                    .build_compile()
+                    .expect("public match-every-line-ascii Compile artifact");
+                let report = regex.build_report();
+                let AggregateBuildAccounting::Continuation(compile) = report.build else {
+                    panic!("public match-every-line-ascii must retain a continuation program")
+                };
+                assert_eq!(report.operation, AggregateOperation::Compile);
+                assert_eq!(report.plan, AggregatePlanKind::ContinuationProgram);
+                assert_eq!(compile.class_ranges, 2);
+                assert_eq!(compile.work, 1_088);
+                assert_eq!(report.syntax.parse_work, 15);
+                let complete_work =
+                    composite_build_work(report).expect("closed composite Compile work");
+                let planner_work = complete_work
+                    .checked_sub(report.syntax.parse_work)
+                    .and_then(|work| work.checked_sub(u64::try_from(compile.work).ok()?))
+                    .expect("planner work is a closed subset of composite work");
+                assert_eq!(planner_work, 60);
+                assert_eq!(complete_work, 1_163);
+                assert_eq!(
+                    aggregate_single_plan_label("compile", report),
+                    "compile-aggregate-continuation-program"
+                );
+            })
+            .expect("spawn public Compile route assertion")
+            .join()
+            .expect("public Compile route assertion");
+    }
+
+    #[test]
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), identity.adapter);
@@ -31134,7 +31179,19 @@ agggtaa[cgt]|[acg]ttaccct 0
             "lifecycle construction creates only an empty workspace"
         ));
         assert!(identity.adapter.starts_with(
-            "fre-current-aggregate-capture-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+            "fre-current-aggregate-capture-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity.identity.contains(
+            "byte-set-word-range-fill-v1 materializes each canonical inclusive byte-class range"
+        ));
+        assert!(identity.identity.contains(
+            "preserving exact logical per-byte compile work, program topology, PlanId, and allocation/resource receipts"
+        ));
+        assert!(identity.availability.contains(
+            "every compiler ByteSet inclusive-range materialization uses the word-range physical fill"
+        ));
+        assert!(identity.availability.contains(
+            "exact or one-below compile admission, execution semantics, and published algorithm/accounting identities remain unchanged"
         ));
         assert!(identity.identity.contains(
             "formal-compact-span-visit-success-projection-v1 factors complete-span visits through one same-pass private-field success projection"
@@ -31433,7 +31490,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "runner/schedule adapter key must version the persistent physical route"
         );
         assert!(current_fre_adapter_id().starts_with(
-            "fre-current-aggregate-capture-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
+            "fre-current-aggregate-capture-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
         ));
         assert!(!current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"));
         assert!(
