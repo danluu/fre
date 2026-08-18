@@ -23116,7 +23116,7 @@ mod tests {
     use std::{fmt::Write as _, rc::Rc};
 
     use super::*;
-    use fre::AggregateResource;
+    use fre::{AggregateResource, SearchWindow};
 
     #[test]
     fn formal_single_span_sweep_requires_large_program_and_unexecutable_dense_work() {
@@ -34237,14 +34237,76 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn prepaid_ascii_word_run_rejects_short_domains_without_widening_refusals() {
+        const PATTERN: &str = r"\b\w{25,}\b";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+        assert_eq!(regex.runtime_implementation_id(), "ascii-word-run-linear-v1");
+
+        let short = vec![b'a'; 24];
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let exact = SearchLimits {
+            max_work: 24,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(search.is_match_value(&short, exact), Ok(false));
+        let one_below = SearchLimits {
+            max_work: 23,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            search.is_match_value(&short, one_below),
+            regex.is_match_value(&short, one_below),
+        );
+        assert!(search.is_match_value(&short, one_below).is_err());
+        let ranged = SearchWindow::new(1, short.len());
+        let ranged_one_below = SearchLimits {
+            max_work: 22,
+            max_scratch_bytes: 0,
+        };
+        let ranged_result = search.is_match_window_value(&short, ranged, ranged_one_below);
+        assert_eq!(
+            ranged_result,
+            regex.is_match_window_value(&short, ranged, ranged_one_below),
+        );
+        assert!(ranged_result.is_err());
+
+        let mut haystack = Vec::new();
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&[vec![b'a'; 23], vec![0xff]].concat());
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&vec![b'a'; 25]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&[vec![b'a'; 24], vec![b'-']].concat());
+        haystack.push(b'\n');
+        haystack.extend_from_slice(b"-abcdefghijklmnopqrstuvwxyz-");
+        assert_eq!(haystack.lines().count(), 5);
+
+        let rust = rust_compile_options(&[PATTERN.to_string()], false, false).unwrap();
+        let expected = grep(&rust, &haystack, RunLimits::default().reducer_steps).unwrap();
+        assert_eq!(expected, 2);
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+        assert!(!session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+    }
+
+    #[test]
     #[ignore = "requires the pinned public Rebar checkout"]
-    fn authenticated_long_words_unicode_short_domain_opportunity_exceeds_five_percent() {
+    fn authenticated_long_words_short_domain_opportunities_exceed_five_percent() {
         std::thread::Builder::new()
-            .name("formal-unicode-word-short-domain".to_string())
+            .name("formal-word-short-domain".to_string())
             .stack_size(16 * 1_048_576)
             .spawn(|| {
                 const PATTERN: &str = r"\b\w{25,}\b";
-                const EXPECTED: u64 = 5_075;
+                const EXPECTED_ASCII: u64 = 5_073;
+                const EXPECTED_UNICODE: u64 = 5_075;
                 const DEFINITION_SHA256: &str =
                     "5bf4b0eafb59f8c3210b0164a297d0322079bb49529009e1a29b0e59fb8a4463";
                 const PATTERN_SHA256: &str =
@@ -34328,7 +34390,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                     .len()
                     .checked_add(content_bytes.checked_mul(2).unwrap())
                     .and_then(|work| work.checked_add(line_domains))
-                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED).ok()?))
+                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED_UNICODE).ok()?))
                     .expect("complete work proxy");
                 let non_short_domains = line_domains
                     .checked_sub(short_domains)
@@ -34353,13 +34415,52 @@ agggtaa[cgt]|[acg]ttaccct 0
                     "unicode-word-run-linear-v1"
                 );
                 let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
-                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED_UNICODE);
                 assert!(session.uses_prepared_unicode_word_run_is_match());
-                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED_UNICODE);
+
+                // The incumbent dedicated ASCII value route logically
+                // examines every byte of each short domain after prepaying a
+                // complete one-work-per-byte scan. Count two conservative
+                // matcher units per line byte, every LF scan byte, every outer
+                // line event, and every successful count event. The
+                // minimum-byte guard replaces the terminal iterator predicate
+                // on short domains, so only its genuinely added comparison on
+                // each non-short domain is debited.
+                let ascii_work_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes.checked_mul(2).unwrap())
+                    .and_then(|work| work.checked_add(line_domains))
+                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED_ASCII).ok()?))
+                    .expect("complete ASCII work proxy");
+                assert_eq!(ascii_work_proxy, 21_918_539);
+                let ascii_net_avoided_units = short_content_bytes
+                    .checked_sub(non_short_domains)
+                    .expect("short bytes cover added ASCII guards");
+                assert_eq!(ascii_net_avoided_units, 1_119_546);
+                assert!(
+                    ascii_net_avoided_units.checked_mul(100).unwrap()
+                        > ascii_work_proxy.checked_mul(5).unwrap()
+                );
+
+                let ascii = current_fre_rebar_portable_builder(PATTERN, false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(ascii.build_report().plan, PlanKind::UnicodeWordRun);
+                assert_eq!(
+                    ascii.runtime_implementation_id(),
+                    "ascii-word-run-linear-v1"
+                );
+                let mut ascii_session =
+                    current_fre_rebar_grep_session(&ascii, haystack.len()).unwrap();
+                assert_eq!(ascii_session.execute(&haystack).unwrap(), EXPECTED_ASCII);
+                assert!(!ascii_session.uses_prepared_unicode_word_run_is_match());
+                assert_eq!(ascii_session.execute(&haystack).unwrap(), EXPECTED_ASCII);
             })
-            .expect("spawn public Unicode-word grep canary")
+            .expect("spawn public word-run grep canary")
             .join()
-            .expect("public Unicode-word grep canary");
+            .expect("public word-run grep canary");
     }
 
     #[test]

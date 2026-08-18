@@ -2211,6 +2211,14 @@ fn full_window_value_scan_is_prepaid(
 }
 
 fn ascii_word_run_exists(haystack: &[u8], minimum: usize) -> bool {
+    // This helper's sole caller has already authenticated the exact ASCII
+    // word-run owner, validated a complete window and prepaid one work unit
+    // for every input byte. A shorter byte domain cannot contain the required
+    // ASCII run, so it needs no source inspection. Keeping the check here
+    // leaves invalid-window and finite-work refusals on the incumbent path.
+    if haystack.len() < minimum {
+        return false;
+    }
     let mut run = 0_usize;
     for &byte in haystack {
         if is_ascii_word(byte) {
@@ -2906,6 +2914,103 @@ mod tests {
         assert!(multibyte_but_too_few_scalars.len() >= 25);
         let multibyte_bytes = multibyte_but_too_few_scalars.as_bytes();
         assert!(!plan.is_match_full_prepared(multibyte_bytes));
+    }
+
+    #[test]
+    fn prepaid_ascii_word_minimum_byte_domain_is_exact_and_refusal_safe() {
+        let plan = AsciiPlan::build_auto(Plan::new(25, WordMode::Ascii))
+            .expect("ASCII word-run plan");
+        let short = vec![b'a'; 24];
+        let short_window = SearchWindow::full(&short);
+
+        assert_eq!(
+            plan.is_match_window_value(
+                &short,
+                short_window,
+                SearchLimits {
+                    max_work: 24,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(false),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                &short,
+                short_window,
+                SearchLimits {
+                    max_work: 23,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(Error::WorkLimitExceeded {
+                needed: 24,
+                limit: 23,
+            }),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                &short,
+                SearchWindow::new(1, short.len()),
+                SearchLimits {
+                    max_work: 22,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(Error::WorkLimitExceeded {
+                needed: 23,
+                limit: 22,
+            }),
+        );
+        let malformed_short = [vec![b'a'; 23], vec![0xff]].concat();
+        assert_eq!(malformed_short.len(), 24);
+        assert_eq!(
+            plan.is_match_window_value(
+                &malformed_short,
+                SearchWindow::full(&malformed_short),
+                SearchLimits {
+                    max_work: 24,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(false),
+        );
+
+        let boundary = vec![b'a'; 25];
+        assert_eq!(
+            plan.is_match_window_value(
+                &boundary,
+                SearchWindow::full(&boundary),
+                SearchLimits {
+                    max_work: 25,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(true),
+        );
+        let broken = [vec![b'a'; 24], vec![b'-']].concat();
+        assert_eq!(broken.len(), 25);
+        assert_eq!(
+            plan.is_match_window_value(
+                &broken,
+                SearchWindow::full(&broken),
+                SearchLimits {
+                    max_work: 25,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(false),
+        );
+
+        let invalid = SearchWindow::new(1, 0);
+        assert_eq!(
+            plan.is_match_window_value(&short, invalid, SearchLimits::unlimited()),
+            Err(Error::InvalidWindow {
+                start: 1,
+                end: 0,
+                haystack_len: short.len(),
+            }),
+        );
     }
 
     #[test]
