@@ -280,13 +280,17 @@ const FRE_ADAPTER_V146: &str =
     "fre-current-aggregate-capture-v146-formal-v145-and-v138-route-composition-v1";
 const FRE_ADAPTER_V147: &str =
     "fre-current-aggregate-capture-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
-const FRE_ADAPTER_V148: &str =
+const FRE_ADAPTER_V148_UNICODE_ORDERED_MANY: &str =
     "fre-current-aggregate-capture-v148-formal-unicode-ordered-many-continuation-literal-proof-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
+const FRE_ADAPTER_V148_FIXED_CLASS: &str =
+    "fre-current-aggregate-capture-v148-formal-fixed-class-disjoint-suffix-scan-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
+const FRE_ADAPTER_V149: &str =
+    "fre-current-aggregate-capture-v149-formal-v148-unicode-ordered-many-continuation-literal-proof-and-v148-fixed-class-disjoint-suffix-scan-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V148
+    FRE_ADAPTER_V149
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -605,7 +609,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V148
+        FRE_ADAPTER_V149
     }
 
     #[allow(
@@ -623,7 +627,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V148.to_string(),
+            adapter: FRE_ADAPTER_V149.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1134,6 +1138,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible Unicode-on case-sensitive nonempty literal sets preserve source order, leftmost-first priority, complete span enumeration, reducer accounting, construction and execution limits, and the existing aggregate-many continuation plan and PlanId; the adapter now accepts that already-published literal theorem instead of faulting because Spans deliberately retains a continuation rather than an OrderedLiteral owner, while Unicode nonliterals, case-insensitive sets, identity mismatches, and all v147 cursor behavior retain their existing refusal or route",
         );
         identity.identity.push_str(
+            "; formal-fixed-class-disjoint-suffix-scan-v1 extends the canonical PREFIX MIDDLE{N} SUFFIX byte-class owner with an allocation-free suffix-candidate scan when the retained middle and suffix masks are disjoint and the fixed width exceeds the incumbent Word64 bound",
+        );
+        identity.availability.push_str(
+            "; one-pattern Unicode-off Count, Compile verification, and generic SpanSum select this physical scan solely from the retained canonical class masks and width; every suffix candidate is visited in source order, backward middle probes are globally amortized because a suffix byte cannot be a middle byte, complete matches retain leftmost non-overlap, and all source reads and reductions remain inside the public operation; widths through 64 retain the incumbent Word64/Shift-And route, overlapping masks retain the bounded circular window, Unicode scalar semantics retain their incumbent route, and the fixed-class v5 Count/SpanSum plus v3 visitor identities authenticate the distinction",
+        );
+        identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
         );
         identity.availability.push_str(
@@ -1191,11 +1201,21 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; formal-auto-certified-reducers-v1 supersedes formal-complete-bound-reduction-v1 for timed Count and CountSpans: Count uses the source-independent certified Count portfolio for structural ASCII-folded literals, fixed Unicode class sequences, terminal byte frontiers, bounded Unicode folding and canonical case folding, with the ordinary Aggregate Auto Count planner as fallback; CountSpans uses one construction-selected complete-span session, prefers a receipt-bearing native endpoint visitor when certified, otherwise retains the generic complete-span iterator, and reduces every returned start/end pair",
         );
         identity.availability.push_str(
-            "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available; this adapter supersedes ",
+            "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available",
         );
         identity
             .availability
-            .push_str("; this Unicode ordered-many continuation literal-proof adapter extends ");
+            .push_str("; this v149 route composition retains both independently qualified siblings ");
+        identity
+            .availability
+            .push_str(FRE_ADAPTER_V148_UNICODE_ORDERED_MANY);
+        identity.availability.push_str(" and ");
+        identity
+            .availability
+            .push_str(FRE_ADAPTER_V148_FIXED_CLASS);
+        identity
+            .availability
+            .push_str(" which both extend ");
         identity.availability.push_str(FRE_ADAPTER_V147);
         identity
             .availability
@@ -8921,7 +8941,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V148
+        if receipt.adapter == FRE_ADAPTER_V149
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -35389,12 +35409,22 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V148);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V149);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v148-formal-unicode-ordered-many-continuation-literal-proof-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1"
+            "fre-current-aggregate-capture-v149-formal-v148-unicode-ordered-many-continuation-literal-proof-and-v148-fixed-class-disjoint-suffix-scan-route-composition-v1"
         );
         assert!(current_identity.availability.contains(FRE_ADAPTER));
+        assert!(
+            current_identity
+                .availability
+                .contains(FRE_ADAPTER_V148_UNICODE_ORDERED_MANY)
+        );
+        assert!(
+            current_identity
+                .availability
+                .contains(FRE_ADAPTER_V148_FIXED_CLASS)
+        );
         assert!(current_identity.availability.contains(FRE_ADAPTER_V147));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V146));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
@@ -35495,6 +35525,34 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(
             "its first and steady timed public operations remain ordinary CountSingle calls"
         ));
+        assert!(current_identity.identity.contains(
+            "formal-fixed-class-disjoint-suffix-scan-v1 extends the canonical PREFIX MIDDLE{N} SUFFIX"
+        ));
+        assert!(current_identity.availability.contains(
+            "backward middle probes are globally amortized because a suffix byte cannot be a middle byte"
+        ));
+        assert!(current_identity.availability.contains(
+            "widths through 64 retain the incumbent Word64/Shift-And route"
+        ));
+        assert!(current_identity.availability.contains(
+            "overlapping masks retain the bounded circular window"
+        ));
+        assert_eq!(
+            fre::FIXED_CLASS_SANDWICH_PLAN_ID,
+            "fixed-class-sandwich.scalar-shift-and-disjoint-suffix-or-circular-window.v5"
+        );
+        assert_eq!(
+            fre::FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+            "fixed-class-sandwich.count.v5"
+        );
+        assert_eq!(
+            fre::FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+            "fixed-class-sandwich.span-sum.v5"
+        );
+        assert_eq!(
+            fre_kernels::FIXED_CLASS_SANDWICH_SPAN_VISIT_OPERATION_ID,
+            "fixed-class-sandwich.span-visit.v3"
+        );
         assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V137));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V136));
@@ -44906,10 +44964,40 @@ agggtaa[cgt]|[acg]ttaccct 0
         byte_haystack.push(b'a');
         byte_haystack.extend(core::iter::repeat_n(b'p', 63));
         byte_haystack.push(b'x');
-        byte_haystack.extend_from_slice(b"--");
-        byte_haystack.push(b'a');
+        byte_haystack.extend_from_slice(b"--a");
         byte_haystack.extend(core::iter::repeat_n(b'u', 63));
         byte_haystack.push(b'x');
+        let direct_count = current_fre_rebar_aggregate_builder(&byte_pattern[0], false, false)
+            .build_count()
+            .expect("wide disjoint fixed-class count");
+        current_fre_rebar_validate_aggregate_identity(
+            direct_count.build_report(),
+            false,
+            "count",
+        )
+        .expect("wide disjoint fixed-class identity");
+        let AggregatePlanIdentity::FixedClassSandwich(identity) =
+            direct_count.build_report().plan_identity
+        else {
+            panic!("wide disjoint count retained another owner")
+        };
+        assert_eq!(identity.kernel.plan_id, fre::FIXED_CLASS_SANDWICH_PLAN_ID);
+        assert_eq!(
+            identity.kernel.operation_id,
+            fre::FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID
+        );
+        let direct_result = direct_count
+            .count(&byte_haystack, AggregateRunLimits::default())
+            .expect("wide disjoint fixed-class execution");
+        let AggregateExecutionDetails::FixedClassSandwich(accounting) =
+            direct_result.report().details()
+        else {
+            panic!("wide disjoint count executed another owner")
+        };
+        assert_eq!(direct_result.value(), 1);
+        assert_eq!(accounting.identity, identity.kernel);
+        assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+        assert_eq!(accounting.actual.scratch_bytes, 0);
         assert_current_fre_execution(
             current_fre(
                 "count",
@@ -44945,6 +45033,29 @@ agggtaa[cgt]|[acg]ttaccct 0
             ),
             1,
             "compile-aggregate-fixed-class-sandwich",
+        );
+
+        let overlapping_pattern = vec![r"[a-q][a-z]{63}x".to_string()];
+        let overlapping = current_fre_rebar_aggregate_builder(
+            &overlapping_pattern[0],
+            false,
+            false,
+        )
+        .build_count()
+        .expect("wide overlapping fixed-class control");
+        let overlapping_result = overlapping
+            .count(&byte_haystack, AggregateRunLimits::default())
+            .expect("wide overlapping fixed-class execution");
+        let AggregateExecutionDetails::FixedClassSandwich(overlapping_accounting) =
+            overlapping_result.report().details()
+        else {
+            panic!("wide overlapping control executed another owner")
+        };
+        assert_eq!(overlapping_result.value(), 2);
+        assert!(overlapping_accounting.upper_bounds.scratch_bytes > 0);
+        assert_eq!(
+            overlapping_accounting.actual.scratch_bytes,
+            overlapping_accounting.upper_bounds.scratch_bytes
         );
 
         let unicode_pattern = vec![r"[a-q][^u-z]{3}[x\xE0-\xFF]".to_string()];

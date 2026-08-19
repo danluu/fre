@@ -12367,6 +12367,9 @@ impl CompiledProgram {
             ordered_edge_dispatch: self
                 .automaton
                 .compiler_private_ordered_edge_dispatch_view(),
+            start_closure_dispatch: self
+                .automaton
+                .compiler_private_epsilon_closure_start_program_view(),
             terminal_range: self
                 .anchored_suffix
                 .native_terminal_range_v1(self.raw.edge_kinds.len()),

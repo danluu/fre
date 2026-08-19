@@ -7,20 +7,23 @@
 //! scalar-category table and eight position masks. Byte operations and Unicode
 //! count operations then use one Shift-And recurrence without operation-time
 //! allocation; Unicode scalars above U+00FF retain bounded binary search over
-//! scalar ranges. Longer plans, and Unicode operations that emit spans, retain
-//! a circular `N + 2` unit window. Both reducers emit the same leftmost
-//! non-overlapping sequence and never construct a boundary-indexed
-//! continuation log.
+//! scalar ranges. Longer byte plans whose retained middle and suffix masks are
+//! disjoint scan suffix candidates and amortize backward middle probes over
+//! the source with no operation allocation. Other longer plans, and Unicode
+//! operations that emit spans, retain a circular `N + 2` unit window. Every
+//! reducer emits the same leftmost non-overlapping sequence and never
+//! constructs a boundary-indexed continuation log.
 
 use core::{fmt, mem::size_of};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
-pub const PLAN_ID: &str = "fixed-class-sandwich.scalar-shift-and-or-circular-window.v4";
-pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v4";
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v4";
+pub const PLAN_ID: &str =
+    "fixed-class-sandwich.scalar-shift-and-disjoint-suffix-or-circular-window.v5";
+pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v5";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v5";
 /// Stable identity of allocation-free complete-span visitation.
-pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-class-sandwich.span-visit.v2";
+pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-class-sandwich.span-visit.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Semantics {
@@ -624,6 +627,13 @@ impl ByteClass {
         let bit = u32::from(byte) & 63;
         self.words[word] & (1_u64 << bit) != 0
     }
+
+    fn is_disjoint(self, other: Self) -> bool {
+        self.words
+            .into_iter()
+            .zip(other.words)
+            .all(|(left, right)| left & right == 0)
+    }
 }
 
 const BYTE_VALUES: usize = 256;
@@ -1122,6 +1132,14 @@ impl FixedClassSandwichPlan {
         })
     }
 
+    fn byte_disjoint_suffix_classes(&self) -> Option<&[ByteClass; 3]> {
+        if self.semantics != Semantics::RustBytesUnicodeOff || self.byte_shift_and.is_some() {
+            return None;
+        }
+        let classes = self.byte_classes.as_ref()?;
+        classes[1].is_disjoint(classes[2]).then_some(classes)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "preflight derives and enforces every resource bound before allocating or traversing input"
@@ -1261,7 +1279,8 @@ impl FixedClassSandwichPlan {
         let mut ring = Vec::new();
         let shift_and_operation = self.byte_shift_and.is_some()
             && (self.semantics == Semantics::RustBytesUnicodeOff || operation == Operation::Count);
-        let ring_units = if shift_and_operation {
+        let disjoint_suffix_operation = self.byte_disjoint_suffix_classes().is_some();
+        let ring_units = if shift_and_operation || disjoint_suffix_operation {
             0
         } else {
             self.window_units
@@ -1338,6 +1357,15 @@ impl FixedClassSandwichPlan {
             && let Some(shift_and) = &self.byte_shift_and
         {
             return self.execute_byte_shift_and(local, window.start(), upper, shift_and, visitor);
+        }
+        if let Some(classes) = self.byte_disjoint_suffix_classes() {
+            return self.execute_byte_disjoint_suffix(
+                local,
+                window.start(),
+                upper,
+                classes,
+                visitor,
+            );
         }
         let mut position = 0_usize;
         let mut head = 0_usize;
@@ -1537,6 +1565,181 @@ impl FixedClassSandwichPlan {
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual fixed class work",
             })?;
+        debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert!(actual.membership_tests <= upper.membership_tests);
+        debug_assert!(actual.range_comparisons <= upper.range_comparisons);
+        debug_assert!(actual.reducer_steps <= upper.reducer_steps);
+        debug_assert!(actual.match_events <= upper.match_events);
+        debug_assert!(actual.count <= upper.count);
+        debug_assert!(actual.matched_bytes <= upper.span_sum);
+        debug_assert!(actual.work <= upper.work);
+        Ok(actual)
+    }
+
+    /// Execute a byte-only fixed sandwich whose suffix cannot be a middle
+    /// byte. Suffix positions are ordered exactly like the corresponding
+    /// fixed-width starts. For consecutive inspected suffix positions `p < q`,
+    /// validation at `q` either reaches `p` after `q - p <= N` probes and
+    /// stops (because every suffix byte is outside the middle class), or uses
+    /// at most `N < q - p` probes. Thus every validation is charged to the
+    /// disjoint forward interval since the previous suffix, and all backward
+    /// probes together are bounded by the input length. An accepted match
+    /// advances the minimum suffix by the full width, partitioning the same
+    /// argument into non-overlapping post-match domains.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "candidate and probe counters are each injectively bounded by the supplied slice length before their checked publication"
+    )]
+    fn execute_byte_disjoint_suffix<F>(
+        &self,
+        local: &[u8],
+        absolute_start: usize,
+        upper: ReduceUpperBounds,
+        classes: &[ByteClass; 3],
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        debug_assert_eq!(self.semantics, Semantics::RustBytesUnicodeOff);
+        debug_assert!(self.byte_shift_and.is_none());
+        debug_assert!(classes[1].is_disjoint(classes[2]));
+
+        let middle_width = usize::try_from(self.middle_repetitions).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix middle width",
+            }
+        })?;
+        let first_suffix =
+            self.window_units
+                .checked_sub(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "fixed class disjoint-suffix first position",
+                })?;
+        let mut minimum_suffix = first_suffix;
+        let mut suffix_membership_tests = 0_usize;
+        let mut middle_membership_tests = 0_usize;
+        let mut prefix_membership_tests = 0_usize;
+        let mut count = 0_u64;
+
+        for (suffix_position, &byte) in local.iter().enumerate() {
+            if suffix_position < minimum_suffix {
+                continue;
+            }
+            suffix_membership_tests += 1;
+            if !classes[2].contains(byte) {
+                continue;
+            }
+
+            let middle_start = suffix_position.checked_sub(middle_width).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "fixed class disjoint-suffix middle start",
+                },
+            )?;
+            let mut probe = suffix_position;
+            let mut middle_matches = true;
+            while probe > middle_start {
+                probe -= 1;
+                middle_membership_tests += 1;
+                if !classes[1].contains(local[probe]) {
+                    middle_matches = false;
+                    break;
+                }
+            }
+            if !middle_matches {
+                continue;
+            }
+
+            let match_start =
+                middle_start
+                    .checked_sub(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "fixed class disjoint-suffix match start",
+                    })?;
+            prefix_membership_tests += 1;
+            if !classes[0].contains(local[match_start]) {
+                continue;
+            }
+
+            count = count
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "fixed class disjoint-suffix count",
+                })?;
+            let end = absolute_start
+                .checked_add(suffix_position)
+                .and_then(|position| position.checked_add(1))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "fixed class disjoint-suffix absolute match end",
+                })?;
+            let start =
+                absolute_start
+                    .checked_add(match_start)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "fixed class disjoint-suffix absolute match start",
+                    })?;
+            visitor(CompleteSpan { start, end });
+
+            // Every suffix below this position would correspond to a start at
+            // or before the accepted end and is therefore an overlapping
+            // candidate. Saturating at the local end is exact when the next
+            // mathematical suffix position is outside the supplied slice.
+            minimum_suffix = suffix_position
+                .checked_add(self.window_units)
+                .filter(|&position| position < local.len())
+                .unwrap_or(local.len());
+        }
+
+        debug_assert!(suffix_membership_tests <= local.len());
+        debug_assert!(middle_membership_tests <= local.len());
+        debug_assert!(prefix_membership_tests <= local.len());
+        let membership_tests = suffix_membership_tests
+            .checked_add(middle_membership_tests)
+            .and_then(|tests| tests.checked_add(prefix_membership_tests))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix membership tests",
+            })?;
+        let match_events = usize::try_from(count).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "fixed class disjoint-suffix match events",
+        })?;
+        let width =
+            u64::try_from(self.window_units).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix width as u64",
+            })?;
+        let matched_bytes = count
+            .checked_mul(width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix matched bytes",
+            })?;
+        let reducer_steps = local
+            .len()
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix reducer steps",
+            })?;
+        let work = local
+            .len()
+            .checked_add(membership_tests)
+            .and_then(|value| value.checked_add(reducer_steps))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class disjoint-suffix work",
+            })?;
+        let actual = ReduceActualCounters {
+            input_bytes_advanced: local.len(),
+            decode_byte_checks: local.len(),
+            valid_units: local.len(),
+            invalid_bytes: 0,
+            membership_tests,
+            range_comparisons: 0,
+            reducer_steps,
+            window_resets: match_events,
+            match_events,
+            count,
+            matched_bytes,
+            work,
+            scratch_bytes: 0,
+        };
         debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
         debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
         debug_assert!(actual.membership_tests <= upper.membership_tests);
@@ -2046,7 +2249,10 @@ fn enforce_reduce(
 mod tests {
     use regex::bytes::RegexBuilder;
 
-    use super::{BuildLimits, CompleteSpan, FixedClassSandwichPlan, ReduceLimits, Semantics};
+    use super::{
+        BuildLimits, CompleteSpan, FixedClassSandwichPlan, Operation, ReduceLimits, Semantics,
+    };
+    use crate::Window;
 
     #[test]
     fn build_attempt_reports_exact_success_and_partial_range_failure() {
@@ -2132,6 +2338,38 @@ mod tests {
                 end: matched.end(),
             })
             .collect()
+    }
+
+    fn assert_byte_oracle(
+        plan: &FixedClassSandwichPlan,
+        regex: &regex::bytes::Regex,
+        haystack: &[u8],
+    ) {
+        let expected = regex
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+        let expected_sum = expected.iter().fold(0_u64, |sum, span| {
+            sum.checked_add(u64::try_from(span.end.checked_sub(span.start).unwrap()).unwrap())
+                .unwrap()
+        });
+        let counted = plan.count(haystack, ReduceLimits::default()).unwrap();
+        let summed = plan.span_sum(haystack, ReduceLimits::default()).unwrap();
+        let mut visited = Vec::new();
+        let visit = plan
+            .visit_spans(haystack, ReduceLimits::default(), |span| {
+                visited.push(span);
+            })
+            .unwrap();
+        assert_eq!(counted.count, u64::try_from(expected.len()).unwrap());
+        assert_eq!(counted.accounting.actual.matched_bytes, expected_sum);
+        assert_eq!(summed.span_sum, expected_sum);
+        assert_eq!(visited, expected);
+        assert_eq!(visit.matches, expected.len());
+        assert_eq!(visit.span_sum, expected_sum);
     }
 
     #[test]
@@ -2267,6 +2505,352 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_suffix_starts_above_shift_and_boundary_and_preserves_short_incumbent() {
+        for middle_repetitions in [62_u32, 63, 64, 80] {
+            let plan = FixedClassSandwichPlan::build_bytes(
+                [(b'a', b'a')],
+                [(b'b', b'b')],
+                [(b'c', b'c')],
+                middle_repetitions,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let middle = "b".repeat(usize::try_from(middle_repetitions).unwrap());
+            let one = format!("a{middle}c");
+            let haystack = format!("x{one}{one}a{}x", "b".repeat(middle.len()));
+            let pattern = format!("ab{{{middle_repetitions}}}c");
+            let regex = RegexBuilder::new(&pattern).unicode(false).build().unwrap();
+            assert_byte_oracle(&plan, &regex, haystack.as_bytes());
+
+            if middle_repetitions == 62 {
+                assert!(plan.byte_shift_and.is_some());
+                assert!(plan.byte_disjoint_suffix_classes().is_none());
+                let counted = plan
+                    .count(haystack.as_bytes(), ReduceLimits::default())
+                    .unwrap();
+                assert_eq!(counted.accounting.actual.membership_tests, haystack.len());
+            } else {
+                assert!(plan.byte_shift_and.is_none());
+                assert!(plan.byte_disjoint_suffix_classes().is_some());
+                let counted = plan
+                    .count(haystack.as_bytes(), ReduceLimits::default())
+                    .unwrap();
+                assert_eq!(counted.accounting.upper_bounds.scratch_bytes, 0);
+                assert_eq!(counted.accounting.actual.scratch_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn disjoint_suffix_exhaustive_boundary_combinations_match_oracle() {
+        const MIDDLE: usize = 63;
+        const WIDTH: usize = MIDDLE + 2;
+        const RADIX: usize = 4;
+        const VARIABLE_POSITIONS: [usize; 7] =
+            [0, 1, MIDDLE, WIDTH - 1, WIDTH, WIDTH + 1, 2 * WIDTH];
+        const ALPHABET: [u8; RADIX] = [b'a', b'b', b'c', 0xFF];
+
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'a'), (b'c', b'c')],
+            [(b'b', b'b'), (0xFF, 0xFF)],
+            [(b'a', b'a'), (b'c', b'c')],
+            u32::try_from(MIDDLE).unwrap(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.byte_disjoint_suffix_classes().is_some());
+        let regex = RegexBuilder::new(r"[ac][b\xFF]{63}[ac]")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let cases = RADIX.pow(u32::try_from(VARIABLE_POSITIONS.len()).unwrap());
+        for mut case in 0..cases {
+            let mut haystack = vec![b'b'; 2 * WIDTH + 1];
+            for &position in &VARIABLE_POSITIONS {
+                haystack[position] = ALPHABET[case % RADIX];
+                case /= RADIX;
+            }
+            assert_byte_oracle(&plan, &regex, &haystack);
+        }
+    }
+
+    #[test]
+    fn disjoint_suffix_random_oracle_covers_long_widths_and_invalid_bytes() {
+        const ALPHABET: [u8; 10] = [b'a', b'b', b'c', b'd', b'e', b'x', b'y', b'z', 0x80, 0xFF];
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        for middle_repetitions in [63_u32, 64, 80, 127] {
+            let plan = FixedClassSandwichPlan::build_bytes(
+                [(b'a', b'c')],
+                [(b'd', b'e'), (0x80, 0xFF)],
+                [(b'x', b'z')],
+                middle_repetitions,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.byte_disjoint_suffix_classes().is_some());
+            let pattern = format!(r"[a-c][d-e\x80-\xFF]{{{middle_repetitions}}}[x-z]");
+            let regex = RegexBuilder::new(&pattern).unicode(false).build().unwrap();
+            let width = usize::try_from(middle_repetitions)
+                .unwrap()
+                .checked_add(2)
+                .unwrap();
+            let length_modulus = width
+                .checked_mul(3)
+                .and_then(|value| value.checked_add(29))
+                .unwrap();
+            for case in 0..160_usize {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let length = case
+                    .checked_mul(37)
+                    .and_then(|value| value.checked_add(usize::try_from(state & 63).unwrap()))
+                    .unwrap()
+                    % length_modulus;
+                let mut haystack = Vec::with_capacity(length);
+                for _ in 0..length {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let alphabet_index =
+                        usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                    haystack.push(ALPHABET[alphabet_index]);
+                }
+                if case % 3 == 0 && length >= width {
+                    let placements = length.checked_sub(width).unwrap().checked_add(1).unwrap();
+                    let start =
+                        usize::try_from(state % u64::try_from(placements).unwrap()).unwrap();
+                    haystack[start] = b'a';
+                    haystack[start + 1..start + width - 1].fill(if case % 2 == 0 {
+                        b'd'
+                    } else {
+                        0xFF
+                    });
+                    haystack[start + width - 1] = b'x';
+                }
+                assert_byte_oracle(&plan, &regex, &haystack);
+            }
+        }
+    }
+
+    #[test]
+    fn disjoint_suffix_dense_candidates_and_self_overlap_remain_linear_and_exact() {
+        const MIDDLE: usize = 63;
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'a'), (b'c', b'c')],
+            [(b'b', b'b')],
+            [(b'a', b'a'), (b'c', b'c')],
+            u32::try_from(MIDDLE).unwrap(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let regex = RegexBuilder::new(r"[ac]b{63}[ac]")
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        let dense = vec![b'c'; 8_192];
+        assert_byte_oracle(&plan, &regex, &dense);
+        let dense_count = plan.count(&dense, ReduceLimits::default()).unwrap();
+        assert!(
+            dense_count.accounting.actual.membership_tests <= dense.len().checked_mul(2).unwrap()
+        );
+
+        let one = format!("a{}c", "b".repeat(MIDDLE));
+        let overlapping_decoy = format!(
+            "a{}ca{}c",
+            "b".repeat(MIDDLE.checked_sub(1).unwrap()),
+            "b".repeat(MIDDLE)
+        );
+        let haystack = format!("cc{one}{overlapping_decoy}{one}ccc");
+        assert_byte_oracle(&plan, &regex, haystack.as_bytes());
+    }
+
+    #[test]
+    fn disjoint_suffix_invalid_byte_classes_and_nonzero_window_match_oracle() {
+        const MIDDLE: usize = 63;
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(0xFF, 0xFF)],
+            [(0x80, 0xFD)],
+            [(0xFE, 0xFE)],
+            u32::try_from(MIDDLE).unwrap(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let regex = RegexBuilder::new(r"\xFF[\x80-\xFD]{63}\xFE")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let one = {
+            let mut bytes = vec![0xFF];
+            bytes.extend(core::iter::repeat_n(0x80, MIDDLE));
+            bytes.push(0xFE);
+            bytes
+        };
+        let mut haystack = b"outside".to_vec();
+        let window_start = haystack.len();
+        haystack.extend_from_slice(&one);
+        haystack.extend_from_slice(&[0xFE, 0xFE, 0xFF]);
+        haystack.extend_from_slice(&one);
+        let window_end = haystack.len();
+        haystack.extend_from_slice(b"outside");
+        assert_byte_oracle(&plan, &regex, &haystack);
+
+        let window = Window::new(window_start, window_end);
+        let (upper, ring) = plan
+            .preflight(
+                &haystack,
+                window,
+                Operation::SpanVisit,
+                ReduceLimits::default(),
+            )
+            .unwrap();
+        assert!(ring.is_empty());
+        let mut visited = Vec::new();
+        let actual = plan
+            .execute_with_visitor(&haystack, window, upper, ring, &mut |span| {
+                visited.push(span);
+            })
+            .unwrap();
+        let expected = regex
+            .find_iter(&haystack[window_start..window_end])
+            .map(|matched| CompleteSpan {
+                start: window_start.checked_add(matched.start()).unwrap(),
+                end: window_start.checked_add(matched.end()).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visited, expected);
+        assert_eq!(actual.match_events, expected.len());
+        assert_eq!(
+            actual.input_bytes_advanced,
+            window_end.checked_sub(window_start).unwrap()
+        );
+    }
+
+    #[test]
+    fn disjoint_suffix_exact_and_one_below_prospective_resources_close() {
+        const MIDDLE: usize = 80;
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'q')],
+            [(0, b't'), (b'{', u8::MAX)],
+            [(b'x', b'x')],
+            u32::try_from(MIDDLE).unwrap(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let one = format!("a{}x", "p".repeat(MIDDLE));
+        let haystack = format!("{one}---{one}").into_bytes();
+        let baseline = plan.count(&haystack, ReduceLimits::default()).unwrap();
+        let upper = baseline.accounting.upper_bounds;
+        assert_eq!(upper.scratch_bytes, 0);
+        assert_eq!(upper.peak_bytes, upper.persistent_bytes);
+        assert_eq!(baseline.accounting.actual.scratch_bytes, 0);
+
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_decode_byte_checks: upper.decode_byte_checks,
+            max_membership_tests: upper.membership_tests,
+            max_range_comparisons: upper.range_comparisons,
+            max_reducer_steps: upper.reducer_steps,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_work: upper.work,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(plan.count(&haystack, exact).unwrap().count, baseline.count);
+        assert_eq!(
+            plan.span_sum(&haystack, exact).unwrap().span_sum,
+            baseline.accounting.actual.matched_bytes
+        );
+
+        macro_rules! one_below {
+            ($field:ident, $error:pat) => {{
+                let mut limits = exact;
+                limits.$field = limits.$field.checked_sub(1).unwrap();
+                assert!(matches!(plan.count(&haystack, limits), Err($error)));
+            }};
+        }
+        one_below!(max_input_bytes, super::ReduceError::InputBytesLimit { .. });
+        one_below!(
+            max_decode_byte_checks,
+            super::ReduceError::DecodeByteChecksLimit { .. }
+        );
+        one_below!(
+            max_membership_tests,
+            super::ReduceError::MembershipTestsLimit { .. }
+        );
+        one_below!(
+            max_reducer_steps,
+            super::ReduceError::ReducerStepsLimit { .. }
+        );
+        one_below!(
+            max_match_events,
+            super::ReduceError::MatchEventsLimit { .. }
+        );
+        one_below!(max_count, super::ReduceError::CountLimit { .. });
+        one_below!(max_work, super::ReduceError::WorkLimit { .. });
+        one_below!(max_peak_bytes, super::ReduceError::PeakLimit { .. });
+
+        let mut span_sum_below = exact;
+        span_sum_below.max_span_sum = upper.span_sum.checked_sub(1).unwrap();
+        assert!(matches!(
+            plan.span_sum(&haystack, span_sum_below),
+            Err(super::ReduceError::SpanSumLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn overlapping_middle_and_suffix_retain_circular_window_control() {
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'a')],
+            [(b'b', b'c')],
+            [(b'c', b'c')],
+            80,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.byte_shift_and.is_none());
+        assert!(plan.byte_disjoint_suffix_classes().is_none());
+        let one = format!("a{}c", "b".repeat(80));
+        let regex = RegexBuilder::new(r"a[bc]{80}c")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_byte_oracle(&plan, &regex, one.as_bytes());
+        let counted = plan.count(one.as_bytes(), ReduceLimits::default()).unwrap();
+        assert!(counted.accounting.upper_bounds.scratch_bytes > 0);
+        assert!(counted.accounting.actual.scratch_bytes > 0);
+    }
+
+    #[test]
+    fn wide_overlapping_suffix_control_keeps_invalid_byte_semantics() {
+        const MIDDLE: usize = 80;
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'q')],
+            [(0, b't'), (b'{', u8::MAX)],
+            [(b'x', b'x'), (0xE0, 0xFF)],
+            u32::try_from(MIDDLE).unwrap(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.byte_shift_and.is_none());
+        assert!(plan.byte_disjoint_suffix_classes().is_none());
+        let regex = RegexBuilder::new(r"[a-q][^u-z]{80}[x\xE0-\xFF]")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut haystack =
+            format!("a{}x--a{}", "p".repeat(MIDDLE), "p".repeat(MIDDLE)).into_bytes();
+        haystack.push(0xE0);
+        assert_byte_oracle(&plan, &regex, &haystack);
+        let counted = plan.count(&haystack, ReduceLimits::default()).unwrap();
+        assert_eq!(counted.count, 2);
+        assert!(counted.accounting.actual.scratch_bytes > 0);
+    }
+
+    #[test]
     fn unicode_count_uses_scalar_shift_and_and_spans_retain_windows() {
         let plan = FixedClassSandwichPlan::build_unicode(
             [('a', 'q')],
@@ -2345,10 +2929,10 @@ mod tests {
     }
 
     #[test]
-    fn execution_refuses_before_traversal_when_window_scratch_is_starved() {
+    fn execution_refuses_before_traversal_when_incumbent_window_scratch_is_starved() {
         let plan = FixedClassSandwichPlan::build_bytes(
             [(b'a', b'a')],
-            [(b'b', b'b')],
+            [(b'b', b'c')],
             [(b'c', b'c')],
             80,
             BuildLimits::default(),

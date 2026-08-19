@@ -96,6 +96,7 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
     },
 };
+use fre_automata::{NativeEpsilonClosureAction, NativeEpsilonClosureProgramView};
 
 const STATUS_NO_MATCH: u32 = 0;
 const STATUS_MATCH: u32 = 1;
@@ -1862,18 +1863,285 @@ fn emit_assertion(
     x.op(&[0xc3])
 }
 
+fn selected_start_closure_program<'a>(
+    image: &NativeOrderedNfaObjectImage<'a>,
+) -> Result<Option<NativeEpsilonClosureProgramView<'a>>, ObjectError> {
+    match (
+        image.start_closure_program,
+        image.layout.start_closure_dispatch,
+    ) {
+        (None, None) => Ok(None),
+        (Some(program), Some(receipt))
+            if program.len() == receipt.instruction_count
+                && program.is_guarded() == receipt.guarded
+                && (!receipt.guarded || image.layout.cache_boundary_assertions) =>
+        {
+            let first = program.instruction(0).ok_or(ObjectError::InvalidModule(
+                "x86 Ordered-NFA start closure first instruction",
+            ))?;
+            if first.state() != image.layout.start_state
+                || first.subtree_end() != program.len()
+                || first.guard() != 0
+            {
+                return Err(ObjectError::InvalidModule(
+                    "x86 Ordered-NFA start closure root",
+                ));
+            }
+            Ok(Some(program))
+        }
+        _ => Err(ObjectError::InvalidModule(
+            "x86 Ordered-NFA start closure receipt",
+        )),
+    }
+}
+
+fn start_closure_labels(
+    asm: &mut X86Assembler,
+    program: NativeEpsilonClosureProgramView<'_>,
+) -> Result<Vec<usize>, ObjectError> {
+    let count = program
+        .len()
+        .checked_add(1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 Ordered-NFA start closure label count",
+        ))?;
+    let mut labels = Vec::new();
+    labels
+        .try_reserve_exact(count)
+        .map_err(|_| ObjectError::Allocation("x86 Ordered-NFA start closure labels"))?;
+    for _ in 0..count {
+        labels.push(asm.label()?);
+    }
+    Ok(labels)
+}
+
+fn start_closure_label(labels: &[usize], index: usize) -> Result<usize, ObjectError> {
+    labels.get(index).copied().ok_or(ObjectError::InvalidModule(
+        "x86 Ordered-NFA start closure label",
+    ))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated assertion-kind bounds make the compiler-emitted cache bit total"
+)]
+fn emit_static_guarded_split_assertions(
+    x: &mut X<'_>,
+    kinds: &[u8],
+    assertion_kinds: u32,
+    assertion: usize,
+    runtime_failure: usize,
+) -> Result<(), ObjectError> {
+    for &kind in kinds.iter().rev() {
+        if kind == EDGE_EPSILON {
+            continue;
+        }
+        if !(2..=19).contains(&kind) {
+            return Err(ObjectError::InvalidModule(
+                "x86 Ordered-NFA guarded start closure Split edge",
+            ));
+        }
+        let bit = 1_u32 << u32::from(kind - 2);
+        if assertion_kinds & bit == 0 {
+            return Err(ObjectError::InvalidModule(
+                "x86 Ordered-NFA guarded start closure assertion kind",
+            ));
+        }
+        let known = x.asm.label()?;
+        x.imm32(R::R8, bit)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_KNOWN_MASK)?;
+        x.test32(R::R9, R::R8)?;
+        x.branch(0x85, known)?;
+        x.imm32(R::Ax, u32::from(kind))?;
+        x.load64(R::Cx, R::Sp, L_POSITION)?;
+        x.call(assertion)?;
+        x.test64(R::Dx, R::Dx)?;
+        x.branch(0x85, runtime_failure)?;
+        x.imm32(R::R8, bit)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_KNOWN_MASK)?;
+        x.or32(R::R9, R::R8)?;
+        x.store32(R::Sp, L_ASSERTION_KNOWN_MASK, R::R9)?;
+        x.test64(R::Ax, R::Ax)?;
+        x.branch(0x84, known)?;
+        x.load32(R::R9, R::Sp, L_ASSERTION_ENABLED_MASK)?;
+        x.or32(R::R9, R::R8)?;
+        x.store32(R::Sp, L_ASSERTION_ENABLED_MASK, R::R9)?;
+        x.asm.bind(known)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "validated guards make cache-bit construction total while the static closure shares the authenticated image and semantic exits"
+)]
+fn emit_static_start_closure(
+    x: &mut X<'_>,
+    image: &NativeOrderedNfaObjectImage<'_>,
+    program: NativeEpsilonClosureProgramView<'_>,
+    labels: &[usize],
+    assertion: usize,
+    after_roots: usize,
+    runtime_failure: usize,
+) -> Result<(), ObjectError> {
+    let layout = image.layout;
+    x.asm.bind(start_closure_label(labels, 0)?)?;
+    x.store_mem64_zero(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_LEN_OFFSET)?;
+    for instruction_index in 0..program.len() {
+        if instruction_index != 0 {
+            x.asm
+                .bind(start_closure_label(labels, instruction_index)?)?;
+        }
+        let instruction = program.instruction(instruction_index).ok_or(
+            ObjectError::InvalidModule("x86 Ordered-NFA start closure instruction"),
+        )?;
+        let state = instruction.state();
+        if usize::try_from(state)
+            .ok()
+            .is_none_or(|state| state >= layout.state_count)
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 Ordered-NFA start closure state",
+            ));
+        }
+        let subtree_end = instruction.subtree_end();
+        if subtree_end <= instruction_index || subtree_end > program.len() {
+            return Err(ObjectError::InvalidModule(
+                "x86 Ordered-NFA start closure subtree",
+            ));
+        }
+        let subtree_end = start_closure_label(labels, subtree_end)?;
+
+        let guard = instruction.guard();
+        if guard != 0 {
+            if !program.is_guarded() || guard > 18 {
+                return Err(ObjectError::InvalidModule(
+                    "x86 Ordered-NFA start closure guard",
+                ));
+            }
+            let bit = 1_u32 << guard.saturating_sub(1);
+            if layout.assertion_kinds & bit == 0 {
+                return Err(ObjectError::InvalidModule(
+                    "x86 Ordered-NFA start closure guard kind",
+                ));
+            }
+            x.imm32(R::R8, bit)?;
+            x.load32(R::R9, R::Sp, L_ASSERTION_KNOWN_MASK)?;
+            x.test32(R::R9, R::R8)?;
+            x.branch(0x84, runtime_failure)?;
+            x.load32(R::R9, R::Sp, L_ASSERTION_ENABLED_MASK)?;
+            x.test32(R::R9, R::R8)?;
+            x.branch(0x84, subtree_end)?;
+        } else if !program.is_guarded() && instruction.guard() != 0 {
+            return Err(ObjectError::InvalidModule(
+                "plain x86 Ordered-NFA start closure guard",
+            ));
+        }
+
+        x.imm32(R::Cx, state)?;
+        x.load64(R::Ax, R::Sp, L_SEEN)?;
+        x.load64_index(R::Dx, R::Ax, R::Cx, 3, 0)?;
+        x.load64(
+            R::R8,
+            R::Bx,
+            FROZEN_ORDERED_NFA_SCRATCH_V1_GENERATION_OFFSET,
+        )?;
+        x.cmp64(R::Dx, R::R8)?;
+        x.branch(0x84, subtree_end)?;
+        x.store64_index(R::Ax, R::Cx, 3, 0, R::R8)?;
+
+        match instruction.action() {
+            NativeEpsilonClosureAction::Accept => {
+                x.load64(R::Dx, R::Sp, L_THREAD_START)?;
+                x.store64(
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_START_OFFSET,
+                    R::Dx,
+                )?;
+                x.load64(R::Dx, R::Sp, L_POSITION)?;
+                x.store64(
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_END_OFFSET,
+                    R::Dx,
+                )?;
+                x.store_mem32_value(
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET,
+                    1,
+                )?;
+                x.jump(after_roots)?;
+            }
+            NativeEpsilonClosureAction::Consume => {
+                x.load64(
+                    R::Cx,
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET,
+                )?;
+                x.cmp64_imm(R::Cx, u32::try_from(layout.state_count).unwrap())?;
+                x.branch(0x83, runtime_failure)?;
+                x.load64(R::Ax, R::Sp, L_CURRENT)?;
+                x.shl64_imm(R::Cx, 4)?;
+                x.add64(R::Ax, R::Cx)?;
+                x.imm32(R::Dx, state)?;
+                x.store32(R::Ax, 0, R::Dx)?;
+                x.store_mem32_value(R::Ax, 4, 0)?;
+                x.load64(R::Dx, R::Sp, L_THREAD_START)?;
+                x.store64(R::Ax, 8, R::Dx)?;
+                x.load64(
+                    R::Cx,
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET,
+                )?;
+                x.inc64(R::Cx)?;
+                x.store64(
+                    R::Bx,
+                    FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET,
+                    R::Cx,
+                )?;
+            }
+            NativeEpsilonClosureAction::Split => {
+                if program.is_guarded() {
+                    let kinds = image.encoded_edge_kinds_for_state(state).ok_or(
+                        ObjectError::InvalidModule(
+                            "x86 Ordered-NFA guarded start closure Split row",
+                        ),
+                    )?;
+                    emit_static_guarded_split_assertions(
+                        x,
+                        kinds,
+                        layout.assertion_kinds,
+                        assertion,
+                        runtime_failure,
+                    )?;
+                }
+            }
+            NativeEpsilonClosureAction::SeenBackedge => x.jump(runtime_failure)?,
+        }
+    }
+    x.asm
+        .bind(start_closure_label(labels, program.len())?)?;
+    x.jump(after_roots)
+}
+
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "authenticated dispatch geometry and target widths make emitted sidecar offsets and masks total"
 )]
 fn emit_semantic_body(
     asm: &mut X86Assembler,
-    layout: NativeOrderedNfaObjectLayout,
+    image: &NativeOrderedNfaObjectImage<'_>,
     assertion: usize,
     no_match: usize,
     matched: usize,
     runtime_failure: usize,
 ) -> Result<(), ObjectError> {
+    let layout = image.layout;
+    let start_program = selected_start_closure_program(image)?;
+    let start_labels = start_program
+        .map(|program| start_closure_labels(asm, program))
+        .transpose()?;
     let boundary = asm.label()?;
     let next_old_root = asm.label()?;
     let old_roots_done = asm.label()?;
@@ -1955,6 +2223,9 @@ fn emit_semantic_body(
     x.store64(R::Sp, L_THREAD_START, R::Ax)?;
     x.imm32(R::Ax, 1)?;
     x.store64(R::Sp, L_ROOT_MODE, R::Ax)?;
+    if let Some(labels) = start_labels.as_deref() {
+        x.jump(start_closure_label(labels, 0)?)?;
+    }
 
     x.asm.bind(expand_start)?;
     x.store_mem64_zero(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_LEN_OFFSET)?;
@@ -2137,6 +2408,18 @@ fn emit_semantic_body(
     x.test64(R::Ax, R::Ax)?;
     x.branch(0x85, after_roots)?;
     x.jump(next_old_root)?;
+
+    if let (Some(program), Some(labels)) = (start_program, start_labels.as_deref()) {
+        emit_static_start_closure(
+            &mut x,
+            image,
+            program,
+            labels,
+            assertion,
+            after_roots,
+            runtime_failure,
+        )?;
+    }
 
     x.asm.bind(after_roots)?;
     x.load64(
@@ -2422,7 +2705,7 @@ fn emit_semantic_body(
 
 /// Emit the x86-64 SysV private/public V15 one-Span search entry.
 pub(super) fn lower_x86_64(
-    image: &NativeOrderedNfaObjectImage,
+    image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<OrderedNfaNativeEntry, ObjectError> {
     let layout = image.layout;
     let expected_scratch_bytes = scratch_bytes(layout)?;
@@ -2619,7 +2902,7 @@ pub(super) fn lower_x86_64(
     asm.bind(search_entry)?;
     emit_semantic_body(
         &mut asm,
-        layout,
+        image,
         assertion,
         no_match,
         matched,
@@ -2722,7 +3005,42 @@ pub(super) fn lower_x86_64(
 mod tests {
     use super::*;
 
-    fn minimal_image() -> NativeOrderedNfaObjectImage {
+    fn optimizing_ordered_nfa(pattern: &str) -> crate::CompiledProgram {
+        let parsed = fre_syntax::parse(fre_syntax::ParseRequest::rust(
+            pattern.to_owned(),
+            fre_syntax::CompatibilityProfile::RustBytes(fre_syntax::RustProfile::default()),
+        ))
+        .unwrap();
+        let fre_syntax::CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            panic!("Rust request returned a non-Rust pattern");
+        };
+        let raw = fre_lower::lower_raw(
+            &parsed,
+            fre_lower::OperationSemantics::CaptureFree,
+            fre_lower::LowerLimits::default(),
+        )
+        .unwrap()
+        .into_plan();
+        let automaton = fre_automata::Automaton::from_raw(
+            raw.clone(),
+            fre_automata::CompileLimits::default(),
+        )
+        .unwrap();
+        crate::CompiledProgram::build(
+            raw,
+            automaton,
+            crate::OutputContract::Span,
+            crate::CompileMode::Optimizing,
+            crate::DeterminizeLimits {
+                max_states: 0,
+                ..crate::DeterminizeLimits::default()
+            },
+            usize::MAX,
+        )
+        .unwrap()
+    }
+
+    fn minimal_image() -> NativeOrderedNfaObjectImage<'static> {
         NativeOrderedNfaObjectImage {
             bytes: vec![0; 144],
             layout: NativeOrderedNfaObjectLayout {
@@ -2742,14 +3060,16 @@ mod tests {
                 start_state: 0,
                 assertion_kinds: 0,
                 cache_boundary_assertions: false,
+                start_closure_dispatch: None,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
             },
+            start_closure_program: None,
         }
     }
 
-    fn terminal_range_image() -> NativeOrderedNfaObjectImage {
+    fn terminal_range_image() -> NativeOrderedNfaObjectImage<'static> {
         let mut image = minimal_image();
         image.layout.terminal_range = Some(
             crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
@@ -2761,11 +3081,63 @@ mod tests {
         image
     }
 
-    fn boundary_assertion_cache_image() -> NativeOrderedNfaObjectImage {
+    fn boundary_assertion_cache_image() -> NativeOrderedNfaObjectImage<'static> {
         let mut image = minimal_image();
         image.layout.assertion_kinds = 1 << 6;
         image.layout.cache_boundary_assertions = true;
         image
+    }
+
+    #[test]
+    fn ordered_nfa_x86_unrolls_only_the_selected_start_closure() {
+        let program = optimizing_ordered_nfa(r"(?:a?|bc)");
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let receipt = selected.layout.start_closure_dispatch.unwrap();
+        assert!(!receipt.guarded);
+        assert!(receipt.instruction_count > 1);
+        let scalar = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                start_closure_dispatch: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, scalar.bytes);
+        let selected_entry = lower_x86_64(&selected).unwrap();
+        let scalar_entry = lower_x86_64(&scalar).unwrap();
+        assert!(selected_entry.code.len() > scalar_entry.code.len());
+        assert_eq!(selected_entry.relocations, scalar_entry.relocations);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_guarded_split_assertions_are_emitted_in_reverse_row_order() {
+        let mut asm = X86Assembler::new();
+        let assertion = asm.label().unwrap();
+        let failure = asm.label().unwrap();
+        emit_static_guarded_split_assertions(
+            &mut X { asm: &mut asm },
+            &[2, 0, 4, 3],
+            0b111,
+            assertion,
+            failure,
+        )
+        .unwrap();
+        let kinds = asm
+            .code
+            .windows(5)
+            .enumerate()
+            .filter(|(offset, window)| {
+                window[0] == 0xb8
+                    && offset.checked_sub(1).is_none_or(|i| asm.code[i] != 0x41)
+            })
+            .map(|(_, window)| u32::from_le_bytes(window[1..5].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [3, 4, 2]);
     }
 
     #[test]

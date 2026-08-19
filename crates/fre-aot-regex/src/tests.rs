@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v18() {
+fn receipt_records_selected_workspace_optimizer_identity_v19() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 18);
+    assert_eq!(OPTIMIZER_VERSION, 19);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -866,6 +866,144 @@ fn ordered_nfa_accelerator_final_object_caps_preserve_v2_v1_before_incumbent() {
     assert_eq!(
         below_v1_aggregate.receipt().prepared_aggregate_strategy,
         Some(PreparedAggregateStrategy::RuntimeHelper),
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordinary and aggregate start-text exact boundaries form one resource transaction"
+)]
+fn ordered_nfa_start_closure_final_object_retry_preserves_exact_v3() {
+    const PATTERN: &str = concat!(
+        r"(?:a?|bc)",
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}",
+        r"(?-u:[\x80-\xFF])\b",
+    );
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(PATTERN, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: crate::DeterminizeLimits {
+                    max_states: 0,
+                    ..crate::DeterminizeLimits::default()
+                },
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let mut slow_limits = SlowAotLimits::default();
+    slow_limits.determinize.max_states = 0;
+    slow_limits.determinize.max_transitions = 0;
+    slow_limits.determinize.max_work = 0;
+    let format = crate::ObjectFormat::for_target(target);
+
+    let selected = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded start-specialized V3 fixture");
+    assert!(selected.module().has_ordered_nfa_start_closure_dispatch());
+    assert!(selected.module().has_ordered_nfa_terminal_range_object());
+    assert!(selected.module().has_ordered_edge_dispatch_object());
+    let without_start = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+        selected.program(),
+        target,
+        false,
+        true,
+        true,
+        true,
+        false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route V3 lowering without start text")
+    .with_optimizing_fallbacks_may_continue(
+        selected.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!without_start.has_ordered_nfa_start_closure_dispatch());
+    assert!(without_start.has_ordered_nfa_terminal_range_object());
+    assert!(without_start.has_ordered_edge_dispatch_object());
+    assert_eq!(
+        selected.module().sections()[1].bytes(),
+        without_start.sections()[1].bytes(),
+        "compiler-only start text must not change V3 data",
+    );
+    let relocation_shapes = |module: &crate::CompiledModule| {
+        module
+            .relocations()
+            .iter()
+            .map(|relocation| {
+                (
+                    relocation.section,
+                    relocation.kind,
+                    relocation.symbol,
+                    relocation.addend,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        relocation_shapes(selected.module()),
+        relocation_shapes(&without_start),
+        "compiler-only start text must not add relocation dependencies",
+    );
+    let without_start_object = emit_object(&without_start, format, usize::MAX)
+        .expect("unbounded V3 object without start text");
+    assert!(without_start_object.len() < selected.object().len());
+
+    let exact = compile_with_slow_aot_limits(request(selected.object().len()), slow_limits)
+        .expect("exact start-specialized V3 boundary");
+    assert_eq!(exact.module(), selected.module());
+    assert_eq!(exact.object(), selected.object());
+    let selected_one_below = selected
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty start-specialized object");
+    assert!(without_start_object.len() <= selected_one_below);
+    let retried = compile_with_slow_aot_limits(request(selected_one_below), slow_limits)
+        .expect("start-specialized one-below retries exact V3 without start text");
+    assert_eq!(retried.module(), &without_start);
+    assert_eq!(retried.object(), without_start_object);
+
+    let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+    let selected_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(usize::MAX),
+            exports,
+            slow_limits,
+        )
+        .expect("unbounded start-specialized V3 aggregate");
+    let serialized = selected
+        .program()
+        .serialize()
+        .expect("serialize start-specialized fixture");
+    let without_start_aggregate = without_start
+        .append_prepared_aggregate_exports(
+            exports,
+            selected.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append V3 aggregate exports without start text");
+    let without_start_aggregate_object =
+        emit_object(&without_start_aggregate, format, usize::MAX)
+            .expect("unbounded V3 aggregate object without start text");
+    let aggregate_one_below = selected_aggregate
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty start-specialized aggregate object");
+    assert!(without_start_aggregate_object.len() <= aggregate_one_below);
+    let retried_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(aggregate_one_below),
+            exports,
+            slow_limits,
+        )
+        .expect("aggregate one-below retries exact V3 without start text");
+    assert_eq!(retried_aggregate.module(), &without_start_aggregate);
+    assert_eq!(
+        retried_aggregate.object(),
+        without_start_aggregate_object,
     );
 }
 
@@ -2924,6 +3062,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
     const ASSERTION_CACHE_PATTERN: &str =
         r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
+    const PLAIN_START_CLOSURE_PATTERN: &str =
+        r"(?-u:(?:a?|bc)!(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
     let target = if cfg!(target_arch = "x86_64") {
         if cfg!(target_os = "linux") {
             Target::x86_64_linux()
@@ -2989,7 +3129,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         ),
         (
             ASSERTION_CACHE_PATTERN,
-            CompileMode::Fast,
+            CompileMode::Optimizing,
             EngineKind::OrderedNfa,
             false,
             true,
@@ -2998,6 +3138,21 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 b"a b cc dd eee ffff ggggg h".to_vec(),
                 b"za xb!ccz dd!eee ffff!ggggg".to_vec(),
                 vec![0xff, b'a', b' ', b'b', 0x80, b'c', b'c', b' ', b'h'],
+            ],
+        ),
+        (
+            PLAIN_START_CLOSURE_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                b"!a".to_vec(),
+                b"a!a".to_vec(),
+                b"bc!a".to_vec(),
+                b"zz!a a!b!cc bc!dd!eee".to_vec(),
+                vec![0xff, b'!', b'a', 0x80, b'b', b'c', b'!', b'h'],
             ],
         ),
         (
@@ -3133,7 +3288,10 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .output(OutputContract::Span);
         let terminal_prefilter_fixture = *pattern == ORDERED_EDGE_DISPATCH_PATTERN
             || *pattern == ORDERED_TERMINAL_LOW_PATTERN;
-        let artifact = if terminal_prefilter_fixture {
+        let forced_ordered_graph_fixture = terminal_prefilter_fixture
+            || *pattern == ASSERTION_CACHE_PATTERN
+            || *pattern == PLAIN_START_CLOSURE_PATTERN;
+        let artifact = if forced_ordered_graph_fixture {
             request.limits.determinize.max_states = 0;
             let mut slow_limits = SlowAotLimits::default();
             slow_limits.determinize.max_states = 0;
@@ -3248,6 +3406,25 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     image.layout.assertion_kinds, 0x42,
                     "assertion-cache fixture lost its Nosey-shaped two-kind mask",
                 );
+                assert!(
+                    image
+                        .layout
+                        .start_closure_dispatch
+                        .is_some_and(|layout| layout.guarded),
+                    "assertion-cache fixture lost its guarded start closure",
+                );
+                assert!(artifact.module().has_ordered_nfa_start_closure_dispatch());
+            }
+            if *pattern == PLAIN_START_CLOSURE_PATTERN {
+                assert!(
+                    artifact
+                        .program()
+                        .native_ordered_nfa_view()
+                        .and_then(|view| view.start_closure_dispatch)
+                        .is_some_and(|program| !program.is_guarded()),
+                    "plain fixture lost its start closure",
+                );
+                assert!(artifact.module().has_ordered_nfa_start_closure_dispatch());
             }
         } else {
             assert_eq!(

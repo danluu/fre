@@ -36,7 +36,10 @@ pub use contract::{
     EarliestEnd, Exists, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan, Operation,
     OutputContract, SearchAccounting, SearchReport, SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
-pub use epsilon_closure_dispatch::EpsilonClosureDispatchAllocationError;
+pub use epsilon_closure_dispatch::{
+    EpsilonClosureDispatchAllocationError, NativeEpsilonClosureAction,
+    NativeEpsilonClosureInstruction, NativeEpsilonClosureProgramView,
+};
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
     DynamicDirectHoleResolution,
