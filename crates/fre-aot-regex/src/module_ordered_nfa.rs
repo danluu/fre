@@ -12,7 +12,7 @@ use super::{
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
-        NativeOrderedNfaStartPrefixPlan,
+        NativeOrderedNfaStartPrefixPlan, WholeWindowWidthBounds,
         ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
@@ -743,6 +743,31 @@ fn emit_v15_claim_classifier(
     x.cmp32_imm(R::Ax, FROZEN_ORDERED_NFA_V15_FORMAT_VERSION)?;
     x.branch(0x84, claimed)?;
     x.jump(legacy)
+}
+
+/// Reject an impossible absolute whole-window width after exact handle and
+/// scratch authentication, but before source reads or scratch mutation. The
+/// independently proved absolute cuts also reject every partial window.
+fn emit_whole_window_width_gate(
+    x: &mut X<'_>,
+    bounds: WholeWindowWidthBounds,
+    no_match: usize,
+) -> Result<(), ObjectError> {
+    let minimum = u64::try_from(bounds.minimum)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 Ordered-NFA minimum width"))?;
+    let maximum = u64::try_from(bounds.maximum)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 Ordered-NFA maximum width"))?;
+    x.load64(R::Ax, R::Sp, L_POSITION)?;
+    x.test64(R::Ax, R::Ax)?;
+    x.branch(0x85, no_match)?;
+    x.cmp64(R::R14, R::R13)?;
+    x.branch(0x85, no_match)?;
+    x.imm64(R::Ax, minimum)?;
+    x.cmp64(R::R13, R::Ax)?;
+    x.branch(0x82, no_match)?;
+    x.imm64(R::Ax, maximum)?;
+    x.cmp64(R::R13, R::Ax)?;
+    x.branch(0x87, no_match)
 }
 
 #[allow(
@@ -2889,6 +2914,10 @@ pub(super) fn lower_x86_64(
         x.mov64(R::Bx, R::Ax)?;
         emit_exact_scratch_auth(&mut x, layout, expected_scratch_bytes, runtime_failure)?;
 
+        if let Some(bounds) = layout.whole_window_width_bounds {
+            emit_whole_window_width_gate(&mut x, bounds, no_match)?;
+        }
+
         // Complete generation-overflow preflight before any source byte read.
         x.mov64(R::Ax, R::R14)?;
         x.load64(R::Cx, R::Sp, L_POSITION)?;
@@ -3140,6 +3169,7 @@ mod tests {
                 cache_boundary_assertions: false,
                 start_closure_dispatch: None,
                 start_prefix: None,
+                whole_window_width_bounds: None,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
@@ -3250,6 +3280,72 @@ mod tests {
         };
         assert_eq!(end_conditions(&scalar_entry.code), [0x84, 0x84]);
         assert_eq!(end_conditions(&selected_entry.code), [0x83, 0x83, 0x83]);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_emits_only_the_selected_whole_window_width_gate() {
+        let program = optimizing_ordered_nfa(r"^.{249}$");
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.layout.whole_window_width_bounds,
+            Some(WholeWindowWidthBounds {
+                minimum: 249,
+                maximum: 996,
+            }),
+        );
+        let without = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                whole_window_width_bounds: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, without.bytes);
+        let selected_entry = lower_x86_64(&selected).unwrap();
+        let without_entry = lower_x86_64(&without).unwrap();
+        assert!(selected_entry.code.len() > without_entry.code.len());
+        let relocation_semantics = |entry: &OrderedNfaNativeEntry| {
+            entry
+                .relocations
+                .iter()
+                .map(|relocation| {
+                    (
+                        relocation.section,
+                        relocation.kind,
+                        relocation.symbol,
+                        relocation.addend,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            relocation_semantics(&selected_entry),
+            relocation_semantics(&without_entry),
+        );
+
+        let mut asm = X86Assembler::new();
+        let no_match = asm.label().unwrap();
+        emit_whole_window_width_gate(
+            &mut X { asm: &mut asm },
+            selected.layout.whole_window_width_bounds.unwrap(),
+            no_match,
+        )
+        .unwrap();
+        assert_eq!(asm.fixups.len(), 4);
+        assert!(asm.fixups.iter().all(|fixup| fixup.label == no_match));
+        assert!(asm
+            .code
+            .windows(8)
+            .any(|bytes| bytes == 249_u64.to_le_bytes()));
+        assert!(asm
+            .code
+            .windows(8)
+            .any(|bytes| bytes == 996_u64.to_le_bytes()));
     }
 
     #[test]
