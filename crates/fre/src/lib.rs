@@ -9873,6 +9873,42 @@ impl PortableRegex {
         Ok((matched, accounting))
     }
 
+    /// Search and populate reusable group-zero locations without constructing
+    /// facade diagnostic accounting on the success path.
+    ///
+    /// Location clearing, cardinality checks, capture-free admission, selected
+    /// span and typed failures are identical to [`Self::captures_read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableCapturesReadError`] under the same contract as
+    /// [`Self::captures_read`].
+    pub fn captures_read_value<'h>(
+        &self,
+        locations: &mut PortableCaptureLocations,
+        haystack: &'h [u8],
+        limits: SearchLimits,
+    ) -> Result<Option<ByteMatch<'h>>, PortableCapturesReadError> {
+        locations.slots.fill(None);
+        if locations.len() != self.captures_len() {
+            return Err(PortableCapturesReadError::LocationCount {
+                expected: self.captures_len(),
+                actual: locations.len(),
+            });
+        }
+        let explicit_captures = self.captures_len().saturating_sub(1);
+        if explicit_captures != 0 {
+            return Err(PortableCapturesReadError::ExplicitCapturesUnsupported {
+                captures: explicit_captures,
+            });
+        }
+        let matched = self.find_value(haystack, limits)?;
+        if let Some(matched) = matched {
+            locations.slots[0] = Some((matched.start(), matched.end()));
+        }
+        Ok(matched.map(|span| ByteMatch { haystack, span }))
+    }
+
     /// The immutable compatibility profile used during parsing.
     #[must_use]
     pub const fn profile(&self) -> &CompatibilityProfile {
