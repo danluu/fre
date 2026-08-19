@@ -1163,7 +1163,7 @@ pub(crate) struct PooledWorkspacePool {
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
-    reason = "boxing the fallback workspace would add an allocation and owner hot calls never move this enum"
+    reason = "boxing the fallback workspace would add an allocation; warm owner value calls bypass this enum"
 )]
 enum PooledWorkspaceStorage<'a> {
     Owner(ThreadOwnerGuard<'a, K0Workspace>),
@@ -1414,6 +1414,43 @@ impl Automaton {
             bidirectional,
         )
         .map(Some)
+    }
+
+    /// Execute through the populated owner lane without materializing the
+    /// large owner-or-fallback checkout enum.
+    ///
+    /// This is a warm-only probe: a missing pool, non-owner caller, empty
+    /// lane, or incompatible retained envelope returns `None` without
+    /// constructing or moving a workspace. The caller then enters the exact
+    /// ordinary checkout path. As with that path, only `Ok` retains mutated
+    /// scratch; an error drops the guard and discards the workspace.
+    #[inline]
+    pub(crate) fn try_with_warm_owner_workspace<T, F>(
+        &self,
+        limits: WorkspaceLimits,
+        execute: F,
+    ) -> Option<Result<T, SearchError>>
+    where
+        F: FnOnce(&mut K0Workspace) -> Result<T, SearchError>,
+    {
+        let pool = self.pooled_workspace.get()?;
+        let mut owner = pool.owner.try_checkout()?;
+        if !owner
+            .value()
+            .is_some_and(|workspace| Self::pooled_workspace_fits(workspace, limits))
+        {
+            owner.commit();
+            return None;
+        }
+        let result = execute(
+            owner
+                .value_mut()
+                .expect("authenticated warm owner remains populated"),
+        );
+        if result.is_ok() {
+            owner.commit();
+        }
+        Some(result)
     }
 
     #[allow(
@@ -2883,6 +2920,141 @@ mod tests {
             .expect("publishing thread is the fast-path owner");
         assert!(owner.value().is_some());
         owner.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_warm_owner_executes_in_place_and_falls_back_transactionally() {
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let limits = WorkspaceLimits::unlimited();
+
+        let cold_probe = automaton.try_with_warm_owner_workspace(
+            limits,
+            |_| Ok::<_, SearchError>(7_u8),
+        );
+        assert!(cold_probe.is_none());
+        assert!(automaton.pooled_workspace.get().is_none());
+
+        let cold = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("ordinary cold path constructs the owner lane");
+        assert!(cold.cold_setup.is_some());
+        cold.commit();
+
+        let warm = automaton
+            .try_with_warm_owner_workspace(limits, |_workspace| {
+                Ok::<_, SearchError>(11_u8)
+            })
+            .expect("publishing thread reaches the warm owner lane")
+            .expect("successful warm transaction completes");
+        assert_eq!(warm, 11);
+        let retained = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("successful in-place execution retains the owner workspace");
+        assert!(retained.cold_setup.is_none());
+        retained.commit();
+
+        let failed = automaton
+            .try_with_warm_owner_workspace(limits, |_| {
+                Err::<(), _>(SearchError::InternalInvariant {
+                    detail: "focused warm-owner failure",
+                })
+            })
+            .expect("warm owner begins the failing transaction");
+        assert!(matches!(
+            failed,
+            Err(SearchError::InternalInvariant {
+                detail: "focused warm-owner failure"
+            })
+        ));
+        let rebuilt = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("an error discards and rebuilds the owner workspace");
+        assert!(rebuilt.cold_setup.is_some());
+        rebuilt.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_warm_owner_probe_leaves_nonowner_fallback_unchanged() {
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let limits = WorkspaceLimits::unlimited();
+        let owner = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("owner lane constructs");
+        owner.commit();
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(
+                        automaton
+                            .try_with_warm_owner_workspace(
+                                limits,
+                                |_| Ok::<_, SearchError>(()),
+                            )
+                            .is_none(),
+                        "a nonowner warm probe must decline without moving the owner workspace",
+                    );
+                    let fallback = automaton
+                        .try_checkout_pooled_workspace(limits, true, true)
+                        .expect("unchanged ordinary path constructs the fallback lane");
+                    assert!(fallback.cold_setup.is_some());
+                    fallback.commit();
+                })
+                .join()
+                .unwrap();
+        });
+
+        let owner = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("original owner lane remains warm");
+        assert!(owner.cold_setup.is_none());
+        owner.commit();
+        assert!(
+            automaton
+                .pooled_workspace
+                .get()
+                .unwrap()
+                .fallback
+                .lock()
+                .unwrap()
+                .is_some(),
+            "nonowner fallback remains retained",
+        );
+    }
+
+    #[test]
+    fn pooled_workspace_default_warm_owner_and_panic_are_transactional() {
+        let limits = WorkspaceLimits::default();
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let cold = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("default limits construct the owner lane");
+        assert!(cold.cold_setup.is_some());
+        cold.commit();
+
+        let warm = automaton
+            .try_with_warm_owner_workspace(limits, |_| Ok::<_, SearchError>(17_u8))
+            .expect("exact default limits reach the populated owner")
+            .expect("default warm transaction succeeds");
+        assert_eq!(warm, 17);
+        let retained = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("default warm success retains the owner");
+        assert!(retained.cold_setup.is_none());
+        retained.commit();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = automaton.try_with_warm_owner_workspace(
+                limits,
+                |_| -> Result<(), SearchError> { panic!("focused warm-owner panic") },
+            );
+        }));
+        assert!(panic.is_err());
+        let rebuilt = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("unwind discards and rebuilds the owner workspace");
+        assert!(rebuilt.cold_setup.is_some());
+        rebuilt.commit();
     }
 
     #[test]

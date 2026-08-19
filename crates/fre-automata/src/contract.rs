@@ -731,6 +731,34 @@ impl Automaton {
         {
             return Ok(None);
         }
+        let warm = self.try_with_warm_owner_workspace(workspace_limits, |workspace| {
+            crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+                self, haystack, window, workspace, limits,
+            )
+        });
+        if let Some(result) = warm {
+            return result.map(Some);
+        }
+        self.search_window_with_optional_pooled_exists_value_slow(
+            haystack,
+            window,
+            limits,
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+        )
+    }
+
+    #[inline(never)]
+    fn search_window_with_optional_pooled_exists_value_slow(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<bool>, SearchError> {
         let checkout = self.try_checkout_pooled_workspace_with_setup(
             workspace_limits,
             endpoint_eligible,
@@ -796,6 +824,34 @@ impl Automaton {
         {
             return Ok(None);
         }
+        let warm = self.try_with_warm_owner_workspace(workspace_limits, |workspace| {
+            crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+                self, haystack, window, workspace, limits,
+            )
+        });
+        if let Some(result) = warm {
+            return result.map(Some);
+        }
+        self.search_window_with_optional_pooled_span_value_slow(
+            haystack,
+            window,
+            limits,
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+        )
+    }
+
+    #[inline(never)]
+    fn search_window_with_optional_pooled_span_value_slow(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<Option<MatchSpan>>, SearchError> {
         let checkout = self.try_checkout_pooled_workspace_with_setup(
             workspace_limits,
             endpoint_eligible,
