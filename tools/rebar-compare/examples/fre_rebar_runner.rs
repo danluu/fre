@@ -2800,6 +2800,16 @@ mod tests {
 
     #[test]
     fn hot_byte_compiler_is_generic_only_and_anonymous_count_uses_auto_count() {
+        std::thread::Builder::new()
+            .name("hot-byte-anonymous-count".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(hot_byte_compiler_is_generic_only_and_anonymous_count_uses_auto_count_inner)
+            .expect("spawn hot-byte anonymous Count test")
+            .join()
+            .expect("hot-byte anonymous Count test thread");
+    }
+
+    fn hot_byte_compiler_is_generic_only_and_anonymous_count_uses_auto_count_inner() {
         let compiler_id =
             rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms.id();
         let benchmark = hot_byte_benchmark("count");
