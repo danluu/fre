@@ -277,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 22;
+pub const OPTIMIZER_VERSION: u32 = 23;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,8 +666,19 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         format,
         max_object_bytes,
         || {
-            let without_width = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                &program, target, false, true, true, true, true, true, false,
+            let without_exact_set = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, true, true, true, true, true, false,
+                effective_native_data_limit_bytes,
+            )?;
+            Ok(without_exact_set.append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?)
+        },
+        || {
+            let without_width = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, true, true, true, true, false, false,
                 effective_native_data_limit_bytes,
             )?;
             Ok(without_width.append_prepared_aggregate_exports(
@@ -677,8 +688,8 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let without_prefix = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                &program, target, false, true, true, true, true, false, false,
+            let without_prefix = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, true, true, true, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
             Ok(without_prefix.append_prepared_aggregate_exports(
@@ -688,8 +699,8 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                &program, target, false, true, true, true, false, false, false,
+            let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, true, true, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
             Ok(without_start.append_prepared_aggregate_exports(
@@ -699,8 +710,8 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                &program, target, false, true, true, false, false, false, false,
+            let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, true, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
             Ok(without_terminal.append_prepared_aggregate_exports(
@@ -710,8 +721,8 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                &program, target, false, true, false, false, false, false, false,
+            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                &program, target, false, true, false, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
             Ok(scalar_base.append_prepared_aggregate_exports(
@@ -932,9 +943,10 @@ enum FinalObjectAttempt {
 }
 
 /// Emit one selected module and retry its compositional Ordered-NFA
-/// accelerators in exact additive order. The compiler-only whole-window width
-/// gate is removed first, followed by prefix and independent start-closure
-/// text, preserving the exact pre-feature V1/V2/V3 object. A selected V3 then
+/// accelerators in exact additive order. Compiler-only fragmented terminal-set
+/// aggregate text is removed first, followed by the whole-window width gate,
+/// prefix, and independent start-closure text, preserving the exact
+/// pre-feature V1/V2/V3 object. A selected V3 then
 /// omits only the terminal-range prefilter, yielding V2 when dispatch is
 /// present and V1 when it is not; a selected V2 becomes scalar V1 by omitting
 /// canonical edge dispatch. Established route fallbacks run only after that
@@ -942,12 +954,13 @@ enum FinalObjectAttempt {
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the three compiler-text, V3, V2, and V1 object retries form one ordered resource transaction"
+    reason = "the four compiler-text, V3, V2, and V1 object retries form one ordered resource transaction"
 )]
 fn emit_with_ordered_nfa_accelerator_retries(
     mut module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
+    rebuild_without_terminal_exact_set: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_whole_window_width_gate: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_width_gate_or_start_prefix: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_width_gate_start_prefix_or_start_closure_dispatch: impl FnOnce() -> Result<
@@ -959,6 +972,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     rebuild_scalar_ordered_nfa: impl FnOnce() -> Result<CompiledModule, CompileError>,
 ) -> Result<FinalObjectAttempt, CompileError> {
     let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
+    let selected_terminal_exact_set = module.has_ordered_nfa_terminal_exact_set();
     let selected_width_gate = module.has_ordered_nfa_whole_window_width_gate();
     let selected_start_prefix = module.has_ordered_nfa_start_prefix();
     let selected_start_closure = module.has_ordered_nfa_start_closure_dispatch();
@@ -973,10 +987,43 @@ fn emit_with_ordered_nfa_accelerator_retries(
         Err(error) => return Err(error.into()),
     };
 
+    if selected_terminal_exact_set {
+        let without_exact_set = rebuild_without_terminal_exact_set()?
+            .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        if without_exact_set.has_ordered_nfa_terminal_exact_set()
+            || without_exact_set.has_ordered_nfa_whole_window_width_gate() != selected_width_gate
+            || without_exact_set.has_ordered_nfa_start_prefix() != selected_start_prefix
+            || without_exact_set.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
+            || without_exact_set.has_ordered_nfa_terminal_range_object() != selected_terminal_range
+            || without_exact_set.has_ordered_edge_dispatch_object() != selected_edge_dispatch
+            || without_exact_set.required_prepare_capabilities()
+                & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                == 0
+        {
+            return Err(CompileError::InternalInvariant(
+                "Ordered-NFA terminal exact-set final-object retry changed its retained route",
+            ));
+        }
+        match emit_object(&without_exact_set, format, max_object_bytes) {
+            Ok(object) => {
+                return Ok(FinalObjectAttempt::Fit {
+                    module: without_exact_set,
+                    object,
+                });
+            }
+            Err(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) => module = without_exact_set,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     if selected_width_gate {
         let without_width = rebuild_without_whole_window_width_gate()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_width.has_ordered_nfa_whole_window_width_gate()
+        if without_width.has_ordered_nfa_terminal_exact_set()
+            || without_width.has_ordered_nfa_whole_window_width_gate()
             || without_width.has_ordered_nfa_start_prefix() != selected_start_prefix
             || without_width.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
             || without_width.has_ordered_nfa_terminal_range_object() != selected_terminal_range
@@ -1006,7 +1053,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     if selected_start_prefix {
         let without_prefix = rebuild_without_width_gate_or_start_prefix()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_prefix.has_ordered_nfa_whole_window_width_gate()
+        if without_prefix.has_ordered_nfa_terminal_exact_set()
+            || without_prefix.has_ordered_nfa_whole_window_width_gate()
             || without_prefix.has_ordered_nfa_start_prefix()
             || without_prefix.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
             || without_prefix.has_ordered_nfa_terminal_range_object() != selected_terminal_range
@@ -1037,7 +1085,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     if selected_start_closure {
         let without_start = rebuild_without_width_gate_start_prefix_or_start_closure_dispatch()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_start.has_ordered_nfa_whole_window_width_gate()
+        if without_start.has_ordered_nfa_terminal_exact_set()
+            || without_start.has_ordered_nfa_whole_window_width_gate()
             || without_start.has_ordered_nfa_start_prefix()
             || without_start.has_ordered_nfa_start_closure_dispatch()
             || without_start.has_ordered_nfa_terminal_range_object() != selected_terminal_range
@@ -1068,7 +1117,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     if selected_terminal_range {
         let without_terminal = rebuild_without_compiler_text_or_terminal_range()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_terminal.has_ordered_nfa_whole_window_width_gate()
+        if without_terminal.has_ordered_nfa_terminal_exact_set()
+            || without_terminal.has_ordered_nfa_whole_window_width_gate()
             || without_terminal.has_ordered_nfa_start_prefix()
             || without_terminal.has_ordered_nfa_start_closure_dispatch()
             || without_terminal.has_ordered_nfa_terminal_range_object()
@@ -1099,7 +1149,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     if selected_edge_dispatch {
         let scalar = rebuild_scalar_ordered_nfa()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if scalar.has_ordered_nfa_whole_window_width_gate()
+        if scalar.has_ordered_nfa_terminal_exact_set()
+            || scalar.has_ordered_nfa_whole_window_width_gate()
             || scalar.has_ordered_nfa_start_prefix()
             || scalar.has_ordered_nfa_start_closure_dispatch()
             || scalar.has_ordered_nfa_terminal_range_object()
@@ -1151,32 +1202,38 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         format,
         max_object_bytes,
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                program, target, false, allow_ordered_nfa, true, true, true, true, false,
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, true, true, true, true, true, false,
                 max_native_data_bytes,
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                program, target, false, allow_ordered_nfa, true, true, true, false, false,
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, true, true, true, true, false, false,
                 max_native_data_bytes,
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                program, target, false, allow_ordered_nfa, true, true, false, false, false,
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, true, true, true, false, false, false,
                 max_native_data_bytes,
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                program, target, false, allow_ordered_nfa, true, false, false, false, false,
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, true, true, false, false, false, false,
                 max_native_data_bytes,
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                program, target, false, allow_ordered_nfa, false, false, false, false, false,
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, true, false, false, false, false, false,
+                max_native_data_bytes,
+            )
+        },
+        || {
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                program, target, false, allow_ordered_nfa, false, false, false, false, false, false,
                 max_native_data_bytes,
             )
         },
@@ -1208,32 +1265,38 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 format,
                 max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        program, target, second_endpoint, second_ordered_route, true, true, true, true, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, true, true, true, true, true, false,
                         max_native_data_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        program, target, second_endpoint, second_ordered_route, true, true, true, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, true, true, true, true, false, false,
                         max_native_data_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        program, target, second_endpoint, second_ordered_route, true, true, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, true, true, true, false, false, false,
                         max_native_data_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        program, target, second_endpoint, second_ordered_route, true, false, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, true, true, false, false, false, false,
                         max_native_data_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        program, target, second_endpoint, second_ordered_route, false, false, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, true, false, false, false, false, false,
+                        max_native_data_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        program, target, second_endpoint, second_ordered_route, false, false, false, false, false, false,
                         max_native_data_bytes,
                     )
                 },
@@ -1327,32 +1390,38 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 format,
                 limits.max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        &program, target, false, true, true, true, true, true, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, true, true, true, true, true, false,
                         effective_native_data_limit_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        &program, target, false, true, true, true, true, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, true, true, true, true, false, false,
                         effective_native_data_limit_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        &program, target, false, true, true, true, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, true, true, true, false, false, false,
                         effective_native_data_limit_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        &program, target, false, true, true, false, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, true, true, false, false, false, false,
                         effective_native_data_limit_bytes,
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                        &program, target, false, true, false, false, false, false, false,
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, true, false, false, false, false, false,
+                        effective_native_data_limit_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                        &program, target, false, true, false, false, false, false, false, false,
                         effective_native_data_limit_bytes,
                     )
                 },
@@ -1378,32 +1447,38 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             format,
                             limits.max_object_bytes,
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                                    &program, target, false, true, true, true, true, true, false,
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, true, true, true, true, true, false,
                                     effective_native_data_limit_bytes,
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                                    &program, target, false, true, true, true, true, false, false,
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, true, true, true, true, false, false,
                                     effective_native_data_limit_bytes,
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                                    &program, target, false, true, true, true, false, false, false,
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, true, true, true, false, false, false,
                                     effective_native_data_limit_bytes,
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                                    &program, target, false, true, true, false, false, false, false,
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, true, true, false, false, false, false,
                                     effective_native_data_limit_bytes,
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
-                                    &program, target, false, true, false, false, false, false, false,
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, true, false, false, false, false, false,
+                                    effective_native_data_limit_bytes,
+                                )
+                            },
+                            || {
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                    &program, target, false, true, false, false, false, false, false, false,
                                     effective_native_data_limit_bytes,
                                 )
                             },

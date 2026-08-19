@@ -53,6 +53,7 @@ use crate::{
         FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
         FrozenOrderedNfaStorageV1, NativeOrderedNfaProgramView,
         NativeOrderedNfaTerminalRangeV1, WholeWindowWidthBounds,
+        MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY,
         MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES,
     },
     required_literals::{self, RequiredLiterals},
@@ -958,6 +959,31 @@ impl AnchoredSuffix {
 
     pub(crate) fn sets(&self) -> &[AnchoredByteSet] {
         &self.sets[..usize::from(self.len)]
+    }
+
+    /// Return the exact graph-proved set for the final consumed byte when it
+    /// is fragmented and the graph is large enough to amortize start-aware
+    /// native candidate scanning. Contiguous sets remain owned by the
+    /// established V3 terminal-range selector.
+    fn native_terminal_exact_set(&self, edge_count: usize) -> Option<[u64; 4]> {
+        if edge_count < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES {
+            return None;
+        }
+        let set = self.sets().first().copied()?;
+        let cardinality = set.cardinality();
+        if cardinality == 0 || cardinality > MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY {
+            return None;
+        }
+        let mut members = (u8::MIN..=u8::MAX).filter(|&byte| set.contains(byte));
+        let start = members.next()?;
+        let end = members.next_back().unwrap_or(start);
+        let width = u16::from(end)
+            .checked_sub(u16::from(start))?
+            .checked_add(1)?;
+        if width == cardinality {
+            return None;
+        }
+        Some(set.words())
     }
 
     /// Return the exact single inclusive range proved for the final consumed
@@ -12399,6 +12425,9 @@ impl CompiledProgram {
             start_closure_dispatch: self
                 .automaton
                 .compiler_private_epsilon_closure_start_program_view(),
+            terminal_exact_set: self
+                .anchored_suffix
+                .native_terminal_exact_set(self.raw.edge_kinds.len()),
             terminal_range: self
                 .anchored_suffix
                 .native_terminal_range_v1(self.raw.edge_kinds.len()),
@@ -29749,6 +29778,84 @@ mod tests {
             terminal_range(&format!(r"{repeated}(?-u:[\x00-\xFF])")).1,
             None
         );
+    }
+
+    #[test]
+    fn ordered_nfa_terminal_exact_set_selects_only_large_fragmented_final_columns() {
+        let terminal_filters = |pattern: &str| {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let edge_count = compiled.raw.edge_kinds.len();
+            let suffix_words = compiled
+                .anchored_suffix
+                .sets()
+                .first()
+                .copied()
+                .map(AnchoredByteSet::words);
+            let view = compiled
+                .native_ordered_nfa_view()
+                .expect("fallback Span program exposes ordered NFA");
+            (
+                edge_count,
+                view.terminal_range,
+                view.terminal_exact_set,
+                suffix_words,
+            )
+        };
+
+        let (tiny_edges, tiny_range, tiny_exact, _) = terminal_filters("[0-24-6]");
+        assert!(tiny_edges < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert_eq!(tiny_range, None);
+        assert_eq!(tiny_exact, None);
+
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let (fragmented_edges, fragmented_range, fragmented_exact, suffix_words) =
+            terminal_filters(&format!(r"{repeated}[0-24-6]"));
+        assert!(fragmented_edges >= MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert_eq!(fragmented_range, None);
+        assert_eq!(fragmented_exact, suffix_words);
+        let fragmented = AnchoredByteSet::from_words(
+            fragmented_exact.expect("fragmented final column selects exact bitmap"),
+        );
+        assert_eq!(fragmented.cardinality(), 6);
+        for byte in [b'0', b'1', b'2', b'4', b'5', b'6'] {
+            assert!(fragmented.contains(byte));
+        }
+        assert!(!fragmented.contains(b'3'));
+
+        let (_, capped_range, capped_exact, capped_words) =
+            terminal_filters(&format!(r"{repeated}(?-u:[\x00-\x3E\x40])"));
+        assert_eq!(capped_range, None);
+        assert_eq!(capped_exact, capped_words);
+        assert_eq!(
+            AnchoredByteSet::from_words(
+                capped_exact.expect("64-member fragmented final column is admitted")
+            )
+            .cardinality(),
+            MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY,
+        );
+
+        let (_, contiguous_range, contiguous_exact, _) =
+            terminal_filters(&format!(r"{repeated}[a-z]"));
+        assert!(contiguous_range.is_some());
+        assert_eq!(contiguous_exact, None);
+
+        let (_, broad_range, broad_exact, _) =
+            terminal_filters(&format!(r"{repeated}(?-u:[\x00-\x3F\x41])"));
+        assert_eq!(broad_range, None);
+        assert_eq!(broad_exact, None);
+
+        let (_, universal_range, universal_exact, _) =
+            terminal_filters(&format!(r"{repeated}[0-24-6](?-u:[\x00-\xFF])"));
+        assert_eq!(universal_range, None);
+        assert_eq!(universal_exact, None);
     }
 
     #[test]

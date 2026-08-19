@@ -10,8 +10,8 @@ use super::{
     aarch64_and_low_w, aarch64_and_w, aarch64_cmp_w, aarch64_cmp_w_imm, aarch64_cmp_x,
     aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_load_w_imm, aarch64_load_w_uxtw, aarch64_load_x_imm,
-    aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_mov_x, aarch64_orr_w, aarch64_store_pair_x,
-    aarch64_lsr_x_imm,
+    aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_lsr_x_imm, aarch64_mov_x,
+    aarch64_orr_w, aarch64_store_pair_x,
     aarch64_store_w, aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm,
     aarch64_sub_x_reg, Aarch64Assembler,
     ModuleRelocation, ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO,
@@ -2597,6 +2597,10 @@ fn emit_semantic_body(
 pub(super) fn lower_aarch64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    // The fragmented terminal proof is aggregate-only. Revalidate it here so
+    // a forged compiler-only receipt still fails closed, but do not let it
+    // change the shared/public/private one-Span entry.
+    let _ = image.terminal_exact_set_plan()?;
     let layout = image.layout;
     let expected_scratch_bytes = scratch_bytes(layout)?;
     let mut asm = Aarch64Assembler::new();
@@ -2976,6 +2980,7 @@ mod tests {
                 ordered_edge_dispatch: None,
                 terminal_range: None,
             },
+            terminal_exact_set_words: None,
             start_closure_program: None,
         }
     }
@@ -3322,6 +3327,60 @@ mod tests {
                 .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_terminal_exact_set_is_shared_entry_inert_but_validated() {
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let pattern = format!(r"{repeated}[0-24-6]");
+        let program = optimizing_ordered_nfa(&pattern);
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            selected.terminal_exact_set_plan().unwrap().is_some(),
+            "fragmented final column must retain its validated aggregate receipt",
+        );
+        assert!(selected.layout.terminal_range.is_none());
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                terminal_exact_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, without.bytes);
+
+        let selected_entry = lower_aarch64(&selected).unwrap();
+        let without_entry = lower_aarch64(&without).unwrap();
+        assert_eq!(selected_entry, without_entry);
+
+        let mut overlap = selected.clone();
+        overlap.layout.terminal_range =
+            Some(crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                start: b'a',
+                end: b'z',
+                reverse_depth: 0,
+            });
+        assert!(matches!(
+            lower_aarch64(&overlap),
+            Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set overlaps terminal range"
+            ))
+        ));
+
+        let mut invalid = selected;
+        invalid.terminal_exact_set_words = Some([0; 4]);
+        assert!(matches!(
+            lower_aarch64(&invalid),
+            Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set proof"
+            ))
+        ));
     }
 
     #[test]
