@@ -36,6 +36,10 @@ mod stream;
 mod tagged;
 
 pub use ast::{Assertion, Ast, Greed};
+pub use backtrack::{
+    BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION, BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION,
+    BoundedBacktrackWorkspace, BoundedBacktrackWorkspaceUsage,
+};
 pub use compile::{BuildReport, FirstByteProof, MaskedInclusiveRange, Program, ProgramBuildOrigin};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use hir::{

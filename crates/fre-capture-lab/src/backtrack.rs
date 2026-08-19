@@ -9,9 +9,16 @@ use crate::compile::{Program, StartPrefilter, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{
-    BoundedBacktrackProspective, CandidateKind, CaptureRecord, RunReport, SearchOutcome, Window,
+    BoundedBacktrackProspective, CandidateKind, CaptureRecord, HistoryProgramShape, RunReport,
+    SearchOutcome, Window,
 };
 use crate::runtime::{assertion_matches, canonicalize_unset, check};
+
+/// Version of the caller-owned bounded-backtracking transition algorithm.
+pub const BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION: u32 = 1;
+
+/// Version of the bounded-backtracking workspace capacity and byte ledger.
+pub const BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION: u32 = 1;
 
 /// Smallest source suffix on which the candidate scanner is selected.
 const START_BYTE_PREFILTER_MIN_SEARCH_BYTES: usize = 64;
@@ -33,6 +40,57 @@ const FRAME_INDEX_MASK: u32 = !RESTORE_TAG;
 struct Frame {
     tagged_index: u32,
     value: usize,
+}
+
+/// Complete fixed-capacity dimensions for one reusable bounded backtracker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundedBacktrackWorkspaceUsage {
+    /// Exact bounded-DFS transition algorithm.
+    pub algorithm_version: u32,
+    /// Exact capacity and retained-byte ledger.
+    pub accounting_version: u32,
+    /// Largest admitted suffix searched from one caller cursor.
+    pub max_search_bytes: usize,
+    /// Immutable capture-program instruction count.
+    pub state_count: usize,
+    /// Instructions that can retain an explicit DFS frame.
+    pub frame_state_count: usize,
+    /// Fixed explicit-frame vector capacity.
+    pub frame_capacity: usize,
+    /// Fixed visited-bitset word capacity.
+    pub visited_word_capacity: usize,
+    /// Fixed raw capture-slot capacity.
+    pub slot_capacity: usize,
+    /// Conservative search scratch charged by the ordinary backtracker.
+    pub admitted_scratch_bytes: usize,
+    /// Exact retained workspace header and element-capacity bytes. Allocator
+    /// metadata and capacity rounding are excluded because construction
+    /// requires every reservation to have the exact requested capacity.
+    pub persistent_bytes: usize,
+}
+
+/// Caller-owned scratch reused across bounded-backtracking searches.
+///
+/// The workspace contains no program-derived pointers. It is bound to one
+/// [`crate::HistoryRegex`] clone lineage and a complete immutable program
+/// shape. Accepted searches allocate only their returned capture record; the
+/// explicit DFS stack, visited bitset and raw capture slots remain retained.
+#[derive(Debug)]
+pub struct BoundedBacktrackWorkspace {
+    pub(crate) identity: u64,
+    shape: HistoryProgramShape,
+    frames: Vec<Frame>,
+    visited: Vec<usize>,
+    slots: Vec<usize>,
+    usage: BoundedBacktrackWorkspaceUsage,
+}
+
+impl BoundedBacktrackWorkspace {
+    /// Fixed source-independent workspace dimensions.
+    #[must_use]
+    pub const fn usage(&self) -> BoundedBacktrackWorkspaceUsage {
+        self.usage
+    }
 }
 
 impl Frame {
@@ -192,6 +250,167 @@ impl<'p> BoundedBacktracker<'p> {
         Ok(prospective)
     }
 
+    pub(crate) fn workspace_usage(
+        &self,
+        max_search_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<BoundedBacktrackWorkspaceUsage, SearchError> {
+        let window = Window {
+            start: 0,
+            end: max_search_bytes,
+        };
+        let prospective = self.admit(window, 0, false, limits)?;
+        let boundaries = max_search_bytes
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let visited_word_capacity = visited_words(self.program.state_len(), boundaries)?;
+        let state_count = self.program.state_len();
+        let frame_state_count = self.program.backtrack_frame_state_len();
+        let slot_capacity = self.program.history_program_shape().slots;
+        let persistent_bytes = size_of::<BoundedBacktrackWorkspace>()
+            .checked_add(
+                prospective
+                    .peak_threads
+                    .checked_mul(size_of::<Frame>())
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?,
+            )
+            .and_then(|bytes| {
+                visited_word_capacity
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|visited| bytes.checked_add(visited))
+            })
+            .and_then(|bytes| {
+                slot_capacity
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|slots| bytes.checked_add(slots))
+            })
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        Ok(BoundedBacktrackWorkspaceUsage {
+            algorithm_version: BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION,
+            accounting_version: BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION,
+            max_search_bytes,
+            state_count,
+            frame_state_count,
+            frame_capacity: prospective.peak_threads,
+            visited_word_capacity,
+            slot_capacity,
+            admitted_scratch_bytes: prospective.scratch_bytes,
+            persistent_bytes,
+        })
+    }
+
+    pub(crate) fn prepare_workspace(
+        &self,
+        identity: u64,
+        max_search_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<BoundedBacktrackWorkspace, SearchError> {
+        let usage = self.workspace_usage(max_search_bytes, limits)?;
+        let mut slots = exact_capacity_vec(usage.slot_capacity)?;
+        slots.resize(usage.slot_capacity, UNSET_SLOT);
+        Ok(BoundedBacktrackWorkspace {
+            identity,
+            shape: self.program.history_program_shape(),
+            frames: exact_capacity_vec(usage.frame_capacity)?,
+            visited: exact_capacity_vec(usage.visited_word_capacity)?,
+            slots,
+            usage,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the reusable bounded search keeps identity, policy and source-independent limits explicit"
+    )]
+    pub(crate) fn captures_with_workspace(
+        &self,
+        identity: u64,
+        workspace: &mut BoundedBacktrackWorkspace,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        anchored: bool,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        if workspace.identity != identity
+            || workspace.shape != self.program.history_program_shape()
+            || workspace.usage.algorithm_version != BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION
+            || workspace.usage.accounting_version != BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        if window.start > window.end
+            || window.end > haystack.len()
+            || from < window.start
+            || from > window.end
+        {
+            return Err(SearchError::InvalidWindow);
+        }
+        let search_bytes = window
+            .end
+            .checked_sub(from)
+            .ok_or(SearchError::InvalidWindow)?;
+        if search_bytes > workspace.usage.max_search_bytes {
+            return Err(SearchError::InvalidWindow);
+        }
+        let prospective = self.admit(window, from, anchored, limits)?;
+        let boundaries = search_bytes
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let words = visited_words(self.program.state_len(), boundaries)?;
+        if prospective.peak_threads > workspace.usage.frame_capacity
+            || words > workspace.usage.visited_word_capacity
+            || workspace.usage.state_count != self.program.state_len()
+            || workspace.usage.frame_state_count != self.program.backtrack_frame_state_len()
+            || workspace.frames.capacity() != workspace.usage.frame_capacity
+            || workspace.visited.capacity() != workspace.usage.visited_word_capacity
+            || workspace.slots.len() != workspace.usage.slot_capacity
+            || workspace.slots.capacity() != workspace.usage.slot_capacity
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        workspace.frames.clear();
+        workspace.visited.resize(words, 0);
+        workspace.visited.fill(0);
+        workspace.slots.fill(UNSET_SLOT);
+        let mut counters = Counters {
+            state_visits: 0,
+            slot_copies: 0,
+            starts_injected: 0,
+            bytes_examined: 0,
+            peak_frames: 0,
+        };
+        if let Some(prefilter) = self.candidate_prefilter(window, from, anchored) {
+            self.captures_with_stack_prefiltered(
+                haystack,
+                window,
+                from,
+                prefilter,
+                prospective,
+                boundaries,
+                &mut workspace.frames,
+                &mut workspace.visited,
+                &mut workspace.slots,
+                true,
+                &mut counters,
+            )
+        } else {
+            self.captures_with_stack(
+                haystack,
+                window,
+                from,
+                anchored,
+                prospective,
+                boundaries,
+                &mut workspace.frames,
+                &mut workspace.visited,
+                &mut workspace.slots,
+                true,
+                &mut counters,
+            )
+        }
+    }
+
     pub(crate) fn captures(
         &self,
         haystack: &[u8],
@@ -255,6 +474,7 @@ impl<'p> BoundedBacktracker<'p> {
             &mut frames,
             &mut visited,
             &mut slots,
+            false,
             &mut counters,
         )
     }
@@ -326,6 +546,7 @@ impl<'p> BoundedBacktracker<'p> {
             &mut frames,
             &mut visited,
             &mut slots,
+            false,
             &mut counters,
         )
     }
@@ -347,16 +568,25 @@ impl<'p> BoundedBacktracker<'p> {
         frames: &mut Vec<Frame>,
         visited: &mut [usize],
         slots: &mut [usize],
+        fixed_capacity: bool,
         counters: &mut Counters,
     ) -> Result<SearchOutcome, SearchError> {
         let last_start = if anchored { from } else { window.end };
         let mut at = from;
         let captures = loop {
             counters.starts_injected += 1;
-            frames.push(Frame::step(self.program.start, at));
+            push_frame(frames, Frame::step(self.program.start, at), fixed_capacity)?;
             counters.peak_frames = counters.peak_frames.max(frames.len());
             if self.backtrack(
-                haystack, window, from, boundaries, frames, visited, slots, counters,
+                haystack,
+                window,
+                from,
+                boundaries,
+                frames,
+                visited,
+                slots,
+                fixed_capacity,
+                counters,
             )? {
                 break Some(canonicalize_unset(self.program, slots, UNSET_SLOT)?);
             }
@@ -398,10 +628,20 @@ impl<'p> BoundedBacktracker<'p> {
         frames: &mut Vec<Frame>,
         visited: &mut [usize],
         slots: &mut [usize],
+        fixed_capacity: bool,
         counters: &mut Counters,
     ) -> Result<SearchOutcome, SearchError> {
         let captures = self.captures_candidate_roots(
-            haystack, window, from, prefilter, boundaries, frames, visited, slots, counters,
+            haystack,
+            window,
+            from,
+            prefilter,
+            boundaries,
+            frames,
+            visited,
+            slots,
+            fixed_capacity,
+            counters,
         )?;
         let report = RunReport {
             candidate: CandidateKind::BoundedBacktracker,
@@ -436,6 +676,7 @@ impl<'p> BoundedBacktracker<'p> {
         frames: &mut Vec<Frame>,
         visited: &mut [usize],
         slots: &mut [usize],
+        fixed_capacity: bool,
         counters: &mut Counters,
     ) -> Result<Option<CaptureRecord>, SearchError> {
         let last_start = window
@@ -468,10 +709,18 @@ impl<'p> BoundedBacktracker<'p> {
                 at += relative;
             }
             counters.starts_injected += 1;
-            frames.push(Frame::step(self.program.start, at));
+            push_frame(frames, Frame::step(self.program.start, at), fixed_capacity)?;
             counters.peak_frames = counters.peak_frames.max(frames.len());
             if self.backtrack(
-                haystack, window, from, boundaries, frames, visited, slots, counters,
+                haystack,
+                window,
+                from,
+                boundaries,
+                frames,
+                visited,
+                slots,
+                fixed_capacity,
+                counters,
             )? {
                 return canonicalize_unset(self.program, slots, UNSET_SLOT).map(Some);
             }
@@ -498,6 +747,7 @@ impl<'p> BoundedBacktracker<'p> {
         frames: &mut Vec<Frame>,
         visited: &mut [usize],
         slots: &mut [usize],
+        fixed_capacity: bool,
         counters: &mut Counters,
     ) -> Result<bool, SearchError> {
         while let Some(frame) = frames.pop() {
@@ -529,13 +779,17 @@ impl<'p> BoundedBacktracker<'p> {
                             at += 1;
                         }
                         State::Split { first, second } => {
-                            frames.push(Frame::step(*second, at));
+                            push_frame(frames, Frame::step(*second, at), fixed_capacity)?;
                             counters.peak_frames = counters.peak_frames.max(frames.len());
                             pc = *first;
                         }
                         State::Save { slot, next, .. } => {
                             debug_assert!(*slot < slots.len());
-                            frames.push(Frame::restore(*slot, slots[*slot]));
+                            push_frame(
+                                frames,
+                                Frame::restore(*slot, slots[*slot]),
+                                fixed_capacity,
+                            )?;
                             counters.peak_frames = counters.peak_frames.max(frames.len());
                             slots[*slot] = at;
                             counters.slot_copies += 1;
@@ -672,6 +926,41 @@ fn ranges_match(ranges: &[(u8, u8)], byte: u8) -> bool {
     false
 }
 
+fn exact_capacity_vec<T>(capacity: usize) -> Result<Vec<T>, SearchError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+    if values.capacity() != capacity {
+        return Err(SearchError::Allocation(ResourceKind::ScratchBytes));
+    }
+    Ok(values)
+}
+
+fn visited_words(states: usize, boundaries: usize) -> Result<usize, SearchError> {
+    let pairs = states
+        .checked_mul(boundaries)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    WORD_BITS
+        .checked_sub(1)
+        .and_then(|rounding| pairs.checked_add(rounding))
+        .and_then(|rounded| rounded.checked_div(WORD_BITS))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))
+}
+
+#[inline]
+fn push_frame(
+    frames: &mut Vec<Frame>,
+    frame: Frame,
+    fixed_capacity: bool,
+) -> Result<(), SearchError> {
+    if fixed_capacity && frames.len() == frames.capacity() {
+        return Err(SearchError::InvalidProgram);
+    }
+    frames.push(frame);
+    Ok(())
+}
+
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "the caller proves the complete state-by-boundary product before allocation; validated coordinates are strictly inside that product"
@@ -696,16 +985,92 @@ fn insert_visited(visited: &mut [usize], stride: usize, from: usize, pc: usize, 
 #[cfg(test)]
 mod tests {
     use super::{
+        BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION,
+        BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION, BoundedBacktrackWorkspace,
         BoundedBacktracker, CandidatePrefilterKind, FRAME_INDEX_MASK, Frame,
         START_BYTE_PREFILTER_MIN_SEARCH_BYTES,
     };
-    use crate::{Ast, BuildLimits, Program, SearchLimits, Window};
+    use crate::{Ast, BuildLimits, Program, SearchError, SearchLimits, Window};
     use std::mem::size_of;
 
     #[test]
     fn admitted_frame_layout_and_index_ceiling_are_exact() {
         assert_eq!(size_of::<Frame>(), size_of::<(u32, usize)>());
         assert_eq!(FRAME_INDEX_MASK, u32::MAX >> 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the tiny exact ledger fixture is independently bounded"
+    )]
+    fn reusable_workspace_ledger_capacities_and_storage_are_exact() {
+        let program = Program::compile(&Ast::Byte(b'a').capture(1), BuildLimits::default())
+            .expect("capture program");
+        let backtracker = BoundedBacktracker::new(&program);
+        let limits = SearchLimits::default();
+        let usage = backtracker
+            .workspace_usage(7, limits)
+            .expect("workspace usage");
+        assert_eq!(
+            usage.algorithm_version,
+            BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION
+        );
+        assert_eq!(
+            usage.accounting_version,
+            BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION
+        );
+        let expected_persistent_bytes = size_of::<BoundedBacktrackWorkspace>()
+            + usage.frame_capacity * size_of::<Frame>()
+            + usage.visited_word_capacity * size_of::<usize>()
+            + usage.slot_capacity * size_of::<usize>();
+        assert_eq!(usage.persistent_bytes, expected_persistent_bytes);
+
+        let identity = 7;
+        let mut workspace = backtracker
+            .prepare_workspace(identity, 7, limits)
+            .expect("workspace");
+        assert_eq!(workspace.frames.capacity(), usage.frame_capacity);
+        assert_eq!(workspace.visited.capacity(), usage.visited_word_capacity);
+        assert_eq!(workspace.slots.len(), usage.slot_capacity);
+        assert_eq!(workspace.slots.capacity(), usage.slot_capacity);
+        let frames = workspace.frames.as_ptr();
+        let visited = workspace.visited.as_ptr();
+        let slots = workspace.slots.as_ptr();
+
+        for haystack in [b"xxxxxxx".as_slice(), b"za"] {
+            backtracker
+                .captures_with_workspace(
+                    identity,
+                    &mut workspace,
+                    haystack,
+                    Window::all(haystack),
+                    0,
+                    false,
+                    limits,
+                )
+                .expect("reused search");
+            assert_eq!(workspace.frames.as_ptr(), frames);
+            assert_eq!(workspace.visited.as_ptr(), visited);
+            assert_eq!(workspace.slots.as_ptr(), slots);
+        }
+
+        let mut corrupt = backtracker
+            .prepare_workspace(identity, 7, limits)
+            .expect("workspace");
+        corrupt.frames = Vec::new();
+        assert_eq!(
+            backtracker.captures_with_workspace(
+                identity,
+                &mut corrupt,
+                b"za",
+                Window::all(b"za"),
+                0,
+                false,
+                limits,
+            ),
+            Err(SearchError::InvalidProgram)
+        );
     }
 
     #[test]
