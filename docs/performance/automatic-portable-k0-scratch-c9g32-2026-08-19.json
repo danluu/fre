@@ -1,0 +1,105 @@
+{
+  "schema": "fre.performance.automatic-portable-k0-scratch.c9g32.v1",
+  "date": "2026-08-19",
+  "ratio_direction": "reference_over_fre; values above 1 mean FRE is faster",
+  "change": {
+    "commit": "176252757328ff88d1b1a8fd38b892b908eef925",
+    "tree": "db6b84c10cfa8963ea91df5be75d0da41c039f11",
+    "summary": "PortableRegex value-only search methods automatically retain and reuse bounded K0 scratch under SearchLimits::default()."
+  },
+  "environment": {
+    "instance_type": "AWS EC2 c9g.8xlarge",
+    "architecture": "aarch64 Neoverse V3",
+    "logical_cpus": 32,
+    "candidate_target": "neoverse-v2",
+    "rustc": "1.93.0",
+    "rust_regex": "1.12.4",
+    "re2": "2025-11-05"
+  },
+  "artifacts": {
+    "external_compact_archive": "fre-auto-pool-17625275-c9g32-results.tgz",
+    "external_compact_archive_sha256": "9ac7d3877a46ce75ea3a9be08d6c0f1ed06c6bd2764a2c72204404b3962c29f4",
+    "holdout_summary_sha256": "081c43ffc33b0eec87183d3d2dc6e4028b1ab294ffbaab755078684cab99f399",
+    "rebar_analysis_sha256": "ff7eb33067499303c81ca16ebe3a2faaae75c5a34211a9929bd534d64492c317",
+    "rebar_points_sha256": "25ef00186ec1c1f841aabf7a87ead489793fcc76f9f2cb23eb6c097b66700bae",
+    "rebar_report_sha256": "a2e92e47fe959cb4818fd4c995ee6502a93db1ac0790fe51a05599bfc97c5389"
+  },
+  "holdout": {
+    "suite_id": "fre-non-rebar-holdout-2026-07-14-v1",
+    "performance_schema": "fre.holdout.performance.v3",
+    "correctness": {
+      "fre_pass": 1014,
+      "rust_regex_exact_pass": 507,
+      "re2_exact_pass": 507
+    },
+    "warmups_per_input": 3,
+    "measurements_per_input": 9,
+    "sample_count": 36846,
+    "current": {
+      "rust_regex": {
+        "primary_common_api_geomean": 0.5065737974552169,
+        "hot_primary_geomean": 0.44756620841032907,
+        "one_shot_primary_geomean": 0.5733610077035406,
+        "all_operation_hot_search_geomean": 0.462286924000399
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.3798032310269564,
+        "hot_primary_geomean": 0.8433269499071128,
+        "one_shot_primary_geomean": 0.1710493116749132,
+        "all_operation_hot_search_geomean": 0.8750024589578079
+      }
+    },
+    "prior_independent_c9g_run": {
+      "commit": "77acfde55601602de4e50c4b5e48f21bcc7257ec",
+      "correctness_sha256": "1a37d6070979155b3ee684cc3c32d378e90c93d4a59820b2cab1f2f00cb2c4aa",
+      "rust_regex": {
+        "primary_common_api_geomean": 0.3739540681925513,
+        "hot_primary_geomean": 0.23372813378405422,
+        "one_shot_primary_geomean": 0.5983089962415977,
+        "all_operation_hot_search_geomean": 0.24277261645642828
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.2796465530642844,
+        "hot_primary_geomean": 0.4362039946480824,
+        "one_shot_primary_geomean": 0.17927895113346448,
+        "all_operation_hot_search_geomean": 0.4555280275103281
+      }
+    },
+    "relative_change_percent": {
+      "rust_regex_primary_common_api": 35.46417609618808,
+      "rust_regex_hot_primary": 91.49008772039562,
+      "rust_regex_one_shot_primary": -4.169749860819927,
+      "re2_primary_common_api": 35.815452350542046,
+      "re2_hot_primary": 93.33315610451622,
+      "re2_one_shot_primary": -4.59041031114954
+    }
+  },
+  "rebar": {
+    "sampling": "one adjacent pair per point; descriptive only",
+    "prepared_points": 1220,
+    "executed_points": 1152,
+    "preflight_exclusions": 68,
+    "arms": 2304,
+    "timing_errors": 0,
+    "ab_points": 576,
+    "ba_points": 576,
+    "current_geomean": {
+      "overall": 2.1770348090931,
+      "rust_regex": 1.3867879250229591,
+      "re2": 3.802922625806944
+    },
+    "prior_independent_c9g_run_geomean": {
+      "commit": "77acfde55601602de4e50c4b5e48f21bcc7257ec",
+      "overall": 2.0567669072625954,
+      "rust_regex": 1.321687813471565,
+      "re2": 3.554168984583097
+    }
+  },
+  "limitations": [
+    "The before and after values came from independent c9g.8xlarge instances and source revisions, not a randomized same-host A/B.",
+    "The prior holdout timed accounting-producing FRE methods; the new performance-v3 boundary intentionally times the Rust-equivalent result-only public methods.",
+    "The deterministic holdout correctness file is byte-identical across the two runs, including plan and accounting receipts.",
+    "Rebar uses one pair per point, so its ratios are descriptive and do not estimate variance or confidence intervals.",
+    "AOT was not rerun because this change is confined to the portable runtime K0 value facade and is not linked into AOT execution."
+  ]
+}
