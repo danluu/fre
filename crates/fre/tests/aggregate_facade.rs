@@ -9,7 +9,8 @@ use fre::{
     AggregateOperationHotCounterReceipt, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
+    BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_PLAN_ID,
+    BoundedContextReduceError,
     DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
     FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedPredicateWord64Operation,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
@@ -203,7 +204,7 @@ fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
     assert_eq!(span_identity.kernel.plan_id, BOUNDED_AFFIX_PLAN_ID);
     assert_eq!(
         span_identity.kernel.operation_id,
-        BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+        BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID
     );
     assert_eq!(
         span_regex
@@ -2149,6 +2150,16 @@ fn assert_unicode_scalar_span_sum_route(pattern: &str, haystack: &[u8], expected
 
 #[test]
 fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-cursor-facade".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum_inner)
+        .expect("spawn Unicode scalar cursor facade test")
+        .join()
+        .expect("Unicode scalar cursor facade test");
+}
+
+fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum_inner() {
     let cases: [(&str, &[u8]); 1] =
         [(r"\p{Greek}+", b"A--\xCE\xB1\xCE\xB2\xFF\xCE\xA9--Z")];
     for (pattern, haystack) in cases {
@@ -2167,6 +2178,16 @@ fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum() {
 
 #[test]
 fn unicode_scalar_cursor_count_gate_routes_the_corrected_campaign_cohorts() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-cursor-campaign-cohorts".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(unicode_scalar_cursor_count_gate_routes_the_corrected_campaign_cohorts_inner)
+        .expect("spawn Unicode scalar cursor campaign-cohort test")
+        .join()
+        .expect("Unicode scalar cursor campaign-cohort test");
+}
+
+fn unicode_scalar_cursor_count_gate_routes_the_corrected_campaign_cohorts_inner() {
     let usable = SimdDispatchContext::capture().capabilities().usable();
     let sve2 = usable.contains(SimdFeature::ArmSve) && usable.contains(SimdFeature::ArmSve2);
     for (pattern, expected_cursor) in [
@@ -2201,6 +2222,16 @@ fn unicode_scalar_cursor_count_gate_routes_the_corrected_campaign_cohorts() {
 
 #[test]
 fn unicode_scalar_cursor_count_broad_mask_falls_back_with_closed_identity_and_details() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-cursor-broad-mask-fallback".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(unicode_scalar_cursor_count_broad_mask_falls_back_with_closed_identity_and_details_inner)
+        .expect("spawn Unicode scalar cursor broad-mask fallback test")
+        .join()
+        .expect("Unicode scalar cursor broad-mask fallback test");
+}
+
+fn unicode_scalar_cursor_count_broad_mask_falls_back_with_closed_identity_and_details_inner() {
     const PATTERN: &str = r"\p{L}{8,13}";
     let haystack = b"abcdefgh--abcdefghijklm--\xD0\x90\xD0\x91\xD0\x92\xD0\x93\xD0\x94\xD0\x95\xD0\x96\xD0\x97--\xFFtail";
     let expected = u64::try_from(upstream_profile(PATTERN, haystack, false, true).len()).unwrap();
@@ -2308,9 +2339,11 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                     == AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
                     && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
         ));
-        let build = match count.build_report().build {
-            AggregateBuildAccounting::UnicodeScalar(build) => build,
-            AggregateBuildAccounting::UnicodeScalarCursorCount(build) => build.scalar,
+        let (build, persistent_bytes) = match count.build_report().build {
+            AggregateBuildAccounting::UnicodeScalar(build) => (build, build.persistent_bytes),
+            AggregateBuildAccounting::UnicodeScalarCursorCount(build) => {
+                (build.scalar, build.persistent_bytes)
+            }
             _ => panic!("root scalar class selected another build family"),
         };
         assert!(build.source_ranges > 0);
@@ -2321,7 +2354,7 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                 <= build.source_ranges.checked_add(1).unwrap()
         );
         assert_eq!(
-            build.persistent_bytes,
+            persistent_bytes,
             count.build_report().retained_capacity_bytes
         );
 
@@ -3371,7 +3404,11 @@ fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
     else {
         panic!("fixed class plan executed another family")
     };
-    assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+    assert_eq!(
+        accounting.actual.scratch_bytes,
+        accounting.upper_bounds.scratch_bytes
+    );
+    assert!(accounting.actual.scratch_bytes > 0);
     let mut run_limits = AggregateRunLimits::default();
     run_limits.fixed_class_sandwich.max_work = accounting.upper_bounds.work.checked_sub(1).unwrap();
     let error = width_65.count(&width_65_haystack, run_limits).unwrap_err();
@@ -4796,8 +4833,14 @@ fn absolute_anchors_use_the_complete_original_haystack() {
             .collect::<Vec<_>>(),
         vec![(2, 5)]
     );
-    let (certificate, _) = continuation_details(spans.report().details());
-    assert_eq!(certificate.range, 0..5);
+    let AggregateExecutionDetails::FixedAbsoluteDomain(
+        fre::AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
+    ) = spans.report().details()
+    else {
+        panic!("end-anchored spans did not retain a fixed-domain guard receipt")
+    };
+    assert!(guard.actual.fits(guard.prospective));
+    assert!(guard.actual.source_accesses <= b"xxfoo".len());
 }
 
 #[test]

@@ -531,7 +531,7 @@ fn direct_route_families_publish_one_exact_selected_success_effect() {
             AggregateConstructionStage::TokenPhrase,
         ),
         (
-            r"[a-q][^u-z]{3}x",
+            r"[a-q][^u-z]{63}x",
             false,
             false,
             AggregatePlanKind::FixedClassSandwich,
@@ -668,7 +668,10 @@ fn direct_route_families_publish_one_exact_selected_success_effect() {
     );
 }
 
-fn assert_complete_policy_skip_ledger(report: &AggregateBuildReport) {
+fn assert_complete_policy_skip_ledger(
+    report: &AggregateBuildReport,
+    spans_probe_finite_shapes: bool,
+) {
     let receipt = report
         .construction_attempt_receipt()
         .expect("policy build lost its transaction");
@@ -682,10 +685,21 @@ fn assert_complete_policy_skip_ledger(report: &AggregateBuildReport) {
             AggregateConstructionStageDisposition::Completed
         } else if entry.stage == AggregateConstructionStage::Continuation {
             AggregateConstructionStageDisposition::Published
+        } else if spans_probe_finite_shapes
+            && matches!(
+                entry.stage,
+                AggregateConstructionStage::FixedAbsolute
+                    | AggregateConstructionStage::SparseFiniteRoot
+            )
+        {
+            AggregateConstructionStageDisposition::SemanticIneligible
         } else {
             AggregateConstructionStageDisposition::PolicySkipped
         };
-        assert_eq!(entry.disposition, expected, "stage={:?}", entry.stage);
+        assert_eq!(
+            entry.disposition, expected,
+            "stage={:?}, ledger={:?}", entry.stage, receipt.ledger
+        );
         if expected == AggregateConstructionStageDisposition::PolicySkipped {
             assert_eq!(entry.effect, AggregateConstructionEffect::default());
         }
@@ -701,7 +715,7 @@ fn forced_continuation_and_spans_pin_full_order_as_policy_skips() {
             .build_count_attempt()
             .expect("forced continuation");
         assert_success_receipt(forced.build_report());
-        assert_complete_policy_skip_ledger(forced.build_report());
+        assert_complete_policy_skip_ledger(forced.build_report(), false);
     }
 
     let spans = builder(r"a.*b")
@@ -709,11 +723,21 @@ fn forced_continuation_and_spans_pin_full_order_as_policy_skips() {
         .build_spans_attempt()
         .expect("spans continuation");
     assert_success_receipt(spans.build_report());
-    assert_complete_policy_skip_ledger(spans.build_report());
+    assert_complete_policy_skip_ledger(spans.build_report(), true);
 }
 
 #[test]
 fn unicode_scalar_cursor_count_transaction_retains_exact_attempt_effects() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-cursor-count-transaction".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(unicode_scalar_cursor_count_transaction_retains_exact_attempt_effects_inner)
+        .expect("spawn Unicode scalar cursor transaction test")
+        .join()
+        .expect("Unicode scalar cursor transaction test");
+}
+
+fn unicode_scalar_cursor_count_transaction_retains_exact_attempt_effects_inner() {
     let pattern = r"\p{Greek}+";
     let baseline = builder(pattern)
         .build_count_attempt()
@@ -800,6 +824,16 @@ fn unicode_scalar_cursor_count_transaction_retains_exact_attempt_effects() {
 
 #[test]
 fn unicode_scalar_cursor_count_broad_fallback_retains_exact_attempt_effects() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-cursor-count-broad-fallback".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(unicode_scalar_cursor_count_broad_fallback_retains_exact_attempt_effects_inner)
+        .expect("spawn Unicode scalar cursor broad-fallback test")
+        .join()
+        .expect("Unicode scalar cursor broad-fallback test");
+}
+
+fn unicode_scalar_cursor_count_broad_fallback_retains_exact_attempt_effects_inner() {
     let pattern = r"\p{L}{8,13}";
     let baseline = builder(pattern)
         .build_count_attempt()

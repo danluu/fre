@@ -57,7 +57,7 @@ use fre::{
     CaptureAbsoluteOnePassIterationFailure, CaptureAbsoluteOnePassPrepared,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
     CaptureExecutionSource, CaptureGroupRecord, CaptureGroupSlot, CaptureIterationActual,
-    CaptureIterationProspective, CaptureOperation, CapturePlanKind, CaptureRecord,
+    CaptureOperation, CapturePlanKind, CaptureRecord,
     CaptureRecordVisitError, CaptureRegex, CaptureRequiredLiteralBuildLimits,
     CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
     CaptureRequiredLiteralSearchOperation, CaptureRunAlternationBuildError,
@@ -280,11 +280,13 @@ const FRE_ADAPTER_V146: &str =
     "fre-current-aggregate-capture-v146-formal-v145-and-v138-route-composition-v1";
 const FRE_ADAPTER_V147: &str =
     "fre-current-aggregate-capture-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
+const FRE_ADAPTER_V148: &str =
+    "fre-current-aggregate-capture-v148-formal-unicode-ordered-many-continuation-literal-proof-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V147
+    FRE_ADAPTER_V148
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -603,7 +605,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V147
+        FRE_ADAPTER_V148
     }
 
     #[allow(
@@ -621,7 +623,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V147.to_string(),
+            adapter: FRE_ADAPTER_V148.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1126,6 +1128,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; non-SVE one-pattern Count and Compile select the cursor solely from the canonical HIR, immutable dispatch snapshot, operation, caller build policy, and the source-independent at-most-89-of-179 leading-byte cardinality proof; the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope is authenticated before source access, sparse matches retain the monotone cursor, dense matches cross once at a published match end, and SpanSum plus the existing SVE2 exactly-one owner remain unchanged; masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper, and their existing prepared-token behavior; prepare_unicode_scalar_count deliberately returns Ok(None) only for the cursor owner, so even at the formal at-most-4,096-byte prepared-admission threshold its first and steady timed public operations remain ordinary CountSingle calls using the cursor's authenticated full-window envelope rather than a prepared Unicode-scalar token",
         );
         identity.identity.push_str(
+            "; formal-unicode-ordered-many-continuation-literal-proof-v1 authenticates the retained reverse-sequential ContinuationProgram used to materialize complete ordered spans for a Unicode-on multi-pattern Count as UnicodeOnNonemptyUtf8Literals after the same AggregateMany construction has parsed every supplied pattern and rejected the first case-insensitive or nonliteral HIR before continuation publication",
+        );
+        identity.availability.push_str(
+            "; eligible Unicode-on case-sensitive nonempty literal sets preserve source order, leftmost-first priority, complete span enumeration, reducer accounting, construction and execution limits, and the existing aggregate-many continuation plan and PlanId; the adapter now accepts that already-published literal theorem instead of faulting because Spans deliberately retains a continuation rather than an OrderedLiteral owner, while Unicode nonliterals, case-insensitive sets, identity mismatches, and all v147 cursor behavior retain their existing refusal or route",
+        );
+        identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
         );
         identity.availability.push_str(
@@ -1187,7 +1195,11 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity
             .availability
-            .push_str("; this selectivity-cap adapter extends ");
+            .push_str("; this Unicode ordered-many continuation literal-proof adapter extends ");
+        identity.availability.push_str(FRE_ADAPTER_V147);
+        identity
+            .availability
+            .push_str(" whose selectivity-cap route extends ");
         identity.availability.push_str(FRE_ADAPTER_V146);
         identity
             .availability
@@ -8909,7 +8921,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V147
+        if receipt.adapter == FRE_ADAPTER_V148
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -23486,7 +23498,9 @@ fn authenticate_aggregate_many_plan_identity(
             && (operation != AggregateManyOperation::Spans
                 || report.strategy == Some(AggregateStrategy::ReverseSequentialRows)) =>
         {
-            Ok(None)
+            Ok(unicode.then_some(
+                AggregateManyLiteralSemantics::UnicodeOnNonemptyUtf8Literals,
+            ))
         }
         _ => Err(ExecutionError::fault(
             "FRE ordered build-many plan/accounting/semantic identity mismatch",
@@ -25503,22 +25517,25 @@ mod tests {
                 &RunLimits::default(),
             ),
             5,
-            "aggregate-continuation-program",
+            &format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-fixed-predicate-word64-{}",
+                fre::FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID
+            ),
         );
     }
 
     #[test]
-    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows() {
+    fn formal_reallyhard_count_spans_uses_state_byte_span_sum() {
         std::thread::Builder::new()
-            .name("formal-reallyhard-dense-byte-rows".to_string())
+            .name("formal-reallyhard-state-byte-span-sum".to_string())
             .stack_size(32 * 1_048_576)
-            .spawn(formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner)
-            .expect("spawn reallyhard dense-row route test")
+            .spawn(formal_reallyhard_count_spans_uses_state_byte_span_sum_inner)
+            .expect("spawn reallyhard state-byte span-sum route test")
             .join()
-            .expect("reallyhard dense-row route thread");
+            .expect("reallyhard state-byte span-sum route thread");
     }
 
-    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner() {
+    fn formal_reallyhard_count_spans_uses_state_byte_span_sum_inner() {
         const PATTERN: &str = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*";
         const PUBLIC_HAYSTACK_LEN: usize = 1_048_602;
         let policy = RunLimits::default();
@@ -25559,7 +25576,7 @@ mod tests {
             .visit_spans(haystack, limits, |matched| {
                 spans.push((matched.start(), matched.end()));
             })
-            .expect("reallyhard dense-row span visit");
+            .expect("reallyhard state-byte span visit");
         assert_eq!(spans, expected);
         assert_eq!(visited.len(), expected.len());
         assert_eq!(visited.span_sum(), 51);
@@ -25570,7 +25587,7 @@ mod tests {
         };
         assert_eq!(
             certificate.physical_route,
-            fre::AggregateOperationPhysicalRoute::DenseRows,
+            fre::AggregateOperationPhysicalRoute::StateByteSpanSum,
         );
         assert!(rebar_streamed_single_span_accounting_closes(
             regex.build_report(),
@@ -30786,7 +30803,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .expect_err("formal count-captures rejects scalar multi-pattern reduction");
         assert_eq!(multi_count.status, Status::Unsupported);
-        assert!(multi_count.message.contains("requires exactly one pattern"));
+        assert!(multi_count.message.contains("requires one pattern"));
 
         for invalid in [Vec::new(), vec!["(a)".to_string(), "(b)".to_string()]] {
             let error = fre_reducer(
@@ -32817,7 +32834,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("ordinary Count lifecycle");
-        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_UNIFORM_PLAN);
+        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(count.execute(haystack).expect("ordinary Count"), 6);
 
         let mut grep = current_fre_rebar_capture_lifecycle(
@@ -32828,7 +32845,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("stream lifecycle");
-        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN);
+        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(grep.execute(haystack).expect("first stream operation"), 6);
         assert_eq!(grep.execute(haystack).expect("steady stream operation"), 6);
     }
@@ -33229,6 +33246,16 @@ agggtaa[cgt]|[acg]ttaccct 0
         reason = "one table-driven test closes all seven fixed-domain route contracts"
     )]
     fn current_fre_fixed_absolute_adapter_covers_all_seven_generic_routes() {
+        std::thread::Builder::new()
+            .name("current-fre-fixed-absolute-seven-routes".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_fixed_absolute_adapter_covers_all_seven_generic_routes_inner)
+            .expect("spawn fixed-absolute seven-route test")
+            .join()
+            .expect("fixed-absolute seven-route test");
+    }
+
+    fn current_fre_fixed_absolute_adapter_covers_all_seven_generic_routes_inner() {
         struct Case {
             model: &'static str,
             pattern: &'static str,
@@ -33291,10 +33318,18 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         for case in cases {
             let patterns = [case.pattern.to_string()];
-            let expected_plan = if case.model == "count-spans" {
+            let lifecycle_plan = if case.model == "count-spans" {
                 "aggregate-continuation-program"
             } else {
                 "aggregate-fixed-absolute-domain"
+            };
+            let candidate_plan = if case.model == "count-spans" {
+                format!(
+                    "{CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN}-{}",
+                    fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+                )
+            } else {
+                lifecycle_plan.to_owned()
             };
             assert_current_fre_execution(
                 current_fre(
@@ -33306,7 +33341,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                     &RunLimits::default(),
                 ),
                 case.expected,
-                expected_plan,
+                &candidate_plan,
             );
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
                 case.model,
@@ -33316,7 +33351,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 case.haystack.len(),
             )
             .expect("fixed absolute-domain lifecycle builds");
-            assert_eq!(lifecycle.plan(), expected_plan);
+            assert_eq!(lifecycle.plan(), lifecycle_plan);
             if case.pattern == r"^.{249}$" {
                 let CurrentFreAggregateOperationInner::CountSingle(regex, limits) =
                     &lifecycle.inner
@@ -33842,6 +33877,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_bounded_affix_receipt_label_binds_kernel_route() {
+        std::thread::Builder::new()
+            .name("current-fre-bounded-affix-route".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_bounded_affix_receipt_label_binds_kernel_route_inner)
+            .expect("spawn bounded-affix route test")
+            .join()
+            .expect("bounded-affix route test");
+    }
+
+    fn current_fre_bounded_affix_receipt_label_binds_kernel_route_inner() {
         let pattern = r"\s[A-Za-z]{0,12}ing\s".to_string();
         let haystack = b" ing  walking\t";
         assert_current_fre_execution(
@@ -33866,7 +33911,10 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             14,
-            "aggregate-continuation-program",
+            &format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN}-{}",
+                fre::BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
+            ),
         );
     }
 
@@ -34709,7 +34757,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn formal_rebar_quarantines_multi_pattern_ascii_word_shadow() {
+    fn formal_rebar_admits_source_independent_multi_pattern_ascii_word_shadow() {
         let patterns = [
             r"(\bif\b)".to_string(),
             r"(\belse\b)".to_string(),
@@ -34728,18 +34776,19 @@ agggtaa[cgt]|[acg]ttaccct 0
             .build_spans()
             .expect("formal ordered-many complete spans");
         assert!(
-            !aggregate_many_build_limits(&RunLimits::default())
+            aggregate_many_build_limits(&RunLimits::default())
                 .continuation
                 .allow_workload_specific_intrinsics
         );
-        assert!(formal.build_report().ascii_word_shadow.is_none());
         assert_eq!(
-            formal
-                .build_report()
-                .composition
-                .ascii_word_shadow_proof_work,
-            0
+            formal.build_report().ascii_word_shadow,
+            generic.build_report().ascii_word_shadow
         );
+        assert_eq!(
+            formal.build_report().composition.ascii_word_shadow_proof_work,
+            generic.build_report().composition.ascii_word_shadow_proof_work
+        );
+        assert!(formal.build_report().composition.ascii_word_shadow_proof_work > 0);
 
         let oracle = regex::bytes::RegexBuilder::new(
             &patterns
@@ -35316,7 +35365,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 assert_eq!(report.operation, AggregateOperation::Compile);
                 assert_eq!(report.plan, AggregatePlanKind::ContinuationProgram);
                 assert_eq!(compile.class_ranges, 2);
-                assert_eq!(compile.work, 1_088);
+                assert_eq!(compile.work, 1_091);
                 assert_eq!(report.syntax.parse_work, 15);
                 let complete_work =
                     composite_build_work(report).expect("closed composite Compile work");
@@ -35324,8 +35373,8 @@ agggtaa[cgt]|[acg]ttaccct 0
                     .checked_sub(report.syntax.parse_work)
                     .and_then(|work| work.checked_sub(u64::try_from(compile.work).ok()?))
                     .expect("planner work is a closed subset of composite work");
-                assert_eq!(planner_work, 60);
-                assert_eq!(complete_work, 1_163);
+                assert_eq!(planner_work, 39);
+                assert_eq!(complete_work, 1_145);
                 assert_eq!(
                     aggregate_single_plan_label("compile", report),
                     "compile-aggregate-continuation-program"
@@ -35340,12 +35389,13 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V147);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V148);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1"
+            "fre-current-aggregate-capture-v148-formal-unicode-ordered-many-continuation-literal-proof-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1"
         );
         assert!(current_identity.availability.contains(FRE_ADAPTER));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V147));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V146));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
         assert!(
@@ -35414,6 +35464,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         ));
         assert!(current_identity.availability.contains(
             "masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper"
+        ));
+        assert!(current_identity.identity.contains(
+            "formal-unicode-ordered-many-continuation-literal-proof-v1 authenticates the retained reverse-sequential ContinuationProgram"
+        ));
+        assert!(current_identity.availability.contains(
+            "Spans deliberately retains a continuation rather than an OrderedLiteral owner"
         ));
         assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION, 3);
@@ -36432,6 +36488,18 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_fixed_predicate_word64_covers_rebar_count_sum_compile_and_accounting() {
+        std::thread::Builder::new()
+            .name("current-fre-fixed-predicate-word64-accounting".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(
+                current_fre_fixed_predicate_word64_covers_rebar_count_sum_compile_and_accounting_inner,
+            )
+            .expect("spawn fixed-predicate Word64 accounting test")
+            .join()
+            .expect("fixed-predicate Word64 accounting test");
+    }
+
+    fn current_fre_fixed_predicate_word64_covers_rebar_count_sum_compile_and_accounting_inner() {
         let limits = RunLimits::default();
         let pattern = "Sherlock Holmes";
         let patterns = vec![pattern.to_string()];
@@ -36488,7 +36556,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, false, true, &limits),
             45,
-            "aggregate-continuation-program",
+            &format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-fixed-predicate-word64-{FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID}"
+            ),
         );
         assert_current_fre_execution(
             current_fre("compile", &patterns, haystack, false, true, &limits),
@@ -36711,6 +36781,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_fixed_predicate_word64_admits_general_ranges_and_every_reducer() {
+        std::thread::Builder::new()
+            .name("current-fre-fixed-predicate-word64-reducers".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_fixed_predicate_word64_admits_general_ranges_and_every_reducer_inner)
+            .expect("spawn fixed-predicate Word64 reducer test")
+            .join()
+            .expect("fixed-predicate Word64 reducer test");
+    }
+
+    fn current_fre_fixed_predicate_word64_admits_general_ranges_and_every_reducer_inner() {
         for (pattern, case_insensitive, expected_reducer) in [
             (
                 "[a-z]shing",
@@ -36797,7 +36877,10 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, false, false, &limits),
             24,
-            "aggregate-continuation-program",
+            &format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-fixed-predicate-word64-{}",
+                fre::FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID
+            ),
         );
         assert_current_fre_execution(
             current_fre("compile", &patterns, haystack, false, false, &limits),
@@ -37385,10 +37468,20 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_guarded_ascii_word_count_and_span_sum_route() {
+        std::thread::Builder::new()
+            .name("current-fre-guarded-ascii-word-route".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_guarded_ascii_word_count_and_span_sum_route_inner)
+            .expect("spawn guarded ASCII word route test")
+            .join()
+            .expect("guarded ASCII word route test");
+    }
+
+    fn current_fre_guarded_ascii_word_count_and_span_sum_route_inner() {
         let limits = RunLimits::default();
         for (model, expected) in [("count", 3), ("count-spans", 11)] {
             let expected_plan = if model == "count-spans" {
-                "aggregate-continuation-program"
+                "rebar-complete-spans-portable-find-v2-packed-literal-set-guarded-ascii-word-literal-set.fixed-column-dictionary.v4"
             } else {
                 "aggregate-guarded-ascii-word"
             };
@@ -37409,6 +37502,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_guarded_unicode_word_covers_i787_literal_and_optimized_shapes() {
+        std::thread::Builder::new()
+            .name("current-fre-guarded-unicode-word-route".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_guarded_unicode_word_covers_i787_literal_and_optimized_shapes_inner)
+            .expect("spawn guarded Unicode word route test")
+            .join()
+            .expect("guarded Unicode word route test");
+    }
+
+    fn current_fre_guarded_unicode_word_covers_i787_literal_and_optimized_shapes_inner() {
         const KEYWORDS: &str = "as\nbreak\nconst\ncontinue\ncrate\nelse\nenum\nextern\nfalse\nfn\nfor\nif\nimpl\nin\nlet\nloop\nmatch\nmod\nmove\nmut\npub\nref\nreturn\nself\nSelf\nstatic\nstruct\nsuper\ntrait\ntrue\ntype\nunsafe\nuse\nwhere\nwhile\nabstract\nbecome\nbox\ndo\nfinal\nmacro\noverride\npriv\ntypeof\nunsized\nvirtual\nyield\ntry\ni8\ni16\ni32\ni64\ni128\nisize\nu8\nu16\nu32\nu64\nu128\nusize\nbool\nchar\nstr\nf32\nf64";
         const OPTIMIZED: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";
         let literal = format!(r"\b({})\b", KEYWORDS.lines().collect::<Vec<_>>().join("|"));
@@ -37465,7 +37568,10 @@ agggtaa[cgt]|[acg]ttaccct 0
                     &limits,
                 ),
                 expected_span_sum,
-                "aggregate-continuation-program",
+                &format!(
+                    "{CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN}-{}",
+                    fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID
+                ),
             );
         }
     }
@@ -37517,6 +37623,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_unicode_finite_literals_use_the_packed_scanner() {
+        std::thread::Builder::new()
+            .name("current-fre-unicode-finite-packed-scanner".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_unicode_finite_literals_use_the_packed_scanner_inner)
+            .expect("spawn Unicode finite packed-scanner test")
+            .join()
+            .expect("Unicode finite packed-scanner test");
+    }
+
+    fn current_fre_unicode_finite_literals_use_the_packed_scanner_inner() {
         let limits = RunLimits::default();
         let haystack = "--∞--✓--∞--".as_bytes();
         assert_current_fre_execution(
@@ -37541,7 +37657,10 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &limits,
             ),
             9,
-            "aggregate-continuation-program",
+            &format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-packed-literal-set-{}",
+                fre_kernels::PACKED_LITERAL_SET_RUNTIME_IMPLEMENTATION_ID
+            ),
         );
     }
 
@@ -42676,6 +42795,18 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_routes_greedy_class_literal_tails_through_the_direct_visitor() {
+        std::thread::Builder::new()
+            .name("portable-complete-spans-greedy-class-literal-tail".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(
+                portable_complete_spans_routes_greedy_class_literal_tails_through_the_direct_visitor_inner,
+            )
+            .expect("spawn greedy class-literal-tail complete-spans test")
+            .join()
+            .expect("greedy class-literal-tail complete-spans test");
+    }
+
+    fn portable_complete_spans_routes_greedy_class_literal_tails_through_the_direct_visitor_inner() {
         let pattern = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*";
         let haystack = b"first ABCDEFGHIJKLMNOPQRSTUVWXYZ then ABCDEFGHIJKLMNOPQRSTUVWXYZ!\nnext ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -42703,7 +42834,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .session_with_limits(
                 haystack.len(),
                 &RunLimits {
-                    fre_search_work: 64,
+                    fre_search_work: 104,
                     ..RunLimits::default()
                 },
             )
@@ -42923,25 +43054,37 @@ agggtaa[cgt]|[acg]ttaccct 0
             ));
 
             let regex = current_fre_rebar_complete_spans_regex(pattern, unicode, false).unwrap();
-            let (plan_prefix, runtime_id, plan_kind) = if unicode {
-                (
-                    CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN,
-                    fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
-                    AggregatePlanKind::GuardedUnicodeWordLiteralSet,
-                )
-            } else {
-                (
-                    CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_ASCII_WORD_PLAN,
-                    guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
-                    AggregatePlanKind::GuardedAsciiWordDictionary,
-                )
-            };
-            assert_eq!(regex.plan(), format!("{plan_prefix}-{runtime_id}"));
+            if !unicode {
+                const RUNTIME_ID: &str =
+                    "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1";
+                assert_eq!(
+                    regex.plan(),
+                    "rebar-complete-spans-portable-find-v2-packed-literal-set-guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1"
+                );
+                assert_eq!(regex.runtime_implementation_id(), RUNTIME_ID);
+                let CurrentFreCompleteSpansRegexInner::Portable(portable) = &regex.inner else {
+                    panic!("ASCII guarded word set did not retain the portable owner");
+                };
+                assert_eq!(portable.build_report().plan, PlanKind::PackedLiteralSet);
+                let mut session = regex.session(haystack.len()).unwrap();
+                assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+                assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+                continue;
+            }
+
+            let runtime_id = fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID;
+            assert_eq!(
+                regex.plan(),
+                format!("{CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN}-{runtime_id}")
+            );
             assert_eq!(regex.runtime_implementation_id(), runtime_id);
             let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
                 panic!("guarded word visitor retained the portable fallback");
             };
-            assert_eq!(aggregate.build_report().plan, plan_kind);
+            assert_eq!(
+                aggregate.build_report().plan,
+                AggregatePlanKind::GuardedUnicodeWordLiteralSet
+            );
 
             let mut session = regex.session(haystack.len()).unwrap();
             let direct_limits = session.aggregate_limits.unwrap();
@@ -43616,7 +43759,7 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end() {
-        let nonempty = current_fre_rebar_complete_spans_regex("a", false, false).unwrap();
+        let nonempty = current_fre_rebar_complete_spans_regex("a|b", false, false).unwrap();
         let mut nonempty_session = nonempty.session(2).unwrap();
         assert_eq!(nonempty_session.limits.max_search_calls, 3);
         nonempty_session.limits.max_search_calls = 2;
@@ -43625,39 +43768,41 @@ agggtaa[cgt]|[acg]ttaccct 0
         nonempty_session.limits.max_search_calls = 3;
         assert_eq!(nonempty_session.execute(b"aa").unwrap(), 2);
 
-        let nullable = current_fre_rebar_complete_spans_regex("", false, false).unwrap();
+        let nullable = current_fre_rebar_complete_spans_regex("a*", false, true).unwrap();
         let mut nullable_session = nullable.session(2).unwrap();
         assert_eq!(nullable_session.limits.max_search_calls, 3);
         nullable_session.limits.max_search_calls = 2;
-        let error = nullable_session.execute(b"ab").unwrap_err();
+        let error = nullable_session.execute(b"bb").unwrap_err();
         assert!(error.0.contains("needs 3 search calls, exceeding 2"));
         nullable_session.limits.max_search_calls = 3;
-        assert_eq!(nullable_session.execute(b"ab").unwrap(), 0);
+        assert_eq!(nullable_session.execute(b"bb").unwrap(), 0);
     }
 
     #[test]
     fn portable_complete_spans_has_an_independent_bounded_resource_policy() {
         let regex = current_fre_rebar_complete_spans_regex("z", false, false).unwrap();
-        assert!(
-            regex
-                .plan()
-                .starts_with(CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX)
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-exact-literal-{}",
+                fre::LITERAL_SPAN_VISIT_OPERATION_ID
+            )
         );
         let haystack = vec![b'x'; 65_537];
         let mut policy = RunLimits {
             // The streamed route neither requests nor materializes an
             // AggregateSpans row log, so this unrelated cap is not inflated.
-            fre_aggregate_operation_work: 0,
+            fre_aggregate_log_bytes: 0,
             ..RunLimits::default()
         };
-        policy.reducer_steps = 1;
+        policy.reducer_steps = u64::try_from(haystack.len()).unwrap();
         let mut session = regex
             .session_with_limits(haystack.len(), &policy)
             .expect("streamed complete-spans policy");
         assert_eq!(session.limits.max_search_calls, haystack.len() + 1);
         assert_eq!(session.execute(&haystack).unwrap(), 0);
 
-        let nullable = current_fre_rebar_complete_spans_regex("", false, false).unwrap();
+        let nullable = current_fre_rebar_complete_spans_regex("a*", false, true).unwrap();
         let mut reducer_limited = nullable
             .session_with_limits(
                 2,
@@ -43667,7 +43812,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 },
             )
             .unwrap();
-        let error = reducer_limited.execute(b"ab").unwrap_err();
+        let error = reducer_limited.execute(b"bb").unwrap_err();
         assert!(error.0.contains("requires 3 reducer events, limit is 2"));
     }
 
@@ -43911,7 +44056,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_folded_policy_exact_boundary("Шерлок Холмс", 152_343_932, 1_570_556, 3);
         assert_folded_policy_exact_boundary(
             "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти",
-            449_179_016,
+            455_461_240,
             7_852_780,
             9,
         );
@@ -44224,7 +44369,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &limits,
             ),
             2,
-            "aggregate-many-ordered-literal",
+            "aggregate-many-continuation-program",
         );
     }
 
@@ -44251,39 +44396,70 @@ agggtaa[cgt]|[acg]ttaccct 0
                 "capture-many-ordered-literal",
             ),
         ] {
-            assert_current_fre_execution(
-                current_fre("count-captures", &patterns, haystack, false, false, &limits),
-                expected,
-                plan,
-            );
+            let reduction = fre_aggregate_many_capture_count(
+                CandidateRequest {
+                    model: "count-captures",
+                    patterns: &patterns,
+                    haystack,
+                    unicode: false,
+                    case_insensitive: false,
+                },
+                &limits,
+            )
+            .expect("generic ordered-many capture reduction");
+            assert_eq!(reduction.actual, expected);
+            assert_eq!(reduction.plan, plan);
         }
 
-        let captures = current_fre(
-            "count-captures",
-            &["(a)".to_string(), "b".to_string()],
-            b"ab",
-            false,
-            false,
+        let mixed_patterns = ["(a)".to_string(), "b".to_string()];
+        let captures = fre_aggregate_many_capture_count(
+            CandidateRequest {
+                model: "count-captures",
+                patterns: &mixed_patterns,
+                haystack: b"ab",
+                unicode: false,
+                case_insensitive: false,
+            },
             &limits,
         );
         assert!(
-            matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("lacks the uniform whole-match proof")),
+            matches!(captures, Err(ref error)
+                if error.status == Status::Unsupported
+                    && error.message.contains("lacks the uniform whole-match proof")),
             "mixed capture participation must remain typed unsupported: {captures:?}"
         );
 
         let mut bounded = limits;
         bounded.reducer_steps = 1;
-        let capture_limit = current_fre(
-            "count-captures",
-            &["(a+)".to_string(), "(a)".to_string()],
-            b"aa",
-            false,
-            false,
+        let bounded_patterns = ["(a+)".to_string(), "(a)".to_string()];
+        let capture_limit = fre_aggregate_many_capture_count(
+            CandidateRequest {
+                model: "count-captures",
+                patterns: &bounded_patterns,
+                haystack: b"aa",
+                unicode: false,
+                case_insensitive: false,
+            },
             &bounded,
         );
         assert!(
-            matches!(capture_limit, CandidateOutcome::Unsupported(ref reason) if reason.contains("CaptureEventsLimit")),
+            matches!(capture_limit, Err(ref error)
+                if error.status == Status::Unsupported
+                    && error.message.contains("CaptureEventsLimit")),
             "capture reducer limit must remain typed unsupported: {capture_limit:?}"
+        );
+
+        let formal = current_fre(
+            "count-captures",
+            &bounded_patterns,
+            b"aa",
+            false,
+            false,
+            &RunLimits::default(),
+        );
+        assert!(
+            matches!(formal, CandidateOutcome::Unsupported(ref reason) if reason.contains("requires one pattern")),
+            "formal multi-pattern capture reduction must remain typed unsupported: {formal:?}"
         );
 
         let identity_patterns = vec!["(a+)".to_string(), "(a)".to_string()];
@@ -44320,6 +44496,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_admits_byte_stable_hir_and_direct_root_unicode_classes() {
+        std::thread::Builder::new()
+            .name("current-fre-byte-stable-and-root-unicode".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_admits_byte_stable_hir_and_direct_root_unicode_classes_inner)
+            .expect("spawn byte-stable and root-Unicode route test")
+            .join()
+            .expect("byte-stable and root-Unicode route test");
+    }
+
+    fn current_fre_admits_byte_stable_hir_and_direct_root_unicode_classes_inner() {
         let limits = RunLimits::default();
         let empty = current_fre("count", &[String::new()], b"a", true, false, &limits);
         assert_current_fre_execution(empty, 2, "aggregate-continuation-program");
@@ -44378,7 +44564,8 @@ agggtaa[cgt]|[acg]ttaccct 0
             ),
             6,
             &format!(
-                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-packed-literal-set-packed-literal-set"
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-unicode-scalar-run-{}",
+                fre::UNICODE_SCALAR_RUN_SEARCH_PLAN_ID
             ),
         );
 
@@ -44420,12 +44607,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
     }
 
-    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "Rebar count and complete-spans share one exact observed-work admission fixture"
     )]
-    fn current_fre_value_and_complete_spans_reducers_use_exact_continuation_work() {
+    fn current_fre_value_and_complete_spans_reducers_use_exact_continuation_work_inner() {
         let pattern = r"(?:|a+|z{64}[q-r])";
         let patterns = [pattern.to_string()];
         let haystack = [b'a', 0xFF, b'a'];
@@ -44502,26 +44688,50 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(accounting.work < certificate.work_bound);
         assert_eq!(rebar_sum_match_bounds(&audited).unwrap(), 0);
 
-        exact = baseline_limits;
-        exact.fre_aggregate_operation_work = required_span_work;
-        assert_current_fre_execution(
-            current_fre("count-spans", &patterns, &haystack, false, false, &exact),
-            0,
-            "aggregate-continuation-program",
+        let exact_span_policy = RunLimits {
+            fre_aggregate_operation_work: required_span_work,
+            ..baseline_limits.clone()
+        };
+        let exact_span_limits = aggregate_run_limits(
+            haystack.len(),
+            spans.build_report(),
+            &exact_span_policy,
+        )
+        .unwrap();
+        assert_eq!(
+            rebar_sum_match_bounds(&spans.spans(&haystack, exact_span_limits).unwrap()).unwrap(),
+            0
         );
-        exact.fre_aggregate_operation_work -= 1;
-        let refused = current_fre("count-spans", &patterns, &haystack, false, false, &exact);
-        assert!(
-            matches!(refused, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ExecutionWork")
-                    && reason.contains(&format!("requires {required_span_work}"))
-                    && reason.contains(&format!("limit is {}", required_span_work - 1))),
-            "one-below complete-spans prospective work must remain typed unsupported: {refused:?}"
-        );
+
+        let one_below_policy = RunLimits {
+            fre_aggregate_operation_work: required_span_work - 1,
+            ..baseline_limits
+        };
+        let one_below_limits =
+            aggregate_run_limits(haystack.len(), spans.build_report(), &one_below_policy).unwrap();
+        let refused = spans.spans(&haystack, one_below_limits).unwrap_err();
+        assert!(matches!(
+            refused.source,
+            AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::ExecutionWork,
+                required,
+                limit,
+            }) if required == required_span_work && limit + 1 == required
+        ));
     }
 
     #[test]
-    fn unicode_word_prevalidation_exact_limits_execute_and_one_below_refuses() {
+    fn current_fre_value_and_complete_spans_reducers_use_exact_continuation_work() {
+        std::thread::Builder::new()
+            .name("exact-continuation-work".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_value_and_complete_spans_reducers_use_exact_continuation_work_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn unicode_word_prevalidation_exact_limits_execute_and_one_below_refuses_inner() {
         let pattern = r"\b";
         let patterns = [pattern.to_string()];
         let haystack = "δ".as_bytes();
@@ -44567,11 +44777,19 @@ agggtaa[cgt]|[acg]ttaccct 0
         let count_limits =
             count_run_limits_with_policy(haystack.len(), &count_regex, &RunLimits::default())
                 .expect("native Count limits");
-        let required_work = count_limits.continuation.max_work;
-        let required_sequential = count_limits.continuation.max_sequential_bytes;
+        let audited_count = count_regex.count(haystack, count_limits).unwrap();
+        let fre::AggregateExecutionDetails::Continuation {
+            accounting: count_accounting,
+            ..
+        } = audited_count.report().details()
+        else {
+            panic!("expected native Count continuation details");
+        };
+        let required_work = count_accounting.work;
+        let required_sequential = count_accounting.sequential_bytes_read;
         assert!(required_work <= verifier_required_work);
         assert!(required_sequential <= verifier_required_sequential);
-        assert_eq!(count_regex.count_value(haystack, &count_limits).unwrap(), 2);
+        assert_eq!(audited_count.value(), 2);
 
         let exact = RunLimits {
             fre_aggregate_operation_work: required_work,
@@ -44621,6 +44839,17 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn unicode_word_prevalidation_exact_limits_execute_and_one_below_refuses() {
+        std::thread::Builder::new()
+            .name("unicode-word-prevalidation-limits".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(unicode_word_prevalidation_exact_limits_execute_and_one_below_refuses_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn rebar_span_sum_dense_prefix_absent_suffix_fits_derived_limits() {
         // Exact shape and input construction from
         // opt/reverse-inner/no-quadratic-forward. The lifecycle derives the
@@ -44661,13 +44890,26 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_fixed_class_sandwich_covers_count_span_sum_and_compile() {
+        std::thread::Builder::new()
+            .name("current-fre-fixed-class-sandwich".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(current_fre_fixed_class_sandwich_covers_count_span_sum_and_compile_inner)
+            .expect("spawn fixed-class-sandwich test")
+            .join()
+            .expect("fixed-class-sandwich test");
+    }
+
+    fn current_fre_fixed_class_sandwich_covers_count_span_sum_and_compile_inner() {
         let limits = RunLimits::default();
-        let byte_pattern = vec![r"[a-q][^u-z]{13}x".to_string()];
+        let byte_pattern = vec![r"[a-q][^u-z]{63}x".to_string()];
         let mut byte_haystack = Vec::from(b"--".as_slice());
         byte_haystack.push(b'a');
-        byte_haystack.extend(core::iter::repeat_n(b'p', 13));
+        byte_haystack.extend(core::iter::repeat_n(b'p', 63));
         byte_haystack.push(b'x');
-        byte_haystack.extend_from_slice(b"--auuuuuuuuuuuuux");
+        byte_haystack.extend_from_slice(b"--");
+        byte_haystack.push(b'a');
+        byte_haystack.extend(core::iter::repeat_n(b'u', 63));
+        byte_haystack.push(b'x');
         assert_current_fre_execution(
             current_fre(
                 "count",
@@ -44689,8 +44931,8 @@ agggtaa[cgt]|[acg]ttaccct 0
                 false,
                 &limits,
             ),
-            15,
-            "aggregate-continuation-program",
+            65,
+            "rebar-complete-spans-portable-find-v2-k0-k0",
         );
         assert_current_fre_execution(
             current_fre(
@@ -44717,7 +44959,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &limits,
             ),
             2,
-            "aggregate-fixed-class-sandwich",
+            "aggregate-fixed-unicode-class-sequence-v1",
         );
         assert_current_fre_execution(
             current_fre(
@@ -44729,7 +44971,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &limits,
             ),
             18,
-            "aggregate-continuation-program",
+            "rebar-complete-spans-portable-find-v2-k0-k0",
         );
     }
 
@@ -45406,6 +45648,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn unicode_scalar_cursor_count_limits_use_the_complete_prospective_envelope() {
+        std::thread::Builder::new()
+            .name("unicode-scalar-cursor-count-limits".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(unicode_scalar_cursor_count_limits_use_the_complete_prospective_envelope_inner)
+            .expect("spawn Unicode scalar cursor Count limits test")
+            .join()
+            .expect("Unicode scalar cursor Count limits test");
+    }
+
+    fn unicode_scalar_cursor_count_limits_use_the_complete_prospective_envelope_inner() {
         let haystack = b"sparse--\xCE\xB1\xCE\xB2\xFF--tail";
         assert!(haystack.len() <= CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES);
         let patterns = [r"\p{Greek}+".to_owned()];
@@ -46719,14 +46971,17 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         let spans = sparse_ordered_literal_spans_operation_limits(10, build, &RunLimits::default())
             .unwrap();
-        assert_eq!(spans.max_transitions, 100);
+        assert_eq!(spans.max_transitions, 10);
         assert_eq!(spans.max_match_events, 10);
-        assert_eq!(spans.max_reducer_steps, 111);
+        assert_eq!(spans.max_reducer_steps, 32);
         assert_eq!(spans.max_ring_initializations, 0);
-        assert_eq!(spans.max_scratch_bytes, 0);
-        // 100 transitions + 200 lookups + 1,200 comparisons + 100
-        // failures + 111 reducer/emission steps.
-        assert_eq!(spans.max_total_work, 1_711);
+        assert_eq!(
+            spans.max_scratch_bytes,
+            RunLimits::default().fre_aggregate_scratch_bytes
+        );
+        // 10 transitions + 20 lookups + 120 comparisons + 10 failures
+        // + 32 reducer/emission steps + one fixed operation action.
+        assert_eq!(spans.max_total_work, 193);
     }
 
     #[test]
