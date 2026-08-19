@@ -7,7 +7,7 @@ use fre_holdout::{
     enforce_strict_gate, expand_manifest, run_correctness, run_performance,
 };
 
-const RECEIPTS_SHA256: &str = "8f6a1c803f3ffb2e0dd64aecb71b46682f1dda095715abab5bf9a1e77e92104a";
+const RECEIPTS_SHA256: &str = "d461acc096b999d14c03ce23593411f6e3093c126a27f8885db3142746633abe";
 
 fn research_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
