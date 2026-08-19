@@ -1762,6 +1762,9 @@ mod tests {
             "(A)((?-u:[C]){1,2})((?-u:[ab]){0,3})(?-u:([ab]))",
             "(?-u:[AQ])(?-u:[ab]){0,3}(?-u:[ab])",
             "(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])(?-u:[xy])?",
+            // regex-syntax erases the zero-width middle repetition, leaving
+            // two ordinary bounded byte-class runs.
+            "(?-u:[ab]){1,2}(?-u:[CD]){0}(?-u:[xy])",
             r"(?-u:\x01[\x30-\x40]{0,64}\x40)",
             r"\A(?-u:\x01[\x30-\x40]{0,64}\x40)",
             r"\A(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])(?-u:[xy])?",
@@ -1783,7 +1786,6 @@ mod tests {
             "(?-u:[ab])+(?-u:[cd]){1,4}",
             "(?-u:[ab]){2}(?-u:[cd]){2}",
             "(?-u:[ab])?(?-u:[CD]){1,2}(?-u:[xy])",
-            "(?-u:[ab]){1,2}(?-u:[CD]){0}(?-u:[xy])",
             "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Bb])",
             "A(?-u:[ab]){1,2}(?-u:[ab]){0,3}(?-u:[ab])",
             "A(?-u:[c]){1,2}(?-u:[ab]){0,3}(?-u:[b]){1,2}",
@@ -1900,8 +1902,8 @@ mod tests {
             "(?-u:[ab])(?-u:[cd]){1,2}(?-u:[cd])?(?-u:[cd])?",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
-            "(?-u:[W])(?-u:[Z])(?-u:[ab]){0,2}(?-u:[ab])",
-            "(?-u:[W])(?-u:[Z])(?-u:[ab]){0,2}(?-u:[bd])",
+            "(?-u:[W])(?-u:[Zc])(?-u:[ab]){0,2}(?-u:[ab])",
+            "(?-u:[W])(?-u:[Zc])(?-u:[ab]){0,2}(?-u:[bd])",
             "(?-u:[W])(?-u:[Zc]){1,2}(?-u:[ab]){0,2}(?-u:[ab])",
             "(?-u:[W])(?-u:[ab]){0,2}(?-u:[ab])",
             "(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])",
@@ -2220,7 +2222,7 @@ mod tests {
 
     #[test]
     fn sealed_overlap_corridor_uses_earliest_and_greedy_backtracking_splits() {
-        let pattern = "A(?-u:[C])(?-u:[B]){0,3}(?-u:[B])(?-u:[xy])?";
+        let pattern = "A(?-u:[CD])(?-u:[B]){0,3}(?-u:[B])(?-u:[xy])?";
         let regex = build(pattern);
         assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
         let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
@@ -2277,7 +2279,7 @@ mod tests {
         }
 
         let partial = build(
-            "(?-u:[Q])(?-u:[C])(?-u:[ab]){0,3}(?-u:[bd])(?-u:[xy])?",
+            "(?-u:[Q])(?-u:[CD])(?-u:[ab]){0,3}(?-u:[bd])(?-u:[xy])?",
         );
         assert_eq!(partial.runtime_implementation_id(), PLAN_ID);
         assert_eq!(

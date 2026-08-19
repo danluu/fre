@@ -908,7 +908,7 @@ mod tests {
             assert_eq!(inspection.generalized_search, generalized, "{pattern:?}");
         }
 
-        let parsed = hir(r"x[^|][^|]*y");
+        let parsed = hir(r"x[^xy][^xy]*y");
         let InspectionOutcome::Eligible(exact) = inspect(&parsed, usize::MAX).unwrap() else {
             panic!("expected exact adjacent-class eligibility");
         };

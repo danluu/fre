@@ -585,12 +585,14 @@ fn find_first_unicode_word(
 ) -> Result<Option<(usize, usize)>, Error> {
     let mut units = UnicodeUnits::new(start, end);
     let mut run_start = None;
+    let mut run_start_is_boundary = false;
     let mut run_scalars = 0_usize;
     while let Some(unit) = units.next(haystack, meter)? {
         meter.transition()?;
         if unit.is_word {
             if run_start.is_none() {
                 run_start = Some(unit.start);
+                run_start_is_boundary = unit.is_boundary;
             }
             run_scalars = run_scalars
                 .checked_add(1)
@@ -598,14 +600,15 @@ fn find_first_unicode_word(
                     computation: "Unicode run scalar count",
                 })?;
         } else if let Some(selected_start) = run_start.take() {
-            if run_scalars >= minimum_scalars {
+            if run_start_is_boundary && unit.is_boundary && run_scalars >= minimum_scalars {
                 return Ok(Some((selected_start, unit.start)));
             }
             run_scalars = 0;
+            run_start_is_boundary = false;
         }
     }
     Ok(run_start
-        .filter(|_| run_scalars >= minimum_scalars)
+        .filter(|_| run_start_is_boundary && run_scalars >= minimum_scalars)
         .map(|selected_start| (selected_start, end)))
 }
 
@@ -613,6 +616,7 @@ fn find_first_unicode_word(
 struct Unit {
     start: usize,
     is_word: bool,
+    is_boundary: bool,
 }
 
 /// Streaming UTF-8 decoder with a four-byte fixed pushback queue.
@@ -627,6 +631,8 @@ struct UnicodeUnits {
     pending: [u8; 4],
     pending_len: usize,
     pending_start: usize,
+    history: [u8; 4],
+    history_len: usize,
 }
 
 impl UnicodeUnits {
@@ -637,6 +643,8 @@ impl UnicodeUnits {
             pending: [0; 4],
             pending_len: 0,
             pending_start: start,
+            history: [0; 4],
+            history_len: 0,
         }
     }
 
@@ -649,11 +657,13 @@ impl UnicodeUnits {
         }
 
         let start = self.pending_start;
+        let word_before = self.reverse_word_context()?;
         let Some(width) = utf8_width(self.pending[0]) else {
             self.drop_prefix(1)?;
             return Ok(Some(Unit {
                 start,
                 is_word: false,
+                is_boundary: word_before,
             }));
         };
         while self.pending_len < width && self.cursor < self.end {
@@ -669,13 +679,43 @@ impl UnicodeUnits {
             return Ok(Some(Unit {
                 start,
                 is_word: false,
+                is_boundary: word_before,
             }));
         };
+        let is_word = is_unicode_word(scalar)?;
         self.drop_prefix(width)?;
         Ok(Some(Unit {
             start,
-            is_word: is_unicode_word(scalar)?,
+            is_word,
+            is_boundary: word_before != is_word,
         }))
+    }
+
+    fn reverse_word_context(&self) -> Result<bool, Error> {
+        if self.history_len == 0 {
+            return Ok(false);
+        }
+        let mut start = self.history_len.saturating_sub(1);
+        let lower = self.history_len.saturating_sub(4);
+        while start > lower && matches!(self.history[start], 0x80..=0xBF) {
+            start = start.saturating_sub(1);
+        }
+        let Some(width) = utf8_width(self.history[start]) else {
+            return Ok(false);
+        };
+        let Some(end) = start.checked_add(width) else {
+            return Ok(false);
+        };
+        let Some(bytes) = self.history.get(start..end) else {
+            return Ok(false);
+        };
+        let Some(scalar) = core::str::from_utf8(bytes)
+            .ok()
+            .and_then(|valid| valid.chars().next())
+        else {
+            return Ok(false);
+        };
+        is_unicode_word(scalar)
     }
 
     fn read_one(&mut self, haystack: &[u8], meter: &mut Meter) -> Result<(), Error> {
@@ -707,6 +747,9 @@ impl UnicodeUnits {
                 detail: "Unicode decoder dropped an invalid queue prefix",
             });
         }
+        for index in 0..width {
+            self.push_history(self.pending[index]);
+        }
         self.pending.copy_within(width..self.pending_len, 0);
         self.pending_len =
             self.pending_len
@@ -724,6 +767,17 @@ impl UnicodeUnits {
             self.pending_start = self.cursor;
         }
         Ok(())
+    }
+
+    fn push_history(&mut self, byte: u8) {
+        if self.history_len < self.history.len() {
+            self.history[self.history_len] = byte;
+            self.history_len = self.history_len.saturating_add(1);
+        } else {
+            self.history.copy_within(1.., 0);
+            let last = self.history.len().saturating_sub(1);
+            self.history[last] = byte;
+        }
     }
 }
 

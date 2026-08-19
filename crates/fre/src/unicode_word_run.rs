@@ -728,40 +728,76 @@ impl Plan {
         if haystack.len() < minimum_scalars {
             return false;
         }
+        let complete_word_boundaries = self.has_complete_word_boundaries();
         let mut run_scalars = 0_usize;
+        let mut run_start_is_boundary = false;
         let mut position = 0_usize;
         while position < haystack.len() {
             let byte = haystack[position];
             if byte.is_ascii() {
                 if is_ascii_word(byte) {
+                    if run_scalars == 0 {
+                        run_start_is_boundary = !complete_word_boundaries
+                            || unicode_word_boundary_before(haystack, position);
+                    }
                     run_scalars += 1;
-                    if run_scalars >= minimum_scalars {
+                    if !complete_word_boundaries && run_scalars >= minimum_scalars {
                         return true;
                     }
                 } else {
+                    if complete_word_boundaries
+                        && run_start_is_boundary
+                        && run_scalars >= minimum_scalars
+                    {
+                        return true;
+                    }
                     run_scalars = 0;
+                    run_start_is_boundary = false;
                 }
                 position += 1;
                 continue;
             }
 
             let Some((scalar, width)) = decode_first(&haystack[position..]) else {
-                // Invalid UTF-8 is exact non-word context for this plan.
+                // A malformed byte is non-word right context, so it may close
+                // the preceding valid run. The reverse boundary decoder below
+                // determines the exact context seen by a following run.
+                if complete_word_boundaries
+                    && run_start_is_boundary
+                    && run_scalars >= minimum_scalars
+                {
+                    return true;
+                }
                 run_scalars = 0;
+                run_start_is_boundary = false;
                 position += 1;
                 continue;
             };
             if is_unicode_word(scalar) {
+                if run_scalars == 0 {
+                    run_start_is_boundary = !complete_word_boundaries
+                        || unicode_word_boundary_before(haystack, position);
+                }
                 run_scalars += 1;
-                if run_scalars >= minimum_scalars {
+                if !complete_word_boundaries && run_scalars >= minimum_scalars {
                     return true;
                 }
             } else {
+                if complete_word_boundaries
+                    && run_start_is_boundary
+                    && run_scalars >= minimum_scalars
+                {
+                    return true;
+                }
                 run_scalars = 0;
+                run_start_is_boundary = false;
             }
             position += width;
         }
-        false
+        complete_word_boundaries
+            && run_start_is_boundary
+            && run_scalars >= minimum_scalars
+            && unicode_word_boundary_after(haystack, position)
     }
 
     const fn minimum_match_units(self) -> usize {
@@ -1230,12 +1266,23 @@ impl Plan {
         let mut position = 0_usize;
         let mut run_start = 0_usize;
         let mut run_scalars = 0_usize;
+        let mut run_start_is_boundary = true;
+        let complete_unicode_word_boundaries = matches!(
+            self,
+            Self::Word {
+                mode: WordMode::Unicode,
+                topology: WordRunTopology::CompleteWordBoundaries,
+                ..
+            }
+        );
+        let mut reverse_word_context = ReverseUnicodeWordContext::default();
         while position < haystack.len() {
+            let first_byte = haystack[position];
             let (admitted, width) = match self {
                 Self::Word {
                     mode: WordMode::Ascii,
                     ..
-                } => (is_ascii_word(haystack[position]), 1),
+                } => (is_ascii_word(first_byte), 1),
                 Self::Word {
                     mode: WordMode::Unicode,
                     ..
@@ -1243,15 +1290,17 @@ impl Plan {
                     (is_unicode_word(scalar), width)
                 }),
                 Self::FixedClassChunks { class_words, .. } => {
-                    (class_contains(class_words, haystack[position]), 1)
+                    (class_contains(class_words, first_byte), 1)
                 }
             };
+            let word_before = complete_unicode_word_boundaries && reverse_word_context.is_word();
             actual.source_reads = checked_add(actual.source_reads, width, "actual source reads")?;
             actual.units = checked_add(actual.units, 1, "actual decoded units")?;
             actual.work = checked_add(actual.work, UNIT_WORK, "actual unit work")?;
             if admitted {
                 if run_scalars == 0 {
                     run_start = position;
+                    run_start_is_boundary = !word_before;
                 }
                 run_scalars = checked_add(run_scalars, 1, "actual admitted-run unit length")?;
             } else if run_scalars != 0 {
@@ -1259,10 +1308,16 @@ impl Plan {
                     run_start,
                     position,
                     run_scalars,
+                    run_start_is_boundary
+                        && (!complete_unicode_word_boundaries || word_before),
                     operation,
                     &mut actual,
                 )?;
                 run_scalars = 0;
+                run_start_is_boundary = true;
+            }
+            if complete_unicode_word_boundaries {
+                reverse_word_context.consume(first_byte, width, admitted);
             }
             position = checked_add(position, width, "actual input cursor")?;
         }
@@ -1271,6 +1326,7 @@ impl Plan {
                 run_start,
                 haystack.len(),
                 run_scalars,
+                run_start_is_boundary,
                 operation,
                 &mut actual,
             )?;
@@ -1317,7 +1373,7 @@ impl Plan {
             }
             aggregate_charge_units(&mut actual, run)?;
             let end = checked_add(position, run, "actual ASCII run boundary")?;
-            self.aggregate_finish_run(position, end, run, operation, &mut actual)?;
+            self.aggregate_finish_run(position, end, run, true, operation, &mut actual)?;
             position = end;
         }
         verify_aggregate_actual(actual, upper)?;
@@ -1491,6 +1547,7 @@ impl Plan {
         start: usize,
         end: usize,
         scalars: usize,
+        boundaries_admitted: bool,
         operation: AggregateOperation,
         actual: &mut AggregateReduceActual,
     ) -> Result<(), AggregateReduceError> {
@@ -1503,7 +1560,7 @@ impl Plan {
             } => 2,
             Self::Word {
                 minimum_scalars, ..
-            } => usize::from(scalars >= minimum_scalars),
+            } => usize::from(boundaries_admitted && scalars >= minimum_scalars),
             Self::FixedClassChunks { chunk_bytes, .. } => scalars.checked_div(chunk_bytes).ok_or(
                 AggregateReduceError::ArithmeticOverflow {
                     computation: "admitted run divided by fixed chunk width",
@@ -1746,7 +1803,8 @@ impl Plan {
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
             if !is_unicode_word(scalar)
-                || (complete_word_boundaries && unicode_word_before(haystack, position))
+                || (complete_word_boundaries
+                    && !unicode_word_boundary_before(haystack, position))
             {
                 position = position
                     .checked_add(width)
@@ -1785,7 +1843,8 @@ impl Plan {
                     })?;
             }
             if count >= minimum_scalars
-                && (!complete_word_boundaries || !unicode_word_after(haystack, position))
+                && (!complete_word_boundaries
+                    || unicode_word_boundary_after(haystack, position))
             {
                 return Ok((
                     Some(Match {
@@ -2282,12 +2341,45 @@ fn aggregate_charge_units(
     Ok(())
 }
 
-fn unicode_word_before(haystack: &[u8], position: usize) -> bool {
-    decode_last(&haystack[..position]).is_some_and(|(scalar, _)| is_unicode_word(scalar))
+/// Reverse Unicode-word context retained from bytes already charged to the
+/// aggregate scan. This mirrors regex-automata's reverse decoder without
+/// rereading the source: up to three stray continuation bytes still expose
+/// the nearest preceding scalar, while four or more hide its leader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReverseUnicodeWordContext {
+    leader_is_word: bool,
+    trailing_continuations: u8,
 }
 
-fn unicode_word_after(haystack: &[u8], position: usize) -> bool {
-    decode_first(&haystack[position..]).is_some_and(|(scalar, _)| is_unicode_word(scalar))
+impl ReverseUnicodeWordContext {
+    const fn is_word(self) -> bool {
+        self.leader_is_word && self.trailing_continuations <= 3
+    }
+
+    fn consume(&mut self, first_byte: u8, width: usize, is_word: bool) {
+        if width > 1 {
+            self.leader_is_word = is_word;
+            self.trailing_continuations =
+                u8::try_from(width.saturating_sub(1).min(4)).unwrap_or(4);
+        } else if matches!(first_byte, 0x80..=0xBF) {
+            self.trailing_continuations = self.trailing_continuations.saturating_add(1).min(4);
+        } else {
+            self.leader_is_word = is_word;
+            self.trailing_continuations = 0;
+        }
+    }
+}
+
+fn unicode_word_boundary_before(haystack: &[u8], position: usize) -> bool {
+    position == 0
+        || decode_last(&haystack[..position])
+            .is_none_or(|(scalar, _)| !is_unicode_word(scalar))
+}
+
+fn unicode_word_boundary_after(haystack: &[u8], position: usize) -> bool {
+    position == haystack.len()
+        || decode_first(&haystack[position..])
+            .is_none_or(|(scalar, _)| !is_unicode_word(scalar))
 }
 
 fn is_ascii_word(byte: u8) -> bool {
@@ -2332,8 +2424,12 @@ fn decode_last(bytes: &[u8]) -> Option<(char, usize)> {
     while start > lower && matches!(bytes[start], 0x80..=0xBF) {
         start = start.checked_sub(1)?;
     }
-    let (scalar, width) = decode_first(&bytes[start..])?;
-    (start.checked_add(width) == Some(bytes.len())).then_some((scalar, width))
+    // Match regex-automata's reverse context decoder: once the nearest
+    // leading-or-invalid byte is found, classify the code point beginning
+    // there. In particular, an ASCII word byte followed by a stray
+    // continuation byte remains the reverse word context at the next
+    // position, even though the whole suffix is not valid UTF-8.
+    decode_first(&bytes[start..])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2501,9 +2597,9 @@ mod tests {
         words
     }
 
-    fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
+    fn oracle_with_unicode(pattern: &str, haystack: &[u8], unicode: bool) -> (u64, u64) {
         let regex = RegexBuilder::new(pattern)
-            .unicode(false)
+            .unicode(unicode)
             .build()
             .expect("oracle pattern");
         regex
@@ -2528,8 +2624,21 @@ mod tests {
             })
     }
 
+    fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
+        oracle_with_unicode(pattern, haystack, false)
+    }
+
     fn assert_plan_matches(pattern: &str, plan: Plan, haystack: &[u8]) {
-        let expected = oracle(pattern, haystack);
+        assert_plan_matches_with_unicode(pattern, plan, haystack, false);
+    }
+
+    fn assert_plan_matches_with_unicode(
+        pattern: &str,
+        plan: Plan,
+        haystack: &[u8],
+        unicode: bool,
+    ) {
+        let expected = oracle_with_unicode(pattern, haystack, unicode);
         let counted = plan
             .aggregate_count(haystack, AggregateReduceLimits::unlimited())
             .expect("count");
@@ -2842,6 +2951,10 @@ mod tests {
             "abcdefghijklmnopqrstuvwx\u{e9}".as_bytes().to_vec(),
             "αβγδεζηθικλμνξοπρστυφχψωα".as_bytes().to_vec(),
             [vec![b'a'; 13], vec![0xff], vec![b'a'; 13]].concat(),
+            b"a\x80aa".to_vec(),
+            b"!\x80aa".to_vec(),
+            vec![b'a', 0x80, 0x80, 0x80, b'a', b'a'],
+            vec![b'a', 0x80, 0x80, 0x80, 0x80, b'a', b'a'],
             vec![0x80, 0xbf, 0xc2, b'a', 0xe2, 0x82, b'_', 0xf4, 0x90, 0x80, 0x80],
         ];
         // This dense short-word input is hostile to the former two-loop
@@ -2870,6 +2983,7 @@ mod tests {
                         oracle.is_match(haystack),
                         "pattern={pattern:?} haystack={haystack:?}",
                     );
+                    assert_plan_matches_with_unicode(&pattern, plan, haystack, true);
                 }
 
                 // Exhaust short arbitrary byte strings containing ASCII word

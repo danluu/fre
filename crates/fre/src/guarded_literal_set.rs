@@ -4167,7 +4167,9 @@ mod tests {
             .min(WIDE_CORRELATED_SAMPLE_BYTES)
             * (WIDE_PACKED_PREFIX_BYTES + 3);
         let secondary_work = upper.anchor_positions * WIDE_SECONDARY_COLUMN_LIMIT;
-        let threshold = upper.total_work + packed_work + sample_work + secondary_work;
+        let boundary_work = upper.anchor_positions * WIDE_CORRELATED_BOUNDARY_COLUMNS;
+        let threshold =
+            upper.total_work + packed_work + sample_work + secondary_work + boundary_work;
         let limits = |work: usize| SearchLimits {
             max_work: u64::try_from(work).unwrap(),
             max_scratch_bytes: 0,
@@ -4641,7 +4643,7 @@ mod tests {
 
     #[test]
     fn wide_packed_build_limits_close_exactly() {
-        let words: &[&[u8]] = &[b"ax", b"cy", b"f2", b"j5"];
+        let words: &[&[u8]] = &[b"ax0", b"cy1", b"f2A", b"j5B"];
         let dictionary = dictionary_with_guards(words, Guard::LeftBoundary, Guard::RightBoundary);
         let dictionary_work =
             usize::try_from(dictionary.build_accounting().actual.build_work).unwrap();
@@ -4661,6 +4663,13 @@ mod tests {
             .expect("the four-column language needs a wide anchor")
             .packed
             .build_accounting();
+        assert!(
+            probe
+                .wide_anchor
+                .as_ref()
+                .is_some_and(|wide| wide.correlated_columns.is_none()),
+            "the mandatory-wide limit fixture must not retain the optional correlated sidecar",
+        );
         let patterns = words.len();
         let minimum_word_bytes = words.iter().map(|word| word.len()).min().unwrap();
         let fixed_selection = patterns

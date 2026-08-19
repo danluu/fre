@@ -182,10 +182,10 @@ mod compile_accounting_layout_tests {
     use super::CompileAccounting;
 
     #[test]
-    fn scalar_sharing_preserves_legacy_compile_accounting_layout() {
-        // 50 `usize` fields, two `Option<usize>` fields and four byte fields,
+    fn url_only_compile_owner_has_exact_compile_accounting_layout() {
+        // 51 `usize` fields, two `Option<usize>` fields and four byte fields,
         // rounded to the eight-byte aggregate alignment.
-        assert_eq!(core::mem::size_of::<CompileAccounting>(), 440);
+        assert_eq!(core::mem::size_of::<CompileAccounting>(), 448);
         assert_eq!(core::mem::align_of::<CompileAccounting>(), 8);
     }
 }

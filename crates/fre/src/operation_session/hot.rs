@@ -1669,6 +1669,7 @@ fn byte_program_descriptors_reject_empty_atoms_and_zero_plan_identity() {
 }
 
 #[test]
+#[ignore = "run alone: stats_alloc observes allocations from every concurrent test thread"]
 #[allow(
     clippy::too_many_lines,
     reason = "the allocation and doubling assertions share one serialized allocator region"

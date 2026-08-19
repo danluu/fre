@@ -26440,7 +26440,7 @@ mod tests {
 
     #[test]
     fn k0_packed_frontier_sidecar_training_never_invents_comparable_work() {
-        let regex = PortableBuilder::new(r"(?-u:[abcd](?:ef|gh)[ijkl][mnop]*)")
+        let regex = PortableBuilder::new(r"(?-u:.[abcd](?:efi|ghj|klk|qrl)[mnop]*)")
             .unicode(false)
             .plan_selection(PlanSelection::Auto)
             .build()
@@ -26543,13 +26543,11 @@ mod tests {
 
     #[test]
     fn k0_packed_frontier_proved_reverse_inner_win_retains_direct_epoch() {
-        let regex = PortableBuilder::new(
-            r"(?-u:[abcd](?:ef|gh)[ijkl][mnop]*\b)",
-        )
-        .unicode(false)
-        .plan_selection(PlanSelection::Auto)
-        .build()
-        .expect("packed reverse-inner win fixture builds");
+        let regex = PortableBuilder::new(r"(?-u:.[abcd](?:efi|ghj|klk|qrl)[mnop]*\b)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("packed reverse-inner win fixture builds");
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("focused fixture lost K0");
         };
@@ -26894,11 +26892,16 @@ mod tests {
 
     #[test]
     fn k0_packed_frontier_residual_error_preserves_all_route_states() {
-        let regex = PortableBuilder::new(r"(?-u:[abcd](?:ef|gh)[ijkl][mnop]*)")
+        let regex = PortableBuilder::new(r"(?-u:.[abcd](?:efi|ghj|klk|qrl)[mnop]*)")
             .unicode(false)
             .plan_selection(PlanSelection::Auto)
             .build()
             .expect("packed residual-error fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("focused residual-error fixture lost K0");
+        };
+        assert!(plan.packed_frontier().is_some());
+        assert!(plan.reverse_inner.is_some());
         let mut haystack = vec![b'!'; 4_096];
         haystack[3_000..3_004].copy_from_slice(b"aefi");
         let window = SearchWindow::full(&haystack);
@@ -27555,6 +27558,17 @@ mod tests {
             automaton: Automaton,
             exclusive: super::K0ExclusivePlan,
             reverse_inner: Option<Box<super::k0_general_reverse_inner::Plan>>,
+            anchored_scalar_corridor_exists:
+                Option<super::k0_anchored_scalar_corridor_exists::Plan>,
+            bounded_delimited_exists: Option<super::k0_bounded_delimited_exists::Plan>,
+            class_delimiter_exists: Option<super::k0_class_delimiter_exists::Plan>,
+            literal_prefix_class_exists: Option<super::k0_literal_prefix_class_exists::Plan>,
+            uri_exists: Option<super::k0_uri_exists::Plan>,
+            lazy_delimited_repeat: Option<super::lazy_delimited_repeat::Plan>,
+            greedy_class_literal_tail: Option<super::greedy_class_literal_tail::Plan>,
+            greedy_delimited_corridor: Option<Box<super::greedy_delimited_corridor::Plan>>,
+            unicode_token_phrase: Option<super::unicode_token_phrase::Plan>,
+            k0_casefold_prefix_class_span: Option<super::k0_casefold_prefix_class_span::Plan>,
             mandatory_suffix: Option<K0MandatorySuffixPlan>,
             mandatory_cut: Option<K0MandatoryCutPlan>,
             negative_prefilter: Option<Box<super::K0NegativePrefilterPlan>>,
@@ -34012,7 +34026,7 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_route_enforces_exact_build_and_search_boundaries() {
-        let pattern = r"QZ[01]{0,64}aa";
+        let pattern = r"aa[01]{0,64}QZ";
         let baseline = PortableBuilder::new(pattern)
             .unicode(false)
             .build()
@@ -34104,11 +34118,11 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_sessions_retain_no_cross_plan_or_same_address_state() {
-        let first = PortableBuilder::new(r"QZ[01]{0,64}aa")
+        let first = PortableBuilder::new(r"aa[01]{0,64}QZ")
             .unicode(false)
             .build()
             .unwrap();
-        let second = PortableBuilder::new(r"QZ[23]{1,64}aa")
+        let second = PortableBuilder::new(r"aa[23]{1,64}QZ")
             .unicode(false)
             .build()
             .unwrap();
@@ -34126,7 +34140,7 @@ mod tests {
         let mut second_session = second
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
-        let mut same_allocation = b"--QZ01aa--".to_vec();
+        let mut same_allocation = b"--aa01QZ--".to_vec();
         assert_eq!(
             first_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
@@ -34134,7 +34148,7 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 8))
         );
-        same_allocation.copy_from_slice(b"--QZ23aa--");
+        same_allocation.copy_from_slice(b"--aa23QZ--");
         assert_eq!(
             second_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
@@ -34148,7 +34162,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        same_allocation.copy_from_slice(b"--QZ00aa--");
+        same_allocation.copy_from_slice(b"--aa00QZ--");
         assert_eq!(
             first_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
@@ -34162,12 +34176,12 @@ mod tests {
     fn finite_two_barrier_exists_routes_share_limits_in_native_sessions() {
         for (pattern, haystack) in [
             (
-                r"QZ[0-9]{0,64}aa",
-                b"--QZ12aa".as_slice(),
+                r"aa[0-4]{0,64}QZ",
+                b"--aa12QZ".as_slice(),
             ),
             (
-                r"aa[0-9]{0,64}QZ",
-                b"--aa12QZ".as_slice(),
+                r"aa[5-9]{0,64}QZ",
+                b"--aa67QZ".as_slice(),
             ),
         ] {
             let regex = PortableBuilder::new(pattern)
@@ -34384,8 +34398,11 @@ mod tests {
                 session: fre_automata::K0SearchSession<'a>,
                 aggregate_setup: super::SearchSessionSetupAccounting,
                 k0_plan: &'a super::PortableK0Plan,
+                line_total_grep_plan: Option<super::line_total_grep::Plan>,
                 reverse_inner:
                     Option<Box<super::k0_general_reverse_inner::SearchSession<'a>>>,
+                lazy_delimited_repeat: Option<&'a super::lazy_delimited_repeat::Plan>,
+                greedy_class_literal_tail: Option<&'a super::greedy_class_literal_tail::Plan>,
                 mandatory_suffix: Option<&'a super::K0MandatorySuffixPlan>,
                 mandatory_cut: Option<&'a super::K0MandatoryCutPlan>,
                 negative_prefilter: Option<&'a super::K0NegativePrefilterPlan>,
