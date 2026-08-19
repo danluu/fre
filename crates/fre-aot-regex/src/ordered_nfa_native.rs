@@ -197,8 +197,10 @@ pub(crate) const MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES: usize = 64;
 /// universal retained sidecar. These fixed ceilings cover the two motivating
 /// Rebar graphs while bounding compiler work and target-code growth before an
 /// assembler allocates the candidate entry.
-pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS: usize = 256;
-pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS: usize = 512;
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS: usize =
+    fre_automata::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS;
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS: usize =
+    fre_automata::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS;
 
 /// Exact immutable object-wire descriptor extent. All table locations are
 /// descriptor-relative little-endian `u32` offsets, so the image contains no

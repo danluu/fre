@@ -37,6 +37,8 @@ pub use contract::{
     OutputContract, SearchAccounting, SearchReport, SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
 pub use epsilon_closure_dispatch::{
+    COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS,
+    COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS,
     EpsilonClosureDispatchAllocationError, NativeEpsilonClosureAction,
     NativeEpsilonClosureInstruction, NativeEpsilonClosureProgramView,
 };

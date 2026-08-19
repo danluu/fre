@@ -35910,7 +35910,7 @@ mod tests {
         ROOT_RUN_WINDOW_BYTES, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
-        epsilon_closure_dispatch::EpsilonClosureDispatch,
+        epsilon_closure_dispatch::{EpsilonClosureDispatch, EpsilonClosureStartProgram},
         ordered_edge_dispatch::OrderedEdgeDispatch,
         plan::{
             ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
@@ -52698,6 +52698,11 @@ mod tests {
             "the epsilon-closure dispatch owner must remain one optional pointer"
         );
         assert_eq!(
+            size_of::<Option<EpsilonClosureStartProgram>>(),
+            size_of::<usize>(),
+            "the compiler-private start closure owner must remain one optional pointer"
+        );
+        assert_eq!(
             size_of::<Option<OrderedEdgeDispatch>>(),
             size_of::<usize>(),
             "the ordered-edge dispatch owner must remain one optional pointer"
@@ -52717,7 +52722,7 @@ mod tests {
             assert!(
                 size_of::<Automaton>()
                     <= 192
-                        + size_of::<usize>() * 2
+                        + size_of::<usize>() * 3
                         + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
                         + size_of::<std::sync::OnceLock<Box<std::sync::Mutex<Option<K0Workspace>>>>>(
                         )
@@ -52732,7 +52737,7 @@ mod tests {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
             assert_eq!(
                 size_of::<Automaton>(),
-                448 + size_of::<usize>() * 2
+                448 + size_of::<usize>() * 3
                     + size_of::<std::sync::OnceLock<Box<std::sync::Mutex<Option<K0Workspace>>>>>()
             );
             #[cfg(feature = "static-dispatch")]

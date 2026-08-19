@@ -70,6 +70,29 @@ const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROGRAM_EXPANSION_FACTOR: usize = 4;
 const MAX_RETAINED_TO_GRAPH_FACTOR: usize = 2;
 
+/// Maximum instruction count retained by the compiler-private start-only
+/// closure fallback.
+///
+/// This is native-lowering policy, not part of the portable K0 or wire
+/// contract. The exported value lets native artifact accounting use the same
+/// authority as canonical derivation instead of duplicating the ceiling.
+#[doc(hidden)]
+pub const COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS: usize = 256;
+
+/// Maximum Split-edge count accepted while deriving the compiler-private
+/// start-only closure fallback.
+#[doc(hidden)]
+pub const COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS: usize = 512;
+
+// One count pass charges every instruction and traversed Split edge. Emission
+// then visits every retained instruction once. The canonical tree identity
+// `instructions == edge_visits + 1` therefore bounds accepted work by
+// `(256 + 255) + 256 == 767`. Keep this authority additive to the unchanged
+// all-root derivation ceiling: a Full decline may consume its complete old
+// budget before this small, independent native-only attempt begins.
+const COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_DERIVATION_WORK: usize =
+    COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS * 3 - 1;
+
 // A one-edge split merely exchanges one scalar loop iteration for one program
 // instruction.  Two zero-width edges are the smallest closure for which the
 // program removes multiple target/kind loads and stack operations.
@@ -455,6 +478,33 @@ struct EpsilonClosureDispatchData {
     eliminated_edge_visits: usize,
 }
 
+/// One compiler-private start-root program retained independently of the
+/// portable all-root dispatch.
+///
+/// Keeping this owner in a distinct [`Automaton`](crate::Automaton) pointer is
+/// intentional: ordinary K0 continues to observe a null Full-dispatch option
+/// and pays no tag/filter branch when only native text can use this program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct EpsilonClosureStartProgram(Box<[EpsilonClosureStartProgramData; 1]>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum EpsilonClosureStartProgramKind {
+    Plain,
+    Guarded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EpsilonClosureStartProgramData {
+    // An explicit discriminator prevents an empty or unexpectedly populated
+    // inactive arena from changing which packed representation is decoded.
+    kind: EpsilonClosureStartProgramKind,
+    instructions: Box<[ClosureInstruction]>,
+    guarded_instructions: Box<[GuardedClosureInstruction]>,
+    retained_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProgramShape {
     instructions: usize,
@@ -828,6 +878,206 @@ impl EpsilonClosureDispatch {
     }
 }
 
+impl EpsilonClosureStartProgram {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded count, exact allocation, and plain/guarded emission form one failure-atomic start-only transaction"
+    )]
+    pub(crate) fn derive(
+        automaton: &Automaton,
+    ) -> Result<Option<Self>, EpsilonClosureDispatchAllocationError> {
+        if automaton.stats().zero_width_edges() < MIN_ELIMINATED_EDGE_VISITS
+            || automaton.roles[plan_index(automaton.start)] != StateRole::Split
+        {
+            return Ok(None);
+        }
+        let states = automaton.roles.len();
+        if states > plan_index(GUARDED_STATE_MASK).saturating_add(1) {
+            return Ok(None);
+        }
+        let instruction_limit = graph_instruction_limit(automaton)
+            .unwrap_or(0)
+            .min(COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS);
+        if instruction_limit == 0 {
+            return Ok(None);
+        }
+        let Some((scratch_bytes, frame_capacity)) =
+            bounded_start_program_compiler_scratch_bytes(states)?
+        else {
+            return Ok(None);
+        };
+        let mut active = exact_filled(states, 0_u8, scratch_bytes)?;
+        let mut count_frames = exact_vec(frame_capacity, scratch_bytes)?;
+        let mut derivation_work = 0usize;
+        let Some(shape) = count_program_bounded(
+            automaton,
+            automaton.start,
+            &mut active,
+            &mut count_frames,
+            instruction_limit,
+            COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS,
+            COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_DERIVATION_WORK,
+            &mut derivation_work,
+        ) else {
+            return Ok(None);
+        };
+        if !shape.admitted()
+            || shape.instructions > COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS
+            || shape.edge_visits > COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS
+            || shape.edge_visits.checked_add(1) != Some(shape.instructions)
+        {
+            return Ok(None);
+        }
+        derivation_work = derivation_work.checked_add(shape.instructions).ok_or(
+            EpsilonClosureDispatchAllocationError {
+                requested_bytes: usize::MAX,
+            },
+        )?;
+        if derivation_work > COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_DERIVATION_WORK {
+            return Ok(None);
+        }
+        // Emission stores a runtime-work exponent in the first packed
+        // instruction. Check its independent encoding authority before any
+        // retained allocation.
+        if shape.runtime_work_bound().is_none() {
+            return Ok(None);
+        }
+
+        let instruction_bytes = if shape.guarded() {
+            shape
+                .instructions
+                .checked_mul(size_of::<GuardedClosureInstruction>())
+        } else {
+            shape
+                .instructions
+                .checked_mul(size_of::<ClosureInstruction>())
+        }
+        .ok_or(EpsilonClosureDispatchAllocationError {
+            requested_bytes: usize::MAX,
+        })?;
+        let retained_bytes = instruction_bytes
+            .checked_add(size_of::<EpsilonClosureStartProgramData>())
+            .ok_or(EpsilonClosureDispatchAllocationError {
+                requested_bytes: usize::MAX,
+            })?;
+        let graph_relative_limit = automaton
+            .stats()
+            .storage_bytes()
+            .saturating_mul(MAX_RETAINED_TO_GRAPH_FACTOR);
+        let subtree_limit = if shape.guarded() {
+            plan_index(GUARDED_SUBTREE_END_MASK)
+        } else {
+            plan_index(SUBTREE_END_MASK)
+        };
+        if retained_bytes > MAX_RETAINED_BYTES
+            || retained_bytes > graph_relative_limit
+            || shape.instructions > subtree_limit
+        {
+            return Ok(None);
+        }
+
+        let mut emit_frames = exact_vec(frame_capacity, scratch_bytes)?;
+        let (kind, instructions, guarded_instructions) = if shape.guarded() {
+            let mut guarded_instructions = exact_vec(shape.instructions, retained_bytes)?;
+            emit_guarded_program(
+                automaton,
+                automaton.start,
+                &mut active,
+                &mut emit_frames,
+                &mut guarded_instructions,
+                shape,
+            );
+            (
+                EpsilonClosureStartProgramKind::Guarded,
+                Vec::new().into_boxed_slice(),
+                guarded_instructions.into_boxed_slice(),
+            )
+        } else {
+            let mut instructions = exact_vec(shape.instructions, retained_bytes)?;
+            emit_program(
+                automaton,
+                automaton.start,
+                &mut active,
+                &mut emit_frames,
+                &mut instructions,
+                shape,
+            );
+            (
+                EpsilonClosureStartProgramKind::Plain,
+                instructions.into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            )
+        };
+        debug_assert_eq!(
+            derivation_work,
+            shape
+                .instructions
+                .checked_mul(2)
+                .and_then(|work| work.checked_add(shape.edge_visits))
+                .expect("bounded start-program derivation work")
+        );
+        let data = EpsilonClosureStartProgramData {
+            kind,
+            instructions,
+            guarded_instructions,
+            retained_bytes,
+        };
+        let mut owner = exact_vec(1, retained_bytes)?;
+        owner.push(data);
+        let owner: Box<[EpsilonClosureStartProgramData]> = owner.into_boxed_slice();
+        let owner = owner
+            .try_into()
+            .map_err(|_| EpsilonClosureDispatchAllocationError {
+                requested_bytes: retained_bytes,
+            })?;
+        Ok(Some(Self(owner)))
+    }
+
+    pub(crate) fn native_start_program(
+        &self,
+        state: u32,
+    ) -> Option<NativeEpsilonClosureProgramView<'_>> {
+        let data = &self.0[0];
+        match data.kind {
+            EpsilonClosureStartProgramKind::Plain => {
+                if !data.guarded_instructions.is_empty() {
+                    return None;
+                }
+                let first = data.instructions.first().copied()?;
+                if first.state() != state
+                    || first.program_work_exponent() == 0
+                    || first.subtree_end() != data.instructions.len()
+                {
+                    return None;
+                }
+                Some(NativeEpsilonClosureProgramView {
+                    program: NativeEpsilonClosureProgram::Plain(&data.instructions),
+                })
+            }
+            EpsilonClosureStartProgramKind::Guarded => {
+                if !data.instructions.is_empty() {
+                    return None;
+                }
+                let first = data.guarded_instructions.first().copied()?;
+                if first.state() != state
+                    || first.guard() != 0
+                    || first.program_work_exponent() == 0
+                    || first.subtree_end() != data.guarded_instructions.len()
+                {
+                    return None;
+                }
+                Some(NativeEpsilonClosureProgramView {
+                    program: NativeEpsilonClosureProgram::Guarded(&data.guarded_instructions),
+                })
+            }
+        }
+    }
+
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.0[0].retained_bytes
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "root discovery, exact sizing, and all resource ceilings form one failure-atomic preflight"
@@ -1047,6 +1297,24 @@ fn bounded_compiler_scratch_bytes(
     Ok((bytes <= MAX_COMPILER_SCRATCH_BYTES).then_some(bytes))
 }
 
+fn bounded_start_program_compiler_scratch_bytes(
+    states: usize,
+) -> Result<Option<(usize, usize)>, EpsilonClosureDispatchAllocationError> {
+    let frame_capacity = states.min(COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS);
+    let bytes = frame_capacity
+        .checked_mul(size_of::<CountFrame>())
+        .and_then(|frame_bytes| states.checked_add(frame_bytes))
+        .and_then(|bytes| {
+            frame_capacity
+                .checked_mul(size_of::<EmitFrame>())
+                .and_then(|more| bytes.checked_add(more))
+        })
+        .ok_or(EpsilonClosureDispatchAllocationError {
+            requested_bytes: usize::MAX,
+        })?;
+    Ok((bytes <= MAX_COMPILER_SCRATCH_BYTES).then_some((bytes, frame_capacity)))
+}
+
 fn try_admit_derivation_work(
     consumed: &mut usize,
     requested: usize,
@@ -1071,6 +1339,32 @@ fn count_program(
     instruction_limit: usize,
     derivation_work: &mut usize,
 ) -> Option<ProgramShape> {
+    count_program_bounded(
+        automaton,
+        root,
+        active,
+        frames,
+        instruction_limit,
+        usize::MAX,
+        MAX_DERIVATION_WORK,
+        derivation_work,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the private start-only path adds independent instruction, edge, and work authorities"
+)]
+fn count_program_bounded(
+    automaton: &Automaton,
+    root: u32,
+    active: &mut [u8],
+    frames: &mut Vec<CountFrame>,
+    instruction_limit: usize,
+    edge_visit_limit: usize,
+    derivation_work_limit: usize,
+    derivation_work: &mut usize,
+) -> Option<ProgramShape> {
     debug_assert!(active.iter().all(|&entry| entry == 0));
     frames.clear();
     let mut shape = ProgramShape::default();
@@ -1083,7 +1377,7 @@ fn count_program(
      -> Option<()> {
         shape.instructions = shape.instructions.checked_add(1)?;
         *derivation_work = derivation_work.checked_add(1)?;
-        if shape.instructions > instruction_limit || *derivation_work > MAX_DERIVATION_WORK {
+        if shape.instructions > instruction_limit || *derivation_work > derivation_work_limit {
             return None;
         }
         let index = plan_index(state);
@@ -1094,7 +1388,11 @@ fn count_program(
             return Some(());
         }
         let edges = automaton.state_edges(state);
-        shape.edge_visits = shape.edge_visits.checked_add(edges.len())?;
+        let edge_visits = shape.edge_visits.checked_add(edges.len())?;
+        if edge_visits > edge_visit_limit {
+            return None;
+        }
+        shape.edge_visits = edge_visits;
         active[index] = 1;
         frames.push(CountFrame {
             state,
@@ -1116,6 +1414,9 @@ fn count_program(
             let edge = frame.next_edge;
             frame.next_edge = frame.next_edge.checked_add(1)?;
             *derivation_work = derivation_work.checked_add(1)?;
+            if edge_visit_limit != usize::MAX && *derivation_work > derivation_work_limit {
+                return None;
+            }
             let kind = automaton.edge_kinds[edge];
             debug_assert!(kind.is_zero_width());
             if kind != EdgeKind::Epsilon {
@@ -1427,7 +1728,10 @@ mod tests {
         ClosureAction, ClosureInstruction, ClosureRoot, EpsilonClosureDispatchData,
         GuardedClosureInstruction, NativeEpsilonClosureAction, MAX_RETAINED_TO_GRAPH_FACTOR,
     };
-    use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
+    use crate::{
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, RawPlan,
+        SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    };
 
     fn branching_cycle(asserted: bool) -> Automaton {
         let first_kind = if asserted {
@@ -1515,6 +1819,112 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b'b', 0, 0, b'c'],
                 byte_ends: vec![0, 0, b'a', b'b', 0, 0, b'c'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the fixed synthetic graph uses small bounded fixture dimensions and indices"
+    )]
+    fn all_root_decline_with_small_start(asserted: bool) -> Automaton {
+        const PREFIX_ROOTS: usize = 20;
+        const SHARED_SPLITS: usize = 20;
+        const FIRST_ROOT_SOURCE: usize = 3;
+        const FIRST_PREFIX: usize = FIRST_ROOT_SOURCE + PREFIX_ROOTS;
+        const FIRST_SHARED: usize = FIRST_PREFIX + PREFIX_ROOTS;
+        const TERMINAL_CONSUME: usize = FIRST_SHARED + SHARED_SPLITS;
+        const TERMINAL_ACCEPT: usize = TERMINAL_CONSUME + 1;
+
+        let mut roles = vec![StateRole::Split, StateRole::Accept, StateRole::Accept];
+        roles.extend([StateRole::Consume; PREFIX_ROOTS]);
+        roles.extend([StateRole::Split; PREFIX_ROOTS]);
+        roles.extend([StateRole::Split; SHARED_SPLITS]);
+        roles.extend([StateRole::Consume, StateRole::Accept]);
+        assert_eq!(roles.len(), TERMINAL_ACCEPT + 1);
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+        for state in 0..roles.len() {
+            if state == 0 {
+                edge_targets.extend([1, 2]);
+                edge_kinds.extend([
+                    if asserted {
+                        EdgeKind::AssertHaystackStart
+                    } else {
+                        EdgeKind::Epsilon
+                    },
+                    EdgeKind::Epsilon,
+                ]);
+                byte_starts.extend([0; 2]);
+                byte_ends.extend([0; 2]);
+            } else if (FIRST_ROOT_SOURCE..FIRST_PREFIX).contains(&state) {
+                edge_targets.push(u32::try_from(FIRST_PREFIX + state - FIRST_ROOT_SOURCE).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(b'a');
+                byte_ends.push(b'a');
+            } else if (FIRST_PREFIX..FIRST_SHARED).contains(&state) {
+                edge_targets.push(u32::try_from(FIRST_SHARED).unwrap());
+                edge_kinds.push(EdgeKind::Epsilon);
+                byte_starts.push(0);
+                byte_ends.push(0);
+            } else if (FIRST_SHARED..TERMINAL_CONSUME).contains(&state) {
+                edge_targets.push(u32::try_from(state + 1).unwrap());
+                edge_kinds.push(EdgeKind::Epsilon);
+                byte_starts.push(0);
+                byte_ends.push(0);
+            } else if state == TERMINAL_CONSUME {
+                edge_targets.push(u32::try_from(TERMINAL_ACCEPT).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(b'z');
+                byte_ends.push(b'z');
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test callers bind the synthetic fanout to the compiler-private cap boundary"
+    )]
+    fn wide_start(edge_count: usize) -> Automaton {
+        let mut roles = vec![StateRole::Split];
+        roles.extend(core::iter::repeat(StateRole::Accept).take(edge_count));
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        edge_offsets.push(0);
+        edge_offsets.push(u32::try_from(edge_count).unwrap());
+        edge_offsets
+            .extend(core::iter::repeat(u32::try_from(edge_count).unwrap()).take(edge_count));
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets: (1..=edge_count)
+                    .map(|state| u32::try_from(state).unwrap())
+                    .collect(),
+                edge_kinds: vec![EdgeKind::Epsilon; edge_count],
+                byte_starts: vec![0; edge_count],
+                byte_ends: vec![0; edge_count],
             },
             CompileLimits::default(),
         )
@@ -1725,6 +2135,291 @@ mod tests {
                 + guarded.len() * size_of::<GuardedClosureInstruction>()
                 + plain.len() * size_of::<ClosureInstruction>()
                 + size_of::<EpsilonClosureDispatchData>()
+        );
+    }
+
+    #[test]
+    fn all_root_decline_can_retain_a_private_plain_start_program() {
+        let mut automaton = all_root_decline_with_small_start(false);
+        assert!(!automaton.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(!automaton.has_epsilon_closure_dispatch());
+        assert_eq!(automaton.epsilon_closure_dispatch_retained_bytes(), 0);
+        assert!(!automaton.compiler_private_has_epsilon_closure_start_program());
+
+        assert!(automaton
+            .try_enable_epsilon_closure_start_program()
+            .unwrap());
+        assert!(automaton.compiler_private_has_epsilon_closure_start_program());
+        assert!(!automaton.has_epsilon_closure_dispatch());
+        assert!(automaton.epsilon_closure_dispatch.is_none());
+        let view = automaton
+            .compiler_private_epsilon_closure_start_program_view()
+            .expect("the distinct start-only owner supplies native lowering");
+        assert!(!view.is_guarded());
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.instruction(0).unwrap().state(), 0);
+        assert_eq!(view.instruction(0).unwrap().subtree_end(), 3);
+        assert_eq!(
+            automaton.compiler_private_epsilon_closure_start_program_retained_bytes(),
+            3 * size_of::<ClosureInstruction>()
+                + size_of::<super::EpsilonClosureStartProgramData>()
+        );
+        assert_eq!(
+            automaton
+                .clone()
+                .compiler_private_epsilon_closure_start_program_retained_bytes(),
+            automaton.compiler_private_epsilon_closure_start_program_retained_bytes(),
+            "cloning retains the immutable source-only owner"
+        );
+    }
+
+    #[test]
+    fn all_root_decline_can_retain_a_private_guarded_start_program() {
+        let mut automaton = all_root_decline_with_small_start(true);
+        assert!(!automaton.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(automaton
+            .try_enable_epsilon_closure_start_program()
+            .unwrap());
+        let view = automaton
+            .compiler_private_epsilon_closure_start_program_view()
+            .expect("the guarded start-only owner supplies native lowering");
+        assert!(view.is_guarded());
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.instruction(0).unwrap().guard(), 0);
+        assert_ne!(view.instruction(1).unwrap().guard(), 0);
+        assert_eq!(
+            automaton.compiler_private_epsilon_closure_start_program_retained_bytes(),
+            3 * size_of::<GuardedClosureInstruction>()
+                + size_of::<super::EpsilonClosureStartProgramData>()
+        );
+    }
+
+    #[test]
+    fn private_start_program_matches_the_full_start_program_exactly() {
+        for asserted in [false, true] {
+            let mut start_only = branching_cycle(asserted);
+            assert!(start_only
+                .try_enable_epsilon_closure_start_program()
+                .unwrap());
+            let start_only_view = start_only
+                .compiler_private_epsilon_closure_start_program_view()
+                .unwrap();
+
+            let mut full = branching_cycle(asserted);
+            assert!(full.try_enable_epsilon_closure_dispatch().unwrap());
+            let full_view = full
+                .compiler_private_epsilon_closure_start_program_view()
+                .unwrap();
+            assert_eq!(start_only_view, full_view, "asserted={asserted}");
+        }
+    }
+
+    #[test]
+    fn private_start_only_owner_is_invisible_to_portable_k0() {
+        macro_rules! compare {
+            ($operation:ty, $scalar:expr, $start_only:expr, $haystack:expr, $window:expr, $limits:expr, $asserted:expr) => {{
+                let mut scalar_workspace =
+                    K0Workspace::new($scalar, WorkspaceLimits::unlimited()).unwrap();
+                let mut start_only_workspace =
+                    K0Workspace::new($start_only, WorkspaceLimits::unlimited()).unwrap();
+                let expected = $scalar
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        $limits,
+                    );
+                let actual = $start_only
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut start_only_workspace,
+                        $limits,
+                    );
+                assert_eq!(
+                    actual, expected,
+                    "asserted={} limits={:?}",
+                    $asserted, $limits
+                );
+            }};
+        }
+
+        for asserted in [false, true] {
+            let scalar = all_root_decline_with_small_start(asserted);
+            let mut start_only = all_root_decline_with_small_start(asserted);
+            assert!(start_only
+                .try_enable_epsilon_closure_start_program()
+                .unwrap());
+            scalar.start_filter_proof.decline();
+            start_only.start_filter_proof.decline();
+            assert!(scalar.epsilon_closure_dispatch.is_none());
+            assert!(start_only.epsilon_closure_dispatch.is_none());
+            assert!(!scalar.compiler_private_has_epsilon_closure_start_program());
+            assert!(start_only.compiler_private_has_epsilon_closure_start_program());
+
+            for haystack in [b"".as_slice(), b"x", b"xyz"] {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        for limits in core::iter::once(SearchLimits::unlimited()).chain(
+                            (0..=8).map(|max_work| SearchLimits {
+                                max_work,
+                                max_scratch_bytes: usize::MAX,
+                            }),
+                        ) {
+                            compare!(
+                                Exists,
+                                &scalar,
+                                &start_only,
+                                haystack,
+                                window,
+                                limits,
+                                asserted
+                            );
+                            compare!(
+                                EarliestEnd,
+                                &scalar,
+                                &start_only,
+                                haystack,
+                                window,
+                                limits,
+                                asserted
+                            );
+                            compare!(
+                                SelectedEnd,
+                                &scalar,
+                                &start_only,
+                                haystack,
+                                window,
+                                limits,
+                                asserted
+                            );
+                            compare!(
+                                Span,
+                                &scalar,
+                                &start_only,
+                                haystack,
+                                window,
+                                limits,
+                                asserted
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_full_publication_replaces_a_private_start_only_owner() {
+        for asserted in [false, true] {
+            let mut direct_full = branching_cycle(asserted);
+            assert!(direct_full.try_enable_epsilon_closure_dispatch().unwrap());
+
+            let mut automaton = branching_cycle(asserted);
+            assert!(automaton
+                .try_enable_epsilon_closure_start_program()
+                .unwrap());
+            assert!(automaton.compiler_private_has_epsilon_closure_start_program());
+            assert!(!automaton.has_epsilon_closure_dispatch());
+
+            assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
+            assert!(automaton.has_epsilon_closure_dispatch());
+            assert!(!automaton.compiler_private_has_epsilon_closure_start_program());
+            assert_eq!(
+                automaton.compiler_private_epsilon_closure_start_program_retained_bytes(),
+                0
+            );
+            assert!(automaton
+                .compiler_private_epsilon_closure_start_program_view()
+                .is_some());
+            assert_eq!(
+                automaton.epsilon_closure_dispatch, direct_full.epsilon_closure_dispatch,
+                "a prior private attempt cannot perturb canonical Full bytes; asserted={asserted}"
+            );
+            assert_eq!(
+                automaton.epsilon_closure_dispatch_retained_bytes(),
+                direct_full.epsilon_closure_dispatch_retained_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn private_start_program_admits_256_instructions_and_declines_257() {
+        let mut admitted =
+            wide_start(super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS - 1);
+        assert!(admitted.try_enable_epsilon_closure_start_program().unwrap());
+        let view = admitted
+            .compiler_private_epsilon_closure_start_program_view()
+            .unwrap();
+        assert_eq!(
+            view.len(),
+            super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS
+        );
+
+        let mut declined =
+            wide_start(super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS);
+        assert!(!declined.try_enable_epsilon_closure_start_program().unwrap());
+        assert!(!declined.compiler_private_has_epsilon_closure_start_program());
+    }
+
+    #[test]
+    fn private_start_count_stops_at_the_split_edge_cap() {
+        let automaton =
+            wide_start(super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS + 1);
+        let mut active = vec![0_u8; automaton.stats().states()];
+        let mut frames = Vec::new();
+        let mut derivation_work = 0usize;
+        assert!(super::count_program_bounded(
+            &automaton,
+            automaton.start,
+            &mut active,
+            &mut frames,
+            super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS,
+            super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS,
+            super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_DERIVATION_WORK,
+            &mut derivation_work,
+        )
+        .is_none());
+        assert_eq!(
+            derivation_work, 1,
+            "an over-wide Split declines before scanning any of its edges"
+        );
+    }
+
+    #[test]
+    fn private_start_scratch_cap_declines_transactionally_and_overflow_is_an_error() {
+        let bounded_frames = super::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS;
+        let fixed_frame_bytes = bounded_frames
+            .checked_mul(size_of::<super::CountFrame>())
+            .and_then(|bytes| {
+                bounded_frames
+                    .checked_mul(size_of::<super::EmitFrame>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .unwrap();
+        let threshold_states = super::MAX_COMPILER_SCRATCH_BYTES
+            .checked_sub(fixed_frame_bytes)
+            .unwrap();
+        let (threshold_bytes, frame_capacity) =
+            super::bounded_start_program_compiler_scratch_bytes(threshold_states)
+                .unwrap()
+                .expect("the exact start-only scratch ceiling is admitted");
+        assert_eq!(threshold_bytes, super::MAX_COMPILER_SCRATCH_BYTES);
+        assert_eq!(frame_capacity, bounded_frames);
+        assert_eq!(
+            super::bounded_start_program_compiler_scratch_bytes(
+                threshold_states.checked_add(1).unwrap()
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            super::bounded_start_program_compiler_scratch_bytes(usize::MAX),
+            Err(super::EpsilonClosureDispatchAllocationError {
+                requested_bytes: usize::MAX
+            })
         );
     }
 
