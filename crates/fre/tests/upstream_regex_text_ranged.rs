@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildLimits, PlanKind, PlanSelection, PortableTextBuilder, PortableTextRegex, RustProfile,
-    SearchLimits,
+    BuildLimits, PlanKind, PlanSelection, PortableTextBuilder, PortableTextRegex,
+    PortableTextSearchError, RustProfile, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -52,6 +52,186 @@ fn text_ranged_search_preserves_original_assertion_context() {
             .expect("contextual text existence search")
             .0
     );
+}
+
+#[test]
+fn text_value_singletons_and_sessions_match_accounted_and_pinned_searches() {
+    let cases = [
+        (
+            PortableTextBuilder::new(r"(?:αβ|γδ)+Z")
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("forced K0 text regex"),
+            regex::Regex::new(r"(?:αβ|γδ)+Z").expect("pinned K0 oracle"),
+            PlanKind::K0,
+        ),
+        (
+            PortableTextRegex::new("東京").expect("native text regex"),
+            regex::Regex::new("東京").expect("pinned native oracle"),
+            PlanKind::ExactLiteral,
+        ),
+    ];
+    let haystacks = ["", "xαβγδZy", "☃γδZ 東京", "none"];
+
+    for (fre, upstream, expected_plan) in cases {
+        assert_eq!(fre.build_report().portable.plan, expected_plan);
+        let mut full = fre
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("full text value session");
+
+        for haystack in haystacks {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let accounted = fre
+                .find(haystack, SearchLimits::unlimited())
+                .expect("accounted text find")
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(accounted, expected);
+            assert_eq!(
+                fre.find_value(haystack, SearchLimits::unlimited())
+                    .expect("singleton text value find")
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+            assert_eq!(
+                full.find_value(haystack, SearchLimits::unlimited())
+                    .expect("session text value find")
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+
+            let expected_exists = expected.is_some();
+            assert_eq!(
+                fre.is_match_value(haystack, SearchLimits::unlimited())
+                    .expect("singleton text value existence"),
+                expected_exists,
+            );
+            assert_eq!(
+                fre.is_match(haystack, SearchLimits::unlimited())
+                    .expect("accounted text existence")
+                    .0,
+                expected_exists,
+            );
+            assert_eq!(
+                full.is_match_value(haystack, SearchLimits::unlimited())
+                    .expect("session text value existence"),
+                expected_exists,
+            );
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    fre.find_at_value(haystack, start, SearchLimits::unlimited())
+                        .expect("singleton ranged text value find")
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={:?}, haystack={haystack:?}, start={start}",
+                    upstream.as_str(),
+                );
+                assert_eq!(
+                    full.find_at_value(haystack, start, SearchLimits::unlimited())
+                        .expect("session ranged text value find")
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={:?}, haystack={haystack:?}, start={start}",
+                    upstream.as_str(),
+                );
+                assert_eq!(
+                    fre.is_match_value_at(haystack, start, SearchLimits::unlimited())
+                        .expect("singleton ranged text value existence"),
+                    upstream.is_match_at(haystack, start),
+                );
+                assert_eq!(
+                    full.is_match_value_at(haystack, start, SearchLimits::unlimited())
+                        .expect("session ranged text value existence"),
+                    upstream.is_match_at(haystack, start),
+                );
+            }
+
+            let boundaries = (0..=haystack.len())
+                .filter(|&offset| haystack.is_char_boundary(offset))
+                .collect::<Vec<_>>();
+            for &start in &boundaries {
+                for &end in boundaries.iter().filter(|&&end| end >= start) {
+                    let window = SearchWindow::new(start, end);
+                    let expected = fre
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .expect("accounted text window")
+                        .0;
+                    assert_eq!(
+                        fre.find_window_value(haystack, window, SearchLimits::unlimited())
+                            .expect("singleton text value window"),
+                        expected,
+                    );
+                    assert_eq!(
+                        full.find_window_value(haystack, window, SearchLimits::unlimited())
+                            .expect("session text value window"),
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn text_value_searches_preserve_utf8_validation_context_and_finite_refusal() {
+    let regex = PortableTextBuilder::new(r"\b(?:αβ)+Z\b")
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("contextual K0 text regex");
+    let haystack = "☃ αβZ αβZ";
+    let expected = regex::Regex::new(r"\b(?:αβ)+Z\b")
+        .expect("pinned contextual oracle")
+        .find_at(haystack, 1)
+        .map(|matched| matched.range());
+    assert_eq!(
+        regex
+            .find_at_value(haystack, 1, SearchLimits::unlimited())
+            .expect("interior-offset value search")
+            .map(fre::Match::range),
+        expected,
+    );
+
+    let invalid = SearchWindow::new(1, haystack.len());
+    let expected_error = regex
+        .find_window(haystack, invalid, SearchLimits::unlimited())
+        .expect_err("accounted API rejects an interior UTF-8 window");
+    assert_eq!(
+        regex
+            .find_window_value(haystack, invalid, SearchLimits::unlimited())
+            .expect_err("value API rejects an interior UTF-8 window"),
+        expected_error,
+    );
+    assert!(matches!(
+        &expected_error,
+        PortableTextSearchError::InvalidUtf8Window {
+            start: 1,
+            haystack_len,
+            ..
+        } if *haystack_len == haystack.len()
+    ));
+
+    let zero = SearchLimits {
+        max_work: 0,
+        max_scratch_bytes: usize::MAX,
+    };
+    assert!(regex.find_value(haystack, zero).is_err());
+    assert!(regex.is_match_value(haystack, zero).is_err());
+    let mut session = regex
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("text refusal session");
+    assert_eq!(
+        session
+            .find_window_value(haystack, invalid, SearchLimits::unlimited())
+            .expect_err("session rejects an interior UTF-8 window"),
+        expected_error,
+    );
+    assert!(session.find_value(haystack, zero).is_err());
+    assert!(session.is_match_value(haystack, zero).is_err());
 }
 
 #[test]

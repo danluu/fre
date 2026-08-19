@@ -887,6 +887,20 @@ impl PortableTextRegex {
         self.inner.is_match(haystack.as_bytes(), limits)
     }
 
+    /// Whether a selected match exists without constructing facade diagnostic
+    /// accounting on the success path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::is_match`].
+    pub fn is_match_value(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.inner.is_match_value(haystack.as_bytes(), limits)
+    }
+
     /// Whether a selected match exists at or after the byte offset `start`.
     ///
     /// Like pinned Rust `Regex::is_match_at`, `start` need not be a UTF-8
@@ -909,6 +923,27 @@ impl PortableTextRegex {
         self.inner.is_match_at(haystack.as_bytes(), start, limits)
     }
 
+    /// Whether a selected match exists at or after `start` without
+    /// constructing facade diagnostic accounting.
+    ///
+    /// Interior UTF-8 offsets retain the normalization and assertion context
+    /// of [`Self::is_match_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as
+    /// [`Self::is_match_at`].
+    pub fn is_match_value_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner
+            .is_match_value_at(haystack.as_bytes(), start, limits)
+    }
+
     /// Return the selected leftmost-first match in byte offsets.
     ///
     /// # Errors
@@ -922,14 +957,28 @@ impl PortableTextRegex {
         self.inner.find(haystack.as_bytes(), limits)
     }
 
-    /// Prepare an explicit reusable session for text match iteration.
+    /// Return only the selected leftmost-first match in byte offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::find`].
+    pub fn find_value(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.inner.find_value(haystack.as_bytes(), limits)
+    }
+
+    /// Prepare an explicit reusable session for repeated text value searches
+    /// and match iteration.
     ///
     /// K0 workspace construction and its setup limits are paid once here.
-    /// Each subsequent [`PortableTextSearchSession::find_iter`] borrows this
-    /// session mutably, allocates no new K0 workspace, and starts independent
-    /// whole-iterator accounting. The wrapper preserves this matcher's text
-    /// equivalence proof, so scalar-wise empty-match progress is not exposed
-    /// on an arbitrary byte matcher.
+    /// Each subsequent value search or [`PortableTextSearchSession::find_iter`]
+    /// borrows this session mutably and allocates no new K0 workspace.
+    /// Iterators start independent whole-iterator accounting. The wrapper
+    /// preserves this matcher's text equivalence proof, so scalar-wise
+    /// empty-match progress is not exposed on an arbitrary byte matcher.
     ///
     /// # Errors
     ///
@@ -987,6 +1036,24 @@ impl PortableTextRegex {
         self.inner.find_at(haystack.as_bytes(), start, limits)
     }
 
+    /// Return only the selected match at or after byte offset `start`.
+    ///
+    /// Interior UTF-8 offsets retain the normalization and assertion context
+    /// of [`Self::find_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::find_at`].
+    pub fn find_at_value(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner.find_at_value(haystack.as_bytes(), start, limits)
+    }
+
     /// Search a byte range whose endpoints are scalar boundaries while
     /// assertions retain their original-haystack context.
     ///
@@ -1020,6 +1087,36 @@ impl PortableTextRegex {
             .map_err(PortableTextSearchError::Search)
     }
 
+    /// Return only the selected match inside a scalar-boundary byte range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableTextSearchError`] under the same range and resource
+    /// contract as [`Self::find_window`].
+    pub fn find_window_value(
+        &self,
+        haystack: &str,
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, PortableTextSearchError> {
+        let start = window.start();
+        let end = window.end();
+        if start > end
+            || end > haystack.len()
+            || !haystack.is_char_boundary(start)
+            || !haystack.is_char_boundary(end)
+        {
+            return Err(PortableTextSearchError::InvalidUtf8Window {
+                start,
+                end,
+                haystack_len: haystack.len(),
+            });
+        }
+        self.inner
+            .find_window_value(haystack.as_bytes(), window, limits)
+            .map_err(PortableTextSearchError::Search)
+    }
+
     /// Return the selected match end in bytes without exposing its start.
     ///
     /// # Errors
@@ -1036,9 +1133,9 @@ impl PortableTextRegex {
 
 /// Reusable, text-proof-preserving wrapper around [`PortableSearchSession`].
 ///
-/// The session owns one construction-selected workspace. Its iterators borrow
-/// it mutably, so only one search can use that workspace at a time and an
-/// iterator drop deterministically makes the session reusable.
+/// The session owns one construction-selected workspace. Its value searches
+/// and iterators borrow it mutably, so only one search can use that workspace
+/// at a time and an iterator drop deterministically makes the session reusable.
 #[derive(Debug)]
 pub struct PortableTextSearchSession<'r> {
     inner: PortableSearchSession<'r>,
@@ -1059,6 +1156,100 @@ impl<'r> PortableTextSearchSession<'r> {
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         self.inner.workspace_setup_accounting()
+    }
+
+    /// Whether a selected match exists while reusing this session's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-search contract as
+    /// [`PortableTextRegex::is_match_value`].
+    pub fn is_match_value(
+        &mut self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.inner.is_match_value(haystack.as_bytes(), limits)
+    }
+
+    /// Whether a selected match exists at or after `start` while reusing this
+    /// session's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableTextRegex::is_match_value_at`].
+    pub fn is_match_value_at(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner
+            .is_match_value_at(haystack.as_bytes(), start, limits)
+    }
+
+    /// Return the selected match while reusing this session's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-search contract as
+    /// [`PortableTextRegex::find_value`].
+    pub fn find_value(
+        &mut self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.inner.find_value(haystack.as_bytes(), limits)
+    }
+
+    /// Return the selected match at or after `start` while reusing this
+    /// session's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableTextRegex::find_at_value`].
+    pub fn find_at_value(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner.find_at_value(haystack.as_bytes(), start, limits)
+    }
+
+    /// Return the selected match inside a scalar-boundary byte range while
+    /// reusing this session's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableTextSearchError`] under the same range and resource
+    /// contract as [`PortableTextRegex::find_window_value`].
+    pub fn find_window_value(
+        &mut self,
+        haystack: &str,
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, PortableTextSearchError> {
+        let start = window.start();
+        let end = window.end();
+        if start > end
+            || end > haystack.len()
+            || !haystack.is_char_boundary(start)
+            || !haystack.is_char_boundary(end)
+        {
+            return Err(PortableTextSearchError::InvalidUtf8Window {
+                start,
+                end,
+                haystack_len: haystack.len(),
+            });
+        }
+        self.inner
+            .find_window_value(haystack.as_bytes(), window, limits)
+            .map_err(PortableTextSearchError::Search)
     }
 
     /// Iterate over non-overlapping matches in one UTF-8 haystack while
@@ -1162,6 +1353,60 @@ pub(crate) fn next_text_boundary(haystack: &str, start: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_value_facade_preserves_retained_k0_proofs_and_assertions() {
+        let regex = PortableTextRegex::new(r"(?m)^a.*MANDATORY.*z$")
+            .expect("asserted text K0 regex");
+        assert_eq!(regex.build_report().portable.plan, crate::PlanKind::K0);
+        assert_eq!(regex.inner.k0_negative_prefilter_needle_bytes(), Some(9));
+        assert_eq!(regex.inner.k0_negative_prefilter_needle_count(), 3);
+
+        let absent = format!("{}\n", "λ".repeat(2_048));
+        let matched = format!("{absent}a---MANDATORY---z\n");
+        for haystack in [&absent, &matched] {
+            let expected = regex
+                .is_match(haystack, SearchLimits::unlimited())
+                .expect("accounted text existence")
+                .0;
+            assert_eq!(
+                regex
+                    .is_match_value(haystack, SearchLimits::unlimited())
+                    .expect("value text existence"),
+                expected,
+            );
+            let expected = regex
+                .find(haystack, SearchLimits::unlimited())
+                .expect("accounted text span")
+                .0;
+            assert_eq!(
+                regex
+                    .find_value(haystack, SearchLimits::unlimited())
+                    .expect("value text span"),
+                expected,
+            );
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("text search session");
+            assert_eq!(
+                session
+                    .is_match_value_at(haystack, 1, SearchLimits::unlimited())
+                    .expect("session existence from interior UTF-8 offset"),
+                regex
+                    .is_match_value_at(haystack, 1, SearchLimits::unlimited())
+                    .expect("facade existence from interior UTF-8 offset"),
+            );
+            assert_eq!(
+                session
+                    .find_at_value(haystack, 1, SearchLimits::unlimited())
+                    .expect("session span from interior UTF-8 offset"),
+                regex
+                    .find_at_value(haystack, 1, SearchLimits::unlimited())
+                    .expect("facade span from interior UTF-8 offset"),
+            );
+        }
+    }
 
     #[test]
     fn text_facade_keeps_line_domain_eligible_shapes_on_k0() {
