@@ -3567,6 +3567,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     const PLAIN_START_CLOSURE_PATTERN: &str =
         r"(?-u:(?:a?|bc)!(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
     const PREFIX_FLOW_PATTERN: &str = r"(?-u:a?a?a?a?a?a?a?a?(?:a.c|ab)\b)";
+    const GUARDED_UNICODE_PREFIX_PATTERN: &str = r"\b\w{12,}\b";
     const ABSOLUTE_DOT_WIDTH_PATTERN: &str = r"^.{249}$";
     const ABSOLUTE_WORD_WIDTH_PATTERN: &str = r"^\w{10}$";
     let target = if cfg!(target_arch = "x86_64") {
@@ -3909,6 +3910,28 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 haystack
             }],
         ),
+        (
+            GUARDED_UNICODE_PREFIX_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                b"abcdefghijk".to_vec(),
+                b"abcdefghijkl".to_vec(),
+                b"!abcdefghijkl?".to_vec(),
+                "Ж".repeat(11).into_bytes(),
+                "Ж".repeat(12).into_bytes(),
+                vec![b'['; 12],
+                {
+                    let mut haystack = vec![0xff];
+                    haystack.extend_from_slice(b"abcdefghijkl");
+                    haystack.push(0x80);
+                    haystack
+                },
+            ],
+        ),
     ];
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
@@ -3953,6 +3976,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             || *pattern == ASSERTION_CACHE_PATTERN
             || *pattern == PLAIN_START_CLOSURE_PATTERN
             || *pattern == PREFIX_FLOW_PATTERN
+            || *pattern == GUARDED_UNICODE_PREFIX_PATTERN
             || *pattern == ABSOLUTE_DOT_WIDTH_PATTERN
             || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN;
         let artifact = if forced_ordered_graph_fixture {
@@ -4143,6 +4167,47 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     [(b'a', b'a')],
                 );
                 assert!(artifact.module().has_ordered_nfa_start_prefix());
+            }
+            if *pattern == GUARDED_UNICODE_PREFIX_PATTERN {
+                let ordered_view = artifact
+                    .program()
+                    .native_ordered_nfa_view()
+                    .expect("guarded Unicode-prefix fixture retains its Ordered-NFA view");
+                let exact = ordered_view
+                    .start_prefix_first_set
+                    .expect("guarded Unicode-prefix fixture retains its exact first-byte set");
+                assert_eq!(
+                    exact.iter().map(|word| word.count_ones()).sum::<u32>(),
+                    110,
+                    "guarded Unicode-prefix fixture changed its exact first-byte set",
+                );
+                assert!(
+                    ordered_view.start_closure_dispatch.is_none(),
+                    "raw-only guarded prefix must not retain a start-closure program",
+                );
+                let image = crate::ordered_nfa_native::NativeOrderedNfaObjectImage::try_build(
+                    ordered_view,
+                    usize::MAX,
+                )
+                .expect("build guarded Unicode-prefix object")
+                .expect("guarded Unicode-prefix object remains native");
+                assert_eq!(
+                    image
+                        .layout
+                        .start_prefix
+                        .expect("guarded Unicode-prefix fixture selects its cover")
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start, range.end))
+                        .collect::<Vec<_>>(),
+                    [(0x30, 0x7a), (0xc2, 0xed), (0xef, 0xf0), (0xf3, 0xf3)],
+                );
+                assert!(
+                    image.layout.start_closure_dispatch.is_none(),
+                    "guarded Unicode prefix must remain independent of closure lowering",
+                );
+                assert!(artifact.module().has_ordered_nfa_start_prefix());
+                assert!(!artifact.module().has_ordered_nfa_start_closure_dispatch());
             }
             if *pattern == ABSOLUTE_DOT_WIDTH_PATTERN
                 || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN
