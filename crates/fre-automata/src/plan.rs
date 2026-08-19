@@ -1399,6 +1399,22 @@ impl Automaton {
             .map_or(0, EpsilonClosureDispatch::retained_bytes)
     }
 
+    /// Borrow only the canonical start-root closure program for native text
+    /// specialization.
+    ///
+    /// This compiler-private view is decoded and address-free. It deliberately
+    /// does not expose the all-state root table or either complete instruction
+    /// arena, and it returns `None` for a scalar or direct-leaf start root.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_epsilon_closure_start_program_view(
+        &self,
+    ) -> Option<crate::NativeEpsilonClosureProgramView<'_>> {
+        self.epsilon_closure_dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.native_start_program(self.start))
+    }
+
     /// Derive the canonical priority-preserving dispatch for profitable wide
     /// consuming rows.
     ///

@@ -9,7 +9,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fre_automata::{
-    EdgeKind, NativeOrderedEdgeDispatchView, NativeOrderedEdgeTransitions, RawPlan, StateRole,
+    EdgeKind, NativeEpsilonClosureAction, NativeEpsilonClosureProgramView,
+    NativeOrderedEdgeDispatchView, NativeOrderedEdgeTransitions, RawPlan, StateRole,
     UnicodeLookMatcher, WorkspaceShape,
 };
 use fre_exact_alloc::try_box_preserve;
@@ -170,6 +171,7 @@ pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) raw: &'a RawPlan,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchView<'a>>,
+    pub(crate) start_closure_dispatch: Option<NativeEpsilonClosureProgramView<'a>>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
     pub(crate) line_terminator: u8,
     pub(crate) artifact_identity: [u8; 32],
@@ -190,6 +192,13 @@ pub(crate) struct NativeOrderedNfaTerminalRangeV1 {
 /// Below this structural size, an extra full-window range scan is more likely
 /// to duplicate cheap Pike work than amortize it.
 pub(crate) const MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES: usize = 64;
+
+/// A start-only text specialization remains deliberately smaller than the
+/// universal retained sidecar. These fixed ceilings cover the two motivating
+/// Rebar graphs while bounding compiler work and target-code growth before an
+/// assembler allocates the candidate entry.
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS: usize = 256;
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS: usize = 512;
 
 /// Exact immutable object-wire descriptor extent. All table locations are
 /// descriptor-relative little-endian `u32` offsets, so the image contains no
@@ -348,15 +357,27 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     /// justify lazy boundary-local truth caching in native code. This is a
     /// compiler-only decision and does not change the frozen object ABI.
     pub(crate) cache_boundary_assertions: bool,
+    /// Compiler-only receipt for an admitted start-root text specialization.
+    /// No field or payload is added to the frozen object image.
+    pub(crate) start_closure_dispatch: Option<NativeOrderedNfaStartClosureLayout>,
     pub(crate) line_terminator: u8,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaStartClosureLayout {
+    pub(crate) guarded: bool,
+    pub(crate) instruction_count: usize,
+    pub(crate) split_edge_visits: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NativeOrderedNfaObjectImage {
+pub(crate) struct NativeOrderedNfaObjectImage<'a> {
     pub(crate) bytes: Vec<u8>,
     pub(crate) layout: NativeOrderedNfaObjectLayout,
+    /// Borrowed compiler IR consumed only while target text is emitted.
+    pub(crate) start_closure_program: Option<NativeEpsilonClosureProgramView<'a>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +412,178 @@ fn validate_native_ordered_nfa_terminal_range(
         ));
     }
     Ok(range)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "instruction and edge indices are checked against the authenticated program and graph extents"
+)]
+fn validate_native_ordered_nfa_start_closure(
+    program: NativeEpsilonClosureProgramView<'_>,
+    raw: &RawPlan,
+    assertion_kinds: u32,
+) -> Result<Option<NativeOrderedNfaStartClosureLayout>, ObjectError> {
+    let instruction_count = program.len();
+    if instruction_count == 0 {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start closure is empty",
+        ));
+    }
+    if instruction_count > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS {
+        return Ok(None);
+    }
+    let first = program.instruction(0).ok_or(ObjectError::InvalidModule(
+        "ordered-NFA start closure first instruction",
+    ))?;
+    if first.state() != raw.start
+        || first.subtree_end() != instruction_count
+        || first.guard() != 0
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start closure root",
+        ));
+    }
+
+    let edges = raw.edge_targets.len();
+    let guarded = program.is_guarded();
+    let mut split_edge_visits = 0_usize;
+    for instruction_index in 0..instruction_count {
+        let instruction = program.instruction(instruction_index).ok_or(
+            ObjectError::InvalidModule("ordered-NFA start closure instruction extent"),
+        )?;
+        let subtree_end = instruction.subtree_end();
+        if subtree_end <= instruction_index || subtree_end > instruction_count {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA start closure subtree",
+            ));
+        }
+        let state = usize::try_from(instruction.state()).map_err(|_| {
+            ObjectError::InvalidModule("ordered-NFA start closure state encoding")
+        })?;
+        let role = raw.roles.get(state).copied().ok_or(ObjectError::InvalidModule(
+            "ordered-NFA start closure state bounds",
+        ))?;
+        let edge_begin = raw
+            .edge_offsets
+            .get(state)
+            .copied()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA start closure edge begin",
+            ))?;
+        let edge_end = raw
+            .edge_offsets
+            .get(state.checked_add(1).ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA start closure state successor",
+            ))?)
+            .copied()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA start closure edge end",
+            ))?;
+        if edge_begin > edge_end || edge_end > edges {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA start closure edge bounds",
+            ));
+        }
+        let degree = edge_end - edge_begin;
+
+        if guarded {
+            let guard = instruction.guard();
+            if guard > 18
+                || (guard != 0
+                    && assertion_kinds & (1_u32 << guard.saturating_sub(1)) == 0)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "ordered-NFA start closure guard",
+                ));
+            }
+        } else if instruction.guard() != 0 {
+            return Err(ObjectError::InvalidModule(
+                "plain ordered-NFA start closure has a guard",
+            ));
+        }
+
+        match instruction.action() {
+            NativeEpsilonClosureAction::Split => {
+                if role != StateRole::Split {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-NFA start closure Split role",
+                    ));
+                }
+                split_edge_visits = split_edge_visits.checked_add(degree).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "ordered-NFA start closure Split-edge visits",
+                    ),
+                )?;
+                if split_edge_visits
+                    > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS
+                {
+                    return Ok(None);
+                }
+                if guarded {
+                    if raw.edge_kinds[edge_begin..edge_end].contains(&EdgeKind::ByteRange) {
+                        return Err(ObjectError::InvalidModule(
+                            "guarded ordered-NFA start closure consuming Split edge",
+                        ));
+                    }
+                } else if instruction.edge_work() != u32::try_from(degree).map_err(|_| {
+                    ObjectError::InvalidModule(
+                        "plain ordered-NFA start closure edge-work encoding",
+                    )
+                })?
+                    || raw.edge_kinds[edge_begin..edge_end]
+                        .iter()
+                        .any(|&kind| kind != EdgeKind::Epsilon)
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "plain ordered-NFA start closure Split row",
+                    ));
+                }
+            }
+            NativeEpsilonClosureAction::Consume => {
+                if role != StateRole::Consume
+                    || instruction.edge_work() != 0
+                    || subtree_end != instruction_index + 1
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-NFA start closure Consume instruction",
+                    ));
+                }
+            }
+            NativeEpsilonClosureAction::Accept => {
+                if role != StateRole::Accept
+                    || instruction.edge_work() != 0
+                    || subtree_end != instruction_index + 1
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-NFA start closure Accept instruction",
+                    ));
+                }
+            }
+            NativeEpsilonClosureAction::SeenBackedge => {
+                if role != StateRole::Split
+                    || instruction.edge_work() != 0
+                    || subtree_end != instruction_index + 1
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-NFA start closure backedge instruction",
+                    ));
+                }
+            }
+        }
+    }
+    if split_edge_visits.checked_add(1) != Some(instruction_count) {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start closure edge/instruction receipt",
+        ));
+    }
+    Ok(Some(NativeOrderedNfaStartClosureLayout {
+        guarded,
+        instruction_count,
+        split_edge_visits,
+    }))
 }
 
 #[allow(
@@ -644,11 +837,42 @@ fn validate_native_ordered_edge_dispatch(
     })
 }
 
-impl NativeOrderedNfaObjectImage {
+impl<'a> NativeOrderedNfaObjectImage<'a> {
+    /// Borrow one state's already-encoded canonical edge-kind row from the
+    /// object image. This is a compiler-only convenience for guarded start
+    /// specialization and does not expose source storage to target code.
+    pub(crate) fn encoded_edge_kinds_for_state(&self, state: u32) -> Option<&[u8]> {
+        let state = usize::try_from(state).ok()?;
+        if state >= self.layout.state_count {
+            return None;
+        }
+        let read_offset = |index: usize| {
+            let begin = self
+                .layout
+                .edge_offsets_offset
+                .checked_add(index.checked_mul(4)?)?;
+            let end = begin.checked_add(4)?;
+            self.bytes
+                .get(begin..end)?
+                .try_into()
+                .ok()
+                .map(u32::from_le_bytes)
+                .and_then(|value| usize::try_from(value).ok())
+        };
+        let begin = read_offset(state)?;
+        let end = read_offset(state.checked_add(1)?)?;
+        if begin > end || end > self.layout.edge_count {
+            return None;
+        }
+        let kinds_begin = self.layout.edge_kinds_offset.checked_add(begin)?;
+        let kinds_end = self.layout.edge_kinds_offset.checked_add(end)?;
+        self.bytes.get(kinds_begin..kinds_end)
+    }
+
     /// Build one canonical, relocation-free graph image. Numeric/structural or
     /// caller-cap refusal is soft; host allocation failure remains explicit.
     pub(crate) fn try_build(
-        view: NativeOrderedNfaProgramView<'_>,
+        view: NativeOrderedNfaProgramView<'a>,
         max_object_bytes: usize,
     ) -> Result<Option<Self>, ObjectError> {
         let mut limits =
@@ -679,8 +903,17 @@ impl NativeOrderedNfaObjectImage {
                 "ordered-NFA assertion mask exceeds object ABI",
             ));
         }
-        let cache_boundary_assertions =
-            boundary_assertion_cache_is_profitable(assertion_edges, assertion_kinds);
+        let start_closure_dispatch = match view.start_closure_dispatch {
+            Some(program) => {
+                validate_native_ordered_nfa_start_closure(program, raw, assertion_kinds)?
+            }
+            None => None,
+        };
+        let start_closure_program = start_closure_dispatch.and(view.start_closure_dispatch);
+        let cache_boundary_assertions = boundary_assertion_cache_is_profitable(
+            assertion_edges,
+            assertion_kinds,
+        ) || start_closure_dispatch.is_some_and(|layout| layout.guarded);
         let terminal_range = view
             .terminal_range
             .map(|range| validate_native_ordered_nfa_terminal_range(range, edges))
@@ -1120,11 +1353,16 @@ impl NativeOrderedNfaObjectImage {
             start_state: raw.start,
             assertion_kinds,
             cache_boundary_assertions,
+            start_closure_dispatch,
             line_terminator: view.line_terminator,
             ordered_edge_dispatch,
             terminal_range,
         };
-        Ok(Some(Self { bytes, layout }))
+        Ok(Some(Self {
+            bytes,
+            layout,
+            start_closure_program,
+        }))
     }
 }
 
@@ -2618,6 +2856,175 @@ mod tests {
         assert!(first.layout.cache_boundary_assertions);
         assert_eq!(first, second);
         assert_eq!(first.layout.assertion_kinds, 0x42);
+    }
+
+    #[test]
+    fn start_closure_selection_is_deterministic_and_does_not_change_object_bytes() {
+        let program = span_program_with_mode(
+            r"(?:a?|bc)",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("optimizing fallback exposes ordered TNFA");
+        let program_view = view
+            .start_closure_dispatch
+            .expect("branching start retains canonical closure bytecode");
+        assert!(!program_view.is_guarded());
+        assert!(program_view.len() > 1);
+
+        let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let second = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        let receipt = first
+            .layout
+            .start_closure_dispatch
+            .expect("bounded canonical start closure is selected");
+        assert_eq!(receipt.guarded, program_view.is_guarded());
+        assert_eq!(receipt.instruction_count, program_view.len());
+        assert_eq!(receipt.split_edge_visits.checked_add(1), Some(program_view.len()));
+        assert_eq!(first.start_closure_program, Some(program_view));
+
+        let without_view = NativeOrderedNfaProgramView {
+            start_closure_dispatch: None,
+            ..view
+        };
+        let without = NativeOrderedNfaObjectImage::try_build(without_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.bytes, without.bytes);
+        assert!(without.layout.start_closure_dispatch.is_none());
+        assert!(without.start_closure_program.is_none());
+    }
+
+    #[test]
+    fn guarded_start_closure_forces_cache_without_changing_object_bytes() {
+        let program = span_program_with_mode(
+            r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("guarded optimizing fallback exposes ordered TNFA");
+        let program_view = view
+            .start_closure_dispatch
+            .expect("assertion-bearing start retains guarded bytecode");
+        assert!(program_view.is_guarded());
+
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let receipt = selected
+            .layout
+            .start_closure_dispatch
+            .expect("bounded guarded start closure is selected");
+        assert!(receipt.guarded);
+        assert!(selected.layout.cache_boundary_assertions);
+        assert_eq!(receipt.split_edge_visits.checked_add(1), Some(receipt.instruction_count));
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_closure_dispatch: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, without.bytes);
+        assert!(without.layout.start_closure_dispatch.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the synthetic one-past-cap graph uses small bounded test indices"
+    )]
+    fn oversized_start_closure_is_softly_omitted_without_object_changes() {
+        let split_count = MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS;
+        let mut roles = vec![StateRole::Split; split_count];
+        roles.extend([StateRole::Consume, StateRole::Accept]);
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::with_capacity(split_count + 1);
+        let mut edge_kinds = Vec::with_capacity(split_count + 1);
+        let mut byte_starts = Vec::with_capacity(split_count + 1);
+        let mut byte_ends = Vec::with_capacity(split_count + 1);
+        edge_offsets.push(0);
+        for index in 0..split_count {
+            edge_targets.push(u32::try_from(index + 1).unwrap());
+            edge_kinds.push(EdgeKind::Epsilon);
+            byte_starts.push(0);
+            byte_ends.push(0);
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        edge_targets.push(u32::try_from(split_count + 1).unwrap());
+        edge_kinds.push(EdgeKind::ByteRange);
+        byte_starts.push(b'z');
+        byte_ends.push(b'z');
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        let raw = RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        };
+        let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
+        let program = crate::CompiledProgram::build(
+            raw,
+            automaton,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("optimizing fallback exposes ordered TNFA");
+        let program_view = view
+            .start_closure_dispatch
+            .expect("optional chain retains canonical start closure bytecode");
+        assert!(
+            program_view.len() > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS,
+            "fixture must exercise the compiler text cap"
+        );
+
+        let omitted = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(omitted.layout.start_closure_dispatch.is_none());
+        assert!(omitted.start_closure_program.is_none());
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_closure_dispatch: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(omitted.bytes, without.bytes);
     }
 
     fn span_program(pattern: &str, line_terminator: u8) -> crate::CompiledProgram {

@@ -104,6 +104,7 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
     },
 };
+use fre_automata::{NativeEpsilonClosureAction, NativeEpsilonClosureProgramView};
 
 const STATUS_NO_MATCH: u32 = 0;
 const STATUS_MATCH: u32 = 1;
@@ -1823,14 +1824,242 @@ fn compare_x_usize(a: &mut A<'_>, register: u8, value: usize) -> Result<(), Obje
     a.cmp_x(register, 17)
 }
 
+fn selected_start_closure_program<'a>(
+    image: &NativeOrderedNfaObjectImage<'a>,
+) -> Result<Option<NativeEpsilonClosureProgramView<'a>>, ObjectError> {
+    match (
+        image.start_closure_program,
+        image.layout.start_closure_dispatch,
+    ) {
+        (None, None) => Ok(None),
+        (Some(program), Some(receipt))
+            if program.len() == receipt.instruction_count
+                && program.is_guarded() == receipt.guarded
+                && (!receipt.guarded || image.layout.cache_boundary_assertions) =>
+        {
+            let first = program.instruction(0).ok_or(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA start closure first instruction",
+            ))?;
+            if first.state() != image.layout.start_state
+                || first.subtree_end() != program.len()
+                || first.guard() != 0
+            {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 Ordered-NFA start closure root",
+                ));
+            }
+            Ok(Some(program))
+        }
+        _ => Err(ObjectError::InvalidModule(
+            "AArch64 Ordered-NFA start closure receipt",
+        )),
+    }
+}
+
+fn start_closure_labels(
+    asm: &mut Aarch64Assembler,
+    program: NativeEpsilonClosureProgramView<'_>,
+) -> Result<Vec<usize>, ObjectError> {
+    let count = program
+        .len()
+        .checked_add(1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 Ordered-NFA start closure label count",
+        ))?;
+    let mut labels = Vec::new();
+    labels
+        .try_reserve_exact(count)
+        .map_err(|_| ObjectError::Allocation("AArch64 Ordered-NFA start closure labels"))?;
+    for _ in 0..count {
+        labels.push(asm.label()?);
+    }
+    Ok(labels)
+}
+
+fn start_closure_label(labels: &[usize], index: usize) -> Result<usize, ObjectError> {
+    labels.get(index).copied().ok_or(ObjectError::InvalidModule(
+        "AArch64 Ordered-NFA start closure label",
+    ))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated assertion-kind bounds make the compiler-emitted cache bit total"
+)]
+fn emit_static_guarded_split_assertions(
+    a: &mut A<'_>,
+    kinds: &[u8],
+    assertion_kinds: u32,
+    assertion: usize,
+    runtime_failure: usize,
+) -> Result<(), ObjectError> {
+    for &kind in kinds.iter().rev() {
+        if kind == EDGE_EPSILON {
+            continue;
+        }
+        if !(EDGE_START_TEXT..=EDGE_WORD_END_HALF_UNICODE).contains(&kind) {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA guarded start closure Split edge",
+            ));
+        }
+        let bit = 1_u32 << u32::from(kind - EDGE_START_TEXT);
+        if assertion_kinds & bit == 0 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA guarded start closure assertion kind",
+            ));
+        }
+        let known = a.asm.label()?;
+        a.constant32(9, bit)?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.and_w(11, 10, 9)?;
+        a.cbnz_w(11, known)?;
+        a.constant32(0, u32::from(kind))?;
+        a.load_x(1, 31, usize::from(L_POSITION))?;
+        a.call(assertion)?;
+        a.cbnz_w(1, runtime_failure)?;
+        a.constant32(9, bit)?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.orr_w(10, 10, 9)?;
+        a.store_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+        a.cbz_w(0, known)?;
+        a.load_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+        a.orr_w(10, 10, 9)?;
+        a.store_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+        a.asm.bind(known)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_arguments,
+    reason = "validated guards make cache-bit construction total while the static closure shares the authenticated image and semantic exits"
+)]
+fn emit_static_start_closure(
+    a: &mut A<'_>,
+    image: &NativeOrderedNfaObjectImage<'_>,
+    program: NativeEpsilonClosureProgramView<'_>,
+    labels: &[usize],
+    assertion: usize,
+    after_roots: usize,
+    runtime_failure: usize,
+) -> Result<(), ObjectError> {
+    let layout = image.layout;
+    a.asm.bind(start_closure_label(labels, 0)?)?;
+    a.store_x(31, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_LEN_OFFSET)?;
+    for instruction_index in 0..program.len() {
+        if instruction_index != 0 {
+            a.asm
+                .bind(start_closure_label(labels, instruction_index)?)?;
+        }
+        let instruction = program.instruction(instruction_index).ok_or(
+            ObjectError::InvalidModule("AArch64 Ordered-NFA start closure instruction"),
+        )?;
+        let state = instruction.state();
+        if usize::try_from(state)
+            .ok()
+            .is_none_or(|state| state >= layout.state_count)
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA start closure state",
+            ));
+        }
+        let subtree_end = instruction.subtree_end();
+        if subtree_end <= instruction_index || subtree_end > program.len() {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA start closure subtree",
+            ));
+        }
+        let subtree_end = start_closure_label(labels, subtree_end)?;
+
+        let guard = instruction.guard();
+        if guard != 0 {
+            if !program.is_guarded() || guard > 18 {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 Ordered-NFA start closure guard",
+                ));
+            }
+            let bit = 1_u32 << guard.saturating_sub(1);
+            if layout.assertion_kinds & bit == 0 {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 Ordered-NFA start closure guard kind",
+                ));
+            }
+            a.constant32(9, bit)?;
+            a.load_w(10, 31, usize::from(L_ASSERT_CACHE_KNOWN))?;
+            a.and_w(11, 10, 9)?;
+            a.cbz_w(11, runtime_failure)?;
+            a.load_w(10, 31, usize::from(L_ASSERT_CACHE_ENABLED))?;
+            a.and_w(11, 10, 9)?;
+            a.cbz_w(11, subtree_end)?;
+        }
+
+        a.constant32(8, state)?;
+        a.i(aarch64_load_x_lsl3(9, 25, 8))?;
+        a.load_x(10, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_GENERATION_OFFSET)?;
+        a.cmp_x(9, 10)?;
+        a.branch_cond(AARCH64_EQ, subtree_end)?;
+        a.i(aarch64_add_x_lsl(9, 25, 8, 3))?;
+        a.store_x(10, 9, 0)?;
+
+        match instruction.action() {
+            NativeEpsilonClosureAction::Accept => {
+                a.load_x(10, 31, usize::from(L_THREAD_START))?;
+                a.store_x(10, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_START_OFFSET)?;
+                a.load_x(10, 31, usize::from(L_POSITION))?;
+                a.store_x(10, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_END_OFFSET)?;
+                a.constant32(10, 1)?;
+                a.store_w(10, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET)?;
+                a.branch(after_roots)?;
+            }
+            NativeEpsilonClosureAction::Consume => {
+                a.load_x(9, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET)?;
+                compare_x_usize(a, 9, layout.state_count)?;
+                a.branch_cond(AARCH64_HS, runtime_failure)?;
+                thread_address(a, 10, 26, 9)?;
+                a.constant32(11, state)?;
+                a.load_x(12, 31, usize::from(L_THREAD_START))?;
+                store_thread(a, 10, 11, 12)?;
+                a.add_x_imm(9, 9, 1)?;
+                a.store_x(9, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET)?;
+            }
+            NativeEpsilonClosureAction::Split => {
+                if program.is_guarded() {
+                    let kinds = image.encoded_edge_kinds_for_state(state).ok_or(
+                        ObjectError::InvalidModule(
+                            "AArch64 Ordered-NFA guarded start closure Split row",
+                        ),
+                    )?;
+                    emit_static_guarded_split_assertions(
+                        a,
+                        kinds,
+                        layout.assertion_kinds,
+                        assertion,
+                        runtime_failure,
+                    )?;
+                }
+            }
+            NativeEpsilonClosureAction::SeenBackedge => a.branch(runtime_failure)?,
+        }
+    }
+    a.asm
+        .bind(start_closure_label(labels, program.len())?)?;
+    a.branch(after_roots)
+}
+
 fn emit_semantic_body(
     asm: &mut Aarch64Assembler,
-    layout: NativeOrderedNfaObjectLayout,
+    image: &NativeOrderedNfaObjectImage<'_>,
     assertion: usize,
     no_match: usize,
     matched: usize,
     runtime_failure: usize,
 ) -> Result<(), ObjectError> {
+    let layout = image.layout;
+    let start_program = selected_start_closure_program(image)?;
+    let start_labels = start_program
+        .map(|program| start_closure_labels(asm, program))
+        .transpose()?;
     let boundary = asm.label()?;
     let next_old_root = asm.label()?;
     let old_roots_done = asm.label()?;
@@ -1897,6 +2126,9 @@ fn emit_semantic_body(
     a.store_x(8, 31, usize::from(L_THREAD_START))?;
     a.constant32(8, 1)?;
     a.store_x(8, 31, usize::from(L_ROOT_MODE))?;
+    if let Some(labels) = start_labels.as_deref() {
+        a.branch(start_closure_label(labels, 0)?)?;
+    }
 
     a.asm.bind(expand_start)?;
     a.store_x(31, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_LEN_OFFSET)?;
@@ -2030,6 +2262,18 @@ fn emit_semantic_body(
     a.load_x(8, 31, usize::from(L_ROOT_MODE))?;
     a.cbnz_x(8, after_roots)?;
     a.branch(next_old_root)?;
+
+    if let (Some(program), Some(labels)) = (start_program, start_labels.as_deref()) {
+        emit_static_start_closure(
+            &mut a,
+            image,
+            program,
+            labels,
+            assertion,
+            after_roots,
+            runtime_failure,
+        )?;
+    }
 
     a.asm.bind(after_roots)?;
     a.load_x(8, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET)?;
@@ -2255,7 +2499,7 @@ fn emit_semantic_body(
 
 /// Emit the AArch64 AAPCS64 private/public V15 one-Span search entry.
 pub(super) fn lower_aarch64(
-    image: &NativeOrderedNfaObjectImage,
+    image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     let layout = image.layout;
     let expected_scratch_bytes = scratch_bytes(layout)?;
@@ -2429,7 +2673,7 @@ pub(super) fn lower_aarch64(
     asm.bind(search_entry)?;
     emit_semantic_body(
         &mut asm,
-        layout,
+        image,
         assertion,
         no_match,
         matched,
@@ -2570,7 +2814,42 @@ pub(super) fn lower_aarch64(
 mod tests {
     use super::*;
 
-    fn minimal_image() -> NativeOrderedNfaObjectImage {
+    fn optimizing_ordered_nfa(pattern: &str) -> crate::CompiledProgram {
+        let parsed = fre_syntax::parse(fre_syntax::ParseRequest::rust(
+            pattern.to_owned(),
+            fre_syntax::CompatibilityProfile::RustBytes(fre_syntax::RustProfile::default()),
+        ))
+        .unwrap();
+        let fre_syntax::CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            panic!("Rust request returned a non-Rust pattern");
+        };
+        let raw = fre_lower::lower_raw(
+            &parsed,
+            fre_lower::OperationSemantics::CaptureFree,
+            fre_lower::LowerLimits::default(),
+        )
+        .unwrap()
+        .into_plan();
+        let automaton = fre_automata::Automaton::from_raw(
+            raw.clone(),
+            fre_automata::CompileLimits::default(),
+        )
+        .unwrap();
+        crate::CompiledProgram::build(
+            raw,
+            automaton,
+            crate::OutputContract::Span,
+            crate::CompileMode::Optimizing,
+            crate::DeterminizeLimits {
+                max_states: 0,
+                ..crate::DeterminizeLimits::default()
+            },
+            usize::MAX,
+        )
+        .unwrap()
+    }
+
+    fn minimal_image() -> NativeOrderedNfaObjectImage<'static> {
         NativeOrderedNfaObjectImage {
             bytes: vec![0; 144],
             layout: NativeOrderedNfaObjectLayout {
@@ -2590,14 +2869,16 @@ mod tests {
                 start_state: 0,
                 assertion_kinds: 0,
                 cache_boundary_assertions: false,
+                start_closure_dispatch: None,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
             },
+            start_closure_program: None,
         }
     }
 
-    fn terminal_range_image() -> NativeOrderedNfaObjectImage {
+    fn terminal_range_image() -> NativeOrderedNfaObjectImage<'static> {
         let mut image = minimal_image();
         image.layout.terminal_range = Some(
             crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
@@ -2609,7 +2890,7 @@ mod tests {
         image
     }
 
-    fn cached_assertion_image() -> NativeOrderedNfaObjectImage {
+    fn cached_assertion_image() -> NativeOrderedNfaObjectImage<'static> {
         let mut image = minimal_image();
         image.layout.assertion_kinds =
             (1 << (EDGE_END_TEXT - EDGE_START_TEXT)) | (1 << (EDGE_WORD_ASCII - EDGE_START_TEXT));
@@ -2619,6 +2900,58 @@ mod tests {
 
     fn instruction(code: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_unrolls_only_the_selected_start_closure() {
+        let program = optimizing_ordered_nfa(r"(?:a?|bc)");
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let receipt = selected.layout.start_closure_dispatch.unwrap();
+        assert!(!receipt.guarded);
+        assert!(receipt.instruction_count > 1);
+        let scalar = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                start_closure_dispatch: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, scalar.bytes);
+        let selected_entry = lower_aarch64(&selected).unwrap();
+        let scalar_entry = lower_aarch64(&scalar).unwrap();
+        assert!(selected_entry.code.len() > scalar_entry.code.len());
+        assert_eq!(selected_entry.relocations, scalar_entry.relocations);
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_guarded_split_assertions_are_emitted_in_reverse_row_order() {
+        let mut asm = Aarch64Assembler::new();
+        let assertion = asm.label().unwrap();
+        let failure = asm.label().unwrap();
+        emit_static_guarded_split_assertions(
+            &mut A { asm: &mut asm },
+            &[2, 0, 4, 3],
+            0b111,
+            assertion,
+            failure,
+        )
+        .unwrap();
+        let kinds = asm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .filter_map(|word| {
+                [2_u32, 3, 4]
+                    .into_iter()
+                    .find(|kind| word == 0xd280_0000 | (kind << 5))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [3, 4, 2]);
     }
 
     #[test]
