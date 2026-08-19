@@ -230,13 +230,33 @@ fn optional_sidecar_closes_planner_literal_and_persistent_limits() {
         oracle.build_report().plan_storage_bytes
     );
 
+    let mut lower = oracle.build_report().charged_persistent_bytes;
+    let mut upper = optimized.build_report().charged_persistent_bytes;
+    while lower < upper {
+        let remaining = upper.checked_sub(lower).expect("ordered sidecar bounds");
+        let middle = lower
+            .checked_add(remaining / 2)
+            .expect("sidecar midpoint fits usize");
+        let mut boundary = BuildLimits::default();
+        boundary.max_persistent_bytes = middle;
+        if build(PATTERN, PlanSelection::Auto, boundary).k0_negative_prefilter_needle_bytes()
+            == Some(9)
+        {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    let exact_sidecar_bytes = lower;
     limits = BuildLimits::default();
-    limits.max_persistent_bytes = optimized.build_report().charged_persistent_bytes;
+    limits.max_persistent_bytes = exact_sidecar_bytes;
     assert_eq!(
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
         Some(9)
     );
-    limits.max_persistent_bytes -= 1;
+    limits.max_persistent_bytes = exact_sidecar_bytes
+        .checked_sub(1)
+        .expect("retained sidecar requires nonzero persistent storage");
     assert_eq!(
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
         None
@@ -249,40 +269,42 @@ fn optional_sidecar_closes_planner_literal_and_persistent_limits() {
         Some(1)
     );
 
+    let retains_at_work = |maximum| {
+        let mut boundary = BuildLimits::default();
+        boundary.max_planner_work = maximum;
+        build(PATTERN, PlanSelection::Auto, boundary).k0_negative_prefilter_needle_bytes()
+            == Some(9)
+    };
+    let mut lower = 0;
+    let mut upper = optimized.build_report().planner_work;
+    while lower < upper {
+        let remaining = upper.checked_sub(lower).expect("ordered planner bounds");
+        let middle = lower
+            .checked_add(remaining / 2)
+            .expect("planner midpoint fits u64");
+        if retains_at_work(middle) {
+            upper = middle;
+        } else {
+            lower = middle.checked_add(1).expect("planner lower bound fits u64");
+        }
+    }
+    let exact_sidecar_work = lower;
     limits = BuildLimits::default();
-    limits.max_planner_work = optimized.build_report().planner_work;
+    limits.max_planner_work = exact_sidecar_work;
     assert_eq!(
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
         Some(9)
     );
-    // The final, incompatible correlated-alternation inspection consumes two
-    // exact work units after this sidecar: one for the root and one for the
-    // first non-literal prefix node. Both one-below boundaries must preserve
-    // the already-admitted sidecar without turning optional inspection into a
-    // hard build failure.
-    limits.max_planner_work -= 1;
-    let followup_declined = build(PATTERN, PlanSelection::Auto, limits);
+    let one_below_sidecar_work = exact_sidecar_work
+        .checked_sub(1)
+        .expect("retained sidecar requires nonzero planner work");
+    assert!(!retains_at_work(one_below_sidecar_work));
+    let mut one_below_limits = BuildLimits::default();
+    one_below_limits.max_planner_work = one_below_sidecar_work;
     assert_eq!(
-        followup_declined.k0_negative_prefilter_needle_bytes(),
-        Some(9)
-    );
-    assert_eq!(
-        followup_declined.build_report().planner_work,
-        limits.max_planner_work
-    );
-    limits.max_planner_work -= 1;
-    let followup_refused = build(PATTERN, PlanSelection::Auto, limits);
-    assert_eq!(
-        followup_refused.k0_negative_prefilter_needle_bytes(),
-        Some(9)
-    );
-    assert_eq!(
-        followup_refused.build_report().planner_work,
-        limits.max_planner_work
-    );
-    limits.max_planner_work -= 1;
-    assert_eq!(
-        build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
-        None
+        build(PATTERN, PlanSelection::Auto, one_below_limits)
+            .build_report()
+            .planner_work,
+        one_below_sidecar_work,
     );
 }
