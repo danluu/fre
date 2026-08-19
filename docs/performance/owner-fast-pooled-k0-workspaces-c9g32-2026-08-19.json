@@ -1,0 +1,124 @@
+{
+  "schema": "fre.performance.owner-fast-pooled-k0-workspaces.c9g32.v1",
+  "date": "2026-08-19",
+  "ratio_direction": "reference_over_fre; values above 1 mean FRE is faster",
+  "change": {
+    "feature_commit": "4c06a7fff13fc8af5e87d04530fa47eb336d34d6",
+    "feature_tree": "fb91f0de7fc9210db0092b592913fa1e18d868bb",
+    "tested_source_commit": "574ceb3da1b1dc807182198dede5396294e19f85",
+    "tested_source_tree": "088ca92e24e29de07cdcd69cc467469f311b5555",
+    "summary": "The automatic portable K0 workspace pool uses a same-thread owner fast path, a bounded fallback lane for non-owner or reentrant use, and transient workspaces on concurrent misses."
+  },
+  "environment": {
+    "instance_type": "AWS EC2 c9g.8xlarge Spot",
+    "availability_zone": "us-east-1c",
+    "architecture": "aarch64 Neoverse V3",
+    "logical_cpus": 32,
+    "candidate_target": "neoverse-v2",
+    "rustc": "1.93.0",
+    "rust_regex": "1.12.4",
+    "re2": "2025-11-05"
+  },
+  "artifacts": {
+    "external_compact_archive": "fre-owner-fast-pool-574ceb3d-c9g32-results.tar.gz",
+    "external_compact_archive_sha256": "f3f9db2b6fe47c19796ea2049e01c0a0364d8a6d3755eae5ae738de3d5b2c174",
+    "holdout_summary_sha256": "d849a3bf2f9acfa52c8858a7913d3078496c5ad91e789e8ad9affe276c248dec",
+    "holdout_correctness_sha256": "1a37d6070979155b3ee684cc3c32d378e90c93d4a59820b2cab1f2f00cb2c4aa",
+    "rebar_analysis_sha256": "3b72b9a575bd8510235afad444338db61a1ff030e28bcc7782103770423cf752",
+    "rebar_points_sha256": "5a1079463bacfbb98fb61d3db4309fe529a0d5864d5d9ebbf14ff5a66927b697",
+    "rebar_report_sha256": "58be8d34b495a7e15c020f1001ece4baf12bc635ab33202e6065f8bbb04694dc"
+  },
+  "holdout": {
+    "suite_id": "fre-non-rebar-holdout-2026-07-14-v1",
+    "performance_schema": "fre.holdout.performance.v3",
+    "correctness": {
+      "fre_pass": 1014,
+      "rust_regex_exact_pass": 507,
+      "re2_exact_pass": 507
+    },
+    "warmups_per_input": 3,
+    "measurements_per_input": 9,
+    "sample_count": 36846,
+    "current": {
+      "rust_regex": {
+        "primary_common_api_geomean": 0.5507426214164807,
+        "hot_primary_geomean": 0.5330719623304147,
+        "one_shot_primary_geomean": 0.5689990404272873,
+        "all_operation_hot_search_geomean": 0.5477538753732969
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.4121488288128924,
+        "hot_primary_geomean": 0.9969462601058207,
+        "one_shot_primary_geomean": 0.17038697459360383,
+        "all_operation_hot_search_geomean": 1.0299835383602225
+      }
+    },
+    "prior_automatic_pool_c9g_run": {
+      "commit": "176252757328ff88d1b1a8fd38b892b908eef925",
+      "correctness_sha256": "1a37d6070979155b3ee684cc3c32d378e90c93d4a59820b2cab1f2f00cb2c4aa",
+      "rust_regex": {
+        "primary_common_api_geomean": 0.5065737974552169,
+        "hot_primary_geomean": 0.44756620841032907,
+        "one_shot_primary_geomean": 0.5733610077035406,
+        "all_operation_hot_search_geomean": 0.462286924000399
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.3798032310269564,
+        "hot_primary_geomean": 0.8433269499071128,
+        "one_shot_primary_geomean": 0.1710493116749132,
+        "all_operation_hot_search_geomean": 0.8750024589578079
+      }
+    },
+    "relative_change_percent": {
+      "rust_regex_primary_common_api": 8.719129213383447,
+      "rust_regex_hot_primary": 19.104604483834,
+      "rust_regex_one_shot_primary": -0.7607715239869695,
+      "re2_primary_common_api": 8.51640932555422,
+      "re2_hot_primary": 18.215866363055056,
+      "re2_one_shot_primary": -0.38721996295908445
+    }
+  },
+  "rebar": {
+    "sampling": "one adjacent pair per point; descriptive only",
+    "prepared_points": 1220,
+    "executed_points": 1152,
+    "preflight_exclusions": 68,
+    "arms": 2304,
+    "timing_errors": 0,
+    "ab_points": 576,
+    "ba_points": 576,
+    "current_geomean": {
+      "overall": 2.172795845046878,
+      "rust_regex": 1.3892771390721406,
+      "re2": 3.7779893527769537
+    },
+    "prior_automatic_pool_c9g_run_geomean": {
+      "commit": "176252757328ff88d1b1a8fd38b892b908eef925",
+      "overall": 2.1770348090931,
+      "rust_regex": 1.3867879250229591,
+      "re2": 3.802922625806944
+    },
+    "relative_change_percent": {
+      "overall": -0.19471273626477936,
+      "rust_regex": 0.17949493244544534,
+      "re2": -0.6556345075440451
+    }
+  },
+  "validation": {
+    "rebar_library_tests": {
+      "passed": 288,
+      "failed": 0,
+      "ignored": 24
+    },
+    "holdout_unit_tests": 7,
+    "holdout_frozen_suite_tests": 4
+  },
+  "limitations": [
+    "The before and after values came from independent c9g.8xlarge instances and source revisions, not a randomized same-host A/B.",
+    "The tested source follows the owner-fast feature commit with test-only stack fixes and holdout test/receipt maintenance; the exact tested commit and tree are recorded separately.",
+    "Rebar uses one pair per point, so its ratios are descriptive and do not estimate variance or confidence intervals.",
+    "The first Rebar attempt stopped before build or timing because the deployed comparator tree was pruned; the successful fresh retry authenticated and hashed the required runtime binaries, receipts, and manifest rather than replaying the unavailable whole-tree manifest.",
+    "The compact archive omits build executables; 52 remaining holdout manifest entries match, while the packaged driver log has one final COMPLETE line appended after the manifest captured its earlier content.",
+    "AOT was not rerun because this change affects the normal portable K0 workspace pool rather than AOT execution."
+  ]
+}
