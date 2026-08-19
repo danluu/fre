@@ -9420,28 +9420,20 @@ impl PortableK0Plan {
                 // A measured losing sidecar may have filled endpoint-oriented
                 // reverse rows or saturated optional caches that are actively
                 // unhelpful to the ordinary forward incumbent. Transactionally
-                // replace that private workspace while its shared slot is
-                // empty. If bounded replacement allocation is unavailable,
-                // return the old workspace so an optional acceleration cannot
-                // create a new allocation-failure opportunity for fallback.
+                // replace that private workspace through its original pool
+                // return route. The replacement is constructed fresh rather
+                // than borrowed from another warm lane. If bounded replacement
+                // allocation is unavailable, return the old workspace so an
+                // optional acceleration cannot create a new allocation-failure
+                // opportunity for fallback.
                 // Successful and unmeasured sidecars retain their warm session.
                 if execution.transient_loss {
-                    match self.automaton.try_checkout_pooled_search_session(
+                    self.automaton.refresh_pooled_search_session(
+                        session,
                         SearchSessionLimits::default(),
                         true,
                         true,
-                    ) {
-                        Ok(Some(replacement)) => {
-                            self.automaton.return_pooled_search_session(replacement)?;
-                        }
-                        Ok(None) => {
-                            self.automaton.return_pooled_search_session(session)?;
-                        }
-                        Err(error) => {
-                            self.automaton.return_pooled_search_session(session)?;
-                            return Err(error);
-                        }
-                    }
+                    )?;
                 } else {
                     self.automaton.return_pooled_search_session(session)?;
                 }

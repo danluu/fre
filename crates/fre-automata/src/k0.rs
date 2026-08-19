@@ -27,7 +27,8 @@ use crate::{
     },
     plan::{
         BoundaryContextClassifier, ByteSet, StartAsciiClassifier, StartByteSetClassifier,
-        StartFilterProof, StartFilterProofCell, StartFilterPublication, StartPositionClass,
+        PooledWorkspaceCheckout, PooledWorkspaceReturn, StartFilterProof, StartFilterProofCell,
+        StartFilterPublication, StartPositionClass,
         StartPositionFilter, StartPositionProbe, StartPositionScanner, StartScanner,
         BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
         BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_RANGE_DETECTION_WORK,
@@ -7262,6 +7263,7 @@ pub struct K0SearchSession<'a> {
     capabilities: LazyCapabilities,
     span_start_proof: SpanCursorStartProof,
     root_run: Option<RootRunDescriptor>,
+    pooled_return: Option<PooledWorkspaceReturn<'a>>,
 }
 
 /// Private limits for authenticating one positive match endpoint.
@@ -9486,7 +9488,7 @@ impl<'a> K0SearchSession<'a> {
     /// transition state; invocation cursors are reset by the called search.
     pub(crate) fn from_pooled_workspace(
         automaton: &'a Automaton,
-        workspace: K0Workspace,
+        workspace: PooledWorkspaceCheckout<'a>,
     ) -> Result<Self, SearchError> {
         if workspace.bound_automaton_identity != automaton.identity()
             || workspace.lazy.is_allocated() && !workspace.lazy.is_bound_to(automaton)
@@ -9501,19 +9503,48 @@ impl<'a> K0SearchSession<'a> {
             reverse: workspace.reverse.is_allocated(),
             contextual: automaton.stats().assertion_edges() != 0,
         };
+        let (workspace, pooled_return) = workspace.into_session_parts();
         Ok(Self {
             automaton,
             workspace,
             capabilities,
             span_start_proof: retained_span_cursor_start_proof(automaton),
             root_run: None,
+            pooled_return: Some(pooled_return),
         })
     }
 
-    /// Recover the source-independent workspace after a pooled facade
-    /// operation succeeds or declines transactionally.
-    pub(crate) fn into_pooled_workspace(self) -> K0Workspace {
-        self.workspace
+    /// Recover the source-independent workspace after a facade operation.
+    /// A pooled session returns through its original route; an explicit session
+    /// is adopted only if this automaton already has a compatible pool.
+    pub(crate) fn commit_pooled_workspace(self) {
+        let Self {
+            automaton,
+            workspace,
+            pooled_return,
+            ..
+        } = self;
+        match pooled_return {
+            Some(pooled_return) => pooled_return.commit(workspace),
+            None => automaton.adopt_unleased_pooled_workspace(workspace),
+        }
+    }
+
+    /// Replace this transaction's workspace while preserving its exact
+    /// owner/fallback return route. The old workspace is discarded; only the
+    /// freshly constructed replacement becomes reusable.
+    pub(crate) fn commit_fresh_pooled_workspace(self, fresh: K0Workspace) {
+        let Self {
+            automaton,
+            workspace: old,
+            pooled_return,
+            ..
+        } = self;
+        drop(old);
+        match pooled_return {
+            Some(pooled_return) => pooled_return.commit(fresh),
+            None => automaton.adopt_unleased_pooled_workspace(fresh),
+        }
     }
 
     /// Select and construct the best admitted reusable workspace tier.
@@ -9591,6 +9622,7 @@ impl<'a> K0SearchSession<'a> {
             capabilities,
             span_start_proof: retained_span_cursor_start_proof(automaton),
             root_run,
+            pooled_return: None,
         })
     }
 
@@ -9643,6 +9675,7 @@ impl<'a> K0SearchSession<'a> {
                 capabilities,
                 span_start_proof: retained_span_cursor_start_proof(automaton),
                 root_run: None,
+                pooled_return: None,
             })
         };
 

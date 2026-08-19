@@ -668,8 +668,37 @@ impl Automaton {
                 detail: "pooled K0 session belongs to another automaton",
             });
         }
-        self.return_pooled_workspace(session.into_pooled_workspace());
+        session.commit_pooled_workspace();
         Ok(())
+    }
+
+    /// Replace a successfully checked-out facade session with genuinely fresh
+    /// selected scratch. Refusal or construction failure restores the old
+    /// session through its original return route and remains an optional
+    /// decline.
+    #[doc(hidden)]
+    pub fn refresh_pooled_search_session(
+        &self,
+        session: K0SearchSession<'_>,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<(), SearchError> {
+        if !session.is_bound_to(self) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "pooled K0 session belongs to another automaton",
+            });
+        }
+        match self.try_new_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional) {
+            Ok(Some(fresh)) => {
+                session.commit_fresh_pooled_workspace(fresh);
+                Ok(())
+            }
+            Ok(None) | Err(_) => {
+                session.commit_pooled_workspace();
+                Ok(())
+            }
+        }
     }
 
     /// Search for existence through the automaton-owned optional value-only
@@ -721,7 +750,7 @@ impl Automaton {
                     self,
                     haystack,
                     window,
-                    &mut checkout.workspace,
+                    &mut checkout,
                     limits,
                     setup,
                 )
@@ -730,12 +759,12 @@ impl Automaton {
                 self,
                 haystack,
                 window,
-                &mut checkout.workspace,
+                &mut checkout,
                 limits,
             ),
         };
         if result.is_ok() {
-            self.return_pooled_workspace(checkout.workspace);
+            checkout.commit();
         }
         result.map(Some)
     }
@@ -786,7 +815,7 @@ impl Automaton {
                     self,
                     haystack,
                     window,
-                    &mut checkout.workspace,
+                    &mut checkout,
                     limits,
                     setup,
                 )
@@ -795,12 +824,12 @@ impl Automaton {
                 self,
                 haystack,
                 window,
-                &mut checkout.workspace,
+                &mut checkout,
                 limits,
             ),
         };
         if result.is_ok() {
-            self.return_pooled_workspace(checkout.workspace);
+            checkout.commit();
         }
         result.map(Some)
     }
@@ -844,7 +873,7 @@ impl Automaton {
             .end()
             .saturating_sub(verifier_window.start());
         let Some(max_work) = session.positive_end_verifier_work_certificate(verifier_bytes) else {
-            self.return_pooled_workspace(session.into_pooled_workspace());
+            session.commit_pooled_workspace();
             return Ok(None);
         };
         let verification = session.try_positive_match_ending_at(
@@ -855,7 +884,7 @@ impl Automaton {
         );
         match verification {
             Ok(verification) => {
-                self.return_pooled_workspace(session.into_pooled_workspace());
+                session.commit_pooled_workspace();
                 match verification.outcome() {
                     crate::K0PositiveEndOutcome::Matched => Ok(Some(true)),
                     crate::K0PositiveEndOutcome::Rejected => Ok(Some(false)),
@@ -906,7 +935,7 @@ impl Automaton {
             .end()
             .saturating_sub(verifier_window.start());
         let Some(max_work) = session.positive_end_verifier_work_certificate(verifier_bytes) else {
-            self.return_pooled_workspace(session.into_pooled_workspace());
+            session.commit_pooled_workspace();
             return Ok(None);
         };
         let verification = session.try_earliest_start_ending_at(
@@ -917,7 +946,7 @@ impl Automaton {
         );
         match verification {
             Ok(verification) => {
-                self.return_pooled_workspace(session.into_pooled_workspace());
+                session.commit_pooled_workspace();
                 match verification.outcome() {
                     crate::K0PositiveEndStartOutcome::Matched { start } => {
                         Ok(Some(Some(MatchSpan::new(start, window.end()))))

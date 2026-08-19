@@ -1,9 +1,14 @@
-use core::{marker::PhantomData, mem::size_of, ops::Deref};
+use core::{
+    marker::PhantomData,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
 };
 
+use fre_exact_alloc::{ThreadOwnerGuard, ThreadOwnerSlot};
 use fre_simd_kernels::{
     AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetNonMemberScanner,
     AsciiSelection, ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK,
@@ -1120,10 +1125,10 @@ fn try_start_filter_proof_owner(proof: &StartFilterProof) -> Option<Box<[StartFi
 #[derive(Debug)]
 pub struct Automaton {
     identity: u64,
-    // Value-only ordinary searches may retain one reusable workspace here.
-    // Diagnostic/accounting searches never use it. A short mutex protects
-    // checkout/return only; K0 execution happens outside the lock.
-    pub(crate) pooled_workspace: OnceLock<Box<Mutex<Option<K0Workspace>>>>,
+    // Value-only ordinary searches may retain one owner-fast workspace and
+    // one non-owner fallback. Diagnostic/accounting searches never use them.
+    // Execution happens outside the fallback mutex.
+    pub(crate) pooled_workspace: OnceLock<Box<PooledWorkspacePool>>,
     pub(crate) start: u32,
     pub(crate) roles: Box<[StateRole]>,
     pub(crate) edge_offsets: Box<[u32]>,
@@ -1146,9 +1151,170 @@ pub struct Automaton {
 /// finite first search can charge that setup before touching the source. A
 /// warm checkout carries no setup because an earlier successful invocation
 /// retained the workspace.
-pub(crate) struct PooledWorkspaceCheckout {
-    pub(crate) workspace: K0Workspace,
+#[derive(Debug)]
+pub(crate) struct PooledWorkspacePool {
+    // Each lane's payload is admitted independently under one invocation's
+    // WorkspaceLimits. At quiescence the pool may retain two such payloads;
+    // the fixed inline storage for both lanes is charged at publication.
+    owner: ThreadOwnerSlot<K0Workspace>,
+    fallback: Mutex<Option<K0Workspace>>,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the fallback workspace would add an allocation and owner hot calls never move this enum"
+)]
+enum PooledWorkspaceStorage<'a> {
+    Owner(ThreadOwnerGuard<'a, K0Workspace>),
+    Owned {
+        workspace: Option<K0Workspace>,
+        return_to: Option<&'a PooledWorkspacePool>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum PooledWorkspaceReturn<'a> {
+    Owner(ThreadOwnerGuard<'a, K0Workspace>),
+    Pool(Option<&'a PooledWorkspacePool>),
+}
+
+/// One transactional checkout from the automaton-owned value cache.
+///
+/// The fast owner borrows its workspace in place. Other callers move a
+/// workspace out of the fallback slot while executing, so they never hold
+/// the mutex during a search. Dropping a transaction discards its workspace;
+/// callers explicitly commit only after successful execution.
+#[derive(Debug)]
+pub(crate) struct PooledWorkspaceCheckout<'a> {
+    storage: PooledWorkspaceStorage<'a>,
     pub(crate) cold_setup: Option<SetupAccounting>,
+}
+
+impl PooledWorkspacePool {
+    fn with_owner(workspace: K0Workspace) -> Self {
+        Self {
+            owner: ThreadOwnerSlot::with_current_owner(workspace),
+            fallback: Mutex::new(None),
+        }
+    }
+
+    fn into_owner_workspace(self) -> Option<K0Workspace> {
+        self.owner.into_value()
+    }
+
+    fn take_fallback(&self) -> Option<K0Workspace> {
+        self.fallback.lock().ok()?.take()
+    }
+
+    fn return_workspace(&self, workspace: K0Workspace) {
+        let workspace = match self.owner.try_checkout() {
+            Some(mut owner) if owner.value().is_none() => {
+                match owner.try_insert(workspace) {
+                    Ok(()) => {
+                        owner.commit();
+                        return;
+                    }
+                    Err(workspace) => {
+                        owner.commit();
+                        workspace
+                    }
+                }
+            }
+            Some(owner) => {
+                owner.commit();
+                workspace
+            }
+            None => workspace,
+        };
+        if let Ok(mut fallback) = self.fallback.lock() {
+            if fallback.is_none() {
+                *fallback = Some(workspace);
+            }
+        }
+    }
+}
+
+impl PooledWorkspaceReturn<'_> {
+    pub(crate) fn commit(self, workspace: K0Workspace) {
+        match self {
+            Self::Owner(mut owner) => {
+                owner
+                    .try_insert(workspace)
+                    .expect("empty owner return token accepts its workspace");
+                owner.commit();
+            }
+            Self::Pool(Some(pool)) => pool.return_workspace(workspace),
+            Self::Pool(None) => {}
+        }
+    }
+}
+
+impl<'a> PooledWorkspaceCheckout<'a> {
+    pub(crate) fn commit(self) {
+        match self.storage {
+            PooledWorkspaceStorage::Owner(owner) => owner.commit(),
+            PooledWorkspaceStorage::Owned {
+                mut workspace,
+                return_to: Some(pool),
+            } => pool.return_workspace(
+                workspace
+                    .take()
+                    .expect("live pooled transaction retains its workspace"),
+            ),
+            PooledWorkspaceStorage::Owned { .. } => {}
+        }
+    }
+
+    pub(crate) fn into_session_parts(
+        self,
+    ) -> (K0Workspace, PooledWorkspaceReturn<'a>) {
+        match self.storage {
+            PooledWorkspaceStorage::Owner(mut owner) => {
+                let workspace = owner
+                    .take()
+                    .expect("owner checkout is populated before session conversion");
+                (workspace, PooledWorkspaceReturn::Owner(owner))
+            }
+            PooledWorkspaceStorage::Owned {
+                mut workspace,
+                return_to,
+            } => (
+                workspace
+                    .take()
+                    .expect("live pooled transaction retains its workspace"),
+                PooledWorkspaceReturn::Pool(return_to),
+            ),
+        }
+    }
+}
+
+impl Deref for PooledWorkspaceCheckout<'_> {
+    type Target = K0Workspace;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.storage {
+            PooledWorkspaceStorage::Owner(owner) => {
+                owner.value().expect("owner checkout is populated")
+            }
+            PooledWorkspaceStorage::Owned { workspace, .. } => workspace
+                .as_ref()
+                .expect("live pooled transaction retains its workspace"),
+        }
+    }
+}
+
+impl DerefMut for PooledWorkspaceCheckout<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.storage {
+            PooledWorkspaceStorage::Owner(owner) => owner
+                .value_mut()
+                .expect("owner checkout is populated"),
+            PooledWorkspaceStorage::Owned { workspace, .. } => workspace
+                .as_mut()
+                .expect("live pooled transaction retains its workspace"),
+        }
+    }
 }
 
 impl Clone for Automaton {
@@ -1193,7 +1359,7 @@ impl Automaton {
     const POOLED_WORKSPACE_OWNER_PUBLICATION_WORK: u64 = 1;
 
     const fn pooled_workspace_owner_bytes() -> usize {
-        size_of::<Mutex<Option<K0Workspace>>>()
+        size_of::<PooledWorkspacePool>()
     }
 
     fn pooled_workspace_payload_limits(limits: WorkspaceLimits) -> Option<WorkspaceLimits> {
@@ -1224,43 +1390,109 @@ impl Automaton {
             && layout.logical_bytes() <= limits.max_scratch_bytes)
     }
 
+    /// Construct a genuinely fresh selected workspace under the same payload
+    /// envelope used by the automaton-owned pool. This deliberately does not
+    /// inspect either retained lane: callers use it to replace a workspace
+    /// whose adaptive state proved counterproductive without recycling warm
+    /// state from the other lane.
+    pub(crate) fn try_new_pooled_workspace(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<K0Workspace>, SearchError> {
+        let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
+            return Ok(None);
+        };
+        if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+            return Ok(None);
+        }
+        K0Workspace::new_selected(
+            self,
+            payload_limits,
+            endpoint_eligible,
+            bidirectional,
+        )
+        .map(Some)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fallible cold publication and both warm lanes share one exact accounting transaction"
+    )]
     fn try_checkout_pooled_workspace_with<A>(
         &self,
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
         bidirectional: bool,
         allocate_owner: A,
-    ) -> Result<Option<PooledWorkspaceCheckout>, SearchError>
+    ) -> Result<Option<PooledWorkspaceCheckout<'_>>, SearchError>
     where
         A: FnOnce(
-            Mutex<Option<K0Workspace>>,
+            PooledWorkspacePool,
         ) -> Result<
-            Box<Mutex<Option<K0Workspace>>>,
-            (fre_exact_alloc::CopyError, Mutex<Option<K0Workspace>>),
+            Box<PooledWorkspacePool>,
+            (fre_exact_alloc::CopyError, PooledWorkspacePool),
         >,
     {
         let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
             return Ok(None);
         };
-        if let Some(owner) = self.pooled_workspace.get() {
-            let Ok(mut slot) = owner.lock() else {
-                return Ok(None);
-            };
-            if let Some(workspace) = slot.take() {
+        if let Some(pool) = self.pooled_workspace.get() {
+            if let Some(mut owner) = pool.owner.try_checkout() {
+                if owner.value().is_none() {
+                    if let Some(workspace) = pool.take_fallback() {
+                        owner
+                            .try_insert(workspace)
+                            .expect("empty owner accepts promoted fallback workspace");
+                    }
+                }
+                if let Some(workspace) = owner.value() {
+                    if Self::pooled_workspace_fits(workspace, limits) {
+                        return Ok(Some(PooledWorkspaceCheckout {
+                            storage: PooledWorkspaceStorage::Owner(owner),
+                            cold_setup: None,
+                        }));
+                    }
+                    owner.commit();
+                    return Ok(None);
+                }
+                if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+                    return Ok(None);
+                }
+                let workspace = K0Workspace::new_selected(
+                    self,
+                    payload_limits,
+                    endpoint_eligible,
+                    bidirectional,
+                )?;
+                let cold_setup = workspace.construction_accounting();
+                owner
+                    .try_insert(workspace)
+                    .expect("empty owner accepts newly constructed workspace");
+                return Ok(Some(PooledWorkspaceCheckout {
+                    storage: PooledWorkspaceStorage::Owner(owner),
+                    cold_setup: Some(cold_setup),
+                }));
+            }
+
+            if let Some(workspace) = pool.take_fallback() {
                 if Self::pooled_workspace_fits(&workspace, limits) {
                     return Ok(Some(PooledWorkspaceCheckout {
-                        workspace,
+                        storage: PooledWorkspaceStorage::Owned {
+                            workspace: Some(workspace),
+                            return_to: Some(pool),
+                        },
                         cold_setup: None,
                     }));
                 }
-                *slot = Some(workspace);
+                pool.return_workspace(workspace);
                 return Ok(None);
             }
-            drop(slot);
             // The optional selected session may have a tighter setup envelope
             // than the canonical one-shot call. Decline before allocating
             // when even its mandatory Pike layout cannot fit; a populated hot
-            // slot above never recomputes this cold layout.
+            // lane above never recomputes this cold layout.
             if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
                 return Ok(None);
             }
@@ -1270,9 +1502,13 @@ impl Automaton {
                 endpoint_eligible,
                 bidirectional,
             )?;
+            let cold_setup = workspace.construction_accounting();
             return Ok(Some(PooledWorkspaceCheckout {
-                cold_setup: Some(workspace.construction_accounting()),
-                workspace,
+                storage: PooledWorkspaceStorage::Owned {
+                    workspace: Some(workspace),
+                    return_to: Some(pool),
+                },
+                cold_setup: Some(cold_setup),
             }));
         }
 
@@ -1286,25 +1522,35 @@ impl Automaton {
         }
         let workspace =
             K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)?;
-        let owner = match allocate_owner(Mutex::new(None)) {
+        let cold_setup = workspace.construction_accounting();
+        let owner = match allocate_owner(PooledWorkspacePool::with_owner(workspace)) {
             Ok(owner) => owner,
             Err((_error, owner)) => {
-                drop(owner);
                 // Workspace construction has already consumed the caller's
                 // finite setup transaction. Execute this exact workspace
                 // uncached instead of declining into a second construction.
                 return Ok(Some(PooledWorkspaceCheckout {
-                    cold_setup: Some(workspace.construction_accounting()),
-                    workspace,
+                    storage: PooledWorkspaceStorage::Owned {
+                        workspace: owner.into_owner_workspace(),
+                        return_to: None,
+                    },
+                    cold_setup: Some(cold_setup),
                 }));
             }
         };
-        // Publish an empty slot while returning the fully constructed
-        // workspace to this invocation. Concurrent first users keep their own
-        // bounded workspace; only a successful search later wins the slot.
-        let cold_setup = workspace.construction_accounting();
+        // The constructing thread reserves the initial owner value before
+        // publication, so another thread cannot steal this invocation's
+        // already-charged workspace after the OnceLock becomes visible.
         match self.pooled_workspace.set(owner) {
             Ok(()) => {
+                let pool = self
+                    .pooled_workspace
+                    .get()
+                    .expect("successful publication is immediately visible");
+                let owner = pool
+                    .owner
+                    .try_checkout()
+                    .expect("publishing thread retains its initial reservation");
                 let owner_bytes = Self::pooled_workspace_owner_bytes();
                 let cold_setup = SetupAccounting {
                     work: cold_setup
@@ -1334,14 +1580,21 @@ impl Automaton {
                     reused: false,
                 };
                 Ok(Some(PooledWorkspaceCheckout {
-                    workspace,
+                    storage: PooledWorkspaceStorage::Owner(owner),
                     cold_setup: Some(cold_setup),
                 }))
             }
             Err(owner) => {
-                drop(owner);
+                let workspace = owner.into_owner_workspace();
+                let pool = self
+                    .pooled_workspace
+                    .get()
+                    .expect("publication loser observes the winning pool");
                 Ok(Some(PooledWorkspaceCheckout {
-                    workspace,
+                    storage: PooledWorkspaceStorage::Owned {
+                        workspace,
+                        return_to: Some(pool),
+                    },
                     cold_setup: Some(cold_setup),
                 }))
             }
@@ -1351,18 +1604,15 @@ impl Automaton {
     /// Check out or fallibly create the optional scratch used only by an
     /// ordinary value-only facade search.
     ///
-    /// The mutex is held only while moving the workspace out of its slot.
-    /// Concurrent searches therefore create independent bounded workspaces
-    /// instead of serializing execution. A poisoned owner or workspace
-    /// construction failure declines this legacy optional acceleration. If
-    /// only owner allocation fails after workspace construction, the already
-    /// charged workspace is returned for one uncached execution.
+    /// The owner thread borrows its workspace in place without locking or
+    /// moving it. A non-owner caller moves a workspace out of the fallback
+    /// slot, and concurrent misses construct independent bounded workspaces.
     pub(crate) fn try_checkout_pooled_workspace(
         &self,
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
         bidirectional: bool,
-    ) -> Option<K0Workspace> {
+    ) -> Option<PooledWorkspaceCheckout<'_>> {
         self.try_checkout_pooled_workspace_with(
             limits,
             endpoint_eligible,
@@ -1371,7 +1621,6 @@ impl Automaton {
         )
         .ok()
         .flatten()
-        .map(|checkout| checkout.workspace)
     }
 
     /// Check out optional value-only scratch while preserving whether this
@@ -1382,7 +1631,7 @@ impl Automaton {
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
         bidirectional: bool,
-    ) -> Result<Option<PooledWorkspaceCheckout>, SearchError> {
+    ) -> Result<Option<PooledWorkspaceCheckout<'_>>, SearchError> {
         self.try_checkout_pooled_workspace_with(
             limits,
             endpoint_eligible,
@@ -1391,17 +1640,12 @@ impl Automaton {
         )
     }
 
-    /// Return a successfully used value-only scratch workspace when its slot
-    /// is empty. A concurrent winner keeps the slot; the excess workspace is
-    /// dropped. A poisoned owner is never reused.
-    pub(crate) fn return_pooled_workspace(&self, workspace: K0Workspace) {
-        let Some(owner) = self.pooled_workspace.get() else {
-            return;
-        };
-        if let Ok(mut slot) = owner.lock() {
-            if slot.is_none() {
-                *slot = Some(workspace);
-            }
+    /// Adopt a successfully used unleased workspace when this automaton
+    /// already owns a pool. Explicit sessions can cross the hidden facade
+    /// return boundary, so their lack of a checkout token must not panic.
+    pub(crate) fn adopt_unleased_pooled_workspace(&self, workspace: K0Workspace) {
+        if let Some(pool) = self.pooled_workspace.get() {
+            pool.return_workspace(workspace);
         }
     }
 
@@ -2348,9 +2592,10 @@ fn validate_offsets(offsets: &[u32], edges: usize) -> Result<(), CompileError> {
 #[cfg(test)]
 mod tests {
     use core::mem::size_of;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::{Exists, SearchLimits, SearchWindow};
+    use crate::{Exists, K0SearchSession, SearchLimits, SearchWindow};
 
     fn raw_ranges(ranges: &[(u8, u8)]) -> RawPlan {
         let edges = u32::try_from(ranges.len()).expect("focused edge count fits u32");
@@ -2602,6 +2847,20 @@ mod tests {
             one_below_owner.pooled_workspace.get().is_none(),
             "resource refusal must not retain an empty owner",
         );
+        let one_below_work = compile_ranges(&[(b'a', b'a')]);
+        assert!(
+            one_below_work
+                .try_checkout_pooled_workspace(
+                    WorkspaceLimits {
+                        max_setup_work: limits.max_setup_work - 1,
+                        ..limits
+                    },
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+        assert!(one_below_work.pooled_workspace.get().is_none());
         assert_eq!(
             one_below_owner
                 .prepare::<Exists>()
@@ -2616,20 +2875,235 @@ mod tests {
             .try_checkout_pooled_workspace(limits, false, false)
             .expect("exact aggregate owner and payload limits admit");
         assert!(exact.pooled_workspace.get().is_some());
-        exact.return_pooled_workspace(admitted);
+        admitted.commit();
+        let pool = exact.pooled_workspace.get().unwrap();
+        let owner = pool
+            .owner
+            .try_checkout()
+            .expect("publishing thread is the fast-path owner");
+        assert!(owner.value().is_some());
+        owner.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_owner_and_nonowner_use_distinct_nonserial_lanes() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<Automaton>();
+
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let owner = automaton
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("first caller constructs the owner lane");
+        assert!(matches!(
+            &owner.storage,
+            PooledWorkspaceStorage::Owner(_)
+        ));
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let fallback = automaton
+                        .try_checkout_pooled_workspace(
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .expect("nonowner constructs a bounded fallback lane");
+                    assert!(matches!(
+                        &fallback.storage,
+                        PooledWorkspaceStorage::Owned { .. }
+                    ));
+                    fallback.commit();
+                })
+                .join()
+                .unwrap();
+        });
+        owner.commit();
+
+        let owner = automaton
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("original owner remains the fast path");
+        assert!(matches!(
+            &owner.storage,
+            PooledWorkspaceStorage::Owner(_)
+        ));
+        owner.commit();
         assert!(
-            exact
+            automaton
                 .pooled_workspace
                 .get()
                 .unwrap()
+                .fallback
                 .lock()
                 .unwrap()
-                .is_some()
+                .is_some(),
+            "nonowner scratch remains available without displacing the owner",
         );
     }
 
     #[test]
-    fn pooled_workspace_owner_failure_poison_and_plan_mutation_fail_closed() {
+    fn pooled_workspace_cold_publication_race_preserves_both_return_lanes() {
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let publish = Arc::new(Barrier::new(2));
+        let checked_out = Arc::new(Barrier::new(2));
+        let lanes = std::thread::scope(|scope| {
+            let automaton = &automaton;
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let publish = Arc::clone(&publish);
+                    let checked_out = Arc::clone(&checked_out);
+                    scope.spawn(move || {
+                        let checkout = automaton
+                            .try_checkout_pooled_workspace_with(
+                                WorkspaceLimits::unlimited(),
+                                true,
+                                true,
+                                move |owner| {
+                                    publish.wait();
+                                    fre_exact_alloc::try_box_preserve(owner)
+                                },
+                            )
+                            .expect("racing workspace construction succeeds")
+                            .expect("racing checkout remains admitted");
+                        let is_owner = matches!(
+                            &checkout.storage,
+                            PooledWorkspaceStorage::Owner(_)
+                        );
+                        checked_out.wait();
+                        checkout.commit();
+                        is_owner
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(lanes.iter().filter(|&&owner| owner).count(), 1);
+        assert_eq!(lanes.iter().filter(|&&owner| !owner).count(), 1);
+        let pool = automaton.pooled_workspace.get().unwrap();
+        assert!(pool.fallback.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn pooled_workspace_and_session_discards_rebuild_each_lane() {
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let owner = automaton
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("owner workspace constructs");
+        assert!(owner.cold_setup.is_some());
+        drop(owner);
+
+        let rebuilt_owner = automaton
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("discarded owner workspace rebuilds");
+        assert!(rebuilt_owner.cold_setup.is_some());
+        rebuilt_owner.commit();
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let fallback = automaton
+                        .try_checkout_pooled_workspace(
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .expect("fallback workspace constructs");
+                    assert!(fallback.cold_setup.is_some());
+                    drop(fallback);
+
+                    let rebuilt = automaton
+                        .try_checkout_pooled_workspace(
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .expect("discarded fallback workspace rebuilds");
+                    assert!(rebuilt.cold_setup.is_some());
+                    let session = K0SearchSession::from_pooled_workspace(&automaton, rebuilt)
+                        .expect("fallback checkout converts to a session");
+                    drop(session);
+
+                    let rebuilt_session = automaton
+                        .try_checkout_pooled_workspace(
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .expect("discarded fallback session rebuilds");
+                    assert!(rebuilt_session.cold_setup.is_some());
+                    rebuilt_session.commit();
+
+                    let warm = automaton
+                        .try_checkout_pooled_workspace(
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .expect("committed fallback remains warm");
+                    assert!(warm.cold_setup.is_none());
+                    warm.commit();
+                })
+                .join()
+                .unwrap();
+        });
+
+        let explicit = K0SearchSession::new_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .expect("explicit session constructs");
+        automaton
+            .return_pooled_search_session(explicit)
+            .expect("an explicit same-plan session is adopted without panic");
+
+        let pool = automaton.pooled_workspace.get().unwrap();
+        assert!(pool.fallback.lock().unwrap().is_some());
+        let losing = automaton
+            .try_checkout_pooled_search_session(WorkspaceLimits::unlimited(), true, true)
+            .unwrap()
+            .expect("owner session checks out for fresh replacement");
+        automaton
+            .refresh_pooled_search_session(
+                losing,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .expect("fresh replacement commits through the original owner token");
+        assert!(
+            pool.fallback.lock().unwrap().is_some(),
+            "fresh owner replacement does not borrow or consume the warm fallback lane",
+        );
+
+        let retained = automaton
+            .try_checkout_pooled_search_session(WorkspaceLimits::unlimited(), true, true)
+            .unwrap()
+            .expect("fresh replacement is retained in the owner lane");
+        automaton
+            .refresh_pooled_search_session(
+                retained,
+                WorkspaceLimits {
+                    max_setup_work: 0,
+                    max_scratch_bytes: 0,
+                },
+                true,
+                true,
+            )
+            .expect("replacement refusal restores the old session");
+        let warm = automaton
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("refused replacement leaves the owner warm");
+        assert!(warm.cold_setup.is_none());
+        warm.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_owner_failure_fallback_poison_and_plan_mutation_are_bounded() {
         let allocation_failed = compile_ranges(&[(b'a', b'a')]);
         assert!(
             allocation_failed
@@ -2648,30 +3122,24 @@ mod tests {
         let workspace = poisoned
             .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
             .expect("focused workspace constructs");
-        poisoned.return_pooled_workspace(workspace);
+        workspace.commit();
         let owner = poisoned.pooled_workspace.get().unwrap();
         let poisoned_result = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _guard = owner.lock().unwrap();
-                    panic!("poison focused pool owner");
+                    let _guard = owner.fallback.lock().unwrap();
+                    panic!("poison focused fallback lane");
                 })
                 .join()
         });
         assert!(poisoned_result.is_err());
+        let workspace = poisoned
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("owner fast path does not touch a poisoned fallback mutex");
+        workspace.commit();
         assert!(
-            poisoned
-                .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
-                .is_none(),
-            "a poisoned optional owner declines to canonical execution",
-        );
-        assert_eq!(
-            poisoned
-                .prepare::<Exists>()
-                .search_window(b"za", SearchWindow::full(b"za"), SearchLimits::unlimited(),)
-                .unwrap()
-                .into_output(),
-            true,
+            owner.fallback.is_poisoned(),
+            "owner reuse must not clear unrelated fallback poison",
         );
 
         let mutable = compile_ranges(&[(b'a', b'a')]);
@@ -2679,7 +3147,7 @@ mod tests {
         let workspace = mutable
             .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
             .expect("focused workspace constructs");
-        mutable.return_pooled_workspace(workspace);
+        workspace.commit();
         let changed = mutable.with_line_terminator(b';');
         assert_ne!(changed.identity(), old_identity);
         assert!(

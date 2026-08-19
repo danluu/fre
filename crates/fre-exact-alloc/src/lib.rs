@@ -1,16 +1,292 @@
-//! Safe access to FRE's single exact-layout allocation primitive.
+//! Safe access to FRE's audited exact-allocation and thread-owner primitives.
 
 #![deny(unsafe_code)]
 
 use core::{
     alloc::Layout,
+    cell::UnsafeCell,
     fmt,
     marker::PhantomData,
     mem::{align_of, size_of},
     ops::{Deref, DerefMut},
+    panic::{RefUnwindSafe, UnwindSafe},
     ptr,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use std::alloc::{alloc, alloc_zeroed};
+
+const THREAD_OWNER_UNOWNED: usize = 0;
+const THREAD_OWNER_IN_USE: usize = 1;
+
+static NEXT_THREAD_OWNER_ID: AtomicUsize = AtomicUsize::new(2);
+
+std::thread_local! {
+    static THREAD_OWNER_ID: usize = NEXT_THREAD_OWNER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        .expect("FRE thread-owner ID space exhausted");
+}
+
+fn thread_owner_id() -> usize {
+    THREAD_OWNER_ID.with(|id| *id)
+}
+
+/// One reusable value reserved for the thread that first checks it out.
+///
+/// The owner thread avoids a mutex and borrows the retained value in place.
+/// Other threads must use a caller-provided fallback pool. A checkout guard
+/// discards its value by default; callers explicitly commit only after a
+/// successful transaction. This makes unwind and error paths fail closed.
+pub struct ThreadOwnerSlot<T> {
+    owner: AtomicUsize,
+    value: UnsafeCell<Option<T>>,
+}
+
+/// Exclusive access to a [`ThreadOwnerSlot`] value.
+///
+/// Dropping this guard discards the value and releases ownership. Call
+/// [`Self::commit`] to retain a successfully used value for the same owner.
+/// A guard can move to another thread when `T: Send`, but it cannot be shared
+/// there unless `T: Sync`:
+///
+/// ```compile_fail
+/// use core::cell::Cell;
+/// use fre_exact_alloc::ThreadOwnerGuard;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<ThreadOwnerGuard<'static, Cell<u8>>>();
+/// ```
+pub struct ThreadOwnerGuard<'a, T> {
+    slot: &'a ThreadOwnerSlot<T>,
+    owner: usize,
+    committed: bool,
+    // A guard may move when T is Send, but sharing the guard requires T: Sync
+    // because `value` can project a shared reference to T.
+    marker: PhantomData<T>,
+}
+
+// The guard contains only a reference, an owner ID, and transaction state;
+// moving it never moves or projects the slot's retained `T`.
+impl<T> Unpin for ThreadOwnerGuard<'_, T> {}
+
+#[allow(
+    unsafe_code,
+    reason = "the atomic owner state gives exactly one thread access to the owner-only cell"
+)]
+// SAFETY: `value` is accessed only while `owner == THREAD_OWNER_IN_USE`, and
+// only the unique thread whose ID matched the prior owner can make that state
+// transition without synchronization. Non-owner threads never access the
+// cell. A guard may move threads, but it retains the original owner ID and
+// keeps the state in-use until commit or drop.
+unsafe impl<T: Send> Sync for ThreadOwnerSlot<T> {}
+
+impl<T: UnwindSafe> UnwindSafe for ThreadOwnerSlot<T> {}
+impl<T: RefUnwindSafe> RefUnwindSafe for ThreadOwnerSlot<T> {}
+
+impl<T> ThreadOwnerSlot<T> {
+    /// Create an unowned empty slot without allocating.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            owner: AtomicUsize::new(THREAD_OWNER_UNOWNED),
+            value: UnsafeCell::new(None),
+        }
+    }
+
+    /// Create an unowned slot containing one reusable value.
+    ///
+    /// The first successful checkout becomes the fast-path owner. Moving this
+    /// slot before that checkout therefore cannot strand the value on the
+    /// construction thread.
+    #[must_use]
+    pub const fn with_value(value: T) -> Self {
+        Self {
+            owner: AtomicUsize::new(THREAD_OWNER_UNOWNED),
+            value: UnsafeCell::new(Some(value)),
+        }
+    }
+
+    /// Create a populated slot already reserved for the current thread.
+    ///
+    /// This is useful when a fallibly built owner is about to be published
+    /// and its constructing invocation must retain the initial checkout. A
+    /// slot that might move without an immediate checkout should use
+    /// [`Self::with_value`] instead.
+    #[must_use]
+    pub fn with_current_owner(value: T) -> Self {
+        Self {
+            owner: AtomicUsize::new(thread_owner_id()),
+            value: UnsafeCell::new(Some(value)),
+        }
+    }
+
+    /// Check out the owner value without locking.
+    ///
+    /// The first populated commit establishes the fast-path owner. Calls from
+    /// a different thread, and reentrant calls while a guard is live, return
+    /// `None` without touching the value. Discarding the value releases the
+    /// empty slot so a later caller may become its new owner.
+    #[must_use]
+    pub fn try_checkout(&self) -> Option<ThreadOwnerGuard<'_, T>> {
+        let caller = thread_owner_id();
+        let owner = self.owner.load(Ordering::Acquire);
+        if owner == caller {
+            // Only the thread with this never-reused ID can enter this branch.
+            // Non-owners never CAS an established owner ID, so this owner-only
+            // load/store shape cannot race another access to `value`.
+            self.owner.store(THREAD_OWNER_IN_USE, Ordering::Release);
+        } else if owner == THREAD_OWNER_UNOWNED {
+            self.owner
+                .compare_exchange(
+                    THREAD_OWNER_UNOWNED,
+                    THREAD_OWNER_IN_USE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .ok()?;
+        } else {
+            return None;
+        }
+        Some(ThreadOwnerGuard {
+            slot: self,
+            owner: caller,
+            committed: false,
+            marker: PhantomData,
+        })
+    }
+
+    /// Recover the retained value when the slot has never been published.
+    ///
+    /// Consuming the slot provides exclusive access and needs no atomic state
+    /// transition. This is used only to recover ownership after a failed
+    /// fallible publication.
+    #[must_use]
+    pub fn into_value(self) -> Option<T> {
+        self.value.into_inner()
+    }
+}
+
+impl<T> Default for ThreadOwnerSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> fmt::Debug for ThreadOwnerSlot<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadOwnerSlot")
+            .field("owner_state", &self.owner.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> ThreadOwnerGuard<'_, T> {
+    /// Borrow the retained value, or `None` for a newly claimed empty slot.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the live guard is the unique accessor to the owner-only cell"
+    )]
+    pub fn value(&self) -> Option<&T> {
+        // SAFETY: this guard exclusively owns the in-use state. Shared access
+        // here cannot overlap mutation except through this same guard.
+        unsafe { (&*self.slot.value.get()).as_ref() }
+    }
+
+    /// Mutably borrow the retained value, or `None` for an empty slot.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the live guard is the unique mutable accessor to the owner-only cell"
+    )]
+    pub fn value_mut(&mut self) -> Option<&mut T> {
+        // SAFETY: no other guard can exist while the atomic state is in-use.
+        unsafe { (&mut *self.slot.value.get()).as_mut() }
+    }
+
+    /// Install the value for this exclusive checkout.
+    ///
+    /// Returns `Err(value)` if the slot already contains a value.
+    pub fn try_insert(&mut self, value: T) -> Result<(), T> {
+        if self.value().is_some() {
+            return Err(value);
+        }
+        // `value_mut` proved this guard's unique access, but it projects the
+        // inner value rather than the surrounding option.
+        self.replace_value(Some(value));
+        Ok(())
+    }
+
+    /// Move the retained value out while keeping this checkout exclusive.
+    ///
+    /// This is intended for an existing owning API that must temporarily
+    /// carry `T` by value. The guard remains the return token: insert the
+    /// successfully used value and commit, or drop the guard to release an
+    /// empty slot.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the live guard exclusively takes the owner-only cell value"
+    )]
+    pub fn take(&mut self) -> Option<T> {
+        // SAFETY: the guard is the sole accessor while the state is in-use.
+        unsafe { (&mut *self.slot.value.get()).take() }
+    }
+
+    /// Discard any current value but keep the guard live and exclusive.
+    pub fn clear(&mut self) {
+        self.replace_value(None);
+    }
+
+    /// Retain the current value and restore the fast-path owner.
+    pub fn commit(mut self) {
+        let owner = if self.value().is_some() {
+            self.owner
+        } else {
+            THREAD_OWNER_UNOWNED
+        };
+        self.committed = true;
+        self.slot.owner.store(owner, Ordering::Release);
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the live guard exclusively replaces the owner-only cell value"
+    )]
+    fn replace_value(&mut self, value: Option<T>) {
+        // SAFETY: the guard is the sole accessor while the state is in-use.
+        // `ptr::replace` installs a valid new option before dropping the old
+        // value, so even a panicking destructor cannot leave stale bits in
+        // the cell to be dropped a second time.
+        let old = unsafe { ptr::replace(self.slot.value.get(), value) };
+        drop(old);
+    }
+}
+
+impl<T> Drop for ThreadOwnerGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Discard before publishing an empty, unowned slot. If T's destructor
+        // panics, the slot remains permanently in-use and therefore fails
+        // closed instead of exposing partially destroyed state.
+        self.clear();
+        self.slot
+            .owner
+            .store(THREAD_OWNER_UNOWNED, Ordering::Release);
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ThreadOwnerGuard<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadOwnerGuard")
+            .field("owner", &self.owner)
+            .field("value", &self.value())
+            .finish()
+    }
+}
 
 /// Failure to copy bytes into an exact-capacity allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,22 +711,210 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        panic::{catch_unwind, AssertUnwindSafe, RefUnwindSafe, UnwindSafe},
+        rc::Rc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        },
+        thread,
+    };
 
     use super::{
-        CopyError, ExactBoxOrUsize, ExactVec, copy_exact, copy_exact_with, exact_box_or_usize_with,
-        exact_box_preserve_with, exact_vec_with_capacity, try_box_preserve, zeroed_exact,
-        zeroed_exact_with,
+        copy_exact, copy_exact_with, exact_box_or_usize_with, exact_box_preserve_with,
+        exact_vec_with_capacity, try_box_preserve, zeroed_exact, zeroed_exact_with, CopyError,
+        ExactBoxOrUsize, ExactVec, ThreadOwnerSlot,
     };
 
     #[derive(Debug)]
     struct DropSpy(Rc<Cell<usize>>);
+
+    struct PanicDrop(Arc<AtomicUsize>);
 
     impl Drop for DropSpy {
         fn drop(&mut self) {
             self.0
                 .set(self.0.get().checked_add(1).expect("two test drops fit"));
         }
+    }
+
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("test destructor panic");
+        }
+    }
+
+    #[test]
+    fn thread_owner_reuses_mutation_without_locking() {
+        let slot = ThreadOwnerSlot::with_value(String::from("cold"));
+        let mut first = slot.try_checkout().unwrap();
+        first.value_mut().unwrap().push_str("-warm");
+        assert!(slot.try_checkout().is_none(), "reentrant checkout aliases");
+        first.commit();
+
+        let second = slot.try_checkout().unwrap();
+        assert_eq!(second.value().map(String::as_str), Some("cold-warm"));
+        second.commit();
+    }
+
+    #[test]
+    fn thread_owner_guard_restores_captured_owner_after_moving_threads() {
+        let slot = ThreadOwnerSlot::with_value(7_usize);
+        let guard = slot.try_checkout().unwrap();
+        thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let mut guard = guard;
+                    *guard.value_mut().unwrap() = 11;
+                    guard.commit();
+                })
+                .join()
+                .unwrap();
+        });
+        let restored = slot.try_checkout().unwrap();
+        assert_eq!(restored.value(), Some(&11));
+        restored.commit();
+    }
+
+    #[test]
+    fn moved_guard_excludes_original_owner_until_handoff() {
+        let slot = ThreadOwnerSlot::with_value(7_usize);
+        let guard = slot.try_checkout().unwrap();
+        let live = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        thread::scope(|scope| {
+            let worker_live = Arc::clone(&live);
+            let worker_release = Arc::clone(&release);
+            let worker = scope.spawn(move || {
+                worker_live.wait();
+                worker_release.wait();
+                guard.commit();
+            });
+            live.wait();
+            assert!(slot.try_checkout().is_none());
+            release.wait();
+            worker.join().unwrap();
+        });
+        let restored = slot.try_checkout().unwrap();
+        assert_eq!(restored.value(), Some(&7));
+        restored.commit();
+    }
+
+    #[test]
+    fn simultaneous_first_claim_has_exactly_one_owner() {
+        const THREADS: usize = 8;
+        let slot = Arc::new(ThreadOwnerSlot::with_value(7_usize));
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let barrier = Arc::clone(&barrier);
+                let winners = Arc::clone(&winners);
+                thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(guard) = slot.try_checkout() {
+                        assert_eq!(guard.value(), Some(&7));
+                        winners.fetch_add(1, Ordering::SeqCst);
+                        guard.commit();
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn thread_owner_auto_traits_match_exclusive_value_access() {
+        fn require_send<T: Send>() {}
+        fn require_sync<T: Sync>() {}
+        fn require_unpin<T: Unpin>() {}
+        fn require_unwind<T: UnwindSafe + RefUnwindSafe>() {}
+
+        require_send::<super::ThreadOwnerGuard<'static, Cell<u8>>>();
+        require_sync::<super::ThreadOwnerGuard<'static, usize>>();
+        require_unpin::<super::ThreadOwnerGuard<'static, core::marker::PhantomPinned>>();
+        require_unwind::<super::ThreadOwnerGuard<'static, usize>>();
+        require_send::<ThreadOwnerSlot<Cell<u8>>>();
+        require_sync::<ThreadOwnerSlot<Cell<u8>>>();
+        require_unwind::<ThreadOwnerSlot<usize>>();
+    }
+
+    #[test]
+    fn thread_owner_drop_and_unwind_discard_before_reclaim() {
+        let slot = ThreadOwnerSlot::with_value(String::from("partial"));
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = slot.try_checkout().unwrap();
+            guard.value_mut().unwrap().push_str("-mutation");
+            panic!("transaction failed");
+        }));
+        assert!(panicked.is_err());
+
+        let mut reclaimed = slot.try_checkout().unwrap();
+        assert!(reclaimed.value().is_none());
+        reclaimed.try_insert(String::from("complete")).unwrap();
+        reclaimed.commit();
+        let retained = slot.try_checkout().unwrap();
+        assert_eq!(retained.value().map(String::as_str), Some("complete"));
+        retained.commit();
+    }
+
+    #[test]
+    fn empty_commit_releases_slot_for_a_different_thread() {
+        let slot = Arc::new(ThreadOwnerSlot::<usize>::new());
+        slot.try_checkout().unwrap().commit();
+        let other = Arc::clone(&slot);
+        let value = thread::spawn(move || {
+            let mut guard = other.try_checkout().unwrap();
+            assert!(guard.value().is_none());
+            guard.try_insert(23).unwrap();
+            guard.commit();
+            23
+        })
+        .join()
+        .unwrap();
+        assert_eq!(value, 23);
+        assert!(slot.try_checkout().is_none());
+    }
+
+    #[test]
+    fn populated_slot_is_owned_by_its_first_checkout_thread() {
+        let slot = Arc::new(ThreadOwnerSlot::with_value(7_usize));
+        let worker = Arc::clone(&slot);
+        thread::spawn(move || {
+            let guard = worker.try_checkout().unwrap();
+            assert_eq!(guard.value(), Some(&7));
+            guard.commit();
+        })
+        .join()
+        .unwrap();
+
+        assert!(slot.try_checkout().is_none());
+        assert_eq!(ThreadOwnerSlot::with_value(11).into_value(), Some(11));
+        assert_eq!(ThreadOwnerSlot::<u8>::new().into_value(), None);
+    }
+
+    #[test]
+    fn panicking_value_drop_cannot_be_observed_or_dropped_twice() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = ThreadOwnerSlot::with_value(PanicDrop(Arc::clone(&drops)));
+        let guard = slot.try_checkout().unwrap();
+        let panicked = catch_unwind(AssertUnwindSafe(|| drop(guard)));
+        assert!(panicked.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            slot.try_checkout().is_none(),
+            "a destructor panic leaves the empty slot fail-closed in-use",
+        );
+        drop(slot);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

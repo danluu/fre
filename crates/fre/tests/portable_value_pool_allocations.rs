@@ -46,6 +46,37 @@ fn default_k0_value_calls_reuse_scratch_while_custom_limits_remain_one_shot() {
     }
     assert_eq!(warm.change(), Stats::default());
 
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let cold_fallback = Region::new(GLOBAL);
+                assert!(regex.is_match_value(haystack, limits).unwrap());
+                assert!(
+                    cold_fallback.change().allocations > 0,
+                    "the first nonowner call constructs its independent fallback",
+                );
+
+                let warm_fallback = Region::new(GLOBAL);
+                for _ in 0..32 {
+                    assert_eq!(
+                        regex
+                            .find_value(haystack, limits)
+                            .unwrap()
+                            .map(|matched| (matched.start(), matched.end())),
+                        Some((8, 17)),
+                    );
+                    assert!(regex.is_match_value(haystack, limits).unwrap());
+                    assert_eq!(
+                        regex.selected_end_value(haystack, limits).unwrap(),
+                        Some(17)
+                    );
+                }
+                assert_eq!(warm_fallback.change(), Stats::default());
+            })
+            .join()
+            .unwrap();
+    });
+
     let custom_regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
         .unicode(false)
         .plan_selection(PlanSelection::ForceK0)

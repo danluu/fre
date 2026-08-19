@@ -27,9 +27,56 @@ const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
 const STATIC_RUNTIME_DENY_ATTRIBUTE: &str = "#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]";
 const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
-    0xf4, 0xfe, 0x44, 0x42, 0xd8, 0xbe, 0x4f, 0xcd, 0xeb, 0x9f, 0xab, 0x4b, 0x14, 0xe3, 0x37, 0x76,
-    0x68, 0xf2, 0xd6, 0x3e, 0x1e, 0x1e, 0x25, 0x18, 0x3f, 0x9f, 0x6a, 0x15, 0x1f, 0x74, 0x04, 0xf4,
+    0xab, 0x59, 0x1c, 0xed, 0x36, 0x9c, 0x63, 0x17, 0xf0, 0xb6, 0xc2, 0xf4, 0x3b, 0x7d, 0x17, 0x46,
+    0x9c, 0x5b, 0xf2, 0xc9, 0x10, 0x2c, 0xe1, 0xea, 0x6f, 0xab, 0xfa, 0x33, 0x2c, 0x3f, 0x6f, 0xba,
 ];
+const THREAD_OWNER_SYNC_REVIEWED_BLOCK: &str = r#"#[allow(
+    unsafe_code,
+    reason = "the atomic owner state gives exactly one thread access to the owner-only cell"
+)]
+// SAFETY: `value` is accessed only while `owner == THREAD_OWNER_IN_USE`, and
+// only the unique thread whose ID matched the prior owner can make that state
+// transition without synchronization. Non-owner threads never access the
+// cell. A guard may move threads, but it retains the original owner ID and
+// keeps the state in-use until commit or drop.
+unsafe impl<T: Send> Sync for ThreadOwnerSlot<T> {}"#;
+const THREAD_OWNER_VALUE_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the live guard is the unique accessor to the owner-only cell"
+    )]
+    pub fn value(&self) -> Option<&T> {
+        // SAFETY: this guard exclusively owns the in-use state. Shared access
+        // here cannot overlap mutation except through this same guard.
+        unsafe { (&*self.slot.value.get()).as_ref() }
+    }"#;
+const THREAD_OWNER_VALUE_MUT_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the live guard is the unique mutable accessor to the owner-only cell"
+    )]
+    pub fn value_mut(&mut self) -> Option<&mut T> {
+        // SAFETY: no other guard can exist while the atomic state is in-use.
+        unsafe { (&mut *self.slot.value.get()).as_mut() }
+    }"#;
+const THREAD_OWNER_TAKE_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the live guard exclusively takes the owner-only cell value"
+    )]
+    pub fn take(&mut self) -> Option<T> {
+        // SAFETY: the guard is the sole accessor while the state is in-use.
+        unsafe { (&mut *self.slot.value.get()).take() }
+    }"#;
+const THREAD_OWNER_REPLACE_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the live guard exclusively replaces the owner-only cell value"
+    )]
+    fn replace_value(&mut self, value: Option<T>) {
+        // SAFETY: the guard is the sole accessor while the state is in-use.
+        // `ptr::replace` installs a valid new option before dropping the old
+        // value, so even a panicking destructor cannot leave stale bits in
+        // the cell to be dropped a second time.
+        let old = unsafe { ptr::replace(self.slot.value.get(), value) };
+        drop(old);
+    }"#;
 const EXACT_BOX_BORROW_REVIEWED_BLOCK: &str = r#"#[allow(
         unsafe_code,
         reason = "the tagged word recovers only the exposed provenance of its live owned allocation"
@@ -209,7 +256,12 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
         Ok(Vec::from_raw_parts(allocation, bytes.len(), bytes.len()))
     }
 }"#;
-const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 8] = [
+const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 13] = [
+    THREAD_OWNER_SYNC_REVIEWED_BLOCK,
+    THREAD_OWNER_VALUE_REVIEWED_BLOCK,
+    THREAD_OWNER_VALUE_MUT_REVIEWED_BLOCK,
+    THREAD_OWNER_TAKE_REVIEWED_BLOCK,
+    THREAD_OWNER_REPLACE_REVIEWED_BLOCK,
     EXACT_BOX_BORROW_REVIEWED_BLOCK,
     EXACT_BOX_MUT_BORROW_REVIEWED_BLOCK,
     EXACT_BOX_DROP_REVIEWED_BLOCK,
@@ -219,7 +271,7 @@ const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 8] = [
     ZEROED_EXACT_REVIEWED_BLOCK,
     COPY_EXACT_REVIEWED_BLOCK,
 ];
-const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 9;
+const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 14;
 const TARGET_FEATURES_UNSAFE_CODE_SPELLINGS: usize = 3;
 const TARGET_FEATURES_SOURCE_SHA256: [u8; 32] = [
     0x6f, 0x80, 0xcd, 0x38, 0x23, 0x9e, 0x5f, 0xed, 0x06, 0x40, 0x0c, 0x56, 0x3c, 0xc6, 0xb5, 0xea,
