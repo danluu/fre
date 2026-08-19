@@ -11,7 +11,9 @@ use fre::{
     AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
     DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedPredicateWord64Operation,
+    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_PLAN_ID,
+    FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FixedClassSandwichOperation,
+    FixedClassSandwichReduceError, FixedPredicateWord64Operation,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
     LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
@@ -3257,7 +3259,8 @@ fn fixed_class_sandwich_erases_nested_captures_with_exact_planner_accounting() {
 }
 
 #[test]
-fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
+fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64_and_scans_wide_disjoint_suffixes()
+{
     let width_64_pattern = r"[a-q][^u-z]{62}x";
     let mut width_64_haystack = vec![b'a'];
     width_64_haystack.extend(core::iter::repeat_n(b'p', 62));
@@ -3341,6 +3344,16 @@ fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
         width_65.build_report().plan,
         AggregatePlanKind::FixedClassSandwich
     );
+    let AggregatePlanIdentity::FixedClassSandwich(width_65_identity) =
+        width_65.build_report().plan_identity
+    else {
+        panic!("width-65 count did not retain the fixed-class identity")
+    };
+    assert_eq!(width_65_identity.kernel.plan_id, FIXED_CLASS_SANDWICH_PLAN_ID);
+    assert_eq!(
+        width_65_identity.kernel.operation_id,
+        FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID
+    );
     assert_eq!(
         width_65
             .count_value(&width_65_haystack, AggregateRunLimits::default())
@@ -3371,7 +3384,9 @@ fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
     else {
         panic!("fixed class plan executed another family")
     };
+    assert_eq!(accounting.identity, width_65_identity.kernel);
     assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+    assert_eq!(accounting.actual.scratch_bytes, 0);
     let mut run_limits = AggregateRunLimits::default();
     run_limits.fixed_class_sandwich.max_work = accounting.upper_bounds.work.checked_sub(1).unwrap();
     let error = width_65.count(&width_65_haystack, run_limits).unwrap_err();
@@ -3381,6 +3396,102 @@ fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
         AggregateExecutionSource::FixedClassSandwich(
             FixedClassSandwichReduceError::WorkLimit { .. }
         )
+    ));
+
+    let width_65_span = aggregate_builder(width_65_pattern)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    let AggregatePlanIdentity::FixedClassSandwich(width_65_span_identity) =
+        width_65_span.build_report().plan_identity
+    else {
+        panic!("width-65 span sum did not retain the fixed-class identity")
+    };
+    assert_eq!(
+        width_65_span_identity.kernel.plan_id,
+        FIXED_CLASS_SANDWICH_PLAN_ID
+    );
+    assert_eq!(
+        width_65_span_identity.kernel.operation_id,
+        FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID
+    );
+    let summed = width_65_span
+        .span_sum(&width_65_haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(summed.value(), 65);
+    let AggregateExecutionDetails::FixedClassSandwich(span_accounting) =
+        summed.report().details()
+    else {
+        panic!("width-65 span sum executed another family")
+    };
+    assert_eq!(span_accounting.identity, width_65_span_identity.kernel);
+    assert_eq!(span_accounting.upper_bounds.scratch_bytes, 0);
+    assert_eq!(span_accounting.actual.scratch_bytes, 0);
+
+    let width_65_compile = aggregate_builder(width_65_pattern)
+        .unicode(false)
+        .build_compile()
+        .unwrap();
+    let AggregatePlanIdentity::FixedClassSandwich(width_65_compile_identity) =
+        width_65_compile.build_report().plan_identity
+    else {
+        panic!("width-65 compile did not retain the fixed-class identity")
+    };
+    assert_eq!(
+        width_65_compile_identity.kernel,
+        width_65_identity.kernel
+    );
+    let verified = width_65_compile
+        .verify_count(&width_65_haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(verified.value(), 1);
+    let AggregateExecutionDetails::FixedClassSandwich(compile_accounting) =
+        verified.report().details()
+    else {
+        panic!("width-65 compile verification executed another family")
+    };
+    assert_eq!(compile_accounting.identity, width_65_compile_identity.kernel);
+    assert_eq!(compile_accounting.upper_bounds.scratch_bytes, 0);
+    assert_eq!(compile_accounting.actual.scratch_bytes, 0);
+
+    let overlapping_pattern = r"[a-q][a-z]{63}x";
+    let overlapping = aggregate_builder(overlapping_pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let mut overlapping_haystack = vec![b'a'];
+    overlapping_haystack.extend(core::iter::repeat_n(b'p', 63));
+    overlapping_haystack.push(b'x');
+    let overlapping_result = overlapping
+        .count(&overlapping_haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(overlapping_result.value(), 1);
+    let AggregateExecutionDetails::FixedClassSandwich(overlapping_accounting) =
+        overlapping_result.report().details()
+    else {
+        panic!("wide overlapping control executed another family")
+    };
+    assert!(overlapping_accounting.upper_bounds.scratch_bytes > 0);
+    assert_eq!(
+        overlapping_accounting.actual.scratch_bytes,
+        overlapping_accounting.upper_bounds.scratch_bytes
+    );
+    let mut one_below_scratch = AggregateRunLimits::default();
+    one_below_scratch.fixed_class_sandwich.max_scratch_bytes = overlapping_accounting
+        .upper_bounds
+        .scratch_bytes
+        .checked_sub(1)
+        .unwrap();
+    let error = overlapping
+        .count(&overlapping_haystack, one_below_scratch)
+        .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::FixedClassSandwich(
+            FixedClassSandwichReduceError::ScratchLimit { needed, limit }
+        ) if needed == overlapping_accounting.upper_bounds.scratch_bytes
+            && limit.checked_add(1) == Some(needed)
     ));
 
     for ineligible in [
