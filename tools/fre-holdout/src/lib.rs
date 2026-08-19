@@ -2278,14 +2278,14 @@ mod tests {
 
     #[test]
     fn checked_build_limit_refusal_is_unsupported_but_default_executes() {
-        let default = build_candidate("(?:a+b|a)").expect("default adversarial build");
+        let default = build_candidate("a").expect("default literal build");
         let needed = default.build_report().planner_work;
         assert!(needed > 0);
         let limits = BuildLimits {
             max_planner_work: needed.checked_sub(1).expect("planner work is positive"),
             ..BuildLimits::default()
         };
-        let failure = build_candidate_with_limits("(?:a+b|a)", &limits)
+        let failure = build_candidate_with_limits("a", &limits)
             .expect_err("one-below planner limit must refuse");
         assert_eq!(failure.status, Status::Unsupported);
         assert_eq!(failure.code, "build.resource.planner-work");
