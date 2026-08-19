@@ -46922,47 +46922,46 @@ mod tests {
                 .unwrap()
         );
 
-        for result in [
-            CompiledProgram::build(
-                raw.clone(),
-                preattached.clone(),
-                OutputContract::Span,
-                CompileMode::Fast,
-                DeterminizeLimits::default(),
-                usize::MAX,
-            ),
-            CompiledProgram::build(
-                raw.clone(),
-                preattached.clone(),
-                OutputContract::Span,
-                CompileMode::Optimizing,
-                DeterminizeLimits::default(),
-                usize::MAX,
-            ),
-            CompiledProgram::build(
-                raw.clone(),
-                preattached.clone(),
-                OutputContract::Exists,
-                CompileMode::Optimizing,
-                forced_nfa,
-                usize::MAX,
-            ),
-            CompiledProgram::build(
-                context_raw,
-                context_preattached,
-                OutputContract::Span,
-                CompileMode::Optimizing,
-                DeterminizeLimits::default(),
-                usize::MAX,
-            ),
-        ] {
+        let assert_ineligible = |result: Result<CompiledProgram, CompileError>| {
             assert!(matches!(
                 result,
                 Err(CompileError::InternalInvariant(
                     "epsilon-closure start program was preattached to an ineligible compiler route"
                 ))
             ));
-        }
+        };
+        assert_ineligible(CompiledProgram::build(
+            raw.clone(),
+            preattached.clone(),
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+            usize::MAX,
+        ));
+        assert_ineligible(CompiledProgram::build(
+            raw.clone(),
+            preattached.clone(),
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+            usize::MAX,
+        ));
+        assert_ineligible(CompiledProgram::build(
+            raw.clone(),
+            preattached.clone(),
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            forced_nfa,
+            usize::MAX,
+        ));
+        assert_ineligible(CompiledProgram::build(
+            context_raw,
+            context_preattached,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+            usize::MAX,
+        ));
         let accepted = CompiledProgram::build(
             raw,
             preattached,
