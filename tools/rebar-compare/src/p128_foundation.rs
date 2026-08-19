@@ -729,6 +729,16 @@ mod tests {
         current_fre_rebar_aggregate_operation_lifecycle,
     };
 
+    fn run_on_p128_test_stack(name: &str, body: fn()) {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn P128 test thread")
+            .join()
+            .expect("P128 test thread completes");
+    }
+
     fn native_continuation_count_lifecycle(
         pattern: &str,
         haystack_len: usize,
@@ -823,6 +833,13 @@ mod tests {
 
     #[test]
     fn post_operation_binding_seals_only_matching_opaque_slots() {
+        run_on_p128_test_stack(
+            "p128-post-operation-binding",
+            post_operation_binding_seals_only_matching_opaque_slots_body,
+        );
+    }
+
+    fn post_operation_binding_seals_only_matching_opaque_slots_body() {
         let patterns = [r"(?:a+b|a)".to_owned()];
         let haystack = b"aaaabaaaa";
         let formal_lifecycle = build_current_fre_complete_match_count_lifecycle(
@@ -899,6 +916,13 @@ mod tests {
 
     #[test]
     fn future_multi_and_capture_slots_are_typed_and_refuse_fabricated_counters() {
+        run_on_p128_test_stack(
+            "p128-future-multi-capture-slots",
+            future_multi_and_capture_slots_are_typed_and_refuse_fabricated_counters_body,
+        );
+    }
+
+    fn future_multi_and_capture_slots_are_typed_and_refuse_fabricated_counters_body() {
         let patterns = ["a+".to_owned(), "b+".to_owned()];
         let haystack = b"aaa bbb";
         let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
@@ -949,6 +973,13 @@ mod tests {
 
     #[test]
     fn direct_single_route_is_explicitly_distinguished_from_missing_receipts() {
+        run_on_p128_test_stack(
+            "p128-direct-single-route",
+            direct_single_route_is_explicitly_distinguished_from_missing_receipts_body,
+        );
+    }
+
+    fn direct_single_route_is_explicitly_distinguished_from_missing_receipts_body() {
         let patterns = ["aba".to_owned()];
         let haystack = b"ababaaba";
         let lifecycle = build_current_fre_complete_match_count_lifecycle(
@@ -993,6 +1024,13 @@ mod tests {
 
     #[test]
     fn held_out_shell_shapes_keep_value_and_counter_semantics_identical() {
+        run_on_p128_test_stack(
+            "p128-shell-shape-semantics",
+            held_out_shell_shapes_keep_value_and_counter_semantics_identical_body,
+        );
+    }
+
+    fn held_out_shell_shapes_keep_value_and_counter_semantics_identical_body() {
         for (model, pattern, haystack) in [
             ("count", r"(?:ab+|a)", b"abbb a ab".as_slice()),
             ("count-spans", r"(?:xy+z|x)", b"xyyzx xyzz".as_slice()),

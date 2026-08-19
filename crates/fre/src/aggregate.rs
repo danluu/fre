@@ -1304,8 +1304,9 @@ pub enum AggregateWordRunSemantics {
     /// Unicode-off ASCII word-boundary assertions. Each maximal ASCII word
     /// run contributes its two zero-width boundaries.
     AsciiWordBoundaries,
-    /// Unicode word scalars under `utf8(false)`; malformed bytes are
-    /// individual non-word units.
+    /// Unicode word scalars under `utf8(false)`. Each malformed forward unit
+    /// is non-word; boundary context still follows the reverse decoder, which
+    /// can see a preceding scalar through stray continuation bytes.
     UnicodeWordScalarsInvalidBytesNonWord,
     /// Unicode-off raw bytes admitted by one canonical 256-bit class. Every
     /// maximal admitted run emits its leftmost non-overlapping exact-width
@@ -25239,6 +25240,16 @@ mod tests {
     };
     use crate::AggregateConstructionLedgerEntry;
 
+    fn run_on_aggregate_test_stack(name: &str, body: fn()) {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     fn url_fixture_pattern(tlds: &str) -> String {
         format!(
             r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){{3}}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){{0,62}}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){{0,62}}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:{tlds}))(?::\d{{2,5}})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)"
@@ -25409,6 +25420,16 @@ mod tests {
 
     #[test]
     fn aggregate_span_visit_streams_the_materialized_sequence_once() {
+        std::thread::Builder::new()
+            .name("aggregate-span-visit-materialization".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(aggregate_span_visit_streams_the_materialized_sequence_once_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn aggregate_span_visit_streams_the_materialized_sequence_once_body() {
         let regex = AggregateBuilder::new(r"a*")
             .unicode(false)
             .build_spans()
@@ -25455,6 +25476,13 @@ mod tests {
 
     #[test]
     fn guarded_word_visitors_stream_endpoints_without_changing_materialization() {
+        run_on_aggregate_test_stack(
+            "aggregate-guarded-word-span-visitors",
+            guarded_word_visitors_stream_endpoints_without_changing_materialization_body,
+        );
+    }
+
+    fn guarded_word_visitors_stream_endpoints_without_changing_materialization_body() {
         let pattern = r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(Self)\b)";
         let haystack = b"as break \xCE\xB2as as\xCE\xB2 Self _as as\xFFbreak";
         for unicode in [false, true] {
@@ -25479,14 +25507,27 @@ mod tests {
                 super::AggregateEngine::GuardedAsciiWord(_)
                     | super::AggregateEngine::GuardedUnicodeWord(_)
             ));
-            assert_eq!(
-                materializer
+            if unicode {
+                let refusal = materializer
                     .spans(haystack, AggregateRunLimits::default())
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                expected
-            );
+                    .unwrap_err();
+                assert!(matches!(
+                    refusal.source,
+                    AggregateExecutionSource::Continuation(
+                        fre_aggregate::Error::InvalidUtf8ForUnicodeWordBoundary
+                    )
+                ));
+                assert!(refusal.has_closed_continuation_attempt());
+            } else {
+                assert_eq!(
+                    materializer
+                        .spans(haystack, AggregateRunLimits::default())
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
 
             let visitor = AggregateBuilder::new(pattern)
                 .unicode(unicode)
@@ -25541,6 +25582,13 @@ mod tests {
 
     #[test]
     fn sparse_root_finite_span_visitor_streams_priority_matches() {
+        run_on_aggregate_test_stack(
+            "aggregate-sparse-root-span-visitor",
+            sparse_root_finite_span_visitor_streams_priority_matches_body,
+        );
+    }
+
+    fn sparse_root_finite_span_visitor_streams_priority_matches_body() {
         let pattern = "ab|a|bc|b";
         let haystack = b"zabcbab";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -25643,6 +25691,13 @@ mod tests {
 
     #[test]
     fn dense_finite_span_visitor_is_explicitly_separate_from_materialization() {
+        run_on_aggregate_test_stack(
+            "aggregate-dense-finite-span-visitor",
+            dense_finite_span_visitor_is_explicitly_separate_from_materialization_body,
+        );
+    }
+
+    fn dense_finite_span_visitor_is_explicitly_separate_from_materialization_body() {
         let pattern = "b|ab|a|aba|bc|cab";
         let haystack = b"zababcabcab";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -25727,6 +25782,16 @@ mod tests {
 
     #[test]
     fn blocking_delimiter_span_visitor_preserves_complete_endpoints() {
+        std::thread::Builder::new()
+            .name("aggregate-blocking-delimiter-span-visitor".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(blocking_delimiter_span_visitor_preserves_complete_endpoints_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn blocking_delimiter_span_visitor_preserves_complete_endpoints_body() {
         let pattern = r#"["'][^"']{0,30}[?!.]["']"#;
         let haystack = br#"--"ok."--'yes?'--"bad,"--'x!'--"a 'nested.' tail"--"#;
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -25806,6 +25871,13 @@ mod tests {
 
     #[test]
     fn token_phrase_span_visitor_is_explicitly_separate_from_materialization() {
+        run_on_aggregate_test_stack(
+            "aggregate-token-phrase-span-visitor",
+            token_phrase_span_visitor_is_explicitly_separate_from_materialization_body,
+        );
+    }
+
+    fn token_phrase_span_visitor_is_explicitly_separate_from_materialization_body() {
         let pattern = r"\b\w+\s+Holmes\s+\w+\b";
         let haystack = b"--left Holmes right--a Holmes b--";
         let materializer = AggregateBuilder::new(pattern)
@@ -25855,6 +25927,13 @@ mod tests {
 
     #[test]
     fn terminal_token_phrase_span_visitor_preserves_materializing_fallback() {
+        run_on_aggregate_test_stack(
+            "aggregate-terminal-token-phrase-span-visitor",
+            terminal_token_phrase_span_visitor_preserves_materializing_fallback_body,
+        );
+    }
+
+    fn terminal_token_phrase_span_visitor_preserves_materializing_fallback_body() {
         let pattern = r"\w+\s+Holmes";
         let haystack = b"--left HolmesX--a Holmes b Holmes--";
         let materializer = AggregateBuilder::new(pattern)
@@ -25906,6 +25985,13 @@ mod tests {
 
     #[test]
     fn reverse_inner_span_visitor_is_explicitly_separate_from_materialization() {
+        run_on_aggregate_test_stack(
+            "aggregate-reverse-inner-span-visitor",
+            reverse_inner_span_visitor_is_explicitly_separate_from_materialization_body,
+        );
+    }
+
+    fn reverse_inner_span_visitor_is_explicitly_separate_from_materialization_body() {
         let pattern = r"\pL+herloc\pL+|\pL+olme\pL+";
         let haystack = "--Sherlock Holmes--éherlocß--".as_bytes();
         let materializer = AggregateBuilder::new(pattern)
@@ -25961,6 +26047,13 @@ mod tests {
 
     #[test]
     fn bounded_literal_pair_span_visitor_preserves_complete_endpoints() {
+        run_on_aggregate_test_stack(
+            "aggregate-bounded-literal-pair-span-visitor",
+            bounded_literal_pair_span_visitor_preserves_complete_endpoints_body,
+        );
+    }
+
+    fn bounded_literal_pair_span_visitor_preserves_complete_endpoints_body() {
         let pattern = r"Holmes.{0,3}Watson|Watson.{0,3}Holmes";
         let haystack = b"--HolmesxxWatson--WatsonHolmes--Holmes\nWatson--";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -26032,6 +26125,13 @@ mod tests {
 
     #[test]
     fn bounded_affix_span_visitor_preserves_complete_endpoints() {
+        run_on_aggregate_test_stack(
+            "aggregate-bounded-affix-span-visitor",
+            bounded_affix_span_visitor_preserves_complete_endpoints_body,
+        );
+    }
+
+    fn bounded_affix_span_visitor_preserves_complete_endpoints_body() {
         let pattern = r"\s[a-zA-Z]{0,12}ing\s";
         let haystack = b" walking  singing xing  thing \n";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -26115,7 +26215,7 @@ mod tests {
             2_400
         );
         assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 736);
-        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_496);
+        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_544);
     }
 
     #[test]
@@ -26124,6 +26224,13 @@ mod tests {
         reason = "the scalar test oracle stays independent of the routed classifier"
     )]
     fn width_one_ascii_uses_only_the_qualified_sve2_owner() {
+        run_on_aggregate_test_stack(
+            "aggregate-width-one-sve2-owner",
+            width_one_ascii_uses_only_the_qualified_sve2_owner_body,
+        );
+    }
+
+    fn width_one_ascii_uses_only_the_qualified_sve2_owner_body() {
         let dispatch = fre_kernels::SimdDispatchContext::capture();
         let eligible = fre_kernels::DispatchedLiteralAggregatePlan::is_eligible(dispatch, b"x");
         let count = AggregateBuilder::new("x")
@@ -26402,6 +26509,13 @@ mod tests {
 
     #[test]
     fn exact_literal_aot_candidate_rejects_report_tampering() {
+        run_on_aggregate_test_stack(
+            "aggregate-exact-literal-aot-report-tampering",
+            exact_literal_aot_candidate_rejects_report_tampering_body,
+        );
+    }
+
+    fn exact_literal_aot_candidate_rejects_report_tampering_body() {
         let mut regex = AggregateBuilder::new("needle")
             .unicode(false)
             .build_count()
@@ -26420,6 +26534,13 @@ mod tests {
 
     #[test]
     fn exact_literal_aot_semantic_binding_is_live_literal_sensitive() {
+        run_on_aggregate_test_stack(
+            "aggregate-exact-literal-aot-semantic-binding",
+            exact_literal_aot_semantic_binding_is_live_literal_sensitive_body,
+        );
+    }
+
+    fn exact_literal_aot_semantic_binding_is_live_literal_sensitive_body() {
         let regex = AggregateBuilder::new("needle")
             .unicode(false)
             .build_count()
@@ -26452,6 +26573,13 @@ mod tests {
 
     #[test]
     fn fixed_aot_planning_identity_is_cached_and_charged_once_at_construction() {
+        run_on_aggregate_test_stack(
+            "aggregate-fixed-aot-planning-identity",
+            fixed_aot_planning_identity_is_cached_and_charged_once_at_construction_body,
+        );
+    }
+
+    fn fixed_aot_planning_identity_is_cached_and_charged_once_at_construction_body() {
         let regex = AggregateBuilder::new("needle")
             .unicode(false)
             .limits(AggregateBuildLimits::aot_count_exact_literal_v1())
@@ -26628,6 +26756,13 @@ mod tests {
 
     #[test]
     fn continuation_hard_terminal_releases_unpublished_compiler_bytes() {
+        run_on_aggregate_test_stack(
+            "aggregate-continuation-hard-terminal-release",
+            continuation_hard_terminal_releases_unpublished_compiler_bytes_body,
+        );
+    }
+
+    fn continuation_hard_terminal_releases_unpublished_compiler_bytes_body() {
         let mut limits = AggregateBuildLimits::default();
         limits.continuation.max_program_states = 0;
         let error = AggregateBuilder::new("(?:ab|cd)+")
@@ -26652,6 +26787,13 @@ mod tests {
 
     #[test]
     fn compile_only_continuation_shares_large_scalar_progress_owners() {
+        run_on_aggregate_test_stack(
+            "aggregate-compile-shared-scalar-owners",
+            compile_only_continuation_shares_large_scalar_progress_owners_body,
+        );
+    }
+
+    fn compile_only_continuation_shares_large_scalar_progress_owners_body() {
         const PATTERN: &str = r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*";
 
         let compiled = AggregateBuilder::new(PATTERN)
@@ -26693,6 +26835,13 @@ mod tests {
 
     #[test]
     fn fixed_guard_and_residual_hard_terminals_release_unpublished_bytes() {
+        run_on_aggregate_test_stack(
+            "aggregate-fixed-hard-terminal-release",
+            fixed_guard_and_residual_hard_terminals_release_unpublished_bytes_body,
+        );
+    }
+
+    fn fixed_guard_and_residual_hard_terminals_release_unpublished_bytes_body() {
         let pattern = r"^.{249}$";
 
         let mut guard_limits = AggregateBuildLimits::default();
@@ -26737,6 +26886,16 @@ mod tests {
 
     #[test]
     fn construction_report_rejects_same_length_receipt_syntax_and_key_splice() {
+        std::thread::Builder::new()
+            .name("aggregate-construction-report-splice".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(construction_report_rejects_same_length_receipt_syntax_and_key_splice_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn construction_report_rejects_same_length_receipt_syntax_and_key_splice_body() {
         let needle = AggregateBuilder::new("needle")
             .unicode(false)
             .build_count_attempt()
@@ -27536,6 +27695,13 @@ mod tests {
 
     #[test]
     fn tom_sawyer_bounded_prefixes_publish_packed_count_route_and_match_regex() {
+        run_on_aggregate_test_stack(
+            "aggregate-tom-sawyer-packed-count",
+            tom_sawyer_bounded_prefixes_publish_packed_count_route_and_match_regex_body,
+        );
+    }
+
+    fn tom_sawyer_bounded_prefixes_publish_packed_count_route_and_match_regex_body() {
         let cases = [
             (
                 ".{0,2}(Tom|Sawyer|Huckleberry|Finn)",
@@ -27639,6 +27805,13 @@ mod tests {
 
     #[test]
     fn packed_absolute_width_refusal_falls_through_to_closed_dense_route() {
+        run_on_aggregate_test_stack(
+            "aggregate-packed-absolute-width-refusal",
+            packed_absolute_width_refusal_falls_through_to_closed_dense_route_body,
+        );
+    }
+
+    fn packed_absolute_width_refusal_falls_through_to_closed_dense_route_body() {
         let count = AggregateBuilder::new("a|bc")
             .unicode(false)
             .build_count()

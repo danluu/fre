@@ -26046,6 +26046,16 @@ mod tests {
 
     #[test]
     fn adversarial_probes_reject_haystack_selected_routes_and_plan_omission() {
+        std::thread::Builder::new()
+            .name("rebar-adversarial-route-probes".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(adversarial_probes_reject_haystack_selected_routes_and_plan_omission_body)
+            .expect("spawn adversarial route-probe thread")
+            .join()
+            .expect("adversarial route-probe thread panicked");
+    }
+
+    fn adversarial_probes_reject_haystack_selected_routes_and_plan_omission_body() {
         let patterns = ["a+".to_string()];
         let probes = [
             b"aaaa----".as_slice(),
@@ -31104,10 +31114,29 @@ agggtaa[cgt]|[acg]ttaccct 0
             } else {
                 grep_captures(&upstream, haystack, u64::MAX).expect("Rust grep-captures result")
             };
+            let direct = capture_run_alternation_plan_one(
+                pattern,
+                unicode,
+                false,
+                &RunLimits::default(),
+            )
+            .expect("direct run-alternation construction")
+            .expect("direct run-alternation shape");
+            let direct_limits = capture_run_alternation_run_limits(
+                &direct,
+                haystack.len(),
+                &RunLimits::default(),
+            )
+            .expect("direct run-alternation limits");
+            assert_eq!(
+                execute_capture_run_alternation_with_limits(&direct, haystack, direct_limits)
+                    .expect("direct run-alternation execution"),
+                expected,
+            );
             let mut lifecycle =
                 current_fre_rebar_capture_lifecycle(model, pattern, unicode, false, haystack.len())
                     .expect("run-alternation lifecycle");
-            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
             assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
             assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
         }
@@ -31141,7 +31170,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn capture_run_intrinsic_caps_and_empty_class_retain_public_generic_route() {
+    fn capture_run_intrinsic_caps_retain_generic_route_and_unproved_empty_shape_refuses_formally() {
         let cases = [
             (
                 r"([a-z]{32})|([a-z]{31})".to_string(),
@@ -31152,11 +31181,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                 wide_capture_run_class_pattern(1_025),
                 true,
                 "\u{1000}\u{1002}\u{1004}".as_bytes(),
-            ),
-            (
-                r"([a&&b]{3})|([a&&b]{2})".to_string(),
-                false,
-                b"aaabbb".as_slice(),
             ),
         ];
         for (pattern, unicode, haystack) in cases {
@@ -31200,6 +31224,34 @@ agggtaa[cgt]|[acg]ttaccct 0
                 expected
             );
         }
+
+        let impossible = r"([a&&b]{3})|([a&&b]{2})";
+        assert!(
+            capture_run_alternation_plan_one(impossible, false, false, &RunLimits::default())
+                .expect("empty shape is not a construction resource failure")
+                .is_none(),
+        );
+        let reference = rust_compile_options(&[impossible.to_string()], false, false)
+            .expect("empty generic incumbent pattern");
+        assert_eq!(
+            count_captures(&reference, b"aaabbb", u64::MAX)
+                .expect("empty generic incumbent capture result"),
+            0,
+        );
+        let CandidateOutcome::Unsupported(reason) = current_fre(
+            "count-captures",
+            &[impossible.to_string()],
+            b"aaabbb",
+            false,
+            false,
+            &RunLimits::default(),
+        ) else {
+            panic!("unproved empty shape must retain a typed formal refusal")
+        };
+        assert!(
+            reason.contains("Resource { kind: Searches, required: 13, limit: 7 }"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -31222,37 +31274,26 @@ agggtaa[cgt]|[acg]ttaccct 0
                 "class ranges",
             ),
         ] {
-            let outcome = current_fre(
-                "count-captures",
-                &[pattern.to_string()],
-                b"abcdef",
-                false,
-                false,
-                &limits,
-            );
-            let CandidateOutcome::Unsupported(reason) = outcome else {
-                panic!("caller quota must be a typed refusal: {outcome:?}");
-            };
+            let error = capture_run_alternation_plan_one(pattern, false, false, &limits)
+                .expect_err("caller quota must refuse the direct owner");
+            assert_eq!(error.status, Status::Unsupported);
+            let reason = error.message;
             assert!(
                 reason.contains("capture run-alternation build refused execution")
                     && reason.contains(expected),
                 "{reason}"
             );
-            let error = current_fre_rebar_capture_lifecycle_with_limits(
-                "count-captures",
-                pattern,
-                false,
-                false,
-                6,
-                limits,
-            )
-            .expect_err("caller quota must refuse lifecycle construction");
-            assert!(
-                error
-                    .to_string()
-                    .contains("capture run-alternation build refused execution")
-                    && error.to_string().contains(expected),
-                "{error}"
+            assert_current_fre_execution(
+                current_fre(
+                    "count-captures",
+                    &[pattern.to_string()],
+                    b"abcdef",
+                    false,
+                    false,
+                    &limits,
+                ),
+                2,
+                CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
             );
         }
     }
@@ -31265,6 +31306,25 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("malformed Unicode reference");
         let expected = count_captures(&reference, &haystack, u64::MAX)
             .expect("malformed Unicode reference result");
+        let direct = capture_run_alternation_plan_one(
+            pattern,
+            true,
+            false,
+            &RunLimits::default(),
+        )
+        .expect("direct malformed Unicode construction")
+        .expect("direct malformed Unicode shape");
+        let direct_limits = capture_run_alternation_run_limits(
+            &direct,
+            haystack.len(),
+            &RunLimits::default(),
+        )
+        .expect("direct malformed Unicode limits");
+        assert_eq!(
+            execute_capture_run_alternation_with_limits(&direct, &haystack, direct_limits)
+                .expect("direct malformed Unicode execution"),
+            expected,
+        );
         let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "count-captures",
             pattern,
@@ -31273,7 +31333,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("malformed Unicode run lifecycle");
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(lifecycle.execute(&haystack).expect("first"), expected);
         assert_eq!(lifecycle.execute(&haystack).expect("steady"), expected);
     }
@@ -31289,26 +31349,26 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("default run-alternation plan");
         let needed = plan.build_report().persistent_bytes;
         let limit = needed.checked_sub(1).expect("plan storage is nonzero");
-        let error = current_fre_rebar_capture_lifecycle_with_limits(
-            "count-captures",
+        let error = capture_run_alternation_plan_one(
             pattern,
             false,
             false,
-            8,
-            RunLimits {
+            &RunLimits {
                 fre_aggregate_program_bytes: limit,
                 ..RunLimits::default()
             },
         )
-        .expect_err("one-below run-alternation storage must refuse");
+        .expect_err("one-below direct run-alternation storage must refuse");
+        assert_eq!(error.status, Status::Unsupported);
         let expected = format!("persistent bytes needs {needed}, limit is {limit}");
         assert!(
             error
-                .to_string()
+                .message
                 .contains("FRE capture run-alternation build refused execution"),
-            "{error}"
+            "{:?}",
+            error
         );
-        assert!(error.to_string().contains(&expected), "{error}");
+        assert!(error.message.contains(&expected), "{:?}", error);
     }
 
     #[test]
@@ -37403,6 +37463,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn canonical_unicode_word_boundary_rows_retain_support() {
+        std::thread::Builder::new()
+            .name("rebar-canonical-unicode-word-boundaries".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(canonical_unicode_word_boundary_rows_retain_support_body)
+            .expect("spawn canonical Unicode word-boundary thread")
+            .join()
+            .expect("canonical Unicode word-boundary thread panicked");
+    }
+
+    fn canonical_unicode_word_boundary_rows_retain_support_body() {
         let patterns = [r"\b".to_string()];
         let limits = RunLimits::default();
         for (job_id, haystack) in [
@@ -37450,6 +37520,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn compile_lifecycle_labels_sparse_finite_representation_exactly() {
+        std::thread::Builder::new()
+            .name("rebar-sparse-finite-compile-lifecycle".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(compile_lifecycle_labels_sparse_finite_representation_exactly_body)
+            .expect("spawn sparse finite compile-lifecycle thread")
+            .join()
+            .expect("sparse finite compile-lifecycle thread panicked");
+    }
+
+    fn compile_lifecycle_labels_sparse_finite_representation_exactly_body() {
         let words = (0..32)
             .map(|index| format!("p{index:03}"))
             .collect::<Vec<_>>();
@@ -41439,6 +41519,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn aggregate_lifecycles_separate_construction_from_same_artifact_operations() {
+        std::thread::Builder::new()
+            .name("rebar-aggregate-lifecycle-separation".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(aggregate_lifecycles_separate_construction_from_same_artifact_operations_body)
+            .expect("spawn aggregate lifecycle-separation thread")
+            .join()
+            .expect("aggregate lifecycle-separation thread panicked");
+    }
+
+    fn aggregate_lifecycles_separate_construction_from_same_artifact_operations_body() {
         let haystack = b"aba aba";
         let single_patterns = vec!["aba".to_string()];
         let compile = current_fre_rebar_aggregate_compile_lifecycle(
@@ -42713,6 +42803,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_guarded_word_sets_through_endpoint_visitors() {
+        std::thread::Builder::new()
+            .name("rebar-guarded-word-complete-spans".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(complete_spans_routes_guarded_word_sets_through_endpoint_visitors_body)
+            .expect("spawn guarded-word complete-spans thread")
+            .join()
+            .expect("guarded-word complete-spans thread panicked");
+    }
+
+    fn complete_spans_routes_guarded_word_sets_through_endpoint_visitors_body() {
         let pattern = r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(const)\b)|(?:\b(Self)\b)";
         let haystack = b"as break \xCE\xB2as as\xCE\xB2 const Self _as as\xFFbreak";
         for unicode in [false, true] {
@@ -42801,6 +42901,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_fixed_absolute_end_patterns_through_the_span_visitor() {
+        std::thread::Builder::new()
+            .name("rebar-fixed-absolute-complete-spans".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(complete_spans_routes_fixed_absolute_end_patterns_through_the_span_visitor_body)
+            .expect("spawn fixed-absolute complete-spans thread")
+            .join()
+            .expect("fixed-absolute complete-spans thread panicked");
+    }
+
+    fn complete_spans_routes_fixed_absolute_end_patterns_through_the_span_visitor_body() {
         let pattern = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ$";
         let mut haystack = vec![0_u8];
         haystack.extend(std::iter::repeat_n(b'x', 1_024));
@@ -42875,6 +42985,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_literal_assertions_through_the_span_visitor() {
+        std::thread::Builder::new()
+            .name("rebar-literal-assertion-complete-spans".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(complete_spans_routes_literal_assertions_through_the_span_visitor_body)
+            .expect("spawn literal-assertion complete-spans thread")
+            .join()
+            .expect("literal-assertion complete-spans thread panicked");
+    }
+
+    fn complete_spans_routes_literal_assertions_through_the_span_visitor_body() {
         let pattern = r"(?m)^Sherlock Holmes|Sherlock Holmes$";
         let haystack = b"Sherlock Holmes begins\ninside Sherlock Holmes\nSherlock Holmes\nno match\nends Sherlock Holmes";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -43058,6 +43178,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_blocking_delimiters_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("rebar-blocking-delimiter-complete-spans".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(complete_spans_routes_blocking_delimiters_through_the_aggregate_visitor_body)
+            .expect("spawn blocking-delimiter complete-spans thread")
+            .join()
+            .expect("blocking-delimiter complete-spans thread panicked");
+    }
+
+    fn complete_spans_routes_blocking_delimiters_through_the_aggregate_visitor_body() {
         let pattern = r#"["'][^"']{0,30}[?!.]["']"#;
         let haystack = br#"--"ok."--'yes?'--"bad,"--'x!'--"a 'nested.' tail"--"#;
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -44799,7 +44929,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             66,
-            "capture-linear-selector-uniform-participation",
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
         );
 
         let overlapping = r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})";
@@ -44813,7 +44943,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             4,
-            CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN,
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
         );
         assert_current_fre_execution(
             current_fre(
@@ -44825,7 +44955,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             6,
-            CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN,
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
         );
 
         assert_eq!(SCALAR_STATES, 95);

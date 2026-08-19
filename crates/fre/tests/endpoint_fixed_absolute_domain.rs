@@ -62,17 +62,17 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     // error-path allocation. Enlarging these heavily nested terminal values
     // can exhaust a default test-thread stack when several large optional
     // builds coexist.
-    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 936);
+    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 944);
     assert_eq!(
         core::mem::size_of::<AggregateConstructionAttemptError>(),
         8_528
     );
     assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_768);
-    assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 10_016);
-    assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_496);
+    assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 10_064);
+    assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_544);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_560);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 10_832);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 440);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 10_848);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 448);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 416);
     // Exact success retains the independent kernel receipt beside accounting;
     // this is the public allocation-free ceiling for the enlarged enum.
@@ -80,8 +80,8 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 64);
     // Full public build/run provenance plus the closed construction
     // evidence remains fixed-size and adds no operation-time allocation.
-    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 10_768);
-    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 10_768);
+    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 10_816);
+    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 10_816);
 }
 
 #[test]

@@ -486,6 +486,14 @@ mod tests {
         assert_eq!(capture_free.identity().plan_id, PLAN_ID);
         assert!(capture_free.is_match_full(b"scheme9://host"));
 
+        // The executor is a generic class-guarded literal corridor. A
+        // one-byte delimiter remains exact when its leading byte is excluded
+        // from both left-hand classes.
+        let colon = plan(r"[a-z][a-z0-9]*:[^ /]+");
+        assert!(colon.is_match_full(b"scheme9:value"));
+        assert!(colon.is_match_full(b"9scheme:value"));
+        assert!(!colon.is_match_full(b"9:value"));
+
         let either = plan(r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?|([^ @]+)@([^ @]+)");
         assert_eq!(either.identity().plan_id, COMPOSITE_PLAN_ID);
         assert_eq!(either.identity().operation_id, COMPOSITE_OPERATION_ID);
@@ -632,7 +640,6 @@ mod tests {
     fn nearby_languages_are_rejected() {
         for pattern in [
             r"[a-z][a-z0-9]+://[^ /]+",
-            r"[a-z][a-z0-9]*:[^ /]+",
             r"[a-z][a-z0-9]*://[^ /]*",
             r"[a-z][a-z0-9]*a[^ /]+",
             r"[a-z][a-z0-9]*://[^ /]+x",

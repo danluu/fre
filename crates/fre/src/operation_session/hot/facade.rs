@@ -1954,6 +1954,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run alone: stats_alloc observes allocations from every concurrent test thread"]
     fn facade_has_zero_steady_allocations_and_linear_authenticated_counters() {
         let _guard = super::super::hot_kernel_test_guard();
         let artifact = builder(

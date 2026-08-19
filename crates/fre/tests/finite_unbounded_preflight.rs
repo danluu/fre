@@ -5,6 +5,16 @@ use fre::{
 
 #[test]
 fn unbounded_languages_refuse_finite_extraction_before_allocation() {
+    std::thread::Builder::new()
+        .name("finite-unbounded-preflight".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(unbounded_languages_refuse_finite_extraction_before_allocation_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn unbounded_languages_refuse_finite_extraction_before_allocation_body() {
     let unbounded = AggregateBuilder::new("(?:ab|cd)+z")
         .unicode(false)
         .build_compile()
