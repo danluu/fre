@@ -52,7 +52,8 @@ use crate::{
     ordered_nfa_native::{
         FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
         FrozenOrderedNfaStorageV1, NativeOrderedNfaProgramView,
-        NativeOrderedNfaTerminalRangeV1, MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES,
+        NativeOrderedNfaTerminalRangeV1, WholeWindowWidthBounds,
+        MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES,
     },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
@@ -207,6 +208,9 @@ const MAX_ANCHORED_PREFIX_WORK: u64 = 1_000_000;
 const MAX_ANCHORED_SUFFIX_WORK: u64 = 1_000_000;
 /// Hard work ceiling for the optional graph-wide exact-width proof.
 const MAX_EXACT_WIDTH_WORK: u64 = 1_000_000;
+/// Hard work ceiling for the optional graph-wide minimum-width proof used by
+/// compiler-only absolute whole-window admission.
+const MAX_MIN_MATCH_WIDTH_WORK: u64 = 1_000_000;
 /// Hard work ceiling for the optional graph-wide maximum-width proof.
 const MAX_MATCH_WIDTH_WORK: u64 = 1_000_000;
 /// Independent ceilings for the optional exact-product NFA proof. The proof
@@ -12380,6 +12384,10 @@ impl CompiledProgram {
         Some(NativeOrderedNfaProgramView {
             output: self.output,
             raw: &self.raw,
+            whole_window_width_bounds: derive_whole_window_width_bounds(
+                &self.raw,
+                self.max_match_width(),
+            ),
             start_prefix_first_set: self
                 .anchored_prefix
                 .sets()
@@ -22720,6 +22728,116 @@ fn analysis_edge_weight(kind: EdgeKind) -> Option<usize> {
     }
 }
 
+/// Prove the minimum number of bytes consumed by any structurally accepting
+/// path. Assertions are conservatively traversed as zero-width edges. A
+/// bounded 0-1 shortest-path traversal is independent of the maximum-width
+/// proof so adding this compiler-only fact cannot change that proof's work,
+/// decline reason, or published result.
+fn derive_min_match_width(raw: &RawPlan) -> Option<usize> {
+    derive_min_match_width_with_limit(raw, MAX_MIN_MATCH_WIDTH_WORK)
+}
+
+fn derive_min_match_width_with_limit(raw: &RawPlan, max_work: u64) -> Option<usize> {
+    let mut work = AnchoredWork::new(max_work);
+    let states = raw.roles.len();
+    let edges = raw.edge_targets.len();
+    if states == 0
+        || raw.edge_offsets.len() != states.checked_add(1)?
+        || raw.edge_kinds.len() != edges
+        || raw.byte_starts.len() != edges
+        || raw.byte_ends.len() != edges
+    {
+        return None;
+    }
+    let start = usize::try_from(raw.start).ok()?;
+    if start >= states {
+        return None;
+    }
+    for &kind in &raw.edge_kinds {
+        if !work.charge(1) || analysis_edge_weight(kind).is_none() {
+            return None;
+        }
+    }
+
+    // Complete one zero-width closure at each byte distance before promoting
+    // consuming-edge targets to the next layer. Every state is admitted once,
+    // so the two pre-reserved stacks never grow beyond the state count.
+    let mut seen = analysis_filled(states, false, &mut work)?;
+    let mut next_mark = analysis_filled(states, false, &mut work)?;
+    let mut current = analysis_capacity(states, &mut work)?;
+    let mut next = analysis_capacity(states, &mut work)?;
+    seen[start] = true;
+    current.push(start);
+    let mut distance = 0_usize;
+    loop {
+        let mut accepted = false;
+        while let Some(state) = current.pop() {
+            if !work.charge(1) {
+                return None;
+            }
+            match raw.roles.get(state)? {
+                StateRole::Accept => accepted = true,
+                StateRole::Split | StateRole::Consume => {}
+                _ => return None,
+            }
+            let state_edges = analysis_state_edges(raw, state)?;
+            for edge in state_edges {
+                if !work.charge(1) {
+                    return None;
+                }
+                let weight = analysis_edge_weight(raw.edge_kinds[edge])?;
+                let target = usize::try_from(raw.edge_targets[edge]).ok()?;
+                let target_seen = *seen.get(target)?;
+                if target_seen {
+                    continue;
+                }
+                if weight == 0 {
+                    seen[target] = true;
+                    next_mark[target] = false;
+                    current.push(target);
+                } else if !next_mark[target] {
+                    next_mark[target] = true;
+                    next.push(target);
+                }
+            }
+        }
+        if accepted {
+            return Some(distance);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        distance = distance.checked_add(1)?;
+        for state in next.drain(..) {
+            if next_mark[state] {
+                next_mark[state] = false;
+                seen[state] = true;
+                current.push(state);
+            }
+        }
+    }
+}
+
+/// Admit bounds only when three independent graph facts hold: the existing
+/// maximum-width proof is finite, every accepting path crosses an absolute
+/// start cut, and every accepting path crosses an absolute end cut. The
+/// shortest-path proof may conservatively underestimate semantic width when
+/// assertions conflict; that remains safe for rejecting impossible window
+/// lengths.
+fn derive_whole_window_width_bounds(
+    raw: &RawPlan,
+    maximum_width: Option<usize>,
+) -> Option<WholeWindowWidthBounds> {
+    let maximum = maximum_width?;
+    if !accept_requires_assertion(raw, EdgeKind::AssertHaystackStart)
+        || !accept_requires_assertion(raw, EdgeKind::AssertHaystackEnd)
+    {
+        return None;
+    }
+    let minimum = derive_min_match_width(raw)?;
+    (minimum <= maximum).then_some(WholeWindowWidthBounds { minimum, maximum })
+}
+
 #[derive(Clone, Copy)]
 struct WidthDfsFrame {
     state: usize,
@@ -29699,6 +29817,135 @@ mod tests {
         assert_eq!(limited.width, None);
         assert!(limited.resource_limited);
         assert!(!limited.unbounded);
+    }
+
+    #[test]
+    fn minimum_match_width_is_bounded_graph_only_byte_analysis() {
+        for (pattern, expected) in [
+            ("", Some(0)),
+            ("a|bc", Some(1)),
+            ("a?b?", Some(0)),
+            ("a{2,4}", Some(2)),
+            (r"(?:a|Δ|𐀀)", Some(1)),
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(derive_min_match_width(&compiled.raw), expected, "{pattern:?}");
+        }
+
+        let compiled = program(
+            "abc",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(derive_min_match_width_with_limit(&compiled.raw, 0), None);
+    }
+
+    #[test]
+    fn absolute_start_and_end_graph_cuts_are_proved_independently() {
+        let cuts = |pattern: &str| {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            (
+                accept_requires_assertion(&compiled.raw, EdgeKind::AssertHaystackStart),
+                accept_requires_assertion(&compiled.raw, EdgeKind::AssertHaystackEnd),
+            )
+        };
+        assert_eq!(cuts(r"^a$"), (true, true));
+        assert_eq!(cuts(r"(?:^a|b$)"), (false, false));
+        assert_eq!(cuts(r"(?:^a$|^b)"), (true, false));
+        assert_eq!(cuts(r"(?:^a$|b$)"), (false, true));
+        assert_eq!(cuts(r"(?m:^a$)"), (false, false));
+    }
+
+    #[test]
+    fn whole_window_width_bounds_require_independent_absolute_cuts_and_round_trip() {
+        let forced_nfa = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for (pattern, expected) in [
+            (
+                r"^.{249}$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 249,
+                    maximum: 996,
+                }),
+            ),
+            (
+                r"^\w{10}$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 10,
+                    maximum: 40,
+                }),
+            ),
+            (
+                r"^(?:a|Δ|𐀀)$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 1,
+                    maximum: 4,
+                }),
+            ),
+            (
+                r"^Δ$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 2,
+                    maximum: 2,
+                }),
+            ),
+            (
+                r"^𐀀$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 4,
+                    maximum: 4,
+                }),
+            ),
+            (
+                r"^$",
+                Some(WholeWindowWidthBounds {
+                    minimum: 0,
+                    maximum: 0,
+                }),
+            ),
+            (r"(?:^a|b$)", None),
+            (r"(?:^a$|^b)", None),
+            (r"(?:^a$|b$)", None),
+            (r"^a", None),
+            (r"a$", None),
+            (r"(?m:^a$)", None),
+            (r"^a*$", None),
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                forced_nfa,
+            );
+            let fresh = compiled
+                .native_ordered_nfa_view()
+                .expect("forced fallback exposes the source graph")
+                .whole_window_width_bounds;
+            assert_eq!(fresh, expected, "fresh {pattern:?}");
+
+            let bytes = compiled.serialize().unwrap();
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert_eq!(restored.serialize().unwrap(), bytes, "wire {pattern:?}");
+            let restored_bounds = restored
+                .native_ordered_nfa_view()
+                .expect("restored fallback exposes the same graph")
+                .whole_window_width_bounds;
+            assert_eq!(restored_bounds, expected, "restored {pattern:?}");
+            assert_eq!(restored_bounds, fresh, "determinism {pattern:?}");
+        }
     }
 
     #[test]

@@ -167,11 +167,22 @@ impl FrozenOrderedNfaAccountingV1 {
     }
 }
 
+/// Compiler-only graph-proved byte bounds for an absolute whole-window match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WholeWindowWidthBounds {
+    pub(crate) minimum: usize,
+    pub(crate) maximum: usize,
+}
+
 /// Target-neutral view of one exact ordered-NFA Span program.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) raw: &'a RawPlan,
+    /// Compiler-only consumed-byte bounds for graphs whose accepting paths
+    /// independently cross absolute start and absolute end assertion cuts.
+    /// This is intentionally absent from every frozen object descriptor.
+    pub(crate) whole_window_width_bounds: Option<WholeWindowWidthBounds>,
     /// Exact compiler-only first-byte proof for a nonempty anchored prefix.
     /// This is intentionally absent from every frozen object descriptor.
     pub(crate) start_prefix_first_set: Option<[u64; 4]>,
@@ -380,6 +391,9 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     /// Compiler-only first-byte admission and idle-forward plan. This changes
     /// generated text only and adds no field or payload to the object image.
     pub(crate) start_prefix: Option<NativeOrderedNfaStartPrefixPlan>,
+    /// Compiler-only absolute whole-window width proof. This changes neither
+    /// the frozen object descriptor nor any following table offset or extent.
+    pub(crate) whole_window_width_bounds: Option<WholeWindowWidthBounds>,
     pub(crate) line_terminator: u8,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
@@ -1147,6 +1161,15 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             .map(derive_native_ordered_nfa_start_prefix)
             .transpose()?
             .flatten();
+        let whole_window_width_bounds = match view.whole_window_width_bounds {
+            Some(bounds) if bounds.minimum <= bounds.maximum => Some(bounds),
+            Some(_) => {
+                return Err(ObjectError::InvalidModule(
+                    "ordered-NFA whole-window width bounds are inverted",
+                ));
+            }
+            None => None,
+        };
         let cache_boundary_assertions = boundary_assertion_cache_is_profitable(
             assertion_edges,
             assertion_kinds,
@@ -1592,6 +1615,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             cache_boundary_assertions,
             start_closure_dispatch,
             start_prefix,
+            whole_window_width_bounds,
             line_terminator: view.line_terminator,
             ordered_edge_dispatch,
             terminal_range,
@@ -3208,6 +3232,58 @@ mod tests {
         .unwrap();
         assert_eq!(first.bytes, without.bytes);
         assert!(without.layout.start_prefix.is_none());
+    }
+
+    #[test]
+    fn whole_window_width_bounds_are_deterministic_and_do_not_change_object_data() {
+        let program = span_program_with_mode(
+            r"^.{2,4}$",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let expected = WholeWindowWidthBounds {
+            minimum: 2,
+            maximum: 16,
+        };
+        assert_eq!(view.whole_window_width_bounds, Some(expected));
+
+        let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let second = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.layout.whole_window_width_bounds, Some(expected));
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                whole_window_width_bounds: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.bytes, without.bytes);
+        assert_eq!(first.layout.object_bytes, without.layout.object_bytes);
+        assert!(without.layout.whole_window_width_bounds.is_none());
+
+        let serialized = program.serialize().unwrap();
+        let restored = crate::CompiledProgram::deserialize(&serialized).unwrap();
+        let restored_view = restored.native_ordered_nfa_view().unwrap();
+        assert_eq!(restored_view.whole_window_width_bounds, Some(expected));
+        let restored_image =
+            NativeOrderedNfaObjectImage::try_build(restored_view, usize::MAX)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored_image.bytes, first.bytes);
+        assert_eq!(restored_image.layout.whole_window_width_bounds, Some(expected));
     }
 
     #[test]

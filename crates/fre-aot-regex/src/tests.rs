@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v21() {
+fn receipt_records_selected_workspace_optimizer_identity_v22() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 21);
+    assert_eq!(OPTIMIZER_VERSION, 22);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -1121,6 +1121,184 @@ fn ordered_nfa_compiler_text_final_object_retries_preserve_exact_v3() {
     assert_eq!(
         retried_aggregate_without_start.object(),
         without_start_aggregate_object,
+    );
+}
+
+#[test]
+fn ordered_nfa_ineligible_width_gate_is_exactly_byte_inert_on_both_isas() {
+    let compiled = compile(
+        CompileRequest::new(r"(?-u:(?:a.c|ab)\b)", Target::x86_64_linux())
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span),
+    )
+    .expect("build width-ineligible Ordered-NFA program");
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert!(
+        compiled
+            .program()
+            .native_ordered_nfa_view()
+            .unwrap()
+            .whole_window_width_bounds
+            .is_none(),
+    );
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let enabled = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
+            compiled.program(), target, false, true, true, true, true, true, true, usize::MAX,
+        )
+        .expect("lower width-ineligible module with gate allowed");
+        let disabled = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
+            compiled.program(), target, false, true, true, true, true, true, false, usize::MAX,
+        )
+        .expect("lower width-ineligible module with gate disabled");
+        assert!(!enabled.has_ordered_nfa_whole_window_width_gate());
+        assert_eq!(enabled, disabled, "no-gate module drift for {target:?}");
+        assert_eq!(
+            emit_object(&enabled, crate::ObjectFormat::for_target(target), usize::MAX)
+                .expect("emit enabled width-ineligible object"),
+            emit_object(&disabled, crate::ObjectFormat::for_target(target), usize::MAX)
+                .expect("emit disabled width-ineligible object"),
+            "no-gate object drift for {target:?}",
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordinary and aggregate exact width-gate cap rungs share one fixture"
+)]
+fn ordered_nfa_whole_window_width_gate_is_text_only_and_retries_first() {
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(r"^.{249}$", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: crate::DeterminizeLimits {
+                    max_states: 0,
+                    ..crate::DeterminizeLimits::default()
+                },
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let mut slow_limits = SlowAotLimits::default();
+    slow_limits.determinize.max_states = 0;
+    slow_limits.determinize.max_transitions = 0;
+    slow_limits.determinize.max_work = 0;
+    let selected = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded whole-window width fixture");
+    assert!(selected.module().has_ordered_nfa_whole_window_width_gate());
+    assert_eq!(
+        selected
+            .program()
+            .native_ordered_nfa_view()
+            .unwrap()
+            .whole_window_width_bounds,
+        Some(crate::ordered_nfa_native::WholeWindowWidthBounds {
+            minimum: 249,
+            maximum: 996,
+        }),
+    );
+    let without_width = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
+        selected.program(), target, false, true, true, true, true, true, false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route lowering without whole-window width gate")
+    .with_optimizing_fallbacks_may_continue(
+        selected.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!without_width.has_ordered_nfa_whole_window_width_gate());
+    assert_eq!(
+        selected.module().has_ordered_nfa_start_prefix(),
+        without_width.has_ordered_nfa_start_prefix(),
+    );
+    assert_eq!(
+        selected.module().has_ordered_nfa_start_closure_dispatch(),
+        without_width.has_ordered_nfa_start_closure_dispatch(),
+    );
+    assert_eq!(
+        selected.module().sections()[1].bytes(),
+        without_width.sections()[1].bytes(),
+        "width gate must not change Ordered-NFA object/program data",
+    );
+    assert!(
+        selected.module().sections()[0].bytes().len()
+            > without_width.sections()[0].bytes().len(),
+    );
+    let relocation_shapes = |module: &crate::CompiledModule| {
+        module
+            .relocations()
+            .iter()
+            .map(|relocation| {
+                (
+                    relocation.section,
+                    relocation.kind,
+                    relocation.symbol,
+                    relocation.addend,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        relocation_shapes(selected.module()),
+        relocation_shapes(&without_width),
+    );
+    let format = crate::ObjectFormat::for_target(target);
+    let without_width_object = emit_object(&without_width, format, usize::MAX)
+        .expect("emit object without width gate");
+    assert!(without_width_object.len() < selected.object().len());
+    let selected_one_below = selected
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty width-gated object");
+    assert!(without_width_object.len() <= selected_one_below);
+    let retried = compile_with_slow_aot_limits(request(selected_one_below), slow_limits)
+        .expect("width-gated object one-below retries without width gate");
+    assert_eq!(retried.module(), &without_width);
+    assert_eq!(retried.object(), without_width_object);
+
+    let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+    let selected_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(usize::MAX),
+            exports,
+            slow_limits,
+        )
+        .expect("unbounded width-gated aggregate");
+    let serialized = selected
+        .program()
+        .serialize()
+        .expect("serialize width-gate fixture");
+    let without_width_aggregate = without_width
+        .append_prepared_aggregate_exports(
+            exports,
+            selected.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append aggregates without width gate");
+    let without_width_aggregate_object =
+        emit_object(&without_width_aggregate, format, usize::MAX)
+            .expect("emit aggregate without width gate");
+    assert!(without_width_aggregate_object.len() < selected_aggregate.object().len());
+    let selected_aggregate_one_below = selected_aggregate
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty width-gated aggregate object");
+    assert!(without_width_aggregate_object.len() <= selected_aggregate_one_below);
+    let retried_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(selected_aggregate_one_below),
+            exports,
+            slow_limits,
+        )
+        .expect("width-gated aggregate one-below retries without width gate");
+    assert_eq!(retried_aggregate.module(), &without_width_aggregate);
+    assert_eq!(
+        retried_aggregate.object(),
+        without_width_aggregate_object,
     );
 }
 
@@ -3189,6 +3367,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     const PLAIN_START_CLOSURE_PATTERN: &str =
         r"(?-u:(?:a?|bc)!(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
     const PREFIX_FLOW_PATTERN: &str = r"(?-u:a?a?a?a?a?a?a?a?(?:a.c|ab)\b)";
+    const ABSOLUTE_DOT_WIDTH_PATTERN: &str = r"^.{249}$";
+    const ABSOLUTE_WORD_WIDTH_PATTERN: &str = r"^\w{10}$";
     let target = if cfg!(target_arch = "x86_64") {
         if cfg!(target_os = "linux") {
             Target::x86_64_linux()
@@ -3293,6 +3473,39 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 b"zzabx".to_vec(),
                 b"zzzz".to_vec(),
                 vec![0xff, b'z', b'a', 0x80, b'c', b'!'],
+            ],
+        ),
+        (
+            ABSOLUTE_DOT_WIDTH_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                vec![b'a'; 248],
+                vec![b'a'; 249],
+                vec![b'a'; 250],
+                "😀".repeat(249).into_bytes(),
+                {
+                    let mut bytes = vec![b'a'; 249];
+                    bytes[248] = 0xff;
+                    bytes
+                },
+            ],
+        ),
+        (
+            ABSOLUTE_WORD_WIDTH_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                b"abcdefghi".to_vec(),
+                b"abcdefghij".to_vec(),
+                b"abcdefghijk".to_vec(),
+                "Ж".repeat(10).into_bytes(),
+                vec![b'a'; 44],
+                vec![0xff; 10],
             ],
         ),
         (
@@ -3431,7 +3644,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         let forced_ordered_graph_fixture = terminal_prefilter_fixture
             || *pattern == ASSERTION_CACHE_PATTERN
             || *pattern == PLAIN_START_CLOSURE_PATTERN
-            || *pattern == PREFIX_FLOW_PATTERN;
+            || *pattern == PREFIX_FLOW_PATTERN
+            || *pattern == ABSOLUTE_DOT_WIDTH_PATTERN
+            || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN;
         let artifact = if forced_ordered_graph_fixture {
             request.limits.determinize.max_states = 0;
             let mut slow_limits = SlowAotLimits::default();
@@ -3600,6 +3815,29 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 );
                 assert!(artifact.module().has_ordered_nfa_start_prefix());
             }
+            if *pattern == ABSOLUTE_DOT_WIDTH_PATTERN
+                || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN
+            {
+                assert!(artifact.module().has_ordered_nfa_whole_window_width_gate());
+                assert_eq!(
+                    artifact
+                        .program()
+                        .native_ordered_nfa_view()
+                        .unwrap()
+                        .whole_window_width_bounds,
+                    Some(if *pattern == ABSOLUTE_DOT_WIDTH_PATTERN {
+                        crate::ordered_nfa_native::WholeWindowWidthBounds {
+                            minimum: 249,
+                            maximum: 996,
+                        }
+                    } else {
+                        crate::ordered_nfa_native::WholeWindowWidthBounds {
+                            minimum: 10,
+                            maximum: 40,
+                        }
+                    }),
+                );
+            }
         } else {
             assert_eq!(
                 artifact.receipt().required_prepare_capabilities,
@@ -3674,7 +3912,11 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             } else {
                 haystack.len()
             };
-            let window_match = if *pattern == PREFIX_FLOW_PATTERN {
+            let window_match = if *pattern == ABSOLUTE_DOT_WIDTH_PATTERN
+                || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN
+            {
+                None
+            } else if *pattern == PREFIX_FLOW_PATTERN {
                 fixed_width_window_oracle(&oracle, haystack, window_start, window_end)
             } else {
                 oracle
@@ -3734,11 +3976,18 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     Some((start, end)) => (1_u32, start, end),
                     None => (0_u32, 0, 0),
                 };
+                let (full_status, full_start, full_end) = match spans.first().copied() {
+                    Some((start, end)) => (1_u32, start, end),
+                    None => (0_u32, 0, 0),
+                };
                 format!(
                     concat!(
                         "{{span_t one={{UINT64_C(0xaaaaaaaaaaaaaaaa),UINT64_C(0xbbbbbbbbbbbbbbbb)}};",
                         "uint32_t q={prepared_search_symbol}(h,h{fixture_index}_{case_index},{length}U,{window_start}U,{window_end}U,&one);",
-                        "if(q!={expected_status}U||one.start!={expected_start}U||one.end!={expected_end}U)return 13;}}"
+                        "if(q!={expected_status}U||one.start!={expected_start}U||one.end!={expected_end}U)return 13;",
+                        "one.start=UINT64_C(0xaaaaaaaaaaaaaaaa);one.end=UINT64_C(0xbbbbbbbbbbbbbbbb);",
+                        "q={prepared_search_symbol}(h,h{fixture_index}_{case_index},{length}U,0U,{length}U,&one);",
+                        "if(q!={full_status}U||one.start!={full_start}U||one.end!={full_end}U)return 14;}}"
                     ),
                     prepared_search_symbol = prepared_search_symbol,
                     fixture_index = fixture_index,
@@ -3749,6 +3998,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     expected_status = expected_status,
                     expected_start = expected_start,
                     expected_end = expected_end,
+                    full_status = full_status,
+                    full_start = full_start,
+                    full_end = full_end,
                 )
             } else {
                 String::new()
