@@ -278,11 +278,13 @@ const FRE_ADAPTER_V138: &str =
     "fre-current-aggregate-capture-v138-formal-fixed-schema-materialized-record-v1-v137-formal-url-only-compile-owner-v1-v136-formal-anchored-line-materialized-record-v1-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V146: &str =
     "fre-current-aggregate-capture-v146-formal-v145-and-v138-route-composition-v1";
+const FRE_ADAPTER_V147: &str =
+    "fre-current-aggregate-capture-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V146
+    FRE_ADAPTER_V147
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -601,7 +603,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V146
+        FRE_ADAPTER_V147
     }
 
     #[allow(
@@ -619,7 +621,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V146.to_string(),
+            adapter: FRE_ADAPTER_V147.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1118,6 +1120,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; every timed operation retains the exact ByteSlice::lines and CRLF partition, allocates a fresh exact outer CaptureRecord array and one fresh exact complete numeric-group array per record for each line, initializes every present and absent slot, retains all records for one line through that line's complete materialization and inspection, then visits every record, numeric slot, and both endpoints of every present span; named or noncanonical HIRs and finite resource refusals retain the incumbent General capture regex and persistent history, malformed bytes retain each proved engine's existing semantics, and selection observes only HIR, options, limits, and the whole haystack length before source access without benchmark names, fixture hashes, expected results, or pre-timed source preparation",
         );
         identity.identity.push_str(
+            "; formal-unicode-scalar-cursor-count-selectivity-cap-v1 builds one canonical positive Unicode scalar repetition owner, derives its conservative leading-byte mask once, and retains the exact cursor only when that mask contains at most 89 of the 179 legal scalar-start bytes; broader masks publish the already-built scalar owner without a cursor classifier or wrapper, advancing the public aggregate explain schema to v52 and the direct-owner algorithm/accounting protocol to v3/v2",
+        );
+        identity.availability.push_str(
+            "; non-SVE one-pattern Count and Compile select the cursor solely from the canonical HIR, immutable dispatch snapshot, operation, caller build policy, and the source-independent at-most-89-of-179 leading-byte cardinality proof; the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope is authenticated before source access, sparse matches retain the monotone cursor, dense matches cross once at a published match end, and SpanSum plus the existing SVE2 exactly-one owner remain unchanged; masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper, and their existing prepared-token behavior; prepare_unicode_scalar_count deliberately returns Ok(None) only for the cursor owner, so even at the formal at-most-4,096-byte prepared-admission threshold its first and steady timed public operations remain ordinary CountSingle calls using the cursor's authenticated full-window envelope rather than a prepared Unicode-scalar token",
+        );
+        identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
         );
         identity.availability.push_str(
@@ -1177,10 +1185,15 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity.availability.push_str(
             "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available; this adapter supersedes ",
         );
-        identity.availability.push_str(FRE_ADAPTER);
         identity
             .availability
-            .push_str("; the public composed adapter supersedes ");
+            .push_str("; this selectivity-cap adapter extends ");
+        identity.availability.push_str(FRE_ADAPTER_V146);
+        identity
+            .availability
+            .push_str(" which composes ");
+        identity.availability.push_str(FRE_ADAPTER);
+        identity.availability.push_str(" and ");
         identity.availability.push_str(FRE_ADAPTER_V138);
         identity
             .availability
@@ -8896,7 +8909,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V146
+        if receipt.adapter == FRE_ADAPTER_V147
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -17504,6 +17517,28 @@ fn unicode_scalar_operation_limits(
     })
 }
 
+fn unicode_scalar_cursor_count_operation_limits(
+    upper: fre::UnicodeScalarCursorCountUpperBounds,
+    limits: &RunLimits,
+) -> Result<UnicodeScalarAggregateReduceLimits, ExecutionError> {
+    let reducer_events = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+
+    Ok(UnicodeScalarAggregateReduceLimits {
+        max_input_bytes: upper.input_bytes,
+        max_decode_byte_checks: upper.decode_byte_checks,
+        max_membership_tests: upper.membership_tests,
+        max_range_comparisons: upper.range_comparisons,
+        max_reducer_steps: upper.reducer_steps.min(reducer_events),
+        max_match_events: upper.match_events.min(reducer_events),
+        max_count: upper.count.min(limits.reducer_steps),
+        max_span_sum: 0,
+        max_work: upper.work.min(limits.fre_aggregate_operation_work),
+        max_scratch_bytes: upper.scratch_bytes,
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
 fn inactive_unicode_scalar_operation_limits() -> UnicodeScalarAggregateReduceLimits {
     UnicodeScalarAggregateReduceLimits::default()
 }
@@ -19036,6 +19071,7 @@ fn aggregate_run_limits_with_fixed_absolute(
     let retained_bounds_required = matches!(
         report.build,
         AggregateBuildAccounting::UnicodeScalar(_)
+            | AggregateBuildAccounting::UnicodeScalarCursorCount(_)
             | AggregateBuildAccounting::PrefixClassAlternation(_)
             | AggregateBuildAccounting::LiteralClassRunLiteral(_)
             | AggregateBuildAccounting::ReverseInner(_)
@@ -19099,17 +19135,30 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
-        AggregateBuildAccounting::UnicodeScalar(_) => {
-            let Some(fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalar(upper)) =
-                retained_upper_bounds
-            else {
-                return Err(ExecutionError::fault(
-                    "FRE Unicode scalar retained-owner envelope is absent or transplanted",
-                ));
+        build @ (AggregateBuildAccounting::UnicodeScalar(_)
+        | AggregateBuildAccounting::UnicodeScalarCursorCount(_)) => {
+            let unicode_scalar = match (build, retained_upper_bounds) {
+                (
+                    AggregateBuildAccounting::UnicodeScalar(_),
+                    Some(fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalar(upper)),
+                ) => unicode_scalar_operation_limits(upper, limits)?,
+                (
+                    AggregateBuildAccounting::UnicodeScalarCursorCount(_),
+                    Some(
+                        fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalarCursorCount(
+                            upper,
+                        ),
+                    ),
+                ) => unicode_scalar_cursor_count_operation_limits(upper, limits)?,
+                _ => {
+                    return Err(ExecutionError::fault(
+                        "FRE Unicode scalar retained-owner envelope is absent or transplanted",
+                    ));
+                }
             };
             Ok(AggregateRunLimits {
                 exact_literal: inactive_literal_operation_limits(limits),
-                unicode_scalar: unicode_scalar_operation_limits(upper, limits)?,
+                unicode_scalar,
                 word_run: inactive_word_run_operation_limits(),
                 literal_assertions: inactive_literal_assertions_operation_limits(),
                 blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
@@ -35291,12 +35340,13 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V146);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V147);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v146-formal-v145-and-v138-route-composition-v1"
+            "fre-current-aggregate-capture-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1"
         );
         assert!(current_identity.availability.contains(FRE_ADAPTER));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V146));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
         assert!(
             current_identity
@@ -35356,6 +35406,40 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(
             "the whole haystack length before source access"
         ));
+        assert!(current_identity.identity.contains(
+            "formal-unicode-scalar-cursor-count-selectivity-cap-v1 builds one canonical positive Unicode scalar repetition owner"
+        ));
+        assert!(current_identity.identity.contains(
+            "at most 89 of the 179 legal scalar-start bytes"
+        ));
+        assert!(current_identity.availability.contains(
+            "masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper"
+        ));
+        assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
+        assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION, 3);
+        assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, 2);
+        assert_eq!(
+            fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+            89
+        );
+        assert_eq!(fre::UNICODE_SCALAR_LEGAL_START_BYTE_COUNT, 179);
+        assert_eq!(
+            fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+            fre::UNICODE_SCALAR_LEGAL_START_BYTE_COUNT / 2,
+        );
+        assert!(current_identity.identity.contains(
+            "public aggregate explain schema to v52 and the direct-owner algorithm/accounting protocol to v3/v2"
+        ));
+        assert!(current_identity.availability.contains(
+            "the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope"
+        ));
+        assert!(current_identity.availability.contains(
+            "prepare_unicode_scalar_count deliberately returns Ok(None) only for the cursor owner"
+        ));
+        assert!(current_identity.availability.contains(
+            "its first and steady timed public operations remain ordinary CountSingle calls"
+        ));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V137));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V136));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V134));
@@ -45318,6 +45402,106 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(capped.max_reducer_steps, 4);
         assert_eq!(capped.max_range_comparisons, 50);
         assert_eq!(capped.max_work, 111);
+    }
+
+    #[test]
+    fn unicode_scalar_cursor_count_limits_use_the_complete_prospective_envelope() {
+        let haystack = b"sparse--\xCE\xB1\xCE\xB2\xFF--tail";
+        assert!(haystack.len() <= CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES);
+        let patterns = [r"\p{Greek}+".to_owned()];
+        let lifecycle =
+            build_current_fre_count_lifecycle(&patterns, true, false, haystack.len())
+                .expect("small cursor Count lifecycle");
+        assert!(matches!(
+            &lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSingle(_, _)
+        ));
+        assert_eq!(lifecycle.execute(haystack).unwrap(), 1);
+        let boundary_lifecycle = build_current_fre_count_lifecycle(
+            &patterns,
+            true,
+            false,
+            CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES,
+        )
+        .expect("4 KiB cursor Count lifecycle");
+        assert!(matches!(
+            &boundary_lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSingle(_, _)
+        ));
+
+        let broad_haystack = b"abcdefgh";
+        let broad_patterns = [r"\p{L}{8,13}".to_owned()];
+        let broad_lifecycle = build_current_fre_count_lifecycle(
+            &broad_patterns,
+            true,
+            false,
+            broad_haystack.len(),
+        )
+        .expect("small broad Unicode-scalar Count lifecycle");
+        assert!(matches!(
+            &broad_lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(_, _, _)
+        ));
+        assert_eq!(broad_lifecycle.execute(broad_haystack).unwrap(), 1);
+        let broad_boundary_lifecycle = build_current_fre_count_lifecycle(
+            &broad_patterns,
+            true,
+            false,
+            CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES,
+        )
+        .expect("4 KiB broad Unicode-scalar Count lifecycle");
+        assert!(matches!(
+            &broad_boundary_lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(_, _, _)
+        ));
+
+        let count = current_fre_rebar_aggregate_builder(r"\p{Greek}+", true, false)
+            .build_count()
+            .expect("cursor Count plan");
+        let AggregateBuildAccounting::UnicodeScalarCursorCount(_) = count.build_report().build
+        else {
+            panic!("positive Unicode scalar Count retained another build owner")
+        };
+        let retained = count
+            .retained_full_window_upper_bounds(haystack.len())
+            .expect("authenticated cursor bounds")
+            .expect("cursor Count publishes retained bounds");
+        let fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalarCursorCount(upper) =
+            retained
+        else {
+            panic!("cursor Count published another bound family")
+        };
+        let projected =
+            unicode_scalar_cursor_count_operation_limits(upper, &RunLimits::default()).unwrap();
+        assert_eq!(projected.max_input_bytes, upper.input_bytes);
+        assert_eq!(projected.max_decode_byte_checks, upper.decode_byte_checks);
+        assert_eq!(projected.max_membership_tests, upper.membership_tests);
+        assert_eq!(projected.max_range_comparisons, upper.range_comparisons);
+        assert_eq!(projected.max_reducer_steps, upper.reducer_steps);
+        assert_eq!(projected.max_match_events, upper.match_events);
+        assert_eq!(projected.max_count, upper.count);
+        assert_eq!(projected.max_work, upper.work);
+        assert_eq!(projected.max_scratch_bytes, upper.scratch_bytes);
+        assert_eq!(projected.max_peak_bytes, upper.peak_bytes);
+
+        let aggregate = current_fre_rebar_count_run_limits(haystack.len(), &count)
+            .expect("cursor Count aggregate limits");
+        assert_eq!(aggregate.unicode_scalar, projected);
+        assert_eq!(count.count_value(haystack, aggregate).unwrap(), 1);
+
+        let capped = unicode_scalar_cursor_count_operation_limits(
+            upper,
+            &RunLimits {
+                reducer_steps: 1,
+                fre_aggregate_operation_work: upper.work - 1,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.max_reducer_steps, 1);
+        assert_eq!(capped.max_match_events, 1);
+        assert_eq!(capped.max_count, 1);
+        assert_eq!(capped.max_work, upper.work - 1);
     }
 
     #[test]

@@ -157,7 +157,12 @@ use fre_kernels::{
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSpanSumResult, UnicodeScalarAggregateUpperBounds, Window,
+    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateSpanSumResult,
+    UnicodeScalarAggregateUpperBounds, UnicodeScalarCursorCountAccounting,
+    UnicodeScalarCursorCountBuild, UnicodeScalarCursorCountResult,
+    UnicodeScalarCursorCountUpperBounds,
+    UnicodeScalarSearchBuildAccounting, UnicodeScalarSearchPlan,
+    UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID, UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -247,13 +252,13 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 51;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 52;
 
 /// Version of the construction-owned direct-route protocol.
-pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
+pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 3;
 
 /// Version of the lossless direct terminal-attempt envelope.
-pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 1;
+pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 2;
 
 /// Canonical schema for the facade-authenticated exact-literal count AOT
 /// semantic binding.
@@ -614,6 +619,8 @@ impl AggregateMatchDomainExecutionReceipt {
 pub enum AggregateRetainedFullWindowUpperBounds {
     /// Established or dispatched Unicode scalar reducer.
     UnicodeScalar(UnicodeScalarAggregateUpperBounds),
+    /// Leading-byte cursor Count with a one-way scalar suffix handoff.
+    UnicodeScalarCursorCount(UnicodeScalarCursorCountUpperBounds),
     /// Established or dispatched two-branch prefix/class count/span-sum reducer.
     PrefixClassAlternation(PrefixClassAlternationUpperBounds),
     /// Literal/class-run/literal count or span-sum reducer.
@@ -1987,6 +1994,8 @@ pub enum AggregateBuildAccounting {
     ExactLiteral(LiteralAggregateBuildAccounting),
     /// Compact scalar-range plan construction certificate.
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
+    /// Scalar ranges plus the retained leading-byte cursor Count owner.
+    UnicodeScalarCursorCount(UnicodeScalarSearchBuildAccounting),
     /// Fixed-size direct word-run construction certificate.
     WordRun(unicode_word_run::AggregateBuildAccounting),
     /// Exact retained literal construction certificate.
@@ -5213,6 +5222,13 @@ fn unicode_scalar_direct_operation_closes(
     operation: AggregateOperation,
     identity: UnicodeScalarAggregateOperationIdentity,
 ) -> bool {
+    let cursor_count = matches!(operation, AggregateOperation::Compile | AggregateOperation::Count)
+        && identity.plan_id == UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID
+        && identity.operation_id == UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID
+        && identity.operation == UnicodeScalarAggregateOperation::Count
+        && identity.scalar_semantics
+            == UnicodeScalarAggregateSemantics::RustBytesUnicodeUtf8False
+        && identity.non_overlapping;
     let expected_operation = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => {
             UnicodeScalarAggregateOperation::Count
@@ -5220,11 +5236,12 @@ fn unicode_scalar_direct_operation_closes(
         AggregateOperation::SpanSum => UnicodeScalarAggregateOperation::SpanSum,
         AggregateOperation::Spans => return false,
     };
-    identity
-        == UnicodeScalarAggregateOperationIdentity::for_repetition(
-            expected_operation,
-            identity.repetition,
-        )
+    cursor_count
+        || identity
+            == UnicodeScalarAggregateOperationIdentity::for_repetition(
+                expected_operation,
+                identity.repetition,
+            )
         || (identity.repetition == UnicodeScalarAggregateRepetition::ExactlyOne
             && identity
                 == UnicodeScalarAggregateOperationIdentity::for_dispatched_operation(
@@ -5479,6 +5496,7 @@ fn direct_details_close_cache(
     cache: &AggregateCacheIdentity,
     details: &AggregateExecutionDetails,
 ) -> bool {
+    let published_build = cache.artifact_owner.as_ref().map(|owner| owner.build);
     match (&cache.plan_identity, details) {
         (
             AggregatePlanIdentity::ExactLiteral(identity),
@@ -5490,6 +5508,21 @@ fn direct_details_close_cache(
         ) => {
             identity.kernel == accounting.identity
                 && unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
+                && matches!(
+                    published_build,
+                    Some(AggregateBuildAccounting::UnicodeScalar(_))
+                )
+        }
+        (
+            AggregatePlanIdentity::UnicodeScalar(identity),
+            AggregateExecutionDetails::UnicodeScalarCursorCount(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
+                && matches!(
+                    published_build,
+                    Some(AggregateBuildAccounting::UnicodeScalarCursorCount(_))
+                )
         }
         (
             AggregatePlanIdentity::WordRun(identity),
@@ -9230,6 +9263,8 @@ pub enum AggregateExecutionDetails {
     ExactLiteral(AggregateExactLiteralExecutionDetails),
     /// Direct scalar stream's complete bounds and structural counters.
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
+    /// Leading-byte cursor Count's complete bounds and exact control effects.
+    UnicodeScalarCursorCount(UnicodeScalarCursorCountAccounting),
     /// Direct word-run prospective and actual counters.
     WordRun(unicode_word_run::AggregateReduceAccounting),
     /// Direct line-assertion literal bounds and exact counters.
@@ -9307,6 +9342,7 @@ impl AggregateExecutionDetails {
         match self {
             Self::ExactLiteral(_) => Some(AggregateDirectRoute::ExactLiteral),
             Self::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
+            Self::UnicodeScalarCursorCount(_) => Some(AggregateDirectRoute::UnicodeScalar),
             Self::WordRun(_) => Some(AggregateDirectRoute::WordRun),
             Self::LiteralAssertions(_) => Some(AggregateDirectRoute::LiteralAssertions),
             Self::BlockingDelimiter(_) => Some(AggregateDirectRoute::BlockingDelimiter),
@@ -10969,7 +11005,13 @@ impl AggregateBuilder {
                 };
                 let use_ascii_blocks = repetition == UnicodeScalarAggregateRepetition::ExactlyOne
                     && DispatchedUnicodeScalarAggregatePlan::classifier_usable(simd_dispatch);
-                let (engine, build_actual, build, kernel) = if use_ascii_blocks {
+                let (
+                    engine,
+                    build_actual,
+                    build,
+                    kernel,
+                    retained_capacity_bytes,
+                ) = if use_ascii_blocks {
                     let attempt =
                         DispatchedUnicodeScalarAggregatePlan::build_attempt_with_dispatch(
                             simd_dispatch,
@@ -10991,12 +11033,71 @@ impl AggregateBuilder {
                         UnicodeScalarAggregateOperation::Count => engine.count_identity(),
                         UnicodeScalarAggregateOperation::SpanSum => engine.span_sum_identity(),
                     };
+                    let retained_capacity_bytes = build.persistent_bytes;
                     (
                         AggregateEngine::DispatchedUnicodeScalar(engine),
                         actual,
-                        build,
+                        AggregateBuildAccounting::UnicodeScalar(build),
                         kernel,
+                        retained_capacity_bytes,
                     )
+                } else if kernel_operation == UnicodeScalarAggregateOperation::Count {
+                    let (minimum, maximum, greedy) = match repetition {
+                        UnicodeScalarAggregateRepetition::ExactlyOne => (1, Some(1), true),
+                        UnicodeScalarAggregateRepetition::OneOrMoreGreedy => (1, None, true),
+                        UnicodeScalarAggregateRepetition::OneOrMoreLazy => (1, None, false),
+                        UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum } => {
+                            (minimum, maximum, true)
+                        }
+                        UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum } => {
+                            (minimum, maximum, false)
+                        }
+                    };
+                    let attempt =
+                        UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+                            simd_dispatch,
+                            ranges(),
+                            minimum,
+                            maximum,
+                            greedy,
+                            limits.unicode_scalar,
+                        )
+                        .map_err(|error| {
+                            construction.pending_terminal_effect =
+                                direct_build_stage_effect(work, error.actual());
+                            AggregateBuildError::UnicodeScalarBuild {
+                                operation,
+                                selection,
+                                source: error.into_source(),
+                            }
+                        })?;
+                    let (selected, actual) = attempt.into_parts();
+                    match selected {
+                        UnicodeScalarCursorCountBuild::Cursor { plan: engine, .. } => {
+                            let build = engine.build_accounting();
+                            let kernel = engine.cursor_count_identity();
+                            let retained_capacity_bytes = build.persistent_bytes;
+                            (
+                                AggregateEngine::UnicodeScalarCursorCount(engine),
+                                actual,
+                                AggregateBuildAccounting::UnicodeScalarCursorCount(build),
+                                kernel,
+                                retained_capacity_bytes,
+                            )
+                        }
+                        UnicodeScalarCursorCountBuild::Scalar { plan: engine, .. } => {
+                            let build = engine.build_accounting();
+                            let kernel = engine.count_identity();
+                            let retained_capacity_bytes = build.persistent_bytes;
+                            (
+                                AggregateEngine::UnicodeScalar(engine),
+                                actual,
+                                AggregateBuildAccounting::UnicodeScalar(build),
+                                kernel,
+                                retained_capacity_bytes,
+                            )
+                        }
+                    }
                 } else {
                     let attempt = match repetition {
                         UnicodeScalarAggregateRepetition::ExactlyOne => {
@@ -11053,11 +11154,13 @@ impl AggregateBuilder {
                         UnicodeScalarAggregateOperation::Count => engine.count_identity(),
                         UnicodeScalarAggregateOperation::SpanSum => engine.span_sum_identity(),
                     };
+                    let retained_capacity_bytes = build.persistent_bytes;
                     (
                         AggregateEngine::UnicodeScalar(engine),
                         actual,
-                        build,
+                        AggregateBuildAccounting::UnicodeScalar(build),
                         kernel,
+                        retained_capacity_bytes,
                     )
                 };
                 retain_direct_build_success(construction, work, build_actual);
@@ -11095,7 +11198,7 @@ impl AggregateBuilder {
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
-                    build: AggregateBuildAccounting::UnicodeScalar(build),
+                    build,
                     plan_identity: AggregatePlanIdentity::UnicodeScalar(
                         AggregateUnicodeScalarIdentity {
                             semantics: if nullable_greedy_span_sum {
@@ -11110,7 +11213,7 @@ impl AggregateBuilder {
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
                     sealed_url_aggregate_identity: None,
-                    retained_capacity_bytes: build.persistent_bytes,
+                    retained_capacity_bytes,
                 };
                 return Ok(AggregatePlan {
                     engine,
@@ -16934,6 +17037,7 @@ enum AggregateEngine {
     ExactLiteral(AggregateExactLiteralEngine),
     DispatchedExactLiteral(DispatchedLiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
+    UnicodeScalarCursorCount(UnicodeScalarSearchPlan),
     DispatchedUnicodeScalar(DispatchedUnicodeScalarAggregatePlan),
     WordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
@@ -17125,7 +17229,9 @@ impl AggregatePlan {
             AggregateEngine::ExactLiteral(_) | AggregateEngine::DispatchedExactLiteral(_) => {
                 Some(AggregateDirectRoute::ExactLiteral)
             }
-            AggregateEngine::UnicodeScalar(_) | AggregateEngine::DispatchedUnicodeScalar(_) => {
+            AggregateEngine::UnicodeScalar(_)
+            | AggregateEngine::UnicodeScalarCursorCount(_)
+            | AggregateEngine::DispatchedUnicodeScalar(_) => {
                 Some(AggregateDirectRoute::UnicodeScalar)
             }
             AggregateEngine::WordRun(_) | AggregateEngine::AsciiWordRun(_) => {
@@ -17543,6 +17649,43 @@ impl AggregatePlan {
                 engine
                     .full_window_upper_bounds(input_bytes)
                     .map(AggregateRetainedFullWindowUpperBounds::UnicodeScalar)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::UnicodeScalar)
+            }
+            AggregateEngine::UnicodeScalarCursorCount(engine) => {
+                if !matches!(
+                    self.operation(),
+                    AggregateOperation::Compile | AggregateOperation::Count
+                ) {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained Unicode scalar cursor Count owner has an unsupported operation",
+                    ));
+                }
+                let (
+                    AggregatePlanIdentity::UnicodeScalar(identity),
+                    AggregateBuildAccounting::UnicodeScalarCursorCount(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained Unicode scalar cursor Count owner does not match its published report",
+                    ));
+                };
+                let expected_identity = engine.cursor_count_identity();
+                if !self.retained_bounds_report_closes(AggregatePlanKind::UnicodeScalarClass)
+                    || identity.kernel != expected_identity
+                    || !unicode_scalar_direct_operation_closes(
+                        self.operation(),
+                        expected_identity,
+                    )
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained Unicode scalar cursor Count owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .cursor_count_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::UnicodeScalarCursorCount)
                     .map(Some)
                     .map_err(AggregateExecutionSource::UnicodeScalar)
             }
@@ -18343,6 +18486,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::UnicodeScalar(source),
                     )
                 }),
+            AggregateEngine::UnicodeScalarCursorCount(engine) => engine
+                .count_with_cursor(haystack, limits.unicode_scalar)
+                .map(AggregateCountExecution::UnicodeScalarCursorCount)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
             AggregateEngine::DispatchedUnicodeScalar(engine) => engine
                 .count(haystack, limits.unicode_scalar)
                 .map(AggregateCountExecution::UnicodeScalar)
@@ -18823,6 +18976,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::UnicodeScalar(source),
                     )
                 }),
+            AggregateEngine::UnicodeScalarCursorCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "Unicode scalar cursor Count owner reached SpanSum execution",
+                ),
+            )),
             AggregateEngine::DispatchedUnicodeScalar(engine) => engine
                 .span_sum(haystack, limits.unicode_scalar)
                 .map(AggregateSpanSumExecution::UnicodeScalar)
@@ -19338,6 +19497,24 @@ impl AggregatePlan {
     }
 
     #[inline(never)]
+    fn execute_unicode_scalar_cursor_count_value(
+        &self,
+        engine: &UnicodeScalarSearchPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .count_with_cursor_value(haystack, limits.unicode_scalar)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
+    #[inline(never)]
     fn execute_dispatched_unicode_scalar_count_value(
         &self,
         engine: &DispatchedUnicodeScalarAggregatePlan,
@@ -19723,6 +19900,9 @@ impl AggregatePlan {
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_count_value(engine, haystack, limits)
             }
+            AggregateEngine::UnicodeScalarCursorCount(engine) => {
+                self.execute_unicode_scalar_cursor_count_value(engine, haystack, limits)
+            }
             AggregateEngine::DispatchedUnicodeScalar(engine) => {
                 self.execute_dispatched_unicode_scalar_count_value(engine, haystack, limits)
             }
@@ -19818,6 +19998,9 @@ impl AggregatePlan {
             }
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::UnicodeScalarCursorCount(engine) => {
+                self.execute_unicode_scalar_cursor_count_value(engine, haystack, limits)
             }
             AggregateEngine::DispatchedUnicodeScalar(engine) => {
                 self.execute_dispatched_unicode_scalar_count_value(engine, haystack, limits)
@@ -20457,6 +20640,12 @@ impl AggregatePlan {
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_span_sum_value(engine, haystack, limits)
             }
+            AggregateEngine::UnicodeScalarCursorCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "Unicode scalar cursor Count owner reached SpanSum value execution",
+                ),
+            )),
             AggregateEngine::DispatchedUnicodeScalar(engine) => {
                 self.execute_dispatched_unicode_scalar_span_sum_value(engine, haystack, limits)
             }
@@ -20550,6 +20739,12 @@ impl AggregatePlan {
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_span_sum_value(engine, haystack, limits)
             }
+            AggregateEngine::UnicodeScalarCursorCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "Unicode scalar cursor Count owner reached fallback SpanSum value execution",
+                ),
+            )),
             AggregateEngine::DispatchedUnicodeScalar(engine) => {
                 self.execute_dispatched_unicode_scalar_span_sum_value(engine, haystack, limits)
             }
@@ -20892,6 +21087,7 @@ enum AggregateCountExecution {
         details: AggregateExactLiteralExecutionDetails,
     },
     UnicodeScalar(UnicodeScalarAggregateCountResult),
+    UnicodeScalarCursorCount(UnicodeScalarCursorCountResult),
     WordRun(unicode_word_run::AggregateCountResult),
     LiteralAssertions(LiteralAssertionsCountResult),
     BlockingDelimiter(BlockingDelimiterCountResult),
@@ -20944,6 +21140,7 @@ impl AggregateCountExecution {
         match self {
             Self::ImpossibleMatchDomain(receipt) => receipt.value(),
             Self::UnicodeScalar(result) => result.count,
+            Self::UnicodeScalarCursorCount(result) => result.count,
             Self::WordRun(result) => result.count,
             Self::LiteralAssertions(result) => result.count,
             Self::BlockingDelimiter(result) => result.count,
@@ -20983,6 +21180,9 @@ impl AggregateCountExecution {
             Self::ExactLiteral { details, .. } => AggregateExecutionDetails::ExactLiteral(details),
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
+            }
+            Self::UnicodeScalarCursorCount(result) => {
+                AggregateExecutionDetails::UnicodeScalarCursorCount(result.accounting)
             }
             Self::WordRun(result) => AggregateExecutionDetails::WordRun(result.accounting),
             Self::LiteralAssertions(result) => {
@@ -24657,12 +24857,14 @@ pub struct AggregateFixedPredicateWidthOneShiftAndCountAdmission {
     limits: AggregateRunLimits,
 }
 
-/// Source-free admission retained for repeated Unicode-scalar Count
-/// operations over one immutable input length and run policy.
+/// Source-free admission retained for repeated established Unicode-scalar
+/// stream Count operations over one immutable input length and run policy.
 ///
 /// The private kernel token and limits are created together by
 /// [`AggregateCountRegex::prepare_unicode_scalar_count`]. A token/input or
 /// retained-owner mismatch is replayed through the ordinary typed value path.
+/// The distinct Unicode-scalar cursor Count owner deliberately does not mint
+/// this admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateUnicodeScalarCountAdmission {
     kernel: UnicodeScalarAggregateCountAdmission,
@@ -24862,13 +25064,17 @@ impl AggregateCountRegex {
             })
     }
 
-    /// Pre-admit a Unicode-scalar Count for one immutable input length and run
-    /// policy without reading source bytes.
+    /// Pre-admit an established Unicode-scalar stream Count for one immutable
+    /// input length and run policy without reading source bytes.
     ///
-    /// `Ok(None)` means the selected plan is not a Unicode-scalar reducer, or
-    /// the facade's ordinary impossible-domain result must remain authoritative.
-    /// A resource refusal preserves the same typed aggregate error as ordinary
-    /// Count preflight.
+    /// `Ok(None)` means the selected plan is not an admission-capable
+    /// Unicode-scalar stream reducer, or the facade's ordinary
+    /// impossible-domain result must remain authoritative. In particular, the
+    /// Unicode-scalar cursor Count owner deliberately returns `Ok(None)`: its
+    /// ordinary Count operation authenticates the complete cursor envelope,
+    /// and no separate prepared-token execution contract is published for that
+    /// owner. A resource refusal from an admission-capable owner preserves the
+    /// same typed aggregate error as ordinary Count preflight.
     pub fn prepare_unicode_scalar_count(
         &self,
         input_bytes: usize,
@@ -25229,14 +25435,17 @@ mod tests {
         AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionIdentity,
         AggregateExecutionReport, AggregateExecutionSource, AggregateOperation,
         AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
-        CompatibilityProfile,
+        CanonicalPattern, CompatibilityProfile,
         DirectBuildAttemptActual, FixedAbsoluteDomainBuildActual,
         OrderedLiteralAggregateBuildError, RustProfile, TokenPhraseTopology,
-        UnicodeScalarInspectionError,
+        SimdDispatchContext, UnicodeScalarCursorCountBuild, UnicodeScalarInspection,
+        UnicodeScalarInspectionError, UnicodeScalarSearchPlan,
+        UnicodeScalarAggregateBuildLimits,
         charge_unicode_scalar_inspection_work, dense_finite_abandonment, direct_build_stage_effect,
         finite_build_limit_allows_continuation, fixed_absolute_construction_effect,
         fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
-        include_selected_plan_owner_effect, sparse_finite_abandonment,
+        include_selected_plan_owner_effect, inspect_unicode_scalar_class,
+        sparse_finite_abandonment,
     };
     use crate::AggregateConstructionLedgerEntry;
 
@@ -27127,6 +27336,69 @@ mod tests {
             Err(UnicodeScalarInspectionError::Overflow { .. })
         ));
         assert_eq!(work, usize::MAX);
+    }
+
+    #[test]
+    fn unicode_scalar_cursor_count_cohort_uses_parsed_hir_mask_cardinality() {
+        for (pattern, expected_count, expected_cursor) in [
+            (r"\p{Sm}", 13, true),
+            (r"\p{Greek}+", 7, true),
+            (r"(?:\p{Lowercase}|\p{Uppercase}){100}", 77, true),
+            (r"\p{L}{8,13}", 97, false),
+        ] {
+            let request = fre_syntax::ParseRequest::rust(
+                pattern,
+                CompatibilityProfile::RustBytes(RustProfile::rebar_1_12_4()),
+            );
+            let parsed = fre_syntax::parse(request).unwrap();
+            let CanonicalPattern::Rust(rust) = parsed.pattern else {
+                panic!("Rust request returned a non-Rust canonical pattern")
+            };
+            let UnicodeScalarInspection::Eligible {
+                class, repetition, ..
+            } = inspect_unicode_scalar_class(&rust.hir, usize::MAX, false)
+                .unwrap_or_else(|_| panic!("{pattern} scalar inspection failed"))
+            else {
+                panic!("{pattern} did not retain a canonical scalar class")
+            };
+            let (minimum, maximum, greedy) = match repetition {
+                super::UnicodeScalarAggregateRepetition::ExactlyOne => (1, Some(1), true),
+                super::UnicodeScalarAggregateRepetition::OneOrMoreGreedy => (1, None, true),
+                super::UnicodeScalarAggregateRepetition::OneOrMoreLazy => (1, None, false),
+                super::UnicodeScalarAggregateRepetition::RepeatedGreedy {
+                    minimum,
+                    maximum,
+                } => (minimum, maximum, true),
+                super::UnicodeScalarAggregateRepetition::RepeatedLazy {
+                    minimum,
+                    maximum,
+                } => (minimum, maximum, false),
+            };
+            let selection =
+                UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+                    SimdDispatchContext::capture(),
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    minimum,
+                    maximum,
+                    greedy,
+                    UnicodeScalarAggregateBuildLimits::unlimited(),
+                )
+                .unwrap()
+                .into_plan();
+            assert_eq!(
+                selection.leading_byte_count(),
+                expected_count,
+                "pattern={pattern}",
+            );
+            assert_eq!(
+                matches!(selection, UnicodeScalarCursorCountBuild::Cursor { .. }),
+                expected_cursor,
+                "pattern={pattern}",
+            );
+        }
     }
 
     #[test]
