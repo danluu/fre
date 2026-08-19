@@ -25520,6 +25520,15 @@ mod tests {
     use super::*;
     use fre::{AggregateResource, SearchWindow};
 
+    fn run_stack_heavy_test(test: fn()) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1_048_576)
+            .spawn(test)
+            .expect("spawn stack-heavy Rebar test")
+            .join()
+            .expect("stack-heavy Rebar test");
+    }
+
     #[test]
     fn formal_single_span_sweep_requires_large_program_and_unexecutable_dense_work() {
         std::thread::Builder::new()
@@ -26765,6 +26774,13 @@ mod tests {
 
     #[test]
     fn current_fre_regex_redux_composite_semantics_and_inventory() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_composite_semantics_and_inventory,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_composite_semantics_and_inventory() {
         let limits = RunLimits::default();
         let result = run_fre_composite(
             b">header\r\n\nagggtaaatHaN",
@@ -26787,6 +26803,13 @@ mod tests {
 
     #[test]
     fn current_fre_regex_redux_stage_order_is_semantic() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_stage_order_is_semantic,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_stage_order_is_semantic() {
         let limits = RunLimits::default();
         let caps = composite_limits(&limits).expect("composite limits");
         let ordered = run_fre_composite(b"tHaN", &REGEX_REDUX_STAGES, &limits, caps)
@@ -26802,6 +26825,13 @@ mod tests {
 
     #[test]
     fn current_fre_regex_redux_report_is_bound_to_the_executed_stage_program() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_report_is_bound_to_the_executed_stage_program,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_report_is_bound_to_the_executed_stage_program() {
         let run_limits = RunLimits::default();
         let limits = composite_limits(&run_limits).expect("composite limits");
 
@@ -26895,6 +26925,13 @@ mod tests {
 
     #[test]
     fn current_fre_regex_redux_metadata_limits_are_exact() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_metadata_limits_are_exact,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_metadata_limits_are_exact() {
         let limits = RunLimits::default();
         let default_caps = composite_limits(&limits).expect("composite limits");
         let input = b">h\n\nagggtaaa";
@@ -27267,6 +27304,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_nullable_replacement_cannot_influence_the_envelope() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_nullable_replacement_cannot_influence_the_envelope,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_nullable_replacement_cannot_influence_the_envelope() {
         let run_limits = RunLimits::default();
         let canonical_program =
             CompositeProgram::authenticate(&REGEX_REDUX_STAGES).expect("canonical program");
@@ -27324,6 +27368,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_rejects_wrong_minimum_and_nullable_count_before_limits() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_rejects_wrong_minimum_and_nullable_count_before_limits,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_rejects_wrong_minimum_and_nullable_count_before_limits() {
         let run_limits = RunLimits::default();
         let canonical_program =
             CompositeProgram::authenticate(&REGEX_REDUX_STAGES).expect("canonical program");
@@ -27418,6 +27469,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_replacement_limits_never_widen_the_component() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_replacement_limits_never_widen_the_component,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_replacement_limits_never_widen_the_component() {
         let build = AggregateBuilder::new(r"tHa[Nt]")
             .profile(rebar_profile())
             .unicode(false)
@@ -27559,6 +27617,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_counts_match_pinned_rust_independently() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_counts_match_pinned_rust_independently,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_counts_match_pinned_rust_independently() {
         let limits = RunLimits::default();
         let input = b"xxagggtaaayytttaccctagggtaaa";
         let result = run_fre_composite(
@@ -27579,6 +27644,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_counts_use_the_general_feature_appropriate_leaf() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_counts_use_the_general_feature_appropriate_leaf,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_counts_use_the_general_feature_appropriate_leaf() {
         let limits = RunLimits::default();
         assert_eq!(
             fre::PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK,
@@ -27640,6 +27712,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_preserves_gaps_adjacency_and_literal_bytes() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_preserves_gaps_adjacency_and_literal_bytes,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_preserves_gaps_adjacency_and_literal_bytes() {
         let limits = RunLimits::default();
         let caps = composite_limits(&limits).expect("composite limits");
         let adjacent = run_fre_composite(
@@ -27851,6 +27930,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_composite_resource_limits_are_exact() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_composite_resource_limits_are_exact,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_composite_resource_limits_are_exact() {
         let run_limits = RunLimits::default();
         let input = b"tHaN";
         assert_regex_redux_all_component_build_peaks(&run_limits);
@@ -27958,6 +28044,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_regex_redux_authenticated_hard_canary() {
+        run_stack_heavy_test(
+            assert_current_fre_regex_redux_authenticated_hard_canary,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_regex_redux_authenticated_hard_canary() {
         const HAYSTACK: &[u8] = b">header\r\n\nagggtaaatHaN";
         assert_eq!(HAYSTACK.len(), 22);
         assert_eq!(
@@ -30891,6 +30984,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn legacy_literal_timing_count_spans_materializes_and_iterates_complete_bounds() {
+        run_stack_heavy_test(
+            assert_legacy_literal_timing_count_spans_materializes_and_iterates_complete_bounds,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_legacy_literal_timing_count_spans_materializes_and_iterates_complete_bounds() {
         let job = synthetic_job("count-spans", 3);
         let loaded = LoadedJob {
             patterns: vec!["a+".to_string()],
@@ -33497,6 +33597,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn scalar_capture_grep_lf_scan_shares_one_work_cap() {
+        run_stack_heavy_test(
+            assert_scalar_capture_grep_lf_scan_shares_one_work_cap,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_scalar_capture_grep_lf_scan_shares_one_work_cap() {
         let defaults = RunLimits::default();
         let patterns = [r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})".to_string()];
         let fixture = b"aaaaaaaaaaaaaa";
@@ -33789,6 +33896,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_name_alt4_casei_uses_k0_casefold_prefix_class_visitor() {
+        run_stack_heavy_test(
+            assert_current_fre_name_alt4_casei_uses_k0_casefold_prefix_class_visitor,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_name_alt4_casei_uses_k0_casefold_prefix_class_visitor() {
         let patterns = vec![r"Sher[a-z]+|Hol[a-z]+".to_string()];
         assert_current_fre_execution(
             current_fre(
@@ -33806,6 +33920,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_tom_sawyer_bounded_prefixes_use_packed_count_route() {
+        run_stack_heavy_test(
+            assert_current_fre_tom_sawyer_bounded_prefixes_use_packed_count_route,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_tom_sawyer_bounded_prefixes_use_packed_count_route() {
         let limits = RunLimits::default();
         for (pattern, haystack, expected) in [
             (
@@ -34000,11 +34121,23 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn current_fre_fixed_absolute_adapter_covers_thirteen_target_lifecycle_shapes() {
+        std::thread::Builder::new()
+            .name("current-fre-fixed-absolute-thirteen-shapes".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(
+                assert_current_fre_fixed_absolute_adapter_covers_thirteen_target_lifecycle_shapes,
+            )
+            .expect("spawn fixed-absolute lifecycle-shapes test")
+            .join()
+            .expect("fixed-absolute lifecycle-shapes test");
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one authenticated table keeps the exact thirteen imported Rebar shapes and lifecycle checks together"
     )]
-    fn current_fre_fixed_absolute_adapter_covers_thirteen_target_lifecycle_shapes() {
+    fn assert_current_fre_fixed_absolute_adapter_covers_thirteen_target_lifecycle_shapes() {
         struct Case {
             id: &'static str,
             model: &'static str,
@@ -34514,6 +34647,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_bounded_separated_ip_receipt_and_hard_limits_are_exact() {
+        std::thread::Builder::new()
+            .name("bounded-separated-ip-receipt-limits".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_current_fre_bounded_separated_ip_receipt_and_hard_limits_are_exact)
+            .expect("spawn bounded separated-field IP receipt thread")
+            .join()
+            .expect("bounded separated-field IP receipt thread panicked");
+    }
+
+    fn assert_current_fre_bounded_separated_ip_receipt_and_hard_limits_are_exact() {
         const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
         assert_current_fre_execution(
             current_fre(
@@ -35005,6 +35148,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_bounded_separated_identity_is_fail_closed() {
+        std::thread::Builder::new()
+            .name("bounded-separated-fail-closed-identity".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_current_fre_bounded_separated_identity_is_fail_closed)
+            .expect("spawn bounded separated-field identity thread")
+            .join()
+            .expect("bounded separated-field identity thread panicked");
+    }
+
+    fn assert_current_fre_bounded_separated_identity_is_fail_closed() {
         const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
 
         let regex = AggregateBuilder::new(PATTERN)
@@ -35780,6 +35933,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn reverse_inner_adapter_closes_independent_and_both_v2_union_receipts() {
+        run_stack_heavy_test(
+            assert_reverse_inner_adapter_closes_independent_and_both_v2_union_receipts,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_reverse_inner_adapter_closes_independent_and_both_v2_union_receipts() {
         let independent = current_fre_rebar_aggregate_builder(r"[a-zλ]+ab[a-zλ]+", true, false)
             .build_count()
             .expect("independent reverse-inner plan");
@@ -37291,6 +37451,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_lazy_unit_byte_predicate_count_and_sum_are_exact_and_narrow() {
+        run_stack_heavy_test(
+            assert_current_fre_lazy_unit_byte_predicate_count_and_sum_are_exact_and_narrow,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_lazy_unit_byte_predicate_count_and_sum_are_exact_and_narrow() {
         let pattern = r"(?P<byte>[a-z]+?)";
         let patterns = vec![pattern.to_string()];
         let count = current_fre_rebar_aggregate_builder(pattern, false, false)
@@ -37643,6 +37810,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_word_run_build_accounting_is_plan_owned_and_operation_complete() {
+        run_stack_heavy_test(
+            assert_current_fre_word_run_build_accounting_is_plan_owned_and_operation_complete,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_word_run_build_accounting_is_plan_owned_and_operation_complete() {
         for (pattern, unicode, expected_semantics, expected_topology, complete_word_boundaries) in [
             (
                 r"\b\w{12,}\b",
@@ -37800,6 +37974,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_ascii_word_boundary_count_and_sum_are_exact_and_narrow() {
+        std::thread::Builder::new()
+            .name("ascii-word-boundary-count-and-sum".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_current_fre_ascii_word_boundary_count_and_sum_are_exact_and_narrow)
+            .expect("spawn ASCII word-boundary count-and-sum thread")
+            .join()
+            .expect("ASCII word-boundary count-and-sum thread panicked");
+    }
+
+    fn assert_current_fre_ascii_word_boundary_count_and_sum_are_exact_and_narrow() {
         let pattern = r"\b";
         let patterns = vec![pattern.to_string()];
         let count = current_fre_rebar_aggregate_builder(pattern, false, false)
@@ -38035,6 +38219,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         reason = "the packed finite adapter audit keeps labels, identities, and limits together"
     )]
     fn current_fre_packed_finite_route_has_exact_labels_identity_and_limits() {
+        run_stack_heavy_test(
+            assert_current_fre_packed_finite_route_has_exact_labels_identity_and_limits,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_packed_finite_route_has_exact_labels_identity_and_limits() {
         let pattern = r"(?:cat|dog)";
         let haystack = b"catdogxxxx";
 
@@ -38262,6 +38453,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_guarded_ascii_word_receipts_fail_closed_under_forgery() {
+        run_stack_heavy_test(
+            assert_current_fre_guarded_ascii_word_receipts_fail_closed_under_forgery,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_guarded_ascii_word_receipts_fail_closed_under_forgery() {
         let report = AggregateBuilder::new(r"\b(?:as|break|Self)\b")
             .profile(rebar_profile())
             .unicode(false)
@@ -38302,6 +38500,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_span_sum_greedy_star_uses_direct_scalar_reduction() {
+        run_stack_heavy_test(
+            assert_current_fre_span_sum_greedy_star_uses_direct_scalar_reduction,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_span_sum_greedy_star_uses_direct_scalar_reduction() {
         assert_current_fre_default_single_count_spans(".*", b"ab\n\xFFcd", true, false, 4);
     }
 
@@ -38587,6 +38792,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn current_fre_one_pattern_aggregate_models_cover_adversarial_semantics() {
+        run_stack_heavy_test(
+            assert_current_fre_one_pattern_aggregate_models_cover_adversarial_semantics,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_current_fre_one_pattern_aggregate_models_cover_adversarial_semantics() {
         assert_current_fre_default_single_count(r"(?:a+b|a)", b"aaaa", false, false, 4);
         assert_current_fre_default_single_count(r"(?:a+b|a)", b"aaaab", false, false, 1);
         assert_current_fre_default_single_count_spans(r"(?:a+b|a)", b"aaaa", false, false, 4);
@@ -42088,11 +42300,21 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
+        std::thread::Builder::new()
+            .name("current-fre-fresh-compile-artifacts".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts)
+            .expect("spawn fresh Compile artifact test")
+            .join()
+            .expect("fresh Compile artifact test thread panicked");
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the single/ordered compile routing and refusal matrix shares one identity setup"
     )]
-    fn current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
+    fn assert_current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
             current_fre(
@@ -43045,6 +43267,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_streams_bounds_and_reuses_the_prepared_session() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_streams_bounds_and_reuses_the_prepared_session,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_streams_bounds_and_reuses_the_prepared_session() {
         let haystack = b"aba\xFFa";
         let regex = current_fre_rebar_complete_spans_regex("a*", false, true)
             .expect("portable complete-spans matcher");
@@ -43382,6 +43611,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_routes_lazy_delimited_repeats_through_the_direct_visitor() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_routes_lazy_delimited_repeats_through_the_direct_visitor,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_routes_lazy_delimited_repeats_through_the_direct_visitor() {
         let pattern = r"(.*?,){2}z";
         let haystack = b"a,b,c,z\r\nfalse,z!d,e,z\xfff,g,h,z";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -43436,6 +43672,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_routes_greedy_delimited_corridors_through_the_indexed_visitor() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_routes_greedy_delimited_corridors_through_the_indexed_visitor,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_routes_greedy_delimited_corridors_through_the_indexed_visitor() {
         let pattern = r"Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes";
         let haystack = b"Holmes Watson\nWatson\nonly whitespace\nHolmes\nHolmes x\n\nWatson";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -43543,6 +43786,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_routes_nested_positive_classes_through_the_direct_visitor() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_routes_nested_positive_classes_through_the_direct_visitor,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_routes_nested_positive_classes_through_the_direct_visitor() {
         let pattern = r"(a+)*[b-z]";
         let haystack = b"aaaaacaa!aaaz";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -43587,6 +43837,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn nested_positive_class_complete_spans_match_regex_bytes_exhaustively() {
+        run_stack_heavy_test(
+            assert_nested_positive_class_complete_spans_match_regex_bytes_exhaustively,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_nested_positive_class_complete_spans_match_regex_bytes_exhaustively() {
         let alphabet = [b'a', b'b', b'c', b'x', 0];
         for pattern in [r"(a+)*[b-c]", r"((?:[ab]+))*c"] {
             let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -44175,6 +44432,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_token_phrases_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("token-phrase-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_complete_spans_routes_token_phrases_through_the_aggregate_visitor)
+            .expect("spawn token-phrase complete-spans thread")
+            .join()
+            .expect("token-phrase complete-spans thread panicked");
+    }
+
+    fn assert_complete_spans_routes_token_phrases_through_the_aggregate_visitor() {
         let pattern = r"\b\w+\s+Holmes\s+\w+\b";
         let haystack = b"--left Holmes right--a Holmes b--";
         let regex = current_fre_rebar_complete_spans_regex(pattern, false, false).unwrap();
@@ -44238,6 +44505,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn complete_spans_routes_reverse_inner_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("reverse-inner-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_complete_spans_routes_reverse_inner_through_the_aggregate_visitor)
+            .expect("spawn reverse-inner complete-spans thread")
+            .join()
+            .expect("reverse-inner complete-spans thread panicked");
+    }
+
+    fn assert_complete_spans_routes_reverse_inner_through_the_aggregate_visitor() {
         let pattern = r"\pL+herloc\pL+|\pL+olme\pL+";
         let haystack = "--Sherlock Holmes--éherlocß--".as_bytes();
         let regex = current_fre_rebar_complete_spans_regex(pattern, true, false).unwrap();
@@ -44443,6 +44720,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end() {
         let nonempty = current_fre_rebar_complete_spans_regex("a|b", false, false).unwrap();
         let mut nonempty_session = nonempty.session(2).unwrap();
         assert_eq!(nonempty_session.limits.max_search_calls, 3);
@@ -44464,6 +44748,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_has_an_independent_bounded_resource_policy() {
+        run_stack_heavy_test(
+            assert_portable_complete_spans_has_an_independent_bounded_resource_policy,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_portable_complete_spans_has_an_independent_bounded_resource_policy() {
         let regex = current_fre_rebar_complete_spans_regex("z", false, false).unwrap();
         assert_eq!(
             regex.plan(),
@@ -44543,6 +44834,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn folded_resource_refusals_fall_through_raw_and_retained_count_ladders() {
+        run_stack_heavy_test(
+            assert_folded_resource_refusals_fall_through_raw_and_retained_count_ladders,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_folded_resource_refusals_fall_through_raw_and_retained_count_ladders() {
         let pattern = "Шерлок Холмс";
         let patterns = [pattern.to_string()];
         let haystack = "ШЕРЛОК ХОЛМС/шерлок холмс".as_bytes();
@@ -44999,6 +45297,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn unicode_folded_literal_unsupported_hir_falls_through() {
+        run_stack_heavy_test(
+            assert_unicode_folded_literal_unsupported_hir_falls_through,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_unicode_folded_literal_unsupported_hir_falls_through() {
         let unsupported = [r"Ш+".to_string()];
         let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
             "count",
@@ -45535,6 +45840,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn rebar_span_sum_dense_prefix_absent_suffix_fits_derived_limits() {
+        run_stack_heavy_test(
+            assert_rebar_span_sum_dense_prefix_absent_suffix_fits_derived_limits,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_rebar_span_sum_dense_prefix_absent_suffix_fits_derived_limits() {
         // Exact shape and input construction from
         // opt/reverse-inner/no-quadratic-forward. The lifecycle derives the
         // same public-operation limit that the Rebar runner enforces.
@@ -45555,6 +45867,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn rebar_span_sum_required_literal_miss_fits_derived_limits() {
+        run_stack_heavy_test(
+            assert_rebar_span_sum_required_literal_miss_fits_derived_limits,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_rebar_span_sum_required_literal_miss_fits_derived_limits() {
         let haystack = b"bcdefghijklmnopq".repeat(500);
         for pattern in [r"[A-Z][a-z]+.efghijklmnopq", r".[a-z]+[A-Z]efghijklmnopq"] {
             let patterns = [pattern.to_string()];
@@ -45787,6 +46106,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn exact_literal_resource_refusal_requires_a_closed_direct_attempt() {
+        run_stack_heavy_test(
+            assert_exact_literal_resource_refusal_requires_a_closed_direct_attempt,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_exact_literal_resource_refusal_requires_a_closed_direct_attempt() {
         let regex = AggregateBuilder::new("needle")
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
@@ -46157,6 +46483,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn continuation_structural_quotas_refuse_before_plan_publication() {
+        std::thread::Builder::new()
+            .name("continuation-structural-quota-refusals".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_continuation_structural_quotas_refuse_before_plan_publication)
+            .expect("spawn continuation structural-quota thread")
+            .join()
+            .expect("continuation structural-quota thread panicked");
+    }
+
+    fn assert_continuation_structural_quotas_refuse_before_plan_publication() {
         let build = |pattern: &str, run: &RunLimits| {
             AggregateBuilder::new(pattern)
                 .profile(rebar_profile())
@@ -46570,6 +46906,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         reason = "one retained-artifact matrix binds every repaired direct family to its executable limits"
     )]
     fn retained_direct_owner_limits_project_actual_selected_artifacts() {
+        run_stack_heavy_test(
+            assert_retained_direct_owner_limits_project_actual_selected_artifacts,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_retained_direct_owner_limits_project_actual_selected_artifacts() {
         let defaults = RunLimits::default();
 
         let prefix_haystack = b"abcz--xy7";
@@ -46906,6 +47249,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes() {
+        run_stack_heavy_test(
+            assert_retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes() {
         let policy = RunLimits::default();
         let eligible = AggregateBuilder::new(r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z")
             .profile(rebar_profile())
@@ -47029,6 +47379,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn persistent_sweep_diagnostics_are_explicit_incumbent_projections() {
+        run_stack_heavy_test(
+            assert_persistent_sweep_diagnostics_are_explicit_incumbent_projections,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_persistent_sweep_diagnostics_are_explicit_incumbent_projections() {
         let pattern = r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z";
         let haystack = b"abcdefghijklmnopqqrstuvwxyzabcdefgz--qrstuvwxyzabcdefgz";
         let policy = RunLimits::default();
@@ -47462,6 +47819,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn required_anchor_public_private_identity_is_fail_closed() {
+        run_stack_heavy_test(
+            assert_required_anchor_public_private_identity_is_fail_closed,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_required_anchor_public_private_identity_is_fail_closed() {
         let regex = AggregateBuilder::new(r"[\w]+://[^/\s?#]+[^\s?#]+(?:\?[^\s#]*)?(?:#[^\s]*)?")
             .profile(rebar_profile())
             .unicode(false)
@@ -47617,6 +47981,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn continuation_limits_include_authenticated_utf8_prevalidation() {
+        std::thread::Builder::new()
+            .name("continuation-utf8-prevalidation-limits".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_continuation_limits_include_authenticated_utf8_prevalidation)
+            .expect("spawn continuation UTF-8 prevalidation limits thread")
+            .join()
+            .expect("continuation UTF-8 prevalidation limits thread panicked");
+    }
+
+    fn assert_continuation_limits_include_authenticated_utf8_prevalidation() {
         let regex = AggregateBuilder::new(r"\b")
             .profile(rebar_profile())
             .unicode(true)
@@ -47937,6 +48311,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn finite_identity_requires_matching_dense_packed_or_sparse_algorithm_operation_pair() {
+        run_stack_heavy_test(
+            assert_finite_identity_requires_matching_dense_packed_or_sparse_algorithm_operation_pair,
+        );
+    }
+
+    #[allow(clippy::too_many_lines, reason = "stack-isolated regression test")]
+    fn assert_finite_identity_requires_matching_dense_packed_or_sparse_algorithm_operation_pair() {
         let identity = |algorithm, operation| AggregateFiniteLiteralIdentity {
             semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
             algorithm,
