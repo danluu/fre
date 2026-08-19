@@ -7,7 +7,9 @@ use std::sync::{
 };
 
 use crate::ast::Ast;
-use crate::backtrack::BoundedBacktracker;
+use crate::backtrack::{
+    BoundedBacktrackWorkspace, BoundedBacktrackWorkspaceUsage, BoundedBacktracker,
+};
 use crate::compile::{MaskedInclusiveRange, Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
@@ -333,6 +335,43 @@ impl HistoryRegex {
             .map(Some)
     }
 
+    /// Derive fixed reusable bounded-backtracking storage without inspecting
+    /// source bytes. `None` means that the immutable program cannot use the
+    /// compact tagged-frame representation. The supplied limits admit the
+    /// largest unanchored search before any allocation occurs.
+    pub fn bounded_backtrack_workspace_usage(
+        &self,
+        max_search_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<BoundedBacktrackWorkspaceUsage>, SearchError> {
+        let backtracker = BoundedBacktracker::new(&self.program);
+        if !backtracker.is_supported() {
+            return Ok(None);
+        }
+        backtracker
+            .workspace_usage(max_search_bytes, limits)
+            .map(Some)
+    }
+
+    /// Allocate the explicit DFS stack, visited bitset and raw capture slots
+    /// needed by every search suffix no longer than `max_search_bytes`.
+    ///
+    /// A successful workspace is bound to this regex clone lineage. Searches
+    /// allocate only the returned canonical capture record.
+    pub fn prepare_bounded_backtrack_workspace(
+        &self,
+        max_search_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<BoundedBacktrackWorkspace>, SearchError> {
+        let backtracker = BoundedBacktracker::new(&self.program);
+        if !backtracker.is_supported() {
+            return Ok(None);
+        }
+        backtracker
+            .prepare_workspace(self.identity, max_search_bytes, limits)
+            .map(Some)
+    }
+
     /// Derive the complete restarted-session envelope without inspecting
     /// source bytes.
     pub fn restarted_prospective(
@@ -405,6 +444,35 @@ impl HistoryRegex {
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
         self.search_from(haystack, window, from, config, limits)
+    }
+
+    /// Run one leftmost-first search with caller-owned bounded-backtracking
+    /// scratch retained across calls.
+    ///
+    /// Workspace lineage, fixed capacities, the requested suffix width and
+    /// complete per-search admission are checked before source access. This
+    /// low-level operation has no fallback after invocation.
+    pub fn captures_from_with_bounded_backtrack_workspace(
+        &self,
+        workspace: &mut BoundedBacktrackWorkspace,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        if config.kind != SearchKind::Leftmost || config.match_kind != MatchKind::LeftmostFirst {
+            return Err(SearchError::InvalidProgram);
+        }
+        BoundedBacktracker::new(&self.program).captures_with_workspace(
+            self.identity,
+            workspace,
+            haystack,
+            window,
+            from,
+            config.anchored,
+            limits,
+        )
     }
 
     /// Search while restricting the domain of newly injected starts.
