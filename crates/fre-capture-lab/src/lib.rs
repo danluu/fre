@@ -40,7 +40,10 @@ pub use backtrack::{
     BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION, BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION,
     BoundedBacktrackWorkspace, BoundedBacktrackWorkspaceUsage,
 };
-pub use compile::{BuildReport, FirstByteProof, MaskedInclusiveRange, Program, ProgramBuildOrigin};
+pub use compile::{
+    BuildReport, FirstByteProof, MaskedInclusiveRange, NonNullableFirstByteMask, Program,
+    ProgramBuildOrigin,
+};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use hir::{
     HirBuildAccounting, HirBuildAllocation, HirBuildResource, HirProgramBuild,

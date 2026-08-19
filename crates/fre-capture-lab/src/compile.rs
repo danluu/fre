@@ -58,6 +58,55 @@ pub struct FirstByteProof {
     nullable: bool,
 }
 
+/// Opaque complete first-byte set for a construction-proved non-nullable
+/// program.
+///
+/// Values are minted only from the transient [`FirstByteProof`] returned by
+/// the same atomic compiler transaction as a [`Program`]. The set is not
+/// retained by `Program` and is not encoded in the stable capture-program
+/// format.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NonNullableFirstByteMask {
+    words: [u64; 4],
+}
+
+impl NonNullableFirstByteMask {
+    pub(crate) const ALL: Self = Self {
+        words: [u64::MAX; 4],
+    };
+
+    /// Whether `byte` belongs to the compiler-proved first-byte set.
+    #[must_use]
+    #[inline]
+    pub fn matches(self, byte: u8) -> bool {
+        let byte = usize::from(byte);
+        self.words[byte / 64] & (1_u64 << (byte % 64)) != 0
+    }
+
+    /// Whether construction proved an empty first-byte domain.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.words[0] == 0 && self.words[1] == 0 && self.words[2] == 0 && self.words[3] == 0
+    }
+
+    /// Whether every byte belongs to the first-byte domain.
+    #[must_use]
+    pub const fn is_all(self) -> bool {
+        self.words[0] == u64::MAX
+            && self.words[1] == u64::MAX
+            && self.words[2] == u64::MAX
+            && self.words[3] == u64::MAX
+    }
+
+    /// Complete four-word set identity for a construction owner to seal.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn words(self) -> [u64; 4] {
+        self.words
+    }
+}
+
 /// One caller-selected byte classifier for restricting newly injected roots.
 ///
 /// This type does not claim full-search equivalence. The hidden low-level
@@ -381,6 +430,18 @@ impl FirstByteProof {
             & (self.words[2] == expected[2])
             & (self.words[3] == expected[3]);
         !self.nullable && words_equal
+    }
+
+    /// Convert this transient proof into its complete opaque first-byte mask
+    /// exactly when the compiled program is non-nullable.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn nonnullable_mask(self) -> Option<NonNullableFirstByteMask> {
+        if self.nullable {
+            None
+        } else {
+            Some(NonNullableFirstByteMask { words: self.words })
+        }
     }
 
     #[allow(
@@ -1575,7 +1636,7 @@ fn check_limit(kind: ResourceKind, required: usize, limit: usize) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{Program, StartPrefilter};
-    use crate::{Assertion, Ast, BuildLimits, Greed};
+    use crate::{Assertion, Ast, BuildLimits, CaptureProfile, Greed};
 
     #[test]
     fn compact_start_prefilter_is_conservative_and_construction_owned() {
@@ -1747,5 +1808,52 @@ mod tests {
                 .start_prefilter(),
             None,
         );
+    }
+
+    #[test]
+    fn opaque_nonnullable_mask_preserves_every_arbitrary_first_byte_bit() {
+        let ranges = vec![(0, 0), (2, 7), (63, 65), (127, 131), (200, 203), (254, 255)];
+        let (_, proof) = Program::compile_for_with_first_byte_proof(
+            &Ast::Class(ranges.clone()),
+            CaptureProfile::RustRegexBytes1_12_4,
+            BuildLimits::default(),
+        )
+        .expect("arbitrary class compile");
+        let mask = proof
+            .nonnullable_mask()
+            .expect("a one-byte class is non-nullable");
+        for byte in 0_u8..=u8::MAX {
+            let expected = ranges
+                .iter()
+                .any(|&(start, end)| start <= byte && byte <= end);
+            assert_eq!(mask.matches(byte), expected, "byte={byte}");
+        }
+        assert!(!mask.is_empty());
+        assert!(!mask.is_all());
+        assert!(proof.equals_nonnullable_words(mask.words()));
+
+        let (_, nullable) = Program::compile_for_with_first_byte_proof(
+            &Ast::Class(ranges).repeat(0, None, Greed::Greedy),
+            CaptureProfile::RustRegexBytes1_12_4,
+            BuildLimits::default(),
+        )
+        .expect("nullable class compile");
+        assert_eq!(nullable.nonnullable_mask(), None);
+
+        let (_, empty) = Program::compile_for_with_first_byte_proof(
+            &Ast::Class(Vec::new()),
+            CaptureProfile::RustRegexBytes1_12_4,
+            BuildLimits::default(),
+        )
+        .expect("empty-language class compile");
+        assert!(empty.nonnullable_mask().expect("non-nullable").is_empty());
+
+        let (_, all) = Program::compile_for_with_first_byte_proof(
+            &Ast::Class(vec![(0, u8::MAX)]),
+            CaptureProfile::RustRegexBytes1_12_4,
+            BuildLimits::default(),
+        )
+        .expect("all-byte class compile");
+        assert!(all.nonnullable_mask().expect("non-nullable").is_all());
     }
 }

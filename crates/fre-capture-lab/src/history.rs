@@ -10,7 +10,7 @@ use crate::ast::Ast;
 use crate::backtrack::{
     BoundedBacktrackWorkspace, BoundedBacktrackWorkspaceUsage, BoundedBacktracker,
 };
-use crate::compile::{MaskedInclusiveRange, Program, State};
+use crate::compile::{MaskedInclusiveRange, NonNullableFirstByteMask, Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
@@ -538,6 +538,41 @@ impl HistoryRegex {
             config,
             maximum_start,
             classifier,
+            limits,
+        )
+    }
+
+    /// Search while restricting newly injected starts by both an inclusive
+    /// absolute ceiling and a compiler-produced arbitrary byte mask.
+    ///
+    /// Only a root whose absolute position is inside the ceiling and whose
+    /// current byte belongs to `mask` is injected. Already-live threads,
+    /// assertion context, ordered priority, capture history, and the existing
+    /// execution counters are unchanged. The end boundary has no current byte
+    /// and is therefore outside the filtered domain.
+    ///
+    /// This low-level operation promises restricted-start semantics. Complete
+    /// search equivalence additionally requires `mask` to come from the same
+    /// atomic program compilation as this regex. Complete window validation
+    /// and history admission precede an empty-domain result or source access.
+    #[doc(hidden)]
+    pub fn captures_from_with_config_start_ceiling_exact_mask(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        mask: NonNullableFirstByteMask,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_start_ceiling_exact_mask(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            mask,
             limits,
         )
     }
@@ -1200,7 +1235,9 @@ impl HistoryRegex {
         config: SearchConfig,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
-        self.search_from_impl::<false, false>(haystack, window, from, config, None, None, limits)
+        self.search_from_impl::<false, false, false>(
+            haystack, window, from, config, None, None, None, limits,
+        )
     }
 
     fn search_from_start_ceiling(
@@ -1212,12 +1249,13 @@ impl HistoryRegex {
         maximum_start: Option<usize>,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
-        self.search_from_impl::<true, false>(
+        self.search_from_impl::<true, false, false>(
             haystack,
             window,
             from,
             config,
             maximum_start,
+            None,
             None,
             limits,
         )
@@ -1233,13 +1271,36 @@ impl HistoryRegex {
         classifier: MaskedInclusiveRange,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
-        self.search_from_impl::<true, true>(
+        self.search_from_impl::<true, true, false>(
             haystack,
             window,
             from,
             config,
             maximum_start,
             Some(classifier),
+            None,
+            limits,
+        )
+    }
+
+    fn search_from_start_ceiling_exact_mask(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        mask: NonNullableFirstByteMask,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_impl::<true, false, true>(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            None,
+            Some(mask),
             limits,
         )
     }
@@ -1249,7 +1310,11 @@ impl HistoryRegex {
         clippy::too_many_lines,
         reason = "the complete generation transition and explicit new-start domain are kept locally auditable"
     )]
-    fn search_from_impl<const RESTRICT_STARTS: bool, const FILTER_STARTS: bool>(
+    fn search_from_impl<
+        const RESTRICT_STARTS: bool,
+        const FILTER_RANGE: bool,
+        const FILTER_EXACT_MASK: bool,
+    >(
         &self,
         haystack: &[u8],
         window: Window,
@@ -1257,15 +1322,19 @@ impl HistoryRegex {
         config: SearchConfig,
         maximum_start: Option<usize>,
         classifier: Option<MaskedInclusiveRange>,
+        exact_mask: Option<NonNullableFirstByteMask>,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
         validate_window(haystack, window, from)?;
         let admission = admit_history(&self.program, window, from, limits)?;
+        if FILTER_RANGE && FILTER_EXACT_MASK {
+            return Err(SearchError::InvalidProgram);
+        }
         let maximum_start = if RESTRICT_STARTS {
             let Some(maximum_start) = maximum_start else {
                 return Ok(empty_start_domain_outcome(admission.scratch_bytes));
             };
-            let maximum_start = if FILTER_STARTS {
+            let maximum_start = if FILTER_RANGE || FILTER_EXACT_MASK {
                 let Some(last_byte) = window.end.checked_sub(1) else {
                     return Ok(empty_start_domain_outcome(admission.scratch_bytes));
                 };
@@ -1280,10 +1349,15 @@ impl HistoryRegex {
         } else {
             window.end
         };
-        let classifier = if FILTER_STARTS {
+        let classifier = if FILTER_RANGE {
             classifier.ok_or(SearchError::InvalidProgram)?
         } else {
             MaskedInclusiveRange::ALL
+        };
+        let exact_mask = if FILTER_EXACT_MASK {
+            exact_mask.ok_or(SearchError::InvalidProgram)?
+        } else {
+            NonNullableFirstByteMask::ALL
         };
         let state_count = self.program.states.len();
         let mut current = reserve_threads(state_count)?;
@@ -1311,9 +1385,14 @@ impl HistoryRegex {
                 && (winner.is_none() || continue_after_match)
                 && (!config.anchored || pos == from)
             {
-                let start_byte_matches = !FILTER_STARTS || {
+                let start_byte_matches = if FILTER_RANGE {
                     let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
                     classifier.matches(byte)
+                } else if FILTER_EXACT_MASK {
+                    let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+                    exact_mask.matches(byte)
+                } else {
+                    true
                 };
                 if start_byte_matches {
                     counters.starts_injected =
@@ -2198,4 +2277,316 @@ fn walk_history(
         cursor = node.previous;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::HistoryRegex;
+    use crate::compile::{NonNullableFirstByteMask, Program};
+    use crate::{
+        Assertion, Ast, BuildLimits, CaptureProfile, Greed, MatchKind, ResourceKind, SearchConfig,
+        SearchError, SearchLimits, Window,
+    };
+
+    fn ranges_from_words(words: [u64; 4]) -> Vec<(u8, u8)> {
+        let contains = |byte: u8| {
+            let byte = usize::from(byte);
+            words[byte / 64] & (1_u64 << (byte % 64)) != 0
+        };
+        let mut ranges = Vec::new();
+        let mut start = None;
+        for ordinal in 0_u16..=u16::from(u8::MAX) {
+            let byte = u8::try_from(ordinal).expect("the loop is bounded by u8::MAX");
+            match (start, contains(byte)) {
+                (None, true) => start = Some(byte),
+                (Some(first), false) => {
+                    ranges.push((
+                        first,
+                        byte.checked_sub(1)
+                            .expect("a completed range has a preceding byte"),
+                    ));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = start {
+            ranges.push((first, u8::MAX));
+        }
+        ranges
+    }
+
+    fn compile_exact_mask(ast: &Ast) -> (HistoryRegex, NonNullableFirstByteMask) {
+        let (program, proof) = Program::compile_for_with_first_byte_proof(
+            ast,
+            CaptureProfile::RustRegexBytes1_12_4,
+            BuildLimits::default(),
+        )
+        .expect("masked fixture compile");
+        let mask = proof
+            .nonnullable_mask()
+            .expect("masked fixture must be non-nullable");
+        (HistoryRegex::from_program(Arc::new(program)), mask)
+    }
+
+    fn assert_exact_mask_parity(
+        history: &HistoryRegex,
+        mask: NonNullableFirstByteMask,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+    ) {
+        let limits = SearchLimits::default();
+        let baseline = history
+            .captures_from_with_config_start_ceiling(
+                haystack,
+                window,
+                from,
+                config,
+                maximum_start,
+                limits,
+            )
+            .expect("ceiling-only baseline");
+        let filtered = history
+            .captures_from_with_config_start_ceiling_exact_mask(
+                haystack,
+                window,
+                from,
+                config,
+                maximum_start,
+                mask,
+                limits,
+            )
+            .expect("exact-mask search");
+        assert_eq!(filtered.captures, baseline.captures);
+        assert!(filtered.report.state_visits <= baseline.report.state_visits);
+        assert!(filtered.report.history_nodes <= baseline.report.history_nodes);
+        assert!(filtered.report.starts_injected <= baseline.report.starts_injected);
+        assert!(filtered.report.peak_threads <= baseline.report.peak_threads);
+        assert_eq!(
+            filtered.report.bytes_examined,
+            baseline.report.bytes_examined
+        );
+        assert_eq!(
+            filtered.report.admitted_scratch_bytes,
+            baseline.report.admitted_scratch_bytes
+        );
+    }
+
+    fn exercise_words(words: [u64; 4], haystack: &[u8]) {
+        let ast = Ast::concat([
+            Ast::Class(ranges_from_words(words)).named(1, "head"),
+            Ast::Byte(b'-')
+                .named(2, "optional_dash")
+                .repeat(0, Some(1), Greed::Greedy),
+            Ast::Byte(0xff).capture(3).repeat(0, Some(1), Greed::Lazy),
+        ]);
+        let (history, mask) = compile_exact_mask(&ast);
+        assert_eq!(mask.words(), words);
+
+        let full = Window::all(haystack);
+        let interior = Window {
+            start: 3,
+            end: haystack
+                .len()
+                .checked_sub(3)
+                .expect("the fixed corpus is wider than its suffix exclusion"),
+        };
+        for (window, from, config, maximum_start) in [
+            (full, 0, SearchConfig::LEFTMOST, Some(full.end)),
+            (interior, 7, SearchConfig::EARLIEST, Some(interior.end)),
+            (
+                interior,
+                17,
+                SearchConfig::LEFTMOST.match_kind(MatchKind::All),
+                Some(200),
+            ),
+            (
+                interior,
+                29,
+                SearchConfig::LEFTMOST.anchored(true),
+                Some(29),
+            ),
+            (
+                Window {
+                    start: full.end,
+                    end: full.end,
+                },
+                full.end,
+                SearchConfig::LEFTMOST,
+                Some(full.end),
+            ),
+            (full, 0, SearchConfig::LEFTMOST, None),
+        ] {
+            assert_exact_mask_parity(
+                &history,
+                mask,
+                haystack,
+                window,
+                from,
+                config,
+                maximum_start,
+            );
+        }
+    }
+
+    #[test]
+    fn exact_mask_matches_ceiling_search_for_all_singletons_and_random_sets() {
+        let mut haystack = (0_u16..=u16::from(u8::MAX))
+            .map(|byte| u8::try_from(byte).expect("byte corpus"))
+            .collect::<Vec<_>>();
+        haystack.extend(
+            (0_u16..=u16::from(u8::MAX))
+                .rev()
+                .map(|byte| u8::try_from(byte).expect("reverse byte corpus")),
+        );
+        haystack.extend_from_slice(b"-a-\xff\xc3\x80\xe2\x82");
+
+        exercise_words([0; 4], &haystack);
+        exercise_words([u64::MAX; 4], &haystack);
+        for byte in 0_u8..=u8::MAX {
+            let byte_index = usize::from(byte);
+            let mut words = [0_u64; 4];
+            words[byte_index / 64] = 1_u64 << (byte_index % 64);
+            exercise_words(words, &haystack);
+        }
+
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for _ in 0..64 {
+            let mut words = [0_u64; 4];
+            for word in &mut words {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *word = state;
+            }
+            exercise_words(words, &haystack);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "assertion context, hostile bytes, exact admission and every one-below resource gate form one qualification transaction"
+    )]
+    fn exact_mask_preserves_assertion_context_and_pre_source_admission() {
+        let ast = Ast::concat([
+            Ast::Assert(Assertion::WordStartAscii),
+            Ast::Class(vec![(b'A', b'Z'), (b'a', b'z')]).named(1, "word_start"),
+            Ast::Byte(b'x').capture(2).repeat(0, Some(1), Greed::Greedy),
+        ]);
+        let (history, mask) = compile_exact_mask(&ast);
+        let haystack = b"\xff ax !b\xc3\x80 c\xe2\x82";
+        let window = Window {
+            start: 2,
+            end: haystack.len(),
+        };
+        for (from, config) in [
+            (2, SearchConfig::LEFTMOST),
+            (3, SearchConfig::EARLIEST),
+            (6, SearchConfig::LEFTMOST.anchored(true)),
+        ] {
+            assert_exact_mask_parity(
+                &history,
+                mask,
+                haystack,
+                window,
+                from,
+                config,
+                Some(window.end),
+            );
+        }
+
+        let empty = b"";
+        let empty_window = Window::all(empty);
+        let prospective = history.search_prospective(empty_window, 0).unwrap();
+        let exact = SearchLimits {
+            max_state_visits: prospective.state_visits,
+            max_history_nodes: prospective.history_nodes,
+            max_history_walk: prospective.history_walk,
+            max_scratch_bytes: prospective.scratch_bytes,
+            ..SearchLimits::default()
+        };
+        let search = |limits| {
+            history.captures_from_with_config_start_ceiling_exact_mask(
+                empty,
+                empty_window,
+                0,
+                SearchConfig::LEFTMOST,
+                Some(0),
+                mask,
+                limits,
+            )
+        };
+        let outcome = search(exact).expect("exact empty-domain admission");
+        assert!(outcome.captures.is_none());
+        assert_eq!(outcome.report.starts_injected, 0);
+        assert_eq!(outcome.report.state_visits, 0);
+        assert_eq!(
+            outcome.report.admitted_scratch_bytes,
+            prospective.scratch_bytes
+        );
+
+        for (kind, required, limits) in [
+            (
+                ResourceKind::StateVisits,
+                prospective.state_visits,
+                SearchLimits {
+                    max_state_visits: prospective
+                        .state_visits
+                        .checked_sub(1)
+                        .expect("the admitted fixture has positive state work"),
+                    ..exact
+                },
+            ),
+            (
+                ResourceKind::HistoryNodes,
+                prospective.history_nodes,
+                SearchLimits {
+                    max_history_nodes: prospective
+                        .history_nodes
+                        .checked_sub(1)
+                        .expect("the admitted fixture has positive history capacity"),
+                    ..exact
+                },
+            ),
+            (
+                ResourceKind::HistoryWalk,
+                prospective.history_walk,
+                SearchLimits {
+                    max_history_walk: prospective
+                        .history_walk
+                        .checked_sub(1)
+                        .expect("the admitted fixture has positive history walk"),
+                    ..exact
+                },
+            ),
+            (
+                ResourceKind::ScratchBytes,
+                prospective.scratch_bytes,
+                SearchLimits {
+                    max_scratch_bytes: prospective
+                        .scratch_bytes
+                        .checked_sub(1)
+                        .expect("the admitted fixture has positive scratch"),
+                    ..exact
+                },
+            ),
+        ] {
+            assert_eq!(
+                search(limits),
+                Err(SearchError::Resource {
+                    kind,
+                    required,
+                    limit: required
+                        .checked_sub(1)
+                        .expect("each admitted resource is positive"),
+                })
+            );
+        }
+    }
 }
