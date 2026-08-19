@@ -25,7 +25,9 @@ use crate::{
     EpsilonClosureDispatchAllocationError,
     OrderedEdgeDispatchAllocationError, ordered_edge_dispatch::OrderedEdgeDispatch,
 };
-use crate::epsilon_closure_dispatch::EpsilonClosureDispatch;
+use crate::epsilon_closure_dispatch::{
+    EpsilonClosureDispatch, EpsilonClosureStartProgram,
+};
 
 static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -1131,6 +1133,7 @@ pub struct Automaton {
     pub(crate) byte_ends: Box<[u8]>,
     byte_classes: ByteClasses,
     pub(crate) epsilon_closure_dispatch: Option<EpsilonClosureDispatch>,
+    epsilon_closure_start_program: Option<EpsilonClosureStartProgram>,
     pub(crate) ordered_edge_dispatch: Option<OrderedEdgeDispatch>,
     pub(crate) start_filter_proof: StartFilterProofCell,
     line_terminator: u8,
@@ -1151,6 +1154,7 @@ impl Clone for Automaton {
             byte_ends: self.byte_ends.clone(),
             byte_classes: self.byte_classes,
             epsilon_closure_dispatch: self.epsilon_closure_dispatch.clone(),
+            epsilon_closure_start_program: self.epsilon_closure_start_program.clone(),
             ordered_edge_dispatch: self.ordered_edge_dispatch.clone(),
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
@@ -1321,6 +1325,7 @@ impl Automaton {
             byte_ends: raw.byte_ends.into_boxed_slice(),
             byte_classes,
             epsilon_closure_dispatch: None,
+            epsilon_closure_start_program: None,
             ordered_edge_dispatch: None,
             start_filter_proof: StartFilterProofCell::new(),
             line_terminator: b'\n',
@@ -1381,7 +1386,14 @@ impl Automaton {
         if self.epsilon_closure_dispatch.is_some() {
             return Ok(true);
         }
-        self.epsilon_closure_dispatch = EpsilonClosureDispatch::derive(self)?;
+        let dispatch = EpsilonClosureDispatch::derive(self)?;
+        if dispatch.is_some() {
+            // Full is strictly stronger and is the portable K0 authority.
+            // Never retain two copies if this hidden source-only API was used
+            // before the ordinary all-root attempt.
+            self.epsilon_closure_start_program = None;
+        }
+        self.epsilon_closure_dispatch = dispatch;
         Ok(self.epsilon_closure_dispatch.is_some())
     }
 
@@ -1399,6 +1411,55 @@ impl Automaton {
             .map_or(0, EpsilonClosureDispatch::retained_bytes)
     }
 
+    /// Derive a bounded start-root closure program solely for native text
+    /// specialization.
+    ///
+    /// Unlike [`Self::try_enable_epsilon_closure_dispatch`], this does not
+    /// enable portable K0 dispatch and is deliberately absent from stable
+    /// serialization. Source builders may call it only after the canonical
+    /// all-root attempt declines. `Ok(true)` means the distinct private owner
+    /// is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact bounded allocation extent when a qualifying start
+    /// program could not be retained.
+    #[doc(hidden)]
+    pub fn try_enable_epsilon_closure_start_program(
+        &mut self,
+    ) -> Result<bool, EpsilonClosureDispatchAllocationError> {
+        if self.epsilon_closure_start_program.is_some() {
+            return Ok(true);
+        }
+        if self.epsilon_closure_dispatch.is_some() {
+            return Ok(false);
+        }
+        self.epsilon_closure_start_program = EpsilonClosureStartProgram::derive(self)?;
+        Ok(self.epsilon_closure_start_program.is_some())
+    }
+
+    /// Whether the distinct compiler-private start-only owner is present.
+    ///
+    /// This intentionally excludes an all-root dispatch even when that
+    /// dispatch contains a start program. It is suitable for rejecting a
+    /// source-only sidecar on build and serialization paths where it is not
+    /// eligible.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_has_epsilon_closure_start_program(&self) -> bool {
+        self.epsilon_closure_start_program.is_some()
+    }
+
+    /// Exact retained bytes in the distinct compiler-private start-only
+    /// owner. The portable all-root dispatch is accounted separately.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_epsilon_closure_start_program_retained_bytes(&self) -> usize {
+        self.epsilon_closure_start_program
+            .as_ref()
+            .map_or(0, EpsilonClosureStartProgram::retained_bytes)
+    }
+
     /// Borrow only the canonical start-root closure program for native text
     /// specialization.
     ///
@@ -1413,6 +1474,11 @@ impl Automaton {
         self.epsilon_closure_dispatch
             .as_ref()
             .and_then(|dispatch| dispatch.native_start_program(self.start))
+            .or_else(|| {
+                self.epsilon_closure_start_program
+                    .as_ref()
+                    .and_then(|program| program.native_start_program(self.start))
+            })
     }
 
     /// Derive the canonical priority-preserving dispatch for profitable wide

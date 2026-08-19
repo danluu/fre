@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v19() {
+fn receipt_records_selected_workspace_optimizer_identity_v20() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 19);
+    assert_eq!(OPTIMIZER_VERSION, 20);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)

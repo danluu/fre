@@ -10592,6 +10592,9 @@ impl CompiledProgram {
         };
         let retains_graph_dispatches =
             mode == CompileMode::Optimizing && matches!(engine, ProgramEngine::OrderedNfa);
+        let retains_native_start_closure_program = retains_graph_dispatches
+            && output == OutputContract::Span
+            && context_dfa.is_none();
         if !retains_graph_dispatches && automaton.has_ordered_edge_dispatch() {
             return Err(CompileError::InternalInvariant(
                 "ordered-edge dispatch was preattached to an ineligible engine",
@@ -10602,6 +10605,13 @@ impl CompiledProgram {
                 "epsilon-closure dispatch was preattached to an ineligible engine",
             ));
         }
+        if !retains_native_start_closure_program
+            && automaton.compiler_private_has_epsilon_closure_start_program()
+        {
+            return Err(CompileError::InternalInvariant(
+                "epsilon-closure start program was preattached to an ineligible compiler route",
+            ));
+        }
         if retains_graph_dispatches {
             automaton
                 .try_enable_ordered_edge_dispatch()
@@ -10610,13 +10620,22 @@ impl CompiledProgram {
                         "ordered-edge dispatch allocation failed",
                     )
                 })?;
-            automaton
+            let full_epsilon_closure_dispatch = automaton
                 .try_enable_epsilon_closure_dispatch()
                 .map_err(|_| {
                     CompileError::InternalInvariant(
                         "epsilon-closure dispatch allocation failed",
                     )
                 })?;
+            if !full_epsilon_closure_dispatch && retains_native_start_closure_program {
+                automaton
+                    .try_enable_epsilon_closure_start_program()
+                    .map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "epsilon-closure start program allocation failed",
+                        )
+                    })?;
+            }
         }
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
@@ -46535,6 +46554,122 @@ mod tests {
         }
     }
 
+    /// The reachable language is `a|bc`. Twenty unreachable consuming roots
+    /// each enter a distinct prefix of one shared twenty-Split chain. The
+    /// all-root closure attempt must unfold that shared tail once per root:
+    /// 443 instructions exceed its 432-instruction graph-relative ceiling.
+    /// The reachable start closure remains the three-instruction
+    /// `Split, Consume, Consume` program admitted by the private native-text
+    /// fallback.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the fixed synthetic graph uses small bounded fixture dimensions and indices"
+    )]
+    fn epsilon_start_only_program_graph() -> RawPlan {
+        const DUPLICATED_ROOTS: usize = 20;
+        const SHARED_SPLITS: usize = 20;
+        const BASE_STATES: usize = 5;
+
+        let dead_consume_begin = BASE_STATES;
+        let prefix_begin = dead_consume_begin + DUPLICATED_ROOTS;
+        let shared_split_begin = prefix_begin + DUPLICATED_ROOTS;
+        let shared_consume = shared_split_begin + SHARED_SPLITS;
+
+        let mut roles = vec![
+            StateRole::Split,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Accept,
+        ];
+        roles.extend(core::iter::repeat_n(
+            StateRole::Consume,
+            DUPLICATED_ROOTS,
+        ));
+        roles.extend(core::iter::repeat_n(
+            StateRole::Split,
+            DUPLICATED_ROOTS + SHARED_SPLITS,
+        ));
+        roles.push(StateRole::Consume);
+        assert_eq!(roles.len(), shared_consume + 1);
+
+        let mut state_edges = vec![Vec::new(); roles.len()];
+        state_edges[0].extend([
+            (1_u32, EdgeKind::Epsilon, 0, 0),
+            (2_u32, EdgeKind::Epsilon, 0, 0),
+        ]);
+        state_edges[1].push((4, EdgeKind::ByteRange, b'a', b'a'));
+        state_edges[2].push((3, EdgeKind::ByteRange, b'b', b'b'));
+        state_edges[3].push((4, EdgeKind::ByteRange, b'c', b'c'));
+        for root in 0..DUPLICATED_ROOTS {
+            state_edges[dead_consume_begin + root].push((
+                u32::try_from(prefix_begin + root).unwrap(),
+                EdgeKind::ByteRange,
+                b'x',
+                b'x',
+            ));
+            state_edges[prefix_begin + root].push((
+                u32::try_from(shared_split_begin).unwrap(),
+                EdgeKind::Epsilon,
+                0,
+                0,
+            ));
+        }
+        for split in 0..SHARED_SPLITS {
+            let target = if split + 1 == SHARED_SPLITS {
+                shared_consume
+            } else {
+                shared_split_begin + split + 1
+            };
+            state_edges[shared_split_begin + split].push((
+                u32::try_from(target).unwrap(),
+                EdgeKind::Epsilon,
+                0,
+                0,
+            ));
+        }
+        state_edges[shared_consume].push((4, EdgeKind::ByteRange, b'y', b'y'));
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+        for edges in state_edges {
+            for (target, kind, start, end) in edges {
+                edge_targets.push(target);
+                edge_kinds.push(kind);
+                byte_starts.push(start);
+                byte_ends.push(end);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        }
+    }
+
+    fn epsilon_start_only_context_program_graph() -> RawPlan {
+        let mut raw = epsilon_start_only_program_graph();
+        let dead_prefix_edge = raw
+            .edge_kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == EdgeKind::Epsilon)
+            .nth(2)
+            .map(|(edge, _)| edge)
+            .expect("fixture has one unreachable prefix edge");
+        raw.edge_kinds[dead_prefix_edge] = EdgeKind::AssertHaystackStart;
+        raw
+    }
+
     fn with_ordered_dispatch_dead_branch(mut raw: RawPlan) -> RawPlan {
         let old_start = raw.start;
         let wide = u32::try_from(raw.roles.len()).unwrap();
@@ -46567,6 +46702,281 @@ mod tests {
             .push(u32::try_from(raw.edge_targets.len()).unwrap());
         raw.start = start;
         raw
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source eligibility, native handoff, stable-wire omission, and preattachment rejection form one compiler-only sidecar transaction"
+    )]
+    fn epsilon_start_only_program_is_source_span_private_and_wire_invisible() {
+        let raw = epsilon_start_only_program_graph();
+        let forced_nfa = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+
+        let mut preattached =
+            Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
+        assert!(
+            !preattached
+                .try_enable_epsilon_closure_dispatch()
+                .unwrap(),
+            "the all-root expansion ceiling must decline this graph",
+        );
+        assert!(
+            preattached
+                .try_enable_epsilon_closure_start_program()
+                .unwrap(),
+            "the bounded reachable start program must remain eligible",
+        );
+        assert!(!preattached.has_epsilon_closure_dispatch());
+        assert!(preattached.compiler_private_has_epsilon_closure_start_program());
+        assert!(
+            preattached.compiler_private_epsilon_closure_start_program_retained_bytes() > 0
+        );
+        let preattached_view = preattached
+            .compiler_private_epsilon_closure_start_program_view()
+            .expect("start-only fixture retains its compiler view");
+        assert!(!preattached_view.is_guarded());
+        assert_eq!(preattached_view.len(), 3);
+
+        let fast = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(fast.engine_kind(), EngineKind::OrderedNfa);
+        assert!(!fast.automaton.has_epsilon_closure_dispatch());
+        assert!(
+            !fast
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program()
+        );
+        assert!(
+            fast.native_ordered_nfa_view()
+                .and_then(|view| view.start_closure_dispatch)
+                .is_none()
+        );
+
+        let complete = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(complete.engine_kind(), EngineKind::OrderedDfa);
+        assert!(
+            !complete
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program()
+        );
+        assert!(complete.native_ordered_nfa_view().is_none());
+
+        let context_raw = epsilon_start_only_context_program_graph();
+        let context_complete = raw_program(
+            &context_raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(context_complete.engine_kind(), EngineKind::OrderedContextDfa);
+        assert!(context_complete.context_dfa.is_some());
+        assert!(
+            !context_complete
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program(),
+            "a complete contextual machine cannot consume native Ordered-NFA start text",
+        );
+        assert!(context_complete.native_ordered_nfa_view().is_none());
+
+        let exists = raw_program(
+            &raw,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            forced_nfa,
+        );
+        assert_eq!(exists.engine_kind(), EngineKind::OrderedNfa);
+        assert!(!exists.automaton.has_epsilon_closure_dispatch());
+        assert!(
+            !exists
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program(),
+            "a source-built non-Span fallback must not retain unused native text IR",
+        );
+
+        let optimized = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            forced_nfa,
+        );
+        assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
+        assert!(!optimized.automaton.has_epsilon_closure_dispatch());
+        assert!(
+            optimized
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program()
+        );
+        let native_view = optimized
+            .native_ordered_nfa_view()
+            .expect("source-built Span fallback has an Ordered-NFA native view");
+        let start_view = native_view
+            .start_closure_dispatch
+            .expect("native compiler receives the start-only program");
+        assert!(!start_view.is_guarded());
+        assert_eq!(start_view.len(), 3);
+        assert!(
+            optimized
+                .clone()
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program(),
+            "fresh compiler clones retain the private owner",
+        );
+
+        let mut without_start = optimized.clone();
+        without_start.automaton =
+            Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
+        assert!(
+            !without_start
+                .automaton
+                .try_enable_epsilon_closure_dispatch()
+                .unwrap()
+        );
+        assert!(
+            !without_start
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program()
+        );
+        let selected_bytes = optimized.serialize().unwrap();
+        let without_start_bytes = without_start.serialize().unwrap();
+        assert_eq!(optimized.program_flags(), without_start.program_flags());
+        assert_eq!(
+            selected_bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+            0,
+            "StartOnly must not claim the stable Full-dispatch marker",
+        );
+        assert_eq!(selected_bytes, without_start_bytes);
+        assert_eq!(
+            optimized.serialized_sha256().unwrap(),
+            without_start.serialized_sha256().unwrap(),
+            "compiler-only retention must not change semantic identity",
+        );
+
+        let selected_image =
+            crate::ordered_nfa_native::NativeOrderedNfaObjectImage::try_build(
+                native_view,
+                usize::MAX,
+            )
+            .unwrap()
+            .expect("source-built start-only graph remains natively representable");
+        let without_start_image =
+            crate::ordered_nfa_native::NativeOrderedNfaObjectImage::try_build(
+                without_start
+                    .native_ordered_nfa_view()
+                    .expect("same graph without compiler text remains native"),
+                usize::MAX,
+            )
+            .unwrap()
+            .expect("same graph without start text remains representable");
+        assert_eq!(selected_image.bytes, without_start_image.bytes);
+        assert_eq!(
+            selected_image.layout.start_closure_dispatch,
+            Some(
+                crate::ordered_nfa_native::NativeOrderedNfaStartClosureLayout {
+                    guarded: false,
+                    instruction_count: 3,
+                    split_edge_visits: 2,
+                }
+            )
+        );
+        assert!(without_start_image.layout.start_closure_dispatch.is_none());
+
+        let restored = CompiledProgram::deserialize(&selected_bytes).unwrap();
+        assert_eq!(restored.serialize().unwrap(), selected_bytes);
+        assert_eq!(restored.artifact_identity(), optimized.artifact_identity());
+        assert!(
+            !restored
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program(),
+            "stable restore deliberately loses non-wire optimizer availability",
+        );
+        assert!(
+            restored
+                .native_ordered_nfa_view()
+                .and_then(|view| view.start_closure_dispatch)
+                .is_none()
+        );
+
+        let mut context_preattached =
+            Automaton::from_raw(context_raw.clone(), CompileLimits::default()).unwrap();
+        assert!(
+            !context_preattached
+                .try_enable_epsilon_closure_dispatch()
+                .unwrap()
+        );
+        assert!(
+            context_preattached
+                .try_enable_epsilon_closure_start_program()
+                .unwrap()
+        );
+
+        for result in [
+            CompiledProgram::build(
+                raw.clone(),
+                preattached.clone(),
+                OutputContract::Span,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            CompiledProgram::build(
+                raw.clone(),
+                preattached.clone(),
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            CompiledProgram::build(
+                raw.clone(),
+                preattached.clone(),
+                OutputContract::Exists,
+                CompileMode::Optimizing,
+                forced_nfa,
+                usize::MAX,
+            ),
+            CompiledProgram::build(
+                context_raw,
+                context_preattached,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(CompileError::InternalInvariant(
+                    "epsilon-closure start program was preattached to an ineligible compiler route"
+                ))
+            ));
+        }
+        let accepted = CompiledProgram::build(
+            raw,
+            preattached,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            forced_nfa,
+            usize::MAX,
+        )
+        .expect("eligible optimizing Ordered-NFA Span accepts the canonical private owner");
+        assert!(
+            accepted
+                .automaton
+                .compiler_private_has_epsilon_closure_start_program()
+        );
     }
 
     #[test]
