@@ -55,7 +55,9 @@ use fre::{
     BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
     BoundedSeparatedFieldsReduceLimits, CaptureAbsoluteOnePassIterationError,
     CaptureAbsoluteOnePassIterationFailure, CaptureAbsoluteOnePassPrepared,
-    CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
+    CaptureAggregateLimits, CaptureBoundedBacktrackIterationError,
+    CaptureBoundedBacktrackIterationFailure, CaptureBoundedBacktrackPreparationError,
+    CaptureBoundedBacktrackSession, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
     CaptureExecutionSource, CaptureGroupRecord, CaptureGroupSlot, CaptureIterationActual,
     CaptureOperation, CapturePlanKind, CaptureRecord,
     CaptureRecordVisitError, CaptureRegex, CaptureRequiredLiteralBuildLimits,
@@ -178,7 +180,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 ///
 /// Generic participation reducers remain available to library callers, but
 /// this route performs every capture search and inspects every numeric slot.
-pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v7";
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v8";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
@@ -286,11 +288,13 @@ const FRE_ADAPTER_V148_FIXED_CLASS: &str =
     "fre-current-aggregate-capture-v148-formal-fixed-class-disjoint-suffix-scan-v1-v147-formal-unicode-scalar-cursor-count-selectivity-cap-v1-v146-formal-v145-and-v138-route-composition-v1";
 const FRE_ADAPTER_V149: &str =
     "fre-current-aggregate-capture-v149-formal-v148-unicode-ordered-many-continuation-literal-proof-and-v148-fixed-class-disjoint-suffix-scan-route-composition-v1";
+const FRE_ADAPTER_V150: &str =
+    "fre-current-aggregate-capture-v150-formal-reusable-bounded-backtrack-capture-iteration-v1-v149-formal-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V149
+    FRE_ADAPTER_V150
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -609,7 +613,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V149
+        FRE_ADAPTER_V150
     }
 
     #[allow(
@@ -627,7 +631,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V149.to_string(),
+            adapter: FRE_ADAPTER_V150.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1203,6 +1207,16 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity.availability.push_str(
             "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available",
         );
+        identity.identity.push_str(
+            "; formal-reusable-bounded-backtrack-capture-iteration-v1 composes the unchanged CaptureIteration v5/accounting2 restarted-History authority with a separately versioned reusable bounded-backtracker iteration v1/accounting1 and binds materialized plan v8 as the exact successor to v7",
+        );
+        identity.availability.push_str(
+            "; only the General MaterializedWhole one-pattern count-captures lifecycle may select this route, and only for a source-independent positive-width LEFTMOST/leftmost-first capture program over at most 128 authenticated input bytes with no eligible absolute-start one-pass owner; it prepares the exact three-buffer workspace before the first operation, admits the incumbent History prospective and refusal first, requires direct aggregate state/slot/scratch/output/combined-peak limits and a strict physical-work economy proof before source access, reuses preparation across first and steady operations, and permits no History fallback after direct selection; MaterializedLines, absolute-onepass, anchored-word, anchored-line and fixed-schema materialization retain their v7 physical behavior under the v8 portfolio label",
+        );
+        identity
+            .availability
+            .push_str("; this v150 route extends the complete v149 composition ");
+        identity.availability.push_str(FRE_ADAPTER_V149);
         identity
             .availability
             .push_str("; this v149 route composition retains both independently qualified siblings ");
@@ -6739,6 +6753,52 @@ fn materialized_absolute_onepass_error(
     }
 }
 
+fn materialized_bounded_backtrack_preparation_error(
+    error: CaptureBoundedBacktrackPreparationError,
+) -> ExecutionError {
+    let message = format!("FRE reusable bounded-backtracking preparation failed: {error}");
+    if !error.has_closed_attempt() {
+        return ExecutionError::fault(format!(
+            "{message}; terminal preparation receipt did not close"
+        ));
+    }
+    match &error.source {
+        CaptureSearchError::Resource { .. } | CaptureSearchError::Allocation(_) => {
+            ExecutionError::unsupported(message)
+        }
+        CaptureSearchError::BoundOverflow(_)
+        | CaptureSearchError::InvalidWindow
+        | CaptureSearchError::EmptyMatch
+        | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
+    }
+}
+
+fn materialized_bounded_backtrack_error(
+    error: CaptureBoundedBacktrackIterationError,
+) -> ExecutionError {
+    let message = format!("FRE reusable bounded-backtracking iteration failed: {error}");
+    if !error.has_closed_attempt() {
+        return ExecutionError::fault(format!(
+            "{message}; terminal bounded-backtracking attempt did not close"
+        ));
+    }
+    match &error.source {
+        CaptureBoundedBacktrackIterationFailure::Search(
+            CaptureSearchError::Resource { .. } | CaptureSearchError::Allocation(_),
+        ) => ExecutionError::unsupported(message),
+        CaptureBoundedBacktrackIterationFailure::Search(
+            CaptureSearchError::BoundOverflow(_)
+            | CaptureSearchError::InvalidWindow
+            | CaptureSearchError::EmptyMatch
+            | CaptureSearchError::InvalidProgram,
+        )
+        | CaptureBoundedBacktrackIterationFailure::InternalInvariant(_) => {
+            ExecutionError::fault(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MaterializedCaptureOperationLedger {
     actual: CaptureIterationActual,
@@ -6904,8 +6964,62 @@ struct MaterializedCaptureSlotReport {
     direct_absolute_onepass: bool,
 }
 
+fn inspect_materialized_capture_records(
+    captures: &[CaptureRecord],
+    expected_groups: usize,
+    haystack_len: usize,
+    reducer_events: &mut u64,
+    limits: &RunLimits,
+) -> Result<(u64, usize), ExecutionError> {
+    let mut participating = 0_u64;
+    let mut inspected = 0_usize;
+    for record in captures {
+        let overall = record
+            .overall()
+            .ok_or_else(|| ExecutionError::fault("materialized capture record lacks group zero"))?;
+        if overall.start == overall.end {
+            return Err(ExecutionError::fault(
+                "capture model violated its non-empty-match promise",
+            ));
+        }
+        if record.groups.len() != expected_groups {
+            return Err(ExecutionError::fault(
+                "materialized capture record has the wrong schema width",
+            ));
+        }
+        for (index, group) in record.groups.iter().enumerate() {
+            charge(
+                reducer_events,
+                1,
+                limits.reducer_steps,
+                "capture group events",
+            )?;
+            inspected = inspected
+                .checked_add(1)
+                .ok_or_else(|| ExecutionError::fault("capture inspection count overflow"))?;
+            if usize::try_from(group.index) != Ok(index) {
+                return Err(ExecutionError::fault(
+                    "materialized capture slots are not in numeric order",
+                ));
+            }
+            if let Some(span) = group.span {
+                if span.start > span.end || span.end > haystack_len {
+                    return Err(ExecutionError::fault(
+                        "materialized capture slot escaped its haystack",
+                    ));
+                }
+                participating = participating
+                    .checked_add(1)
+                    .ok_or_else(|| ExecutionError::fault("capture reducer overflow"))?;
+            }
+        }
+    }
+    Ok((participating, inspected))
+}
+
 fn count_materialized_capture_slots(
     direct: Option<&CaptureAbsoluteOnePassPrepared<'_>>,
+    bounded_backtrack: Option<&mut CaptureBoundedBacktrackSession>,
     regex: &CaptureRegex,
     haystack: &[u8],
     run_limits: CaptureAggregateLimits,
@@ -6956,6 +7070,77 @@ fn count_materialized_capture_slots(
         }
     }
 
+    let expected_groups = regex
+        .build_report()
+        .engine
+        .captures
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE capture schema overflowed"))?;
+    if let Some(session) = bounded_backtrack {
+        let preparation = session.preparation_receipt();
+        let report = regex
+            .captures_iter_bounded_backtrack(session, haystack, run_limits)
+            .map_err(materialized_bounded_backtrack_error)?
+            .ok_or_else(|| {
+                ExecutionError::fault(
+                    "prepared FRE reusable bounded-backtracking route refused its exact authenticated invocation",
+                )
+            })?;
+        if !report.has_closed_attempt()
+            || report.identity.incumbent.plan
+                != fre::CaptureIterationPlanKind::RestartedPersistentHistory
+            || report.identity.incumbent.run_limits != run_limits
+            || report.preparation_receipt != preparation
+            || report.prospective.haystack_len != haystack.len()
+            || report.prospective.workspace.max_search_bytes != haystack.len()
+            || report.prospective.incumbent.haystack_len != haystack.len()
+            || report.attempt_receipt.operation_setup_allocations != 0
+            || report.actual.searches == 0
+            || report.actual.results != report.captures.len()
+            || report.actual.total_history_nodes != 0
+            || report.actual.total_history_walk != 0
+        {
+            return Err(ExecutionError::fault(
+                "FRE reusable bounded-backtracking iteration identity did not close",
+            ));
+        }
+        let (participating, inspected) = inspect_materialized_capture_records(
+            &report.captures,
+            expected_groups,
+            haystack.len(),
+            reducer_events,
+            limits,
+        )?;
+        let participating_usize = usize::try_from(participating).map_err(|_| {
+            ExecutionError::fault("FRE reusable bounded-backtracking capture count does not fit usize")
+        })?;
+        if inspected != report.actual.capture_events
+            || inspected != report.attempt_receipt.actual.capture_events
+            || participating_usize != report.capture_count
+            || report.actual.total_state_visits
+                > report.attempt_receipt.actual.total_state_visits
+            || report.actual.total_slot_copies
+                > report.attempt_receipt.actual.total_slot_copies
+            || report.actual.bytes_examined > report.attempt_receipt.actual.bytes_examined
+            || report.actual.starts_injected > report.attempt_receipt.actual.starts_injected
+        {
+            return Err(ExecutionError::fault(
+                "FRE reusable bounded-backtracking iteration did not publish a complete operation ledger",
+            ));
+        }
+        let prospective = report.prospective;
+        return Ok(MaterializedCaptureSlotReport {
+            count: participating,
+            actual: report.actual,
+            state_visits_prospective: prospective.total_state_visits,
+            slot_copies_prospective: prospective.total_slot_copies,
+            history_nodes_prospective: prospective.total_history_nodes,
+            history_walk_prospective: prospective.total_history_walk,
+            sequential_work_prospective: prospective.bytes_examined,
+            direct_absolute_onepass: false,
+        });
+    }
+
     let report = regex
         .captures_iter(haystack, run_limits)
         .map_err(materialized_capture_iteration_error)?;
@@ -6969,55 +7154,13 @@ fn count_materialized_capture_slots(
         ));
     }
 
-    let expected_groups = regex
-        .build_report()
-        .engine
-        .captures
-        .checked_add(1)
-        .ok_or_else(|| ExecutionError::fault("FRE capture schema overflowed"))?;
-    let mut actual = 0_u64;
-    let mut inspected = 0_usize;
-    for record in &report.captures {
-        let overall = record
-            .overall()
-            .ok_or_else(|| ExecutionError::fault("materialized capture record lacks group zero"))?;
-        if overall.start == overall.end {
-            return Err(ExecutionError::fault(
-                "capture model violated its non-empty-match promise",
-            ));
-        }
-        if record.groups.len() != expected_groups {
-            return Err(ExecutionError::fault(
-                "materialized capture record has the wrong schema width",
-            ));
-        }
-        for (index, group) in record.groups.iter().enumerate() {
-            charge(
-                reducer_events,
-                1,
-                limits.reducer_steps,
-                "capture group events",
-            )?;
-            inspected = inspected
-                .checked_add(1)
-                .ok_or_else(|| ExecutionError::fault("capture inspection count overflow"))?;
-            if usize::try_from(group.index) != Ok(index) {
-                return Err(ExecutionError::fault(
-                    "materialized capture slots are not in numeric order",
-                ));
-            }
-            if let Some(span) = group.span {
-                if span.start > span.end || span.end > haystack.len() {
-                    return Err(ExecutionError::fault(
-                        "materialized capture slot escaped its haystack",
-                    ));
-                }
-                actual = actual
-                    .checked_add(1)
-                    .ok_or_else(|| ExecutionError::fault("capture reducer overflow"))?;
-            }
-        }
-    }
+    let (actual, inspected) = inspect_materialized_capture_records(
+        &report.captures,
+        expected_groups,
+        haystack.len(),
+        reducer_events,
+        limits,
+    )?;
     if inspected != report.capture_events {
         return Err(ExecutionError::fault(
             "materialized capture iteration did not inspect every published slot",
@@ -7065,6 +7208,7 @@ fn count_materialized_capture_slots(
 
 fn execute_materialized_count_captures(
     regex: &CaptureRegex,
+    bounded_backtrack: Option<&mut CaptureBoundedBacktrackSession>,
     haystack: &[u8],
     run_limits: CaptureAggregateLimits,
     limits: &RunLimits,
@@ -7072,6 +7216,7 @@ fn execute_materialized_count_captures(
     let mut reducer_events = 0_u64;
     count_materialized_capture_slots(
         None,
+        bounded_backtrack,
         regex,
         haystack,
         run_limits,
@@ -7289,6 +7434,7 @@ fn execute_materialized_grep_captures_inner(
             materialization.remaining_line_limits(run_limits, selector, reducer_events, limits)?;
         let line_report = count_materialized_capture_slots(
             direct_absolute_onepass.as_ref(),
+            None,
             regex,
             line,
             line_run_limits,
@@ -7442,6 +7588,7 @@ fn execute_materialized_grep_captures_inner(
 pub struct CurrentFreCaptureLifecycle {
     model: CurrentFreCaptureModel,
     regex: CurrentFreCaptureRegex,
+    bounded_backtrack: Option<CaptureBoundedBacktrackSession>,
     limits: RunLimits,
     unicode: bool,
     case_insensitive: bool,
@@ -7489,11 +7636,18 @@ impl CurrentFreCaptureLifecycle {
                 self.haystack_len
             )));
         }
+        let bounded_backtrack = self.bounded_backtrack.as_mut();
         let result = match (&self.regex, self.preparation) {
             (
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::MaterializedWhole(run_limits),
-            ) => execute_materialized_count_captures(regex, haystack, run_limits, &self.limits),
+            ) => execute_materialized_count_captures(
+                regex,
+                bounded_backtrack,
+                haystack,
+                run_limits,
+                &self.limits,
+            ),
             (
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::MaterializedLines(run_limits),
@@ -7563,6 +7717,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             return Ok(CurrentFreCaptureLifecycle {
                 model,
                 regex: CurrentFreCaptureRegex::AnchoredWordMaterialized(Box::new(prepared)),
+                bounded_backtrack: None,
                 limits,
                 unicode,
                 case_insensitive,
@@ -7580,6 +7735,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             return Ok(CurrentFreCaptureLifecycle {
                 model,
                 regex: CurrentFreCaptureRegex::AnchoredLineMaterialized(Box::new(prepared)),
+                bounded_backtrack: None,
                 limits,
                 unicode,
                 case_insensitive,
@@ -7597,6 +7753,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             return Ok(CurrentFreCaptureLifecycle {
                 model,
                 regex: CurrentFreCaptureRegex::FixedSchemaMaterialized(Box::new(prepared)),
+                bounded_backtrack: None,
                 limits,
                 unicode,
                 case_insensitive,
@@ -7616,14 +7773,19 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
     .map_err(|error| CompareError::new(error.message))?;
     let run_limits = match model {
         CurrentFreCaptureModel::CountCaptures => {
-            capture_count_run_limits(&regex, haystack_len, &limits)
+            materialized_capture_run_limits(&regex, haystack_len, &limits)
                 .map_err(|error| CompareError::new(error.message))?
-                .aggregate
         }
         CurrentFreCaptureModel::GrepCaptures => {
             materialized_capture_run_limits(&regex, haystack_len, &limits)
                 .map_err(|error| CompareError::new(error.message))?
         }
+    };
+    let bounded_backtrack = if model == CurrentFreCaptureModel::CountCaptures {
+        prepare_materialized_bounded_backtrack(&regex, haystack_len, run_limits)
+            .map_err(|error| CompareError::new(error.message))?
+    } else {
+        None
     };
     let preparation = match model {
         CurrentFreCaptureModel::CountCaptures => {
@@ -7636,6 +7798,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
     Ok(CurrentFreCaptureLifecycle {
         model,
         regex: CurrentFreCaptureRegex::General(Box::new(regex)),
+        bounded_backtrack,
         limits,
         unicode,
         case_insensitive,
@@ -8941,7 +9104,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V149
+        if receipt.adapter == FRE_ADAPTER_V150
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -12516,8 +12679,16 @@ fn fre_count_captures(
         ));
     }
     let regex = capture_regex(request, limits)?;
-    let run_limits = capture_count_run_limits(&regex, request.haystack.len(), limits)?.aggregate;
-    let actual = execute_materialized_count_captures(&regex, request.haystack, run_limits, limits)?;
+    let run_limits = materialized_capture_run_limits(&regex, request.haystack.len(), limits)?;
+    let mut bounded_backtrack =
+        prepare_materialized_bounded_backtrack(&regex, request.haystack.len(), run_limits)?;
+    let actual = execute_materialized_count_captures(
+        &regex,
+        bounded_backtrack.as_mut(),
+        request.haystack,
+        run_limits,
+        limits,
+    )?;
     Ok(FreReduction {
         actual,
         plan: CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN.to_owned(),
@@ -12562,12 +12733,38 @@ fn materialized_capture_run_limits(
     let mut aggregate = capture_count_run_limits(regex, haystack_len, limits)?.aggregate;
     let iteration = rebar_capture_iteration_limits(haystack_len, limits)?;
     // Incumbent History materialization has no slot-copy work, but the
-    // optional direct one-pass capture array does. Grant only that missing
-    // physical capacity; every incumbent logical/output limit and identity is
-    // otherwise unchanged.
+    // optional direct one-pass and reusable bounded-backtracking capture
+    // arrays do. Grant only that missing physical capacity; every incumbent
+    // logical/output limit and identity is otherwise unchanged.
     aggregate.per_search.max_slot_copies = iteration.per_search.max_slot_copies;
     aggregate.max_total_slot_copies = iteration.max_total_slot_copies;
     Ok(aggregate)
+}
+
+fn prepare_materialized_bounded_backtrack(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: CaptureAggregateLimits,
+) -> Result<Option<CaptureBoundedBacktrackSession>, ExecutionError> {
+    let session = regex
+        .prepare_captures_iter_bounded_backtrack(haystack_len, run_limits)
+        .map_err(materialized_bounded_backtrack_preparation_error)?;
+    if let Some(session) = session.as_ref() {
+        let receipt = session.preparation_receipt();
+        if !receipt.succeeded
+            || receipt.run_limits != run_limits
+            || receipt.usage.algorithm_version != 1
+            || receipt.usage.accounting_version != 1
+            || receipt.usage.max_search_bytes != haystack_len
+            || receipt.setup_allocations != 3
+            || receipt.persistent_bytes < receipt.usage.persistent_bytes
+        {
+            return Err(ExecutionError::fault(
+                "FRE reusable bounded-backtracking preparation identity did not close",
+            ));
+        }
+    }
+    Ok(session)
 }
 
 fn execute_count_captures_with_limits(
@@ -31870,6 +32067,197 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn reusable_bounded_backtrack_count_reuses_public_bibleref_short_session() {
+        const PATTERN: &str = r"(?P<Book>(([1234]|I{1,4})[\t\f\pZ]*)?\pL+\.?)[\t\f\pZ]+(?P<Locations>((?P<Chapter>1?[0-9]?[0-9])(-(?P<ChapterEnd>\d+)|,\s*(?P<ChapterNext>\\d+))*(:\s*(?P<Verse>\d+))?(-(?P<VerseEnd>\d+)|,\s*(?P<VerseNext>\d+))*\s?)+)";
+        const HAYSTACK: &[u8] = b"Gen 1:1, 2\n3 King 1:3-4\nII Ki. 3:12-14, 25\n";
+        const EXPECTED: u64 = 30;
+
+        assert_eq!(PATTERN.len(), 216);
+        assert_eq!(
+            sha256(PATTERN.as_bytes()),
+            "4c8cb903c4f34954bc810f88cbe73ab2da5cbefacb9db929632e3b0b576877b2"
+        );
+        assert_eq!(HAYSTACK.len(), 43);
+        assert_eq!(
+            sha256(HAYSTACK),
+            "2b597ad9c5778f281dd26b4e301b6a7c7471b5a7486ff13657ce7724c9d62da0"
+        );
+        let pinned = rust_compile_options(&[PATTERN.to_string()], true, false)
+            .expect("pinned public bibleref-short regex");
+        assert_eq!(
+            count_captures(&pinned, HAYSTACK, u64::MAX)
+                .expect("pinned public bibleref-short reduction"),
+            EXPECTED
+        );
+
+        let limits = RunLimits::default();
+        let regex = capture_regex_one(PATTERN, true, false, &limits)
+            .expect("public bibleref-short FRE artifact");
+        let run_limits = materialized_capture_run_limits(&regex, HAYSTACK.len(), &limits)
+            .expect("public bibleref-short materialized limits");
+        let mut session = prepare_materialized_bounded_backtrack(
+            &regex,
+            HAYSTACK.len(),
+            run_limits,
+        )
+        .expect("public bibleref-short direct preparation")
+        .expect("public bibleref-short selects reusable bounded backtracking");
+        let preparation = session.preparation_receipt();
+        assert!(preparation.succeeded);
+        assert_eq!(preparation.run_limits, run_limits);
+        assert_eq!(preparation.setup_allocations, 3);
+        assert_eq!(preparation.usage.max_search_bytes, HAYSTACK.len());
+        assert!(preparation.persistent_bytes > preparation.usage.persistent_bytes);
+
+        let first = regex
+            .captures_iter_bounded_backtrack(&mut session, HAYSTACK, run_limits)
+            .expect("first public bibleref-short direct operation")
+            .expect("prepared route must select on its exact invocation");
+        let steady = regex
+            .captures_iter_bounded_backtrack(&mut session, HAYSTACK, run_limits)
+            .expect("steady public bibleref-short direct operation")
+            .expect("reused route must select on its exact invocation");
+        assert_eq!(first, steady);
+        assert!(first.has_closed_attempt());
+        assert_eq!(first.preparation_receipt, preparation);
+        assert_eq!(first.identity.preparation, preparation);
+        assert_eq!(first.identity.incumbent.run_limits, run_limits);
+        assert_eq!(first.capture_count, usize::try_from(EXPECTED).unwrap());
+        assert_eq!(first.actual.results, first.captures.len());
+        assert_eq!(first.actual.materialized_records, first.captures.len());
+        assert_eq!(first.actual.searches, first.captures.len() + 1);
+        assert_eq!(
+            first.actual.capture_events,
+            first
+                .captures
+                .iter()
+                .map(|record| record.groups.len())
+                .sum::<usize>()
+        );
+        assert_eq!(first.actual.total_history_nodes, 0);
+        assert_eq!(first.actual.total_history_walk, 0);
+        assert!(first.actual.total_state_visits > 0);
+        assert!(first.actual.total_slot_copies > 0);
+        assert_eq!(first.attempt_receipt.operation_setup_allocations, 0);
+        assert!(first.attempt_receipt.succeeded);
+        assert_eq!(
+            first.prospective.persistent_workspace_bytes,
+            preparation.persistent_bytes
+        );
+        assert!(first.actual.total_state_visits <= first.prospective.total_state_visits);
+        assert!(first.actual.total_slot_copies <= first.prospective.total_slot_copies);
+        assert!(first.actual.combined_peak_bytes <= first.prospective.combined_peak_bytes);
+
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            PATTERN,
+            true,
+            false,
+            HAYSTACK.len(),
+        )
+        .expect("public bibleref-short retained lifecycle");
+        assert!(matches!(
+            &lifecycle.regex,
+            CurrentFreCaptureRegex::General(_)
+        ));
+        assert!(matches!(
+            lifecycle.preparation,
+            CurrentFreCapturePreparation::MaterializedWhole(_)
+        ));
+        let retained_preparation = lifecycle
+            .bounded_backtrack
+            .as_ref()
+            .expect("Count lifecycle retains its prepared direct session")
+            .preparation_receipt();
+        assert_eq!(retained_preparation, preparation);
+        assert_eq!(lifecycle.execute(HAYSTACK).expect("first lifecycle operation"), EXPECTED);
+        assert_eq!(
+            lifecycle.execute(HAYSTACK).expect("steady lifecycle operation"),
+            EXPECTED
+        );
+        assert_eq!(
+            lifecycle
+                .bounded_backtrack
+                .as_ref()
+                .expect("steady lifecycle retains the same session")
+                .preparation_receipt(),
+            retained_preparation
+        );
+
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[PATTERN.to_string()],
+                HAYSTACK,
+                true,
+                false,
+                &limits,
+            ),
+            EXPECTED,
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
+        );
+    }
+
+    #[test]
+    fn reusable_bounded_backtrack_count_keeps_pre_source_refusal_routes_separate() {
+        const PATTERN: &str = r"(?P<Book>(([1234]|I{1,4})[\t\f\pZ]*)?\pL+\.?)[\t\f\pZ]+(?P<Locations>((?P<Chapter>1?[0-9]?[0-9])(-(?P<ChapterEnd>\d+)|,\s*(?P<ChapterNext>\\d+))*(:\s*(?P<Verse>\d+))?(-(?P<VerseEnd>\d+)|,\s*(?P<VerseNext>\d+))*\s?)+)";
+        let over_cap = [b'x'; 129];
+        let mut history = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            PATTERN,
+            true,
+            false,
+            over_cap.len(),
+        )
+        .expect("over-cap Count retains History");
+        assert!(history.bounded_backtrack.is_none());
+        assert_eq!(history.execute(&over_cap).expect("over-cap History operation"), 0);
+
+        let grep = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            PATTERN,
+            true,
+            false,
+            43,
+        )
+        .expect("MaterializedLines lifecycle remains available");
+        assert!(grep.bounded_backtrack.is_none());
+        assert!(matches!(
+            grep.preparation,
+            CurrentFreCapturePreparation::MaterializedLines(_)
+        ));
+
+        let limits = RunLimits::default();
+        let direct_pattern = r"^ *(\w+) +(\w+) +(\w+)";
+        let direct_haystack = b"alpha beta gamma";
+        let direct = capture_regex_one(direct_pattern, false, false, &limits)
+            .expect("absolute one-pass control artifact");
+        assert!(direct.prepare_captures_iter_absolute_onepass().is_some());
+        let direct_limits =
+            materialized_capture_run_limits(&direct, direct_haystack.len(), &limits)
+                .expect("absolute one-pass control limits");
+        assert!(
+            prepare_materialized_bounded_backtrack(
+                &direct,
+                direct_haystack.len(),
+                direct_limits,
+            )
+            .expect("absolute one-pass control preparation")
+            .is_none()
+        );
+
+        let nullable = capture_regex_one(r"(a*)", false, false, &limits)
+            .expect("nullable History control artifact");
+        let nullable_limits = materialized_capture_run_limits(&nullable, 0, &limits)
+            .expect("nullable History control limits");
+        assert!(
+            prepare_materialized_bounded_backtrack(&nullable, 0, nullable_limits)
+                .expect("nullable control preparation")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn prepared_absolute_onepass_fuses_slots_and_preserves_pre_source_fallback() {
         let limits = RunLimits::default();
         let pattern = r"^ *(\w+) +(\w+) +(\w+)";
@@ -31946,6 +32334,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut reducer_events = 0_u64;
         let fallback = count_materialized_capture_slots(
             Some(&prepared),
+            None,
             &regex,
             line,
             slot_one_below,
@@ -35409,10 +35798,10 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V149);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V150);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v149-formal-v148-unicode-ordered-many-continuation-literal-proof-and-v148-fixed-class-disjoint-suffix-scan-route-composition-v1"
+            "fre-current-aggregate-capture-v150-formal-reusable-bounded-backtrack-capture-iteration-v1-v149-formal-route-composition-v1"
         );
         assert!(current_identity.availability.contains(FRE_ADAPTER));
         assert!(
@@ -35428,6 +35817,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(FRE_ADAPTER_V147));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V146));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V138));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V149));
+        assert!(
+            current_identity
+                .identity
+                .contains("formal-reusable-bounded-backtrack-capture-iteration-v1")
+        );
         assert!(
             current_identity
                 .identity
@@ -40620,7 +41015,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn materialized_absolute_start_closure_preserves_pre_source_limits_and_receipts() {
         assert_eq!(
             CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
-            "capture-materialized-array-iteration-v7"
+            "capture-materialized-array-iteration-v8"
         );
         let regex = CaptureBuilder::new(r"^((a)?)(b?)")
             .unicode(false)

@@ -18,19 +18,20 @@ use fre_aggregate::{
     Resource as SelectorResource, RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
-    AggregateLimits, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
-    BuildReport as EngineBuildReport, CandidateKind as EngineCandidateKind, CaptureCountOutcome,
-    CaptureGroupSlot, CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting,
-    CaptureStreamDomains,
+    AggregateLimits, BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION,
+    BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION, BoundedBacktrackProspective,
+    BoundedBacktrackWorkspace, BoundedBacktrackWorkspaceUsage, BuildError as EngineBuildError,
+    BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
+    CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureGroupSlot, CaptureProfile,
+    CaptureRecord, CaptureStream, CaptureStreamAccounting, CaptureStreamDomains,
     CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
     CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, FirstByteProof,
     HirProgramBuildError, HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex,
-    HistorySearchProspective,
-    ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
-    OnePassCaptureAnchoredInlineAdmission, OnePassCaptureAnchoredInlineIssuer,
-    OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
-    OnePassCaptureOwnerSeal, OnePassCapturePlan, OnePassCaptureWorkspace,
-    PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    HistorySearchProspective, ONEPASS_CAPTURE_ACCOUNTING_VERSION,
+    ONEPASS_CAPTURE_ALGORITHM_VERSION, OnePassCaptureAnchoredInlineAdmission,
+    OnePassCaptureAnchoredInlineIssuer, OnePassCaptureBuildError, OnePassCaptureBuildLimits,
+    OnePassCaptureBuildReport, OnePassCaptureOwnerSeal, OnePassCapturePlan,
+    OnePassCaptureWorkspace, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
     ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
@@ -93,11 +94,24 @@ pub const CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION: u32 = 2;
 /// composition.
 #[doc(hidden)]
 pub const CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION: u32 = 1;
+/// Semantic version of the optional reusable bounded-backtracking
+/// capture-array composition.
+#[doc(hidden)]
+pub const CAPTURE_BOUNDED_BACKTRACK_ITERATION_ALGORITHM_VERSION: u32 = 1;
+/// Accounting version of the optional reusable bounded-backtracking
+/// capture-array composition.
+#[doc(hidden)]
+pub const CAPTURE_BOUNDED_BACKTRACK_ITERATION_ACCOUNTING_VERSION: u32 = 1;
+/// Largest whole source admitted by the first reusable bounded-backtracking
+/// capture-array composition.
+#[doc(hidden)]
+pub const CAPTURE_BOUNDED_BACKTRACK_ITERATION_MAX_SEARCH_BYTES: usize = 128;
 
 const FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH: usize = 64;
 const FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS: usize = 64;
 const FIXED_BYTE_CAPTURE_RECORD_MAX_INSPECTION_WORK: usize = 1_024;
 const ABSOLUTE_ONEPASS_INLINE_GROUPS: usize = 16;
+const BOUNDED_BACKTRACK_SETUP_ALLOCATIONS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FixedByteCaptureMask([u64; 4]);
@@ -1758,6 +1772,547 @@ impl std::error::Error for CaptureAbsoluteOnePassIterationError {
     }
 }
 
+/// Physical plan selected by the optional reusable bounded-backtracking
+/// capture-array composition.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureBoundedBacktrackIterationPlan {
+    /// Priority-ordered bounded DFS with three caller-owned reusable buffers.
+    ReusedPriorityDfsLeftmostFirst,
+}
+
+/// Complete fallback contract for the reusable bounded-backtracking route.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureBoundedBacktrackIterationFallback {
+    /// History is permitted only on a source-free refusal. Once a direct
+    /// search prospective is charged, every failure is terminal.
+    PreSourceHistoryPostSelectionNone,
+}
+
+/// Conservative preparation charge for the three reusable workspace
+/// buffers.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureBoundedBacktrackPreparationReceipt {
+    /// Complete low-level fixed-capacity workspace ledger.
+    pub usage: BoundedBacktrackWorkspaceUsage,
+    /// Limits used to admit the largest reusable domain before allocation.
+    pub run_limits: AggregateLimits,
+    /// Conservatively charged setup allocations. This is three on both
+    /// success and allocation failure, even when allocation failed earlier.
+    pub setup_allocations: usize,
+    /// Exact logical bytes retained by the complete session: the low-level
+    /// workspace header and capacities plus the facade owner and receipt.
+    pub persistent_bytes: usize,
+    /// Whether all three buffers were successfully retained by a session.
+    pub succeeded: bool,
+}
+
+impl CaptureBoundedBacktrackPreparationReceipt {
+    fn closes(self) -> bool {
+        self.usage.algorithm_version == BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION
+            && self.usage.accounting_version == BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION
+            && self.usage.max_search_bytes <= CAPTURE_BOUNDED_BACKTRACK_ITERATION_MAX_SEARCH_BYTES
+            && self.setup_allocations == BOUNDED_BACKTRACK_SETUP_ALLOCATIONS
+            && bounded_backtrack_session_persistent_bytes(self.usage) == Some(self.persistent_bytes)
+    }
+}
+
+/// Owned reusable bounded-backtracking state. It can be stored beside its
+/// [`CaptureRegex`] because it contains no borrow from that regex.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CaptureBoundedBacktrackSession {
+    owner: CaptureIterationOwnerSeal,
+    workspace: BoundedBacktrackWorkspace,
+    preparation_receipt: CaptureBoundedBacktrackPreparationReceipt,
+}
+
+fn bounded_backtrack_session_persistent_bytes(
+    usage: BoundedBacktrackWorkspaceUsage,
+) -> Option<usize> {
+    let wrapper_bytes = core::mem::size_of::<CaptureBoundedBacktrackSession>()
+        .checked_sub(core::mem::size_of::<BoundedBacktrackWorkspace>())?;
+    usage.persistent_bytes.checked_add(wrapper_bytes)
+}
+
+impl CaptureBoundedBacktrackSession {
+    /// Successful source-free preparation and exact retained workspace
+    /// accounting.
+    #[must_use]
+    pub const fn preparation_receipt(&self) -> CaptureBoundedBacktrackPreparationReceipt {
+        self.preparation_receipt
+    }
+}
+
+/// Typed failure after the three-buffer allocation attempt began.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CaptureBoundedBacktrackPreparationError {
+    /// Low-level allocation failure.
+    pub source: EngineSearchError,
+    /// Full conservative preparation charge. It never claims that a partially
+    /// completed allocation attempt performed zero work.
+    pub attempt_receipt: CaptureBoundedBacktrackPreparationReceipt,
+}
+
+impl CaptureBoundedBacktrackPreparationError {
+    /// Whether this terminal allocation failure conservatively retained the
+    /// complete three-buffer attempt.
+    #[must_use]
+    pub fn has_closed_attempt(&self) -> bool {
+        !self.attempt_receipt.succeeded && self.attempt_receipt.closes()
+    }
+}
+
+impl fmt::Display for CaptureBoundedBacktrackPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "bounded-backtracking capture workspace preparation failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CaptureBoundedBacktrackPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Invocation identity for the optional reusable bounded-backtracking route.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureBoundedBacktrackIterationIdentity {
+    /// Pointer-authenticated incumbent materialized-iteration invocation.
+    pub incumbent: CaptureIterationIdentity,
+    /// Selected direct physical plan.
+    pub plan: CaptureBoundedBacktrackIterationPlan,
+    /// Successful reusable workspace preparation bound to this invocation.
+    pub preparation: CaptureBoundedBacktrackPreparationReceipt,
+    /// Semantic route version.
+    pub algorithm_version: u32,
+    /// Prospective/actual accounting version.
+    pub accounting_version: u32,
+    /// Complete before/after-source fallback contract.
+    pub declared_fallback: CaptureBoundedBacktrackIterationFallback,
+}
+
+/// Complete pre-source envelope for restarted reusable bounded backtracking.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureBoundedBacktrackIterationProspective {
+    /// Incumbent History session envelope admitted first so an old refusal can
+    /// never become direct success.
+    pub incumbent: CaptureIterationProspective,
+    /// Largest single bounded-backtracking suffix search.
+    pub largest_search: BoundedBacktrackProspective,
+    /// Exact retained workspace dimensions.
+    pub workspace: BoundedBacktrackWorkspaceUsage,
+    /// Original source length.
+    pub haystack_len: usize,
+    /// Maximum independently bounded searches.
+    pub searches: usize,
+    /// Maximum winners materialized by nested searches.
+    pub materialized_records: usize,
+    /// Maximum capture records retained by the output.
+    pub results: usize,
+    /// Maximum cumulative bounded-DFS state visits.
+    pub total_state_visits: usize,
+    /// Maximum cumulative capture writes and restorations.
+    pub total_slot_copies: usize,
+    /// Bounded backtracking allocates no persistent tagged histories.
+    pub total_history_nodes: usize,
+    /// Bounded backtracking reconstructs no persistent tagged histories.
+    pub total_history_walk: usize,
+    /// Maximum complete-schema entries materialized.
+    pub capture_events: usize,
+    /// Conservative maximum participating capture entries.
+    pub capture_count: usize,
+    /// Maximum cumulative byte-transition and candidate-scan examinations.
+    pub bytes_examined: usize,
+    /// Maximum cumulative candidate starts.
+    pub starts_injected: usize,
+    /// Largest explicit DFS frame high-water mark.
+    pub peak_threads: usize,
+    /// Low-level per-search scratch ledger.
+    pub scratch_bytes: usize,
+    /// Exact logical bytes retained by completed output records.
+    pub retained_output_bytes: usize,
+    /// Exact retained session bytes co-live with returned output, including
+    /// the facade owner and preparation receipt around the low-level buffers.
+    pub persistent_workspace_bytes: usize,
+    /// Maximum retained output plus the retained reusable workspace.
+    pub combined_peak_bytes: usize,
+}
+
+impl CaptureBoundedBacktrackIterationProspective {
+    fn contains(self, actual: CaptureIterationActual, capture_count: usize) -> bool {
+        actual.searches <= self.searches
+            && actual.materialized_records <= self.materialized_records
+            && actual.results <= self.results
+            && actual.total_state_visits <= self.total_state_visits
+            && actual.total_slot_copies <= self.total_slot_copies
+            && actual.total_history_nodes == 0
+            && actual.total_history_walk == 0
+            && actual.capture_events <= self.capture_events
+            && capture_count <= self.capture_count
+            && actual.bytes_examined <= self.bytes_examined
+            && actual.starts_injected <= self.starts_injected
+            && actual.peak_threads <= self.peak_threads
+            && actual.scratch_bytes <= self.scratch_bytes
+            && actual.retained_output_bytes <= self.retained_output_bytes
+            && actual.combined_peak_bytes <= self.combined_peak_bytes
+    }
+
+    fn is_direct_admitted(self, limits: AggregateLimits) -> bool {
+        self.largest_search.state_visits <= limits.per_search.max_state_visits
+            && self.largest_search.slot_copies <= limits.per_search.max_slot_copies
+            && self.scratch_bytes <= limits.per_search.max_scratch_bytes
+            && self.searches <= limits.max_searches
+            && self.results <= limits.max_results
+            && self.total_state_visits <= limits.max_total_state_visits
+            && self.total_slot_copies <= limits.max_total_slot_copies
+            && self.total_history_nodes <= limits.max_total_history_nodes
+            && self.total_history_walk <= limits.max_total_history_walk
+            && self.capture_events <= limits.max_capture_events
+            && self.capture_count <= limits.max_capture_count
+            && self.retained_output_bytes <= limits.max_retained_output_bytes
+            && self.combined_peak_bytes <= limits.max_combined_peak_bytes
+    }
+
+    fn is_structurally_economical(self) -> bool {
+        let Some(direct_actions) = self.total_state_visits.checked_add(self.total_slot_copies)
+        else {
+            return false;
+        };
+        let incumbent = self.incumbent.engine;
+        let Some(history_actions) = incumbent
+            .total_state_visits
+            .checked_add(incumbent.total_history_nodes)
+            .and_then(|work| work.checked_add(incumbent.total_history_walk))
+        else {
+            return false;
+        };
+        direct_actions < history_actions
+    }
+}
+
+fn bounded_backtrack_largest_search(
+    shape: fre_capture_lab::HistoryProgramShape,
+    usage: BoundedBacktrackWorkspaceUsage,
+    haystack_len: usize,
+) -> Option<BoundedBacktrackProspective> {
+    if haystack_len > usage.max_search_bytes
+        || usage.state_count != shape.states
+        || usage.slot_capacity != shape.slots
+        || shape.save_states != shape.slots
+    {
+        return None;
+    }
+    let boundaries = haystack_len.checked_add(1)?;
+    let state_visits = shape
+        .states
+        .checked_mul(2)?
+        .checked_add(1)?
+        .checked_mul(boundaries)?;
+    let slot_copies = shape.save_states.checked_mul(2)?.checked_mul(boundaries)?;
+    let bytes_examined = shape.states.checked_mul(boundaries)?;
+    let peak_threads = usage.frame_state_count.checked_mul(boundaries)?.max(1);
+    Some(BoundedBacktrackProspective {
+        state_visits,
+        slot_copies,
+        bytes_examined,
+        starts_injected: boundaries,
+        peak_threads,
+        // The retained session charges the largest prepared low-level scratch
+        // on every operation, even when this particular domain is smaller.
+        scratch_bytes: usage.admitted_scratch_bytes,
+    })
+}
+
+fn compose_bounded_backtrack_iteration_prospective(
+    shape: fre_capture_lab::HistoryProgramShape,
+    usage: BoundedBacktrackWorkspaceUsage,
+    incumbent: CaptureIterationProspective,
+) -> Option<CaptureBoundedBacktrackIterationProspective> {
+    let engine = incumbent.engine;
+    if engine.minimum_match_bytes == 0
+        || engine.window.start != 0
+        || engine.window.end != incumbent.haystack_len
+    {
+        return None;
+    }
+    let largest_search = bounded_backtrack_largest_search(shape, usage, incumbent.haystack_len)?;
+    // `starts_injected` is the incumbent restart coefficient C: the sum of
+    // suffix boundary counts at minimum-width cursor progression. For an
+    // unanchored bounded DFS, exact closed bounds are therefore
+    //   state=(2*S+1)*C, slot=2*Q*C, bytes=S*C, starts=C.
+    let coefficient = engine.starts_injected;
+    let total_state_visits = shape
+        .states
+        .checked_mul(2)?
+        .checked_add(1)?
+        .checked_mul(coefficient)?;
+    let total_slot_copies = shape.save_states.checked_mul(2)?.checked_mul(coefficient)?;
+    let bytes_examined = shape.states.checked_mul(coefficient)?;
+    let persistent_workspace_bytes = bounded_backtrack_session_persistent_bytes(usage)?;
+    let combined_peak_bytes = engine
+        .retained_output_bytes
+        .checked_add(persistent_workspace_bytes)?;
+    Some(CaptureBoundedBacktrackIterationProspective {
+        incumbent,
+        largest_search,
+        workspace: usage,
+        haystack_len: incumbent.haystack_len,
+        searches: engine.searches,
+        materialized_records: engine.materialized_records,
+        results: engine.results,
+        total_state_visits,
+        total_slot_copies,
+        total_history_nodes: 0,
+        total_history_walk: 0,
+        capture_events: engine.capture_events,
+        capture_count: engine.capture_events,
+        bytes_examined,
+        starts_injected: coefficient,
+        peak_threads: largest_search.peak_threads,
+        scratch_bytes: usage.admitted_scratch_bytes,
+        retained_output_bytes: engine.retained_output_bytes,
+        persistent_workspace_bytes,
+        combined_peak_bytes,
+    })
+}
+
+fn reconstruct_bounded_backtrack_iteration_prospective(
+    identity: &CaptureBoundedBacktrackIterationIdentity,
+    haystack_len: usize,
+) -> Option<CaptureBoundedBacktrackIterationProspective> {
+    let window = Window {
+        start: 0,
+        end: haystack_len,
+    };
+    let incumbent = identity
+        .incumbent
+        .session_seal
+        .prospective(haystack_len, window)
+        .ok()?;
+    let route = identity.incumbent.session_seal.route_identity();
+    compose_bounded_backtrack_iteration_prospective(
+        route.engine_shape,
+        identity.preparation.usage,
+        incumbent,
+    )
+}
+
+/// Complete result of one selected reusable bounded-backtracking iteration.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureBoundedBacktrackIterationReport {
+    /// Complete incumbent/direct composition identity.
+    pub identity: CaptureBoundedBacktrackIterationIdentity,
+    /// Complete pre-source envelope admitted before source access.
+    pub prospective: CaptureBoundedBacktrackIterationProspective,
+    /// Exact completed physical and logical accounting.
+    pub actual: CaptureIterationActual,
+    /// Every non-overlapping leftmost-first capture record.
+    pub captures: Vec<CaptureRecord>,
+    /// Exact participating capture entries across retained records.
+    pub capture_count: usize,
+    /// Successful reusable workspace preparation receipt.
+    pub preparation_receipt: CaptureBoundedBacktrackPreparationReceipt,
+    /// Complete terminal operation receipt.
+    pub attempt_receipt: CaptureBoundedBacktrackIterationAttemptReceipt,
+}
+
+/// Lossless terminal charge for one selected reusable bounded-backtracking
+/// attempt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureBoundedBacktrackIterationAttemptReceipt {
+    /// Complete pre-source envelope.
+    pub prospective: CaptureBoundedBacktrackIterationProspective,
+    /// Search prospectives charged before source access plus exact completed
+    /// materialization counters.
+    pub actual: CaptureIterationActual,
+    /// Exact participating capture count completed so far.
+    pub capture_count: usize,
+    /// Setup allocations performed by this operation. The reusable session
+    /// makes this exactly zero.
+    pub operation_setup_allocations: usize,
+    /// Whether the selected attempt returned a complete semantic result.
+    pub succeeded: bool,
+}
+
+/// Failure reason for the optional reusable bounded-backtracking route.
+#[doc(hidden)]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CaptureBoundedBacktrackIterationFailure {
+    /// The selected direct executor failed after route selection.
+    Search(EngineSearchError),
+    /// Immutable construction or returned accounting was incoherent.
+    InternalInvariant(&'static str),
+}
+
+/// Terminal failure after reusable bounded backtracking crossed its source
+/// boundary.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CaptureBoundedBacktrackIterationError {
+    /// Complete selected composition identity.
+    pub identity: Box<CaptureBoundedBacktrackIterationIdentity>,
+    /// Typed failure reason.
+    pub source: CaptureBoundedBacktrackIterationFailure,
+    /// Present for every selected terminal failure.
+    pub attempt_receipt: Box<CaptureBoundedBacktrackIterationAttemptReceipt>,
+}
+
+impl CaptureBoundedBacktrackIterationAttemptReceipt {
+    /// Validate version, fallback, preparation and complete charged ledgers.
+    #[must_use]
+    pub fn closes(&self, identity: &CaptureBoundedBacktrackIterationIdentity) -> bool {
+        let route = identity.incumbent.session_seal.route_identity();
+        let Some(expected) = reconstruct_bounded_backtrack_iteration_prospective(
+            identity,
+            self.prospective.haystack_len,
+        ) else {
+            return false;
+        };
+        identity.plan == CaptureBoundedBacktrackIterationPlan::ReusedPriorityDfsLeftmostFirst
+            && identity.algorithm_version == CAPTURE_BOUNDED_BACKTRACK_ITERATION_ALGORITHM_VERSION
+            && identity.accounting_version == CAPTURE_BOUNDED_BACKTRACK_ITERATION_ACCOUNTING_VERSION
+            && identity.declared_fallback
+                == CaptureBoundedBacktrackIterationFallback::PreSourceHistoryPostSelectionNone
+            && BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION == 1
+            && BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION == 1
+            && identity.preparation.closes()
+            && identity.preparation.succeeded
+            && identity.preparation.usage == self.prospective.workspace
+            && identity.incumbent.closes_session_seal()
+            && identity.incumbent.search == CaptureSearchConfig::LEFTMOST
+            && route.absolute_onepass.is_none()
+            && route.minimum_match_bytes > 0
+            && route.operation == CaptureIterationOperation::MaterializeCaptureArray
+            && route.plan == CaptureIterationPlanKind::RestartedPersistentHistory
+            && route.backend == CaptureIterationBackend::PersistentHistory
+            && route.algorithm_version == CAPTURE_ITERATION_ALGORITHM_VERSION
+            && route.accounting_version == CAPTURE_ITERATION_ACCOUNTING_VERSION
+            && route.declared_fallback == CaptureIterationDeclaredFallback::None
+            && route.syntax == identity.incumbent.syntax
+            && route.capture_profile == identity.incumbent.capture_profile
+            && route.build_limits == identity.incumbent.build_limits
+            && identity.incumbent.run_limits == identity.preparation.run_limits
+            && self.prospective.incumbent.haystack_len == self.prospective.haystack_len
+            && self.prospective.workspace == identity.preparation.usage
+            && self.prospective.persistent_workspace_bytes == identity.preparation.persistent_bytes
+            && self.prospective == expected
+            && self
+                .prospective
+                .incumbent
+                .first_limit_error(identity.incumbent.run_limits)
+                .is_none()
+            && self
+                .prospective
+                .is_direct_admitted(identity.incumbent.run_limits)
+            && self.prospective.is_structurally_economical()
+            && self.prospective.contains(self.actual, self.capture_count)
+            && self.operation_setup_allocations == 0
+            && self.actual.combined_peak_bytes >= identity.preparation.persistent_bytes
+            && self.actual.results <= self.actual.materialized_records
+    }
+}
+
+impl CaptureBoundedBacktrackIterationReport {
+    /// Whether this successful selected route retains a complete closed
+    /// preparation and operation attempt.
+    #[must_use]
+    pub fn has_closed_attempt(&self) -> bool {
+        let mut expected_actual = self.attempt_receipt.actual;
+        expected_actual.total_state_visits = self.actual.total_state_visits;
+        expected_actual.total_slot_copies = self.actual.total_slot_copies;
+        expected_actual.bytes_examined = self.actual.bytes_examined;
+        expected_actual.starts_injected = self.actual.starts_injected;
+        expected_actual.peak_threads = self.actual.peak_threads;
+        self.preparation_receipt == self.identity.preparation
+            && self.preparation_receipt.succeeded
+            && self.prospective == self.attempt_receipt.prospective
+            && self.actual == expected_actual
+            && self.capture_count == self.attempt_receipt.capture_count
+            && self.captures.len() == self.actual.results
+            && self.attempt_receipt.succeeded
+            && self.attempt_receipt.closes(&self.identity)
+    }
+}
+
+impl CaptureBoundedBacktrackIterationError {
+    /// Whether a selected post-source fault retained its complete charged
+    /// attempt.
+    #[must_use]
+    pub fn has_closed_attempt(&self) -> bool {
+        !self.attempt_receipt.succeeded && self.attempt_receipt.closes(&self.identity)
+    }
+}
+
+impl fmt::Display for CaptureBoundedBacktrackIterationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Search(source) => write!(formatter, "{source}"),
+            Self::InternalInvariant(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CaptureBoundedBacktrackIterationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Search(source) => Some(source),
+            Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for CaptureBoundedBacktrackIterationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "reusable bounded-backtracking capture iteration failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CaptureBoundedBacktrackIterationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn bounded_backtrack_selected_error(
+    identity: &CaptureBoundedBacktrackIterationIdentity,
+    prospective: CaptureBoundedBacktrackIterationProspective,
+    actual: CaptureIterationActual,
+    capture_count: usize,
+    source: CaptureBoundedBacktrackIterationFailure,
+) -> CaptureBoundedBacktrackIterationError {
+    let attempt_receipt = CaptureBoundedBacktrackIterationAttemptReceipt {
+        prospective,
+        actual,
+        capture_count,
+        operation_setup_allocations: 0,
+        succeeded: false,
+    };
+    let error = CaptureBoundedBacktrackIterationError {
+        identity: Box::new(identity.clone()),
+        source,
+        attempt_receipt: Box::new(attempt_receipt),
+    };
+    debug_assert!(error.has_closed_attempt());
+    error
+}
+
 /// Checked capture-iteration failure retaining exact source and limit identity.
 #[derive(Debug)]
 pub struct CaptureIterationError {
@@ -2472,6 +3027,118 @@ fn capture_iteration_search_fits(
         && actual.starts_injected <= prospective.starts_injected
         && actual.peak_threads <= prospective.peak_threads
         && actual.admitted_scratch_bytes <= prospective.scratch_bytes
+}
+
+fn bounded_backtrack_search_fits(
+    prospective: BoundedBacktrackProspective,
+    actual: &EngineSearchAccounting,
+) -> bool {
+    actual.candidate == EngineCandidateKind::BoundedBacktracker
+        && actual.state_visits <= prospective.state_visits
+        && actual.slot_copies <= prospective.slot_copies
+        && actual.history_nodes == 0
+        && actual.history_walk == 0
+        && actual.bytes_examined <= prospective.bytes_examined
+        && actual.starts_injected <= prospective.starts_injected
+        && actual.peak_threads <= prospective.peak_threads
+        && actual.admitted_scratch_bytes <= prospective.scratch_bytes
+}
+
+fn charge_bounded_backtrack_search(
+    actual: &mut CaptureIterationActual,
+    prospective: BoundedBacktrackProspective,
+    persistent_workspace_bytes: usize,
+) -> Result<(), EngineSearchError> {
+    actual.searches =
+        capture_iteration_exact_add(actual.searches, 1, EngineResource::Searches, usize::MAX)?;
+    actual.total_state_visits = capture_iteration_exact_add(
+        actual.total_state_visits,
+        prospective.state_visits,
+        EngineResource::AggregateStateVisits,
+        usize::MAX,
+    )?;
+    actual.total_slot_copies = capture_iteration_exact_add(
+        actual.total_slot_copies,
+        prospective.slot_copies,
+        EngineResource::AggregateSlotCopies,
+        usize::MAX,
+    )?;
+    actual.bytes_examined = actual
+        .bytes_examined
+        .checked_add(prospective.bytes_examined)
+        .ok_or(EngineSearchError::BoundOverflow(
+            EngineResource::AggregateStateVisits,
+        ))?;
+    actual.starts_injected = actual
+        .starts_injected
+        .checked_add(prospective.starts_injected)
+        .ok_or(EngineSearchError::BoundOverflow(
+            EngineResource::AggregateStateVisits,
+        ))?;
+    actual.peak_threads = actual.peak_threads.max(prospective.peak_threads);
+    actual.scratch_bytes = actual.scratch_bytes.max(prospective.scratch_bytes);
+    actual.combined_peak_bytes = actual.combined_peak_bytes.max(
+        actual
+            .retained_output_bytes
+            .checked_add(persistent_workspace_bytes)
+            .ok_or(EngineSearchError::BoundOverflow(
+                EngineResource::CombinedPeakBytes,
+            ))?,
+    );
+    Ok(())
+}
+
+fn record_bounded_backtrack_materialization(
+    actual: &mut CaptureIterationActual,
+    groups: usize,
+    materialized_record_bytes: usize,
+    persistent_workspace_bytes: usize,
+) -> Result<(), EngineSearchError> {
+    actual.materialized_records = capture_iteration_exact_add(
+        actual.materialized_records,
+        1,
+        EngineResource::Results,
+        usize::MAX,
+    )?;
+    actual.capture_events = capture_iteration_exact_add(
+        actual.capture_events,
+        groups,
+        EngineResource::CaptureEvents,
+        usize::MAX,
+    )?;
+    let peak = actual
+        .retained_output_bytes
+        .checked_add(materialized_record_bytes)
+        .and_then(|bytes| bytes.checked_add(persistent_workspace_bytes))
+        .ok_or(EngineSearchError::BoundOverflow(
+            EngineResource::CombinedPeakBytes,
+        ))?;
+    actual.combined_peak_bytes = actual.combined_peak_bytes.max(peak);
+    Ok(())
+}
+
+fn record_bounded_backtrack_result(
+    actual: &mut CaptureIterationActual,
+    retained_record_bytes: usize,
+    persistent_workspace_bytes: usize,
+) -> Result<(), EngineSearchError> {
+    actual.results =
+        capture_iteration_exact_add(actual.results, 1, EngineResource::Results, usize::MAX)?;
+    actual.retained_output_bytes = capture_iteration_exact_add(
+        actual.retained_output_bytes,
+        retained_record_bytes,
+        EngineResource::RetainedOutputBytes,
+        usize::MAX,
+    )?;
+    actual.combined_peak_bytes = actual.combined_peak_bytes.max(
+        actual
+            .retained_output_bytes
+            .checked_add(persistent_workspace_bytes)
+            .ok_or(EngineSearchError::BoundOverflow(
+                EngineResource::CombinedPeakBytes,
+            ))?,
+    );
+    Ok(())
 }
 
 fn optional_required_literal_refusal(error: &CaptureRequiredLiteralBuildError) -> bool {
@@ -3248,11 +3915,8 @@ impl CaptureBuilder {
             .properties()
             .look_set_prefix()
             .contains(Look::Start);
-        let record_search_absolute_end = rust
-            .hir
-            .properties()
-            .look_set_suffix()
-            .contains(Look::End);
+        let record_search_absolute_end =
+            rust.hir.properties().look_set_suffix().contains(Look::End);
         let record_search_absolute_fixed_width = if record_search_absolute_start {
             let properties = rust.hir.properties();
             properties
@@ -3766,22 +4430,21 @@ impl CaptureRecordVisitorSession {
             if !outcome.matched {
                 break;
             }
-            let overall = self
-                .groups
-                .first()
-                .and_then(|slot| slot.span())
-                .ok_or(CaptureRecordVisitError::InternalInvariant(
+            let overall = self.groups.first().and_then(|slot| slot.span()).ok_or(
+                CaptureRecordVisitError::InternalInvariant(
                     "retained capture search omitted group zero",
-                ))?;
+                ),
+            )?;
             if overall.start == overall.end && last_match_end == Some(overall.start) {
                 if overall.end == window.end {
                     break;
                 }
-                cursor = overall.end.checked_add(1).ok_or(
-                    CaptureRecordVisitError::Replay(EngineSearchError::BoundOverflow(
-                        EngineResource::Searches,
-                    )),
-                )?;
+                cursor = overall
+                    .end
+                    .checked_add(1)
+                    .ok_or(CaptureRecordVisitError::Replay(
+                        EngineSearchError::BoundOverflow(EngineResource::Searches),
+                    ))?;
                 continue;
             }
             report.matches = record_add(
@@ -3800,11 +4463,11 @@ impl CaptureRecordVisitorSession {
                 if *group == CaptureGroupSlot::UNMATCHED {
                     continue;
                 }
-                let group_span = group.span().ok_or(
-                    CaptureRecordVisitError::InternalInvariant(
+                let group_span = group
+                    .span()
+                    .ok_or(CaptureRecordVisitError::InternalInvariant(
                         "retained search published a noncanonical capture slot",
-                    ),
-                )?;
+                    ))?;
                 if group_span.start > group_span.end || group_span.end > haystack.len() {
                     return Err(CaptureRecordVisitError::InternalInvariant(
                         "retained search published a capture outside its domain",
@@ -3831,11 +4494,12 @@ impl CaptureRecordVisitorSession {
                 if overall.end == window.end {
                     break;
                 }
-                cursor = overall.end.checked_add(1).ok_or(
-                    CaptureRecordVisitError::Replay(EngineSearchError::BoundOverflow(
-                        EngineResource::Searches,
-                    )),
-                )?;
+                cursor = overall
+                    .end
+                    .checked_add(1)
+                    .ok_or(CaptureRecordVisitError::Replay(
+                        EngineSearchError::BoundOverflow(EngineResource::Searches),
+                    ))?;
             } else {
                 cursor = overall.end;
             }
@@ -4361,20 +5025,20 @@ fn record_remaining(
     used: usize,
     resource: EngineResource,
 ) -> Result<usize, CaptureRecordVisitError> {
-    limit.checked_sub(used).ok_or(CaptureRecordVisitError::Replay(
-        EngineSearchError::BoundOverflow(resource),
-    ))
+    limit
+        .checked_sub(used)
+        .ok_or(CaptureRecordVisitError::Replay(
+            EngineSearchError::BoundOverflow(resource),
+        ))
 }
 
 fn allocate_capture_record_groups(
     group_count: usize,
 ) -> Result<Vec<CaptureGroupSlot>, CaptureRecordVisitError> {
     let mut groups = Vec::new();
-    groups
-        .try_reserve_exact(group_count)
-        .map_err(|_| CaptureRecordVisitError::Replay(EngineSearchError::Allocation(
-            EngineResource::Captures,
-        )))?;
+    groups.try_reserve_exact(group_count).map_err(|_| {
+        CaptureRecordVisitError::Replay(EngineSearchError::Allocation(EngineResource::Captures))
+    })?;
     if groups.capacity() != group_count {
         return Err(CaptureRecordVisitError::Replay(
             EngineSearchError::Allocation(EngineResource::Captures),
@@ -4801,14 +5465,9 @@ impl CaptureRegex {
         limits: EngineSearchLimits,
         max_persistent_bytes: usize,
     ) -> Result<CaptureRecordVisitorSession, CaptureRecordVisitError> {
-        let group_count = self
-            .report
-            .engine
-            .captures
-            .checked_add(1)
-            .ok_or(CaptureRecordVisitError::InternalInvariant(
-                "capture record schema overflowed usize",
-            ))?;
+        let group_count = self.report.engine.captures.checked_add(1).ok_or(
+            CaptureRecordVisitError::InternalInvariant("capture record schema overflowed usize"),
+        )?;
         let group_bytes = group_count
             .checked_mul(core::mem::size_of::<CaptureGroupSlot>())
             .ok_or(CaptureRecordVisitError::Replay(
@@ -4864,7 +5523,8 @@ impl CaptureRegex {
                 limits,
             )
             && let Ok(workspace_usage) = plan.workspace_usage(limits)
-            && let Some(persistent_bytes) = workspace_usage.persistent_bytes.checked_add(group_bytes)
+            && let Some(persistent_bytes) =
+                workspace_usage.persistent_bytes.checked_add(group_bytes)
             && persistent_bytes <= max_persistent_bytes
             && let Ok(workspace) = plan.create_workspace(limits)
             && workspace.usage() == workspace_usage
@@ -5575,6 +6235,132 @@ impl CaptureRegex {
         self.engine.captures_exact(haystack, window, span, limits)
     }
 
+    /// Prepare an owned three-buffer bounded-backtracking session for one
+    /// fixed maximum whole-source width.
+    ///
+    /// Every eligibility, incumbent, direct-resource and economy refusal is
+    /// `Ok(None)` before allocation or source access. Once allocation begins,
+    /// a failure is terminal and conservatively carries all three attempted
+    /// setup allocations and the complete formal retained-session bytes.
+    #[doc(hidden)]
+    pub fn prepare_captures_iter_bounded_backtrack(
+        &self,
+        max_search_bytes: usize,
+        limits: AggregateLimits,
+    ) -> Result<Option<CaptureBoundedBacktrackSession>, CaptureBoundedBacktrackPreparationError>
+    {
+        if max_search_bytes > CAPTURE_BOUNDED_BACKTRACK_ITERATION_MAX_SEARCH_BYTES
+            || BOUNDED_BACKTRACK_WORKSPACE_ALGORITHM_VERSION != 1
+            || BOUNDED_BACKTRACK_WORKSPACE_ACCOUNTING_VERSION != 1
+        {
+            return Ok(None);
+        }
+        let route = self.iteration_owner.identity();
+        // Retaining this large workspace beside a usable absolute-start
+        // sidecar would change the direct route's co-live-byte ledger. Keep
+        // both its priority and its P/A identity exact by declining here.
+        if route.absolute_onepass.is_some()
+            || route.minimum_match_bytes == 0
+            || route.operation != CaptureIterationOperation::MaterializeCaptureArray
+            || route.plan != CaptureIterationPlanKind::RestartedPersistentHistory
+            || route.backend != CaptureIterationBackend::PersistentHistory
+            || route.algorithm_version != CAPTURE_ITERATION_ALGORITHM_VERSION
+            || route.accounting_version != CAPTURE_ITERATION_ACCOUNTING_VERSION
+            || route.declared_fallback != CaptureIterationDeclaredFallback::None
+            || route.syntax != self.report.plan_identity.syntax
+            || route.capture_profile != self.report.plan_identity.capture_profile
+            || route.build_limits != self.build_limits
+        {
+            return Ok(None);
+        }
+        let incumbent_identity = self.iteration_identity(limits);
+        let window = Window {
+            start: 0,
+            end: max_search_bytes,
+        };
+        let Ok(incumbent) = incumbent_identity
+            .session_seal
+            .prospective(max_search_bytes, window)
+        else {
+            return Ok(None);
+        };
+        if incumbent.first_limit_error(limits).is_some() {
+            return Ok(None);
+        }
+        let usage = match self
+            .engine
+            .bounded_backtrack_workspace_usage(max_search_bytes, limits.per_search)
+        {
+            Ok(Some(usage)) => usage,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let Some(prospective) =
+            compose_bounded_backtrack_iteration_prospective(route.engine_shape, usage, incumbent)
+        else {
+            return Ok(None);
+        };
+        let direct = match self.engine.bounded_backtrack_prospective(
+            window,
+            0,
+            CaptureSearchConfig::LEFTMOST,
+        ) {
+            Ok(Some(direct)) => direct,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if direct != prospective.largest_search
+            || !prospective.is_direct_admitted(limits)
+            || !prospective.is_structurally_economical()
+        {
+            return Ok(None);
+        }
+        let Some(persistent_bytes) = bounded_backtrack_session_persistent_bytes(usage) else {
+            return Ok(None);
+        };
+
+        let attempted = CaptureBoundedBacktrackPreparationReceipt {
+            usage,
+            run_limits: limits,
+            setup_allocations: BOUNDED_BACKTRACK_SETUP_ALLOCATIONS,
+            persistent_bytes,
+            succeeded: false,
+        };
+        debug_assert!(attempted.closes());
+        let workspace = match self
+            .engine
+            .prepare_bounded_backtrack_workspace(max_search_bytes, limits.per_search)
+        {
+            Ok(Some(workspace)) => workspace,
+            Ok(None) => {
+                return Err(CaptureBoundedBacktrackPreparationError {
+                    source: EngineSearchError::InvalidProgram,
+                    attempt_receipt: attempted,
+                });
+            }
+            Err(source) => {
+                return Err(CaptureBoundedBacktrackPreparationError {
+                    source,
+                    attempt_receipt: attempted,
+                });
+            }
+        };
+        if workspace.usage() != usage {
+            return Err(CaptureBoundedBacktrackPreparationError {
+                source: EngineSearchError::InvalidProgram,
+                attempt_receipt: attempted,
+            });
+        }
+        let preparation_receipt = CaptureBoundedBacktrackPreparationReceipt {
+            succeeded: true,
+            ..attempted
+        };
+        debug_assert!(preparation_receipt.closes());
+        Ok(Some(CaptureBoundedBacktrackSession {
+            owner: self.iteration_owner.clone(),
+            workspace,
+            preparation_receipt,
+        }))
+    }
+
     /// Prepare one borrowed direct route for repeated independent domains.
     ///
     /// Every immutable theorem, version, schema and pointer check happens
@@ -5599,11 +6385,11 @@ impl CaptureRegex {
         let group_count = owner.capture_group_count();
         let slot_count = group_count.checked_mul(2)?;
         let raw_scratch_bytes = absolute_onepass_raw_scratch(owner)?;
-        let fixed_group_bytes = ABSOLUTE_ONEPASS_INLINE_GROUPS
-            .checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+        let fixed_group_bytes =
+            ABSOLUTE_ONEPASS_INLINE_GROUPS.checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
         let scratch_bytes = raw_scratch_bytes.checked_add(fixed_group_bytes)?;
-        let retained_output_bytes = group_count
-            .checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+        let retained_output_bytes =
+            group_count.checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
         if minimum_match_bytes == 0
             || group_count == 0
             || group_count > ABSOLUTE_ONEPASS_INLINE_GROUPS
@@ -5701,8 +6487,7 @@ impl CaptureAbsoluteOnePassPrepared<'_> {
             incumbent_search,
             haystack.len(),
             limits.per_search,
-        )
-        else {
+        ) else {
             return Ok(None);
         };
         if !prospective.is_direct_aggregate_admitted(limits) {
@@ -5903,10 +6688,7 @@ impl CaptureAbsoluteOnePassPrepared<'_> {
         // Retain only the invocation/session cross-bind before commitment.
         if !incumbent_identity.closes_session_seal()
             || incumbent_identity.search != CaptureSearchConfig::LEFTMOST
-            || !core::ptr::eq(
-                incumbent_identity.session_seal.route_identity(),
-                self.route,
-            )
+            || !core::ptr::eq(incumbent_identity.session_seal.route_identity(), self.route)
         {
             return Ok(None);
         }
@@ -6106,10 +6888,429 @@ impl CaptureAbsoluteOnePassPrepared<'_> {
         debug_assert!(report.has_closed_attempt());
         Ok(Some(report))
     }
-
 }
 
 impl CaptureRegex {
+    /// Collect every positive-width leftmost-first capture record with an
+    /// owned reusable bounded-backtracking session.
+    ///
+    /// `Ok(None)` is a source-free refusal: the caller may use the incumbent
+    /// History iterator. After the exact incumbent and direct prospectives are
+    /// admitted, every fault is terminal and carries a charged attempt;
+    /// History fallback is forbidden.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "incumbent admission, direct selection, source boundary, restarted progression and terminal P/A closure remain locally auditable"
+    )]
+    pub fn captures_iter_bounded_backtrack(
+        &self,
+        session: &mut CaptureBoundedBacktrackSession,
+        haystack: &[u8],
+        limits: AggregateLimits,
+    ) -> Result<Option<CaptureBoundedBacktrackIterationReport>, CaptureBoundedBacktrackIterationError>
+    {
+        let preparation = session.preparation_receipt;
+        let route = self.iteration_owner.identity();
+        if session.owner != self.iteration_owner
+            || !preparation.closes()
+            || !preparation.succeeded
+            || preparation.run_limits != limits
+            || haystack.len() > preparation.usage.max_search_bytes
+            || haystack.len() > CAPTURE_BOUNDED_BACKTRACK_ITERATION_MAX_SEARCH_BYTES
+            || route.absolute_onepass.is_some()
+            || route.minimum_match_bytes == 0
+        {
+            return Ok(None);
+        }
+
+        // Replay the incumbent History preflight first. An old refusal must
+        // remain a source-free fallback instead of becoming direct success.
+        let incumbent_identity = self.iteration_identity(limits);
+        let window = Window::all(haystack);
+        let incumbent = match incumbent_identity
+            .session_seal
+            .prospective(haystack.len(), window)
+        {
+            Ok(prospective) => prospective,
+            Err(_) => return Ok(None),
+        };
+        if incumbent.first_limit_error(limits).is_some() {
+            return Ok(None);
+        }
+        let Some(prospective) = compose_bounded_backtrack_iteration_prospective(
+            route.engine_shape,
+            preparation.usage,
+            incumbent,
+        ) else {
+            return Ok(None);
+        };
+        let direct_largest = match self.engine.bounded_backtrack_prospective(
+            window,
+            0,
+            CaptureSearchConfig::LEFTMOST,
+        ) {
+            Ok(Some(direct)) => direct,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if direct_largest.state_visits != prospective.largest_search.state_visits
+            || direct_largest.slot_copies != prospective.largest_search.slot_copies
+            || direct_largest.bytes_examined != prospective.largest_search.bytes_examined
+            || direct_largest.starts_injected != prospective.largest_search.starts_injected
+            || direct_largest.peak_threads != prospective.largest_search.peak_threads
+            || direct_largest.scratch_bytes > prospective.largest_search.scratch_bytes
+            || !prospective.is_direct_admitted(limits)
+            || !prospective.is_structurally_economical()
+            || !incumbent_identity.closes_session_seal()
+        {
+            return Ok(None);
+        }
+
+        let shape = route.engine_shape;
+        let materialized_record_bytes = match shape.materialized_record_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let retained_record_bytes = match shape.retained_record_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let identity = CaptureBoundedBacktrackIterationIdentity {
+            incumbent: incumbent_identity,
+            plan: CaptureBoundedBacktrackIterationPlan::ReusedPriorityDfsLeftmostFirst,
+            preparation,
+            algorithm_version: CAPTURE_BOUNDED_BACKTRACK_ITERATION_ALGORITHM_VERSION,
+            accounting_version: CAPTURE_BOUNDED_BACKTRACK_ITERATION_ACCOUNTING_VERSION,
+            declared_fallback:
+                CaptureBoundedBacktrackIterationFallback::PreSourceHistoryPostSelectionNone,
+        };
+
+        let mut captures = Vec::new();
+        let initial_actual = CaptureIterationActual {
+            combined_peak_bytes: preparation.persistent_bytes,
+            ..CaptureIterationActual::default()
+        };
+        let mut charged_actual = initial_actual;
+        let mut physical_actual = initial_actual;
+        let mut capture_count = 0_usize;
+        let mut cursor = 0_usize;
+        loop {
+            let direct = match self.engine.bounded_backtrack_prospective(
+                window,
+                cursor,
+                CaptureSearchConfig::LEFTMOST,
+            ) {
+                Ok(Some(direct)) => direct,
+                Ok(None) => {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                            "selected bounded-backtracking program became unsupported",
+                        ),
+                    ));
+                }
+                Err(source) => {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::Search(source),
+                    ));
+                }
+            };
+            let charged_search = BoundedBacktrackProspective {
+                scratch_bytes: preparation.usage.admitted_scratch_bytes,
+                ..direct
+            };
+            if let Err(source) = charge_bounded_backtrack_search(
+                &mut charged_actual,
+                charged_search,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+            if !prospective.contains(charged_actual, capture_count) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                        "bounded-backtracking search charge exceeded its session prospective",
+                    ),
+                ));
+            }
+
+            let outcome = match self.engine.captures_from_with_bounded_backtrack_workspace(
+                &mut session.workspace,
+                haystack,
+                window,
+                cursor,
+                CaptureSearchConfig::LEFTMOST,
+                limits.per_search,
+            ) {
+                Ok(outcome) => outcome,
+                Err(source) => {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::Search(source),
+                    ));
+                }
+            };
+            if !bounded_backtrack_search_fits(direct, &outcome.report) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                        "bounded-backtracking search exceeded its admitted envelope",
+                    ),
+                ));
+            }
+            let physical_search = BoundedBacktrackProspective {
+                state_visits: outcome.report.state_visits,
+                slot_copies: outcome.report.slot_copies,
+                bytes_examined: outcome.report.bytes_examined,
+                starts_injected: outcome.report.starts_injected,
+                peak_threads: outcome.report.peak_threads,
+                scratch_bytes: preparation.usage.admitted_scratch_bytes,
+            };
+            if let Err(source) = charge_bounded_backtrack_search(
+                &mut physical_actual,
+                physical_search,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+
+            let Some(record) = outcome.captures else {
+                break;
+            };
+            let Some(overall) = record.overall() else {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                        "bounded-backtracking result omitted group zero",
+                    ),
+                ));
+            };
+            let valid_overall = overall.start >= cursor
+                && overall.start < overall.end
+                && overall.end <= haystack.len()
+                && overall.end.saturating_sub(overall.start) >= route.minimum_match_bytes;
+            if !valid_overall || record.groups.len() != shape.groups {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                        "bounded-backtracking result violated its sealed capture shape",
+                    ),
+                ));
+            }
+            let mut record_capture_count = 0_usize;
+            for (index, group) in record.groups.iter().enumerate() {
+                if usize::try_from(group.index) != Ok(index) {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                            "bounded-backtracking result reordered its capture schema",
+                        ),
+                    ));
+                }
+                let Some(span) = group.span else {
+                    continue;
+                };
+                if span.start < overall.start || span.end > overall.end || span.start > span.end {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                            "bounded-backtracking capture escaped its overall match",
+                        ),
+                    ));
+                }
+                record_capture_count = match record_capture_count.checked_add(1) {
+                    Some(count) => count,
+                    None => {
+                        return Err(bounded_backtrack_selected_error(
+                            &identity,
+                            prospective,
+                            charged_actual,
+                            capture_count,
+                            CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                                "bounded-backtracking capture count overflowed",
+                            ),
+                        ));
+                    }
+                };
+            }
+            capture_count = match capture_count.checked_add(record_capture_count) {
+                Some(count) => count,
+                None => {
+                    return Err(bounded_backtrack_selected_error(
+                        &identity,
+                        prospective,
+                        charged_actual,
+                        capture_count,
+                        CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                            "bounded-backtracking aggregate capture count overflowed",
+                        ),
+                    ));
+                }
+            };
+            if let Err(source) = record_bounded_backtrack_materialization(
+                &mut charged_actual,
+                shape.groups,
+                materialized_record_bytes,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+            if let Err(source) = record_bounded_backtrack_materialization(
+                &mut physical_actual,
+                shape.groups,
+                materialized_record_bytes,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+            if !prospective.contains(charged_actual, capture_count) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                        "bounded-backtracking materialization exceeded its session prospective",
+                    ),
+                ));
+            }
+            if captures.try_reserve_exact(1).is_err() {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(EngineSearchError::Allocation(
+                        EngineResource::RetainedOutputBytes,
+                    )),
+                ));
+            }
+            if let Err(source) = record_bounded_backtrack_result(
+                &mut charged_actual,
+                retained_record_bytes,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+            if let Err(source) = record_bounded_backtrack_result(
+                &mut physical_actual,
+                retained_record_bytes,
+                preparation.persistent_bytes,
+            ) {
+                return Err(bounded_backtrack_selected_error(
+                    &identity,
+                    prospective,
+                    charged_actual,
+                    capture_count,
+                    CaptureBoundedBacktrackIterationFailure::Search(source),
+                ));
+            }
+            captures.push(record);
+            cursor = overall.end;
+        }
+
+        if !prospective.contains(charged_actual, capture_count)
+            || !prospective.contains(physical_actual, capture_count)
+        {
+            return Err(bounded_backtrack_selected_error(
+                &identity,
+                prospective,
+                charged_actual,
+                capture_count,
+                CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                    "bounded-backtracking terminal accounting exceeded its prospective",
+                ),
+            ));
+        }
+        let attempt_receipt = CaptureBoundedBacktrackIterationAttemptReceipt {
+            prospective,
+            actual: charged_actual,
+            capture_count,
+            operation_setup_allocations: 0,
+            succeeded: true,
+        };
+        if !attempt_receipt.closes(&identity) {
+            return Err(bounded_backtrack_selected_error(
+                &identity,
+                prospective,
+                charged_actual,
+                capture_count,
+                CaptureBoundedBacktrackIterationFailure::InternalInvariant(
+                    "bounded-backtracking terminal receipt did not close",
+                ),
+            ));
+        }
+        let report = CaptureBoundedBacktrackIterationReport {
+            identity,
+            prospective,
+            actual: physical_actual,
+            captures,
+            capture_count,
+            preparation_receipt: preparation,
+            attempt_receipt,
+        };
+        debug_assert!(report.has_closed_attempt());
+        Ok(Some(report))
+    }
 
     /// Collect every non-overlapping leftmost-first match and every capture
     /// slot, including empty participating spans and explicit unmatched slots.
