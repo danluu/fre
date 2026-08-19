@@ -12,6 +12,7 @@ use super::{
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
+        NativeOrderedNfaStartPrefixPlan,
         ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
@@ -1895,6 +1896,41 @@ fn selected_start_closure_program<'a>(
     }
 }
 
+/// Branch to `matched` exactly when `byte` is in the compiler-proved
+/// first-byte cover. The ranges are compiler-only metadata, so validate their
+/// canonical ordering before baking them into target text.
+fn emit_start_prefix_membership(
+    x: &mut X<'_>,
+    plan: NativeOrderedNfaStartPrefixPlan,
+    byte: R,
+    matched: usize,
+    missed: usize,
+) -> Result<(), ObjectError> {
+    let mut previous_end = None;
+    if plan.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 Ordered-NFA empty start-prefix cover",
+        ));
+    }
+    for range in plan.ranges() {
+        if range.start > range.end
+            || previous_end.is_some_and(|end| end >= range.start)
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 Ordered-NFA start-prefix range order",
+            ));
+        }
+        previous_end = Some(range.end);
+        let next_range = x.asm.label()?;
+        x.cmp32_imm(byte, u32::from(range.start))?;
+        x.branch(0x82, next_range)?;
+        x.cmp32_imm(byte, u32::from(range.end))?;
+        x.branch(0x86, matched)?;
+        x.asm.bind(next_range)?;
+    }
+    x.jump(missed)
+}
+
 fn start_closure_labels(
     asm: &mut X86Assembler,
     program: NativeEpsilonClosureProgramView<'_>,
@@ -2217,6 +2253,21 @@ fn emit_semantic_body(
     )?;
     x.test64(R::Ax, R::Ax)?;
     x.branch(0x85, after_roots)?;
+    if let Some(prefix) = layout.start_prefix {
+        let start_admitted = x.asm.label()?;
+        x.load64(R::Dx, R::Sp, L_POSITION)?;
+        x.cmp64(R::Dx, R::R14)?;
+        x.branch(0x83, after_roots)?;
+        x.load8_index(R::Ax, R::R12, R::Dx, 0)?;
+        emit_start_prefix_membership(
+            &mut x,
+            prefix,
+            R::Ax,
+            start_admitted,
+            after_roots,
+        )?;
+        x.asm.bind(start_admitted)?;
+    }
     x.imm32(R::Ax, layout.start_state)?;
     x.store64(R::Sp, L_THREAD_STATE, R::Ax)?;
     x.load64(R::Ax, R::Sp, L_POSITION)?;
@@ -2439,11 +2490,38 @@ fn emit_semantic_body(
     x.branch(0x85, finish)?;
     x.load64(R::Dx, R::Sp, L_POSITION)?;
     x.cmp64(R::Dx, R::R14)?;
-    x.branch(0x84, finish)?;
+    x.branch(
+        if layout.start_prefix.is_some() {
+            0x83
+        } else {
+            0x84
+        },
+        finish,
+    )?;
+    if let Some(prefix) = layout.start_prefix {
+        let scan_next = x.asm.label()?;
+        let scan_hit = x.asm.label()?;
+        x.asm.bind(scan_next)?;
+        x.inc64(R::Dx)?;
+        x.cmp64(R::Dx, R::R14)?;
+        x.branch(0x83, finish)?;
+        x.load8_index(R::Ax, R::R12, R::Dx, 0)?;
+        emit_start_prefix_membership(&mut x, prefix, R::Ax, scan_hit, scan_next)?;
+        x.asm.bind(scan_hit)?;
+        x.store64(R::Sp, L_POSITION, R::Dx)?;
+        x.jump(boundary)?;
+    }
     x.asm.bind(has_current)?;
     x.load64(R::Dx, R::Sp, L_POSITION)?;
     x.cmp64(R::Dx, R::R14)?;
-    x.branch(0x84, finish)?;
+    x.branch(
+        if layout.start_prefix.is_some() {
+            0x83
+        } else {
+            0x84
+        },
+        finish,
+    )?;
     x.jump(consume_start)?;
 
     x.asm.bind(consume_start)?;
@@ -3061,6 +3139,7 @@ mod tests {
                 assertion_kinds: 0,
                 cache_boundary_assertions: false,
                 start_closure_dispatch: None,
+                start_prefix: None,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
                 terminal_range: None,
@@ -3112,6 +3191,100 @@ mod tests {
         let scalar_entry = lower_x86_64(&scalar).unwrap();
         assert!(selected_entry.code.len() > scalar_entry.code.len());
         assert_eq!(selected_entry.relocations, scalar_entry.relocations);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_emits_only_the_selected_start_prefix_fast_forward() {
+        let program = optimizing_ordered_nfa(r"a?b?c?d?e?f?g?h?[a-z]x");
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let prefix = selected.layout.start_prefix.unwrap();
+        assert_eq!(
+            prefix
+                .ranges()
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(b'a', b'z')]
+        );
+        let scalar = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                start_prefix_first_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(scalar.layout.start_prefix.is_none());
+        assert_eq!(selected.bytes, scalar.bytes);
+        let selected_entry = lower_x86_64(&selected).unwrap();
+        let scalar_entry = lower_x86_64(&scalar).unwrap();
+        assert!(selected_entry.code.len() > scalar_entry.code.len());
+        assert_eq!(selected_entry.relocations, scalar_entry.relocations);
+
+        let mut signature_assembler = X86Assembler::new();
+        {
+            let mut signature = X {
+                asm: &mut signature_assembler,
+            };
+            signature.load64(R::Dx, R::Sp, L_POSITION).unwrap();
+            signature.cmp64(R::Dx, R::R14).unwrap();
+        }
+        let signature = signature_assembler.code;
+        let end_conditions = |code: &[u8]| {
+            code.windows(signature.len() + 2)
+                .filter_map(|bytes| {
+                    if !bytes.starts_with(&signature) {
+                        return None;
+                    }
+                    match &bytes[signature.len()..] {
+                        [0x74, _] | [0x0f, 0x84] => Some(0x84),
+                        [0x73, _] | [0x0f, 0x83] => Some(0x83),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(end_conditions(&scalar_entry.code), [0x84, 0x84]);
+        assert_eq!(end_conditions(&selected_entry.code), [0x83, 0x83, 0x83]);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_start_prefix_membership_has_hit_and_miss_edges() {
+        let program = optimizing_ordered_nfa(r"a?b?c?d?e?f?g?h?[a-z]x");
+        let image = NativeOrderedNfaObjectImage::try_build(
+            program.native_ordered_nfa_view().unwrap(),
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        let prefix = image.layout.start_prefix.unwrap();
+        let mut asm = X86Assembler::new();
+        let matched = asm.label().unwrap();
+        let missed = asm.label().unwrap();
+        emit_start_prefix_membership(&mut X { asm: &mut asm }, prefix, R::Ax, matched, missed)
+            .unwrap();
+
+        assert_eq!(asm.fixups.len(), 3);
+        assert_eq!(asm.fixups[1].label, matched);
+        assert_eq!(asm.fixups[2].label, missed);
+        assert!(asm
+            .code
+            .windows(6)
+            .any(|bytes| bytes == [0x81, 0xf8, b'a', 0, 0, 0]));
+        assert!(asm
+            .code
+            .windows(6)
+            .any(|bytes| bytes == [0x81, 0xf8, b'z', 0, 0, 0]));
+
+        asm.bind(matched).unwrap();
+        asm.instruction(&[0xc3]).unwrap();
+        asm.bind(missed).unwrap();
+        asm.instruction(&[0xc3]).unwrap();
+        assert!(!asm.finish().unwrap().is_empty());
     }
 
     #[test]

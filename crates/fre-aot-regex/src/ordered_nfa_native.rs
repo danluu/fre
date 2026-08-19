@@ -15,7 +15,9 @@ use fre_automata::{
 };
 use fre_exact_alloc::try_box_preserve;
 
-use crate::{program::OutputContract, ObjectError};
+use crate::{
+    byte_frequency::estimated_byte_frequency_units, program::OutputContract, ObjectError,
+};
 
 /// Stable descriptor magic for a prepared ordered TNFA.
 #[doc(hidden)]
@@ -170,6 +172,9 @@ impl FrozenOrderedNfaAccountingV1 {
 pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) raw: &'a RawPlan,
+    /// Exact compiler-only first-byte proof for a nonempty anchored prefix.
+    /// This is intentionally absent from every frozen object descriptor.
+    pub(crate) start_prefix_first_set: Option<[u64; 4]>,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchView<'a>>,
     pub(crate) start_closure_dispatch: Option<NativeEpsilonClosureProgramView<'a>>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
@@ -201,6 +206,16 @@ pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS: usize =
     fre_automata::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS;
 pub(crate) const MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS: usize =
     fre_automata::COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_SPLIT_EDGE_VISITS;
+
+/// Bound code growth and false-positive scanning for the compiler-only
+/// first-byte restart filter. The cover may contain gaps, but never omits a
+/// byte proved possible by the anchored prefix.
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES: usize = 4;
+pub(crate) const MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES: usize = 96;
+/// Require enough authenticated idle-root closure work to amortize the
+/// compiler-only membership test. A raw Consume root has no retained closure
+/// receipt and deliberately keeps the incumbent byte-by-byte loop.
+pub(crate) const MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS: usize = 16;
 
 /// Exact immutable object-wire descriptor extent. All table locations are
 /// descriptor-relative little-endian `u32` offsets, so the image contains no
@@ -362,6 +377,9 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     /// Compiler-only receipt for an admitted start-root text specialization.
     /// No field or payload is added to the frozen object image.
     pub(crate) start_closure_dispatch: Option<NativeOrderedNfaStartClosureLayout>,
+    /// Compiler-only first-byte admission and idle-forward plan. This changes
+    /// generated text only and adds no field or payload to the object image.
+    pub(crate) start_prefix: Option<NativeOrderedNfaStartPrefixPlan>,
     pub(crate) line_terminator: u8,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
@@ -372,6 +390,27 @@ pub(crate) struct NativeOrderedNfaStartClosureLayout {
     pub(crate) guarded: bool,
     pub(crate) instruction_count: usize,
     pub(crate) split_edge_visits: usize,
+}
+
+const EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE: NativeOrderedNfaByteRange =
+    NativeOrderedNfaByteRange { start: 0, end: 0 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaByteRange {
+    pub(crate) start: u8,
+    pub(crate) end: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaStartPrefixPlan {
+    ranges: [NativeOrderedNfaByteRange; MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES],
+    range_count: u8,
+}
+
+impl NativeOrderedNfaStartPrefixPlan {
+    pub(crate) fn ranges(&self) -> &[NativeOrderedNfaByteRange] {
+        &self.ranges[..usize::from(self.range_count)]
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,6 +453,193 @@ fn validate_native_ordered_nfa_terminal_range(
         ));
     }
     Ok(range)
+}
+
+fn native_ordered_nfa_start_prefix_contains(
+    plan: NativeOrderedNfaStartPrefixPlan,
+    byte: u8,
+) -> bool {
+    plan.ranges()
+        .iter()
+        .any(|range| (range.start..=range.end).contains(&byte))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "fixed four-word membership and the complete byte loop bound every index and shift"
+)]
+fn validate_native_ordered_nfa_start_prefix(
+    plan: NativeOrderedNfaStartPrefixPlan,
+    exact: [u64; 4],
+) -> Result<NativeOrderedNfaStartPrefixPlan, ObjectError> {
+    let ranges = plan.ranges();
+    if ranges.is_empty() || ranges.len() > MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix range count",
+        ));
+    }
+    let mut candidate_bytes = 0_usize;
+    let mut previous_end = None;
+    for range in ranges {
+        if range.start > range.end
+            || previous_end.is_some_and(|end| end >= range.start)
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA start-prefix range order",
+            ));
+        }
+        let width = usize::from(range.end)
+            .checked_sub(usize::from(range.start))
+            .and_then(|width| width.checked_add(1))
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA start-prefix range width",
+            ))?;
+        candidate_bytes = candidate_bytes
+            .checked_add(width)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA start-prefix candidate bytes",
+            ))?;
+        previous_end = Some(range.end);
+    }
+    if candidate_bytes == 0
+        || candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix candidate-byte cap",
+        ));
+    }
+    for byte in u8::MIN..=u8::MAX {
+        let index = usize::from(byte);
+        if exact[index / 64] & (1_u64 << (index % 64)) != 0
+            && !native_ordered_nfa_start_prefix_contains(plan, byte)
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA start-prefix cover omits an exact byte",
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// Cover the exact first-byte proof by at most four deterministic inclusive
+/// ranges. Merging the least-frequent intervening gaps can add candidates,
+/// but the returned filter remains a superset of the semantic proof.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the exact cardinality, deterministic gap merging, and fixed range capacity form one bounded planner transaction"
+)]
+fn derive_native_ordered_nfa_start_prefix(
+    exact: [u64; 4],
+) -> Result<Option<NativeOrderedNfaStartPrefixPlan>, ObjectError> {
+    const MAX_EXACT_RANGES: usize = MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES;
+
+    let exact_candidate_bytes: usize = exact
+        .iter()
+        .map(|word| {
+            usize::try_from(word.count_ones())
+                .expect("a u64 population count fits every supported usize")
+        })
+        .sum();
+    if exact_candidate_bytes == 0
+        || exact_candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES
+    {
+        return Ok(None);
+    }
+
+    let mut ranges = [EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE; MAX_EXACT_RANGES];
+    let mut range_count = 0_usize;
+    for byte in u8::MIN..=u8::MAX {
+        let index = usize::from(byte);
+        if exact[index / 64] & (1_u64 << (index % 64)) == 0 {
+            continue;
+        }
+        if let Some(last) = range_count
+            .checked_sub(1)
+            .and_then(|index| ranges.get_mut(index))
+            && last.end.checked_add(1) == Some(byte)
+        {
+            last.end = byte;
+            continue;
+        }
+        let slot = ranges.get_mut(range_count).ok_or(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix exact range capacity",
+        ))?;
+        *slot = NativeOrderedNfaByteRange {
+            start: byte,
+            end: byte,
+        };
+        range_count = range_count
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA start-prefix exact range count",
+            ))?;
+    }
+
+    while range_count > MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES {
+        let mut selected_gap = None;
+        for gap_index in 0..range_count.saturating_sub(1) {
+            let left = ranges[gap_index];
+            let right = ranges[gap_index + 1];
+            let gap_start = u16::from(left.end) + 1;
+            let gap_end = u16::from(right.start).saturating_sub(1);
+            let gap_bytes = gap_end
+                .checked_sub(gap_start)
+                .and_then(|width| width.checked_add(1))
+                .ok_or(ObjectError::InvalidModule(
+                    "ordered-NFA start-prefix ranges overlap",
+                ))?;
+            let mut frequency_units = 0_u16;
+            for byte in gap_start..=gap_end {
+                frequency_units = frequency_units.saturating_add(
+                    estimated_byte_frequency_units(u8::try_from(byte).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "ordered-NFA start-prefix gap byte",
+                        )
+                    })?),
+                );
+            }
+            let key = (frequency_units, gap_bytes, gap_index);
+            if selected_gap.is_none_or(|(_, current_key)| key < current_key) {
+                selected_gap = Some((gap_index, key));
+            }
+        }
+        let (gap_index, _) = selected_gap.ok_or(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix has no mergeable gap",
+        ))?;
+        ranges[gap_index].end = ranges[gap_index + 1].end;
+        ranges.copy_within(gap_index + 2..range_count, gap_index + 1);
+        range_count -= 1;
+    }
+
+    let candidate_bytes = ranges[..range_count].iter().try_fold(
+        0_usize,
+        |sum, range| {
+            let width = usize::from(range.end)
+                .checked_sub(usize::from(range.start))
+                .and_then(|width| width.checked_add(1))
+                .ok_or(ObjectError::InvalidModule(
+                    "ordered-NFA start-prefix coalesced range width",
+                ))?;
+            sum.checked_add(width).ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA start-prefix coalesced candidate bytes",
+            ))
+        },
+    )?;
+    if candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES {
+        return Ok(None);
+    }
+
+    let mut compact =
+        [EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE; MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES];
+    compact[..range_count].copy_from_slice(&ranges[..range_count]);
+    let plan = NativeOrderedNfaStartPrefixPlan {
+        ranges: compact,
+        range_count: u8::try_from(range_count).map_err(|_| {
+            ObjectError::ArithmeticOverflow("ordered-NFA start-prefix compact range count")
+        })?,
+    };
+    Ok(Some(validate_native_ordered_nfa_start_prefix(plan, exact)?))
 }
 
 #[allow(
@@ -912,6 +1138,15 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             None => None,
         };
         let start_closure_program = start_closure_dispatch.and(view.start_closure_dispatch);
+        let start_prefix = start_closure_dispatch
+            .filter(|receipt| {
+                receipt.instruction_count
+                    >= MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS
+            })
+            .and(view.start_prefix_first_set)
+            .map(derive_native_ordered_nfa_start_prefix)
+            .transpose()?
+            .flatten();
         let cache_boundary_assertions = boundary_assertion_cache_is_profitable(
             assertion_edges,
             assertion_kinds,
@@ -1356,6 +1591,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             assertion_kinds,
             cache_boundary_assertions,
             start_closure_dispatch,
+            start_prefix,
             line_terminator: view.line_terminator,
             ordered_edge_dispatch,
             terminal_range,
@@ -2827,6 +3063,153 @@ mod tests {
         FrozenOrderedNfaLimitsV1::new(max_handle_bytes)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "u8 membership bounds every four-word test index and shift"
+    )]
+    fn membership_words(bytes: impl IntoIterator<Item = u8>) -> [u64; 4] {
+        let mut words = [0_u64; 4];
+        for byte in bytes {
+            let index = usize::from(byte);
+            words[index / 64] |= 1_u64 << (index % 64);
+        }
+        words
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "validated inclusive byte ranges have bounded width"
+    )]
+    fn prefix_candidate_bytes(plan: NativeOrderedNfaStartPrefixPlan) -> usize {
+        plan.ranges()
+            .iter()
+            .map(|range| usize::from(range.end) - usize::from(range.start) + 1)
+            .sum()
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "u8 membership bounds every four-word test index and shift"
+    )]
+    fn start_prefix_plan_admits_nosey_shape_as_four_range_superset() {
+        let exact = membership_words(
+            [b'$', b'-']
+                .into_iter()
+                .chain(b'0'..=b'9')
+                .chain(b'A'..=b'Z')
+                .chain(b'a'..=b'z'),
+        );
+        let plan = derive_native_ordered_nfa_start_prefix(exact)
+            .unwrap()
+            .expect("Nosey first set remains below the prefix-text cap");
+        assert_eq!(
+            plan.ranges(),
+            &[
+                NativeOrderedNfaByteRange {
+                    start: b'$',
+                    end: b'$',
+                },
+                NativeOrderedNfaByteRange {
+                    start: b'-',
+                    end: b'9',
+                },
+                NativeOrderedNfaByteRange {
+                    start: b'A',
+                    end: b'Z',
+                },
+                NativeOrderedNfaByteRange {
+                    start: b'a',
+                    end: b'z',
+                },
+            ]
+        );
+        assert_eq!(prefix_candidate_bytes(plan), 66);
+        assert!(native_ordered_nfa_start_prefix_contains(plan, b'.'));
+        assert!(native_ordered_nfa_start_prefix_contains(plan, b'/'));
+        for byte in u8::MIN..=u8::MAX {
+            let index = usize::from(byte);
+            if exact[index / 64] & (1_u64 << (index % 64)) != 0 {
+                assert!(native_ordered_nfa_start_prefix_contains(plan, byte));
+            }
+        }
+    }
+
+    #[test]
+    fn start_prefix_plan_enforces_candidate_and_range_caps() {
+        let admitted_96 = membership_words(u8::MIN..=95);
+        let plan = derive_native_ordered_nfa_start_prefix(admitted_96)
+            .unwrap()
+            .expect("96 contiguous candidates fit exactly");
+        assert_eq!(prefix_candidate_bytes(plan), 96);
+        assert!(derive_native_ordered_nfa_start_prefix(membership_words(u8::MIN..=96))
+            .unwrap()
+            .is_none());
+
+        let exact_four = membership_words([1, 3, 5, 7]);
+        let four = derive_native_ordered_nfa_start_prefix(exact_four)
+            .unwrap()
+            .expect("four exact ranges fit without coalescing");
+        assert_eq!(four.ranges().len(), 4);
+        assert_eq!(prefix_candidate_bytes(four), 4);
+
+        let exact_five = membership_words([1, 3, 5, 7, 9]);
+        let five = derive_native_ordered_nfa_start_prefix(exact_five)
+            .unwrap()
+            .expect("five tiny ranges coalesce safely");
+        assert_eq!(five.ranges().len(), 4);
+        assert_eq!(prefix_candidate_bytes(five), 6);
+        for byte in [1, 3, 5, 7, 9] {
+            assert!(native_ordered_nfa_start_prefix_contains(five, byte));
+        }
+
+        let costly_cover = membership_words((0_u8..=188).step_by(4));
+        assert!(derive_native_ordered_nfa_start_prefix(costly_cover)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn start_prefix_selection_is_compiler_only_and_deterministic() {
+        let program = span_program_with_mode(
+            r"a?b?c?d?e?f?g?h?[a-z]+Z",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        assert!(view.start_prefix_first_set.is_some());
+        let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let second = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.layout.start_prefix.unwrap().ranges(),
+            &[NativeOrderedNfaByteRange {
+                start: b'a',
+                end: b'z',
+            }]
+        );
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_prefix_first_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.bytes, without.bytes);
+        assert!(without.layout.start_prefix.is_none());
+    }
+
     #[test]
     fn boundary_assertion_cache_requires_dense_exact_kind_reuse() {
         let first = 1_u32;
@@ -2951,13 +3334,11 @@ mod tests {
         assert!(without.layout.start_closure_dispatch.is_none());
     }
 
-    #[test]
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "the synthetic one-past-cap graph uses small bounded test indices"
+        reason = "the synthetic unary split graph uses small bounded test indices"
     )]
-    fn oversized_start_closure_is_softly_omitted_without_object_changes() {
-        let split_count = MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS;
+    fn unary_split_chain_program(split_count: usize) -> crate::CompiledProgram {
         let mut roles = vec![StateRole::Split; split_count];
         roles.extend([StateRole::Consume, StateRole::Accept]);
         let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
@@ -2989,7 +3370,7 @@ mod tests {
             byte_ends,
         };
         let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
-        let program = crate::CompiledProgram::build(
+        crate::CompiledProgram::build(
             raw,
             automaton,
             OutputContract::Span,
@@ -3000,7 +3381,67 @@ mod tests {
             },
             usize::MAX,
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn start_prefix_requires_sixteen_authenticated_closure_instructions() {
+        let below_program = unary_split_chain_program(14);
+        let below_view = below_program
+            .native_ordered_nfa_view()
+            .expect("15-instruction closure exposes an ordered-NFA view");
+        assert_eq!(
+            below_view
+                .start_closure_dispatch
+                .expect("unary split chain retains a closure")
+                .len(),
+            MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS - 1,
+        );
+        assert!(below_view.start_prefix_first_set.is_some());
+        let below = NativeOrderedNfaObjectImage::try_build(below_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(below.layout.start_prefix.is_none());
+
+        let exact_program = unary_split_chain_program(15);
+        let exact_view = exact_program
+            .native_ordered_nfa_view()
+            .expect("16-instruction closure exposes an ordered-NFA view");
+        assert_eq!(
+            exact_view
+                .start_closure_dispatch
+                .expect("unary split chain retains a closure")
+                .len(),
+            MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS,
+        );
+        let exact = NativeOrderedNfaObjectImage::try_build(exact_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact.layout.start_prefix.unwrap().ranges(),
+            &[NativeOrderedNfaByteRange {
+                start: b'z',
+                end: b'z',
+            }],
+        );
+
+        let no_closure = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_closure_dispatch: None,
+                ..exact_view
+            },
+            usize::MAX,
+        )
+        .unwrap()
         .unwrap();
+        assert!(no_closure.layout.start_prefix.is_none());
+        assert_eq!(exact.bytes, no_closure.bytes);
+    }
+
+    #[test]
+    fn oversized_start_closure_is_softly_omitted_without_object_changes() {
+        let program =
+            unary_split_chain_program(MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS);
         let view = program
             .native_ordered_nfa_view()
             .expect("optimizing fallback exposes ordered TNFA");
