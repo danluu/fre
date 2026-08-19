@@ -9,21 +9,36 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, CaptureProfile, HistoryProgramShape, HistorySearchProspective,
-    MaskedInclusiveRange, OnePassCaptureOwnerSeal, ResourceKind, RestartedHistoryProspective,
-    SearchConfig, SearchError, Window,
+    MaskedInclusiveRange, NonNullableFirstByteMask, OnePassCaptureOwnerSeal, ResourceKind,
+    RestartedHistoryProspective, SearchConfig, SearchError, Window,
 };
 use fre_syntax::CacheKey;
 
 use crate::captures::{CaptureBuildLimits, CaptureIterationPlanKind};
 
 /// Version of materialized restarted persistent-history iteration.
-pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 5;
+pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 6;
 
 /// Version of the capture-array session prospective/actual ledger.
 pub const CAPTURE_ITERATION_ACCOUNTING_VERSION: u32 = 2;
 
 /// Fixed work charged by the optional construction-time start classifier.
 pub const CAPTURE_ITERATION_START_CLASSIFIER_WORK: usize = 5;
+
+/// Minimum authenticated tagged-program extent for an arbitrary exact mask.
+///
+/// The compact ASCII-alphabetic representation predates this gate and remains
+/// eligible independently. An exact four-word lookup adds a fixed root check;
+/// retaining it only for a nontrivial semantic program keeps that check out of
+/// cheap capture loops without consulting source bytes or mask cardinality.
+pub const CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES: usize = 16;
+
+pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_WORDS: [u64; 4] = [
+    0,
+    (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
+    0,
+    0,
+];
 
 pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_RANGE: MaskedInclusiveRange =
     match MaskedInclusiveRange::new(0x20, b'a', b'z') {
@@ -36,11 +51,18 @@ pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_RANGE: MaskedInclusiveRange =
 pub enum CaptureIterationStartClassifierOutcome {
     /// Fewer than five HIR work units remained, so no comparison ran.
     NotAttempted,
-    /// All five fixed units were charged, but the exact first-byte set did not
-    /// equal the predetermined classifier image.
+    /// All five fixed units were charged, but the proof was nullable, its
+    /// non-nullable mask admitted every byte, or the authenticated tagged
+    /// program was too small for an arbitrary exact-mask root check.
     AttemptedIneligible,
-    /// The exact non-nullable first-byte set equals this classifier image.
+    /// The exact non-nullable first-byte set equals the compact predetermined
+    /// ASCII-alphabetic classifier image.
     Selected(MaskedInclusiveRange),
+    /// A useful exact non-nullable, non-all first-byte set that is not the
+    /// compact ASCII-alphabetic classifier and whose authenticated tagged
+    /// program meets the source-independent extent gate. An empty mask remains
+    /// a valid proof, subject to the same program-shape gate.
+    SelectedExactMask(NonNullableFirstByteMask),
 }
 
 /// Closed construction receipt for the optional new-root classifier proof.
@@ -91,20 +113,53 @@ impl CaptureIterationStartClassifierReceipt {
         self.outcome
     }
 
-    /// Selected classifier, absent for either incumbent terminal.
+    /// Selected compact range classifier, absent for an exact mask or either
+    /// incumbent terminal.
     #[must_use]
     pub const fn classifier(self) -> Option<MaskedInclusiveRange> {
         match self.outcome {
             CaptureIterationStartClassifierOutcome::Selected(classifier) => Some(classifier),
             CaptureIterationStartClassifierOutcome::NotAttempted
-            | CaptureIterationStartClassifierOutcome::AttemptedIneligible => None,
+            | CaptureIterationStartClassifierOutcome::AttemptedIneligible
+            | CaptureIterationStartClassifierOutcome::SelectedExactMask(_) => None,
         }
     }
 
-    /// Authenticate arithmetic, ceiling admission and the only selected
-    /// classifier implemented by this algorithm version.
+    /// Selected arbitrary exact mask, absent for the compact range and either
+    /// incumbent terminal.
     #[must_use]
-    pub fn closes(self, max_hir_work: usize) -> bool {
+    pub const fn exact_mask(self) -> Option<NonNullableFirstByteMask> {
+        match self.outcome {
+            CaptureIterationStartClassifierOutcome::SelectedExactMask(mask) => Some(mask),
+            CaptureIterationStartClassifierOutcome::NotAttempted
+            | CaptureIterationStartClassifierOutcome::AttemptedIneligible
+            | CaptureIterationStartClassifierOutcome::Selected(_) => None,
+        }
+    }
+
+    /// Authenticate arithmetic, ceiling admission, co-owned program shape and
+    /// every selected start filter implemented by this algorithm version.
+    #[must_use]
+    pub fn closes(self, route: &CaptureIterationRouteIdentity) -> bool {
+        if route.operation != CaptureIterationOperation::MaterializeCaptureArray
+            || route.plan != CaptureIterationPlanKind::RestartedPersistentHistory
+            || route.backend != CaptureIterationBackend::PersistentHistory
+            || route.capture_profile != CaptureProfile::RustRegexBytes1_12_4
+            || route.algorithm_version != CAPTURE_ITERATION_ALGORITHM_VERSION
+            || route.accounting_version != CAPTURE_ITERATION_ACCOUNTING_VERSION
+            || route.declared_fallback != CaptureIterationDeclaredFallback::None
+            || route.engine_shape.states == 0
+            || route.engine_shape.save_states > route.engine_shape.states
+            || route.engine_shape.groups == 0
+            || route
+                .engine_shape
+                .groups
+                .checked_mul(2)
+                .is_none_or(|slots| slots != route.engine_shape.slots)
+        {
+            return false;
+        }
+        let max_hir_work = route.build_limits.max_hir_work;
         if self.work_before > max_hir_work {
             return false;
         }
@@ -128,6 +183,15 @@ impl CaptureIterationStartClassifierReceipt {
                     && self.work_after <= max_hir_work
                     && classifier == CAPTURE_ITERATION_ASCII_FOLD_RANGE
                     && classifier.lower() <= classifier.upper()
+            }
+            CaptureIterationStartClassifierOutcome::SelectedExactMask(mask) => {
+                self.charged_work == CAPTURE_ITERATION_START_CLASSIFIER_WORK
+                    && admitted_after == Some(self.work_after)
+                    && self.work_after <= max_hir_work
+                    && route.engine_shape.states
+                        >= CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES
+                    && !mask.is_all()
+                    && mask.words() != CAPTURE_ITERATION_ASCII_FOLD_WORDS
             }
         }
     }
@@ -176,7 +240,7 @@ pub struct CaptureIterationRouteIdentity {
     /// canonical HIR also proves original-source absolute start. This reuses
     /// the sidecar's existing allocation. Like the incumbent owner seal and
     /// syntax `Arc`, this construction-provenance pointer is outside the
-    /// runtime iteration P/A ledger; algorithm v5 binds its semantics.
+    /// runtime iteration P/A ledger; algorithm v6 binds its semantics.
     pub absolute_onepass: Option<OnePassCaptureOwnerSeal>,
     /// Exact construction limits used to publish the tagged program.
     pub build_limits: CaptureBuildLimits,
@@ -223,7 +287,7 @@ impl CaptureIterationOwnerSeal {
             CaptureIterationPlanKind::RestartedPersistentHistory
         );
         debug_assert_eq!(identity.backend, CaptureIterationBackend::PersistentHistory);
-        debug_assert!(start_classifier.closes(identity.build_limits.max_hir_work));
+        debug_assert!(start_classifier.closes(&identity));
         Self(Arc::new(CaptureIterationOwner {
             route: identity,
             start_classifier,

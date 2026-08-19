@@ -2,7 +2,8 @@ use core::mem::size_of;
 
 use fre::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
-    CAPTURE_ITERATION_START_CLASSIFIER_WORK, CaptureAggregateLimits, CaptureBuildError,
+    CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+    CaptureAggregateLimits, CaptureBuildError,
     CaptureBuildLimits, CaptureBuilder, CaptureEngineBuildLimits, CaptureGroupRecord,
     CaptureIterationActual, CaptureIterationBackend, CaptureIterationDeclaredFallback,
     CaptureIterationOperation, CaptureIterationPlanKind, CaptureIterationStartClassifierOutcome,
@@ -39,23 +40,30 @@ fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "owner closure, clone identity and exact-mask provenance form one construction transaction"
+)]
 fn capture_array_owner_is_distinct_immutable_and_closed() {
-    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 5);
+    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 6);
     assert_eq!(CAPTURE_ITERATION_ACCOUNTING_VERSION, 2);
-    let regex = CaptureBuilder::new(r"(?P<left>a)|(b)")
+    const PATTERN: &str =
+        r"(?P<outer>(?P<head>(?:a[0-3]|c[0-3]|e[0-3]))(?P<tail>[0-9]?))";
+    const HAYSTACK: &[u8] = b"a1 c2 e3 miss a0";
+    let regex = CaptureBuilder::new(PATTERN)
         .unicode(false)
         .build()
         .expect("capture-array build");
     let clone = regex.clone();
     let limits = CaptureAggregateLimits::default();
     let first = regex
-        .captures_iter(b"ab", limits)
+        .captures_iter(HAYSTACK, limits)
         .expect("first capture array");
     let steady = regex
-        .captures_iter(b"ab", limits)
+        .captures_iter(HAYSTACK, limits)
         .expect("steady capture array");
     let cloned = clone
-        .captures_iter(b"ab", limits)
+        .captures_iter(HAYSTACK, limits)
         .expect("cloned capture array");
 
     for report in [&first, &steady, &cloned] {
@@ -92,9 +100,11 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         CaptureIterationPlanKind::RestartedPersistentHistory
     );
     assert_eq!(route.backend, CaptureIterationBackend::PersistentHistory);
-    assert_eq!(route.engine_shape.groups, 3);
-    assert_eq!(route.engine_shape.name_payload_bytes, "left".len());
-    assert_eq!(route.minimum_match_bytes, 1);
+    assert_eq!(route.engine_shape.states, 20);
+    assert_eq!(route.engine_shape.save_states, 8);
+    assert_eq!(route.engine_shape.groups, 4);
+    assert_eq!(route.engine_shape.name_payload_bytes, 13);
+    assert_eq!(route.minimum_match_bytes, 2);
     assert_eq!(route.algorithm_version, CAPTURE_ITERATION_ALGORITHM_VERSION);
     assert_eq!(
         route.accounting_version,
@@ -105,27 +115,36 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         CaptureIterationDeclaredFallback::None
     );
     let classifier_receipt = *first.identity.session_seal.start_classifier_receipt();
-    assert!(classifier_receipt.closes(route.build_limits.max_hir_work));
+    assert!(classifier_receipt.closes(route));
     assert_eq!(
         classifier_receipt.work_after(),
         regex.build_report().hir.work
     );
     assert_eq!(classifier_receipt.charged_work(), 5);
+    assert!(classifier_receipt.classifier().is_none());
+    let exact_mask = classifier_receipt
+        .exact_mask()
+        .expect("the non-range {a,b} proof selects an exact mask");
+    assert!(!exact_mask.is_empty());
+    assert!(!exact_mask.is_all());
+    for byte in 0_u8..=u8::MAX {
+        assert_eq!(exact_mask.matches(byte), matches!(byte, b'a' | b'c' | b'e'));
+    }
     assert_eq!(
         classifier_receipt.outcome(),
-        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+        CaptureIterationStartClassifierOutcome::SelectedExactMask(exact_mask)
     );
     assert_eq!(
         first.identity.session_seal.start_classifier_receipt(),
         steady.identity.session_seal.start_classifier_receipt()
     );
 
-    let separately_built = CaptureBuilder::new(r"(?P<left>a)|(b)")
+    let separately_built = CaptureBuilder::new(PATTERN)
         .unicode(false)
         .build()
         .expect("second construction");
     let separate = separately_built
-        .captures_iter(b"ab", limits)
+        .captures_iter(HAYSTACK, limits)
         .expect("separate capture array");
     assert_ne!(first.identity.session_seal, separate.identity.session_seal);
     assert_eq!(
@@ -143,6 +162,7 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
         .build()
         .expect("baseline classifier build");
     let baseline_identity = baseline.iteration_identity(CaptureAggregateLimits::default());
+    let baseline_route = baseline_identity.session_seal.route_identity();
     let baseline_receipt = *baseline_identity.session_seal.start_classifier_receipt();
     let mandatory_work = baseline_receipt.work_before();
     assert_eq!(
@@ -160,12 +180,13 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
     let classifier = baseline_receipt
         .classifier()
         .expect("exact ASCII alphabetic first-byte set");
+    assert!(baseline_receipt.exact_mask().is_none());
     assert_eq!(core::mem::size_of_val(&classifier), 3);
     assert_eq!(
         (classifier.or_mask(), classifier.lower(), classifier.upper()),
         (0x20, b'a', b'z')
     );
-    assert!(baseline_receipt.closes(CaptureBuildLimits::default().max_hir_work));
+    assert!(baseline_receipt.closes(baseline_route));
 
     let mandatory_one_below = CaptureBuildLimits {
         max_hir_work: mandatory_work - 1,
@@ -192,10 +213,8 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
             .limits(limits)
             .build()
             .expect("mandatory build with insufficient classifier headroom");
-        let receipt = *fallback
-            .iteration_identity(CaptureAggregateLimits::default())
-            .session_seal
-            .start_classifier_receipt();
+        let identity = fallback.iteration_identity(CaptureAggregateLimits::default());
+        let receipt = *identity.session_seal.start_classifier_receipt();
         assert_eq!(receipt.work_before(), mandatory_work);
         assert_eq!(receipt.charged_work(), 0);
         assert_eq!(receipt.work_after(), mandatory_work);
@@ -204,7 +223,7 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
             receipt.outcome(),
             CaptureIterationStartClassifierOutcome::NotAttempted
         );
-        assert!(receipt.closes(limits.max_hir_work));
+        assert!(receipt.closes(identity.session_seal.route_identity()));
     }
 
     let exact_limits = CaptureBuildLimits {
@@ -216,12 +235,10 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
         .limits(exact_limits)
         .build()
         .expect("exact classifier headroom");
-    let exact_receipt = *exact
-        .iteration_identity(CaptureAggregateLimits::default())
-        .session_seal
-        .start_classifier_receipt();
+    let exact_identity = exact.iteration_identity(CaptureAggregateLimits::default());
+    let exact_receipt = *exact_identity.session_seal.start_classifier_receipt();
     assert_eq!(exact_receipt, baseline_receipt);
-    assert!(exact_receipt.closes(exact_limits.max_hir_work));
+    assert!(exact_receipt.closes(exact_identity.session_seal.route_identity()));
 
     let onepass_work = baseline.build_report().onepass_capture_compile_work;
     assert!(baseline.build_report().onepass_capture.is_some());
@@ -254,6 +271,216 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
     assert_eq!(
         exact_onepass_receipt.work_after(),
         exact_onepass.build_report().hir.work
+    );
+}
+
+#[test]
+fn exact_mask_receipt_distinguishes_program_extent_empty_nullable_and_all_byte_proofs() {
+    let empty = CaptureBuilder::new(r"([^\x00-\xFF])")
+        .unicode(false)
+        .build()
+        .expect("empty byte-language capture build");
+    let empty_identity = empty.iteration_identity(CaptureAggregateLimits::default());
+    let empty_route = empty_identity.session_seal.route_identity();
+    let empty_receipt = *empty_identity.session_seal.start_classifier_receipt();
+    assert_eq!(empty_route.engine_shape.states, 6);
+    assert_eq!(
+        empty_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+    );
+    assert!(empty_receipt.exact_mask().is_none());
+    assert!(empty_receipt.closes(empty_route));
+    assert!(
+        empty
+            .captures_iter(b"\x00\xFFa", CaptureAggregateLimits::default())
+            .expect("empty-language capture iteration")
+            .captures
+            .is_empty()
+    );
+
+    for pattern in [r"([ace]?)", r"([\x00-\xFF])"] {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("incumbent classifier terminal build");
+        let identity = regex.iteration_identity(CaptureAggregateLimits::default());
+        let receipt = *identity.session_seal.start_classifier_receipt();
+        assert_eq!(
+            receipt.outcome(),
+            CaptureIterationStartClassifierOutcome::AttemptedIneligible,
+            "pattern={pattern:?}"
+        );
+        assert!(receipt.classifier().is_none(), "pattern={pattern:?}");
+        assert!(receipt.exact_mask().is_none(), "pattern={pattern:?}");
+        assert!(receipt.closes(identity.session_seal.route_identity()));
+    }
+}
+
+#[test]
+fn exact_mask_requires_sixteen_authenticated_program_states() {
+    for (pattern, expected_states) in [
+        (r"([A-Z]+)", 7),
+        (r"^([A-Z]+)$", 9),
+        (r"(?P<outer>(?P<head>[ace])(?P<tail>[0-9]?))", 13),
+        (r"([ace]{1,5})", 14),
+    ] {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("small exact-mask program build");
+        let identity = regex.iteration_identity(CaptureAggregateLimits::default());
+        let route = identity.session_seal.route_identity();
+        let receipt = *identity.session_seal.start_classifier_receipt();
+        assert_eq!(route.engine_shape.states, expected_states, "pattern={pattern:?}");
+        assert_eq!(receipt.charged_work(), 5, "pattern={pattern:?}");
+        assert_eq!(
+            receipt.outcome(),
+            CaptureIterationStartClassifierOutcome::AttemptedIneligible,
+            "pattern={pattern:?}"
+        );
+        assert!(receipt.classifier().is_none(), "pattern={pattern:?}");
+        assert!(receipt.exact_mask().is_none(), "pattern={pattern:?}");
+        assert!(receipt.closes(route), "pattern={pattern:?}");
+    }
+
+    let pattern = r"([ace]{1,6})";
+    let selected = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("threshold exact-mask program build");
+    let selected_identity = selected.iteration_identity(CaptureAggregateLimits::default());
+    let selected_route = selected_identity.session_seal.route_identity();
+    let selected_receipt = *selected_identity.session_seal.start_classifier_receipt();
+    assert_eq!(CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES, 16);
+    assert_eq!(
+        selected_route.engine_shape.states,
+        CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES
+    );
+    let mask = selected_receipt
+        .exact_mask()
+        .expect("the exact threshold admits an arbitrary mask");
+    for byte in 0_u8..=u8::MAX {
+        assert_eq!(mask.matches(byte), matches!(byte, b'a' | b'c' | b'e'));
+    }
+    assert!(selected_receipt.closes(selected_route));
+
+    let mut forged_route = selected_route.clone();
+    forged_route.engine_shape.states = CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES - 1;
+    assert!(!selected_receipt.closes(&forged_route));
+
+    forged_route = selected_route.clone();
+    forged_route.capture_profile = fre_capture_lab::CaptureProfile::Re2Commit972a15Pending;
+    assert!(!selected_receipt.closes(&forged_route));
+
+    let incumbent_limits = CaptureBuildLimits {
+        max_hir_work: selected_receipt.work_before() + 4,
+        ..CaptureBuildLimits::default()
+    };
+    let incumbent = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(incumbent_limits)
+        .build()
+        .expect("one-below exact-mask admission");
+    let incumbent_identity = incumbent.iteration_identity(CaptureAggregateLimits::default());
+    let incumbent_receipt = *incumbent_identity.session_seal.start_classifier_receipt();
+    assert_eq!(
+        incumbent_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::NotAttempted
+    );
+    assert!(incumbent_receipt.closes(incumbent_identity.session_seal.route_identity()));
+    let haystack = b"aaaaa z cccccc eeeeeee";
+    assert_eq!(
+        selected
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .expect("selected threshold records")
+            .captures,
+        incumbent
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .expect("one-below incumbent records")
+            .captures
+    );
+}
+
+#[test]
+fn near_all_exact_mask_has_dense_incumbent_parity_and_prunes_excluded_roots() {
+    let pattern = r"([^\x00]{1,8})";
+    let selected = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("near-all exact-mask build");
+    let selected_identity = selected.iteration_identity(CaptureAggregateLimits::default());
+    let selected_route = selected_identity.session_seal.route_identity();
+    let selected_receipt = *selected_identity.session_seal.start_classifier_receipt();
+    assert_eq!(selected_route.engine_shape.states, 20);
+    assert!(selected_receipt.closes(selected_route));
+    let mask = selected_receipt
+        .exact_mask()
+        .expect("a near-all non-nullable class selects its exact mask");
+    assert!(!mask.is_empty());
+    assert!(!mask.is_all());
+    assert!(!mask.matches(0));
+    assert!((1_u8..=u8::MAX).all(|byte| mask.matches(byte)));
+
+    let incumbent_limits = CaptureBuildLimits {
+        max_hir_work: selected_receipt.work_before(),
+        ..CaptureBuildLimits::default()
+    };
+    let incumbent = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(incumbent_limits)
+        .build()
+        .expect("near-all exact mandatory-work incumbent");
+    let incumbent_identity = incumbent.iteration_identity(CaptureAggregateLimits::default());
+    let incumbent_receipt = *incumbent_identity.session_seal.start_classifier_receipt();
+    assert_eq!(
+        incumbent_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::NotAttempted
+    );
+    assert_eq!(incumbent_receipt.charged_work(), 0);
+    assert!(incumbent_receipt.closes(incumbent_identity.session_seal.route_identity()));
+
+    let dense = b"all-byte-roots-here-are-members";
+    let selected_dense = selected
+        .captures_iter(dense, CaptureAggregateLimits::default())
+        .expect("selected dense iteration");
+    let incumbent_dense = incumbent
+        .captures_iter(dense, CaptureAggregateLimits::default())
+        .expect("incumbent dense iteration");
+    assert_eq!(selected_dense.captures, incumbent_dense.captures);
+    assert_eq!(
+        selected_dense.session_receipt.actual,
+        incumbent_dense.session_receipt.actual
+    );
+    assert_eq!(
+        selected_dense.total_state_visits,
+        incumbent_dense.total_state_visits
+    );
+    assert_eq!(
+        selected_dense.total_history_nodes,
+        incumbent_dense.total_history_nodes
+    );
+    assert_eq!(
+        selected_dense.total_history_walk,
+        incumbent_dense.total_history_walk
+    );
+
+    let excluded = b"a\x00b\x00c";
+    let selected_excluded = selected
+        .captures_iter(excluded, CaptureAggregateLimits::default())
+        .expect("selected excluded-byte iteration");
+    let incumbent_excluded = incumbent
+        .captures_iter(excluded, CaptureAggregateLimits::default())
+        .expect("incumbent excluded-byte iteration");
+    assert_eq!(selected_excluded.captures, incumbent_excluded.captures);
+    assert_eq!(
+        selected_excluded.session_receipt.actual,
+        incumbent_excluded.session_receipt.actual
+    );
+    assert!(selected_excluded.total_state_visits < incumbent_excluded.total_state_visits);
+    assert!(selected_excluded.total_history_nodes < incumbent_excluded.total_history_nodes);
+    assert_eq!(
+        selected_excluded.total_history_walk,
+        incumbent_excluded.total_history_walk
     );
 }
 

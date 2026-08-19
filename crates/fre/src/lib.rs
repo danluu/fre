@@ -416,7 +416,7 @@ pub use capture_count_seal::{
 };
 pub use capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
-    CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+    CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
     CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
@@ -533,6 +533,7 @@ pub use fre_capture_lab::{
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS,
     MaskedInclusiveRange as CaptureMaskedInclusiveRange,
+    NonNullableFirstByteMask as CaptureNonNullableFirstByteMask,
     ParticipationSearchProspective as CaptureParticipationSearchProspective,
     ResourceKind as CaptureResource, RunReport as CaptureSearchAccounting,
     SearchConfig as CaptureSearchConfig, SearchError as CaptureSearchError,
