@@ -913,10 +913,6 @@ impl AnchoredPrefix {
         context_assertions: false,
     };
 
-    #[allow(
-        dead_code,
-        reason = "suffix sets are exposed through NativeProgramView for the next native lowering"
-    )]
     pub(crate) fn sets(&self) -> &[AnchoredByteSet] {
         &self.sets[..usize::from(self.len)]
     }
@@ -12371,8 +12367,9 @@ impl CompiledProgram {
     }
 
     /// Return the canonical table-driven Span view for a universal ordered
-    /// NFA. This is deliberately independent of every incumbent DFA, prefix,
-    /// suffix, and graph-dispatch optimization; lowering decides precedence.
+    /// NFA. The graph remains independent of every incumbent DFA and native
+    /// optimization; additive compiler-only prefix/suffix/dispatch proofs are
+    /// carried separately so lowering can decide their precedence.
     pub(crate) fn native_ordered_nfa_view(&self) -> Option<NativeOrderedNfaProgramView<'_>> {
         if self.output != OutputContract::Span
             || self.context_dfa.is_some()
@@ -12383,6 +12380,11 @@ impl CompiledProgram {
         Some(NativeOrderedNfaProgramView {
             output: self.output,
             raw: &self.raw,
+            start_prefix_first_set: self
+                .anchored_prefix
+                .sets()
+                .first()
+                .map(|set| set.words()),
             ordered_edge_dispatch: self
                 .automaton
                 .compiler_private_ordered_edge_dispatch_view(),

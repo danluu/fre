@@ -277,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 20;
+pub const OPTIMIZER_VERSION: u32 = 21;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,13 +666,32 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         format,
         max_object_bytes,
         || {
-            let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            let without_prefix = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 &program,
                 target,
                 false,
                 true,
                 true,
                 true,
+                true,
+                false,
+                effective_native_data_limit_bytes,
+            )?;
+            Ok(without_prefix.append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?)
+        },
+        || {
+            let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+                &program,
+                target,
+                false,
+                true,
+                true,
+                true,
+                false,
                 false,
                 effective_native_data_limit_bytes,
             )?;
@@ -683,12 +702,13 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 &program,
                 target,
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 effective_native_data_limit_bytes,
@@ -700,11 +720,12 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             )?)
         },
         || {
-            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 &program,
                 target,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -928,25 +949,28 @@ enum FinalObjectAttempt {
 }
 
 /// Emit one selected module and retry its compositional Ordered-NFA
-/// accelerators in exact additive order. The compiler-only start-closure text
-/// is removed first, preserving the exact pre-feature V1/V2/V3 object. A
-/// selected V3 then omits only the terminal-range prefilter, yielding V2 when
-/// dispatch is present and V1 when it is not; a selected V2 becomes scalar V1
-/// by omitting canonical edge dispatch. Established route fallbacks run only
-/// after that smallest native candidate also exceeds the final object ceiling.
+/// accelerators in exact additive order. The compiler-only prefix text is
+/// removed first, followed by the independent start-closure text, preserving
+/// the exact pre-feature V1/V2/V3 object. A selected V3 then omits only the
+/// terminal-range prefilter, yielding V2 when dispatch is present and V1 when
+/// it is not; a selected V2 becomes scalar V1 by omitting canonical edge
+/// dispatch. Established route fallbacks run only after that smallest native
+/// candidate also exceeds the final object ceiling.
 #[allow(
     clippy::too_many_lines,
-    reason = "the start-text, V3, V2, and V1 object retries form one ordered resource transaction"
+    reason = "the two compiler-text, V3, V2, and V1 object retries form one ordered resource transaction"
 )]
 fn emit_with_ordered_nfa_accelerator_retries(
     mut module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
-    rebuild_without_start_closure_dispatch: impl FnOnce() -> Result<CompiledModule, CompileError>,
-    rebuild_without_start_closure_or_terminal_range: impl FnOnce() -> Result<CompiledModule, CompileError>,
+    rebuild_without_start_prefix: impl FnOnce() -> Result<CompiledModule, CompileError>,
+    rebuild_without_start_prefix_or_start_closure_dispatch: impl FnOnce() -> Result<CompiledModule, CompileError>,
+    rebuild_without_compiler_text_or_terminal_range: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_scalar_ordered_nfa: impl FnOnce() -> Result<CompiledModule, CompileError>,
 ) -> Result<FinalObjectAttempt, CompileError> {
     let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
+    let selected_start_prefix = module.has_ordered_nfa_start_prefix();
     let selected_start_closure = module.has_ordered_nfa_start_closure_dispatch();
     let selected_terminal_range = module.has_ordered_nfa_terminal_range_object();
     let selected_edge_dispatch = module.has_ordered_edge_dispatch_object();
@@ -959,10 +983,41 @@ fn emit_with_ordered_nfa_accelerator_retries(
         Err(error) => return Err(error.into()),
     };
 
-    if selected_start_closure {
-        let without_start = rebuild_without_start_closure_dispatch()?
+    if selected_start_prefix {
+        let without_prefix = rebuild_without_start_prefix()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_start.has_ordered_nfa_start_closure_dispatch()
+        if without_prefix.has_ordered_nfa_start_prefix()
+            || without_prefix.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
+            || without_prefix.has_ordered_nfa_terminal_range_object() != selected_terminal_range
+            || without_prefix.has_ordered_edge_dispatch_object() != selected_edge_dispatch
+            || without_prefix.required_prepare_capabilities()
+                & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                == 0
+        {
+            return Err(CompileError::InternalInvariant(
+                "Ordered-NFA start-prefix final-object retry changed its retained route",
+            ));
+        }
+        match emit_object(&without_prefix, format, max_object_bytes) {
+            Ok(object) => {
+                return Ok(FinalObjectAttempt::Fit {
+                    module: without_prefix,
+                    object,
+                });
+            }
+            Err(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) => module = without_prefix,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if selected_start_closure {
+        let without_start = rebuild_without_start_prefix_or_start_closure_dispatch()?
+            .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        if without_start.has_ordered_nfa_start_prefix()
+            || without_start.has_ordered_nfa_start_closure_dispatch()
             || without_start.has_ordered_nfa_terminal_range_object() != selected_terminal_range
             || without_start.has_ordered_edge_dispatch_object() != selected_edge_dispatch
             || without_start.required_prepare_capabilities()
@@ -989,9 +1044,10 @@ fn emit_with_ordered_nfa_accelerator_retries(
     }
 
     if selected_terminal_range {
-        let without_terminal = rebuild_without_start_closure_or_terminal_range()?
+        let without_terminal = rebuild_without_compiler_text_or_terminal_range()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if without_terminal.has_ordered_nfa_start_closure_dispatch()
+        if without_terminal.has_ordered_nfa_start_prefix()
+            || without_terminal.has_ordered_nfa_start_closure_dispatch()
             || without_terminal.has_ordered_nfa_terminal_range_object()
             || without_terminal.has_ordered_edge_dispatch_object() != selected_edge_dispatch
             || without_terminal.required_prepare_capabilities()
@@ -1020,7 +1076,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     if selected_edge_dispatch {
         let scalar = rebuild_scalar_ordered_nfa()?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-        if scalar.has_ordered_nfa_start_closure_dispatch()
+        if scalar.has_ordered_nfa_start_prefix()
+            || scalar.has_ordered_nfa_start_closure_dispatch()
             || scalar.has_ordered_nfa_terminal_range_object()
             || scalar.has_ordered_edge_dispatch_object()
             || scalar.required_prepare_capabilities() & PREPARED_CAPABILITY_ORDERED_NFA_V15 == 0
@@ -1070,11 +1127,12 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         format,
         max_object_bytes,
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 program,
                 target,
                 false,
                 allow_ordered_nfa,
+                true,
                 true,
                 true,
                 false,
@@ -1082,11 +1140,12 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 program,
                 target,
                 false,
                 allow_ordered_nfa,
+                true,
                 true,
                 false,
                 false,
@@ -1094,11 +1153,25 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
             )
         },
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                 program,
                 target,
                 false,
                 allow_ordered_nfa,
+                true,
+                false,
+                false,
+                false,
+                max_native_data_bytes,
+            )
+        },
+        || {
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+                program,
+                target,
+                false,
+                allow_ordered_nfa,
+                false,
                 false,
                 false,
                 false,
@@ -1133,11 +1206,12 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 format,
                 max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         program,
                         target,
                         second_endpoint,
                         second_ordered_route,
+                        true,
                         true,
                         true,
                         false,
@@ -1145,11 +1219,12 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         program,
                         target,
                         second_endpoint,
                         second_ordered_route,
+                        true,
                         true,
                         false,
                         false,
@@ -1157,11 +1232,25 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         program,
                         target,
                         second_endpoint,
                         second_ordered_route,
+                        true,
+                        false,
+                        false,
+                        false,
+                        max_native_data_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+                        program,
+                        target,
+                        second_endpoint,
+                        second_ordered_route,
+                        false,
                         false,
                         false,
                         false,
@@ -1258,10 +1347,11 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 format,
                 limits.max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         &program,
                         target,
                         false,
+                        true,
                         true,
                         true,
                         true,
@@ -1270,10 +1360,11 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         &program,
                         target,
                         false,
+                        true,
                         true,
                         true,
                         false,
@@ -1282,11 +1373,25 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     )
                 },
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                         &program,
                         target,
                         false,
                         true,
+                        true,
+                        false,
+                        false,
+                        false,
+                        effective_native_data_limit_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+                        &program,
+                        target,
+                        false,
+                        true,
+                        false,
                         false,
                         false,
                         false,
@@ -1315,10 +1420,11 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             format,
                             limits.max_object_bytes,
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                                     &program,
                                     target,
                                     false,
+                                    true,
                                     true,
                                     true,
                                     true,
@@ -1327,10 +1433,11 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                                     &program,
                                     target,
                                     false,
+                                    true,
                                     true,
                                     true,
                                     false,
@@ -1339,11 +1446,25 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                 )
                             },
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure(
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
                                     &program,
                                     target,
                                     false,
                                     true,
+                                    true,
+                                    false,
+                                    false,
+                                    false,
+                                    effective_native_data_limit_bytes,
+                                )
+                            },
+                            || {
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+                                    &program,
+                                    target,
+                                    false,
+                                    true,
+                                    false,
                                     false,
                                     false,
                                     false,
@@ -1625,6 +1746,11 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             passes.extend_from_slice(&[
                 OptimizationPass::UniversalOrderedTnfa,
                 OptimizationPass::OutputContractSpecialization,
+            ]);
+            if module.has_ordered_nfa_start_prefix() {
+                passes.push(OptimizationPass::AnchoredPrefixCandidateFilter);
+            }
+            passes.extend_from_slice(&[
                 OptimizationPass::NativeOrderedTnfaLowering,
                 OptimizationPass::TargetInstructionSelection,
                 OptimizationPass::FixedRegisterAssignment,

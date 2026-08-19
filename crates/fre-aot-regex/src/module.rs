@@ -1439,6 +1439,9 @@ pub struct CompiledModule {
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
     ordered_nfa_start_closure_dispatch_lowered: bool,
+    /// Whether this exact Ordered-NFA text uses the anchored-prefix first-byte
+    /// proof. This compiler-only bit drives the first final-object retry.
+    ordered_nfa_start_prefix_lowered: bool,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -2230,6 +2233,7 @@ enum PreparedEntryKind {
 struct PreparedOrderedNfaEntryLayout {
     object_abi_version: u32,
     start_closure_dispatch_lowered: bool,
+    start_prefix_lowered: bool,
     object_offset: usize,
     object_size: usize,
     object_alignment: usize,
@@ -2477,10 +2481,10 @@ impl CompiledModule {
         )
     }
 
-    /// Rebuild the ordinary portfolio while independently selecting the
-    /// compiler-only canonical start-closure text specialization. Exact
-    /// final-object retries disable this newest additive text before removing
-    /// either established immutable-data accelerator.
+    /// Compatibility seam for independently selecting the compiler-only
+    /// canonical start-closure specialization while retaining prefix text.
+    /// The expanded seam below lets final-object retries remove those two
+    /// additive text accelerators independently.
     #[allow(
         clippy::too_many_arguments,
         clippy::fn_params_excessive_bools,
@@ -2496,6 +2500,39 @@ impl CompiledModule {
         allow_ordered_nfa_start_closure_dispatch: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+            program,
+            target,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    /// Rebuild the ordinary portfolio while independently selecting both
+    /// compiler-only Ordered-NFA text accelerators. Final-object retries omit
+    /// the prefix admission/idle-forward text before the canonical start
+    /// closure, without changing any frozen object bytes.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "the retry preserves two route permissions, four independent accelerator permissions, and one exact data ceiling"
+    )]
+    pub(crate) fn lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
         Self::lower_without_slow_optimization(
             program,
             target,
@@ -2505,6 +2542,7 @@ impl CompiledModule {
             allow_ordered_edge_dispatch,
             allow_ordered_nfa_terminal_range,
             allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
             max_native_data_bytes,
         )
     }
@@ -3494,6 +3532,7 @@ impl CompiledModule {
             true,
             true,
             true,
+            true,
             max_native_data_bytes,
         )
     }
@@ -3511,6 +3550,7 @@ impl CompiledModule {
         allow_ordered_edge_dispatch: bool,
         allow_ordered_nfa_terminal_range: bool,
         allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -3561,6 +3601,9 @@ impl CompiledModule {
                     }
                     if !allow_ordered_nfa_start_closure_dispatch {
                         view.start_closure_dispatch = None;
+                    }
+                    if !allow_ordered_nfa_start_prefix {
+                        view.start_prefix_first_set = None;
                     }
                     view
                 })
@@ -4929,6 +4972,13 @@ impl CompiledModule {
                     ..
                 }))
             ),
+            ordered_nfa_start_prefix_lowered: matches!(
+                prepared_layout.map(|layout| layout.kind),
+                Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                    start_prefix_lowered: true,
+                    ..
+                }))
+            ),
         })
     }
 
@@ -5233,6 +5283,14 @@ impl CompiledModule {
     #[must_use]
     pub(crate) const fn has_ordered_nfa_start_closure_dispatch(&self) -> bool {
         self.ordered_nfa_start_closure_dispatch_lowered
+    }
+
+    /// Whether generated Ordered-NFA text uses the anchored-prefix first-byte
+    /// proof. This compiler-only receipt participates only in monotone final
+    /// object retries.
+    #[must_use]
+    pub(crate) const fn has_ordered_nfa_start_prefix(&self) -> bool {
+        self.ordered_nfa_start_prefix_lowered
     }
 
     /// Iterate every unresolved runtime function dependency in deterministic
@@ -7288,6 +7346,7 @@ fn lower_native_ordered_nfa_prepared(
                     ORDERED_NFA_OBJECT_V1_ABI_VERSION
                 },
                 start_closure_dispatch_lowered: image.layout.start_closure_dispatch.is_some(),
+                start_prefix_lowered: image.layout.start_prefix.is_some(),
                 object_offset,
                 object_size: image.bytes.len(),
                 object_alignment: ORDERED_NFA_OBJECT_V1_ALIGNMENT,
@@ -99429,6 +99488,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 bit_parallel_endpoint_oracle_lowered: false,
                 bit_parallel_exact_endpoint_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
+                ordered_nfa_start_prefix_lowered: false,
             };
 
             let nonce = SystemTime::now()
@@ -99750,6 +99810,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             bit_parallel_endpoint_oracle_lowered: false,
             bit_parallel_exact_endpoint_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
+            ordered_nfa_start_prefix_lowered: false,
         };
 
         let nonce = SystemTime::now()
