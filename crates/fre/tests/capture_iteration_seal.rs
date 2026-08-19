@@ -39,8 +39,12 @@ fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "owner closure, clone identity and exact-mask provenance form one construction transaction"
+)]
 fn capture_array_owner_is_distinct_immutable_and_closed() {
-    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 5);
+    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 6);
     assert_eq!(CAPTURE_ITERATION_ACCOUNTING_VERSION, 2);
     let regex = CaptureBuilder::new(r"(?P<left>a)|(b)")
         .unicode(false)
@@ -111,9 +115,18 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         regex.build_report().hir.work
     );
     assert_eq!(classifier_receipt.charged_work(), 5);
+    assert!(classifier_receipt.classifier().is_none());
+    let exact_mask = classifier_receipt
+        .exact_mask()
+        .expect("the non-range {a,b} proof selects an exact mask");
+    assert!(!exact_mask.is_empty());
+    assert!(!exact_mask.is_all());
+    for byte in 0_u8..=u8::MAX {
+        assert_eq!(exact_mask.matches(byte), matches!(byte, b'a' | b'b'));
+    }
     assert_eq!(
         classifier_receipt.outcome(),
-        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+        CaptureIterationStartClassifierOutcome::SelectedExactMask(exact_mask)
     );
     assert_eq!(
         first.identity.session_seal.start_classifier_receipt(),
@@ -160,6 +173,7 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
     let classifier = baseline_receipt
         .classifier()
         .expect("exact ASCII alphabetic first-byte set");
+    assert!(baseline_receipt.exact_mask().is_none());
     assert_eq!(core::mem::size_of_val(&classifier), 3);
     assert_eq!(
         (classifier.or_mask(), classifier.lower(), classifier.upper()),
@@ -254,6 +268,136 @@ fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
     assert_eq!(
         exact_onepass_receipt.work_after(),
         exact_onepass.build_report().hir.work
+    );
+}
+
+#[test]
+fn exact_mask_receipt_distinguishes_empty_nullable_and_all_byte_proofs() {
+    let empty = CaptureBuilder::new(r"([^\x00-\xFF])")
+        .unicode(false)
+        .build()
+        .expect("empty byte-language capture build");
+    let empty_receipt = *empty
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt();
+    let empty_mask = empty_receipt
+        .exact_mask()
+        .expect("an empty language has a non-nullable empty mask");
+    assert!(empty_mask.is_empty());
+    assert!(!empty_mask.is_all());
+    assert_eq!(
+        empty_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::SelectedExactMask(empty_mask)
+    );
+    assert!(
+        empty
+            .captures_iter(b"\x00\xFFa", CaptureAggregateLimits::default())
+            .expect("empty-language capture iteration")
+            .captures
+            .is_empty()
+    );
+
+    for pattern in [r"([ace]?)", r"([\x00-\xFF])"] {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("incumbent classifier terminal build");
+        let receipt = *regex
+            .iteration_identity(CaptureAggregateLimits::default())
+            .session_seal
+            .start_classifier_receipt();
+        assert_eq!(
+            receipt.outcome(),
+            CaptureIterationStartClassifierOutcome::AttemptedIneligible,
+            "pattern={pattern:?}"
+        );
+        assert!(receipt.classifier().is_none(), "pattern={pattern:?}");
+        assert!(receipt.exact_mask().is_none(), "pattern={pattern:?}");
+        assert!(receipt.closes(CaptureBuildLimits::default().max_hir_work));
+    }
+}
+
+#[test]
+fn near_all_exact_mask_has_dense_incumbent_parity_and_prunes_excluded_roots() {
+    let pattern = r"([^\x00])";
+    let selected = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("near-all exact-mask build");
+    let selected_receipt = *selected
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt();
+    let mask = selected_receipt
+        .exact_mask()
+        .expect("a near-all non-nullable class selects its exact mask");
+    assert!(!mask.is_empty());
+    assert!(!mask.is_all());
+    assert!(!mask.matches(0));
+    assert!((1_u8..=u8::MAX).all(|byte| mask.matches(byte)));
+
+    let incumbent_limits = CaptureBuildLimits {
+        max_hir_work: selected_receipt.work_before(),
+        ..CaptureBuildLimits::default()
+    };
+    let incumbent = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(incumbent_limits)
+        .build()
+        .expect("near-all exact mandatory-work incumbent");
+    let incumbent_receipt = *incumbent
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt();
+    assert_eq!(
+        incumbent_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::NotAttempted
+    );
+    assert_eq!(incumbent_receipt.charged_work(), 0);
+
+    let dense = b"all-byte-roots-here-are-members";
+    let selected_dense = selected
+        .captures_iter(dense, CaptureAggregateLimits::default())
+        .expect("selected dense iteration");
+    let incumbent_dense = incumbent
+        .captures_iter(dense, CaptureAggregateLimits::default())
+        .expect("incumbent dense iteration");
+    assert_eq!(selected_dense.captures, incumbent_dense.captures);
+    assert_eq!(
+        selected_dense.session_receipt.actual,
+        incumbent_dense.session_receipt.actual
+    );
+    assert_eq!(
+        selected_dense.total_state_visits,
+        incumbent_dense.total_state_visits
+    );
+    assert_eq!(
+        selected_dense.total_history_nodes,
+        incumbent_dense.total_history_nodes
+    );
+    assert_eq!(
+        selected_dense.total_history_walk,
+        incumbent_dense.total_history_walk
+    );
+
+    let excluded = b"a\x00b\x00c";
+    let selected_excluded = selected
+        .captures_iter(excluded, CaptureAggregateLimits::default())
+        .expect("selected excluded-byte iteration");
+    let incumbent_excluded = incumbent
+        .captures_iter(excluded, CaptureAggregateLimits::default())
+        .expect("incumbent excluded-byte iteration");
+    assert_eq!(selected_excluded.captures, incumbent_excluded.captures);
+    assert_eq!(
+        selected_excluded.session_receipt.actual,
+        incumbent_excluded.session_receipt.actual
+    );
+    assert!(selected_excluded.total_state_visits < incumbent_excluded.total_state_visits);
+    assert!(selected_excluded.total_history_nodes < incumbent_excluded.total_history_nodes);
+    assert_eq!(
+        selected_excluded.total_history_walk,
+        incumbent_excluded.total_history_walk
     );
 }
 

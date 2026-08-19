@@ -524,6 +524,7 @@ pub use fre_capture_lab::{
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS,
     MaskedInclusiveRange as CaptureMaskedInclusiveRange,
+    NonNullableFirstByteMask as CaptureNonNullableFirstByteMask,
     ParticipationSearchProspective as CaptureParticipationSearchProspective,
     ResourceKind as CaptureResource, RunReport as CaptureSearchAccounting,
     SearchConfig as CaptureSearchConfig, SearchError as CaptureSearchError,

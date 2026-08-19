@@ -68,11 +68,12 @@ use crate::capture_count_seal::{
 };
 use crate::capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
-    CAPTURE_ITERATION_ASCII_FOLD_RANGE, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
-    CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
-    CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
-    CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
-    CaptureIterationStartClassifierOutcome, CaptureIterationStartClassifierReceipt,
+    CAPTURE_ITERATION_ASCII_FOLD_RANGE, CAPTURE_ITERATION_ASCII_FOLD_WORDS,
+    CAPTURE_ITERATION_START_CLASSIFIER_WORK, CaptureIterationActual,
+    CaptureIterationAttemptReceipt, CaptureIterationBackend, CaptureIterationDeclaredFallback,
+    CaptureIterationOperation, CaptureIterationOwnerSeal, CaptureIterationProspective,
+    CaptureIterationRouteIdentity, CaptureIterationSeal, CaptureIterationStartClassifierOutcome,
+    CaptureIterationStartClassifierReceipt,
 };
 use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
@@ -2497,13 +2498,6 @@ struct OptionalOnePassCaptureBuild {
     compile_work: usize,
 }
 
-const CAPTURE_ITERATION_ASCII_FOLD_WORDS: [u64; 4] = [
-    0,
-    (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
-    0,
-    0,
-];
-
 fn project_capture_iteration_start_classifier(
     proof: FirstByteProof,
     accounting: &mut CaptureHirAccounting,
@@ -2522,12 +2516,19 @@ fn project_capture_iteration_start_classifier(
         );
     };
 
-    // This is the last HIR-budget transaction. The candidate and its exact
-    // four-word image are predetermined, so the fixed ledger is one attempt
-    // plus four comparisons with no scan, inference or allocation.
+    // This is the last HIR-budget transaction. One fixed attempt owns the
+    // nullable/all terminal classification and mask publication. The four
+    // remaining units compare the already-produced proof words with the
+    // predetermined compact ASCII-fold image. There is no HIR scan, inference
+    // or allocation.
     accounting.work = work_after;
     let outcome = if proof.equals_nonnullable_words(CAPTURE_ITERATION_ASCII_FOLD_WORDS) {
         CaptureIterationStartClassifierOutcome::Selected(CAPTURE_ITERATION_ASCII_FOLD_RANGE)
+    } else if let Some(mask) = proof
+        .nonnullable_mask()
+        .filter(|candidate| !candidate.is_all())
+    {
+        CaptureIterationStartClassifierOutcome::SelectedExactMask(mask)
     } else {
         CaptureIterationStartClassifierOutcome::AttemptedIneligible
     };
@@ -6187,6 +6188,10 @@ impl CaptureRegex {
         let start_classifier = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
             .then(|| self.iteration_owner.start_classifier_receipt().classifier())
             .flatten();
+        let start_exact_mask =
+            (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
+                .then(|| self.iteration_owner.start_classifier_receipt().exact_mask())
+                .flatten();
 
         let mut captures = Vec::new();
         let mut total_state_visits = 0_usize;
@@ -6277,6 +6282,25 @@ impl CaptureRegex {
                         config,
                         maximum_start,
                         start_classifier,
+                        per_search,
+                    )
+            } else if let (Some(maximum_start), Some(start_exact_mask)) =
+                (maximum_start, start_exact_mask)
+            {
+                // The opaque exact mask and Program were returned by one
+                // admitted HIR transaction and retained under this iteration
+                // owner. The compact [A-Za-z] range has first priority above;
+                // this second path therefore handles only a useful non-all
+                // arbitrary mask. It composes with the same positive-minimum
+                // ceiling and changes only new-root injection.
+                self.engine
+                    .captures_from_with_config_start_ceiling_exact_mask(
+                        haystack,
+                        window,
+                        cursor,
+                        config,
+                        maximum_start,
+                        start_exact_mask,
                         per_search,
                     )
             } else if let Some(maximum_start) = maximum_start {
