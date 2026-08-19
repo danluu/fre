@@ -69,6 +69,7 @@ use crate::capture_count_seal::{
 use crate::capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
     CAPTURE_ITERATION_ASCII_FOLD_RANGE, CAPTURE_ITERATION_ASCII_FOLD_WORDS,
+    CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES,
     CAPTURE_ITERATION_START_CLASSIFIER_WORK, CaptureIterationActual,
     CaptureIterationAttemptReceipt, CaptureIterationBackend, CaptureIterationDeclaredFallback,
     CaptureIterationOperation, CaptureIterationOwnerSeal, CaptureIterationProspective,
@@ -2500,6 +2501,7 @@ struct OptionalOnePassCaptureBuild {
 
 fn project_capture_iteration_start_classifier(
     proof: FirstByteProof,
+    engine_shape: fre_capture_lab::HistoryProgramShape,
     accounting: &mut CaptureHirAccounting,
     max_hir_work: usize,
 ) -> CaptureIterationStartClassifierReceipt {
@@ -2517,16 +2519,19 @@ fn project_capture_iteration_start_classifier(
     };
 
     // This is the last HIR-budget transaction. One fixed attempt owns the
-    // nullable/all terminal classification and mask publication. The four
-    // remaining units compare the already-produced proof words with the
-    // predetermined compact ASCII-fold image. There is no HIR scan, inference
-    // or allocation.
+    // nullable/all/owner-shape terminal classification and mask publication.
+    // The four remaining units compare the already-produced proof words with
+    // the predetermined compact ASCII-fold image. The shape is already bound
+    // by the mandatory Program; there is no HIR scan, inference or allocation.
     accounting.work = work_after;
     let outcome = if proof.equals_nonnullable_words(CAPTURE_ITERATION_ASCII_FOLD_WORDS) {
         CaptureIterationStartClassifierOutcome::Selected(CAPTURE_ITERATION_ASCII_FOLD_RANGE)
     } else if let Some(mask) = proof
         .nonnullable_mask()
-        .filter(|candidate| !candidate.is_all())
+        .filter(|candidate| {
+            !candidate.is_all()
+                && engine_shape.states >= CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES
+        })
     {
         CaptureIterationStartClassifierOutcome::SelectedExactMask(mask)
     } else {
@@ -3201,6 +3206,7 @@ impl CaptureBuilder {
         accounting = hir_program_report.hir;
         let engine_report = hir_program_report.program;
         let program = Arc::new(program);
+        let history_program_shape = program.history_program_shape();
         let onepass_capture_build = if build_onepass_capture {
             build_optional_onepass_capture(Arc::clone(&program), &engine_report, limits.engine)?
         } else {
@@ -3213,6 +3219,7 @@ impl CaptureBuilder {
         let onepass_capture_compile_work = onepass_capture_build.compile_work;
         let iteration_start_classifier = project_capture_iteration_start_classifier(
             first_byte_proof,
+            history_program_shape,
             &mut accounting,
             limits.max_hir_work,
         );
@@ -3409,7 +3416,7 @@ impl CaptureBuilder {
                 operation: CaptureIterationOperation::MaterializeCaptureArray,
                 plan: CaptureIterationPlanKind::RestartedPersistentHistory,
                 backend: CaptureIterationBackend::PersistentHistory,
-                engine_shape: program.history_program_shape(),
+                engine_shape: history_program_shape,
                 minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
                 absolute_onepass: if record_search_absolute_start {
                     onepass_capture.as_ref().map(OnePassCapturePlan::owner_seal)

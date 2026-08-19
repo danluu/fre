@@ -416,7 +416,7 @@ pub use capture_count_seal::{
 };
 pub use capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
-    CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+    CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
     CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,

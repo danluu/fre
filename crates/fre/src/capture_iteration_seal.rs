@@ -25,6 +25,14 @@ pub const CAPTURE_ITERATION_ACCOUNTING_VERSION: u32 = 2;
 /// Fixed work charged by the optional construction-time start classifier.
 pub const CAPTURE_ITERATION_START_CLASSIFIER_WORK: usize = 5;
 
+/// Minimum authenticated tagged-program extent for an arbitrary exact mask.
+///
+/// The compact ASCII-alphabetic representation predates this gate and remains
+/// eligible independently. An exact four-word lookup adds a fixed root check;
+/// retaining it only for a nontrivial semantic program keeps that check out of
+/// cheap capture loops without consulting source bytes or mask cardinality.
+pub const CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES: usize = 16;
+
 pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_WORDS: [u64; 4] = [
     0,
     (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
@@ -43,15 +51,17 @@ pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_RANGE: MaskedInclusiveRange =
 pub enum CaptureIterationStartClassifierOutcome {
     /// Fewer than five HIR work units remained, so no comparison ran.
     NotAttempted,
-    /// All five fixed units were charged, but the proof was nullable or its
-    /// non-nullable mask admitted every byte.
+    /// All five fixed units were charged, but the proof was nullable, its
+    /// non-nullable mask admitted every byte, or the authenticated tagged
+    /// program was too small for an arbitrary exact-mask root check.
     AttemptedIneligible,
     /// The exact non-nullable first-byte set equals the compact predetermined
     /// ASCII-alphabetic classifier image.
     Selected(MaskedInclusiveRange),
     /// A useful exact non-nullable, non-all first-byte set that is not the
-    /// compact ASCII-alphabetic classifier. An empty mask is a valid selected
-    /// empty-language proof.
+    /// compact ASCII-alphabetic classifier and whose authenticated tagged
+    /// program meets the source-independent extent gate. An empty mask remains
+    /// a valid proof, subject to the same program-shape gate.
     SelectedExactMask(NonNullableFirstByteMask),
 }
 
@@ -127,10 +137,29 @@ impl CaptureIterationStartClassifierReceipt {
         }
     }
 
-    /// Authenticate arithmetic, ceiling admission and every selected start
-    /// filter implemented by this algorithm version.
+    /// Authenticate arithmetic, ceiling admission, co-owned program shape and
+    /// every selected start filter implemented by this algorithm version.
     #[must_use]
-    pub fn closes(self, max_hir_work: usize) -> bool {
+    pub fn closes(self, route: &CaptureIterationRouteIdentity) -> bool {
+        if route.operation != CaptureIterationOperation::MaterializeCaptureArray
+            || route.plan != CaptureIterationPlanKind::RestartedPersistentHistory
+            || route.backend != CaptureIterationBackend::PersistentHistory
+            || route.capture_profile != CaptureProfile::RustRegexBytes1_12_4
+            || route.algorithm_version != CAPTURE_ITERATION_ALGORITHM_VERSION
+            || route.accounting_version != CAPTURE_ITERATION_ACCOUNTING_VERSION
+            || route.declared_fallback != CaptureIterationDeclaredFallback::None
+            || route.engine_shape.states == 0
+            || route.engine_shape.save_states > route.engine_shape.states
+            || route.engine_shape.groups == 0
+            || route
+                .engine_shape
+                .groups
+                .checked_mul(2)
+                .is_none_or(|slots| slots != route.engine_shape.slots)
+        {
+            return false;
+        }
+        let max_hir_work = route.build_limits.max_hir_work;
         if self.work_before > max_hir_work {
             return false;
         }
@@ -159,6 +188,8 @@ impl CaptureIterationStartClassifierReceipt {
                 self.charged_work == CAPTURE_ITERATION_START_CLASSIFIER_WORK
                     && admitted_after == Some(self.work_after)
                     && self.work_after <= max_hir_work
+                    && route.engine_shape.states
+                        >= CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES
                     && !mask.is_all()
                     && mask.words() != CAPTURE_ITERATION_ASCII_FOLD_WORDS
             }
@@ -256,7 +287,7 @@ impl CaptureIterationOwnerSeal {
             CaptureIterationPlanKind::RestartedPersistentHistory
         );
         debug_assert_eq!(identity.backend, CaptureIterationBackend::PersistentHistory);
-        debug_assert!(start_classifier.closes(identity.build_limits.max_hir_work));
+        debug_assert!(start_classifier.closes(&identity));
         Self(Arc::new(CaptureIterationOwner {
             route: identity,
             start_classifier,

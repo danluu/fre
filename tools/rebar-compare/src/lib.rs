@@ -1146,10 +1146,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; one-pattern Unicode-off Count, Compile verification, and generic SpanSum select this physical scan solely from the retained canonical class masks and width; every suffix candidate is visited in source order, backward middle probes are globally amortized because a suffix byte cannot be a middle byte, complete matches retain leftmost non-overlap, and all source reads and reductions remain inside the public operation; widths through 64 retain the incumbent Word64/Shift-And route, overlapping masks retain the bounded circular window, Unicode scalar semantics retain their incumbent route, and the fixed-class v5 Count/SpanSum plus v3 visitor identities authenticate the distinction",
         );
         identity.identity.push_str(
-            "; formal-arbitrary-nonnullable-first-byte-root-mask-v1 binds capture-materialized-array-iteration-v8 as the exact successor to v7 and CaptureIteration algorithm v6/accounting v2 to the opaque NonNullableFirstByteMask minted from the same atomic HIR build as the mandatory Program and retained inside the same capture-iteration owner Arc; the existing final five-unit HIR transaction remains one fixed terminal attempt plus four predetermined proof-word publications/comparisons, preserves the exact [A-Za-z] MaskedInclusiveRange as its first selected representation, otherwise seals a nonnullable non-all exact mask, explicitly retains an empty-language mask as selected proof evidence, and leaves nullable or all-byte proofs AttemptedIneligible plus insufficient-headroom proofs NotAttempted; Program, State, engine BuildReport and capture-program V1 identity remain unchanged",
+            "; formal-arbitrary-nonnullable-first-byte-root-mask-v1 binds capture-materialized-array-iteration-v8 as the exact successor to v7 and CaptureIteration algorithm v6/accounting v2 to the opaque NonNullableFirstByteMask minted from the same atomic HIR build as the mandatory Program and retained inside the same capture-iteration owner Arc; the existing final five-unit HIR transaction remains one fixed terminal classification/publication attempt plus four predetermined proof-word comparisons, preserves the exact [A-Za-z] MaskedInclusiveRange as its first selected representation, and otherwise seals a nonnullable non-all exact mask only when the co-owned tagged History program contains at least 16 authenticated states; nullable, all-byte, and smaller-program proofs are AttemptedIneligible while insufficient-headroom proofs are NotAttempted; this shape gate reads the already-published owner scalar without another HIR traversal, inference or allocation, and Program, State, engine BuildReport and capture-program V1 identity remain unchanged",
         );
         identity.availability.push_str(
-            "; only ordinary LEFTMOST positive-minimum restarted persistent History composes the owner-bound arbitrary mask with materialized-positive-minimum-start-ceiling-v1, after every prepared or direct capture owner has retained its higher-priority route; validation and incumbent history admission precede source access, the end boundary has no byte, a rejected position does not close later starts, and filtering changes only NEW root injection while already-live histories, ordered priority, assertions, captures, slots, winning history walk, refusal order and logical prospective/bytes/starts remain unchanged; rejected roots are neither physical starts nor state visits, so only physical state visits, history nodes, starts and peak threads may decrease; the exact [A-Za-z] range remains first, useful non-all exact masks are second, the v140 ceiling-only route is third and ordinary History is fourth, while zero-minimum, non-LEFTMOST, nullable, all-byte and unattempted constructions retain their incumbents with no execution-time fallback, benchmark identity, fixture name, expected value, result hash or source-dependent selection",
+            "; only ordinary LEFTMOST positive-minimum restarted persistent History composes the owner-bound arbitrary mask with materialized-positive-minimum-start-ceiling-v1, after every prepared or direct capture owner has retained its higher-priority route; validation and incumbent history admission precede source access, the end boundary has no byte, a rejected position does not close later starts, and filtering changes only NEW root injection while already-live histories, ordered priority, assertions, captures, slots, winning history walk, refusal order and logical prospective/bytes/starts remain unchanged; rejected roots are neither physical starts nor state visits, so only physical state visits, history nodes, starts and peak threads may decrease; the exact [A-Za-z] range remains first, at-least-16-state non-all exact masks are second, the v140 ceiling-only route is third and ordinary History is fourth, while smaller programs, zero-minimum, non-LEFTMOST, nullable, all-byte and unattempted constructions retain their incumbents with no execution-time fallback, benchmark identity, fixture name, expected value, result hash, mask-cardinality threshold or source-dependent selection",
         );
         identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
@@ -29865,7 +29865,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let classifier_receipt = *construction_identity
             .session_seal
             .start_classifier_receipt();
-        assert!(classifier_receipt.closes(construction_route.build_limits.max_hir_work));
+        assert!(classifier_receipt.closes(construction_route));
         assert_eq!(
             classifier_receipt.work_after(),
             regex.build_report().hir.work
@@ -31887,7 +31887,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         reason = "one source-generic canary binds the exact-mask receipt, full records, physical actual and incumbent controls"
     )]
     fn formal_arbitrary_nonnullable_first_byte_root_mask_materializes_generic_records() {
-        const PATTERN: &str = r"(?P<outer>(?P<head>[ace])(?P<tail>[0-9]?))";
+        const PATTERN: &str =
+            r"(?P<outer>(?P<head>(?:a[0-3]|c[0-3]|e[0-3]))(?P<tail>[0-9]?))";
         const HAYSTACK: &[u8] = b"a1 b c e9 z\nca2 e a0\nmiss\n";
 
         let limits = RunLimits {
@@ -31910,9 +31911,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let identity = regex.iteration_identity(run_limits);
         let route = identity.session_seal.route_identity();
         let receipt = *identity.session_seal.start_classifier_receipt();
-        assert!(receipt.closes(route.build_limits.max_hir_work));
+        assert!(receipt.closes(route));
         assert_eq!(route.algorithm_version, 6);
         assert_eq!(route.accounting_version, 2);
+        assert_eq!(route.engine_shape.states, 20);
+        assert_eq!(route.engine_shape.save_states, 8);
         assert!(receipt.classifier().is_none());
         let mask = receipt
             .exact_mask()
@@ -31926,6 +31929,30 @@ agggtaa[cgt]|[acg]ttaccct 0
             receipt.outcome(),
             fre::CaptureIterationStartClassifierOutcome::SelectedExactMask(mask)
         );
+
+        let one_below_limits = CaptureBuildLimits {
+            max_hir_work: receipt.work_before()
+                + fre::CAPTURE_ITERATION_START_CLASSIFIER_WORK
+                - 1,
+            ..regex.build_limits()
+        };
+        let one_below = capture_regex_one_with_build_limits(
+            PATTERN,
+            false,
+            false,
+            &one_below_limits,
+        )
+        .expect("one-below arbitrary-mask admission retains incumbent History");
+        let one_below_identity = one_below.iteration_identity(run_limits);
+        let one_below_route = one_below_identity.session_seal.route_identity();
+        let one_below_receipt = *one_below_identity.session_seal.start_classifier_receipt();
+        assert_eq!(one_below_route.engine_shape, route.engine_shape);
+        assert_eq!(one_below_receipt.charged_work(), 0);
+        assert_eq!(
+            one_below_receipt.outcome(),
+            fre::CaptureIterationStartClassifierOutcome::NotAttempted
+        );
+        assert!(one_below_receipt.closes(one_below_route));
 
         let operation = execute_materialized_grep_captures_inner(
             None,
@@ -31945,10 +31972,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             let report = regex
                 .captures_iter(line, run_limits)
                 .expect("line-local exact-mask capture records");
+            let incumbent = one_below
+                .captures_iter(line, run_limits)
+                .expect("line-local one-below incumbent records");
             assert_eq!(
                 materialized_capture_spans(&report),
                 pinned_capture_spans(&pinned, Input::new(line))
             );
+            assert_eq!(report.captures, incumbent.captures);
             physical
                 .charge(CaptureIterationActual {
                     total_state_visits: report.total_state_visits,
@@ -31974,13 +32005,34 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(lifecycle.execute(HAYSTACK).unwrap(), expected);
 
+        for (pattern, expected_states) in [
+            (r"([A-Z]+)", 7),
+            (r"^([A-Z]+)$", 9),
+            (r"(?P<outer>(?P<head>[ace])(?P<tail>[0-9]?))", 13),
+        ] {
+            let incumbent = capture_grep_regex_one(pattern, false, false, &limits)
+                .expect("small-program exact-mask control build");
+            let control_identity = incumbent.iteration_identity(run_limits);
+            let control_route = control_identity.session_seal.route_identity();
+            let control = *control_identity.session_seal.start_classifier_receipt();
+            assert_eq!(control_route.engine_shape.states, expected_states);
+            assert!(control.closes(control_route));
+            assert_eq!(
+                control.outcome(),
+                fre::CaptureIterationStartClassifierOutcome::AttemptedIneligible,
+                "pattern={pattern:?}"
+            );
+            assert!(control.classifier().is_none(), "pattern={pattern:?}");
+            assert!(control.exact_mask().is_none(), "pattern={pattern:?}");
+        }
+
         for pattern in [r"([ace]?)", r"([\x00-\xFF])"] {
             let incumbent = capture_grep_regex_one(pattern, false, false, &limits)
                 .expect("nullable/all-byte incumbent control build");
             let control_identity = incumbent.iteration_identity(run_limits);
             let control_route = control_identity.session_seal.route_identity();
             let control = *control_identity.session_seal.start_classifier_receipt();
-            assert!(control.closes(control_route.build_limits.max_hir_work));
+            assert!(control.closes(control_route));
             assert_eq!(
                 control.outcome(),
                 fre::CaptureIterationStartClassifierOutcome::AttemptedIneligible,
@@ -35664,13 +35716,17 @@ agggtaa[cgt]|[acg]ttaccct 0
             "formal-arbitrary-nonnullable-first-byte-root-mask-v1 binds capture-materialized-array-iteration-v8 as the exact successor to v7 and CaptureIteration algorithm v6/accounting v2"
         ));
         assert!(current_identity.identity.contains(
-            "the existing final five-unit HIR transaction remains one fixed terminal attempt plus four predetermined proof-word publications/comparisons"
+            "the existing final five-unit HIR transaction remains one fixed terminal classification/publication attempt plus four predetermined proof-word comparisons"
         ));
         assert!(current_identity.identity.contains(
             "preserves the exact [A-Za-z] MaskedInclusiveRange as its first selected representation"
         ));
         assert!(current_identity.identity.contains(
-            "explicitly retains an empty-language mask as selected proof evidence"
+            "only when the co-owned tagged History program contains at least 16 authenticated states"
+        ));
+        assert_eq!(fre::CAPTURE_ITERATION_EXACT_MASK_MIN_PROGRAM_STATES, 16);
+        assert!(current_identity.identity.contains(
+            "this shape gate reads the already-published owner scalar without another HIR traversal, inference or allocation"
         ));
         assert!(current_identity.availability.contains(
             "only ordinary LEFTMOST positive-minimum restarted persistent History composes the owner-bound arbitrary mask"
@@ -35679,7 +35735,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "rejected roots are neither physical starts nor state visits"
         ));
         assert!(current_identity.availability.contains(
-            "the exact [A-Za-z] range remains first, useful non-all exact masks are second, the v140 ceiling-only route is third and ordinary History is fourth"
+            "the exact [A-Za-z] range remains first, at-least-16-state non-all exact masks are second, the v140 ceiling-only route is third and ordinary History is fourth"
         ));
         assert_eq!(
             fre::FIXED_CLASS_SANDWICH_PLAN_ID,
