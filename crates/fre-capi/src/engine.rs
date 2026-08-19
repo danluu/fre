@@ -95,15 +95,20 @@ impl CompiledRegex {
     }
 
     pub(crate) fn exists(&self, haystack: &[u8]) -> Result<FreV1ExistsResult, Outcome> {
-        self.regex
-            .is_match(haystack, self.search_limits)
-            .map(|(matched, _)| FreV1ExistsResult {
-                abi_version: crate::FRE_V1_ABI_VERSION,
-                struct_size: size_u32::<FreV1ExistsResult>(),
-                matched: u32::from(matched),
-                reserved: 0,
-            })
-            .map_err(|error| search_error(&error))
+        let matched = if self.search_limits == SearchLimits::unlimited() {
+            self.regex.is_match_value(haystack, self.search_limits)
+        } else {
+            self.regex
+                .is_match(haystack, self.search_limits)
+                .map(|(matched, _)| matched)
+        }
+        .map_err(|error| search_error(&error))?;
+        Ok(FreV1ExistsResult {
+            abi_version: crate::FRE_V1_ABI_VERSION,
+            struct_size: size_u32::<FreV1ExistsResult>(),
+            matched: u32::from(matched),
+            reserved: 0,
+        })
     }
 
     pub(crate) fn selected_end(&self, haystack: &[u8]) -> Result<FreV1SelectedEndResult, Outcome> {
@@ -120,17 +125,22 @@ impl CompiledRegex {
     }
 
     pub(crate) fn span(&self, haystack: &[u8]) -> Result<FreV1MatchResult, Outcome> {
-        self.regex
-            .find(haystack, self.search_limits)
-            .map(|(matched, _)| FreV1MatchResult {
-                abi_version: crate::FRE_V1_ABI_VERSION,
-                struct_size: size_u32::<FreV1MatchResult>(),
-                found: u32::from(matched.is_some()),
-                reserved: 0,
-                start: matched.map_or(0, fre::Match::start),
-                end: matched.map_or(0, fre::Match::end),
-            })
-            .map_err(|error| search_error(&error))
+        let matched = if self.search_limits == SearchLimits::unlimited() {
+            self.regex.find_value(haystack, self.search_limits)
+        } else {
+            self.regex
+                .find(haystack, self.search_limits)
+                .map(|(matched, _)| matched)
+        }
+        .map_err(|error| search_error(&error))?;
+        Ok(FreV1MatchResult {
+            abi_version: crate::FRE_V1_ABI_VERSION,
+            struct_size: size_u32::<FreV1MatchResult>(),
+            found: u32::from(matched.is_some()),
+            reserved: 0,
+            start: matched.map_or(0, fre::Match::start),
+            end: matched.map_or(0, fre::Match::end),
+        })
     }
 }
 

@@ -8,7 +8,7 @@ use core::{
     ptr,
 };
 
-use fre::PlanKind;
+use fre::{PlanKind, PortableRegex, SearchLimits};
 
 use crate::{
     FRE_V1_ABI_VERSION, FRE_V1_DIAGNOSTIC_ARGUMENT, FRE_V1_DIAGNOSTIC_COMPILE,
@@ -333,6 +333,82 @@ fn compile_and_all_single_search_outputs_work() {
 }
 
 #[test]
+fn k0_exists_and_span_match_direct_searches_across_limit_modes() {
+    let pattern = r"(?:αβ|γδ)+Z";
+    let mut unlimited_config = FreV1Config::checked_default();
+    unlimited_config.search_work = u64::MAX;
+    unlimited_config.search_scratch_bytes =
+        u64::try_from(usize::MAX).expect("supported target scratch width fits u64");
+    let direct = PortableRegex::new(pattern).expect("matching direct portable regex");
+    assert_eq!(direct.build_report().plan, PlanKind::K0);
+    let absent = vec![b'x'; 4_096];
+    let mut present = absent.clone();
+    present.extend_from_slice("αγδαβZ".as_bytes());
+    for (config, limits) in [
+        (FreV1Config::checked_default(), SearchLimits::default()),
+        (unlimited_config, SearchLimits::unlimited()),
+    ] {
+        let (regex, diagnostic) = compile(pattern.as_bytes(), config);
+        assert_eq!(diagnostic.category, FRE_V1_DIAGNOSTIC_NONE);
+        let mut plan = FreV1PlanInfo::caller_init();
+        // SAFETY: compile returned one live handle and plan is valid output storage.
+        assert_eq!(
+            unsafe { fre_v1_regex_plan(regex, &raw mut plan, ptr::null_mut()) },
+            FRE_V1_STATUS_OK
+        );
+        assert_eq!(plan.plan, FRE_V1_PLAN_K0);
+
+        for haystack in [&absent[..], &present[..]] {
+            let expected_exists = direct
+                .is_match(haystack, limits)
+                .expect("accounted direct existence")
+                .0;
+            let expected_span = direct
+                .find(haystack, limits)
+                .expect("accounted direct span")
+                .0;
+
+            let mut exists = FreV1ExistsResult::caller_init();
+            // SAFETY: handle, byte view, and output storage remain live for the call.
+            assert_eq!(
+                unsafe {
+                    fre_v1_regex_exists(
+                        regex,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut exists,
+                        ptr::null_mut(),
+                    )
+                },
+                FRE_V1_STATUS_OK
+            );
+            assert_eq!(exists.matched, u32::from(expected_exists));
+
+            let mut span = FreV1MatchResult::caller_init();
+            // SAFETY: handle, byte view, and output storage remain live for the call.
+            assert_eq!(
+                unsafe {
+                    fre_v1_regex_span(
+                        regex,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut span,
+                        ptr::null_mut(),
+                    )
+                },
+                FRE_V1_STATUS_OK
+            );
+            assert_eq!(span.found, u32::from(expected_span.is_some()));
+            assert_eq!(span.start, expected_span.map_or(0, fre::Match::start));
+            assert_eq!(span.end, expected_span.map_or(0, fre::Match::end));
+        }
+
+        // SAFETY: transfers compile's sole live reference.
+        assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+    }
+}
+
+#[test]
 fn unicode_word_run_has_a_stable_public_plan_tag() {
     let (regex, _) = compile(br"\b\w{2,}\b", FreV1Config::checked_default());
     let mut plan = FreV1PlanInfo::caller_init();
@@ -648,6 +724,27 @@ fn every_checked_search_failure_leaves_result_unchanged() {
     let mut limited = FreV1Config::checked_default();
     limited.search_work = 0;
     let (limited_regex, _) = compile(b"x", limited);
+    let exists_sentinel = FreV1ExistsResult {
+        abi_version: FRE_V1_ABI_VERSION,
+        struct_size: u32::try_from(size_of::<FreV1ExistsResult>()).expect("small record"),
+        matched: 83,
+        reserved: 89,
+    };
+    let mut limited_exists = exists_sentinel;
+    // SAFETY: valid call whose explicit zero work limit forces search refusal.
+    assert_eq!(
+        unsafe {
+            fre_v1_regex_exists(
+                limited_regex,
+                b"x".as_ptr(),
+                1,
+                &raw mut limited_exists,
+                ptr::null_mut(),
+            )
+        },
+        FRE_V1_STATUS_SEARCH_ERROR
+    );
+    assert_eq!(limited_exists, exists_sentinel);
     output = sentinel;
     let before = output;
     // SAFETY: valid call whose explicit zero work limit forces search refusal.
