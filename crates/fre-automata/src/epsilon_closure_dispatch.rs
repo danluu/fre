@@ -169,6 +169,136 @@ pub(crate) enum ClosureRoot<'a> {
     Scalar,
 }
 
+/// Decoded action in one compiler-private epsilon-closure instruction.
+///
+/// This is an address-free view of the canonical retained sidecar, not a
+/// stable serialized format. Native lowering may specialize the borrowed
+/// start program without depending on the packed in-memory representation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeEpsilonClosureAction {
+    Split,
+    Consume,
+    Accept,
+    SeenBackedge,
+}
+
+impl From<ClosureAction> for NativeEpsilonClosureAction {
+    fn from(action: ClosureAction) -> Self {
+        match action {
+            ClosureAction::Split => Self::Split,
+            ClosureAction::Consume => Self::Consume,
+            ClosureAction::Accept => Self::Accept,
+            ClosureAction::SeenBackedge => Self::SeenBackedge,
+        }
+    }
+}
+
+/// One decoded instruction borrowed from a compiler-private start program.
+///
+/// `subtree_end` is program-local. Plain instructions have guard zero;
+/// guarded instructions have edge work zero because their exact Split rows
+/// remain authoritative in the canonical graph.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEpsilonClosureInstruction {
+    state: u32,
+    subtree_end: usize,
+    action: NativeEpsilonClosureAction,
+    edge_work: u32,
+    guard: u32,
+}
+
+impl NativeEpsilonClosureInstruction {
+    #[must_use]
+    pub const fn state(self) -> u32 {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn subtree_end(self) -> usize {
+        self.subtree_end
+    }
+
+    #[must_use]
+    pub const fn action(self) -> NativeEpsilonClosureAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn edge_work(self) -> u32 {
+        self.edge_work
+    }
+
+    #[must_use]
+    pub const fn guard(self) -> u32 {
+        self.guard
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeEpsilonClosureProgram<'a> {
+    Plain(&'a [ClosureInstruction]),
+    Guarded(&'a [GuardedClosureInstruction]),
+}
+
+/// Zero-allocation decoded view of the canonical start-root closure program.
+///
+/// The view deliberately exposes neither the all-state root table nor either
+/// complete instruction arena. Its lifetime is bound to the immutable
+/// automaton that owns the canonically derived optimization sidecar.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEpsilonClosureProgramView<'a> {
+    program: NativeEpsilonClosureProgram<'a>,
+}
+
+impl NativeEpsilonClosureProgramView<'_> {
+    #[must_use]
+    pub const fn is_guarded(self) -> bool {
+        matches!(self.program, NativeEpsilonClosureProgram::Guarded(_))
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self.program {
+            NativeEpsilonClosureProgram::Plain(instructions) => instructions.len(),
+            NativeEpsilonClosureProgram::Guarded(instructions) => instructions.len(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn instruction(self, index: usize) -> Option<NativeEpsilonClosureInstruction> {
+        match self.program {
+            NativeEpsilonClosureProgram::Plain(instructions) => {
+                let instruction = instructions.get(index).copied()?;
+                Some(NativeEpsilonClosureInstruction {
+                    state: instruction.state(),
+                    subtree_end: instruction.subtree_end(),
+                    action: instruction.action().into(),
+                    edge_work: instruction.edge_work(),
+                    guard: 0,
+                })
+            }
+            NativeEpsilonClosureProgram::Guarded(instructions) => {
+                let instruction = instructions.get(index).copied()?;
+                Some(NativeEpsilonClosureInstruction {
+                    state: instruction.state(),
+                    subtree_end: instruction.subtree_end(),
+                    action: instruction.action().into(),
+                    edge_work: 0,
+                    guard: instruction.guard(),
+                })
+            }
+        }
+    }
+}
+
 impl GuardedClosureInstruction {
     fn placeholder(state: u32, guard: u32, action: ClosureAction) -> Self {
         debug_assert_eq!(state & !GUARDED_STATE_MASK, 0);
@@ -567,7 +697,7 @@ impl EpsilonClosureDispatch {
         let Some(first) = data.instructions.get(begin).copied() else {
             return ClosureRoot::Scalar;
         };
-        if first.program_work_exponent() != work_exponent {
+        if first.program_work_exponent() != work_exponent || first.state() != state {
             return ClosureRoot::Scalar;
         }
         let length = first.subtree_end();
@@ -629,6 +759,25 @@ impl EpsilonClosureDispatch {
                 max_work,
             },
         )
+    }
+
+    pub(crate) fn native_start_program(
+        &self,
+        state: u32,
+    ) -> Option<NativeEpsilonClosureProgramView<'_>> {
+        match self.assertion_root(state) {
+            ClosureRoot::Program { instructions, .. } => {
+                Some(NativeEpsilonClosureProgramView {
+                    program: NativeEpsilonClosureProgram::Plain(instructions),
+                })
+            }
+            ClosureRoot::GuardedProgram { instructions, .. } => {
+                Some(NativeEpsilonClosureProgramView {
+                    program: NativeEpsilonClosureProgram::Guarded(instructions),
+                })
+            }
+            ClosureRoot::Consume | ClosureRoot::Accept | ClosureRoot::Scalar => None,
+        }
     }
 
     pub(crate) const fn retained_bytes(&self) -> usize {
@@ -1276,7 +1425,7 @@ mod tests {
 
     use super::{
         ClosureAction, ClosureInstruction, ClosureRoot, EpsilonClosureDispatchData,
-        GuardedClosureInstruction, MAX_RETAINED_TO_GRAPH_FACTOR,
+        GuardedClosureInstruction, NativeEpsilonClosureAction, MAX_RETAINED_TO_GRAPH_FACTOR,
     };
     use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
 
@@ -1396,6 +1545,17 @@ mod tests {
         assert!(program
             .iter()
             .any(|instruction| instruction.action() == ClosureAction::SeenBackedge));
+        let native = automaton
+            .compiler_private_epsilon_closure_start_program_view()
+            .expect("native lowering borrows the canonical start program");
+        assert!(!native.is_guarded());
+        assert_eq!(native.len(), program.len());
+        let native_root = native.instruction(0).unwrap();
+        assert_eq!(native_root.state(), 0);
+        assert_eq!(native_root.subtree_end(), program.len());
+        assert_eq!(native_root.action(), NativeEpsilonClosureAction::Split);
+        assert_eq!(native_root.edge_work(), program[0].edge_work());
+        assert_eq!(native_root.guard(), 0);
         let exact_work = program
             .iter()
             .try_fold(0_u64, |work, instruction| {
@@ -1493,6 +1653,15 @@ mod tests {
         assert!(instructions.iter().skip(1).any(|instruction| {
             instruction.guard() != 0
         }));
+        let native = asserted
+            .compiler_private_epsilon_closure_start_program_view()
+            .expect("native lowering borrows the guarded start program");
+        assert!(native.is_guarded());
+        assert_eq!(native.len(), instructions.len());
+        assert_eq!(native.instruction(0).unwrap().guard(), 0);
+        assert!(
+            (1..native.len()).any(|index| native.instruction(index).unwrap().guard() != 0)
+        );
         assert!(max_work.is_power_of_two());
         assert_eq!(dispatch.instruction_count(), 0);
         assert_eq!(dispatch.guarded_instruction_count(), instructions.len());
