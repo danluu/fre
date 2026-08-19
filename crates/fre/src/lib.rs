@@ -9470,6 +9470,19 @@ impl PortableK0Plan {
         limits: SearchLimits,
         minimum_match_bytes: Option<usize>,
     ) -> Result<Option<K0PooledValue>, K0SearchError> {
+        // The Rust-like default value facade automatically owns its reusable
+        // K0 scratch. Unlimited calls may additionally consume the optional
+        // proof shortcuts below; default finite calls go straight to the
+        // generic pooled executor so their checked envelope stays exact.
+        if limits == SearchLimits::default() {
+            return self.pooled_workspace_value(
+                operation,
+                haystack,
+                window,
+                limits,
+                minimum_match_bytes,
+            );
+        }
         if limits != SearchLimits::unlimited()
             || window.start() > window.end()
             || window.end() > haystack.len()
@@ -9630,6 +9643,26 @@ impl PortableK0Plan {
             }
         }
 
+        self.pooled_workspace_value(
+            operation,
+            haystack,
+            search_window,
+            limits,
+            minimum_match_bytes,
+        )
+    }
+
+    fn pooled_workspace_value(
+        &self,
+        operation: K0PooledValueOperation,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        minimum_match_bytes: Option<usize>,
+    ) -> Result<Option<K0PooledValue>, K0SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
         let positive = matches!(minimum_match_bytes, Some(minimum) if minimum > 0);
         let assertion_free_nullable =
             minimum_match_bytes == Some(0) && !self.automaton.stats().has_assertions();
@@ -9642,7 +9675,7 @@ impl PortableK0Plan {
                 .automaton
                 .search_window_with_optional_pooled_exists_value(
                     haystack,
-                    search_window,
+                    window,
                     limits,
                     SearchSessionLimits::default(),
                     endpoint_eligible,
@@ -9653,7 +9686,7 @@ impl PortableK0Plan {
                 .automaton
                 .search_window_with_optional_pooled_span_value(
                     haystack,
-                    search_window,
+                    window,
                     limits,
                     SearchSessionLimits::default(),
                     endpoint_eligible,
@@ -10207,7 +10240,10 @@ impl PortableRegex {
     /// This is the value-only counterpart to [`Self::is_match`]. It preserves
     /// the same selected plan, checked execution limits and typed failures,
     /// while keeping callers that only consume the boolean outside the
-    /// [`SearchAccounting`] projection boundary.
+    /// [`SearchAccounting`] projection boundary. Under the default limits,
+    /// generic K0 plans automatically retain bounded scratch in this immutable
+    /// matcher and reuse it on later calls; callers do not need to construct a
+    /// search session.
     ///
     /// # Errors
     ///
@@ -11472,7 +11508,8 @@ impl PortableRegex {
     ///
     /// This value-only projection shares the exact selected-span path with
     /// [`Self::find_value`] and therefore does not construct facade diagnostic
-    /// accounting.
+    /// accounting. Its automatic scratch lifetime is the same as
+    /// [`Self::find_value`].
     ///
     /// # Errors
     ///
@@ -11505,6 +11542,9 @@ impl PortableRegex {
     /// same selected plan, checked execution limits and typed failures. K0
     /// stays outside the facade [`SearchAccounting`] projection boundary;
     /// native owners retain their existing concrete search implementations.
+    /// Under the default limits, generic K0 plans automatically retain bounded
+    /// scratch in this immutable matcher and reuse it on later calls; callers
+    /// do not need to construct a search session.
     ///
     /// # Errors
     ///
@@ -22266,7 +22306,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_unlimited_k0_value_calls_reuse_source_bound_workspace() {
+    fn ordinary_k0_value_calls_automatically_reuse_source_bound_workspace() {
         let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
             .unicode(false)
             .plan_selection(PlanSelection::ForceK0)
@@ -22318,12 +22358,42 @@ mod tests {
             expected,
         );
 
-        // Finite limits and invalid windows stay on the canonical one-shot
-        // entry, including its public range validation.
+        // The default finite value API owns the same cache policy. Its first
+        // search pays for bounded construction and later calls reuse that
+        // exact workspace without requiring an explicit session.
+        let finite = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite pooled ordinary-search fixture builds");
         assert_eq!(
-            regex
+            finite
                 .find_value(haystack, SearchLimits::default())
-                .expect("finite value search succeeds"),
+                .expect("cold finite value search succeeds"),
+            expected,
+        );
+        assert!(
+            finite
+                .is_match_value(haystack, SearchLimits::default())
+                .expect("warm finite existence search succeeds")
+        );
+        assert_eq!(
+            finite
+                .selected_end_value(haystack, SearchLimits::default())
+                .expect("warm finite selected-end search succeeds"),
+            Some(17),
+        );
+
+        // Custom finite envelopes keep their canonical one-shot behavior,
+        // while invalid windows retain public range validation.
+        let custom_finite = SearchLimits {
+            max_work: SearchLimits::default().max_work - 1,
+            ..SearchLimits::default()
+        };
+        assert_eq!(
+            finite
+                .find_value(haystack, custom_finite)
+                .expect("custom finite value search succeeds"),
             expected,
         );
         assert!(matches!(
@@ -22396,6 +22466,11 @@ mod tests {
             let barrier = std::sync::Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
+                let limits = if thread_index % 2 == 0 {
+                    SearchLimits::default()
+                } else {
+                    SearchLimits::unlimited()
+                };
                 for iteration in 0..32 {
                     let haystack: &[u8] = if (thread_index + iteration) % 2 == 0 {
                         b"xxxxxxxxabacabacz"
@@ -22405,13 +22480,13 @@ mod tests {
                     let expected = (thread_index + iteration) % 2 == 0;
                     assert_eq!(
                         regex
-                            .is_match_value(haystack, SearchLimits::unlimited())
+                            .is_match_value(haystack, limits)
                             .expect("concurrent existence search succeeds"),
                         expected,
                     );
                     assert_eq!(
                         regex
-                            .find_value(haystack, SearchLimits::unlimited())
+                            .find_value(haystack, limits)
                             .expect("concurrent span search succeeds")
                             .is_some(),
                         expected,
@@ -22449,21 +22524,23 @@ mod tests {
                 .expect("one-shot reference succeeds")
                 .0;
             let expected_exists = expected.is_some();
-            for _ in 0..3 {
-                assert_eq!(
-                    regex
-                        .find_window_value(haystack, window, SearchLimits::unlimited())
-                        .expect("pooled nullable/contextual search succeeds"),
-                    expected,
-                    "pattern {pattern:?}",
-                );
-                assert_eq!(
-                    regex
-                        .is_match_window_value(haystack, window, SearchLimits::unlimited())
-                        .expect("pooled nullable/contextual existence succeeds"),
-                    expected_exists,
-                    "pattern {pattern:?}",
-                );
+            for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+                for _ in 0..3 {
+                    assert_eq!(
+                        regex
+                            .find_window_value(haystack, window, limits)
+                            .expect("pooled nullable/contextual search succeeds"),
+                        expected,
+                        "pattern {pattern:?}",
+                    );
+                    assert_eq!(
+                        regex
+                            .is_match_window_value(haystack, window, limits)
+                            .expect("pooled nullable/contextual existence succeeds"),
+                        expected_exists,
+                        "pattern {pattern:?}",
+                    );
+                }
             }
         }
     }

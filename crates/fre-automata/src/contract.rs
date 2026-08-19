@@ -683,8 +683,9 @@ impl Automaton {
     /// # Errors
     ///
     /// Returns [`SearchError`] if execution with a successfully checked-out
-    /// workspace fails. Invalid windows and finite limits decline before any
-    /// pooled execution so the caller's canonical path remains authoritative.
+    /// workspace fails. Invalid windows and custom finite limits decline
+    /// before pooled execution, while the exact default finite envelope
+    /// charges cold workspace construction on its first successful attempt.
     #[doc(hidden)]
     pub fn search_window_with_optional_pooled_exists_value(
         &self,
@@ -695,26 +696,46 @@ impl Automaton {
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Option<bool>, SearchError> {
-        if limits != SearchLimits::unlimited()
+        if (limits != SearchLimits::unlimited() && limits != SearchLimits::default())
             || window.start() > window.end()
             || window.end() > haystack.len()
         {
             return Ok(None);
         }
-        let Some(mut workspace) =
-            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        let checkout = self.try_checkout_pooled_workspace_with_setup(
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+        );
+        let Some(mut checkout) = (match checkout {
+            Ok(checkout) => checkout,
+            Err(_) if limits == SearchLimits::unlimited() => return Ok(None),
+            Err(error) => return Err(error),
+        })
         else {
             return Ok(None);
         };
-        let result = crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
-            self,
-            haystack,
-            window,
-            &mut workspace,
-            limits,
-        );
+        let result = match (limits == SearchLimits::default(), checkout.cold_setup) {
+            (true, Some(setup)) => {
+                crate::k0::search_prevalidated_exists_value_with_authenticated_workspace_and_setup(
+                    self,
+                    haystack,
+                    window,
+                    &mut checkout.workspace,
+                    limits,
+                    setup,
+                )
+            }
+            _ => crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+                self,
+                haystack,
+                window,
+                &mut checkout.workspace,
+                limits,
+            ),
+        };
         if result.is_ok() {
-            self.return_pooled_workspace(workspace);
+            self.return_pooled_workspace(checkout.workspace);
         }
         result.map(Some)
     }
@@ -740,26 +761,46 @@ impl Automaton {
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Option<Option<MatchSpan>>, SearchError> {
-        if limits != SearchLimits::unlimited()
+        if (limits != SearchLimits::unlimited() && limits != SearchLimits::default())
             || window.start() > window.end()
             || window.end() > haystack.len()
         {
             return Ok(None);
         }
-        let Some(mut workspace) =
-            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        let checkout = self.try_checkout_pooled_workspace_with_setup(
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+        );
+        let Some(mut checkout) = (match checkout {
+            Ok(checkout) => checkout,
+            Err(_) if limits == SearchLimits::unlimited() => return Ok(None),
+            Err(error) => return Err(error),
+        })
         else {
             return Ok(None);
         };
-        let result = crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
-            self,
-            haystack,
-            window,
-            &mut workspace,
-            limits,
-        );
+        let result = match (limits == SearchLimits::default(), checkout.cold_setup) {
+            (true, Some(setup)) => {
+                crate::k0::search_prevalidated_span_value_with_authenticated_workspace_and_setup(
+                    self,
+                    haystack,
+                    window,
+                    &mut checkout.workspace,
+                    limits,
+                    setup,
+                )
+            }
+            _ => crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+                self,
+                haystack,
+                window,
+                &mut checkout.workspace,
+                limits,
+            ),
+        };
         if result.is_ok() {
-            self.return_pooled_workspace(workspace);
+            self.return_pooled_workspace(checkout.workspace);
         }
         result.map(Some)
     }

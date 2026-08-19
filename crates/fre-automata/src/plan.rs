@@ -17,7 +17,7 @@ use fre_simd_kernels::{
 use fre_simd_kernels::{AsciiByteSetRunScanner, ASCII_RUN_SCANNER_BUILD_WORK};
 
 use crate::{
-    CompileError, MalformedPlan, Operation, ResourceKind, SearchError, TypedPlan,
+    CompileError, MalformedPlan, Operation, ResourceKind, SearchError, SetupAccounting, TypedPlan,
     WorkspaceLayout, WorkspaceLimits,
 };
 use crate::K0Workspace;
@@ -1140,6 +1140,17 @@ pub struct Automaton {
     stats: PlanStats,
 }
 
+/// One workspace checked out of an automaton-owned value cache.
+///
+/// A cold checkout carries the workspace's exact construction receipt so a
+/// finite first search can charge that setup before touching the source. A
+/// warm checkout carries no setup because an earlier successful invocation
+/// retained the workspace.
+pub(crate) struct PooledWorkspaceCheckout {
+    pub(crate) workspace: K0Workspace,
+    pub(crate) cold_setup: Option<SetupAccounting>,
+}
+
 impl Clone for Automaton {
     fn clone(&self) -> Self {
         Self {
@@ -1204,13 +1215,22 @@ impl Automaton {
             && workspace.retained_bytes() <= payload_limits.max_scratch_bytes
     }
 
+    fn pooled_workspace_mandatory_layout_fits(
+        &self,
+        limits: WorkspaceLimits,
+    ) -> Result<bool, SearchError> {
+        let layout = WorkspaceLayout::for_automaton(self)?;
+        Ok(layout.construction_work() <= limits.max_setup_work
+            && layout.logical_bytes() <= limits.max_scratch_bytes)
+    }
+
     fn try_checkout_pooled_workspace_with<A>(
         &self,
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
         bidirectional: bool,
         allocate_owner: A,
-    ) -> Option<K0Workspace>
+    ) -> Result<Option<PooledWorkspaceCheckout>, SearchError>
     where
         A: FnOnce(
             Mutex<Option<K0Workspace>>,
@@ -1219,49 +1239,111 @@ impl Automaton {
             (fre_exact_alloc::CopyError, Mutex<Option<K0Workspace>>),
         >,
     {
-        let payload_limits = Self::pooled_workspace_payload_limits(limits)?;
+        let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
+            return Ok(None);
+        };
         if let Some(owner) = self.pooled_workspace.get() {
-            let mut slot = owner.lock().ok()?;
+            let Ok(mut slot) = owner.lock() else {
+                return Ok(None);
+            };
             if let Some(workspace) = slot.take() {
                 if Self::pooled_workspace_fits(&workspace, limits) {
-                    return Some(workspace);
+                    return Ok(Some(PooledWorkspaceCheckout {
+                        workspace,
+                        cold_setup: None,
+                    }));
                 }
                 *slot = Some(workspace);
-                return None;
+                return Ok(None);
             }
             drop(slot);
-            return K0Workspace::new_selected(
+            // The optional selected session may have a tighter setup envelope
+            // than the canonical one-shot call. Decline before allocating
+            // when even its mandatory Pike layout cannot fit; a populated hot
+            // slot above never recomputes this cold layout.
+            if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+                return Ok(None);
+            }
+            let workspace = K0Workspace::new_selected(
                 self,
                 payload_limits,
                 endpoint_eligible,
                 bidirectional,
-            )
-            .ok();
+            )?;
+            return Ok(Some(PooledWorkspaceCheckout {
+                cold_setup: Some(workspace.construction_accounting()),
+                workspace,
+            }));
         }
 
         // Construct the complete selected workspace before allocating or
-        // publishing its owner. A layout/resource/allocation refusal therefore
-        // leaves no empty retained cache behind and the facade can run its
-        // canonical one-shot path with the original envelope.
+        // publishing its owner. A refusal therefore leaves no empty retained
+        // cache behind. Result-bearing finite callers propagate that setup
+        // failure; legacy unlimited optional callers may still decline to
+        // their canonical path.
+        if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+            return Ok(None);
+        }
         let workspace =
-            K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)
-                .ok()?;
+            K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)?;
         let owner = match allocate_owner(Mutex::new(None)) {
             Ok(owner) => owner,
             Err((_error, owner)) => {
                 drop(owner);
-                drop(workspace);
-                return None;
+                // Workspace construction has already consumed the caller's
+                // finite setup transaction. Execute this exact workspace
+                // uncached instead of declining into a second construction.
+                return Ok(Some(PooledWorkspaceCheckout {
+                    cold_setup: Some(workspace.construction_accounting()),
+                    workspace,
+                }));
             }
         };
         // Publish an empty slot while returning the fully constructed
         // workspace to this invocation. Concurrent first users keep their own
         // bounded workspace; only a successful search later wins the slot.
+        let cold_setup = workspace.construction_accounting();
         match self.pooled_workspace.set(owner) {
-            Ok(()) => Some(workspace),
+            Ok(()) => {
+                let owner_bytes = Self::pooled_workspace_owner_bytes();
+                let cold_setup = SetupAccounting {
+                    work: cold_setup
+                        .work
+                        .checked_add(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "pooled workspace owner publication work",
+                        })?,
+                    allocated_bytes: cold_setup
+                        .allocated_bytes
+                        .checked_add(owner_bytes)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "pooled workspace owner allocated bytes",
+                        })?,
+                    initialized_bytes: cold_setup
+                        .initialized_bytes
+                        .checked_add(owner_bytes)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "pooled workspace owner initialized bytes",
+                        })?,
+                    retained_bytes: cold_setup
+                        .retained_bytes
+                        .checked_add(owner_bytes)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "pooled workspace owner retained bytes",
+                        })?,
+                    reused: false,
+                };
+                Ok(Some(PooledWorkspaceCheckout {
+                    workspace,
+                    cold_setup: Some(cold_setup),
+                }))
+            }
             Err(owner) => {
                 drop(owner);
-                Some(workspace)
+                Ok(Some(PooledWorkspaceCheckout {
+                    workspace,
+                    cold_setup: Some(cold_setup),
+                }))
             }
         }
     }
@@ -1271,15 +1353,36 @@ impl Automaton {
     ///
     /// The mutex is held only while moving the workspace out of its slot.
     /// Concurrent searches therefore create independent bounded workspaces
-    /// instead of serializing execution. Allocation failure or a poisoned
-    /// owner declines this optional acceleration so the facade can use its
-    /// canonical one-shot path.
+    /// instead of serializing execution. A poisoned owner or workspace
+    /// construction failure declines this legacy optional acceleration. If
+    /// only owner allocation fails after workspace construction, the already
+    /// charged workspace is returned for one uncached execution.
     pub(crate) fn try_checkout_pooled_workspace(
         &self,
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Option<K0Workspace> {
+        self.try_checkout_pooled_workspace_with(
+            limits,
+            endpoint_eligible,
+            bidirectional,
+            fre_exact_alloc::try_box_preserve,
+        )
+        .ok()
+        .flatten()
+        .map(|checkout| checkout.workspace)
+    }
+
+    /// Check out optional value-only scratch while preserving whether this
+    /// invocation constructed it. Finite default searches consume the cold
+    /// receipt; unlimited callers retain their existing value-only fast path.
+    pub(crate) fn try_checkout_pooled_workspace_with_setup(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<PooledWorkspaceCheckout>, SearchError> {
         self.try_checkout_pooled_workspace_with(
             limits,
             endpoint_eligible,
@@ -2536,7 +2639,8 @@ mod tests {
                     true,
                     |owner| Err((fre_exact_alloc::CopyError::AllocationFailed, owner)),
                 )
-                .is_none()
+                .expect("workspace construction remains executable")
+                .is_some()
         );
         assert!(allocation_failed.pooled_workspace.get().is_none());
 

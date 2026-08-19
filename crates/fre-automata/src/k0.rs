@@ -16689,6 +16689,38 @@ pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace(
     .map(|report| report.found.is_some())
 }
 
+/// Execute the cold half of an automaton-owned value-cache transaction.
+///
+/// Unlike the warm value entry above, this seeds the invocation meter with
+/// the selected workspace's construction receipt. A finite default call thus
+/// preserves checked setup/work behavior while hiding the retained session
+/// from callers.
+pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace_and_setup(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+) -> Result<bool, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "cold pooled K0 workspace belongs to another automaton",
+        });
+    }
+    execute(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        OutputContract::Exists,
+        true,
+    )
+    .map(|report| report.found.is_some())
+}
+
 pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
     automaton: &Automaton,
     haystack: &[u8],
@@ -16754,6 +16786,34 @@ pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
         limits,
         OutputContract::Span,
         capabilities,
+    )
+    .map(|report| report.found)
+}
+
+/// Cold, setup-accounted counterpart to
+/// [`search_prevalidated_span_value_with_authenticated_workspace`].
+pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace_and_setup(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+) -> Result<Option<MatchSpan>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "cold pooled K0 workspace belongs to another automaton",
+        });
+    }
+    execute(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        OutputContract::Span,
+        true,
     )
     .map(|report| report.found)
 }

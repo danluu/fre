@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 /// Stable deterministic correctness-report schema.
 pub const REPORT_SCHEMA: &str = "fre.holdout.correctness.v1";
 /// Stable non-normative timing-diagnostic schema.
-pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v2";
+pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v3";
 /// Stable committed suite schema.
 pub const SUITE_SCHEMA: &str = "fre.holdout.suite.v1";
 /// Stable digest sidecar schema.
@@ -1783,10 +1783,10 @@ pub fn run_performance(
             "warmup and measurement are independent complete sweeps in repetition-major, ascending input-ordinal order; every case input receives the policy repetition count"
                 .to_string(),
         measurement_scope:
-            "search elapsed_ns spans the engine API call plus semantic value extraction; error classification and report construction occur after the clock sample"
+            "search elapsed_ns spans the result-only engine API call plus semantic value extraction; FRE uses find_value/is_match_value/selected_end_value with default checked limits, Rust-regex uses find/is_match, and error classification and report construction occur after the clock sample"
                 .to_string(),
         selected_end_adapter:
-            "Rust-regex has no selected_end method; its baseline invokes find once and maps the selected match to end, while FRE invokes selected_end"
+            "Rust-regex has no selected_end method; both baselines invoke their result-only selected-span path once and map the selected match to end (Rust find, FRE selected_end_value)"
                 .to_string(),
         builds,
         operations,
@@ -1956,7 +1956,7 @@ fn measure_fre_search(
 ) -> (u64, &'static str) {
     let started = Instant::now();
     let raw = catch_unwind(AssertUnwindSafe(|| {
-        execute_candidate_inner(regex, haystack, operation, SearchLimits::default())
+        execute_candidate_value_inner(regex, haystack, operation, SearchLimits::default())
     }));
     let elapsed = elapsed_ns(started);
     let state = match &raw {
@@ -1968,6 +1968,28 @@ fn measure_fre_search(
     };
     let _ = black_box(raw);
     (elapsed, state)
+}
+
+fn execute_candidate_value_inner(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    operation: Operation,
+    limits: SearchLimits,
+) -> Result<SemanticValue, SearchError> {
+    match operation {
+        Operation::Find => regex.find_value(haystack, limits).map(|matched| {
+            SemanticValue::Span(matched.map(|matched| SpanValue {
+                start: matched.start(),
+                end: matched.end(),
+            }))
+        }),
+        Operation::Exists => regex
+            .is_match_value(haystack, limits)
+            .map(SemanticValue::Boolean),
+        Operation::SelectedEnd => regex
+            .selected_end_value(haystack, limits)
+            .map(SemanticValue::End),
+    }
 }
 
 fn build_timing_oracle(pattern: &str) -> Result<Regex, String> {
@@ -2188,6 +2210,35 @@ mod tests {
             visits.push((repetition_index, input.ordinal));
         });
         assert_eq!(visits, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn performance_value_surface_matches_accounting_correctness_surface() {
+        for (pattern, haystack) in [
+            (r"(?:a+b|a)", b"xxaaabyy".as_slice()),
+            (r"(?m:^a+)", b"z\naaa\nz".as_slice()),
+            (r"a{0,100}b", b"aaaaaaaaab".as_slice()),
+        ] {
+            let regex = build_candidate(pattern).expect("comparison fixture builds");
+            for operation in [Operation::Find, Operation::Exists, Operation::SelectedEnd] {
+                let accounted = execute_candidate_inner(
+                    &regex,
+                    haystack,
+                    operation,
+                    SearchLimits::default(),
+                )
+                .expect("accounting correctness surface executes")
+                .0;
+                let value = execute_candidate_value_inner(
+                    &regex,
+                    haystack,
+                    operation,
+                    SearchLimits::default(),
+                )
+                .expect("value performance surface executes");
+                assert_eq!(value, accounted, "pattern={pattern:?} operation={operation:?}");
+            }
+        }
     }
 
     #[test]

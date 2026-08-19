@@ -1,0 +1,71 @@
+#![forbid(unsafe_code)]
+
+use std::alloc::System;
+
+use fre::{PlanSelection, PortableBuilder, SearchLimits};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+#[test]
+fn default_k0_value_calls_reuse_scratch_while_custom_limits_remain_one_shot() {
+    let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .unwrap();
+    let haystack = b"xxxxxxxxabacabacz";
+    let limits = SearchLimits::default();
+
+    let cold = Region::new(GLOBAL);
+    assert_eq!(
+        regex
+            .find_value(haystack, limits)
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end())),
+        Some((8, 17)),
+    );
+    let cold_change = cold.change();
+    assert!(cold_change.allocations > 0);
+
+    let warm = Region::new(GLOBAL);
+    for _ in 0..32 {
+        assert_eq!(
+            regex
+                .find_value(haystack, limits)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((8, 17)),
+        );
+        assert!(regex.is_match_value(haystack, limits).unwrap());
+        assert_eq!(
+            regex.selected_end_value(haystack, limits).unwrap(),
+            Some(17)
+        );
+    }
+    assert_eq!(warm.change(), Stats::default());
+
+    let custom_regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .unwrap();
+    let haystack = b"xxxxxxxxabacabacz";
+    let limits = SearchLimits {
+        max_work: SearchLimits::default().max_work - 1,
+        ..SearchLimits::default()
+    };
+
+    for _ in 0..2 {
+        let call = Region::new(GLOBAL);
+        assert_eq!(
+            custom_regex
+                .find_value(haystack, limits)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((8, 17)),
+        );
+        assert!(call.change().allocations > 0);
+    }
+}
