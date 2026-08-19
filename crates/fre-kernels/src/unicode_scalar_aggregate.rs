@@ -50,6 +50,14 @@ pub const CURSOR_COUNT_PLAN_ID: &str =
 /// Stable identity for the cursor Count reduction.
 pub const CURSOR_COUNT_OPERATION_ID: &str =
     "unicode-scalar-aggregate.count.leading-byte-cursor.v1";
+/// Number of bytes that can begin a valid Unicode scalar: all 128 ASCII
+/// bytes plus the 51 canonical multi-byte leads `0xC2..=0xF4`.
+pub const LEGAL_SCALAR_START_BYTE_COUNT: usize = 179;
+/// Construction-only selectivity ceiling for the Count cursor. At most half
+/// of the legal scalar-start byte domain may enter the cursor; broader masks
+/// retain the already-built scalar owner instead.
+pub const CURSOR_COUNT_MAX_LEADING_BYTE_COUNT: usize =
+    LEGAL_SCALAR_START_BYTE_COUNT / 2;
 /// Exact byte-value probes used to select a sparse or fixed-table leading
 /// search during construction.
 pub const SEARCH_LEADING_SELECTION_WORK: usize = 256;
@@ -3503,6 +3511,41 @@ pub struct UnicodeScalarSearchPlan {
     build: SearchBuildAccounting,
 }
 
+/// Construction-selected owner for Unicode scalar Count.
+///
+/// Both variants retain the one scalar plan materialized by the attempt. A
+/// broad leading-byte mask publishes that plan directly, without allocating
+/// or initializing a cursor wrapper or classifier.
+#[derive(Debug)]
+pub enum CursorCountBuild {
+    Cursor {
+        plan: UnicodeScalarSearchPlan,
+        leading_byte_count: usize,
+    },
+    Scalar {
+        plan: UnicodeScalarAggregatePlan,
+        leading_byte_count: usize,
+    },
+}
+
+impl CursorCountBuild {
+    /// Exact cardinality of the conservative leading-byte mask derived from
+    /// the retained canonical scalar ranges.
+    #[must_use]
+    pub const fn leading_byte_count(&self) -> usize {
+        match self {
+            Self::Cursor {
+                leading_byte_count,
+                ..
+            }
+            | Self::Scalar {
+                leading_byte_count,
+                ..
+            } => *leading_byte_count,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeadingByteSearch {
     Classifier,
@@ -3590,6 +3633,58 @@ impl UnicodeScalarSearchPlan {
         greedy: bool,
         limits: BuildLimits,
     ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let attempt = Self::build_repeated_routed_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            minimum,
+            maximum,
+            greedy,
+            LEGAL_SCALAR_START_BYTE_COUNT,
+            limits,
+        )?;
+        let (selection, actual) = attempt.into_parts();
+        let CursorCountBuild::Cursor { plan, .. } = selection else {
+            unreachable!("every canonical scalar class fits the legal start-byte domain")
+        };
+        Ok(DirectBuildAttempt::new(plan, actual))
+    }
+
+    /// Build the Count owner selected by the fixed source-independent
+    /// leading-byte cardinality gate. Broad masks publish the already-built
+    /// scalar plan; selective masks retain the cursor wrapper.
+    pub fn build_repeated_count_attempt_with_dispatch(
+        dispatch: SimdDispatchContext,
+        ranges: impl IntoIterator<Item = (char, char)>,
+        minimum: u32,
+        maximum: Option<u32>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<CursorCountBuild>, DirectBuildAttemptError<BuildError>> {
+        Self::build_repeated_routed_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            minimum,
+            maximum,
+            greedy,
+            CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private routed attempt keeps scalar ownership, exact selection work, wrapper construction, and every terminal effect in one transaction"
+    )]
+    fn build_repeated_routed_attempt_with_dispatch(
+        dispatch: SimdDispatchContext,
+        ranges: impl IntoIterator<Item = (char, char)>,
+        minimum: u32,
+        maximum: Option<u32>,
+        greedy: bool,
+        max_leading_byte_count: usize,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<CursorCountBuild>, DirectBuildAttemptError<BuildError>> {
         let attempt = UnicodeScalarAggregatePlan::build_repeated_attempt(
             ranges, minimum, maximum, greedy, limits,
         )?;
@@ -3598,9 +3693,9 @@ impl UnicodeScalarSearchPlan {
             let scalar_build = scalar.build_accounting();
             debug_assert_eq!(actual.work, u64::try_from(scalar_build.work).unwrap_or(u64::MAX));
             debug_assert_eq!(actual.live_persistent_bytes, scalar_build.persistent_bytes);
-
             let (leading_set, leading_byte_derivation_work) = scalar.leading_byte_set()?;
-            let leading_search = select_leading_byte_search(leading_set);
+            let (leading_search, leading_byte_count) =
+                select_leading_byte_search_and_cardinality(leading_set);
             let leading_byte_derivation_work = leading_byte_derivation_work
                 .checked_add(SEARCH_LEADING_SELECTION_WORK)
                 .ok_or(BuildError::ArithmeticOverflow {
@@ -3616,6 +3711,30 @@ impl UnicodeScalarSearchPlan {
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "actual Unicode scalar leading-search work",
                 })?;
+
+            let routed_scalar_work = scalar_build
+                .work
+                .checked_add(leading_byte_derivation_work)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "Unicode scalar Count routing work",
+                })?;
+            enforce_build(
+                routed_scalar_work,
+                limits.max_build_work,
+                BuildResource::Work,
+            )?;
+            if leading_byte_count > max_leading_byte_count {
+                let mut scalar = scalar;
+                scalar.build.work = routed_scalar_work;
+                debug_assert_eq!(
+                    actual.work,
+                    u64::try_from(scalar.build.work).unwrap_or(u64::MAX)
+                );
+                return Ok(CursorCountBuild::Scalar {
+                    plan: scalar,
+                    leading_byte_count,
+                });
+            }
 
             let leading = dispatch
                 .byte_set_classifier(leading_set, DispatchPolicy::Auto)
@@ -3635,10 +3754,8 @@ impl UnicodeScalarSearchPlan {
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "actual Unicode scalar search build work",
                 })?;
-            let work = scalar_build
-                .work
-                .checked_add(leading_byte_derivation_work)
-                .and_then(|work| work.checked_add(leading_byte_classifier_build_work))
+            let work = routed_scalar_work
+                .checked_add(leading_byte_classifier_build_work)
                 .and_then(|work| work.checked_add(1))
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "Unicode scalar search build work",
@@ -3683,11 +3800,14 @@ impl UnicodeScalarSearchPlan {
                 })?;
             actual.live_persistent_bytes = persistent_bytes;
             actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
-            Ok(Self {
-                scalar,
-                leading,
-                leading_search,
-                build,
+            Ok(CursorCountBuild::Cursor {
+                plan: Self {
+                    scalar,
+                    leading,
+                    leading_search,
+                    build,
+                },
+                leading_byte_count,
             })
         })();
         match result {
@@ -4324,7 +4444,9 @@ impl UnicodeScalarAggregatePlan {
     clippy::arithmetic_side_effects,
     reason = "the complete byte domain bounds the member count to 256"
 )]
-fn select_leading_byte_search(set: ByteSet256) -> LeadingByteSearch {
+fn select_leading_byte_search_and_cardinality(
+    set: ByteSet256,
+) -> (LeadingByteSearch, usize) {
     let mut selected = [0_u8; 16];
     let mut count = 0_usize;
     for value in 0_u16..=u16::from(u8::MAX) {
@@ -4336,7 +4458,7 @@ fn select_leading_byte_search(set: ByteSet256) -> LeadingByteSearch {
             count += 1;
         }
     }
-    match count {
+    let search = match count {
         1 => LeadingByteSearch::One(selected[0]),
         2 => LeadingByteSearch::Two(selected[0], selected[1]),
         3 => LeadingByteSearch::Three(selected[0], selected[1], selected[2]),
@@ -4363,7 +4485,8 @@ fn select_leading_byte_search(set: ByteSet256) -> LeadingByteSearch {
         )))]
         4..=16 => LeadingByteSearch::Classifier,
         _ => LeadingByteSearch::Classifier,
-    }
+    };
+    (search, count)
 }
 
 impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
@@ -4861,12 +4984,14 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, CURSOR_COUNT_DENSE_MAX_MEAN_BYTES,
-        CURSOR_COUNT_DENSE_SAMPLE_MATCHES, CURSOR_COUNT_OPERATION_ID, CURSOR_COUNT_PLAN_ID,
+        CURSOR_COUNT_DENSE_SAMPLE_MATCHES, CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+        CURSOR_COUNT_OPERATION_ID, CURSOR_COUNT_PLAN_ID, CursorCountBuild,
         DISPATCHED_PLAN_ID, DecodedScalar,
         DispatchedUnicodeScalarAggregatePlan, LeadingByteSearch, NoExecutionMeter, Operation,
         PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
         REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceActualCounters, ReduceError,
-        ReduceLimits, Repetition, SEARCH_PLAN_ID, SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP,
+        ReduceLimits, Repetition, SEARCH_LEADING_SELECTION_WORK, SEARCH_PLAN_ID,
+        SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP,
         SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES, SEARCH_VALUE_PREFLIGHT_WORK_FACTOR,
         SIMD_ASCII_CLASSIFIER_BUILD_WORK, SearchError, SearchLimits, UnicodeScalarAggregatePlan,
         UnicodeScalarSearchPlan, ValueReduction, binary_search_comparison_bound, decode_scalar,
@@ -4880,7 +5005,7 @@ mod tests {
         target_feature = "sve",
         target_feature = "sve2"
     ))]
-    use super::select_leading_byte_search;
+    use super::select_leading_byte_search_and_cardinality;
     #[cfg(all(
         feature = "static-dispatch-arm-41-d84",
         target_arch = "aarch64",
@@ -6750,18 +6875,25 @@ mod tests {
     ))]
     #[test]
     fn leading_search_small_table_boundary_is_sixteen_values() {
-        let sixteen = select_leading_byte_search(ByteSet256::from_words([
+        let sixteen = select_leading_byte_search_and_cardinality(ByteSet256::from_words([
             (1_u64 << 16) - 1,
             0,
             0,
             0,
-        ]));
+        ]))
+        .0;
         let LeadingByteSearch::Small(values) = sixteen else {
             panic!("sixteen values did not select the fixed table");
         };
         assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         assert_eq!(
-            select_leading_byte_search(ByteSet256::from_words([(1_u64 << 17) - 1, 0, 0, 0])),
+            select_leading_byte_search_and_cardinality(ByteSet256::from_words([
+                (1_u64 << 17) - 1,
+                0,
+                0,
+                0,
+            ]))
+            .0,
             LeadingByteSearch::Classifier,
         );
     }
@@ -7162,6 +7294,123 @@ mod tests {
             )
             .unwrap();
         assert!(accounting.actual.leading_block_classifications > 0);
+    }
+
+    #[test]
+    fn scalar_cursor_count_route_is_exact_at_89_and_reuses_scalar_at_90() {
+        assert_eq!(CURSOR_COUNT_MAX_LEADING_BYTE_COUNT, 89);
+        let dispatch = SimdDispatchContext::capture();
+        let exact = UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+            dispatch,
+            [('\0', 'W'), ('\u{80}', '\u{80}')],
+            1,
+            None,
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(matches!(
+            exact.into_plan(),
+            CursorCountBuild::Cursor {
+                leading_byte_count: 89,
+                ..
+            }
+        ));
+
+        let scalar_attempt = UnicodeScalarAggregatePlan::build_one_or_more_attempt(
+            [('\0', 'X'), ('\u{80}', '\u{80}')],
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let scalar_actual = scalar_attempt.actual();
+        let scalar_build = scalar_attempt.into_plan().build_accounting();
+        let broad = UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+            dispatch,
+            [('\0', 'X'), ('\u{80}', '\u{80}')],
+            1,
+            None,
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let broad_actual = broad.actual();
+        let CursorCountBuild::Scalar {
+            plan,
+            leading_byte_count,
+        } = broad.into_plan()
+        else {
+            panic!("90 leading bytes retained a cursor wrapper")
+        };
+        assert_eq!(leading_byte_count, 90);
+        let build = plan.build_accounting();
+        let routing_work = SEARCH_LEADING_SELECTION_WORK + 2 + 51;
+        assert_eq!(build.work, scalar_build.work + routing_work);
+        assert!(scalar_actual.allocations > 0);
+        assert!(scalar_actual.allocated_bytes > 0);
+        assert_eq!(broad_actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(broad_actual.allocations, scalar_actual.allocations);
+        assert_eq!(broad_actual.allocated_bytes, scalar_actual.allocated_bytes);
+        assert_eq!(broad_actual.copied_bytes, scalar_actual.copied_bytes);
+        assert_eq!(broad_actual.initialized_bytes, scalar_actual.initialized_bytes);
+        assert_eq!(broad_actual.live_persistent_bytes, scalar_actual.live_persistent_bytes);
+        assert_eq!(broad_actual.peak_bytes, scalar_actual.peak_bytes);
+        assert_eq!(build.persistent_bytes, scalar_build.persistent_bytes);
+        assert_eq!(build.peak_bytes, scalar_build.peak_bytes);
+
+        let exact_limits = BuildLimits {
+            max_build_work: build.work,
+            max_persistent_bytes: scalar_build.persistent_bytes,
+            max_peak_bytes: scalar_build.peak_bytes,
+            ..BuildLimits::unlimited()
+        };
+        let exact_quota = UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+            dispatch,
+            [('\0', 'X'), ('\u{80}', '\u{80}')],
+            1,
+            None,
+            true,
+            exact_limits,
+        )
+        .unwrap();
+        assert_eq!(exact_quota.actual(), broad_actual);
+        assert!(matches!(
+            exact_quota.into_plan(),
+            CursorCountBuild::Scalar {
+                leading_byte_count: 90,
+                ..
+            }
+        ));
+
+        let one_below = UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+            dispatch,
+            [('\0', 'X'), ('\u{80}', '\u{80}')],
+            1,
+            None,
+            true,
+            BuildLimits {
+                max_build_work: build.work - 1,
+                max_persistent_bytes: scalar_build.persistent_bytes,
+                max_peak_bytes: scalar_build.peak_bytes,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            one_below.source(),
+            &BuildError::WorkLimit {
+                needed: build.work,
+                limit: build.work - 1,
+            }
+        );
+        let refused = one_below.actual();
+        assert_eq!(refused.work, broad_actual.work);
+        assert_eq!(refused.allocations, scalar_actual.allocations);
+        assert_eq!(refused.allocated_bytes, scalar_actual.allocated_bytes);
+        assert_eq!(refused.copied_bytes, scalar_actual.copied_bytes);
+        assert_eq!(refused.initialized_bytes, scalar_actual.initialized_bytes);
+        assert_eq!(refused.live_persistent_bytes, 0);
+        assert_eq!(refused.peak_bytes, scalar_actual.peak_bytes);
     }
 
     #[test]

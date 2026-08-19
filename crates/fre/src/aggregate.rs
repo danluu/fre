@@ -159,7 +159,8 @@ use fre_kernels::{
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateSpanSumResult,
     UnicodeScalarAggregateUpperBounds, UnicodeScalarCursorCountAccounting,
-    UnicodeScalarCursorCountResult, UnicodeScalarCursorCountUpperBounds,
+    UnicodeScalarCursorCountBuild, UnicodeScalarCursorCountResult,
+    UnicodeScalarCursorCountUpperBounds,
     UnicodeScalarSearchBuildAccounting, UnicodeScalarSearchPlan,
     UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID, UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID, Window,
 };
@@ -11051,34 +11052,51 @@ impl AggregateBuilder {
                             (minimum, maximum, false)
                         }
                     };
-                    let attempt = UnicodeScalarSearchPlan::build_repeated_attempt_with_dispatch(
-                        simd_dispatch,
-                        ranges(),
-                        minimum,
-                        maximum,
-                        greedy,
-                        limits.unicode_scalar,
-                    )
-                    .map_err(|error| {
-                        construction.pending_terminal_effect =
-                            direct_build_stage_effect(work, error.actual());
-                        AggregateBuildError::UnicodeScalarBuild {
-                            operation,
-                            selection,
-                            source: error.into_source(),
+                    let attempt =
+                        UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+                            simd_dispatch,
+                            ranges(),
+                            minimum,
+                            maximum,
+                            greedy,
+                            limits.unicode_scalar,
+                        )
+                        .map_err(|error| {
+                            construction.pending_terminal_effect =
+                                direct_build_stage_effect(work, error.actual());
+                            AggregateBuildError::UnicodeScalarBuild {
+                                operation,
+                                selection,
+                                source: error.into_source(),
+                            }
+                        })?;
+                    let (selected, actual) = attempt.into_parts();
+                    match selected {
+                        UnicodeScalarCursorCountBuild::Cursor { plan: engine, .. } => {
+                            let build = engine.build_accounting();
+                            let kernel = engine.cursor_count_identity();
+                            let retained_capacity_bytes = build.persistent_bytes;
+                            (
+                                AggregateEngine::UnicodeScalarCursorCount(engine),
+                                actual,
+                                AggregateBuildAccounting::UnicodeScalarCursorCount(build),
+                                kernel,
+                                retained_capacity_bytes,
+                            )
                         }
-                    })?;
-                    let (engine, actual) = attempt.into_parts();
-                    let build = engine.build_accounting();
-                    let kernel = engine.cursor_count_identity();
-                    let retained_capacity_bytes = build.persistent_bytes;
-                    (
-                        AggregateEngine::UnicodeScalarCursorCount(engine),
-                        actual,
-                        AggregateBuildAccounting::UnicodeScalarCursorCount(build),
-                        kernel,
-                        retained_capacity_bytes,
-                    )
+                        UnicodeScalarCursorCountBuild::Scalar { plan: engine, .. } => {
+                            let build = engine.build_accounting();
+                            let kernel = engine.count_identity();
+                            let retained_capacity_bytes = build.persistent_bytes;
+                            (
+                                AggregateEngine::UnicodeScalar(engine),
+                                actual,
+                                AggregateBuildAccounting::UnicodeScalar(build),
+                                kernel,
+                                retained_capacity_bytes,
+                            )
+                        }
+                    }
                 } else {
                     let attempt = match repetition {
                         UnicodeScalarAggregateRepetition::ExactlyOne => {
@@ -25416,14 +25434,17 @@ mod tests {
         AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionIdentity,
         AggregateExecutionReport, AggregateExecutionSource, AggregateOperation,
         AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
-        CompatibilityProfile,
+        CanonicalPattern, CompatibilityProfile,
         DirectBuildAttemptActual, FixedAbsoluteDomainBuildActual,
         OrderedLiteralAggregateBuildError, RustProfile, TokenPhraseTopology,
-        UnicodeScalarInspectionError,
+        SimdDispatchContext, UnicodeScalarCursorCountBuild, UnicodeScalarInspection,
+        UnicodeScalarInspectionError, UnicodeScalarSearchPlan,
+        UnicodeScalarAggregateBuildLimits,
         charge_unicode_scalar_inspection_work, dense_finite_abandonment, direct_build_stage_effect,
         finite_build_limit_allows_continuation, fixed_absolute_construction_effect,
         fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
-        include_selected_plan_owner_effect, sparse_finite_abandonment,
+        include_selected_plan_owner_effect, inspect_unicode_scalar_class,
+        sparse_finite_abandonment,
     };
     use crate::AggregateConstructionLedgerEntry;
 
@@ -27156,6 +27177,69 @@ mod tests {
             Err(UnicodeScalarInspectionError::Overflow { .. })
         ));
         assert_eq!(work, usize::MAX);
+    }
+
+    #[test]
+    fn unicode_scalar_cursor_count_cohort_uses_parsed_hir_mask_cardinality() {
+        for (pattern, expected_count, expected_cursor) in [
+            (r"\p{Sm}", 13, true),
+            (r"\p{Greek}+", 7, true),
+            (r"(?:\p{Lowercase}|\p{Uppercase}){100}", 77, true),
+            (r"\p{L}{8,13}", 97, false),
+        ] {
+            let request = fre_syntax::ParseRequest::rust(
+                pattern,
+                CompatibilityProfile::RustBytes(RustProfile::rebar_1_12_4()),
+            );
+            let parsed = fre_syntax::parse(request).unwrap();
+            let CanonicalPattern::Rust(rust) = parsed.pattern else {
+                panic!("Rust request returned a non-Rust canonical pattern")
+            };
+            let UnicodeScalarInspection::Eligible {
+                class, repetition, ..
+            } = inspect_unicode_scalar_class(&rust.hir, usize::MAX, false)
+                .unwrap_or_else(|_| panic!("{pattern} scalar inspection failed"))
+            else {
+                panic!("{pattern} did not retain a canonical scalar class")
+            };
+            let (minimum, maximum, greedy) = match repetition {
+                super::UnicodeScalarAggregateRepetition::ExactlyOne => (1, Some(1), true),
+                super::UnicodeScalarAggregateRepetition::OneOrMoreGreedy => (1, None, true),
+                super::UnicodeScalarAggregateRepetition::OneOrMoreLazy => (1, None, false),
+                super::UnicodeScalarAggregateRepetition::RepeatedGreedy {
+                    minimum,
+                    maximum,
+                } => (minimum, maximum, true),
+                super::UnicodeScalarAggregateRepetition::RepeatedLazy {
+                    minimum,
+                    maximum,
+                } => (minimum, maximum, false),
+            };
+            let selection =
+                UnicodeScalarSearchPlan::build_repeated_count_attempt_with_dispatch(
+                    SimdDispatchContext::capture(),
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    minimum,
+                    maximum,
+                    greedy,
+                    UnicodeScalarAggregateBuildLimits::unlimited(),
+                )
+                .unwrap()
+                .into_plan();
+            assert_eq!(
+                selection.leading_byte_count(),
+                expected_count,
+                "pattern={pattern}",
+            );
+            assert_eq!(
+                matches!(selection, UnicodeScalarCursorCountBuild::Cursor { .. }),
+                expected_cursor,
+                "pattern={pattern}",
+            );
+        }
     }
 
     #[test]

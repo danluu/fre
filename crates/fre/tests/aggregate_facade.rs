@@ -18,7 +18,8 @@ use fre::{
     LiteralAggregateReduceError, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind,
     PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
     SimdDispatchContext, SimdFeature, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError, UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateRepetition, UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID,
     UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
@@ -2148,10 +2149,8 @@ fn assert_unicode_scalar_span_sum_route(pattern: &str, haystack: &[u8], expected
 
 #[test]
 fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum() {
-    let cases: [(&str, &[u8]); 2] = [
-        (r"\p{Greek}+", b"A--\xCE\xB1\xCE\xB2\xFF\xCE\xA9--Z"),
-        (r"(?s:.){2,3}?", b"a\n\xFF\xE9\x9B\xAA\x80bc"),
-    ];
+    let cases: [(&str, &[u8]); 1] =
+        [(r"\p{Greek}+", b"A--\xCE\xB1\xCE\xB2\xFF\xCE\xA9--Z")];
     for (pattern, haystack) in cases {
         let expected = upstream_profile(pattern, haystack, false, true);
         let expected_count = u64::try_from(expected.len()).unwrap();
@@ -2164,6 +2163,113 @@ fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum() {
         assert_unicode_scalar_cursor_compile_route(pattern, haystack, expected_count);
         assert_unicode_scalar_span_sum_route(pattern, haystack, expected_span_sum);
     }
+}
+
+#[test]
+fn unicode_scalar_cursor_count_gate_routes_the_corrected_campaign_cohorts() {
+    let usable = SimdDispatchContext::capture().capabilities().usable();
+    let sve2 = usable.contains(SimdFeature::ArmSve) && usable.contains(SimdFeature::ArmSve2);
+    for (pattern, expected_cursor) in [
+        (r"\p{Sm}", true),
+        (r"\p{Greek}+", true),
+        (r"(?:\p{Lowercase}|\p{Uppercase}){100}", true),
+        (r"\p{L}{8,13}", false),
+    ] {
+        for build in [
+            aggregate_builder(pattern).build_count().unwrap().build_report().build,
+            aggregate_builder(pattern)
+                .build_compile()
+                .unwrap()
+                .build_report()
+                .build,
+        ] {
+            if pattern == r"\p{Sm}" && sve2 {
+                assert!(matches!(build, AggregateBuildAccounting::UnicodeScalar(_)));
+            } else {
+                assert_eq!(
+                    matches!(
+                        build,
+                        AggregateBuildAccounting::UnicodeScalarCursorCount(_)
+                    ),
+                    expected_cursor,
+                    "pattern={pattern}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_scalar_cursor_count_broad_mask_falls_back_with_closed_identity_and_details() {
+    const PATTERN: &str = r"\p{L}{8,13}";
+    let haystack = b"abcdefgh--abcdefghijklm--\xD0\x90\xD0\x91\xD0\x92\xD0\x93\xD0\x94\xD0\x95\xD0\x96\xD0\x97--\xFFtail";
+    let expected = u64::try_from(upstream_profile(PATTERN, haystack, false, true).len()).unwrap();
+    let count = aggregate_builder(PATTERN).build_count().unwrap();
+    let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
+        panic!("broad scalar mask retained a cursor wrapper")
+    };
+    assert_eq!(build.persistent_bytes, count.build_report().retained_capacity_bytes);
+    let AggregatePlanIdentity::UnicodeScalar(identity) = count.build_report().plan_identity else {
+        panic!("broad scalar mask retained another semantic identity")
+    };
+    assert_eq!(
+        identity.kernel,
+        UnicodeScalarAggregateOperationIdentity::for_repetition(
+            UnicodeScalarAggregateOperation::Count,
+            UnicodeScalarAggregateRepetition::RepeatedGreedy {
+                minimum: 8,
+                maximum: Some(13),
+            },
+        )
+    );
+
+    let retained = count
+        .retained_full_window_upper_bounds(haystack.len())
+        .unwrap()
+        .expect("scalar fallback publishes a retained full-window envelope");
+    let fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalar(upper) = retained else {
+        panic!("scalar fallback published cursor bounds")
+    };
+    let admission = count
+        .prepare_unicode_scalar_count(haystack.len(), AggregateRunLimits::default())
+        .unwrap()
+        .expect("scalar fallback remains admission-capable");
+    assert_eq!(
+        count
+            .count_value_prepared_unicode_scalar(haystack, &admission)
+            .unwrap(),
+        expected,
+    );
+    let counted = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), expected);
+    assert!(counted.report().has_closed_direct_attempt());
+    let owner = counted
+        .report()
+        .direct_owner()
+        .expect("scalar fallback retains its direct owner");
+    assert_eq!(owner.identity().schema_version, 52);
+    assert_eq!(owner.identity().algorithm_version, 3);
+    assert_eq!(owner.identity().accounting_version, 2);
+    let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details() else {
+        panic!("scalar fallback published cursor execution details")
+    };
+    assert_eq!(accounting.upper_bounds, upper);
+    assert_eq!(accounting.actual.count, expected);
+
+    let compiled = aggregate_builder(PATTERN).build_compile().unwrap();
+    assert!(matches!(
+        compiled.build_report().build,
+        AggregateBuildAccounting::UnicodeScalar(_)
+    ));
+    assert_eq!(
+        compiled
+            .verify_count(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        expected,
+    );
 }
 
 #[test]
@@ -3430,34 +3536,39 @@ fn rebar_row_curated_10_bounded_repeat_context_complete_span_matrix() {
 
 #[test]
 fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
-    let cases: [(&str, &[u8], AggregateUnicodeScalarSemantics); 5] = [
+    let cases: [(&str, &[u8], AggregateUnicodeScalarSemantics, bool); 5] = [
         (
             r"\pL+",
             b"abc--\xCE\xB1\xCE\xB2\xFFZ",
             AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+            false,
         ),
         (
             r"\pL+?",
             b"abc--\xCE\xB1\xCE\xB2\xFFZ",
             AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False,
+            false,
         ),
         (
             r"(?P<run>[a-z]+)",
             b"ab--c\xFFde",
             AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+            true,
         ),
         (
             r"(?P<atom>[a-z])+?",
             b"ab--c\xFFde",
             AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False,
+            true,
         ),
         (
             r"(?s:.)+",
             b"A\n\xFF\xE9\x9B\xAA\x80Z",
             AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+            false,
         ),
     ];
-    for (pattern, haystack, semantics) in cases {
+    for (pattern, haystack, semantics, expected_cursor) in cases {
         let expected = upstream_profile(pattern, haystack, false, true);
         let expected_count = u64::try_from(expected.len()).unwrap();
         let expected_sum = expected
@@ -3476,24 +3587,36 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
                     && identity.kernel.repetition.is_run()
                     && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
         ));
-        let AggregateBuildAccounting::UnicodeScalarCursorCount(build) =
-            count.build_report().build
-        else {
-            panic!("scalar repetition selected another build family")
-        };
-        assert!(build.scalar.repetition.is_run());
+        match count.build_report().build {
+            AggregateBuildAccounting::UnicodeScalarCursorCount(build) => {
+                assert!(expected_cursor, "pattern={pattern:?}");
+                assert!(build.scalar.repetition.is_run());
+            }
+            AggregateBuildAccounting::UnicodeScalar(build) => {
+                assert!(!expected_cursor, "pattern={pattern:?}");
+                assert!(build.repetition.is_run());
+            }
+            _ => panic!("scalar repetition selected another build family"),
+        }
         let counted = count
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) =
-            counted.report().details()
-        else {
-            panic!("scalar repetition executed another family")
-        };
-        assert!(accounting.upper_bounds.reducer_steps > 0);
-        assert!(accounting.actual.search_calls <= accounting.upper_bounds.search_calls);
-        assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+        match counted.report().details() {
+            AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) => {
+                assert!(expected_cursor, "pattern={pattern:?}");
+                assert!(accounting.upper_bounds.reducer_steps > 0);
+                assert!(accounting.actual.search_calls <= accounting.upper_bounds.search_calls);
+                assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+            }
+            AggregateExecutionDetails::UnicodeScalar(accounting) => {
+                assert!(!expected_cursor, "pattern={pattern:?}");
+                assert!(accounting.upper_bounds.reducer_steps > 0);
+                assert!(accounting.actual.reducer_steps <= accounting.upper_bounds.reducer_steps);
+                assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+            }
+            _ => panic!("scalar repetition executed another family"),
+        }
 
         let sum = aggregate_builder(pattern).build_span_sum().unwrap();
         assert_eq!(

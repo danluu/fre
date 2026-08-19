@@ -1120,10 +1120,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; every timed operation retains the exact ByteSlice::lines and CRLF partition, allocates a fresh exact outer CaptureRecord array and one fresh exact complete numeric-group array per record for each line, initializes every present and absent slot, retains all records for one line through that line's complete materialization and inspection, then visits every record, numeric slot, and both endpoints of every present span; named or noncanonical HIRs and finite resource refusals retain the incumbent General capture regex and persistent history, malformed bytes retain each proved engine's existing semantics, and selection observes only HIR, options, limits, and the whole haystack length before source access without benchmark names, fixture hashes, expected results, or pre-timed source preparation",
         );
         identity.identity.push_str(
-            "; formal-unicode-scalar-cursor-count-v1 retains one canonical positive Unicode scalar repetition as an exact leading-byte search cursor with a one-way dense-stream handoff to its embedded scalar reducer, advancing the public aggregate explain schema to v52 and the direct-owner algorithm/accounting protocol to v3/v2",
+            "; formal-unicode-scalar-cursor-count-selectivity-cap-v1 builds one canonical positive Unicode scalar repetition owner, derives its conservative leading-byte mask once, and retains the exact cursor only when that mask contains at most 89 of the 179 legal scalar-start bytes; broader masks publish the already-built scalar owner without a cursor classifier or wrapper, advancing the public aggregate explain schema to v52 and the direct-owner algorithm/accounting protocol to v3/v2",
         );
         identity.availability.push_str(
-            "; non-SVE one-pattern Count and Compile select this owner solely from the canonical HIR, immutable dispatch snapshot, operation, and caller build policy; the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope is authenticated before source access, sparse matches retain the monotone cursor, dense matches cross once at a published match end, and SpanSum plus the existing SVE2 exactly-one owner remain unchanged; prepare_unicode_scalar_count deliberately returns Ok(None) for this cursor owner, so even at the formal at-most-4,096-byte prepared-admission threshold its first and steady timed public operations remain ordinary CountSingle calls using the cursor's authenticated full-window envelope rather than a prepared Unicode-scalar token",
+            "; non-SVE one-pattern Count and Compile select the cursor solely from the canonical HIR, immutable dispatch snapshot, operation, caller build policy, and the source-independent at-most-89-of-179 leading-byte cardinality proof; the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope is authenticated before source access, sparse matches retain the monotone cursor, dense matches cross once at a published match end, and SpanSum plus the existing SVE2 exactly-one owner remain unchanged; masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper, and their existing prepared-token behavior; prepare_unicode_scalar_count deliberately returns Ok(None) only for the cursor owner, so even at the formal at-most-4,096-byte prepared-admission threshold its first and steady timed public operations remain ordinary CountSingle calls using the cursor's authenticated full-window envelope rather than a prepared Unicode-scalar token",
         );
         identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
@@ -1185,10 +1185,15 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity.availability.push_str(
             "; no benchmark identity, expected answer, result hash, or haystack bytes participate in plan selection; fixture identity is likewise unavailable, and the narrowly admitted structural intrinsics obey the same boundary; Count may use endpoint-only or scalar reducers as Rebar permits, while CountSpans cannot use SpanSum formulas or total-cover shortcuts and falls back to the retained generic complete-span iterator when no certified specialized complete-span visitor is available; this adapter supersedes ",
         );
-        identity.availability.push_str(FRE_ADAPTER);
         identity
             .availability
-            .push_str("; the public composed adapter supersedes ");
+            .push_str("; this selectivity-cap adapter extends ");
+        identity.availability.push_str(FRE_ADAPTER_V146);
+        identity
+            .availability
+            .push_str(" which composes ");
+        identity.availability.push_str(FRE_ADAPTER);
+        identity.availability.push_str(" and ");
         identity.availability.push_str(FRE_ADAPTER_V138);
         identity
             .availability
@@ -35342,11 +35347,26 @@ agggtaa[cgt]|[acg]ttaccct 0
             "the whole haystack length before source access"
         ));
         assert!(current_identity.identity.contains(
-            "formal-unicode-scalar-cursor-count-v1 retains one canonical positive Unicode scalar repetition"
+            "formal-unicode-scalar-cursor-count-selectivity-cap-v1 builds one canonical positive Unicode scalar repetition owner"
+        ));
+        assert!(current_identity.identity.contains(
+            "at most 89 of the 179 legal scalar-start bytes"
+        ));
+        assert!(current_identity.availability.contains(
+            "masks above 89 retain ordinary Unicode-scalar Count/Compile with exact routing work, no cursor wrapper"
         ));
         assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION, 3);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, 2);
+        assert_eq!(
+            fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+            89
+        );
+        assert_eq!(fre::UNICODE_SCALAR_LEGAL_START_BYTE_COUNT, 179);
+        assert_eq!(
+            fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
+            fre::UNICODE_SCALAR_LEGAL_START_BYTE_COUNT / 2,
+        );
         assert!(current_identity.identity.contains(
             "public aggregate explain schema to v52 and the direct-owner algorithm/accounting protocol to v3/v2"
         ));
@@ -35354,7 +35374,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "the complete doubled-probe, decode, membership, comparison, reducer, search-call, event, count, work, scratch, persistent, and peak envelope"
         ));
         assert!(current_identity.availability.contains(
-            "prepare_unicode_scalar_count deliberately returns Ok(None) for this cursor owner"
+            "prepare_unicode_scalar_count deliberately returns Ok(None) only for the cursor owner"
         ));
         assert!(current_identity.availability.contains(
             "its first and steady timed public operations remain ordinary CountSingle calls"
@@ -45277,6 +45297,32 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(matches!(
             &boundary_lifecycle.inner,
             CurrentFreAggregateOperationInner::CountSingle(_, _)
+        ));
+
+        let broad_haystack = b"abcdefgh";
+        let broad_patterns = [r"\p{L}{8,13}".to_owned()];
+        let broad_lifecycle = build_current_fre_count_lifecycle(
+            &broad_patterns,
+            true,
+            false,
+            broad_haystack.len(),
+        )
+        .expect("small broad Unicode-scalar Count lifecycle");
+        assert!(matches!(
+            &broad_lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(_, _, _)
+        ));
+        assert_eq!(broad_lifecycle.execute(broad_haystack).unwrap(), 1);
+        let broad_boundary_lifecycle = build_current_fre_count_lifecycle(
+            &broad_patterns,
+            true,
+            false,
+            CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES,
+        )
+        .expect("4 KiB broad Unicode-scalar Count lifecycle");
+        assert!(matches!(
+            &broad_boundary_lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(_, _, _)
         ));
 
         let count = current_fre_rebar_aggregate_builder(r"\p{Greek}+", true, false)
