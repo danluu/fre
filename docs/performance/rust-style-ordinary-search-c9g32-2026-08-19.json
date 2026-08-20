@@ -1,0 +1,341 @@
+{
+  "schema": "fre.performance.rust-style-ordinary-search.c9g32.v1",
+  "date": "2026-08-19",
+  "ratio_direction": "reference_over_fre; values above 1 mean FRE is faster",
+  "change": {
+    "commit": "2a7befbf4128b712e946d0e0580e397c9941fcc5",
+    "tree": "9e469f48072633257ea152beb2034b98b8c439bd",
+    "summary": "PortableRegex and PortableTextRegex ordinary find/is_match methods are Rust-style work-unbounded calls with automatic construction-bounded scratch reuse; explicit finite and accounting-producing methods remain separately named.",
+    "holdout_boundary": "FRE and Rust-regex both time ordinary find/is_match; selected-end invokes ordinary find once and maps the match end on both sides.",
+    "rebar_boundary": "Only the plain-grep Rebar adapter boundary changed: one matcher is built before timing, then ordinary is_match is called once per ByteSlice::lines domain.",
+    "intervening_k0_performance_commit": {
+      "commit": "62ccd74c",
+      "title": "perf(automata): bypass large warm-owner checkout moves",
+      "comparison_effect": "This commit lies between the 574ceb3d owner-fast baseline and 2a7befbf and directly changes exact pooled K0 exists/span hot paths, so the holdout gain cannot be attributed to API policy alone."
+    }
+  },
+  "environment": {
+    "instance_id": "i-07141b3a31001d798",
+    "instance_type": "AWS EC2 c9g.8xlarge Spot",
+    "availability_zone": "us-east-1c",
+    "architecture": "aarch64 Neoverse V3 (AWS Graviton5)",
+    "logical_cpus": 32,
+    "candidate_target": "neoverse-v2",
+    "rustc": "1.93.0",
+    "rust_regex": "1.12.4",
+    "re2": "2025-11-05",
+    "persistent_after_run": true
+  },
+  "artifacts": {
+    "source_archive": "fre-2a7befbf-source.tar.gz",
+    "source_archive_sha256": "22ee7e648242aa2f85a8becf4805c35ec0908dc9205c379d0f0cdb3c9fac3b8e",
+    "initial_sequence_bundle": "c9g-normal-rerun-2a7befbf-20260819-r2.tar.gz",
+    "initial_sequence_bundle_sha256": "0fc0ed9e93253f5aff4764589c0deb4e0b234c09695a8bad0060a71c31d5d004",
+    "rebar_retry_bundle": "c9g-normal-rebar-retry-2a7befbf-20260819-r3.tar.gz",
+    "rebar_retry_bundle_sha256": "0b0c09c974b8c1d0650b5dc91fb1eefe5913096d42a6c51b58c52f0ec8dccc02",
+    "external_compact_archive": "c9g-normal-results-2a7befbf-20260819-r2-r3.tar.gz",
+    "external_compact_archive_bytes": 5872271,
+    "external_compact_archive_sha256": "bf04c0f73ce88b0eb8aae97c4f9e07397903cdc662c4bce02d062aa601585dec",
+    "included_file_count": 183,
+    "included_manifest": "INCLUDED-SHA256SUMS",
+    "included_manifest_sha256": "b83f588740aa9b5fbc0648fec07968fff4dad1c38f2c62d4f1fb31a6536f1fbb",
+    "excluded_klv_inventory": "EXCLUDED-KLV-INVENTORY.tsv",
+    "excluded_klv_inventory_sha256": "d1f465cddb8523f5ada46556319c4a40bcdf7623b525fd8397b158062b2951e8",
+    "holdout_analysis_sha256": "e9b150de607ab38690ea108eebd416a6604eb1656cab39c009d4e22b3a0d55e8",
+    "holdout_summary_sha256": "fa724cedb8be8e59b32425ae6c23f31ccfca7684a538bd3b297ea20cb17079e7",
+    "holdout_correctness_sha256": "0eb61190e49824e968bdde030a26d90d33dba4958d97067df9d8df2c98224ac6",
+    "holdout_performance_sha256": "ed844ee1c72ae6ae48b831ac7e5ceffdae7b92cc0e39d1eda818d16dcbbd3bf2",
+    "holdout_points_sha256": "c39fd7436f4b5b0fcc2866ed61e2216472cc4f4fb1bc8abe63f1d0da68a75318",
+    "rebar_analysis_sha256": "1a9802cbd37a10a7462bd83db3b1bb49665c306ccf6a3b300544d11c389f7e9e",
+    "rebar_points_sha256": "b9baa591b8722c75464e6774585ab06113e0d6fd4fc11b78c9c8fba84088f226",
+    "rebar_report_sha256": "894aad5a48efe4e010d52602804768252879759cbed01b5f8bd037ed1cf5b2b3"
+  },
+  "holdout": {
+    "run_id": "fre-holdout-standard-2a7befbf-slowest-first-c9g32-20260819-r2",
+    "suite_id": "fre-non-rebar-holdout-2026-07-14-v1",
+    "performance_schema": "fre.holdout.performance.v4",
+    "fre_measurement_scope": "search elapsed_ns spans the ordinary Rust-style engine API call plus semantic value extraction; FRE and Rust-regex both use find/is_match with no per-search work limit, selected-end maps ordinary find to the match end, and panic classification and report construction occur after the clock sample; finite-limit and accounting validation is untimed",
+    "fre_selected_end_adapter": "neither timed baseline uses a selected_end-specific API; both invoke ordinary find exactly once and map the selected match to end",
+    "correctness": {
+      "fre_pass": 1014,
+      "rust_regex_exact_pass": 507,
+      "re2_exact_pass": 507
+    },
+    "warmups_per_input": 3,
+    "measurements_per_input": 9,
+    "performance_case_order": "descending-prior-total-elapsed-ns",
+    "sample_count": 36846,
+    "point_count": 4094,
+    "current": {
+      "rust_regex": {
+        "primary_common_api_geomean": 0.6536323481804285,
+        "hot_primary_geomean": 0.7912457287873803,
+        "one_shot_primary_geomean": 0.5399526734161563,
+        "all_operation_hot_search_geomean": 0.7802441841839792
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.4780597356686025,
+        "hot_primary_geomean": 1.4181774928087947,
+        "one_shot_primary_geomean": 0.16115127480615507,
+        "all_operation_hot_search_geomean": 1.4242573099900873
+      }
+    },
+    "owner_fast_baseline": {
+      "commit": "574ceb3da1b1dc807182198dede5396294e19f85",
+      "performance_schema": "fre.holdout.performance.v3",
+      "rust_regex": {
+        "primary_common_api_geomean": 0.5507426214164807,
+        "hot_primary_geomean": 0.5330719623304147,
+        "one_shot_primary_geomean": 0.5689990404272873,
+        "all_operation_hot_search_geomean": 0.5477538753732969
+      },
+      "re2": {
+        "primary_common_api_geomean": 0.4121488288128924,
+        "hot_primary_geomean": 0.9969462601058207,
+        "one_shot_primary_geomean": 0.17038697459360383,
+        "all_operation_hot_search_geomean": 1.0299835383602225
+      }
+    },
+    "relative_change_percent": {
+      "rust_regex_primary_common_api": 18.681998226198825,
+      "rust_regex_hot_primary": 48.431315976236156,
+      "rust_regex_one_shot_primary": -5.104818276902334,
+      "rust_regex_all_operation_hot_search": 42.44430195080575,
+      "re2_primary_common_api": 15.992016050501112,
+      "re2_hot_primary": 42.2521503474282,
+      "re2_one_shot_primary": -5.420425950679131,
+      "re2_all_operation_hot_search": 38.279618745903974
+    },
+    "plan_stratification": {
+      "classification": "The authenticated correctness receipt plan for each case; k0 has 87 inputs and non-k0 has 82 inputs. Primary metrics include find and exists only. The split locates the gain but does not isolate ordinary accelerator admission from intervening warm-owner move-bypass work.",
+      "rust_regex": {
+        "k0": {
+          "hot_primary_input_points": 174,
+          "hot_primary_baseline": 0.2794947996085435,
+          "hot_primary_current": 0.5706941824892932,
+          "hot_primary_relative_change_percent": 104.18776424055096,
+          "one_shot_primary_baseline": 0.5079735465571594,
+          "one_shot_primary_current": 0.4539140022171228,
+          "one_shot_primary_relative_change_percent": -10.642196765250967
+        },
+        "non_k0": {
+          "hot_primary_input_points": 164,
+          "hot_primary_baseline": 1.0575386517951573,
+          "hot_primary_current": 1.1191086037263442,
+          "hot_primary_relative_change_percent": 5.822004881492782,
+          "one_shot_primary_baseline": 0.6417801295682188,
+          "one_shot_primary_current": 0.6491338881149317,
+          "one_shot_primary_relative_change_percent": 1.145837679901418
+        }
+      },
+      "re2": {
+        "k0": {
+          "hot_primary_input_points": 174,
+          "hot_primary_baseline": 0.38724960688325205,
+          "hot_primary_current": 0.7567498128787089,
+          "hot_primary_relative_change_percent": 95.4165477324432,
+          "one_shot_primary_baseline": 0.11131967192291879,
+          "one_shot_primary_current": 0.09899992657459791,
+          "one_shot_primary_relative_change_percent": -11.066997535576151
+        },
+        "non_k0": {
+          "hot_primary_input_points": 164,
+          "hot_primary_baseline": 2.7189049251022284,
+          "hot_primary_current": 2.7614785624975076,
+          "hot_primary_relative_change_percent": 1.5658376650915296,
+          "one_shot_primary_baseline": 0.2676536002480933,
+          "one_shot_primary_current": 0.27023088815081964,
+          "one_shot_primary_relative_change_percent": 0.9629191986722407
+        }
+      }
+    }
+  },
+  "rebar": {
+    "run_id": "rebar-main-2a7befbf-anonymous-v2-rust-re2-fixed1-fresh-preflight-duration-longest-full31-c9g32-20260819-r3",
+    "sampling": "one adjacent pair per point; descriptive only",
+    "duration_longest_first_ordering": true,
+    "raw_points": 1226,
+    "raw_plan_exclusions": 6,
+    "prepared_points": 1220,
+    "preflight_exclusions": 68,
+    "executed_points": 1152,
+    "arms": 2304,
+    "timing_errors": 0,
+    "ab_points": 576,
+    "ba_points": 576,
+    "executed_population_identity": {
+      "tuple_fields": [
+        "comparator",
+        "model",
+        "boundary",
+        "benchmark"
+      ],
+      "canonicalization": "CSV header plus tuples, bytewise sorted, newline terminated",
+      "current_sha256": "9a9b67e0d375eac6ed03734a3fa8ae748f8e6250077f2953cef6a2d9148ac793",
+      "owner_fast_baseline_sha256": "9a9b67e0d375eac6ed03734a3fa8ae748f8e6250077f2953cef6a2d9148ac793",
+      "exactly_equal": true,
+      "point_ids_also_exactly_equal": true
+    },
+    "current_geomean": {
+      "overall": 2.126565108469878,
+      "rust_regex": 1.366449100556179,
+      "re2": 3.6750867336244797
+    },
+    "owner_fast_baseline_geomean": {
+      "commit": "574ceb3da1b1dc807182198dede5396294e19f85",
+      "overall": 2.172795845046878,
+      "rust_regex": 1.3892771390721406,
+      "re2": 3.7779893527769537
+    },
+    "relative_change_percent": {
+      "overall": -2.1277073353388576,
+      "rust_regex": -1.6431594441414177,
+      "re2": -2.723740316442047
+    },
+    "plain_grep": {
+      "changed_api_boundary": true,
+      "diagnosis": "The dominant regression is not attributable to pool checkout alone. The old explicit session lazily prepared and bound the PortableIsMatchValueToken route family once for the operation; the ordinary pooled-value path does not yet automatically retain that full direct-accelerator family.",
+      "point_count": {
+        "rust_regex_each_boundary": 10,
+        "re2_each_boundary": 9,
+        "both_boundaries_and_comparators": 38
+      },
+      "rust_regex": {
+        "first_baseline": 0.5389248820743943,
+        "first_current": 0.2543578934138547,
+        "first_relative_change_percent": -52.8027185468229,
+        "steady_baseline": 0.5389461331012436,
+        "steady_current": 0.25522853777219695,
+        "steady_relative_change_percent": -52.64303385877508
+      },
+      "re2": {
+        "first_baseline": 1.3424790983696415,
+        "first_current": 0.5970134966866305,
+        "first_relative_change_percent": -55.52902854043189,
+        "steady_baseline": 1.3604907078652968,
+        "steady_current": 0.6030607648336328,
+        "steady_relative_change_percent": -55.67329042769601
+      },
+      "runtime_stratification": {
+        "k0": {
+          "points": 28,
+          "baseline_geomean": 0.7211284950636906,
+          "current_geomean": 0.25069674812331544,
+          "relative_change_percent": -65.23549549915182
+        },
+        "exact_literal": {
+          "points": 4,
+          "baseline_geomean": 1.897511741442503,
+          "current_geomean": 2.0495778592208933,
+          "relative_change_percent": 8.013975063089118
+        },
+        "ascii_word_run": {
+          "points": 4,
+          "baseline_geomean": 1.1533164971028065,
+          "current_geomean": 1.206786636191061,
+          "relative_change_percent": 4.636206906133267
+        },
+        "unicode_word_run": {
+          "points": 2,
+          "baseline_geomean": 0.6311590830859531,
+          "current_geomean": 0.49063003438545755,
+          "relative_change_percent": -22.265234307236913
+        }
+      },
+      "dominant_k0_examples_fre_elapsed_ms_range": {
+        "opt_accelerate_whole_line": {
+          "baseline_min": 3.217432,
+          "baseline_max": 3.366525,
+          "current_min": 283.852943,
+          "current_max": 290.87901
+        },
+        "imported_email": {
+          "baseline_min": 20.25155,
+          "baseline_max": 20.722917,
+          "current_min": 231.442387,
+          "current_max": 234.469737
+        }
+      },
+      "excluding_whole_line_and_email": {
+        "excluded_points": 8,
+        "remaining_points": 30,
+        "baseline_geomean": 0.599211053381668,
+        "current_geomean": 0.5600210012701942,
+        "relative_change_percent": -6.54027523195767
+      },
+      "next_general_target": "Make ordinary calls automatically retain or cheaply recover the same general prepared/direct accelerator capabilities that previously existed only behind explicit sessions; separately profile dispatch, admission, and pool checkout/return as residual costs."
+    },
+    "unchanged_non_grep_boundaries": {
+      "points": 1114,
+      "baseline_geomean": {
+        "overall": 2.2450261046748516,
+        "rust_regex": 1.4325823271004783,
+        "re2": 3.9213018762399394
+      },
+      "current_geomean": {
+        "overall": 2.2547657508368264,
+        "rust_regex": 1.4429028696440982,
+        "re2": 3.9244070854543582
+      },
+      "relative_change_percent": {
+        "overall": 0.4338322009572071,
+        "rust_regex": 0.7204153191327167,
+        "re2": 0.079188221473947
+      }
+    },
+    "controller_retry": {
+      "initial_run_id_suffix": "20260819-r2",
+      "initial_exit_status": 1,
+      "failed_phase": "prepare",
+      "failed_before_preflight": true,
+      "failed_before_timing": true,
+      "cause": "The controller omitted rebar klv -d ., so rebar defaulted to its mini benchmark directory and could not match a full-corpus benchmark definition.",
+      "fix": "The retry explicitly passed -d . to rebar klv while preserving the source archive, workload manifest, semantic inventory, and comparator binaries.",
+      "retry_exit_status": 0
+    }
+  },
+  "validation": {
+    "test_harness": {
+      "rebar_and_conformance_rust_min_stack_bytes": 33554432,
+      "reason": "Use the established stack size for stack-heavy libtest workers after the default worker stack overflowed; no assertion failed."
+    },
+    "fre_library_tests": {
+      "passed": 754,
+      "failed": 0,
+      "ignored": 5
+    },
+    "holdout_unit_tests": {
+      "passed": 8,
+      "failed": 0
+    },
+    "holdout_frozen_suite_tests": {
+      "passed": 4,
+      "failed": 0
+    },
+    "rebar_library_tests": {
+      "passed": 290,
+      "failed": 0,
+      "ignored": 24
+    },
+    "fre_capi_tests": {
+      "passed": 15,
+      "failed": 0
+    },
+    "rust_regex_conformance_tests": {
+      "passed": 180,
+      "failed": 0,
+      "ignored": 10
+    }
+  },
+  "limitations": [
+    "The owner-fast baseline and current result are independent C9g runs, not a randomized same-process A/B; host and source-revision movement can affect timing.",
+    "Holdout v4 intentionally changes the timed FRE boundary from the earlier finite result-only facade to ordinary Rust-style work-unbounded find/is_match, so the comparison measures the requested public-API policy as well as implementation changes.",
+    "Commit 62ccd74c between the baseline and tested source bypasses large warm-owner workspace moves in exact pooled K0 hot paths; the holdout before/after result does not isolate that optimization from ordinary unbounded accelerator admission.",
+    "The K0/non-K0 stratification uses the authenticated case plan and equal-weights exact primary input points; it is diagnostic rather than a separately preregistered headline.",
+    "Rebar uses one adjacent pair per point, so its ratios and before/after deltas are descriptive and do not estimate variance or confidence intervals.",
+    "Only Rebar plain grep intentionally changed API boundary. The dominant loss is concentrated in K0 cases for which the old session prepared and bound direct is-match accelerator tokens once but the ordinary path does not yet cache that full route family. Dispatch/admission and pool checkout/return remain possible residual costs and are not isolated by this run.",
+    "The failed initial Rebar attempt built the candidate but stopped during prepare, before preflight or timing; only the successful retry contributes measurements.",
+    "The compact package excludes full source/build trees, copied executables, comparator build caches, and 1,031 content-addressed prepared KLV cache files. It retains source/binary receipts and hashes, all schedules and journals, an explicit excluded-KLV inventory, raw holdout samples, analyses, and an authenticated 183-file inclusion manifest.",
+    "AOT was not rerun, and no aggregate combines normal and AOT boundaries."
+  ]
+}
