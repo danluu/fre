@@ -56,7 +56,7 @@ containing at least two x86-64 and two AArch64 microarchitectures.
 
 | Gate | Pass condition |
 |---|---|
-| Correctness | Zero known syntax, non-resource error, span, capture, iteration, Unicode, byte, replacement, or chunk-boundary mismatches against the applicable upstream profile; zero resource-admission mismatches in `StrictAdmission`. `QuotaBounded` results are labeled separately. |
+| Correctness | Zero known syntax, non-resource error, span, capture, iteration, Unicode, byte, replacement, or chunk-boundary mismatches against the applicable upstream profile. Resource refusals are tested against FRE's declared representation limits; exact upstream compiled-size admission is not promised. `QuotaBounded` results are labeled separately. |
 | Complexity | Every accepted plan has a checked work/resource certificate. Doubling tests and counters agree with its analytic bound. No uncapped exponential construction or execution exists; optional subset/tag construction is bounded by explicit `K`/transition/tag caps that may not auto-scale exponentially with pattern size. |
 | Literal strict gate | On every preregistered, same-semantics Rebar case shared with Rust regex or RE2, the lower confidence bound for the paired baseline/FRE speed ratio is greater than 1.0 on every qualification CPU. A result inside the noise floor is not a win. |
 | Practical ordinary-search gate | At least 20% faster geometric mean than Rust regex on a sealed ordinary holdout, with no case more than 5% slower outside noise; report every case as well as aggregates. |
@@ -121,7 +121,7 @@ The incompatibilities are semantic inputs to lowering, not parser trivia:
 | Perl classes/boundaries | Unicode-aware by default, including `\w`/`\b` | ASCII Perl classes and word boundary | Profile-stamped class/property IDs; never share a cache entry merely because pattern bytes match. |
 | Text and bytes | `&str` plus a byte facade that remains Unicode-aware unless `u` is disabled locally | UTF-8 or Latin-1 option; `\C` can consume one byte | Separate input validators, boundary advance, and class lowering. |
 | Extra grammar | Nested class algebra and Rust flags/boundaries | Octal, `\Q...\E`, RE2 options and POSIX syntax | Separate versioned parsers feeding a common semantic HIR only after meaning is fixed. |
-| Repetition/data | Configurable compiled-size limits; richer/current Unicode tables | Counted-repeat ceiling of 1,000; independently versioned Unicode tables | Preserve the upstream acceptance/error and Unicode version in each profile. |
+| Repetition/data | Configurable approximate compiled-size limit; richer/current Unicode tables | Counted-repeat ceiling of 1,000; independently versioned Unicode tables | Preserve non-resource acceptance/errors and Unicode identity. Rust `size_limit` caps FRE's charged compiled representation; it does not reproduce upstream byte accounting. |
 | Names/submatches | Rust capture-name and nullable-participation rules | Different duplicate-name and nullable-submatch behavior; optional longest policy | Oracle and tag policy are selected by profile, including unmatched versus participating-empty slots. |
 | Sets and iteration | Rust `RegexSet` returns matching IDs in declaration order and uses Rust's adjacent-empty iterator rule | RE2 `Set` anchor modes return IDs whose order callers must not assume; RE2 operations have distinct progress/submatch behavior | Distinct public contracts and conformance suites; shared executors only after result semantics agree. |
 | Replacement/consumption | Rust replacers expand `$N`, `$name`, `${...}` and `$$`, plus split iterators and closure APIs | RE2 exposes `Rewrite`, `Replace`, `GlobalReplace`, `Consume`, and `FindAndConsume`; rewrites accept only `\0`–`\9` and `\\`, with operation-specific empty progress | Separate facade-level operation state machines; share selected matches only after proving the transformation contract identical. |
@@ -156,19 +156,21 @@ Compatibility has two independent axes that must never be conflated:
 | Axis/policy | Contract |
 |---|---|
 | Semantic profile | Grammar, non-resource diagnostics, selected matches, captures, names, offsets, iteration/progress, replacement, and set behavior for the pinned upstream revision and declared valid-input domain. |
-| `StrictAdmission` (`ExactCompat`) | Reproduce the pinned upstream constructor's own limit accounting and resource error by invoking it as an admission oracle or by a separately validated faithful emulator. An upstream-accepted pattern that FRE cannot represent within its internal hard safety caps is a FRE qualification failure, not a compatible rejection. |
-| `QuotaBounded` | Apply explicit FRE source, compiler, code, scratch, history, and tenant quotas and return the distinct `FreResourceLimit` category. This is useful for services and hostile tenants, but is not error-compatible and cannot enter an `ExactCompat` score. |
+| `StrictAdmission` | Check the pinned grammar, options, and non-resource diagnostics locally and publish `StrictChecked`. It does not construct a shadow upstream matcher or promise identical compiled-size thresholds. |
+| `QuotaBounded` | Apply additional explicit FRE source, compiler, code, scratch, history, and tenant quotas and return the distinct `FreResourceLimit` category. This is useful for services and hostile tenants, but its configured refusals are not upstream resource errors. |
 
-Rust's `size_limit` and RE2's `max_mem` constrain upstream-specific
-representations, so similarly named FRE arena limits cannot reproduce their
-thresholds. No FRE cap failure is relabeled `CompiledTooBig` or
-`ErrorPatternTooLarge` without the admission oracle. Exact qualification of
-RE2 `Set` runtime DFA-OOM behavior either delegates that resource decision to
-the pinned RE2 implementation or excludes the operation from semantic and
-performance qualification; ordinary successful set results remain a separate
-semantic obligation. Rust-compatible post-construction methods remain
-infallible. A quota-returning search is exposed only by a separately named
-fallible API.
+Rust's `size_limit` and RE2's `max_mem` constrain implementation-specific
+representations, so FRE does not promise their exact thresholds. On the Rust
+facades, `size_limit` is an approximate cap on FRE's charged persistent
+representation: retained source plus capture-name metadata plus the selected
+execution plan. A refusal is `PersistentBytesLimit` (or a set-wide
+`PersistentLimit`), never a relabeled upstream `CompiledTooBig`. Rust regex
+sets apply that cap once to the complete retained set and do not construct a
+capture-free upstream meta matcher. Exact RE2 `Set` runtime DFA-OOM behavior
+is likewise not part of the semantic promise; ordinary successful set results
+remain a separate obligation. Rust-compatible post-construction methods
+remain infallible. A quota-returning search is exposed only by a separately
+named fallible API.
 
 RE2 rejects counted bounds above 1,000, supports UTF-8 and Latin-1 plus options
 such as `longest_match`, `never_nl`, `literal`, `never_capture`, and
@@ -278,12 +280,12 @@ reported results.
   estimation each consume explicit fuel.
 - A mandatory bounded semantic plan must fit FRE's hard representation safety
   envelope. Under `QuotaBounded`, a configured shortfall returns the distinct
-  `FreResourceLimit`. Under `StrictAdmission`, the pinned upstream oracle alone
-  decides compatible resource acceptance/error; if it accepts but FRE's floor
-  cannot fit, the build is disqualified rather than mapping the FRE shortfall
-  to an upstream error. The floor is the prioritized NFA for a general pattern,
-  but a proved exact finite/literal set may use its trie/AC representation
-  directly rather than first expanding a giant redundant NFA.
+  `FreResourceLimit`. Rust `size_limit` independently caps the completed FRE
+  persistent representation and returns its native persistent-limit error;
+  no upstream constructor is built as an admission oracle. The floor is the
+  prioritized NFA for a general pattern, but a proved exact finite/literal set
+  may use its trie/AC representation directly rather than first expanding a
+  giant redundant NFA.
 - Construct and validate that portable plan before spending optional
   determinization/JIT fuel. Each optional attempt uses a reservation-backed
   arena, and its peak allocation/work is charged even when the attempt is
@@ -333,8 +335,10 @@ number is an estimate to falsify, not an upstream semantic limit:
 | Exact-stream retained history | 8 MiB unless the caller selects another policy | manifest-selected |
 | Live context executable code | 64 MiB, including evicted-but-referenced slabs | artifact/database cap |
 
-Profile-configured limits such as RE2 `max_mem` and Rust builder size limits
-remain inputs to `StrictAdmission`; the table above describes FRE's
+Profile-configured limits remain part of profile identity. Rust builder
+`size_limit` also sets the FRE persistent-representation ceiling (10 MiB by
+default); `dfa_size_limit` is retained as inert identity because portable FRE
+does not use the upstream lazy-DFA cache. The table above describes FRE's
 `QuotaBounded` prototype policy and optional-optimization caps, not upstream
 errors. The qualification policy must also admit every
 applicable giant-pattern and full-dictionary Rebar definition; if a provisional
@@ -494,7 +498,7 @@ local assertions, Rust byte/scalar boundary rules, captures, subranges with
 original context, and RE2 longest mode each need a proof or a separately
 typed algorithm; testing cannot fill a missing case in the theorem.
 
-For the future `StrictAdmission` compatible facade, the explicit allocation
+For the strict semantic facade, the explicit allocation
 policy is an overflow-checked, one-shot reservation from the ordinary process
 allocator for `peak_bytes` when the aggregate pass becomes necessary. It has
 no 64 MiB FRE quota and never opens or spills to a file. Allocation failure
@@ -1090,7 +1094,7 @@ exists:
 | RE2 `Consume[N]`, `FindAndConsume[N]` | consume-wrapper state machine | Required emulation; preserve typed extraction, zero-byte empty behavior and remaining-view anchors |
 | RE2 `Rewrite`, `Replace`, `GlobalReplace`, `Extract`, `CheckRewriteString`, `MaxSubmatch` | profile-specific replacement/extraction | Required emulation; RE2 rewrite grammar and operation-specific progress only |
 | RE2 `QuoteMeta` | syntax utility | Required emulation |
-| RE2 `Set(anchor)` construction/add/compile/match | profile-specific `PatternMembership` | Required direct for successful semantics; exact runtime DFA-OOM is delegated or explicitly not promised under `StrictAdmission` |
+| RE2 `Set(anchor)` construction/add/compile/match | profile-specific `PatternMembership` | Required direct for successful semantics; exact runtime DFA-OOM is explicitly not promised |
 | RE2 representation access/diagnostics `Regexp()`, `ProgramSize`, reverse size/fanout and `PossibleMatchRange` | upstream-representation introspection | Not promised by v1; FRE cannot expose RE2's raw internal `re2::Regexp*`, and the RE2-style facade is not advertised as source-API compatible for these methods |
 | Backreferences, arbitrary lookaround, callbacks in generated code | none | Not promised/rejected, matching the relevant upstream syntax or the JIT trust boundary |
 

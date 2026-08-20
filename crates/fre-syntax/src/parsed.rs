@@ -8,7 +8,7 @@ use crate::{
     AdmissionPolicy, CompatibilityProfile, ParseError, ResourceKind, RustAstOptions, SafetyEnvelope,
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 /// Version of the receipt-bearing Rust parse-attempt algorithm.
 pub const PARSE_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the parse-attempt prospective/actual accounting schema.
@@ -614,13 +614,11 @@ impl ParseAttemptReceipt {
     }
 }
 
-/// What syntax parsing has established about constructor admission.
+/// What syntax parsing has established about local admission.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AdmissionStatus {
-    /// Local syntax checks passed, but exact upstream constructor admission has
-    /// not. The pinned upstream oracle must still run before compatibility is
-    /// claimed.
-    UpstreamOraclePending,
+    /// Every strict FRE syntax and hard-safety check passed.
+    StrictChecked,
     /// All caller-selected FRE syntax quotas were checked. This is not exact
     /// upstream resource compatibility.
     QuotaChecked,
@@ -629,7 +627,7 @@ pub enum AdmissionStatus {
 impl AdmissionStatus {
     pub(crate) const fn from_policy(policy: AdmissionPolicy) -> Self {
         match policy {
-            AdmissionPolicy::Strict(_) => Self::UpstreamOraclePending,
+            AdmissionPolicy::Strict(_) => Self::StrictChecked,
             AdmissionPolicy::Quota(_) => Self::QuotaChecked,
         }
     }

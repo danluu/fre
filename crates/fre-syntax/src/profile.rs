@@ -231,6 +231,10 @@ pub enum RustMatchKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RustConstructor {
     /// High-level `regex::bytes::RegexBuilder` release defaults.
+    ///
+    /// FRE interprets `size_limit` as its native compiled-representation
+    /// ceiling. `dfa_size_limit` remains part of API/profile identity, but FRE
+    /// has no corresponding lazy-DFA cache.
     RegexBuilder {
         size_limit: u64,
         dfa_size_limit: u64,
@@ -242,9 +246,9 @@ pub enum RustConstructor {
     },
     /// High-level `regex::bytes::RegexSetBuilder` release defaults.
     ///
-    /// The fields deliberately mirror [`Self::RegexBuilder`], but the
-    /// compiled-size limit applies once to the combined capture-free NFA for
-    /// all patterns. It must not be applied independently to each pattern.
+    /// The fields deliberately mirror [`Self::RegexBuilder`]. FRE interprets
+    /// the size limit as one native aggregate compiled-representation ceiling;
+    /// the DFA limit remains identity-only.
     RegexSetBuilder {
         size_limit: u64,
         dfa_size_limit: u64,
@@ -397,7 +401,7 @@ impl RustProfile {
                 match_kind: RustMatchKind::LeftmostFirst,
                 build_many_ordered: true,
                 thompson_nfa_size_limit: 100 * 1_048_576,
-                admission_status: AdmissionStatus::UpstreamOraclePending,
+                admission_status: AdmissionStatus::StrictChecked,
             },
             options: RustOptions::default(),
         }

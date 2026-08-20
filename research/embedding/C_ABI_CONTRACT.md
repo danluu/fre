@@ -3,7 +3,8 @@
 This is the long-term target ABI. It is not a statement that every item below
 is implemented or compatibility-qualified. The smaller experimental surface
 that exists today is recorded in [IMPLEMENTED_V1.md](IMPLEMENTED_V1.md); its
-plan records deliberately report `UPSTREAM_ORACLE_PENDING`.
+strict plan records report `STRICT_CHECKED` without claiming exact upstream
+compiled-size admission.
 
 A target row becomes a supported contract only after its underlying Rust
 operation has a complete compatibility and resource contract. Future rows are

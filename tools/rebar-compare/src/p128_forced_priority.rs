@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn forced_priority_receipt_schema_identity_is_current() {
-        assert_eq!(PRIORITY_AGGREGATE_SCHEMA_VERSION, 6);
+        assert_eq!(PRIORITY_AGGREGATE_SCHEMA_VERSION, 7);
         assert_eq!(
             PRIORITY_AGGREGATE_ACCOUNTING_ID,
             "fre.priority-aggregate.facade.v6"

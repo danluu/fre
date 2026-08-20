@@ -47,4 +47,5 @@ capture count, and independently expected RE2 match spans when
 constructor/diagnostic cases, seven directed match-span records, and all 34
 source-derived constructor fixtures. This is an oracle-checked slice, not full
 RE2 parser or constructor qualification; capability entries label that
-distinction explicitly.
+distinction explicitly. Downstream FRE program construction uses native checked
+resource limits and does not promise RE2's exact `max_mem` threshold.

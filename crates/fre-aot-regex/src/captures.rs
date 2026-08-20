@@ -27,7 +27,7 @@ use fre_syntax::{
 use crate::{
     CompileError, CompileLimitsV1, CompileMode, CompiledProgram, CompiledRegex,
     CompiledRegexWorkspace, MatchResult, OutputContract, SearchWindow, SlowAotLimits, Target,
-    finite_language,
+    finite_language, rust_profile_compiled_size_limit, set_rust_profile_compiled_size_limit,
 };
 
 /// Capture projection selected by this first stable operation.
@@ -72,19 +72,26 @@ impl CaptureCompileRequest {
     /// Construct a pinned Rust-bytes `All` capture request.
     #[must_use]
     pub fn new(pattern: impl Into<String>, target: Target) -> Self {
+        let profile = RustProfile::default();
+        let mut limits = CaptureCompileLimits::default();
+        if let Some(limit) = rust_profile_compiled_size_limit(&profile) {
+            limits.selector.max_program_bytes = limit;
+        }
         Self {
             pattern: pattern.into(),
-            profile: RustProfile::default(),
+            profile,
             level: CaptureLevel::All,
             target,
             mode: CompileMode::Optimizing,
-            limits: CaptureCompileLimits::default(),
+            limits,
         }
     }
 
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
+        self.limits.selector.max_program_bytes = rust_profile_compiled_size_limit(&self.profile)
+            .unwrap_or(CompileLimitsV1::default().max_program_bytes);
         self
     }
 
@@ -95,8 +102,33 @@ impl CaptureCompileRequest {
     }
 
     #[must_use]
-    pub const fn limits(mut self, limits: CaptureCompileLimits) -> Self {
+    pub fn limits(mut self, limits: CaptureCompileLimits) -> Self {
         self.limits = limits;
+        set_rust_profile_compiled_size_limit(
+            &mut self.profile,
+            limits.selector.max_program_bytes,
+        );
+        self
+    }
+
+    /// Set the maximum bytes in the capture operation's FRE selector program.
+    /// Capture schema/replay programs retain their separately typed limits.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        set_rust_profile_compiled_size_limit(&mut self.profile, bytes);
+        self.limits.selector.max_program_bytes = bytes;
+        self
+    }
+
+    /// Retain the Rust-like lazy-DFA cache option. FRE's capture compiler does
+    /// not use that cache, so this does not change compilation or execution.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 }
@@ -537,8 +569,14 @@ pub fn compile_captures(
         level,
         target,
         mode,
-        limits,
+        mut limits,
     } = request;
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.selector.max_program_bytes = limits
+            .selector
+            .max_program_bytes
+            .min(profile_limit);
+    }
     if level != CaptureLevel::All {
         return Err(CaptureCompileError::InternalInvariant(
             "unknown capture level reached compiler",

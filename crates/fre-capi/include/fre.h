@@ -82,7 +82,9 @@ typedef uint32_t fre_v1_status;
 #define FRE_V1_PLAN_UNICODE_SCALAR_RUN UINT32_C(15)
 #define FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS UINT32_C(16)
 
-#define FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING UINT32_C(1)
+/* Local syntax/configuration/non-resource diagnostics were checked. This does
+ * not promise the pinned upstream compiled-size threshold. */
+#define FRE_V1_ADMISSION_STRICT_CHECKED UINT32_C(1)
 
 typedef struct fre_v1_regex fre_v1_regex;
 

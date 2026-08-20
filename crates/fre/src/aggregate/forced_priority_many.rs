@@ -54,7 +54,7 @@ use crate::captures::{
 };
 
 /// Schema for the forced ordered Build-Many receipt.
-pub const PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION: u32 = 3;
+pub const PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION: u32 = 4;
 /// Stable accounting identity for this forced-only bridge.
 pub const PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID: &str = "fre.priority-aggregate-many.facade.v3";
 
@@ -3218,7 +3218,7 @@ fn pattern_syntax_closes(
         .prospective
         .and_then(|prospective| prospective.source_bytes.checked_add(actual.observed_work));
     let expected_admission = match report.syntax_key.admission {
-        AdmissionPolicy::Strict(_) => AdmissionStatus::UpstreamOraclePending,
+        AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
         AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
     };
     report.syntax_receipt.terminal == ParseAttemptTerminal::Success

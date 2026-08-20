@@ -473,7 +473,6 @@ name = "fre-syntax"
 version = "0.1.0"
 dependencies = [
  "fre-re2-syntax",
- "regex-automata 0.4.14",
  "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 

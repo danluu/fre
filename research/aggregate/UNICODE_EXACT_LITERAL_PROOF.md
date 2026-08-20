@@ -178,11 +178,11 @@ The facade now has separate typed high-level and Rebar profiles for the released
 `regex` 1.12.4, `regex-automata` 0.4.14 and `regex-syntax` 0.8.11 stack. Each
 component records its crates.io checksum and independent packaged VCS revision.
 The Rebar profile additionally records revision `463d00f`, dependency features,
-ordered leftmost-first meta construction, `syntax.utf8=false`,
-`utf8_empty=false`, the 100 MiB Thompson NFA limit, Unicode 16.0.0, and pending
-upstream admission. Comparator and admission-frontier paths select that profile
-explicitly; the 100 MiB upstream setting is identity only and does not widen an
-FRE safety envelope or quota.
+ordered leftmost-first comparator configuration, `syntax.utf8=false`,
+`utf8_empty=false`, the comparator's 100 MiB Thompson NFA limit, Unicode
+16.0.0, and locally strict-checked syntax. Comparator and frontier paths select
+that profile explicitly; the 100 MiB setting is identity only, does not build a
+shadow meta matcher, and does not widen an FRE safety envelope or quota.
 
 `fre-syntax` schema 2 prevents the corrected component/configuration stamp from
 aliasing the former shape. Aggregate schema 4 additionally distinguishes the

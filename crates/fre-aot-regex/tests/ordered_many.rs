@@ -1,10 +1,76 @@
 use fre_aot_regex::{
-    CompileError, CompileMode, OrderedManyCompileError, OrderedManyCompileLimits,
+    CompileError, CompileMode, CompileResource, OrderedManyCompileError, OrderedManyCompileLimits,
     OrderedManyCompileRequest, OrderedManyFallbackReason, OrderedManyMatch, OrderedManyPatternId,
     OrderedManyRow, OrderedManyRunError, OrderedManySessionLimits, OrderedManyStrategy,
     compile_ordered_many,
 };
+use fre_syntax::{RustConstructor, RustProfile};
 use regex_automata::meta::Regex as MetaRegex;
+
+fn profile_size_limit(profile: &RustProfile) -> Option<usize> {
+    match profile.constructor {
+        RustConstructor::RegexBuilder { size_limit, .. }
+        | RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            Some(usize::try_from(size_limit).unwrap())
+        }
+        RustConstructor::RebarMeta { .. } => None,
+    }
+}
+
+fn one_row_request() -> OrderedManyCompileRequest {
+    OrderedManyCompileRequest::new(vec![OrderedManyRow::new(OrderedManyPatternId::new(7), "a")])
+}
+
+#[test]
+fn native_per_row_size_limit_is_synchronized_and_last_setter_wins() {
+    const HIGH_LEVEL_DEFAULT: usize = 10 * 1_048_576;
+    let default_request = one_row_request();
+    assert_eq!(
+        HIGH_LEVEL_DEFAULT,
+        default_request.limits.max_program_bytes_per_row
+    );
+    assert_eq!(
+        Some(HIGH_LEVEL_DEFAULT),
+        profile_size_limit(&default_request.profile)
+    );
+
+    let mut limits = OrderedManyCompileLimits::default();
+    limits.max_program_bytes_per_row = 12_345;
+    let limits_last = one_row_request().size_limit(7).limits(limits);
+    assert_eq!(12_345, limits_last.limits.max_program_bytes_per_row);
+    assert_eq!(Some(12_345), profile_size_limit(&limits_last.profile));
+
+    let size_last = one_row_request().limits(limits).size_limit(7);
+    assert_eq!(7, size_last.limits.max_program_bytes_per_row);
+    assert_eq!(Some(7), profile_size_limit(&size_last.profile));
+
+    let rebar = one_row_request()
+        .size_limit(7)
+        .profile(RustProfile::rebar_1_12_4());
+    assert_eq!(
+        OrderedManyCompileLimits::default().max_program_bytes_per_row,
+        rebar.limits.max_program_bytes_per_row
+    );
+    assert_eq!(None, profile_size_limit(&rebar.profile));
+}
+
+#[test]
+fn direct_request_cannot_bypass_the_profile_native_program_limit() {
+    let mut request = one_row_request().size_limit(0);
+    request.limits.max_program_bytes_per_row = usize::MAX;
+    assert!(matches!(
+        compile_ordered_many(request),
+        Err(OrderedManyCompileError::Row {
+            row: 0,
+            pattern_id,
+            source: CompileError::Resource {
+                resource: CompileResource::ProgramBytes,
+                limit: 0,
+                required,
+            },
+        }) if pattern_id == OrderedManyPatternId::new(7) && required > 0
+    ));
+}
 
 fn compile_rows(
     patterns: &[&str],

@@ -252,7 +252,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 52;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 53;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 3;
@@ -262,10 +262,10 @@ pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 2;
 
 /// Canonical schema for the facade-authenticated exact-literal count AOT
 /// semantic binding.
-pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 1;
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 2;
 
 /// Canonical schema for the facade-owned, fixed-policy AOT planning receipt.
-pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION: u32 = 2;
 
 /// Exact facade construction policy admitted by the v1 AOT compiler.
 ///
@@ -2047,7 +2047,7 @@ pub enum AggregateBuildAccounting {
 /// Construction limits whose complete values participate in cache identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateBuildLimits {
-    /// Exact-upstream-pending strict mode or an explicit FRE quota mode.
+    /// Locally strict-checked syntax mode or an explicit FRE syntax-quota mode.
     pub admission: AdmissionPolicy,
     /// Non-configurable implementation safety envelope used during parsing.
     pub syntax_safety: SafetyEnvelope,
@@ -4092,7 +4092,7 @@ impl AggregateBuildReport {
                 (self.build_limits.admission, self.admission),
                 (
                     AdmissionPolicy::Strict(_),
-                    AdmissionStatus::UpstreamOraclePending,
+                    AdmissionStatus::StrictChecked,
                 ) | (AdmissionPolicy::Quota(_), AdmissionStatus::QuotaChecked)
             )
             && plan.stage() == construction_stage_for_report(self)
@@ -6187,7 +6187,7 @@ fn encode_aot_rust_constructor(
             encoder.boolean(*build_many_ordered);
             encoder.u64(*thompson_nfa_size_limit);
             encoder.u8(match *admission_status {
-                AdmissionStatus::UpstreamOraclePending => 0,
+                AdmissionStatus::StrictChecked => 0,
                 AdmissionStatus::QuotaChecked => 1,
             });
             Some(())
@@ -6300,7 +6300,7 @@ fn aggregate_count_exact_literal_aot_semantic_binding_identity(
     }
 
     let mut encoder = AggregateAotBindingEncoder::new();
-    encoder.raw(b"fre.aggregate.count-exact-literal-aot-semantic-binding.v1\0");
+    encoder.raw(b"fre.aggregate.count-exact-literal-aot-semantic-binding.v2\0");
     encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION);
     encoder.u32(report.schema_version);
     encoder.u32(report.syntax_key.schema_version);
@@ -6514,7 +6514,7 @@ fn encode_aot_planning_report(
     encoder.u32(report.schema_version)?;
     encoder.u32(report.syntax_key.schema_version)?;
     encoder.u8(match report.admission {
-        AdmissionStatus::UpstreamOraclePending => 0,
+        AdmissionStatus::StrictChecked => 0,
         AdmissionStatus::QuotaChecked => 1,
     })?;
     encoder.u8(2)?; // AggregateOperation::Count.
@@ -6646,7 +6646,7 @@ fn aggregate_count_exact_literal_aot_planning_receipt(
     }
 
     let mut encoder = AggregateAotPlanningEncoder::new();
-    encoder.raw(b"fre.aggregate.count-exact-literal-aot-planning-receipt.v1\0")?;
+    encoder.raw(b"fre.aggregate.count-exact-literal-aot-planning-receipt.v2\0")?;
     encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION)?;
     encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_POLICY_VERSION)?;
     encoder.u64(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1)?;

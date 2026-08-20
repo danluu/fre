@@ -3,8 +3,10 @@
 This document describes the code that exists today. It is intentionally
 narrower than the [long-term embedding contract](C_ABI_CONTRACT.md) and makes
 no claim that the underlying portable subset is compatibility-qualified. Every
-plan record reports `FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING` until the pinned
-upstream oracle work is complete.
+strict plan record reports `FRE_V1_ADMISSION_STRICT_CHECKED`: local syntax,
+configuration, and non-resource diagnostics were checked, but exact upstream
+compiled-size admission is not promised. FRE applies its own typed resource
+limits to its compiled representation.
 
 ## Implemented surface
 

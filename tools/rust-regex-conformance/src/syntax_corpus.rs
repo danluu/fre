@@ -5246,7 +5246,7 @@ fn execute_hir_print_probe(
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     if !identity_valid || parsed.hir != expected_hir {
         return Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
@@ -5382,7 +5382,7 @@ fn execute_hir_literal_probe(
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     if !identity_valid || parsed.hir != expected_hir {
         return Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
@@ -5522,31 +5522,12 @@ fn execute_hir_literal_crazy_repeats_case(case_id: &str) -> Result<(), AstMismat
             &expected,
             &observed,
         )?;
-        if index < 5 {
-            execute_hir_literal_probe(pattern, None, &format!("{case_id}-fre-binding-{index}"))?;
-        }
+        execute_hir_literal_probe(pattern, None, &format!("{case_id}-fre-binding-{index}"))?;
     }
     execute_hir_literal_probe(
         r"a{8}{8}",
         None,
         &format!("{case_id}-bounded-fre-repeat-binding"),
-    )?;
-    let profile = CompatibilityProfile::RustBytes(RustProfile::regex_1_12_4());
-    let refusal = parse(ParseRequest::rust(
-        HIR_LITERAL_CRAZY_REPEATS_PROBES[5],
-        profile.clone(),
-    ))
-    .expect_err("default FRE safety envelope rejects the exponentially expanded repeat");
-    let valid_refusal = refusal.schema_version == SCHEMA_VERSION
-        && refusal.profile.as_ref() == &profile
-        && refusal.category == ErrorCategory::UpstreamRustCompiledTooBig { limit: 10_485_760 }
-        && refusal.span.is_none()
-        && refusal.message == "Compiled regex exceeds size limit of 10485760 bytes.";
-    hir_doctest_assert_eq(
-        case_id,
-        "authenticated-default-safety-refusal",
-        &true,
-        &valid_refusal,
     )?;
     Ok(())
 }
@@ -5770,7 +5751,7 @@ fn exact_hir_pair(
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     if !identity_valid || parsed.hir != expected_hir {
         return Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
@@ -7508,7 +7489,7 @@ fn exact_text_hir_pair(
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     if !identity_valid || parsed.hir != expected_hir {
         return Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
@@ -7838,7 +7819,7 @@ fn execute_hir_translate_probe(
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     let properties_match = parsed.hir.properties() == expected_hir.properties();
     if identity_valid && parsed.hir == expected_hir && properties_match {
         Ok(())
@@ -7889,7 +7870,7 @@ fn execute_hir_translate_fuzz_match_probe() -> Result<(), AstMismatch> {
         && record.key.profile == compatibility
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+        && record.admission_status == AdmissionStatus::StrictChecked;
     if identity_valid && parsed.hir == expected_hir {
         Ok(())
     } else {
@@ -8302,7 +8283,7 @@ fn validate_ast_record_with_options(
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
         && record.ast_options == ast_options
-        && record.admission_status == AdmissionStatus::UpstreamOraclePending
+        && record.admission_status == AdmissionStatus::StrictChecked
         && record.reserved_ast_nodes == nodes
         && record.reserved_max_nesting == nesting
         && record.reserved_parser_stack == stack

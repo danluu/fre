@@ -932,7 +932,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 16;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 17;
 
 // Automatic ordinary search admits exact anchors and staged general primaries
 // when the finite incumbent cannot fit. Three-member primaries use memchr3;
@@ -959,7 +959,7 @@ pub fn escape(pattern: &str) -> String {
 /// Construction limits whose identities affect admission or lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildLimits {
-    /// Exact-upstream-pending strict mode or an explicitly FRE-quota mode.
+    /// Strict local syntax checks or an explicitly caller-quota mode.
     pub admission: AdmissionPolicy,
     /// Non-configurable-in-production hard syntax safety envelope.
     pub syntax_safety: SafetyEnvelope,
@@ -1297,7 +1297,7 @@ pub enum BuildError {
 /// Stable top-level classification for a failed portable construction.
 ///
 /// This is deliberately coarser than [`BuildError`]. It lets conformance
-/// adapters distinguish an upstream-invalid pattern from an FRE capability
+/// adapters distinguish a syntax-invalid pattern from an FRE capability
 /// gap, an explicitly configured resource refusal, invalid profile state, or
 /// an internal construction failure without parsing diagnostic text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1322,7 +1322,6 @@ impl BuildError {
             Self::Syntax(error) => match &error.category {
                 fre_syntax::ErrorCategory::InvalidPatternEncoding
                 | fre_syntax::ErrorCategory::UpstreamRustSyntax
-                | fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { .. }
                 | fre_syntax::ErrorCategory::Re2Syntax { .. } => BuildFailureClass::ExpectedInvalid,
                 fre_syntax::ErrorCategory::FreResourceLimit { .. }
                 | fre_syntax::ErrorCategory::StrictQualificationFailure { .. } => {
@@ -5398,10 +5397,29 @@ pub struct PortableBuilder {
     profile: RustProfile,
     limits: BuildLimits,
     selection: PlanSelection,
-    set_admitted: bool,
     utf8_start_guarded: bool,
     byte_native_plans_allowed: bool,
     retained_find_iter: bool,
+}
+
+pub(crate) fn rust_profile_size_limit(profile: &RustProfile) -> Option<usize> {
+    match &profile.constructor {
+        fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
+        | fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            Some(usize::try_from(*size_limit).unwrap_or(usize::MAX))
+        }
+        fre_syntax::RustConstructor::RebarMeta { .. } => None,
+    }
+}
+
+pub(crate) fn set_rust_profile_size_limit(profile: &mut RustProfile, bytes: usize) {
+    match &mut profile.constructor {
+        fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
+        | fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        fre_syntax::RustConstructor::RebarMeta { .. } => {}
+    }
 }
 
 fn try_box_bounded_literal_class_run_owner(
@@ -5591,12 +5609,16 @@ impl PortableBuilder {
     /// `false` for byte classes; unsupported HIR is rejected either way.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
+        let profile = RustProfile::default();
+        let mut limits = BuildLimits::default();
+        if let Some(limit) = rust_profile_size_limit(&profile) {
+            limits.max_persistent_bytes = limit;
+        }
         Self {
             pattern: pattern.into(),
-            profile: RustProfile::default(),
-            limits: BuildLimits::default(),
+            profile,
+            limits,
             selection: PlanSelection::Auto,
-            set_admitted: false,
             utf8_start_guarded: false,
             byte_native_plans_allowed: true,
             retained_find_iter: false,
@@ -5607,6 +5629,8 @@ impl PortableBuilder {
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile.into_regex_builder();
+        self.limits.max_persistent_bytes = rust_profile_size_limit(&self.profile)
+            .unwrap_or(BuildLimits::default().max_persistent_bytes);
         self
     }
 
@@ -5701,32 +5725,16 @@ impl PortableBuilder {
         self
     }
 
-    /// Set the pinned high-level builder's approximate compiled-regex limit.
-    ///
-    /// FRE applies this limit with the same pinned meta-construction path and
-    /// configuration used by `regex` 1.12.4 before selecting an FRE executor.
-    /// A pattern that exceeds the limit is therefore an upstream constructor
-    /// rejection, not an FRE capability or plan-resource refusal. The
-    /// distinct direct-Rebar constructor profile has no corresponding high-
-    /// level option and is left unchanged.
+    /// Set the maximum bytes retained by FRE's compiled matcher.
     #[must_use]
     pub fn size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
-            &mut self.profile.constructor
-        {
-            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
-        }
+        set_rust_profile_size_limit(&mut self.profile, bytes);
+        self.limits.max_persistent_bytes = bytes;
         self
     }
 
-    /// Set the pinned high-level builder's lazy-DFA cache capacity identity.
-    ///
-    /// FRE's portable plans do not use the upstream lazy-DFA cache, so this
-    /// option cannot weaken their independently checked construction and
-    /// execution limits. It is nevertheless retained in the compatibility
-    /// profile exactly because it is part of the public Rust bytes builder
-    /// configuration. The distinct direct-Rebar constructor profile has no
-    /// corresponding high-level option and is left unchanged.
+    /// Retain the Rust-like lazy-DFA cache option. FRE has no corresponding
+    /// cache, so this does not change native construction or execution.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
         if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
@@ -5739,16 +5747,28 @@ impl PortableBuilder {
 
     /// Replace every checked construction limit.
     #[must_use]
-    pub const fn limits(mut self, limits: BuildLimits) -> Self {
+    pub fn limits(mut self, limits: BuildLimits) -> Self {
         self.limits = limits;
+        if matches!(
+            &self.profile.constructor,
+            fre_syntax::RustConstructor::RegexBuilder { .. }
+        ) {
+            set_rust_profile_size_limit(&mut self.profile, limits.max_persistent_bytes);
+        }
         self
     }
 
     /// Set the total logical persistent-byte ceiling for the published
     /// matcher without changing any plan-specific construction limits.
     #[must_use]
-    pub const fn max_persistent_bytes(mut self, limit: usize) -> Self {
+    pub fn max_persistent_bytes(mut self, limit: usize) -> Self {
         self.limits.max_persistent_bytes = limit;
+        if matches!(
+            &self.profile.constructor,
+            fre_syntax::RustConstructor::RegexBuilder { .. }
+        ) {
+            set_rust_profile_size_limit(&mut self.profile, limit);
+        }
         self
     }
 
@@ -5769,17 +5789,6 @@ impl PortableBuilder {
     #[must_use]
     pub const fn retained_find_iter(mut self, enabled: bool) -> Self {
         self.retained_find_iter = enabled;
-        self
-    }
-
-    /// Use the already-completed aggregate Rust-set constructor admission.
-    pub(crate) const fn after_set_admission(mut self) -> Self {
-        self.set_admitted = true;
-        self
-    }
-
-    pub(crate) const fn after_set_admission_if(mut self, admitted: bool) -> Self {
-        self.set_admitted = admitted;
         self
     }
 
@@ -5809,16 +5818,26 @@ impl PortableBuilder {
         clippy::too_many_lines,
         reason = "plan selection keeps each no-fallback construction branch and report explicit"
     )]
-    pub fn build(self) -> Result<PortableRegex, BuildError> {
+    pub fn build(mut self) -> Result<PortableRegex, BuildError> {
         let profile = CompatibilityProfile::RustBytes(self.profile.clone());
-        let request = fre_syntax::ParseRequest::rust(self.pattern, profile.clone())
+        let pattern = core::mem::take(&mut self.pattern);
+        let request = fre_syntax::ParseRequest::rust(pattern, profile.clone())
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let parsed = if self.set_admitted {
-            fre_syntax::parse_rust_regex_set_constituent(request)?
-        } else {
-            fre_syntax::parse(request)?
-        };
+        let parsed = fre_syntax::parse(request)?;
+        self.build_from_parsed_record(parsed)
+    }
+
+    pub(crate) fn build_from_parsed_record(
+        self,
+        parsed: fre_syntax::ParseRecord,
+    ) -> Result<PortableRegex, BuildError> {
+        let profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        if parsed.key.profile != profile {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received a parsed record for another profile",
+            ));
+        }
         let source = String::from_utf8(parsed.key.pattern.into_bytes())
             .map_err(|_| {
                 BuildError::InternalInvariant("Rust parse retained a non-UTF-8 source pattern")

@@ -65,8 +65,10 @@ pub const FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION: u32 = 14;
 pub const FRE_V1_PLAN_UNICODE_SCALAR_RUN: u32 = 15;
 pub const FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS: u32 = 16;
 
-/// Strict Rust constructor admission is still awaiting its pinned oracle.
-pub const FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING: u32 = 1;
+/// Local syntax, configuration and non-resource diagnostics were checked.
+///
+/// This does not promise the pinned upstream compiled-size threshold.
+pub const FRE_V1_ADMISSION_STRICT_CHECKED: u32 = 1;
 
 pub const FRE_V1_DIAGNOSTIC_CAPACITY: usize = 256;
 

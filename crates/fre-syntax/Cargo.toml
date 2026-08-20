@@ -8,7 +8,6 @@ description = "Versioned compatibility profiles and bounded syntax parsing for F
 
 [dependencies]
 fre-re2-syntax = { path = "../fre-re2-syntax" }
-regex-automata = "=0.4.14"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
 
 [lints]

@@ -31,7 +31,7 @@ use fre_syntax::{
 };
 
 /// Schema for explicit forced-priority construction and execution receipts.
-pub const PRIORITY_AGGREGATE_SCHEMA_VERSION: u32 = 6;
+pub const PRIORITY_AGGREGATE_SCHEMA_VERSION: u32 = 7;
 /// Stable accounting identity for the facade bridge.
 pub const PRIORITY_AGGREGATE_ACCOUNTING_ID: &str = "fre.priority-aggregate.facade.v6";
 
@@ -272,7 +272,7 @@ impl PriorityAggregateSyntaxEvidence {
     pub fn closes(&self) -> bool {
         let actual = self.receipt.actual;
         let expected_admission = match self.key.admission {
-            AdmissionPolicy::Strict(_) => AdmissionStatus::UpstreamOraclePending,
+            AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
             AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
         };
         let summary_work = self

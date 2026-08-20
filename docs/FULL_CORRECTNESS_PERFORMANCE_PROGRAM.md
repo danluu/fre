@@ -48,10 +48,11 @@ It may not be reported as full Rust compatibility.
 ### 1.2 Full RE2 correctness
 
 RE2 Perl/POSIX syntax, UTF-8/Latin-1 encoding, options, longest-match behavior,
-sets, captures, replacement/consume operations, diagnostics, and `max_mem`
-admission have a separate versioned ledger. Rust results cannot stand in for an
-RE2 result. RE2 completion uses the same zero-mismatch, zero-fault, zero-silent-
-skip rule for the surface FRE declares compatible.
+sets, captures, replacement/consume operations, diagnostics, `max_mem` option
+identity, and FRE-native program-construction limits have a separate versioned
+ledger. Exact RE2 `max_mem` threshold parity is not promised. Rust results
+cannot stand in for an RE2 result. RE2 completion uses the same zero-mismatch,
+zero-fault, zero-silent-skip rule for the surface FRE declares compatible.
 
 ### 1.3 Good performance
 

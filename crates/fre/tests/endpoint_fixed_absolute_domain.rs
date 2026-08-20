@@ -1435,8 +1435,8 @@ fn endpoint_fixed_report_seal_rejects_public_discriminator_and_receipt_mutation(
     });
     rejected_mutation(&report, |changed| {
         changed.admission = match changed.admission {
-            AdmissionStatus::UpstreamOraclePending => AdmissionStatus::QuotaChecked,
-            AdmissionStatus::QuotaChecked => AdmissionStatus::UpstreamOraclePending,
+            AdmissionStatus::StrictChecked => AdmissionStatus::QuotaChecked,
+            AdmissionStatus::QuotaChecked => AdmissionStatus::StrictChecked,
         };
     });
     rejected_mutation(&report, |changed| {

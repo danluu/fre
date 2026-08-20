@@ -132,8 +132,9 @@ pub struct NotYetImplemented {
 /// Three-way result: success, qualified RE2-style rejection, or incomplete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseOutcome {
-    /// Syntax was represented under the requested envelope. This does not
-    /// claim RE2 constructor admission, which also compiles under `max_mem`.
+    /// Syntax was represented under the requested envelope. Downstream FRE
+    /// program construction applies its own checked resource limits; this
+    /// outcome does not promise RE2's exact `max_mem` threshold.
     Parsed {
         ast: Ast,
         usage: ResourceUsage,

@@ -355,19 +355,23 @@ fn compile_and_prepare_limits_report_exact_indexed_failures() {
 }
 
 #[test]
-fn aggregate_admission_failure_remains_unindexed() {
-    let mut profile = fre_syntax::RustProfile::regex_set_1_12_4();
-    let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } = &mut profile.constructor
-    else {
-        unreachable!("set profile constructor")
-    };
-    *size_limit = 0;
+fn native_total_program_limit_reports_the_first_crossing_pattern() {
+    let first_program_bytes =
+        compile_regex_set(RegexSetCompileRequest::new(strings(&["a"])).mode(CompileMode::Fast))
+            .expect("single native set program")
+            .stats()
+            .serialized_program_bytes;
+
     assert!(matches!(
         compile_regex_set(
-            RegexSetCompileRequest::new(strings(&["a"]))
-                .profile(profile)
+            RegexSetCompileRequest::new(strings(&["a", "b"]))
+                .size_limit(first_program_bytes)
                 .mode(CompileMode::Fast)
         ),
-        Err(RegexSetCompileError::AggregateAdmission { .. })
+        Err(RegexSetCompileError::TotalProgramBytesLimit {
+            pattern: 1,
+            needed,
+            limit,
+        }) if needed > first_program_bytes && limit == first_program_bytes
     ));
 }

@@ -13,10 +13,36 @@ const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
 const SCRIPT_ALIASES: &[&str] = include!("../src/unicode_script_aliases.in");
 const SEGMENT_ALIASES: &[(&[&str], &[&str])] = include!("../src/unicode_segment_aliases.in");
 
+#[test]
+fn syntax_manifest_has_no_shadow_regex_automata_dependency() {
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+    assert!(
+        !MANIFEST.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(name, _)| name.trim() == "regex-automata")
+        }),
+        "fre-syntax must not construct a shadow regex-automata meta matcher"
+    );
+}
+
 fn re2_literal_profile() -> CompatibilityProfile {
     let mut profile = Re2Profile::default();
     profile.options.literal = true;
     CompatibilityProfile::Re2(profile)
+}
+
+fn parse_rust_text_set_patterns(
+    patterns: &[&str],
+    profile: RustProfile,
+) -> Result<(), (usize, fre_syntax::ParseError)> {
+    for (index, pattern) in patterns.iter().enumerate() {
+        parse(ParseRequest::rust(
+            *pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| (index, error))?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -103,7 +129,7 @@ fn pinned_defaults_are_explicit() {
             match_kind: RustMatchKind::LeftmostFirst,
             build_many_ordered: true,
             thompson_nfa_size_limit: 104_857_600,
-            admission_status: AdmissionStatus::UpstreamOraclePending,
+            admission_status: AdmissionStatus::StrictChecked,
         }
     ));
 
@@ -533,18 +559,13 @@ fn unicode_case_profile_accepts_only_unicode_simple_case_folding() {
 
     let mut case_set = RustProfile::regex_set_1_12_4();
     case_set.unicode_features = RustUnicodeFeatures::CASE;
-    fre_syntax::validate_rust_regex_set_admission(
-        &[r"(?i:a)", r"(?i:\u{03B4})"],
-        &CompatibilityProfile::RustText(case_set.clone()),
-    )
-    .expect("unicode-case set admission");
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &[r"(?i:a)", r"\p{Alphabetic}"],
-        &CompatibilityProfile::RustText(case_set),
-    )
-    .expect_err("unicode-case set cannot borrow unicode-bool");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    parse_rust_text_set_patterns(&[r"(?i:a)", r"(?i:\u{03B4})"], case_set.clone())
+        .expect("unicode-case set patterns parse");
+    let (index, error) =
+        parse_rust_text_set_patterns(&[r"(?i:a)", r"\p{Alphabetic}"], case_set)
+            .expect_err("unicode-case set cannot borrow unicode-bool");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -637,18 +658,13 @@ fn unicode_gencat_profile_accepts_only_materialized_general_categories() {
 
     let mut gencat_set = RustProfile::regex_set_1_12_4();
     gencat_set.unicode_features = RustUnicodeFeatures::GENCAT;
-    fre_syntax::validate_rust_regex_set_admission(
-        &[r"\pL", r"\p{gc=Nd}", r"\d"],
-        &CompatibilityProfile::RustText(gencat_set.clone()),
-    )
-    .expect("unicode-gencat set admission");
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &[r"\pL", r"\p{Alphabetic}"],
-        &CompatibilityProfile::RustText(gencat_set),
-    )
-    .expect_err("unicode-gencat set cannot borrow unicode-bool");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    parse_rust_text_set_patterns(&[r"\pL", r"\p{gc=Nd}", r"\d"], gencat_set.clone())
+        .expect("unicode-gencat set patterns parse");
+    let (index, error) =
+        parse_rust_text_set_patterns(&[r"\pL", r"\p{Alphabetic}"], gencat_set)
+            .expect_err("unicode-gencat set cannot borrow unicode-bool");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -722,18 +738,13 @@ fn unicode_perl_profile_accepts_only_singleton_perl_data() {
 
     let mut perl_set = RustProfile::regex_set_1_12_4();
     perl_set.unicode_features = RustUnicodeFeatures::PERL;
-    fre_syntax::validate_rust_regex_set_admission(
-        &[r"\b\w+\b", r"\p{gc=Nd}+", r"\s+"],
-        &CompatibilityProfile::RustText(perl_set.clone()),
-    )
-    .expect("unicode-perl set admission");
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &[r"\w+", r"\p{Alphabetic}"],
-        &CompatibilityProfile::RustText(perl_set),
-    )
-    .expect_err("unicode-perl set cannot borrow unicode-bool");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    parse_rust_text_set_patterns(&[r"\b\w+\b", r"\p{gc=Nd}+", r"\s+"], perl_set.clone())
+        .expect("unicode-perl set patterns parse");
+    let (index, error) =
+        parse_rust_text_set_patterns(&[r"\w+", r"\p{Alphabetic}"], perl_set)
+            .expect_err("unicode-perl set cannot borrow unicode-bool");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -803,18 +814,13 @@ fn unicode_script_profile_accepts_only_singleton_script_data() {
 
     let mut script_set = RustProfile::regex_set_1_12_4();
     script_set.unicode_features = RustUnicodeFeatures::SCRIPT;
-    fre_syntax::validate_rust_regex_set_admission(
-        &[r"\p{Greek}+", r"\p{scx=Latin}+"],
-        &CompatibilityProfile::RustText(script_set.clone()),
-    )
-    .expect("unicode-script set admission");
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &[r"\p{Greek}+", r"\p{gcb=Extend}"],
-        &CompatibilityProfile::RustText(script_set),
-    )
-    .expect_err("unicode-script set cannot borrow unicode-segment");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    parse_rust_text_set_patterns(&[r"\p{Greek}+", r"\p{scx=Latin}+"], script_set.clone())
+        .expect("unicode-script set patterns parse");
+    let (index, error) =
+        parse_rust_text_set_patterns(&[r"\p{Greek}+", r"\p{gcb=Extend}"], script_set)
+            .expect_err("unicode-script set cannot borrow unicode-segment");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -921,18 +927,16 @@ fn unicode_segment_profile_accepts_only_singleton_segmentation_data() {
 
     let mut segment_set = RustProfile::regex_set_1_12_4();
     segment_set.unicode_features = RustUnicodeFeatures::SEGMENT;
-    fre_syntax::validate_rust_regex_set_admission(
+    parse_rust_text_set_patterns(
         &[r"\p{gcb=Extend}+", r"\p{wb=ALetter}+"],
-        &CompatibilityProfile::RustText(segment_set.clone()),
+        segment_set.clone(),
     )
-    .expect("unicode-segment set admission");
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &[r"\p{gcb=Extend}+", r"\p{Greek}"],
-        &CompatibilityProfile::RustText(segment_set),
-    )
-    .expect_err("unicode-segment set cannot borrow unicode-script");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    .expect("unicode-segment set patterns parse");
+    let (index, error) =
+        parse_rust_text_set_patterns(&[r"\p{gcb=Extend}+", r"\p{Greek}"], segment_set)
+            .expect_err("unicode-segment set cannot borrow unicode-script");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -1084,13 +1088,11 @@ fn partial_unicode_profiles_cover_aliases_overlaps_nested_classes_and_sets() {
 
     let mut none_set = RustProfile::regex_set_1_12_4();
     none_set.unicode_features = RustUnicodeFeatures::NONE;
-    let error = fre_syntax::validate_rust_regex_set_admission(
-        &["literal", r"\p{Greek}"],
-        &CompatibilityProfile::RustText(none_set),
-    )
-    .expect_err("set admission must enforce constituent feature availability");
-    assert_eq!(error.pattern, Some(1));
-    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+    let (index, error) =
+        parse_rust_text_set_patterns(&["literal", r"\p{Greek}"], none_set)
+            .expect_err("set parsing must enforce constituent feature availability");
+    assert_eq!(index, 1);
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
 }
 
 #[test]
@@ -1963,7 +1965,7 @@ fn rebar_profile_allows_only_job_options_to_vary() {
         assert_eq!(record.key.profile, expected_profile);
         assert_eq!(
             record.admission_status,
-            AdmissionStatus::UpstreamOraclePending
+            AdmissionStatus::StrictChecked
         );
         let CompatibilityProfile::RustBytes(accepted) = record.key.profile else {
             panic!("Rebar profile changed syntax family")
@@ -2027,7 +2029,7 @@ fn cache_keys_separate_facade_options_policy_and_safety() {
     assert_ne!(text.key, quota.key);
     assert_eq!(
         text.admission_status,
-        AdmissionStatus::UpstreamOraclePending
+        AdmissionStatus::StrictChecked
     );
     assert_eq!(quota.admission_status, AdmissionStatus::QuotaChecked);
 

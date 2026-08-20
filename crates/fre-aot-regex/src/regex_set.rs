@@ -96,11 +96,16 @@ impl RegexSetCompileRequest {
     /// Construct a pinned high-level Rust byte-regex set request.
     #[must_use]
     pub fn new(patterns: Vec<String>) -> Self {
+        let profile = RustProfile::regex_set_1_12_4();
+        let mut limits = RegexSetCompileLimits::default();
+        if let Some(limit) = profile_size_limit(&profile) {
+            limits.max_total_program_bytes = limit;
+        }
         Self {
             patterns,
-            profile: RustProfile::regex_set_1_12_4(),
+            profile,
             mode: CompileMode::Optimizing,
-            limits: RegexSetCompileLimits::default(),
+            limits,
         }
     }
 
@@ -109,6 +114,28 @@ impl RegexSetCompileRequest {
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile.into_regex_set_builder();
+        self.limits.max_total_program_bytes = profile_size_limit(&self.profile)
+            .unwrap_or(RegexSetCompileLimits::default().max_total_program_bytes);
+        self
+    }
+
+    /// Set the maximum aggregate bytes in FRE's stable compiled programs.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        set_profile_size_limit(&mut self.profile, bytes);
+        self.limits.max_total_program_bytes = bytes;
+        self
+    }
+
+    /// Retain the Rust-like lazy-DFA cache option. FRE's AOT programs do not
+    /// have such a cache, so this does not change compilation or execution.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let RustConstructor::RegexSetBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 
@@ -121,9 +148,35 @@ impl RegexSetCompileRequest {
 
     /// Select explicit construction limits.
     #[must_use]
-    pub const fn limits(mut self, limits: RegexSetCompileLimits) -> Self {
+    pub fn limits(mut self, limits: RegexSetCompileLimits) -> Self {
         self.limits = limits;
+        if matches!(
+            &self.profile.constructor,
+            RustConstructor::RegexSetBuilder { .. }
+        ) {
+            set_profile_size_limit(&mut self.profile, limits.max_total_program_bytes);
+        }
         self
+    }
+}
+
+fn profile_size_limit(profile: &RustProfile) -> Option<usize> {
+    match &profile.constructor {
+        RustConstructor::RegexBuilder { size_limit, .. }
+        | RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            Some(usize::try_from(*size_limit).unwrap_or(usize::MAX))
+        }
+        RustConstructor::RebarMeta { .. } => None,
+    }
+}
+
+fn set_profile_size_limit(profile: &mut RustProfile, bytes: usize) {
+    match &mut profile.constructor {
+        RustConstructor::RegexBuilder { size_limit, .. }
+        | RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        RustConstructor::RebarMeta { .. } => {}
     }
 }
 
@@ -151,11 +204,6 @@ pub enum RegexSetCompileError {
     },
     UnsupportedProfile {
         requirement: &'static str,
-    },
-    /// An aggregate high-level set admission failure without a source-row
-    /// index, such as the combined NFA size limit.
-    AggregateAdmission {
-        source: fre_syntax::ParseError,
     },
     /// First indexed constituent compilation failure.
     Pattern {
@@ -200,9 +248,6 @@ impl fmt::Display for RegexSetCompileError {
             Self::UnsupportedProfile { requirement } => {
                 write!(formatter, "unsupported regex-set profile: {requirement}")
             }
-            Self::AggregateAdmission { source } => {
-                write!(formatter, "regex-set aggregate admission: {source}")
-            }
             Self::Pattern { pattern, source } => {
                 write!(formatter, "regex-set pattern {pattern}: {source}")
             }
@@ -239,7 +284,6 @@ impl fmt::Display for RegexSetCompileError {
 impl std::error::Error for RegexSetCompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::AggregateAdmission { source } => Some(source),
             Self::Pattern { source, .. } => Some(source),
             Self::PatternLimit { .. }
             | Self::PatternBytesLimit { .. }
@@ -926,9 +970,8 @@ impl std::error::Error for RegexSetProgramShapeError {}
 /// Compile a complete Rust byte-regex set from independently executable
 /// existence programs.
 ///
-/// Aggregate high-level set admission runs before the compiled-row vector is
-/// allocated. It preserves the pinned constructor's first indexed syntax
-/// error and its unindexed combined-size failure.
+/// Syntax is parsed once per source row and the aggregate size limit is
+/// applied directly to FRE's stable compiled programs.
 #[allow(
     clippy::too_many_lines,
     reason = "aggregate admission, exact row allocation, indexed compilation, and identity publication form one transaction"
@@ -940,10 +983,13 @@ pub fn compile_regex_set(
         patterns,
         profile,
         mode,
-        limits,
+        mut limits,
     } = request;
     let profile = profile.into_regex_set_builder();
     validate_profile(&profile)?;
+    if let Some(profile_limit) = profile_size_limit(&profile) {
+        limits.max_total_program_bytes = limits.max_total_program_bytes.min(profile_limit);
+    }
     let pattern_count = patterns.len();
     if pattern_count > limits.max_patterns {
         return Err(RegexSetCompileError::PatternLimit {
@@ -971,17 +1017,12 @@ pub fn compile_regex_set(
             computation: "required output words",
         })?;
     let compatibility = CompatibilityProfile::RustBytes(profile.clone());
-    fre_syntax::validate_rust_regex_set_admission(&patterns, &compatibility)
-        .map_err(map_aggregate_admission)?;
 
     let mut rows = reserve_exact_compile(pattern_count, "compiled rows")?;
     let line_terminator = profile.options.line_terminator;
     let mut total_program_bytes = 0usize;
     for (pattern, source) in patterns.into_iter().enumerate() {
-        let parsed = fre_syntax::parse_rust_regex_set_constituent(ParseRequest::rust(
-            source,
-            compatibility.clone(),
-        ))
+        let parsed = fre_syntax::parse(ParseRequest::rust(source, compatibility.clone()))
         .map_err(CompileError::from)
         .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
         let CanonicalPattern::Rust(parsed) = parsed.pattern else {
@@ -1065,19 +1106,6 @@ fn validate_profile(profile: &RustProfile) -> Result<(), RegexSetCompileError> {
         Err(RegexSetCompileError::UnsupportedProfile {
             requirement: "high-level leftmost-first Rust byte RegexSet with byte-progress empty matches",
         })
-    }
-}
-
-fn map_aggregate_admission(error: fre_syntax::RustRegexSetAdmissionError) -> RegexSetCompileError {
-    if let Some(pattern) = error.pattern {
-        RegexSetCompileError::Pattern {
-            pattern,
-            source: CompileError::Syntax(error.source),
-        }
-    } else {
-        RegexSetCompileError::AggregateAdmission {
-            source: error.source,
-        }
     }
 }
 

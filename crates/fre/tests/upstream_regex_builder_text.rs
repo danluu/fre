@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    CompatibilityProfile, PortableTextBuildError, PortableTextBuilder, PortableTextRegex,
-    RustProfile, SearchLimits, SearchWindow,
+    BuildError, BuildLimits, CompatibilityProfile, PlanSelection, PortableTextBuildError,
+    PortableTextBuilder, PortableTextRegex, RustProfile, SearchLimits, SearchWindow,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -346,65 +346,75 @@ fn syntax_affecting_examples_match_pinned_text_builder() {
 }
 
 #[test]
-fn size_limit_matches_pinned_text_constructor_boundaries_and_error_class() {
-    for pattern in ["a", "é", "a|ab", "(?:é|東京)+"] {
-        for size_limit in [0, 1, 64, 128, 256, 512, 1_024, 4_096] {
-            let mut upstream = regex::RegexBuilder::new(pattern);
-            upstream.size_limit(size_limit);
-            let expected = upstream.build();
-            let actual = PortableTextBuilder::new(pattern)
-                .size_limit(size_limit)
-                .build();
-            assert_eq!(
-                actual.is_ok(),
-                expected.is_ok(),
-                "pattern={pattern:?}, size_limit={size_limit}, FRE={actual:?}, upstream={expected:?}"
-            );
-            match (actual, expected) {
-                (Ok(fre), Ok(upstream)) => {
-                    assert_searches_equal(pattern, &fre, &upstream, &["", "a", "ab", "é", "東京é"]);
-                    let CompatibilityProfile::RustText(profile) = fre.profile() else {
-                        panic!("text builder published a non-text profile");
-                    };
-                    let fre_syntax::RustConstructor::RegexBuilder {
-                        size_limit: retained,
-                        ..
-                    } = &profile.constructor
-                    else {
-                        panic!("text builder lost constructor identity");
-                    };
-                    assert_eq!(*retained, u64::try_from(size_limit).unwrap_or(u64::MAX));
-                }
-                (
-                    Err(PortableTextBuildError::TextSyntax(error)),
-                    Err(regex::Error::CompiledTooBig(limit)),
-                ) => {
-                    assert_eq!(limit, size_limit);
-                    assert_eq!(
-                        error.category,
-                        fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig {
-                            limit: u64::try_from(size_limit).unwrap_or(u64::MAX),
-                        }
-                    );
-                }
-                (actual, expected) => panic!(
-                    "unexpected size-limit result for {pattern:?}/{size_limit}: FRE={actual:?}, upstream={expected:?}"
-                ),
-            }
-        }
-    }
+fn size_limit_caps_the_fre_text_representation_at_its_exact_boundary() {
+    let pattern = "(?:é|東京)+";
+    let measured = PortableTextBuilder::new(pattern)
+        .plan_selection(PlanSelection::ForceK0)
+        .size_limit(usize::MAX)
+        .build()
+        .expect("unbounded FRE text measurement build");
+    let needed = measured.build_report().portable.charged_persistent_bytes;
+    assert!(needed > 0);
 
-    let mut upstream = regex::RegexBuilder::new(r"\w");
+    let exact = PortableTextBuilder::new(pattern)
+        .plan_selection(PlanSelection::ForceK0)
+        .size_limit(needed)
+        .build()
+        .expect("the exact FRE text persistent-byte boundary is inclusive");
+    assert_eq!(
+        exact.build_report().portable.charged_persistent_bytes,
+        needed
+    );
+    assert_eq!(exact.build_report().portable.persistent_byte_limit, needed);
+    let CompatibilityProfile::RustText(profile) = exact.profile() else {
+        panic!("text builder published a non-text profile");
+    };
+    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor
+    else {
+        panic!("text builder lost constructor identity");
+    };
+    assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
+
+    let one_below = needed.checked_sub(1).expect("nonzero charged size");
     assert!(matches!(
-        upstream.size_limit(45_000).build(),
-        Err(regex::Error::CompiledTooBig(45_000))
+        PortableTextBuilder::new(pattern)
+            .plan_selection(PlanSelection::ForceK0)
+            .size_limit(one_below)
+            .build(),
+        Err(PortableTextBuildError::Portable(
+            BuildError::PersistentBytesLimit {
+                needed: rejected,
+                limit,
+            }
+        )) if rejected == needed && limit == one_below
     ));
+
+    let default = PortableTextBuilder::new("a")
+        .build()
+        .expect("default FRE text limit");
+    assert_eq!(
+        default.build_report().portable.persistent_byte_limit,
+        10 * (1 << 20)
+    );
+
+    let mut lower_limits = BuildLimits::default();
+    lower_limits.max_persistent_bytes = one_below;
     assert!(matches!(
-        PortableTextBuilder::new(r"\w").size_limit(45_000).build(),
-        Err(PortableTextBuildError::TextSyntax(ref error))
-            if error.category
-                == fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { limit: 45_000 }
+        PortableTextBuilder::new(pattern)
+            .plan_selection(PlanSelection::ForceK0)
+            .size_limit(needed)
+            .limits(lower_limits)
+            .build(),
+        Err(PortableTextBuildError::Portable(
+            BuildError::PersistentBytesLimit { limit, .. }
+        )) if limit == one_below
     ));
+    PortableTextBuilder::new(pattern)
+        .plan_selection(PlanSelection::ForceK0)
+        .limits(lower_limits)
+        .size_limit(needed)
+        .build()
+        .expect("the last text size-limit setter owns the native ceiling");
 }
 
 #[test]

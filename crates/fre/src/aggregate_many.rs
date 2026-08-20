@@ -23,7 +23,7 @@ use fre_syntax::{
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
-pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 5;
+pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 6;
 
 /// Stable identity for the source-independent total byte-cover theorem.
 pub const AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID: &str =

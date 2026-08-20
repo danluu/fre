@@ -144,57 +144,62 @@ fn text_set_preserves_proofs_profile_identity_and_traits() {
     let empty = PortableTextRegexSet::default();
     assert!(empty.is_empty());
     assert_eq!(ids(&empty, "anything"), Vec::<usize>::new());
-    assert_eq!(RustProfile::default(), empty.build_report().profile);
+    assert_eq!(
+        RustProfile::regex_set_1_12_4(),
+        empty.build_report().profile
+    );
 }
 
 #[test]
-fn aggregate_size_limit_matches_pinned_text_set_boundary_and_order() {
+fn aggregate_size_limit_uses_the_reported_fre_text_set_boundary() {
     let patterns = sources(&["a", "b"]);
-    let mut upstream_below = regex::RegexSetBuilder::new(&patterns);
-    upstream_below.size_limit(311);
-    assert!(matches!(
-        upstream_below.build(),
-        Err(regex::Error::CompiledTooBig(311))
-    ));
-    let fre_below = PortableTextRegexSetBuilder::new(&patterns)
-        .size_limit(311)
+    let mut limits = PortableRegexSetBuildLimits::default();
+    limits.pattern.max_persistent_bytes = usize::MAX;
+    let measured = PortableTextRegexSetBuilder::new(&patterns)
+        .limits(limits)
+        .size_limit(usize::MAX)
         .build()
-        .expect_err("aggregate text NFA one byte below its boundary");
-    assert!(matches!(
-        fre_below,
-        PortableTextRegexSetBuildError::UpstreamAdmission { source }
-            if source.category
-                == fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { limit: 311 }
-    ));
-
-    let mut upstream_exact = regex::RegexSetBuilder::new(&patterns);
-    upstream_exact.size_limit(312);
-    let upstream_exact = upstream_exact.build().expect("exact upstream text limit");
+        .expect("unbounded FRE text set measurement");
+    let needed = measured.build_report().charged_persistent_bytes;
     let fre_exact = PortableTextRegexSetBuilder::new(&patterns)
-        .size_limit(312)
+        .limits(limits)
+        .size_limit(needed)
         .build()
-        .expect("exact FRE text limit");
-    for haystack in ["", "a", "b", "ab", "é"] {
-        assert_eq!(
-            ids(&fre_exact, haystack),
-            upstream_exact
-                .matches(haystack)
-                .into_iter()
-                .collect::<Vec<_>>()
-        );
-    }
-    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
+        .expect("exact FRE text set boundary");
+    assert_eq!(fre_exact.build_report().charged_persistent_bytes, needed);
+    assert_eq!(fre_exact.build_report().limits.max_persistent_bytes, needed);
+    let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } =
         &fre_exact.build_report().profile.constructor
     else {
         panic!("text set lost high-level constructor identity");
     };
-    assert_eq!(*size_limit, 312);
+    assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
+
+    let one_below = needed.checked_sub(1).expect("nonzero aggregate charge");
+    assert!(matches!(
+        PortableTextRegexSetBuilder::new(&patterns)
+            .limits(limits)
+            .size_limit(one_below)
+            .build(),
+        Err(PortableTextRegexSetBuildError::PersistentLimit {
+            needed: rejected,
+            limit,
+        }) if rejected == needed && limit == one_below
+    ));
 
     let invalid = sources(&["a", "("]);
     let error = PortableTextRegexSetBuilder::new(&invalid)
         .size_limit(0)
         .build()
-        .expect_err("text syntax must precede aggregate NFA admission");
+        .expect_err("aggregate retained-storage preflight must be bounded");
+    assert!(matches!(
+        error,
+        PortableTextRegexSetBuildError::PersistentLimit { limit: 0, .. }
+    ));
+    let error = PortableTextRegexSetBuilder::new(&invalid)
+        .size_limit(usize::MAX)
+        .build()
+        .expect_err("the invalid text pattern must retain its index");
     assert!(matches!(
         error,
         PortableTextRegexSetBuildError::Pattern {
@@ -205,33 +210,30 @@ fn aggregate_size_limit_matches_pinned_text_set_boundary_and_order() {
 }
 
 #[test]
-fn text_set_uses_capture_free_aggregate_instead_of_single_regex_admission() {
+fn text_set_size_limit_is_not_reapplied_to_constituent_matchers() {
     let patterns = sources(&["(a)"]);
-    let mut upstream_single = regex::RegexBuilder::new(&patterns[0]);
-    upstream_single.size_limit(200);
-    assert!(matches!(
-        upstream_single.build(),
-        Err(regex::Error::CompiledTooBig(200))
-    ));
-
-    let mut upstream_set = regex::RegexSetBuilder::new(&patterns);
-    upstream_set.size_limit(200);
-    let upstream_set = upstream_set
+    let mut limits = PortableRegexSetBuildLimits::default();
+    limits.max_persistent_bytes = usize::MAX;
+    limits.pattern.max_persistent_bytes = usize::MAX;
+    let measured = PortableTextRegexSetBuilder::new(&patterns)
+        .limits(limits)
+        .size_limit(usize::MAX)
         .build()
-        .expect("capture-free upstream text set fits 200 bytes");
+        .expect("unbounded aggregate measurement");
+    let needed = measured.build_report().charged_persistent_bytes;
     let fre_set = PortableTextRegexSetBuilder::new(&patterns)
-        .size_limit(200)
+        .limits(limits)
+        .size_limit(needed)
         .build()
-        .expect("text set must not substitute single-regex admission");
-    for haystack in ["", "a", "ba"] {
-        assert_eq!(
-            ids(&fre_set, haystack),
-            upstream_set
-                .matches(haystack)
-                .into_iter()
-                .collect::<Vec<_>>()
-        );
-    }
+        .expect("aggregate exact limit");
+    assert_eq!(
+        fre_set
+            .pattern_build_report(0)
+            .expect("constituent report")
+            .portable
+            .persistent_byte_limit,
+        usize::MAX
+    );
 }
 
 #[test]

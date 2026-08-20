@@ -171,8 +171,9 @@ three-engine source exposes an exact hidden consumer hot-loop symbol and
 authenticates the generated binding/receipt, but no build or post-link
 observation has run. The retained Search V1 adopter/default-off binding is a
 different ABI and cannot authorize P2b. A small implemented C11/C++17 surface
-exists for the current portable subset and reports `UPSTREAM_ORACLE_PENDING`
-in every plan record.
+exists for the current portable subset and reports `STRICT_CHECKED` in every
+strict plan record. This status covers local grammar/configuration and
+non-resource diagnostics; it is not an exact upstream size-admission promise.
 
 Seven-process diagnostic medians put exact literals and packed literal
 alternation at parity within noise; the retained literal-set DFA cross-check is

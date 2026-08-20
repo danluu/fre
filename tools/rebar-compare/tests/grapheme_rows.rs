@@ -89,7 +89,7 @@ fn assert_formal_adapter_quarantines_grapheme_intrinsic_and_matches_oracle() {
         runner.matches("adapter={} report={REPORT_SCHEMA}").count(),
         1
     );
-    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
+    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 53);
     assert_eq!(runner.matches("aggregate-explain={}").count(), 1);
     assert_eq!(
         runner

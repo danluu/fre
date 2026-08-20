@@ -44,7 +44,9 @@ mod seeded_reverse;
 
 use fre_automata::{Automaton, RawPlan};
 use fre_lower::{LowerLimits, OperationSemantics};
-use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+use fre_syntax::{
+    CanonicalPattern, CompatibilityProfile, ParseRequest, RustConstructor, RustProfile,
+};
 use sha2::{Digest, Sha256};
 
 pub use bit_parallel_exists::{
@@ -358,13 +360,18 @@ pub struct CompileRequest {
 impl CompileRequest {
     #[must_use]
     pub fn new(pattern: impl Into<String>, target: Target) -> Self {
+        let profile = RustProfile::default();
+        let mut limits = CompileLimitsV1::default();
+        if let Some(limit) = rust_profile_compiled_size_limit(&profile) {
+            limits.max_program_bytes = limit;
+        }
         Self {
             pattern: pattern.into(),
-            profile: RustProfile::default(),
+            profile,
             output: OutputContract::Span,
             target,
             mode: CompileMode::Optimizing,
-            limits: CompileLimitsV1::default(),
+            limits,
         }
     }
 
@@ -381,15 +388,58 @@ impl CompileRequest {
     }
 
     #[must_use]
-    pub const fn limits(mut self, limits: CompileLimitsV1) -> Self {
+    pub fn limits(mut self, limits: CompileLimitsV1) -> Self {
         self.limits = limits;
+        set_rust_profile_compiled_size_limit(&mut self.profile, limits.max_program_bytes);
         self
     }
 
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
+        self.limits.max_program_bytes = rust_profile_compiled_size_limit(&self.profile)
+            .unwrap_or(CompileLimitsV1::default().max_program_bytes);
         self
+    }
+
+    /// Set the maximum bytes in FRE's stable serialized semantic program.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        set_rust_profile_compiled_size_limit(&mut self.profile, bytes);
+        self.limits.max_program_bytes = bytes;
+        self
+    }
+
+    /// Retain the Rust-like lazy-DFA cache option. FRE's AOT compiler does not
+    /// use that cache, so this does not change compilation or execution.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+}
+
+pub(crate) fn rust_profile_compiled_size_limit(profile: &RustProfile) -> Option<usize> {
+    match &profile.constructor {
+        RustConstructor::RegexBuilder { size_limit, .. }
+        | RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            Some(usize::try_from(*size_limit).unwrap_or(usize::MAX))
+        }
+        RustConstructor::RebarMeta { .. } => None,
+    }
+}
+
+pub(crate) fn set_rust_profile_compiled_size_limit(profile: &mut RustProfile, bytes: usize) {
+    match &mut profile.constructor {
+        RustConstructor::RegexBuilder { size_limit, .. }
+        | RustConstructor::RegexSetBuilder { size_limit, .. } => {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        RustConstructor::RebarMeta { .. } => {}
     }
 }
 
@@ -836,8 +886,11 @@ pub fn compile_with_slow_aot_limits(
         output,
         target,
         mode,
-        limits,
+        mut limits,
     } = request;
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.max_program_bytes = limits.max_program_bytes.min(profile_limit);
+    }
     let source_bytes = pattern.len();
     let line_terminator = profile.options.line_terminator;
     let profile = CompatibilityProfile::RustBytes(profile);

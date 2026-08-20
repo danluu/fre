@@ -3,7 +3,7 @@
 use fre::{PlanKind, PortableBuilder, PortableRegex, SearchLimits};
 
 use crate::{
-    FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING, FRE_V1_DIAGNOSTIC_COMPILE, FRE_V1_DIAGNOSTIC_CONFIG,
+    FRE_V1_ADMISSION_STRICT_CHECKED, FRE_V1_DIAGNOSTIC_COMPILE, FRE_V1_DIAGNOSTIC_CONFIG,
     FRE_V1_DIAGNOSTIC_PATTERN_ENCODING, FRE_V1_DIAGNOSTIC_SEARCH, FRE_V1_JIT_DENY,
     FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE, FRE_V1_PLAN_EXACT_LITERAL,
     FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED, FRE_V1_PLAN_K0,
@@ -85,7 +85,7 @@ impl CompiledRegex {
             abi_version: crate::FRE_V1_ABI_VERSION,
             struct_size: size_u32::<FreV1PlanInfo>(),
             plan: plan_tag(report.plan),
-            admission: FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING,
+            admission: FRE_V1_ADMISSION_STRICT_CHECKED,
             planner_work: report.planner_work,
             states: u64::try_from(report.states).unwrap_or(u64::MAX),
             edges: u64::try_from(report.edges).unwrap_or(u64::MAX),

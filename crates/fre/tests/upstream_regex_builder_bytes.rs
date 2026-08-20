@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildFailureClass, CompatibilityProfile, PlanSelection, PortableBuilder,
-    PortableRegexSetBuildError, PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile,
-    SearchLimits,
+    BuildError, BuildFailureClass, BuildLimits, CompatibilityProfile, PlanSelection,
+    PortableBuilder, PortableRegexSetBuildError, PortableRegexSetBuildLimits,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile, SearchLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -36,158 +36,140 @@ fn authenticated_bytes_builder_flag_inventory_has_no_silent_omissions() {
 }
 
 #[test]
-fn size_limit_matches_pinned_compiled_nfa_admission_and_error_class() {
-    let mut upstream_example = regex::bytes::RegexBuilder::new(r"\w");
-    upstream_example.size_limit(45_000);
-    assert!(matches!(
-        upstream_example.build(),
-        Err(regex::Error::CompiledTooBig(45_000))
-    ));
-    let fre_example = PortableBuilder::new(r"\w")
-        .size_limit(45_000)
+fn size_limit_caps_the_fre_persistent_representation_at_its_exact_boundary() {
+    let pattern = r"(?P<word>ab)+(?:c|d)";
+    let measured = PortableBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .size_limit(usize::MAX)
         .build()
-        .expect_err("the pinned size-limit doctest pattern must be rejected before planning");
+        .expect("unbounded FRE measurement build");
+    let needed = measured.build_report().charged_persistent_bytes;
+    assert!(needed > 0);
     assert_eq!(
-        fre_example.failure_class(),
-        BuildFailureClass::ExpectedInvalid
+        needed,
+        measured.build_report().source_storage_bytes
+            + measured.build_report().capture_name_storage_bytes
+            + measured.build_report().plan_storage_bytes
     );
 
-    let patterns = ["Sherlock", "a|ab", "(?:ab)+", "(?P<word>ab)"];
-    let limits = [0, 1, 64, 128, 256, 512, 1_024, 2_048, 8_192, 45_000];
+    let exact = PortableBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .size_limit(needed)
+        .build()
+        .expect("the exact FRE persistent-byte boundary is inclusive");
+    assert_eq!(exact.build_report().charged_persistent_bytes, needed);
+    assert_eq!(exact.build_report().persistent_byte_limit, needed);
+    let CompatibilityProfile::RustBytes(profile) = exact.profile() else {
+        panic!("portable bytes builder published a non-bytes profile");
+    };
+    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor
+    else {
+        panic!("configured builder lost its high-level constructor identity");
+    };
+    assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
 
-    for pattern in patterns {
-        for size_limit in limits {
-            let mut upstream = regex::bytes::RegexBuilder::new(pattern);
-            upstream.unicode(false).size_limit(size_limit);
-            let expected = upstream.build();
-            let actual = PortableBuilder::new(pattern)
-                .unicode(false)
-                .size_limit(size_limit)
-                .build();
+    let one_below = needed.checked_sub(1).expect("nonzero charged size");
+    let error = PortableBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .size_limit(one_below)
+        .build()
+        .expect_err("one byte below the FRE representation must fail");
+    assert_eq!(error.failure_class(), BuildFailureClass::ResourceLimit);
+    assert!(matches!(
+        error,
+        BuildError::PersistentBytesLimit {
+            needed: rejected,
+            limit,
+        } if rejected == needed && limit == one_below
+    ));
 
-            assert_eq!(
-                actual.is_ok(),
-                expected.is_ok(),
-                "pattern={pattern:?}, size_limit={size_limit}, FRE={actual:?}, upstream={expected:?}"
-            );
-            match (actual, expected) {
-                (Ok(fre), Ok(_)) => {
-                    let CompatibilityProfile::RustBytes(profile) = fre.profile() else {
-                        panic!("portable bytes builder published a non-bytes profile");
-                    };
-                    let fre_syntax::RustConstructor::RegexBuilder {
-                        size_limit: retained,
-                        ..
-                    } = &profile.constructor
-                    else {
-                        panic!("configured builder lost its high-level constructor identity");
-                    };
-                    assert_eq!(*retained, u64::try_from(size_limit).unwrap_or(u64::MAX));
-                }
-                (Err(error), Err(regex::Error::CompiledTooBig(limit))) => {
-                    assert_eq!(limit, size_limit);
-                    assert_eq!(error.failure_class(), BuildFailureClass::ExpectedInvalid);
-                    let BuildError::Syntax(error) = error else {
-                        panic!(
-                            "compiled-too-big refusal did not originate in constructor admission"
-                        );
-                    };
-                    assert_eq!(
-                        error.category,
-                        fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig {
-                            limit: u64::try_from(size_limit).unwrap_or(u64::MAX),
-                        }
-                    );
-                }
-                (actual, expected) => panic!(
-                    "unexpected size-limit result for {pattern:?}/{size_limit}: FRE={actual:?}, upstream={expected:?}"
-                ),
-            }
-        }
-    }
+    let default = PortableBuilder::new("a")
+        .unicode(false)
+        .build()
+        .expect("default FRE limit");
+    assert_eq!(default.build_report().persistent_byte_limit, 10 * (1 << 20));
+
+    let mut lower_limits = BuildLimits::default();
+    lower_limits.max_persistent_bytes = one_below;
+    assert!(matches!(
+        PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .size_limit(needed)
+            .limits(lower_limits)
+            .build(),
+        Err(BuildError::PersistentBytesLimit { limit, .. }) if limit == one_below
+    ));
+    PortableBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .limits(lower_limits)
+        .size_limit(needed)
+        .build()
+        .expect("the last size-limit setter owns the native ceiling");
 }
 
 #[test]
-fn set_size_limit_matches_the_pinned_combined_capture_free_program() {
-    let patterns = vec!["(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)".to_owned()];
-    let capture_erasure_limit = (0..=16_384)
-        .step_by(8)
-        .find(|&limit| {
-            let mut upstream_set = regex::bytes::RegexSetBuilder::new(&patterns);
-            upstream_set.unicode(false).size_limit(limit);
-            let mut upstream_single = regex::bytes::RegexBuilder::new(&patterns[0]);
-            upstream_single.unicode(false).size_limit(limit);
-            upstream_set.build().is_ok() && upstream_single.build().is_err()
-        })
-        .expect("pinned set capture erasure must have a smaller admission threshold");
+fn set_size_limit_is_one_aggregate_fre_persistent_cap() {
+    let patterns = vec!["(a)".to_owned(), "bravo".to_owned(), "charlie|delta".to_owned()];
+    let mut unbounded_limits = PortableRegexSetBuildLimits::default();
+    unbounded_limits.max_persistent_bytes = usize::MAX;
+    unbounded_limits.pattern.max_persistent_bytes = usize::MAX;
+    let measured = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .limits(unbounded_limits)
+        .size_limit(usize::MAX)
+        .build()
+        .expect("unbounded FRE set measurement build");
+    let needed = measured.build_report().charged_persistent_bytes;
+    assert!(needed > 0);
 
-    let fre = PortableRegexSetBuilder::new(&patterns)
+    let exact = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
-        .size_limit(capture_erasure_limit)
+        .limits(unbounded_limits)
+        .size_limit(needed)
         .build()
-        .expect("FRE must apply the set limit after capture erasure, not per pattern");
-    assert_eq!(fre.len(), 1);
-    let single_error = PortableBuilder::new(&patterns[0])
-        .profile(fre.build_report().profile.clone())
-        .unicode(false)
-        .build()
-        .expect_err("a set-constructor profile must not bypass single-regex admission");
-    assert_eq!(
-        single_error.failure_class(),
-        BuildFailureClass::ExpectedInvalid
-    );
-    for profile in
-        core::iter::once(&fre.build_report().profile).chain((0..fre.len()).map(|index| {
-            let CompatibilityProfile::RustBytes(profile) = &fre
-                .pattern_build_report(index)
-                .expect("constituent build report")
-                .profile
-            else {
-                panic!("set constituent published a non-bytes profile");
-            };
-            profile
-        }))
-    {
+        .expect("the exact aggregate FRE boundary is inclusive");
+    assert_eq!(exact.build_report().charged_persistent_bytes, needed);
+    assert_eq!(exact.build_report().limits.max_persistent_bytes, needed);
+    for index in 0..exact.len() {
+        let report = exact.pattern_build_report(index).expect("constituent report");
+        assert_eq!(report.persistent_byte_limit, usize::MAX);
+        let CompatibilityProfile::RustBytes(profile) = &report.profile else {
+            panic!("set constituent published a non-bytes profile");
+        };
         let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } = &profile.constructor
         else {
             panic!("configured set lost its set-constructor identity");
         };
-        assert_eq!(
-            *size_limit,
-            u64::try_from(capture_erasure_limit).unwrap_or(u64::MAX)
-        );
+        assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
     }
 
-    let combined_patterns: Vec<String> = ["alpha", "bravo", "charlie", "delta", "echo"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let combined_limit = (0..=16_384)
-        .step_by(8)
-        .find(|&limit| {
-            let mut upstream_set = regex::bytes::RegexSetBuilder::new(&combined_patterns);
-            upstream_set.unicode(false).size_limit(limit);
-            let every_single_passes = combined_patterns.iter().all(|pattern| {
-                let mut single = regex::bytes::RegexBuilder::new(pattern);
-                single.unicode(false).size_limit(limit);
-                single.build().is_ok()
-            });
-            every_single_passes && upstream_set.build().is_err()
-        })
-        .expect("pinned combined set must exceed its constituents at one exact limit");
-    let error = PortableRegexSetBuilder::new(&combined_patterns)
+    let one_below = needed.checked_sub(1).expect("nonzero aggregate charge");
+    let error = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
-        .size_limit(combined_limit)
+        .limits(unbounded_limits)
+        .size_limit(one_below)
         .build()
-        .expect_err("FRE must reject the same combined-program size boundary");
-    let PortableRegexSetBuildError::UpstreamAdmission { source } = error else {
-        panic!("combined size refusal lost its constructor source: {error}");
-    };
+        .expect_err("one byte below the aggregate FRE representation must fail");
+    assert!(matches!(
+        error,
+        PortableRegexSetBuildError::PersistentLimit {
+            needed: rejected,
+            limit,
+        } if rejected == needed && limit == one_below
+    ));
+
+    let default = PortableRegexSetBuilder::new(&["a".to_owned(), "b".to_owned()])
+        .unicode(false)
+        .build()
+        .expect("default set limit");
     assert_eq!(
-        source.category,
-        fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig {
-            limit: u64::try_from(combined_limit).unwrap_or(u64::MAX),
-        }
+        default.build_report().limits.max_persistent_bytes,
+        10 * (1 << 20)
     );
 }
 

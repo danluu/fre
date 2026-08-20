@@ -10,10 +10,10 @@ pub enum ResourceKind {
     TraversalStack,
 }
 
-/// Marks exact upstream constructor admission.
+/// Selects FRE's strict, locally checked syntax-admission policy.
 ///
-/// Syntax parsing can execute locally, but full constructor admission must be
-/// decided by the pinned upstream oracle (or a validated faithful emulator).
+/// This applies the audited hard safety envelope without substituting
+/// another regex engine's constructor or resource model.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StrictAdmission;
 
@@ -59,9 +59,9 @@ impl Default for AdmissionPolicy {
 
 /// Non-configurable implementation safety envelope.
 ///
-/// Crossing this boundary in strict mode is a qualification failure, never an
-/// upstream syntax/resource error. Production values can only be raised after
-/// auditing allocation and integer bounds.
+/// Crossing this boundary in strict mode is a qualification failure.
+/// Production values can only be raised after auditing allocation and integer
+/// bounds.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SafetyEnvelope {
     pub max_pattern_bytes: u64,

@@ -25,7 +25,8 @@ use fre_syntax::{
 
 use crate::{
     CompileError, CompileMode, DeterminizeLimits, MatchResult, OutputContract, ProgramWorkspace,
-    SearchWindow, program::CompiledProgram,
+    SearchWindow, program::CompiledProgram, rust_profile_compiled_size_limit,
+    set_rust_profile_compiled_size_limit,
 };
 
 /// Maximum owner count represented by the current tagged quotient.
@@ -130,11 +131,16 @@ impl OrderedManyCompileRequest {
     /// Construct a generic Rust-bytes request.
     #[must_use]
     pub fn new(rows: Vec<OrderedManyRow>) -> Self {
+        let profile = RustProfile::default();
+        let mut limits = OrderedManyCompileLimits::default();
+        if let Some(limit) = rust_profile_compiled_size_limit(&profile) {
+            limits.max_program_bytes_per_row = limit;
+        }
         Self {
             rows,
-            profile: RustProfile::default(),
+            profile,
             mode: CompileMode::Optimizing,
-            limits: OrderedManyCompileLimits::default(),
+            limits,
         }
     }
 
@@ -142,6 +148,8 @@ impl OrderedManyCompileRequest {
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
+        self.limits.max_program_bytes_per_row = rust_profile_compiled_size_limit(&self.profile)
+            .unwrap_or(OrderedManyCompileLimits::default().max_program_bytes_per_row);
         self
     }
 
@@ -154,8 +162,28 @@ impl OrderedManyCompileRequest {
 
     /// Select explicit construction limits.
     #[must_use]
-    pub const fn limits(mut self, limits: OrderedManyCompileLimits) -> Self {
+    pub fn limits(mut self, limits: OrderedManyCompileLimits) -> Self {
         self.limits = limits;
+        set_rust_profile_compiled_size_limit(&mut self.profile, limits.max_program_bytes_per_row);
+        self
+    }
+
+    /// Set the maximum bytes in any one FRE stable semantic program.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        set_rust_profile_compiled_size_limit(&mut self.profile, bytes);
+        self.limits.max_program_bytes_per_row = bytes;
+        self
+    }
+
+    /// Retain the Rust-like lazy-DFA cache option. FRE's AOT compiler does not
+    /// use that cache, so this does not change compilation or execution.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } = &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 }
@@ -890,8 +918,11 @@ pub fn compile_ordered_many(
         rows,
         profile,
         mode,
-        limits,
+        mut limits,
     } = request;
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.max_program_bytes_per_row = limits.max_program_bytes_per_row.min(profile_limit);
+    }
     if rows.len() > limits.max_rows {
         return Err(OrderedManyCompileError::RowsLimit {
             needed: rows.len(),

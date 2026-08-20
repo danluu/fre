@@ -2075,7 +2075,7 @@ fn assert_unicode_scalar_cursor_count_route(pattern: &str, haystack: &[u8], expe
         .report()
         .direct_owner()
         .expect("cursor Count retains its direct owner");
-    assert_eq!(owner.identity().schema_version, 52);
+    assert_eq!(owner.identity().schema_version, 53);
     assert_eq!(owner.identity().algorithm_version, 3);
     assert_eq!(owner.identity().accounting_version, 2);
     let AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) =
@@ -2282,7 +2282,7 @@ fn unicode_scalar_cursor_count_broad_mask_falls_back_with_closed_identity_and_de
         .report()
         .direct_owner()
         .expect("scalar fallback retains its direct owner");
-    assert_eq!(owner.identity().schema_version, 52);
+    assert_eq!(owner.identity().schema_version, 53);
     assert_eq!(owner.identity().algorithm_version, 3);
     assert_eq!(owner.identity().accounting_version, 2);
     let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details() else {

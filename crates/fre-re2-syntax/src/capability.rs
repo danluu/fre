@@ -20,6 +20,8 @@ pub enum Surface {
     RewriteApplication,
     CaptureNameMaps,
     Diagnostics,
+    /// Legacy surface name for downstream FRE program construction readiness.
+    /// Exact RE2 `max_mem` threshold parity is not part of this contract.
     ConstructorAdmission,
     Matching,
 }
@@ -141,7 +143,7 @@ pub const fn capability_ledger() -> &'static [Capability] {
         Capability {
             surface: Surface::ConstructorAdmission,
             status: NotYetImplemented,
-            note: "RE2 program compilation and max_mem admission are outside syntax parsing",
+            note: "downstream FRE program construction under native checked limits is outside syntax parsing; exact RE2 max_mem parity is not promised",
         },
         Capability {
             surface: Surface::Matching,

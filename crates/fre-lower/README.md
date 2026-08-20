@@ -115,7 +115,7 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 ## Limitations ledger
 
 - This crate lowers `RustParsed` HIR only. It does not implement the RE2 parser
-  surface or decide strict upstream constructor admission.
+  surface or own the facade's charged persistent-representation limit.
 - Unicode scalar classes compile to valid-UTF-8 byte paths. Unicode word
   assertions decode at most one scalar on each side and classify it with
   the pinned UTS#18 Perl-word table. Invalid UTF-8 is exact non-word context.

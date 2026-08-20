@@ -16,9 +16,7 @@ mod rust;
 pub use admission::{
     AdmissionPolicy, QuotaBounded, ResourceKind, SafetyEnvelope, StrictAdmission, SyntaxQuotas,
 };
-pub use error::{
-    ErrorCategory, ParseAttemptError, ParseError, RustRegexSetAdmissionError, SourceSpan,
-};
+pub use error::{ErrorCategory, ParseAttemptError, ParseError, SourceSpan};
 /// Direct, pinned RE2 syntax types retained by [`CanonicalPattern::Re2`].
 pub use fre_re2_syntax as re2_syntax;
 pub use parsed::{
@@ -39,7 +37,8 @@ pub use re2::{Re2Capability, Re2CapabilityStatus, Re2Surface, re2_surface_invent
 ///
 /// Rust profiles use the pinned `regex-syntax` parser. RE2 profiles use the
 /// independent source-mapped parser in `fre-re2-syntax`; its remaining typed
-/// incomplete surfaces and constructor-admission boundary stay explicit.
+/// incomplete surfaces and downstream FRE program-construction boundary stay
+/// explicit. Exact RE2 `max_mem` threshold parity is not promised.
 ///
 /// # Errors
 ///
@@ -104,7 +103,7 @@ pub fn parse_attempt(request: ParseRequest) -> Result<ParseAttempt, ParseAttempt
     }
     receipt.actual.source_admission_checks = 1;
 
-    let output = match rust::parse_rust_attempt(&request, true, &mut receipt.actual) {
+    let output = match rust::parse_rust_attempt(&request, &mut receipt.actual) {
         Ok(output) => output,
         Err(source) => {
             return Err(ParseAttemptError::new(
@@ -172,48 +171,6 @@ pub fn parse_rust_ast_with_options(
             request.profile().clone(),
             ErrorCategory::InvalidConfiguration,
             "Rust AST parsing requires a Rust profile",
-        )),
-    }
-}
-
-/// Applies the exact pinned `regex` 1.12.4 aggregate constructor admission to
-/// a complete source-ordered set.
-///
-/// Unlike independent single-pattern construction, this uses one
-/// `MatchKind::All`, capture-free Thompson NFA and one compiled-size limit for
-/// all patterns. Syntax failures retain their source-order pattern index;
-/// compiled-size failures are aggregate and therefore unindexed.
-///
-/// # Errors
-///
-/// Returns [`RustRegexSetAdmissionError`] for an invalid profile, the first
-/// syntax-invalid pattern in pinned upstream order, or an aggregate compiled
-/// NFA that exceeds the configured high-level size limit.
-pub fn validate_rust_regex_set_admission<P: AsRef<str>>(
-    patterns: &[P],
-    profile: &CompatibilityProfile,
-) -> Result<(), RustRegexSetAdmissionError> {
-    rust::validate_regex_set_admission(patterns, profile)
-}
-
-/// Parses one constituent after its exact complete set has already passed
-/// [`validate_rust_regex_set_admission`].
-///
-/// This entry point deliberately skips only the *single-regex* compiled-size
-/// check. A set caller must not substitute that capture-bearing check for the
-/// capture-free aggregate check. Source quotas, pinned profile validation,
-/// syntax parsing and every FRE admission bound remain enforced.
-#[doc(hidden)]
-pub fn parse_rust_regex_set_constituent(request: ParseRequest) -> Result<ParseRecord, ParseError> {
-    request.validate_and_charge_source()?;
-    match request.profile() {
-        CompatibilityProfile::RustText(_) | CompatibilityProfile::RustBytes(_) => {
-            rust::parse_rust(request, false)
-        }
-        CompatibilityProfile::Re2(_) => Err(ParseError::new(
-            request.profile().clone(),
-            ErrorCategory::InvalidConfiguration,
-            "Rust regex set constituent parsing requires a Rust profile",
         )),
     }
 }

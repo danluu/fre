@@ -11,7 +11,8 @@ use crate::{
     PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
     PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
     SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
-    charge_planner, finite, reserve_planner,
+    reserve_planner, rust_profile_size_limit, set_rust_profile_size_limit,
+    charge_planner, finite,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -203,25 +204,36 @@ pub struct PortableTextBuilder {
     profile: RustProfile,
     limits: BuildLimits,
     selection: PlanSelection,
-    set_admitted: bool,
 }
 
 impl PortableTextBuilder {
     /// Start from pinned Rust `regex::RegexBuilder` defaults.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
+        let profile = RustProfile::default();
+        let mut limits = BuildLimits::default();
+        if let Some(limit) = rust_profile_size_limit(&profile) {
+            limits.max_persistent_bytes = limit;
+        }
         Self {
             pattern: pattern.into(),
-            profile: RustProfile::default(),
-            limits: BuildLimits::default(),
+            profile,
+            limits,
             selection: PlanSelection::Auto,
-            set_admitted: false,
         }
     }
 
     /// Replace the complete pinned Rust profile.
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile.into_regex_builder();
+        self.limits.max_persistent_bytes = rust_profile_size_limit(&self.profile)
+            .unwrap_or(BuildLimits::default().max_persistent_bytes);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn set_constituent_profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
         self
     }
@@ -303,24 +315,16 @@ impl PortableTextBuilder {
         self
     }
 
-    /// Set the pinned high-level builder's approximate compiled-regex limit.
-    ///
-    /// Admission uses the pinned text constructor configuration before FRE's
-    /// independent equivalence proof and plan selection.
+    /// Set the maximum bytes retained by FRE's compiled matcher.
     #[must_use]
     pub fn size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
-            &mut self.profile.constructor
-        {
-            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
-        }
+        set_rust_profile_size_limit(&mut self.profile, bytes);
+        self.limits.max_persistent_bytes = bytes;
         self
     }
 
-    /// Set the pinned high-level builder's lazy-DFA cache capacity identity.
-    ///
-    /// Portable execution does not use that cache, but the value remains part
-    /// of the authenticated compatibility identity and constructor admission.
+    /// Retain the Rust-like lazy-DFA cache option. FRE has no corresponding
+    /// cache, so this does not change native construction or execution.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
         if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
@@ -333,8 +337,14 @@ impl PortableTextBuilder {
 
     /// Replace every checked construction limit.
     #[must_use]
-    pub const fn limits(mut self, limits: BuildLimits) -> Self {
+    pub fn limits(mut self, limits: BuildLimits) -> Self {
         self.limits = limits;
+        if matches!(
+            &self.profile.constructor,
+            fre_syntax::RustConstructor::RegexBuilder { .. }
+        ) {
+            set_rust_profile_size_limit(&mut self.profile, limits.max_persistent_bytes);
+        }
         self
     }
 
@@ -342,12 +352,6 @@ impl PortableTextBuilder {
     #[must_use]
     pub const fn plan_selection(mut self, selection: PlanSelection) -> Self {
         self.selection = selection;
-        self
-    }
-
-    /// Use the already-completed aggregate Rust-set constructor admission.
-    pub(crate) const fn after_set_admission(mut self) -> Self {
-        self.set_admitted = true;
         self
     }
 
@@ -359,36 +363,28 @@ impl PortableTextBuilder {
     /// Returns [`PortableTextBuildError`] when syntax is invalid, the pattern
     /// is outside the proof slice, proof limits are exhausted, profiles
     /// disagree or portable construction fails.
-    pub fn build(self) -> Result<PortableTextRegex, PortableTextBuildError> {
+    pub fn build(mut self) -> Result<PortableTextRegex, PortableTextBuildError> {
         let text_profile = CompatibilityProfile::RustText(self.profile.clone());
         let text_request = ParseRequest::rust(self.pattern.clone(), text_profile.clone())
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let text = if self.set_admitted {
-            fre_syntax::parse_rust_regex_set_constituent(text_request)
-        } else {
-            fre_syntax::parse(text_request)
-        }
-        .map_err(PortableTextBuildError::TextSyntax)?;
+        let text = fre_syntax::parse(text_request).map_err(PortableTextBuildError::TextSyntax)?;
         let text_syntax = text.summary.clone();
-        let CanonicalPattern::Rust(text_pattern) = text.pattern else {
+        let CanonicalPattern::Rust(text_pattern) = &text.pattern else {
             return Err(PortableTextBuildError::InternalInvariant(
                 "RustText parse produced a non-Rust pattern",
             ));
         };
 
         let bytes_profile = CompatibilityProfile::RustBytes(self.profile.clone());
-        let bytes_request = ParseRequest::rust(self.pattern.clone(), bytes_profile)
+        let pattern = core::mem::take(&mut self.pattern);
+        let bytes_request = ParseRequest::rust(pattern, bytes_profile)
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let bytes = if self.set_admitted {
-            fre_syntax::parse_rust_regex_set_constituent(bytes_request)
-        } else {
-            fre_syntax::parse(bytes_request)
-        }
-        .map_err(PortableTextBuildError::BytesProofSyntax)?;
+        let bytes =
+            fre_syntax::parse(bytes_request).map_err(PortableTextBuildError::BytesProofSyntax)?;
         let bytes_syntax = bytes.summary.clone();
-        let CanonicalPattern::Rust(bytes_pattern) = bytes.pattern else {
+        let CanonicalPattern::Rust(bytes_pattern) = &bytes.pattern else {
             return Err(PortableTextBuildError::InternalInvariant(
                 "RustBytes proof parse produced a non-Rust pattern",
             ));
@@ -411,17 +407,16 @@ impl PortableTextBuilder {
             });
         }
 
-        let mut inner_builder = PortableBuilder::new(self.pattern)
-            .profile(self.profile)
+        let mut inner_builder = PortableBuilder::new(String::new())
+            .set_constituent_profile(self.profile)
             .limits(self.limits)
             .plan_selection(self.selection)
-            .after_set_admission_if(self.set_admitted)
             .for_text_facade();
         if utf8_start_guarded {
             inner_builder = inner_builder.with_utf8_start_guard();
         }
         let inner = inner_builder
-            .build()
+            .build_from_parsed_record(bytes)
             .map_err(PortableTextBuildError::Portable)?;
         let report = PortableTextBuildReport {
             profile: text_profile.clone(),

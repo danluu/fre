@@ -36,6 +36,35 @@ fn slot_tuple(slot: CaptureGroupSlot) -> Option<(usize, usize)> {
 }
 
 #[test]
+fn capture_request_size_limit_controls_the_native_selector() {
+    let target = Target::x86_64_linux();
+    let default = CaptureCompileRequest::new("(a)", target);
+    assert_eq!(default.limits.selector.max_program_bytes, 10 * 1_048_576);
+
+    let mut limits = CaptureCompileLimits::default();
+    limits.selector.max_program_bytes = 19 * 1_048_576;
+    let limits_last = CaptureCompileRequest::new("(a)", target)
+        .size_limit(17)
+        .limits(limits);
+    assert_eq!(
+        limits_last.limits.selector.max_program_bytes,
+        limits.selector.max_program_bytes
+    );
+    let size_last = CaptureCompileRequest::new("(a)", target)
+        .limits(limits)
+        .size_limit(17);
+    assert_eq!(size_last.limits.selector.max_program_bytes, 17);
+
+    let rebar = CaptureCompileRequest::new("(a)", target)
+        .size_limit(17)
+        .profile(fre_syntax::RustProfile::rebar_1_12_4());
+    assert_eq!(
+        rebar.limits.selector.max_program_bytes,
+        fre_aot_regex::CompileLimitsV1::default().max_program_bytes
+    );
+}
+
+#[test]
 fn all_capture_slots_match_upstream_for_general_byte_patterns() {
     let cases: &[(&str, &[u8])] = &[
         (r"(?P<outer>a(?P<inner>b))(?P<optional>c)?", b"xxab yy"),

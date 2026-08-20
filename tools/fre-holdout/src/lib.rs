@@ -1290,6 +1290,12 @@ fn classify_build_error(error: &BuildError) -> CandidateFailure {
             (Status::Fault, "build.fault.unexpected-forced-shape")
         }
         BuildError::PlannerWorkLimit { .. } => (Status::Unsupported, "build.resource.planner-work"),
+        BuildError::PersistentBytesLimit { .. } => {
+            (Status::Unsupported, "build.resource.persistent-bytes")
+        }
+        BuildError::PersistentBytesOverflow => {
+            (Status::Fault, "build.fault.persistent-bytes-overflow")
+        }
         BuildError::AllocationFailed { .. } => (Status::Fault, "build.fault.allocation"),
         BuildError::InternalInvariant(_) => (Status::Fault, "build.fault.internal-invariant"),
         _ => (Status::Fault, "build.unknown-fault"),
@@ -1312,7 +1318,6 @@ fn classify_syntax_build_error(error: &fre_syntax::ParseError) -> (Status, &'sta
         }
         fre_syntax::ErrorCategory::InvalidPatternEncoding
         | fre_syntax::ErrorCategory::UpstreamRustSyntax
-        | fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { .. }
         | fre_syntax::ErrorCategory::Re2Syntax { .. }
         | fre_syntax::ErrorCategory::InvalidConfiguration => {
             (Status::Fault, "build.fault.syntax-or-profile")

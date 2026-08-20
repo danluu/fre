@@ -16,11 +16,11 @@ use sha2::{Digest, Sha256};
 use crate::{BuildLimits, BuildReport, PlanKind, PlanSelection, PortablePlan, PortableRegex};
 
 /// Stable schema for the facade-owned exact-literal Search AOT binding.
-pub const SEARCH_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 1;
+pub const SEARCH_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 2;
 /// Fixed facade construction policy admitted by the V1 Search AOT handoff.
 pub const SEARCH_EXACT_LITERAL_AOT_FIXED_BUILD_POLICY_VERSION: u32 = 1;
 
-const BINDING_DOMAIN: &[u8] = b"fre.search.exact-literal-aot-semantic-binding.v1\0";
+const BINDING_DOMAIN: &[u8] = b"fre.search.exact-literal-aot-semantic-binding.v2\0";
 
 /// Canonical semantic identity of one facade-selected exact-literal plan.
 ///
@@ -234,7 +234,7 @@ fn semantic_binding_identity(
 fn encode_build_report(encoder: &mut BindingEncoder, report: &BuildReport) -> Option<()> {
     encoder.u8(0); // CompatibilityProfile::RustBytes.
     encoder.u8(match report.admission {
-        AdmissionStatus::UpstreamOraclePending => 0,
+        AdmissionStatus::StrictChecked => 0,
         AdmissionStatus::QuotaChecked => 1,
     });
     let syntax = &report.syntax;
@@ -447,7 +447,7 @@ fn encode_rust_constructor(
             encoder.boolean(*build_many_ordered);
             encoder.u64(*thompson_nfa_size_limit);
             encoder.u8(match *admission_status {
-                AdmissionStatus::UpstreamOraclePending => 0,
+                AdmissionStatus::StrictChecked => 0,
                 AdmissionStatus::QuotaChecked => 1,
             });
             Some(())

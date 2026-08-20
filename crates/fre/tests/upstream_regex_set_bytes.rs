@@ -209,52 +209,26 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
 }
 
 #[test]
-fn aggregate_size_limit_matches_pinned_bytes_set_and_retains_identity() {
+fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
     let patterns = sources(&["a", "b"]);
-
-    // Each capture-bearing single-regex constructor succeeds even at zero,
-    // while the pinned capture-free aggregate NFA needs 312 bytes. This
-    // proves the set admission is total, not a loop over per-pattern checks.
-    for pattern in &patterns {
-        let mut single = regex::bytes::RegexBuilder::new(pattern);
-        single.unicode(false).size_limit(0);
-        assert!(single.build().is_ok(), "single pattern {pattern:?}");
-    }
-    let mut upstream_below = regex::bytes::RegexSetBuilder::new(&patterns);
-    upstream_below.unicode(false).size_limit(311);
-    assert!(matches!(
-        upstream_below.build(),
-        Err(regex::Error::CompiledTooBig(311))
-    ));
-    let fre_below = PortableRegexSetBuilder::new(&patterns)
+    let mut limits = PortableRegexSetBuildLimits::default();
+    limits.pattern.max_persistent_bytes = usize::MAX;
+    let measured = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
-        .size_limit(311)
+        .limits(limits)
+        .size_limit(usize::MAX)
         .build()
-        .expect_err("aggregate NFA one byte below its exact boundary");
-    assert!(matches!(
-        fre_below,
-        PortableRegexSetBuildError::UpstreamAdmission { source }
-            if source.category
-                == fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { limit: 311 }
-    ));
+        .expect("unbounded FRE set measurement");
+    let needed = measured.build_report().charged_persistent_bytes;
 
-    let mut upstream_exact = regex::bytes::RegexSetBuilder::new(&patterns);
-    upstream_exact.unicode(false).size_limit(312);
-    let upstream_exact = upstream_exact.build().expect("exact upstream limit");
     let fre_exact = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
-        .size_limit(312)
+        .limits(limits)
+        .size_limit(needed)
         .build()
-        .expect("exact FRE aggregate limit");
-    for haystack in [b"".as_slice(), b"a", b"b", b"ab", &[0xFF, b'a']] {
-        assert_eq!(
-            ids(&fre_exact, haystack),
-            upstream_exact
-                .matches(haystack)
-                .into_iter()
-                .collect::<Vec<_>>()
-        );
-    }
+        .expect("exact FRE aggregate boundary");
+    assert_eq!(fre_exact.build_report().charged_persistent_bytes, needed);
+    assert_eq!(fre_exact.build_report().limits.max_persistent_bytes, needed);
     let profiles = core::iter::once(&fre_exact.build_report().profile).chain(
         (0..fre_exact.len()).map(|index| {
             let fre::CompatibilityProfile::RustBytes(profile) =
@@ -270,22 +244,41 @@ fn aggregate_size_limit_matches_pinned_bytes_set_and_retains_identity() {
         else {
             panic!("set lost high-level constructor identity");
         };
-        assert_eq!(*size_limit, 312);
+        assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
     }
+
+    let one_below = needed.checked_sub(1).expect("nonzero aggregate charge");
+    assert!(matches!(
+        PortableRegexSetBuilder::new(&patterns)
+            .unicode(false)
+            .limits(limits)
+            .size_limit(one_below)
+            .build(),
+        Err(PortableRegexSetBuildError::PersistentLimit {
+            needed: rejected,
+            limit,
+        }) if rejected == needed && limit == one_below
+    ));
 }
 
 #[test]
-fn aggregate_admission_preserves_upstream_syntax_before_size_order() {
+fn aggregate_persistent_preflight_is_bounded_before_later_pattern_syntax() {
     let patterns = sources(&["a", "("]);
-    let mut upstream = regex::bytes::RegexSetBuilder::new(&patterns);
-    upstream.unicode(false).size_limit(0);
-    assert!(matches!(upstream.build(), Err(regex::Error::Syntax(_))));
-
     let error = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
         .size_limit(0)
         .build()
-        .expect_err("syntax must precede aggregate NFA admission");
+        .expect_err("aggregate retained-storage preflight must be bounded");
+    assert!(matches!(
+        error,
+        PortableRegexSetBuildError::PersistentLimit { limit: 0, .. }
+    ));
+
+    let error = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .size_limit(usize::MAX)
+        .build()
+        .expect_err("the first invalid pattern must retain its index");
     assert!(matches!(
         error,
         PortableRegexSetBuildError::Pattern {
@@ -296,34 +289,31 @@ fn aggregate_admission_preserves_upstream_syntax_before_size_order() {
 }
 
 #[test]
-fn set_admission_does_not_reapply_capture_bearing_single_regex_limit() {
+fn set_size_limit_is_not_reapplied_to_constituent_matchers() {
     let patterns = sources(&["(a)"]);
-    let mut upstream_single = regex::bytes::RegexBuilder::new(&patterns[0]);
-    upstream_single.unicode(false).size_limit(200);
-    assert!(matches!(
-        upstream_single.build(),
-        Err(regex::Error::CompiledTooBig(200))
-    ));
-
-    let mut upstream_set = regex::bytes::RegexSetBuilder::new(&patterns);
-    upstream_set.unicode(false).size_limit(200);
-    let upstream_set = upstream_set
+    let mut limits = PortableRegexSetBuildLimits::default();
+    limits.max_persistent_bytes = usize::MAX;
+    limits.pattern.max_persistent_bytes = usize::MAX;
+    let measured = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .limits(limits)
+        .size_limit(usize::MAX)
         .build()
-        .expect("capture-free upstream set fits 200 bytes");
+        .expect("unbounded aggregate measurement");
+    let needed = measured.build_report().charged_persistent_bytes;
     let fre_set = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
-        .size_limit(200)
+        .limits(limits)
+        .size_limit(needed)
         .build()
-        .expect("FRE must not substitute single-regex admission");
-    for haystack in [b"".as_slice(), b"a", b"ba"] {
-        assert_eq!(
-            ids(&fre_set, haystack),
-            upstream_set
-                .matches(haystack)
-                .into_iter()
-                .collect::<Vec<_>>()
-        );
-    }
+        .expect("aggregate exact limit");
+    assert_eq!(
+        fre_set
+            .pattern_build_report(0)
+            .expect("constituent report")
+            .persistent_byte_limit,
+        usize::MAX
+    );
 }
 
 #[test]

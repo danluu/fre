@@ -7,10 +7,11 @@ use fre_syntax::RustProfile;
 use crate::{
     BuildError, BuildLimits, BuildReport, PortableBuilder, PortableRegex, PortableSearchSession,
     SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
+    rust_profile_size_limit, set_rust_profile_size_limit,
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 5;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 6;
 
 /// Stable schema for reusable regex-set session construction reports.
 pub const PORTABLE_REGEX_SET_SESSION_SCHEMA_VERSION: u32 = 1;
@@ -80,10 +81,6 @@ pub enum PortableRegexSetBuildError {
         index: usize,
         source: BuildError,
     },
-    /// The pinned aggregate Rust-set constructor rejected the complete set.
-    UpstreamAdmission {
-        source: fre_syntax::ParseError,
-    },
     ArithmeticOverflow {
         computation: &'static str,
     },
@@ -116,9 +113,6 @@ impl fmt::Display for PortableRegexSetBuildError {
             Self::Pattern { index, source } => {
                 write!(f, "portable regex set pattern {index} failed: {source}")
             }
-            Self::UpstreamAdmission { source } => {
-                write!(f, "pinned Rust regex set admission failed: {source}")
-            }
             Self::ArithmeticOverflow { computation } => {
                 write!(f, "portable regex set overflow computing {computation}")
             }
@@ -130,7 +124,6 @@ impl std::error::Error for PortableRegexSetBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pattern { source, .. } => Some(source),
-            Self::UpstreamAdmission { source } => Some(source),
             _ => None,
         }
     }
@@ -148,10 +141,15 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// Start a Rust-byte set from pattern sources in stable ID order.
     #[must_use]
     pub fn new(patterns: &'a [String]) -> Self {
+        let profile = RustProfile::regex_set_1_12_4();
+        let mut limits = PortableRegexSetBuildLimits::default();
+        if let Some(limit) = rust_profile_size_limit(&profile) {
+            limits.max_persistent_bytes = limit;
+        }
         Self {
             patterns,
-            profile: RustProfile::regex_set_1_12_4(),
-            limits: PortableRegexSetBuildLimits::default(),
+            profile,
+            limits,
         }
     }
 
@@ -159,6 +157,8 @@ impl<'a> PortableRegexSetBuilder<'a> {
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile.into_regex_set_builder();
+        self.limits.max_persistent_bytes = rust_profile_size_limit(&self.profile)
+            .unwrap_or(PortableRegexSetBuildLimits::default().max_persistent_bytes);
         self
     }
 
@@ -243,31 +243,16 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
-    /// Set the pinned high-level set builder's approximate compiled-regex
-    /// limit for the combined capture-free program.
-    ///
-    /// Unlike a single-pattern builder, this limit is evaluated once across
-    /// every pattern after each constituent passes FRE's syntax and plan
-    /// admission. It is never approximated as an independent per-pattern
-    /// limit.
+    /// Set the native retained-byte ceiling for the complete compiled set.
     #[must_use]
     pub fn size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } =
-            &mut self.profile.constructor
-        {
-            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
-        }
+        set_rust_profile_size_limit(&mut self.profile, bytes);
+        self.limits.max_persistent_bytes = bytes;
         self
     }
 
-    /// Set the pinned high-level builder's lazy-DFA cache capacity identity
-    /// for every pattern.
-    ///
-    /// FRE's portable plans do not use this upstream cache. Each constituent
-    /// matcher still retains the configured value while enforcing FRE's
-    /// independent construction and execution limits. The distinct direct-
-    /// Rebar constructor profile has no corresponding high-level option and
-    /// is left unchanged.
+    /// Retain the Rust-like lazy-DFA cache option. FRE has no corresponding
+    /// cache, so this does not change native construction or execution.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
         if let fre_syntax::RustConstructor::RegexSetBuilder { dfa_size_limit, .. } =
@@ -280,8 +265,14 @@ impl<'a> PortableRegexSetBuilder<'a> {
 
     /// Replace all set-wide and per-pattern construction limits.
     #[must_use]
-    pub const fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {
+    pub fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {
         self.limits = limits;
+        if matches!(
+            &self.profile.constructor,
+            fre_syntax::RustConstructor::RegexSetBuilder { .. }
+        ) {
+            set_rust_profile_size_limit(&mut self.profile, limits.max_persistent_bytes);
+        }
         self
     }
 
@@ -311,10 +302,6 @@ impl<'a> PortableRegexSetBuilder<'a> {
             self.limits.max_pattern_bytes,
             |needed, limit| PortableRegexSetBuildError::PatternBytesLimit { needed, limit },
         )?;
-
-        let upstream_profile = fre_syntax::CompatibilityProfile::RustBytes(self.profile.clone());
-        fre_syntax::validate_rust_regex_set_admission(self.patterns, &upstream_profile)
-            .map_err(map_upstream_admission)?;
 
         let source_slots = checked_mul::<String>(pattern_count, "source vector slots")?;
         let regex_slots = checked_mul::<PortableRegex>(pattern_count, "matcher vector slots")?;
@@ -373,7 +360,6 @@ impl<'a> PortableRegexSetBuilder<'a> {
             let regex = PortableBuilder::new(pattern.as_str())
                 .set_constituent_profile(self.profile.clone())
                 .limits(self.limits.pattern)
-                .after_set_admission()
                 .build()
                 .map_err(|source| PortableRegexSetBuildError::Pattern { index, source })?;
             plan_storage_bytes = checked_add(
@@ -440,21 +426,6 @@ impl<'a> PortableRegexSetBuilder<'a> {
             regexes,
             report,
         })
-    }
-}
-
-fn map_upstream_admission(
-    error: fre_syntax::RustRegexSetAdmissionError,
-) -> PortableRegexSetBuildError {
-    if let Some(index) = error.pattern {
-        PortableRegexSetBuildError::Pattern {
-            index,
-            source: BuildError::Syntax(error.source),
-        }
-    } else {
-        PortableRegexSetBuildError::UpstreamAdmission {
-            source: error.source,
-        }
     }
 }
 

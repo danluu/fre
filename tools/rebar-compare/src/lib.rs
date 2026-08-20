@@ -36637,7 +36637,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(current_identity.availability.contains(
             "Spans deliberately retains a continuation rather than an OrderedLiteral owner"
         ));
-        assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
+        assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 53);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION, 3);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, 2);
         assert_eq!(
