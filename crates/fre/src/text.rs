@@ -1270,14 +1270,18 @@ impl<'r> PortableTextSearchSession<'r> {
         self.inner.prepare_k0_start_filter(limits)
     }
 
-    pub(crate) fn is_match_accounted_at(
+    pub(crate) fn is_match_accounted_at_normalized(
         &mut self,
         haystack: &str,
         start: usize,
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
-        let start = next_text_boundary(haystack, start);
-        self.inner.is_match_at(haystack.as_bytes(), start, limits)
+        debug_assert!(start <= haystack.len() && haystack.is_char_boundary(start));
+        self.inner.is_match_window(
+            haystack.as_bytes(),
+            SearchWindow::new(start, haystack.len()),
+            limits,
+        )
     }
 
     /// Whether a selected match exists while reusing this session's workspace.
@@ -1310,6 +1314,20 @@ impl<'r> PortableTextSearchSession<'r> {
         let start = next_text_boundary(haystack, start);
         self.inner
             .is_match_value_at(haystack.as_bytes(), start, limits)
+    }
+
+    pub(crate) fn is_match_value_at_normalized(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        debug_assert!(start <= haystack.len() && haystack.is_char_boundary(start));
+        self.inner.is_match_window_value(
+            haystack.as_bytes(),
+            SearchWindow::new(start, haystack.len()),
+            limits,
+        )
     }
 
     /// Return the selected match while reusing this session's workspace.

@@ -760,6 +760,23 @@ impl PortableTextRegexSetSearchSession<'_> {
         self.is_match_at(haystack, 0, limits)
     }
 
+    /// Whether any pattern matches the full haystack without constructing a
+    /// set or constituent execution report on the unlimited-work success
+    /// path.
+    ///
+    /// Finite aggregate work, constituent work, or constituent scratch limits
+    /// retain the accounted constituent route so their exact cumulative work
+    /// and refusal semantics remain unchanged. Pattern-search limits are
+    /// enforced directly in both routes.
+    #[inline(always)]
+    pub fn is_match_value(
+        &mut self,
+        haystack: &str,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at(haystack, 0, limits)
+    }
+
     /// Whether any pattern matches at or after `start` while preserving text
     /// boundary normalization and reusing all constituent workspaces.
     pub fn is_match_at(
@@ -773,8 +790,14 @@ impl PortableTextRegexSetSearchSession<'_> {
         let mut searched = 0_usize;
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let search_count = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) =
-                search_one_session(session, index, haystack, search_start, limits, total_work)?;
+            let (matched, work) = search_one_session_normalized(
+                session,
+                index,
+                haystack,
+                search_start,
+                limits,
+                total_work,
+            )?;
             total_work = work;
             searched = search_count;
             if matched {
@@ -800,6 +823,77 @@ impl PortableTextRegexSetSearchSession<'_> {
                 output_capacity_bytes: 0,
             },
         ))
+    }
+
+    /// Whether any pattern matches at or after `start` without constructing a
+    /// set or constituent execution report on the unlimited-work success
+    /// path.
+    ///
+    /// This normalizes an interior UTF-8 offset exactly once, preserves
+    /// original-haystack assertion context and short-circuits in source order.
+    /// Calls with any finite work or scratch limit retain the exact
+    /// cumulative-work loop from [`Self::is_match_at`], while omitting only
+    /// its final report. The fully unlimited route also bypasses constituent
+    /// accounting when the constituent plan can do so without regressing its
+    /// assertion-heavy K0 path.
+    #[inline(always)]
+    pub fn is_match_value_at(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        let search_start = validate_text_start(haystack, start)?;
+        if !text_set_value_route_is_unlimited(limits) {
+            return self.is_match_value_at_accounted_normalized(haystack, search_start, limits);
+        }
+
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+            let regex = &self.owner.regexes[index];
+            let matched = if text_set_constituent_value_route_is_direct(regex) {
+                session.is_match_value_at_normalized(haystack, search_start, limits.pattern)
+            } else {
+                session
+                    .is_match_accounted_at_normalized(haystack, search_start, limits.pattern)
+                    .map(|(matched, _)| matched)
+            }
+            .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                index,
+                total_work_before: 0,
+                remaining_total_work: u64::MAX,
+                source,
+            })?;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_match_value_at_accounted_normalized(
+        &mut self,
+        haystack: &str,
+        search_start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        let mut total_work = 0_u64;
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+            let (matched, work) = search_one_session_normalized(
+                session,
+                index,
+                haystack,
+                search_start,
+                limits,
+                total_work,
+            )?;
+            total_work = work;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Return every matching pattern ID while reusing all constituent
@@ -836,8 +930,14 @@ impl PortableTextRegexSetSearchSession<'_> {
         let mut matched_patterns = 0_usize;
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) =
-                search_one_session(session, index, haystack, search_start, limits, total_work)?;
+            let (matched, work) = search_one_session_normalized(
+                session,
+                index,
+                haystack,
+                search_start,
+                limits,
+                total_work,
+            )?;
             total_work = work;
             if matched {
                 let needed = matched_patterns.checked_add(1).ok_or(
@@ -906,7 +1006,7 @@ fn search_one(
     Ok((matched, total_work))
 }
 
-fn search_one_session(
+fn search_one_session_normalized(
     session: &mut PortableTextSearchSession<'_>,
     index: usize,
     haystack: &str,
@@ -924,7 +1024,7 @@ fn search_one_session(
         max_scratch_bytes: limits.pattern.max_scratch_bytes,
     };
     let (matched, accounting) = session
-        .is_match_accounted_at(haystack, start, pattern_limits)
+        .is_match_accounted_at_normalized(haystack, start, pattern_limits)
         .map_err(|source| PortableRegexSetExecutionError::Pattern {
             index,
             total_work_before,
@@ -979,6 +1079,24 @@ fn enforce_output_bytes(needed: usize, limit: usize) -> Result<(), PortableRegex
         return Err(PortableRegexSetExecutionError::OutputBytesLimit { needed, limit });
     }
     Ok(())
+}
+
+const fn text_set_value_route_is_unlimited(limits: PortableRegexSetRunLimits) -> bool {
+    limits.max_total_work == u64::MAX
+        && limits.pattern.max_work == u64::MAX
+        && limits.pattern.max_scratch_bytes == usize::MAX
+}
+
+fn text_set_constituent_value_route_is_direct(regex: &PortableTextRegex) -> bool {
+    let report = regex.build_report();
+    report.portable.plan != crate::PlanKind::K0
+        || matches!(
+            &report.proof,
+            crate::PortableTextProof::IdenticalUtf8Hir {
+                has_look_assertions: false,
+                ..
+            }
+        )
 }
 
 fn enforce<E>(needed: usize, limit: usize, error: impl FnOnce(usize, usize) -> E) -> Result<(), E> {
