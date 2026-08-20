@@ -412,6 +412,24 @@ impl Plan {
         Ok((end, accounting))
     }
 
+    pub(crate) fn earliest_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if self.unmetered_work_fits(window) {
+                return Ok(self
+                    .search_value(haystack, window, true)
+                    .map(|(_, end)| end));
+            }
+        }
+        self.earliest_end_window(haystack, window, limits)
+            .map(|(end, _)| end)
+    }
+
     pub(crate) fn selected_end_window(
         &self,
         haystack: &[u8],

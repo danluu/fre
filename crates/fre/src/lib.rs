@@ -11218,9 +11218,17 @@ impl PortableRegex {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
-            _ => self
-                .shortest_match_window(haystack, window, limits)
-                .map(|(output, _)| output),
+            _ => {
+                if limits == SearchLimits::unlimited()
+                    && let PortablePlan::BoundedByteClassSequence(plan) = &self.plan
+                {
+                    return plan
+                        .earliest_end_window_value(haystack, window, limits)
+                        .map_err(SearchError::BoundedByteClassSequence);
+                }
+                self.shortest_match_window(haystack, window, limits)
+                    .map(|(output, _)| output)
+            }
         }
     }
 
