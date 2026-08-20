@@ -234,6 +234,16 @@ impl Plan {
         Ok((tail.map(|(_, end)| end), accounting))
     }
 
+    pub(crate) fn earliest_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, Error> {
+        self.first_tail(haystack, window, limits)
+            .map(|(tail, _, _)| tail.map(|(_, end)| end))
+    }
+
     pub(crate) fn selected_end_window(
         &self,
         haystack: &[u8],

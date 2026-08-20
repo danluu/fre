@@ -11193,6 +11193,12 @@ impl PortableRegex {
             PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
+            PortablePlan::NullableOptionalChain(plan) => plan
+                .earliest_end_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
+            PortablePlan::NullableFiniteTokenRepeat(plan) => plan
+                .earliest_end_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
             PortablePlan::K0(k0) => match k0.pooled_earliest_end_value(
                 haystack,
                 window,
