@@ -88,6 +88,11 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
             .0,
         None
     );
+    assert_eq!(
+        fre.find_at_borrowed_value(haystack, 2, SearchLimits::unlimited())
+            .expect("contextual borrowed value search"),
+        None
+    );
 
     let mut session = fre
         .search_session(SearchSessionLimits::unlimited())
@@ -156,6 +161,10 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
             let expected_full = upstream
                 .find(haystack)
                 .map(|matched| (matched.range(), matched.as_bytes()));
+            let immutable_full_value = fre
+                .find_borrowed_value(haystack, SearchLimits::unlimited())
+                .expect("immutable full borrowed value search");
+            assert_eq!(borrowed(immutable_full_value), expected_full);
             let (reused_full, reused_full_accounting) = session
                 .find_borrowed(haystack, SearchLimits::unlimited())
                 .expect("reused full borrowed search");
@@ -187,6 +196,14 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                             fre.as_str()
                         )
                     });
+                let actual_borrowed_value = fre
+                    .find_at_borrowed_value(haystack, start, SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "find_at_borrowed_value failed for {:?}/{haystack:?}/{start}: {error}",
+                            fre.as_str()
+                        )
+                    });
                 let (exists, exists_accounting) = fre
                     .is_match_at(haystack, start, SearchLimits::unlimited())
                     .unwrap_or_else(|error| {
@@ -204,6 +221,7 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                 assert_eq!(exists, upstream.is_match_at(haystack, start));
                 assert_eq!(exists, expected.is_some());
                 assert_eq!(borrowed(actual_borrowed), expected_borrowed);
+                assert_eq!(borrowed(actual_borrowed_value), expected_borrowed);
                 assert_eq!(borrowed_accounting, find_accounting);
                 assert_accounting_plan(&find_accounting, expected_plan);
                 assert_accounting_plan(&exists_accounting, expected_plan);
@@ -447,6 +465,8 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
             .expect_err("cold find_at must reject an out-of-bounds start"),
         fre.find_at_borrowed(haystack, start, SearchLimits::unlimited())
             .expect_err("cold find_at_borrowed must reject an out-of-bounds start"),
+        fre.find_at_borrowed_value(haystack, start, SearchLimits::unlimited())
+            .expect_err("cold borrowed-value find_at must reject an out-of-bounds start"),
         fre.find_at_value(haystack, start, SearchLimits::unlimited())
             .expect_err("cold value-only find_at must reject an out-of-bounds start"),
         fre.find_window_value(
