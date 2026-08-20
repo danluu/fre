@@ -885,6 +885,83 @@ impl PortableRegexSet {
         Ok((matched_patterns != 0, report))
     }
 
+    /// Set matching IDs in caller-owned flags without constructing set or
+    /// constituent execution reports on the unlimited-resource path.
+    ///
+    /// Successful searches have the same incremental mutation semantics as
+    /// [`Self::matches_read_at`]: only matching slots are changed from
+    /// `false` to `true`, any caller-owned tail remains untouched, and the
+    /// returned boolean describes this execution rather than flags retained
+    /// from an earlier call.
+    ///
+    /// Calls with any finite set or constituent limit retain the exact
+    /// accounted implementation, including cumulative work, partial flag
+    /// mutation, and refusal precedence. The value route is selected only
+    /// when every field equals [`PortableRegexSetRunLimits::unlimited`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same invalid range, undersized buffer, set limit, or
+    /// indexed matcher refusal as [`Self::matches_read_at`].
+    #[inline(always)]
+    pub fn matches_read_at_value(
+        &self,
+        match_flags: &mut [bool],
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        if start > haystack.len() {
+            return Err(PortableRegexSetExecutionError::InvalidStart {
+                start,
+                haystack_len: haystack.len(),
+            });
+        }
+        if match_flags.len() < self.len() {
+            return Err(PortableRegexSetExecutionError::MatchBufferTooSmall {
+                needed: self.len(),
+                available: match_flags.len(),
+            });
+        }
+        if self.is_empty() {
+            return Ok(false);
+        }
+        if limits != PortableRegexSetRunLimits::unlimited() {
+            return self
+                .matches_read_at(match_flags, haystack, start, limits)
+                .map(|(matched, _report)| matched);
+        }
+        let window = SearchWindow::new(start, haystack.len());
+        let mut any = false;
+        for (index, regex) in self.regexes.iter().enumerate() {
+            let matched = regex
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+            if matched {
+                match_flags[index] = true;
+                any = true;
+            }
+        }
+        Ok(any)
+    }
+
+    /// Backward-compatible spelling matching [`Self::read_matches_at`].
+    #[inline(always)]
+    pub fn read_matches_at_value(
+        &self,
+        match_flags: &mut [bool],
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.matches_read_at_value(match_flags, haystack, start, limits)
+    }
+
     /// Backward-compatible alias for [`Self::matches_read_at`].
     pub fn read_matches_at(
         &self,
