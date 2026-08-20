@@ -251,6 +251,10 @@ fn qualified_facade_session_value_projection_preserves_public_contracts() {
     let facade = PortableBuilder::new("0123456789abcdef")
         .build_qualified_exact_search(QUALIFIED_WORKLOAD)
         .expect("Candidate facade retains its exact portable owner");
+    assert!(
+        facade.portable_value_view().is_none(),
+        "exact-literal facade must not expose a portable value view"
+    );
     let session = facade
         .begin_current_thread_session()
         .expect("Candidate facade session needs no host contract");
@@ -297,7 +301,6 @@ fn qualified_facade_session_value_projection_preserves_public_contracts() {
             .expect("value-only facade existence search"),
         reported.is_some()
     );
-
     let needed = haystack
         .len()
         .checked_add(literal.len())
@@ -330,6 +333,9 @@ fn qualified_facade_value_projection_preserves_non_exact_portable_plan() {
         .unicode(false)
         .build_qualified_exact_search(QUALIFIED_WORKLOAD)
         .expect("non-exact facade retains its selected portable plan");
+    let portable_value = facade
+        .portable_value_view()
+        .expect("non-exact facade exposes its retained portable plan");
     let session = facade
         .begin_current_thread_session()
         .expect("portable facade plan needs no host contract");
@@ -353,6 +359,24 @@ fn qualified_facade_value_projection_preserves_non_exact_portable_plan() {
             .expect("value-only non-exact facade existence search"),
         reported.is_some()
     );
+    assert_eq!(
+        portable_value
+            .find(haystack)
+            .expect("unlimited-only non-exact facade search"),
+        reported
+    );
+    assert_eq!(
+        portable_value
+            .find_at(haystack, 0)
+            .expect("unlimited-only non-exact facade start search"),
+        reported
+    );
+    assert_eq!(
+        portable_value
+            .is_match(haystack)
+            .expect("unlimited-only non-exact facade existence search"),
+        reported.is_some()
+    );
 
     let invalid = SearchWindow::new(haystack.len(), haystack.len() - 1);
     let reporting_invalid = session
@@ -362,6 +386,37 @@ fn qualified_facade_value_projection_preserves_non_exact_portable_plan() {
         .find_window_value(haystack, invalid, SearchLimits::unlimited())
         .expect_err("value-only non-exact facade call must reject an invalid window");
     assert_eq!(value_invalid, reporting_invalid);
+    let unlimited_invalid = portable_value
+        .find_window(haystack, invalid)
+        .expect_err("unlimited-only non-exact facade call must reject an invalid window");
+    assert_eq!(
+        QualifiedExactSearchFacadeError::from(unlimited_invalid),
+        reporting_invalid
+    );
+
+    for limits in [
+        SearchLimits::default(),
+        SearchLimits {
+            max_work: 0,
+            ..SearchLimits::unlimited()
+        },
+        SearchLimits {
+            max_scratch_bytes: 0,
+            ..SearchLimits::unlimited()
+        },
+    ] {
+        for window in [
+            SearchWindow::full(haystack),
+            SearchWindow::new(1, haystack.len()),
+            SearchWindow::new(haystack.len(), haystack.len()),
+        ] {
+            let reporting = session
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+            let value = session.find_window_value(haystack, window, limits);
+            assert_eq!(value, reporting, "limits {limits:?}, window {window:?}");
+        }
+    }
 }
 
 #[test]

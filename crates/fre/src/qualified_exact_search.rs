@@ -1863,6 +1863,51 @@ pub struct QualifiedExactSearchFacadeThreadSession<'session> {
     plan: QualifiedExactSearchFacadeThreadSessionPlan<'session>,
 }
 
+/// Borrowed unlimited, report-free view of a qualified facade's retained
+/// portable plan.
+///
+/// Acquire this view once with
+/// [`QualifiedExactSearchFacade::portable_value_view`] when the facade did not
+/// select its exact-literal route. Repeated calls then avoid redispatching on
+/// the facade plan. Finite-resource callers should use the ordinary facade or
+/// facade-session methods instead. Since the route is already certified as
+/// portable, search failures use [`SearchError`] directly.
+#[derive(Clone, Copy, Debug)]
+pub struct QualifiedExactSearchFacadePortableValue<'regex> {
+    regex: &'regex PortableRegex,
+}
+
+impl QualifiedExactSearchFacadePortableValue<'_> {
+    /// Find the first match in the complete haystack.
+    #[inline(always)]
+    pub fn find(&self, haystack: &[u8]) -> Result<Option<Match>, SearchError> {
+        self.find_window(haystack, SearchWindow::full(haystack))
+    }
+
+    /// Find the first match at or after a checked start offset.
+    #[inline(always)]
+    pub fn find_at(&self, haystack: &[u8], start: usize) -> Result<Option<Match>, SearchError> {
+        self.find_window(haystack, SearchWindow::new(start, haystack.len()))
+    }
+
+    /// Find the first match wholly inside a checked byte window.
+    #[inline(always)]
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<Match>, SearchError> {
+        self.regex
+            .find_window_value(haystack, window, SearchLimits::unlimited())
+    }
+
+    /// Whether a selected match exists in the complete haystack.
+    #[inline(always)]
+    pub fn is_match(&self, haystack: &[u8]) -> Result<bool, SearchError> {
+        self.find(haystack).map(|matched| matched.is_some())
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 enum QualificationSessionAuthority<'session> {
@@ -2282,6 +2327,24 @@ impl QualifiedExactSearchFacade {
     #[must_use]
     pub const fn captures_len(&self) -> usize {
         self.portable_build_report().captures_len
+    }
+
+    /// Return an unlimited, report-free borrowed view of the retained
+    /// portable plan.
+    ///
+    /// This returns `None` when the facade selected its exact-literal route.
+    /// Inspecting the selection once lets repeated portable calls avoid the
+    /// facade's per-call route dispatch. Finite-resource callers should use
+    /// [`Self::begin_current_thread_session`] and its limit-aware methods.
+    #[must_use]
+    #[inline]
+    pub fn portable_value_view(&self) -> Option<QualifiedExactSearchFacadePortableValue<'_>> {
+        match &self.plan {
+            QualifiedExactSearchFacadePlan::Portable(regex) => {
+                Some(QualifiedExactSearchFacadePortableValue { regex })
+            }
+            QualifiedExactSearchFacadePlan::ExactLiteral(_) => None,
+        }
     }
 
     /// Establish one same-thread session for repeated facade calls.
