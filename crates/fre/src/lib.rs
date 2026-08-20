@@ -5486,6 +5486,22 @@ pub(crate) fn rust_profile_size_limit(profile: &RustProfile) -> Option<usize> {
     }
 }
 
+/// Construction limits selected by a fresh portable builder for this Rust
+/// profile.
+///
+/// [`BuildLimits::default`] remains the engine-wide resource envelope used by
+/// direct/internal profiles. A Rust-like facade additionally projects its
+/// public `size_limit` into the native retained-artifact ceiling, so code that
+/// authenticates the facade's default policy must compare against this
+/// profile-aware value rather than the engine-wide envelope alone.
+pub(crate) fn default_portable_build_limits(profile: &RustProfile) -> BuildLimits {
+    let mut limits = BuildLimits::default();
+    if let Some(limit) = rust_profile_size_limit(profile) {
+        limits.max_persistent_bytes = limit;
+    }
+    limits
+}
+
 pub(crate) fn set_rust_profile_size_limit(profile: &mut RustProfile, bytes: usize) {
     match &mut profile.constructor {
         fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
@@ -5684,10 +5700,7 @@ impl PortableBuilder {
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         let profile = RustProfile::default();
-        let mut limits = BuildLimits::default();
-        if let Some(limit) = rust_profile_size_limit(&profile) {
-            limits.max_persistent_bytes = limit;
-        }
+        let limits = default_portable_build_limits(&profile);
         Self {
             pattern: pattern.into(),
             profile,
@@ -32740,7 +32753,7 @@ mod tests {
         );
         assert_eq!(
             regex.build_report().persistent_byte_limit,
-            BuildLimits::default().max_persistent_bytes,
+            regex.limits.max_persistent_bytes,
         );
         assert_eq!(
             regex.runtime_implementation_id(),
@@ -37245,12 +37258,13 @@ mod tests {
         assert!(retained_build.additional_build_bytes > 0);
         assert!(retained_build.additional_persistent_bytes > 0);
         let planner_work = regex.build_report().planner_work;
+        let baseline_limits = regex.limits;
         let exact_build = PortableBuilder::new(pattern)
             .unicode(false)
             .retained_find_iter(true)
             .limits(BuildLimits {
                 max_planner_work: planner_work,
-                ..BuildLimits::default()
+                ..baseline_limits
             })
             .build()
             .unwrap();
@@ -37260,7 +37274,7 @@ mod tests {
             .retained_find_iter(true)
             .limits(BuildLimits {
                 max_planner_work: planner_work.checked_sub(1).unwrap(),
-                ..BuildLimits::default()
+                ..baseline_limits
             })
             .build()
             .unwrap();
@@ -39878,7 +39892,7 @@ mod tests {
             span.repeat,
             fre_kernels::RequiredLiteralClassRepeat::one_or_more()
         );
-        assert_eq!(span.build_limits, BuildLimits::default());
+        assert_eq!(span.build_limits, regex.limits);
         assert_eq!(span.search_limits, limits);
         assert_eq!(
             span,
@@ -40243,13 +40257,14 @@ mod tests {
             .unwrap();
         assert_eq!(baseline.build_report().plan, PlanKind::RequiredLiteral);
         let required = baseline.build_report().planner_work;
+        let baseline_limits = baseline.limits;
         assert!(required > 0);
 
         let exact = PortableBuilder::new(pattern)
             .unicode(false)
             .limits(BuildLimits {
                 max_planner_work: required,
-                ..BuildLimits::default()
+                ..baseline_limits
             })
             .build()
             .unwrap();
@@ -40260,7 +40275,7 @@ mod tests {
             .unicode(false)
             .limits(BuildLimits {
                 max_planner_work: one_below,
-                ..BuildLimits::default()
+                ..baseline_limits
             })
             .build()
             .unwrap_err();
@@ -41217,7 +41232,7 @@ mod tests {
             .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
             .unwrap();
         assert_eq!(span.plan_id, fre_kernels::ABSOLUTE_END_FIXED_PLAN_ID);
-        assert_eq!(span.build_limits, BuildLimits::default());
+        assert_eq!(span.build_limits, regex.limits);
         assert_eq!(span.search_limits, limits);
         assert_eq!(
             span,

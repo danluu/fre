@@ -13,7 +13,10 @@ use fre_syntax::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{BuildLimits, BuildReport, PlanKind, PlanSelection, PortablePlan, PortableRegex};
+use crate::{
+    BuildLimits, BuildReport, PlanKind, PlanSelection, PortablePlan, PortableRegex,
+    default_portable_build_limits,
+};
 
 /// Stable schema for the facade-owned exact-literal Search AOT binding.
 pub const SEARCH_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 2;
@@ -152,15 +155,17 @@ impl PortableRegex {
     /// not emit code or inspect the host.
     #[must_use]
     pub fn exact_literal_search_aot_candidate(&self) -> Option<SearchExactLiteralAotCandidate<'_>> {
-        if self.limits != BuildLimits::default() || self.selection != PlanSelection::Auto {
-            return None;
-        }
         let PortablePlan::ExactLiteral(literal) = &self.plan else {
             return None;
         };
         let CompatibilityProfile::RustBytes(profile) = &self.profile else {
             return None;
         };
+        if self.limits != default_portable_build_limits(profile)
+            || self.selection != PlanSelection::Auto
+        {
+            return None;
+        }
         let report = &self.report;
         let charged_persistent_bytes = self
             .source
@@ -553,7 +558,10 @@ mod tests {
 
         assert_eq!(first.source(), "needle");
         assert_eq!(first.literal(), b"needle");
-        assert_eq!(first.build_limits(), BuildLimits::default());
+        assert_eq!(
+            first.build_limits(),
+            default_portable_build_limits(first.profile())
+        );
         assert_eq!(first.selection(), PlanSelection::Auto);
         assert_eq!(
             first.semantic_binding_identity(),
