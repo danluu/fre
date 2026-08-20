@@ -11164,48 +11164,54 @@ impl PortableRegex {
         )
     }
 
+    #[inline]
     fn shortest_match_window_value(
         &self,
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
-        if let PortablePlan::UnicodeScalarRun(plan) = &self.plan {
-            return plan
+        match &self.plan {
+            PortablePlan::UnicodeScalarRun(plan) => plan
                 .shortest_match_window_value(
                     haystack,
                     fre_kernels::Window::new(window.start(), window.end()),
                     unicode_scalar_search_limits(limits),
                 )
-                .map_err(SearchError::from);
-        }
-        if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
-            return plan
+                .map_err(SearchError::from),
+            PortablePlan::BoundedLiteralClassRun(plan) => plan
                 .shortest_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
-                .map_err(SearchError::from);
-        }
-        if let PortablePlan::BoundedByteClassRepeat(plan) = &self.plan {
-            return plan
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
-                .map_err(SearchError::from);
-        }
-        if let PortablePlan::K0(k0) = &self.plan
-            && let Some(end) = k0.pooled_earliest_end_value(
+                .map_err(SearchError::from),
+            PortablePlan::K0(k0) => match k0.pooled_earliest_end_value(
                 haystack,
                 window,
                 limits,
                 SearchSessionLimits::default(),
                 self.report.minimum_match_bytes,
-            )?
-        {
-            return Ok(end);
+            )? {
+                Some(end) => Ok(end),
+                None => self
+                    .shortest_match_window(haystack, window, limits)
+                    .map(|(output, _)| output),
+            },
+            PortablePlan::FixedPredicateWord64(plan) => plan
+                .earliest_end_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )
+                .map_err(SearchError::from),
+            _ => self
+                .shortest_match_window(haystack, window, limits)
+                .map(|(output, _)| output),
         }
-        self.shortest_match_window(haystack, window, limits)
-            .map(|(output, _)| output)
     }
 
     #[allow(

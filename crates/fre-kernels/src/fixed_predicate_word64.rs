@@ -3389,6 +3389,22 @@ impl FixedPredicateWord64Plan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Return only the first accepting end wholly inside `window`.
+    ///
+    /// The compact success projection deliberately omits diagnostic accounting
+    /// while retaining the reporting operation's exact preflight and error
+    /// contract.
+    #[inline]
+    pub fn earliest_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.search_window_value(haystack, window, limits)
+            .map(|matched| matched.map(|(_, end)| end))
+    }
+
     /// Return the selected leftmost-first end in the complete haystack.
     pub fn selected_end(
         &self,
@@ -9911,6 +9927,12 @@ mod tests {
         let (earliest_end, earliest_accounting) =
             plan.earliest_end_window(haystack, window, limits).unwrap();
         assert_eq!(earliest_end, expected.map(|(_, end)| end));
+        assert_eq!(
+            plan.earliest_end_window_value(haystack, window, limits)
+                .unwrap(),
+            expected.map(|(_, end)| end),
+            "compact earliest end haystack={haystack:?}, window={window:?}"
+        );
         assert_eq!(
             earliest_accounting.identity.operation,
             SearchOperation::EarliestEnd
