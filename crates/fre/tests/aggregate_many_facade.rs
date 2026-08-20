@@ -389,10 +389,25 @@ fn capture_count_admits_result_only_after_exact_reducer_limits() {
     assert_eq!(6, baseline.value());
     assert_eq!(6, baseline.capture_events());
 
+    let mut selector_refused = AggregateManyCaptureRunLimits::unlimited();
+    selector_refused.selector.continuation.max_boundaries = 0;
+    assert_eq!(
+        regex
+            .count_captures(b"aabb", selector_refused)
+            .unwrap_err(),
+        regex
+            .count_captures_value(b"aabb", selector_refused)
+            .unwrap_err()
+    );
+
     let mut exact = AggregateManyCaptureRunLimits::unlimited();
     exact.max_capture_events = baseline.capture_events();
     exact.max_capture_count = baseline.value();
     assert_eq!(baseline, regex.count_captures(b"aabb", exact).unwrap());
+    assert_eq!(
+        baseline.value(),
+        regex.count_captures_value(b"aabb", exact).unwrap()
+    );
 
     exact.max_capture_events -= 1;
     assert!(matches!(
@@ -402,10 +417,30 @@ fn capture_count_admits_result_only_after_exact_reducer_limits() {
             limit: 5
         }
     ));
+    assert!(matches!(
+        regex
+            .count_captures_value(b"aabb", exact)
+            .unwrap_err()
+            .source,
+        AggregateManyExecutionSource::CaptureEventsLimit {
+            needed: 6,
+            limit: 5
+        }
+    ));
     exact.max_capture_events += 1;
     exact.max_capture_count -= 1;
     assert!(matches!(
         regex.count_captures(b"aabb", exact).unwrap_err().source,
+        AggregateManyExecutionSource::CaptureCountLimit {
+            needed: 6,
+            limit: 5
+        }
+    ));
+    assert!(matches!(
+        regex
+            .count_captures_value(b"aabb", exact)
+            .unwrap_err()
+            .source,
         AggregateManyExecutionSource::CaptureCountLimit {
             needed: 6,
             limit: 5

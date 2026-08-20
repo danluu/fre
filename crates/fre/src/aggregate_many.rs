@@ -1702,13 +1702,17 @@ impl AggregateManyCaptureCountRegex {
         })
     }
 
+    /// Count participating capture events without constructing the selector's
+    /// diagnostic execution details. Continuation selectors retain the
+    /// observed-work value contract of [`AggregateManyCountRegex::count_value`];
+    /// capture-event and capture-count limits are unchanged.
     pub fn count_captures_value(
         &self,
         haystack: &[u8],
         limits: AggregateManyCaptureRunLimits,
     ) -> Result<u64, AggregateManyExecutionError> {
-        self.count_captures(haystack, limits)
-            .map(|result| result.value)
+        let matches = self.0.count_value(haystack, limits.selector)?;
+        self.capture_value_from_matches(matches, limits)
     }
 
     /// Return the exact source-free retained storage required by an eligible
