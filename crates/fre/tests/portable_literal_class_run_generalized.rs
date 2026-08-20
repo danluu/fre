@@ -93,6 +93,18 @@ fn assert_exhaustive_windows(pattern: &str, alphabet: &[u8], maximum_length: usi
                     expected,
                     "selected pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
                 );
+                assert_eq!(
+                    regex
+                        .find_window_value(
+                            &haystack,
+                            SearchWindow::new(start, end),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "selected value pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                );
                 let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
                     panic!("wrong accounting family for {pattern:?}");
                 };
@@ -160,6 +172,33 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
         expected,
         "unlimited pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
     );
+    assert_eq!(
+        regex
+            .find_window_value(
+                haystack,
+                SearchWindow::new(start, end),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end())),
+        expected,
+        "unlimited value pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
+    assert_eq!(
+        regex
+            .find_window_value(
+                haystack,
+                SearchWindow::new(start, end),
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end())),
+        expected,
+        "custom-limit value pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
     let SearchAccounting::LiteralClassRunLiteral(unlimited_accounting) = unlimited_accounting
     else {
         panic!("wrong unlimited accounting family for {pattern:?}");
@@ -187,6 +226,21 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
         probe.map(|matched| (matched.start(), matched.end())),
         expected,
         "metered probe pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
+    assert_eq!(
+        regex
+            .find_window_value(
+                haystack,
+                SearchWindow::new(start, end),
+                SearchLimits {
+                    max_work: probe_limit,
+                    max_scratch_bytes: unlimited_accounting.scratch_bytes,
+                },
+            )
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end())),
+        expected,
+        "metered probe value pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
     );
     let SearchAccounting::LiteralClassRunLiteral(probe_accounting) = probe_accounting else {
         panic!("wrong metered probe accounting family for {pattern:?}");
@@ -219,6 +273,22 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
         expected,
         "metered pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
     );
+    let exact_limits = SearchLimits {
+        max_work: exact_work,
+        max_scratch_bytes: unlimited_accounting.scratch_bytes,
+    };
+    assert_eq!(
+        regex
+            .find_window_value(
+                haystack,
+                SearchWindow::new(start, end),
+                exact_limits,
+            )
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end())),
+        expected,
+        "metered value pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
     let SearchAccounting::LiteralClassRunLiteral(metered_accounting) = metered_accounting else {
         panic!("wrong metered accounting family for {pattern:?}");
     };
@@ -233,6 +303,18 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
     );
     assert!(u64::try_from(metered_accounting.work).unwrap() <= exact_work);
     assert!(metered_accounting.work_upper_bound > exact_work);
+
+    let refusing = SearchLimits {
+        max_work: exact_work - 1,
+        max_scratch_bytes: unlimited_accounting.scratch_bytes,
+    };
+    let accounted_error = regex
+        .find_window(haystack, SearchWindow::new(start, end), refusing)
+        .unwrap_err();
+    let value_error = regex
+        .find_window_value(haystack, SearchWindow::new(start, end), refusing)
+        .unwrap_err();
+    assert_eq!(accounted_error, value_error);
 }
 
 #[test]
@@ -284,6 +366,25 @@ fn exhaustive_singleton_star_overlap_and_word_subset_match_oracles() {
 fn exhaustive_guarded_suffix_inside_class_windows_match_oracles() {
     assert_exhaustive_windows(r"\b[AB]+B\b", b"ABC!\x80\xff", 4);
     assert_exhaustive_windows(r"\b[A-T]+T\b", b"AMTU!\x80\xff", 4);
+}
+
+#[test]
+fn generalized_span_value_preserves_invalid_window_errors() {
+    let regex = portable(r"a[ab]+c");
+    let haystack = b"!aabc!";
+    for window in [
+        SearchWindow::new(5, 4),
+        SearchWindow::new(0, haystack.len() + 1),
+    ] {
+        assert_eq!(
+            regex
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .unwrap_err(),
+            regex
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap_err(),
+        );
+    }
 }
 
 #[test]
@@ -402,6 +503,17 @@ fn generalized_plan_survives_cloning_sessions_and_nonoverlapping_iteration() {
                 .find(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected.first().copied()
+        );
+        assert_eq!(
+            session
+                .find_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
                 .map(|matched| (matched.start(), matched.end())),
             expected.first().copied()
         );

@@ -12761,12 +12761,12 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::LiteralClassRunSearch(plan) => plan
-                .find_window(
+                .find_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::BoundedLiteralClassRun(plan) => plan
                 .find_window_value(

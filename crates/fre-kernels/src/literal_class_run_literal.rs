@@ -2998,6 +2998,57 @@ impl LiteralClassRunSearchPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Return the selected match without retaining diagnostic accounting when
+    /// the complete unguarded search envelope is admitted.
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        if self.boundary_semantics() != BoundarySemantics::Unguarded
+            || limits != SearchLimits::unlimited()
+        {
+            return self
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+        }
+        let (upper, _, _, meter) = self.search_preflight(haystack.len(), window, limits)?;
+        if !meter.work_envelope_admitted
+            || upper.anchor_candidates > limits.max_candidate_visits
+        {
+            return self
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+        }
+        let slice = &haystack[window.start()..window.end()];
+        self.search_prefix_selected_value(slice)
+            .map(|(start, end)| {
+                Ok::<(usize, usize), ReduceError>((
+                    window.start().checked_add(start).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute generalized value match start",
+                        },
+                    )?,
+                    window.start().checked_add(end).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute generalized value match end",
+                        },
+                    )?,
+                ))
+            })
+            .transpose()
+            .map_err(SearchError::from)
+    }
+
     /// Whether any selected match exists without constructing diagnostic
     /// accounting on the success path.
     ///
@@ -3468,6 +3519,60 @@ impl LiteralClassRunSearchPlan {
             }
 
             // Prefix occurrences whose repeated runs share an end can be
+            // skipped as a group. These additions are bounded by the slice:
+            // the prefix is nonempty, the anchor lies inside the slice, and
+            // the recovered run end never exceeds it.
+            let overlapping_end = run_end - prefix_bytes + 1;
+            cursor = (anchor_start + 1).max(overlapping_end);
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the admitted fast path keeps every cursor within one proven nonempty-prefix slice"
+    )]
+    fn search_prefix_selected_value(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        debug_assert_eq!(self.anchor_kind, Anchor::Prefix);
+        let prefix_bytes = self.prefix().len();
+        let mut cursor = 0_usize;
+        loop {
+            let relative = self.anchor.find(&haystack[cursor..])?;
+            let anchor_start = cursor + relative;
+            let anchor_end = anchor_start + prefix_bytes;
+            let recovered = if self.unicode_all_non_ascii {
+                scan_unicode_all_non_ascii_run_forward_value(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                )
+            } else {
+                scan_class_run_forward_value(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                )
+            };
+            let run_end = match (self.minimum, recovered) {
+                (SearchRunMinimum::Zero, None) => anchor_end,
+                (SearchRunMinimum::Zero | SearchRunMinimum::One, Some(end)) => end,
+                (SearchRunMinimum::One, None) => {
+                    cursor = anchor_start + 1;
+                    continue;
+                }
+            };
+            if self.suffix().is_empty() {
+                return Some((anchor_start, run_end));
+            }
+            if haystack
+                .get(run_end..)
+                .is_some_and(|remaining| remaining.starts_with(self.suffix()))
+            {
+                return Some((anchor_start, run_end + self.suffix().len()));
+            }
+
+            // Prefix occurrences whose repeated runs share one end can be
             // skipped as a group. These additions are bounded by the slice:
             // the prefix is nonempty, the anchor lies inside the slice, and
             // the recovered run end never exceeds it.
@@ -7258,7 +7363,19 @@ mod tests {
                     }
                     for start in 0..=haystack.len() {
                         for end in start..=haystack.len() {
-                            let expected = oracle.find(&haystack[start..end]).is_some();
+                            let expected = oracle.find(&haystack[start..end]).map(|matched| {
+                                (start + matched.start(), start + matched.end())
+                            });
+                            assert_eq!(
+                                plan.find_window_value(
+                                    &haystack,
+                                    Window::new(start, end),
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected,
+                                "selected pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                            );
                             assert_eq!(
                                 plan.is_match_window_value(
                                     &haystack,
@@ -7266,7 +7383,7 @@ mod tests {
                                     SearchLimits::unlimited(),
                                 )
                                 .unwrap(),
-                                expected,
+                                expected.is_some(),
                                 "pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
                             );
                         }
@@ -7307,6 +7424,12 @@ mod tests {
                             .0,
                         expected,
                         "haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.find_window_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected,
+                        "value haystack={haystack:?} window={start}..{end}"
                     );
                     assert_eq!(
                         plan.shortest_window(haystack, window, SearchLimits::unlimited())
