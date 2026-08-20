@@ -2998,6 +2998,27 @@ impl LiteralClassRunSearchPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Return the earliest accepting end without retaining diagnostic
+    /// accounting when selected and earliest-end search share one loop.
+    #[inline]
+    pub fn shortest_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        if self.suffix().is_empty()
+            || self.boundary_semantics() != BoundarySemantics::Unguarded
+            || limits != SearchLimits::unlimited()
+        {
+            return self
+                .shortest_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+        }
+        self.find_window_value(haystack, window, limits)
+            .map(|matched| matched.map(|(_, end)| end))
+    }
+
     /// Return the selected match without retaining diagnostic accounting when
     /// the complete unguarded search envelope is admitted.
     #[inline]
@@ -7366,6 +7387,9 @@ mod tests {
                             let expected = oracle.find(&haystack[start..end]).map(|matched| {
                                 (start + matched.start(), start + matched.end())
                             });
+                            let expected_shortest = oracle
+                                .shortest_match(&haystack[start..end])
+                                .map(|relative_end| start + relative_end);
                             assert_eq!(
                                 plan.find_window_value(
                                     &haystack,
@@ -7385,6 +7409,16 @@ mod tests {
                                 .unwrap(),
                                 expected.is_some(),
                                 "pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                            );
+                            assert_eq!(
+                                plan.shortest_window_value(
+                                    &haystack,
+                                    Window::new(start, end),
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected_shortest,
+                                "shortest pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
                             );
                         }
                     }
@@ -7437,6 +7471,16 @@ mod tests {
                             .0,
                         expected_shortest,
                         "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.shortest_window_value(
+                            haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap(),
+                        expected_shortest,
+                        "shortest value haystack={haystack:?} window={start}..{end}"
                     );
                     assert_eq!(
                         plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
@@ -9217,6 +9261,132 @@ mod tests {
             ),
             Err(BuildError::WorkLimit { .. })
         ));
+    }
+
+    #[test]
+    fn generalized_shortest_value_preserves_fallback_resources_and_errors() {
+        let plan = generalized_plan(
+            b"a",
+            [(b'a', b'b')].into_iter(),
+            b"c",
+            SearchRunMinimum::One,
+        );
+        let haystack = b"!!aabbc!!";
+        let window = Window::full(haystack);
+        let (expected, accounting) = plan
+            .shortest_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            plan.shortest_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert!(accounting.work > 0);
+        assert!(accounting.candidate_visits > 0);
+
+        let exact = SearchLimits {
+            max_work_upper_bound: u64::try_from(accounting.work).unwrap(),
+            max_candidate_visits: accounting.candidate_visits,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            plan.shortest_window_value(haystack, window, exact)
+                .unwrap(),
+            plan.shortest_window(haystack, window, exact).unwrap().0
+        );
+
+        let work_below = SearchLimits {
+            max_work_upper_bound: u64::try_from(accounting.work - 1).unwrap(),
+            max_candidate_visits: usize::MAX,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            plan.shortest_window_value(haystack, window, work_below)
+                .unwrap_err(),
+            plan.shortest_window(haystack, window, work_below)
+                .unwrap_err()
+        );
+
+        let candidates_below = SearchLimits {
+            max_work_upper_bound: u64::MAX,
+            max_candidate_visits: accounting.candidate_visits - 1,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            plan.shortest_window_value(haystack, window, candidates_below)
+                .unwrap_err(),
+            plan.shortest_window(haystack, window, candidates_below)
+                .unwrap_err()
+        );
+
+        let custom = SearchLimits {
+            max_work_upper_bound: u64::MAX,
+            max_candidate_visits: usize::MAX,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            plan.shortest_window_value(haystack, window, custom)
+                .unwrap(),
+            plan.shortest_window(haystack, window, custom).unwrap().0
+        );
+
+        for invalid in [
+            Window::new(haystack.len(), haystack.len() - 1),
+            Window::new(0, haystack.len() + 1),
+        ] {
+            assert_eq!(
+                plan.shortest_window_value(haystack, invalid, SearchLimits::unlimited())
+                    .unwrap_err(),
+                plan.shortest_window(haystack, invalid, SearchLimits::unlimited())
+                    .unwrap_err()
+            );
+        }
+
+        let prefix_only = generalized_plan(
+            b"a",
+            [(b'b', b'c')].into_iter(),
+            b"",
+            SearchRunMinimum::Zero,
+        );
+        let prefix_haystack = b"!abcb!";
+        assert_eq!(
+            prefix_only
+                .shortest_window_value(
+                    prefix_haystack,
+                    Window::full(prefix_haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(2)
+        );
+
+        let guarded = LiteralClassRunSearchPlan::build(
+            b"",
+            [(b'A', b'Z'), (b'a', b'z')].into_iter(),
+            b"TRAILER",
+            SearchRunMinimum::One,
+            BoundarySemantics::CompleteAsciiWordRun,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let guarded_haystack = b"!abcTRAILER!";
+        assert_eq!(
+            guarded
+                .shortest_window_value(
+                    guarded_haystack,
+                    Window::full(guarded_haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            guarded
+                .shortest_window(
+                    guarded_haystack,
+                    Window::full(guarded_haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0
+        );
     }
 
     #[test]

@@ -11180,6 +11180,13 @@ impl PortableRegex {
                     unicode_scalar_search_limits(limits),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunSearch(plan) => plan
+                .shortest_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map_err(SearchError::from),
             PortablePlan::BoundedLiteralClassRun(plan) => plan
                 .shortest_window_value(
                     haystack,
