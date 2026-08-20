@@ -94,15 +94,10 @@ impl CompiledRegex {
     }
 
     pub(crate) fn exists(&self, haystack: &[u8]) -> Result<FreV1ExistsResult, Outcome> {
-        let matched = if self.search_limits == SearchLimits::unlimited() {
-            self.regex
-                .is_match_with_limits(haystack, self.search_limits)
-        } else {
-            self.regex
-                .is_match_accounted(haystack, self.search_limits)
-                .map(|(matched, _)| matched)
-        }
-        .map_err(|error| search_error(&error))?;
+        let matched = self
+            .regex
+            .is_match_with_limits(haystack, self.search_limits)
+            .map_err(|error| search_error(&error))?;
         Ok(FreV1ExistsResult {
             abi_version: crate::FRE_V1_ABI_VERSION,
             struct_size: size_u32::<FreV1ExistsResult>(),
@@ -125,14 +120,10 @@ impl CompiledRegex {
     }
 
     pub(crate) fn span(&self, haystack: &[u8]) -> Result<FreV1MatchResult, Outcome> {
-        let matched = if self.search_limits == SearchLimits::unlimited() {
-            self.regex.find_with_limits(haystack, self.search_limits)
-        } else {
-            self.regex
-                .find_accounted(haystack, self.search_limits)
-                .map(|(matched, _)| matched)
-        }
-        .map_err(|error| search_error(&error))?;
+        let matched = self
+            .regex
+            .find_with_limits(haystack, self.search_limits)
+            .map_err(|error| search_error(&error))?;
         Ok(FreV1MatchResult {
             abi_version: crate::FRE_V1_ABI_VERSION,
             struct_size: size_u32::<FreV1MatchResult>(),
