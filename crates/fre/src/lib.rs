@@ -11071,6 +11071,15 @@ impl PortableRegex {
             PortablePlan::AsciiWordRun(plan) => plan
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
+            PortablePlan::BoundedWordClass(plan)
+                if limits.max_work == u64::MAX
+                    && window.start() <= window.end()
+                    && window.end() <= haystack.len() =>
+            {
+                plan.shortest_window(haystack, window, limits)
+                    .map(|(end, _)| end.is_some())
+                    .map_err(SearchError::from)
+            }
             PortablePlan::BoundedWordClass(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched.is_some())
