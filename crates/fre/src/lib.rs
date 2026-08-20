@@ -13988,6 +13988,21 @@ enum PortableSearchSessionPlan<'a> {
 }
 
 #[inline]
+fn validate_k0_facade_window(
+    haystack_len: usize,
+    window: SearchWindow,
+) -> Result<(), SearchError> {
+    if window.start() > window.end() || window.end() > haystack_len {
+        return Err(SearchError::K0(K0SearchError::InvalidWindow {
+            start: window.start(),
+            end: window.end(),
+            haystack_len,
+        }));
+    }
+    Ok(())
+}
+
+#[inline]
 fn k0_absolute_end_window_is_proven_empty(
     proof: Option<K0AbsoluteEndProof>,
     haystack_len: usize,
@@ -19571,6 +19586,7 @@ impl<'r> PortableSearchSession<'r> {
                 aggregate_setup,
                 ..
             } => {
+                validate_k0_facade_window(haystack.len(), window)?;
                 let invocation =
                     K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
                 let report = session
@@ -19628,26 +19644,24 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_exists_state,
                 ..
             } => {
-                let invocation =
-                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
-                let limits = invocation.primary_limits();
-                let result = (|| {
-                    let absolute_end_proof = k0_plan.absolute_end_proof;
-                    let correlated_terminal = k0_plan.correlated_terminal();
-                    if k0_finite_minimum_window_is_proven_empty(
+                validate_k0_facade_window(haystack.len(), window)?;
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
-                ) {
-                    return Ok(false);
-                }
-                if k0_absolute_end_window_is_proven_empty(
+                ) || k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
                     window,
                 ) {
                     return Ok(false);
                 }
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let correlated_terminal = k0_plan.correlated_terminal();
                 if let Some(suffix) = (*mandatory_suffix)
                     .filter(|suffix| suffix.universal_finite_match_byte_bounds().is_some())
                 {
@@ -19932,26 +19946,24 @@ impl<'r> PortableSearchSession<'r> {
                 exclusive_route_state,
                 ..
             } => {
-                let invocation =
-                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
-                let limits = invocation.primary_limits();
-                let result = (|| {
-                    let absolute_end_proof = k0_plan.absolute_end_proof;
-                    let correlated_terminal = k0_plan.correlated_terminal();
-                    if k0_finite_minimum_window_is_proven_empty(
+                validate_k0_facade_window(haystack.len(), window)?;
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
-                ) {
-                    return Ok(None);
-                }
-                if k0_absolute_end_window_is_proven_empty(
+                ) || k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
                     window,
                 ) {
                     return Ok(None);
                 }
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let correlated_terminal = k0_plan.correlated_terminal();
                 if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
                         plan,
@@ -20110,6 +20122,7 @@ impl<'r> PortableSearchSession<'r> {
                 aggregate_setup,
                 ..
             } => {
+                validate_k0_facade_window(haystack.len(), window)?;
                 let invocation =
                     K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
                 let report = session
@@ -20354,6 +20367,7 @@ impl<'r> PortableSearchSession<'r> {
                 aggregate_setup,
                 ..
             } => {
+                validate_k0_facade_window(haystack.len(), window)?;
                 let invocation =
                     K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
                 let report = if window.end() == haystack.len() {
@@ -20424,26 +20438,24 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_span_state,
                 ..
             } => {
-                let invocation =
-                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
-                let limits = invocation.primary_limits();
-                let result = (|| {
-                    let absolute_end_proof = k0_plan.absolute_end_proof;
-                    let correlated_terminal = k0_plan.correlated_terminal();
-                    if k0_finite_minimum_window_is_proven_empty(
+                validate_k0_facade_window(haystack.len(), window)?;
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
-                ) {
-                    return Ok(None);
-                }
-                if k0_absolute_end_window_is_proven_empty(
+                ) || k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
                     window,
                 ) {
                     return Ok(None);
                 }
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let correlated_terminal = k0_plan.correlated_terminal();
                 if let Some(suffix) = (*mandatory_suffix)
                     .filter(|suffix| suffix.universal_finite_match_byte_bounds().is_some())
                 {
@@ -21676,11 +21688,9 @@ impl<'r> PortableSearchSession<'r> {
         if suffix.universal_finite_match_byte_bounds().is_none() {
             return None;
         }
-        let invocation = match K0AggregateInvocation::admit(session, *aggregate_setup, limits) {
-            Ok(invocation) => invocation,
-            Err(error) => return Some(Err(error)),
-        };
-        let limits = invocation.primary_limits();
+        if let Err(error) = validate_k0_facade_window(haystack.len(), window) {
+            return Some(Err(error));
+        }
         if k0_finite_minimum_window_is_proven_empty(Some(suffix), haystack.len(), window)
             || k0_absolute_end_window_is_proven_empty(
                 k0_plan.absolute_end_proof,
@@ -21690,6 +21700,11 @@ impl<'r> PortableSearchSession<'r> {
         {
             return Some(Ok(None));
         }
+        let invocation = match K0AggregateInvocation::admit(session, *aggregate_setup, limits) {
+            Ok(invocation) => invocation,
+            Err(error) => return Some(Err(error)),
+        };
+        let limits = invocation.primary_limits();
 
         // A positive-width iterator continuation owns a monotone residual
         // window. The graph-proved universal corridor is exact there even
@@ -21773,6 +21788,10 @@ impl<'r> PortableSearchSession<'r> {
         else {
             unreachable!("source-bound K0 iterator route was checked before construction");
         };
+        validate_k0_facade_window(
+            source.haystack().len(),
+            SearchWindow::new(start, source.haystack().len()),
+        )?;
         let invocation = K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
         let found = session
             .search_span_value_at_source_cursor(source, start, invocation.primary_limits())
@@ -21815,6 +21834,10 @@ impl<'r> PortableSearchSession<'r> {
             else {
                 unreachable!("retained K0 root-run cursor was checked above");
             };
+            validate_k0_facade_window(
+                source.haystack().len(),
+                SearchWindow::new(start, source.haystack().len()),
+            )?;
             let invocation = K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
             let report = session
                 .search_span_at_source_cursor(source, start, invocation.primary_limits())
@@ -21884,6 +21907,10 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter,
                 ..
             } => {
+                validate_k0_facade_window(
+                    source.haystack().len(),
+                    SearchWindow::new(start, source.haystack().len()),
+                )?;
                 let invocation =
                     K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
                 let limits = invocation.primary_limits();
@@ -24560,10 +24587,7 @@ mod tests {
         for start in (0..haystack.len().saturating_sub(3)).step_by(8) {
             haystack[start..start + 3].copy_from_slice(b"XYZ");
         }
-        assert_eq!(
-            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
-            None,
-        );
+        assert_eq!(regex.find(&haystack), None);
         let PortablePlan::K0(plan) = &regex.plan else {
             unreachable!("dense fixture selects K0");
         };
@@ -24580,10 +24604,7 @@ mod tests {
                 ),
                 Some((0, 8)),
             );
-            assert_eq!(
-                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
-                None,
-            );
+            assert_eq!(regex.find(&haystack), None);
             assert_eq!(
                 super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
                     adaptive.load()
@@ -25335,10 +25356,7 @@ mod tests {
             0,
             "Exists must leave the Span-only reverse owner untouched",
         );
-        assert_eq!(
-            regex.find_value(&absent, SearchLimits::unlimited()).unwrap(),
-            None,
-        );
+        assert_eq!(regex.find(&absent), None);
         assert_eq!(
             suffix.reverse_suffix_span_adaptive().unwrap().load(),
             0,
@@ -25355,7 +25373,7 @@ mod tests {
             "positive Exists must still bypass the Span-only reverse owner",
         );
         assert_eq!(
-            regex.find_value(&absent, SearchLimits::unlimited()).unwrap(),
+            regex.find(&absent),
             Some(Match {
                 start: 3_000,
                 end: 4_096,
@@ -25383,10 +25401,7 @@ mod tests {
         let suffix = plan.mandatory_suffix.as_ref().unwrap();
 
         let mut haystack = vec![b'q'; 4_096];
-        assert_eq!(
-            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
-            None,
-        );
+        assert_eq!(regex.find(&haystack), None);
         assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
 
         haystack[3_000..3_007].copy_from_slice(b"Zabzqqq");
@@ -25396,7 +25411,7 @@ mod tests {
                 .try_admit_reverse_suffix_span(haystack.len())
                 .expect("focused class admits one in-flight owner");
             assert_eq!(
-                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+                regex.find(&haystack),
                 Some(Match {
                     start: 3_000,
                     end: 4_096,
@@ -25412,7 +25427,7 @@ mod tests {
             assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
         }
         assert_eq!(
-            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+            regex.find(&haystack),
             Some(Match {
                 start: 3_000,
                 end: 4_096,
@@ -25429,7 +25444,7 @@ mod tests {
                 "a claimed short route must consume the cut before its suffix scan",
             );
             assert_eq!(
-                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+                regex.find(&haystack),
                 Some(Match {
                     start: 3_000,
                     end: 4_096,
@@ -25792,10 +25807,7 @@ mod tests {
             cut.first_member(&haystack).and_then(|member| cut.candidate_floor(0, member)),
             Some(6_000),
         );
-        assert_eq!(
-            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
-            expected,
-        );
+        assert_eq!(regex.find(&haystack), expected);
         let PortablePlan::K0(plan) = &regex.plan else {
             unreachable!("focused helper installs K0");
         };
@@ -28043,7 +28055,7 @@ mod tests {
     }
 
     #[test]
-    fn universal_finite_suffix_iterator_early_miss_preflights_live_scratch() {
+    fn universal_finite_suffix_iterator_early_miss_precedes_live_scratch() {
         let regex = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
         let haystack = vec![b'!'; 64];
         let mut search = regex
@@ -28075,15 +28087,19 @@ mod tests {
         };
         assert_eq!(
             search.find_iter_universal_finite_suffix_at(&haystack, haystack.len(), one_below),
-            Some(Err(SearchError::K0(
-                super::K0SearchError::ResourceLimit {
-                    resource: fre_automata::ResourceKind::ScratchBytes,
-                    needed: retained,
-                    limit: retained - 1,
-                },
-            ))),
-            "the early terminal theorem must not bypass the live scratch floor",
+            Some(Ok(None)),
+            "the minimum-window terminal theorem completes before live scratch admission",
         );
+        assert!(matches!(
+            search.find_iter_universal_finite_suffix_at(
+                &haystack,
+                haystack.len().checked_add(1).unwrap(),
+                one_below,
+            ),
+            Some(Err(SearchError::K0(
+                fre_automata::SearchError::InvalidWindow { .. }
+            )))
+        ));
     }
 
     #[test]
@@ -29129,21 +29145,38 @@ mod tests {
             SearchWindow::new(5, 4),
             SearchWindow::new(0, end.checked_add(1).unwrap()),
         ] {
-            assert!(is_invalid_window(session.is_match_window_value(
-                &haystack,
-                invalid,
-                SearchLimits::unlimited(),
-            )));
-            assert!(is_invalid_window(session.shortest_match_window_value(
-                &haystack,
-                invalid,
-                SearchLimits::unlimited(),
-            )));
-            assert!(is_invalid_window(session.find_window_value(
-                &haystack,
-                invalid,
-                SearchLimits::unlimited(),
-            )));
+            for invalid_limits in [SearchLimits::unlimited(), no_budget] {
+                assert!(is_invalid_window(session.is_match_window_value(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+                assert!(is_invalid_window(session.shortest_match_window_value(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+                assert!(is_invalid_window(session.find_window_value(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+                assert!(is_invalid_window(session.is_match_window(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+                assert!(is_invalid_window(session.shortest_match_window(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+                assert!(is_invalid_window(session.find_window(
+                    &haystack,
+                    invalid,
+                    invalid_limits,
+                )));
+            }
         }
 
         assert_eq!(haystack.as_ptr(), address);
@@ -37563,9 +37596,12 @@ mod tests {
             accounted_core < accounted_state,
             "general iterator payload retained the fixed cursor"
         );
+        // Demand-growth receipts add five word-sized counters to the
+        // accounting core. Keep the complete iterator inline with one word of
+        // headroom beyond its current 35-word layout.
         assert!(
-            accounted_state <= 32 * word,
-            "iterator state grew beyond its inline 32-word envelope: {accounted_state} bytes"
+            accounted_state <= 36 * word,
+            "iterator state grew beyond its inline 36-word envelope: {accounted_state} bytes"
         );
     }
 

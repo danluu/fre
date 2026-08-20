@@ -1790,31 +1790,54 @@ mod tests {
         let PortableSearchSessionPlan::K0 {
             session: exact_primary,
             aggregate_setup: exact_setup,
-            reverse_inner: Some(_),
+            reverse_inner: Some(exact_reverse_inner),
             ..
         } = &exact_session.plan
         else {
             panic!("exact aggregate limits must retain the sidecar");
         };
-        // A finite setup-work cap can decline an optional root-run inspection
-        // whose conservative prospective envelope fit under the unlimited
-        // construction. The same primary and sidecar storage must remain
-        // admitted, while actual setup work may consequently decrease.
-        assert!(exact_setup.work() <= aggregate_setup.work());
+        // Finite limits may select smaller adaptive seeds or a narrower
+        // admitted primary layout than the unlimited construction. Recompose
+        // the receipt from the owners this exact construction retained rather
+        // than requiring its physical footprint to equal another session's.
+        let exact_primary_setup = exact_primary.construction_accounting();
+        let exact_prefix_setup = exact_reverse_inner
+            .prefix_session()
+            .construction_accounting();
         assert_eq!(
-            exact_setup.retained_bytes(),
-            aggregate_setup.retained_bytes()
+            exact_setup.work(),
+            exact_primary_setup
+                .work()
+                .checked_add(exact_prefix_setup.work())
+                .and_then(|work| work.checked_add(SearchSession::owner_publication_work()))
+                .unwrap(),
         );
         assert_eq!(
             exact_setup.allocated_bytes(),
-            aggregate_setup.allocated_bytes()
+            exact_primary_setup
+                .allocated_bytes()
+                .checked_add(exact_prefix_setup.allocated_bytes())
+                .and_then(|bytes| bytes.checked_add(SearchSession::owner_bytes()))
+                .unwrap(),
         );
         assert_eq!(
             exact_setup.initialized_bytes(),
-            aggregate_setup.initialized_bytes()
+            exact_primary_setup
+                .initialized_bytes()
+                .checked_add(exact_prefix_setup.initialized_bytes())
+                .and_then(|bytes| bytes.checked_add(SearchSession::owner_bytes()))
+                .unwrap(),
         );
-
-        let exact_primary_setup = exact_primary.construction_accounting();
+        assert_eq!(
+            exact_setup.retained_bytes(),
+            exact_primary_setup
+                .retained_bytes()
+                .checked_add(exact_prefix_setup.retained_bytes())
+                .and_then(|bytes| bytes.checked_add(SearchSession::owner_bytes()))
+                .unwrap(),
+        );
+        assert!(exact_setup.work() <= exact_limits.max_setup_work);
+        assert!(exact_setup.retained_bytes() <= exact_limits.max_scratch_bytes);
         assert!(exact_primary_setup.work() < exact_limits.max_setup_work);
         let one_below = regex
             .search_session(SearchSessionLimits {
