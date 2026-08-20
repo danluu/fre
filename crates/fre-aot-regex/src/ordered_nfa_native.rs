@@ -236,6 +236,15 @@ pub(crate) const MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES: usize = 96
 /// receipt and deliberately keeps the incumbent byte-by-byte loop.
 pub(crate) const MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS: usize = 16;
 
+// A distinct single-assertion guarded start may amortize the same prefix text
+// in its wide consuming row instead of a retained epsilon closure. Keep this
+// narrow policy private to source admission: the ordinary 96-byte cap, emitted
+// plan, and frozen object ABI remain unchanged.
+const MIN_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CONSUME_EDGES: usize = 32;
+const MIN_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_EXACT_BYTES: u32 = 97;
+const MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_EXACT_BYTES: u32 = 128;
+const MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CANDIDATE_BYTES: usize = 128;
+
 /// Exact immutable object-wire descriptor extent. All table locations are
 /// descriptor-relative little-endian `u32` offsets, so the image contains no
 /// data relocations and remains position independent.
@@ -555,10 +564,18 @@ fn native_ordered_nfa_start_prefix_contains(
     clippy::arithmetic_side_effects,
     reason = "fixed four-word membership and the complete byte loop bound every index and shift"
 )]
-fn validate_native_ordered_nfa_start_prefix(
+fn validate_native_ordered_nfa_start_prefix_with_candidate_cap(
     plan: NativeOrderedNfaStartPrefixPlan,
     exact: [u64; 4],
+    max_candidate_bytes: usize,
 ) -> Result<NativeOrderedNfaStartPrefixPlan, ObjectError> {
+    if max_candidate_bytes == 0
+        || max_candidate_bytes > MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CANDIDATE_BYTES
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix planner candidate-byte cap",
+        ));
+    }
     let ranges = plan.ranges();
     if ranges.is_empty() || ranges.len() > MAX_NATIVE_ORDERED_NFA_START_PREFIX_RANGES {
         return Err(ObjectError::InvalidModule(
@@ -568,9 +585,7 @@ fn validate_native_ordered_nfa_start_prefix(
     let mut candidate_bytes = 0_usize;
     let mut previous_end = None;
     for range in ranges {
-        if range.start > range.end
-            || previous_end.is_some_and(|end| end >= range.start)
-        {
+        if range.start > range.end || previous_end.is_some_and(|end| end >= range.start) {
             return Err(ObjectError::InvalidModule(
                 "ordered-NFA start-prefix range order",
             ));
@@ -581,16 +596,15 @@ fn validate_native_ordered_nfa_start_prefix(
             .ok_or(ObjectError::InvalidModule(
                 "ordered-NFA start-prefix range width",
             ))?;
-        candidate_bytes = candidate_bytes
-            .checked_add(width)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "ordered-NFA start-prefix candidate bytes",
-            ))?;
+        candidate_bytes =
+            candidate_bytes
+                .checked_add(width)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-NFA start-prefix candidate bytes",
+                ))?;
         previous_end = Some(range.end);
     }
-    if candidate_bytes == 0
-        || candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES
-    {
+    if candidate_bytes == 0 || candidate_bytes > max_candidate_bytes {
         return Err(ObjectError::InvalidModule(
             "ordered-NFA start-prefix candidate-byte cap",
         ));
@@ -619,7 +633,28 @@ fn validate_native_ordered_nfa_start_prefix(
 fn derive_native_ordered_nfa_start_prefix(
     exact: [u64; 4],
 ) -> Result<Option<NativeOrderedNfaStartPrefixPlan>, ObjectError> {
-    const MAX_EXACT_RANGES: usize = MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES;
+    derive_native_ordered_nfa_start_prefix_with_candidate_cap(
+        exact,
+        MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES,
+    )
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the exact cardinality, deterministic gap merging, and fixed range capacity form one bounded planner transaction"
+)]
+fn derive_native_ordered_nfa_start_prefix_with_candidate_cap(
+    exact: [u64; 4],
+    max_candidate_bytes: usize,
+) -> Result<Option<NativeOrderedNfaStartPrefixPlan>, ObjectError> {
+    const MAX_EXACT_RANGES: usize = MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CANDIDATE_BYTES;
+
+    if max_candidate_bytes == 0 || max_candidate_bytes > MAX_EXACT_RANGES {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA start-prefix derivation candidate-byte cap",
+        ));
+    }
 
     let exact_candidate_bytes: usize = exact
         .iter()
@@ -628,9 +663,7 @@ fn derive_native_ordered_nfa_start_prefix(
                 .expect("a u64 population count fits every supported usize")
         })
         .sum();
-    if exact_candidate_bytes == 0
-        || exact_candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES
-    {
+    if exact_candidate_bytes == 0 || exact_candidate_bytes > max_candidate_bytes {
         return Ok(None);
     }
 
@@ -649,9 +682,11 @@ fn derive_native_ordered_nfa_start_prefix(
             last.end = byte;
             continue;
         }
-        let slot = ranges.get_mut(range_count).ok_or(ObjectError::InvalidModule(
-            "ordered-NFA start-prefix exact range capacity",
-        ))?;
+        let slot = ranges
+            .get_mut(range_count)
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA start-prefix exact range capacity",
+            ))?;
         *slot = NativeOrderedNfaByteRange {
             start: byte,
             end: byte,
@@ -678,13 +713,11 @@ fn derive_native_ordered_nfa_start_prefix(
                 ))?;
             let mut frequency_units = 0_u16;
             for byte in gap_start..=gap_end {
-                frequency_units = frequency_units.saturating_add(
-                    estimated_byte_frequency_units(u8::try_from(byte).map_err(|_| {
-                        ObjectError::ArithmeticOverflow(
-                            "ordered-NFA start-prefix gap byte",
-                        )
-                    })?),
-                );
+                frequency_units = frequency_units.saturating_add(estimated_byte_frequency_units(
+                    u8::try_from(byte).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("ordered-NFA start-prefix gap byte")
+                    })?,
+                ));
             }
             let key = (frequency_units, gap_bytes, gap_index);
             if selected_gap.is_none_or(|(_, current_key)| key < current_key) {
@@ -699,21 +732,21 @@ fn derive_native_ordered_nfa_start_prefix(
         range_count -= 1;
     }
 
-    let candidate_bytes = ranges[..range_count].iter().try_fold(
-        0_usize,
-        |sum, range| {
+    let candidate_bytes = ranges[..range_count]
+        .iter()
+        .try_fold(0_usize, |sum, range| {
             let width = usize::from(range.end)
                 .checked_sub(usize::from(range.start))
                 .and_then(|width| width.checked_add(1))
                 .ok_or(ObjectError::InvalidModule(
                     "ordered-NFA start-prefix coalesced range width",
                 ))?;
-            sum.checked_add(width).ok_or(ObjectError::ArithmeticOverflow(
-                "ordered-NFA start-prefix coalesced candidate bytes",
-            ))
-        },
-    )?;
-    if candidate_bytes > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES {
+            sum.checked_add(width)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-NFA start-prefix coalesced candidate bytes",
+                ))
+        })?;
+    if candidate_bytes > max_candidate_bytes {
         return Ok(None);
     }
 
@@ -726,7 +759,211 @@ fn derive_native_ordered_nfa_start_prefix(
             ObjectError::ArithmeticOverflow("ordered-NFA start-prefix compact range count")
         })?,
     };
-    Ok(Some(validate_native_ordered_nfa_start_prefix(plan, exact)?))
+    Ok(Some(
+        validate_native_ordered_nfa_start_prefix_with_candidate_cap(
+            plan,
+            exact,
+            max_candidate_bytes,
+        )?,
+    ))
+}
+
+fn native_ordered_nfa_state_edge_bounds(
+    raw: &RawPlan,
+    state: usize,
+) -> Result<(usize, usize), ObjectError> {
+    let successor = state.checked_add(1).ok_or(ObjectError::InvalidModule(
+        "ordered-NFA guarded Unicode prefix state successor",
+    ))?;
+    let begin = raw
+        .edge_offsets
+        .get(state)
+        .copied()
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix edge begin",
+        ))?;
+    let end = raw
+        .edge_offsets
+        .get(successor)
+        .copied()
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix edge end",
+        ))?;
+    if begin > end || end > raw.edge_targets.len() {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix edge bounds",
+        ));
+    }
+    Ok((begin, end))
+}
+
+fn native_ordered_nfa_start_prefix_intersects_utf8_continuation(
+    plan: NativeOrderedNfaStartPrefixPlan,
+) -> bool {
+    plan.ranges()
+        .iter()
+        .any(|range| range.start <= 0xbf && range.end >= 0x80)
+}
+
+/// Admit the one audited cheap-closure exception without weakening the
+/// ordinary start-prefix policy. The scalar start closure deliberately has no
+/// retained sidecar for this one-edge shape, so the canonical graph must
+/// describe exactly `AssertWordUnicode -> Consume`; the consuming row then
+/// reconstructs the authenticated first-byte bitmap before the wider cover is
+/// considered.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the complete fail-closed graph, bitmap, and range validation transaction bounds every index and shift"
+)]
+fn derive_native_ordered_nfa_guarded_unicode_start_prefix(
+    raw: &RawPlan,
+    exact: [u64; 4],
+) -> Result<Option<NativeOrderedNfaStartPrefixPlan>, ObjectError> {
+    let root_state = usize::try_from(raw.start)
+        .map_err(|_| ObjectError::InvalidModule("ordered-NFA guarded Unicode prefix root state"))?;
+    let root_role = raw.roles.get(root_state).ok_or(ObjectError::InvalidModule(
+        "ordered-NFA guarded Unicode prefix root bounds",
+    ))?;
+    if *root_role != StateRole::Split {
+        return Ok(None);
+    }
+
+    let (root_begin, root_end) = native_ordered_nfa_state_edge_bounds(raw, root_state)?;
+    for edge in root_begin..root_end {
+        let kind = *raw.edge_kinds.get(edge).ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix root edge kind",
+        ))?;
+        if kind == EdgeKind::ByteRange || encode_edge_kind(kind).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix root edge role",
+            ));
+        }
+        if raw.byte_starts.get(edge) != Some(&0) || raw.byte_ends.get(edge) != Some(&0) {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix assertion payload",
+            ));
+        }
+        let target = raw
+            .edge_targets
+            .get(edge)
+            .copied()
+            .and_then(|target| usize::try_from(target).ok())
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix root target",
+            ))?;
+        if target >= raw.roles.len() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix root target bounds",
+            ));
+        }
+    }
+    if root_end.checked_sub(root_begin) != Some(1) {
+        return Ok(None);
+    }
+    let root_kind = raw
+        .edge_kinds
+        .get(root_begin)
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix root edge kind",
+        ))?;
+    if *root_kind != EdgeKind::AssertWordUnicode {
+        return Ok(None);
+    }
+    let consume_state = *raw
+        .edge_targets
+        .get(root_begin)
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix root target",
+        ))?;
+    let consume_index = usize::try_from(consume_state).map_err(|_| {
+        ObjectError::InvalidModule("ordered-NFA guarded Unicode prefix consume state")
+    })?;
+    let consume_role = raw
+        .roles
+        .get(consume_index)
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix consume bounds",
+        ))?;
+    if *consume_role != StateRole::Consume {
+        return Ok(None);
+    }
+
+    let (consume_begin, consume_end) = native_ordered_nfa_state_edge_bounds(raw, consume_index)?;
+    let consume_degree =
+        consume_end
+            .checked_sub(consume_begin)
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix consuming degree",
+            ))?;
+
+    let mut reconstructed = [0_u64; 4];
+    for edge in consume_begin..consume_end {
+        if raw.edge_kinds.get(edge) != Some(&EdgeKind::ByteRange) {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix consuming edge kind",
+            ));
+        }
+        let target = raw
+            .edge_targets
+            .get(edge)
+            .copied()
+            .and_then(|target| usize::try_from(target).ok())
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix consuming target",
+            ))?;
+        if target >= raw.roles.len() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix consuming target bounds",
+            ));
+        }
+        let start = *raw.byte_starts.get(edge).ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix range start",
+        ))?;
+        let end = *raw.byte_ends.get(edge).ok_or(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix range end",
+        ))?;
+        if start > end {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA guarded Unicode prefix range order",
+            ));
+        }
+        for byte in start..=end {
+            let index = usize::from(byte);
+            reconstructed[index / 64] |= 1_u64 << (index % 64);
+        }
+    }
+
+    let exact_bytes = reconstructed
+        .iter()
+        .map(|word| word.count_ones())
+        .sum::<u32>();
+    if reconstructed != exact {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA guarded Unicode prefix exact-set proof",
+        ));
+    }
+    if consume_degree < MIN_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CONSUME_EDGES
+        || !(MIN_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_EXACT_BYTES
+            ..=MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_EXACT_BYTES)
+            .contains(&exact_bytes)
+        || exact[2] != 0
+    {
+        return Ok(None);
+    }
+    let Some(plan) = derive_native_ordered_nfa_start_prefix_with_candidate_cap(
+        exact,
+        MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CANDIDATE_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    if native_ordered_nfa_start_prefix_intersects_utf8_continuation(plan) {
+        return Ok(None);
+    }
+    Ok(Some(plan))
 }
 
 #[allow(
@@ -1243,15 +1480,22 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             None => None,
         };
         let start_closure_program = start_closure_dispatch.and(view.start_closure_dispatch);
-        let start_prefix = start_closure_dispatch
-            .filter(|receipt| {
-                receipt.instruction_count
-                    >= MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS
-            })
-            .and(view.start_prefix_first_set)
-            .map(derive_native_ordered_nfa_start_prefix)
-            .transpose()?
-            .flatten();
+        let start_prefix = match (
+            view.start_closure_dispatch,
+            start_closure_dispatch,
+            view.start_prefix_first_set,
+        ) {
+            (Some(_), Some(receipt), Some(exact))
+                if receipt.instruction_count
+                    >= MIN_NATIVE_ORDERED_NFA_START_PREFIX_CLOSURE_INSTRUCTIONS =>
+            {
+                derive_native_ordered_nfa_start_prefix(exact)?
+            }
+            (None, None, Some(exact)) => {
+                derive_native_ordered_nfa_guarded_unicode_start_prefix(raw, exact)?
+            }
+            _ => None,
+        };
         let whole_window_width_bounds = match view.whole_window_width_bounds {
             Some(bounds) if bounds.minimum <= bounds.maximum => Some(bounds),
             Some(_) => {
@@ -3216,6 +3460,92 @@ mod tests {
             .sum()
     }
 
+    fn ranges_with_degree(mut ranges: Vec<(u8, u8)>, degree: usize) -> Vec<(u8, u8)> {
+        assert!(!ranges.is_empty());
+        assert!(ranges.len() <= degree);
+        let duplicate = ranges[0].0;
+        while ranges.len() < degree {
+            ranges.push((duplicate, duplicate));
+        }
+        ranges
+    }
+
+    fn guarded_prefix_cardinality_ranges(cardinality: u16, degree: usize) -> Vec<(u8, u8)> {
+        assert!((1..=192).contains(&cardinality));
+        let ranges = if cardinality <= 128 {
+            vec![(
+                0,
+                u8::try_from(cardinality.checked_sub(1).unwrap()).unwrap(),
+            )]
+        } else {
+            vec![
+                (0, 127),
+                (
+                    192,
+                    u8::try_from(
+                        191_u16
+                            .checked_add(cardinality.checked_sub(128).unwrap())
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            ]
+        };
+        ranges_with_degree(ranges, degree)
+    }
+
+    fn guarded_prefix_program(assertion: EdgeKind, ranges: &[(u8, u8)]) -> crate::CompiledProgram {
+        let consume_end = ranges
+            .len()
+            .checked_add(1)
+            .and_then(|end| u32::try_from(end).ok())
+            .expect("focused guarded-prefix edge count fits u32");
+        let mut edge_targets = vec![1];
+        edge_targets.extend(std::iter::repeat_n(2, ranges.len()));
+        let mut edge_kinds = vec![assertion];
+        edge_kinds.extend(std::iter::repeat_n(EdgeKind::ByteRange, ranges.len()));
+        let mut byte_starts = vec![0];
+        byte_starts.extend(ranges.iter().map(|&(start, _)| start));
+        let mut byte_ends = vec![0];
+        byte_ends.extend(ranges.iter().map(|&(_, end)| end));
+        let raw = RawPlan {
+            start: 0,
+            roles: vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, 1, consume_end, consume_end],
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        };
+        let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
+            .expect("validate focused guarded-prefix graph");
+        crate::CompiledProgram::build(
+            raw,
+            automaton,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            usize::MAX,
+        )
+        .expect("compile focused guarded-prefix graph")
+    }
+
+    fn selected_start_prefix(
+        program: &crate::CompiledProgram,
+    ) -> Option<NativeOrderedNfaStartPrefixPlan> {
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("focused program exposes an ordered-NFA view");
+        NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap()
+            .layout
+            .start_prefix
+    }
+
     #[test]
     #[allow(
         clippy::arithmetic_side_effects,
@@ -3296,6 +3626,365 @@ mod tests {
         assert!(derive_native_ordered_nfa_start_prefix(costly_cover)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn guarded_unicode_word_wide_row_admits_a_wider_compiler_only_prefix() {
+        let ranges = guarded_prefix_cardinality_ranges(110, 39);
+        let program = guarded_prefix_program(EdgeKind::AssertWordUnicode, &ranges);
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("guarded fixture exposes an ordered-NFA view");
+        let exact = view
+            .start_prefix_first_set
+            .expect("guarded fixture has an authenticated first-byte set");
+        assert_eq!(exact.iter().map(|word| word.count_ones()).sum::<u32>(), 110);
+        assert_eq!(exact[2], 0);
+        assert!(
+            derive_native_ordered_nfa_start_prefix(exact)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(view.start_closure_dispatch.is_none());
+
+        let plan = derive_native_ordered_nfa_guarded_unicode_start_prefix(view.raw, exact)
+            .unwrap()
+            .expect("audited guarded shape admits the wider cover");
+        assert_eq!(prefix_candidate_bytes(plan), 110);
+        assert!(prefix_candidate_bytes(plan) > MAX_NATIVE_ORDERED_NFA_START_PREFIX_CANDIDATE_BYTES);
+        assert!(!native_ordered_nfa_start_prefix_intersects_utf8_continuation(plan));
+        for byte in u8::MIN..=u8::MAX {
+            let index = usize::from(byte);
+            if exact[index / 64] & (1_u64 << (index % 64)) != 0 {
+                assert!(native_ordered_nfa_start_prefix_contains(plan, byte));
+            }
+        }
+
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.layout.start_prefix, Some(plan));
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_prefix_first_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(without.layout.start_prefix.is_none());
+        assert!(selected.layout.start_closure_dispatch.is_none());
+        assert!(selected.start_closure_program.is_none());
+        assert!(without.layout.start_closure_dispatch.is_none());
+        assert!(without.start_closure_program.is_none());
+        assert_eq!(selected.bytes, without.bytes);
+        assert_eq!(selected.layout.object_bytes, without.layout.object_bytes);
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_requires_the_source_receipt_to_be_absent() {
+        let ranges = guarded_prefix_cardinality_ranges(110, 39);
+        let program = guarded_prefix_program(EdgeKind::AssertWordUnicode, &ranges);
+        let view = program.native_ordered_nfa_view().unwrap();
+        assert!(view.start_closure_dispatch.is_none());
+        assert!(selected_start_prefix(&program).is_some());
+
+        let oversized =
+            unary_split_chain_program(MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS);
+        let oversized_program = oversized
+            .native_ordered_nfa_view()
+            .unwrap()
+            .start_closure_dispatch
+            .expect("oversized fixture still exposes its source receipt");
+        assert!(oversized_program.len() > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS);
+
+        let omitted = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                start_closure_dispatch: Some(oversized_program),
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(omitted.layout.start_closure_dispatch.is_none());
+        assert!(omitted.start_closure_program.is_none());
+        assert!(omitted.layout.start_prefix.is_none());
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_requires_the_exact_raw_shape_and_bitmap() {
+        let ranges = guarded_prefix_cardinality_ranges(110, 39);
+        let unicode = guarded_prefix_program(EdgeKind::AssertWordUnicode, &ranges);
+        let unicode_view = unicode.native_ordered_nfa_view().unwrap();
+        let exact = unicode_view.start_prefix_first_set.unwrap();
+        assert!(unicode_view.start_closure_dispatch.is_none());
+
+        let absolute = guarded_prefix_program(EdgeKind::AssertHaystackStart, &ranges);
+        let absolute_view = absolute.native_ordered_nfa_view().unwrap();
+        assert_eq!(absolute_view.start_prefix_first_set, Some(exact));
+        assert_eq!(
+            absolute_view.raw.edge_kinds[0],
+            EdgeKind::AssertHaystackStart
+        );
+        assert!(absolute_view.start_closure_dispatch.is_none());
+        assert!(selected_start_prefix(&absolute).is_none());
+
+        let mut alternative = unicode_view.raw.clone();
+        alternative.roles[0] = StateRole::Consume;
+        assert!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&alternative, exact)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut mismatched = exact;
+        mismatched[0] &= !1;
+        assert!(matches!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(unicode_view.raw, mismatched,),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let mut malformed = unicode_view.raw.clone();
+        malformed.byte_starts[0] = 1;
+        assert!(matches!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&malformed, exact),
+            Err(ObjectError::InvalidModule(_))
+        ));
+        alternative = unicode_view.raw.clone();
+        alternative.edge_targets.insert(1, 1);
+        alternative
+            .edge_kinds
+            .insert(1, EdgeKind::AssertWordUnicode);
+        alternative.byte_starts.insert(1, 0);
+        alternative.byte_ends.insert(1, 0);
+        for offset in &mut alternative.edge_offsets[1..] {
+            *offset = offset.checked_add(1).unwrap();
+        }
+        assert!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&alternative, exact)
+                .unwrap()
+                .is_none()
+        );
+        alternative = unicode_view.raw.clone();
+        alternative.edge_targets[0] = 2;
+        assert!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&alternative, exact)
+                .unwrap()
+                .is_none()
+        );
+        malformed = unicode_view.raw.clone();
+        malformed.edge_kinds[1] = EdgeKind::Epsilon;
+        assert!(matches!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&malformed, exact),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        malformed = unicode_view.raw.clone();
+        malformed.edge_targets[1] = u32::MAX;
+        assert!(matches!(
+            derive_native_ordered_nfa_guarded_unicode_start_prefix(&malformed, exact),
+            Err(ObjectError::InvalidModule(_))
+        ));
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_explicitly_rejects_continuation_cover_ranges() {
+        let plan = NativeOrderedNfaStartPrefixPlan {
+            ranges: [
+                NativeOrderedNfaByteRange {
+                    start: 0x70,
+                    end: 0x80,
+                },
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+            ],
+            range_count: 1,
+        };
+        assert!(native_ordered_nfa_start_prefix_intersects_utf8_continuation(plan));
+
+        let lead = NativeOrderedNfaStartPrefixPlan {
+            ranges: [
+                NativeOrderedNfaByteRange {
+                    start: 0xc0,
+                    end: 0xff,
+                },
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+                EMPTY_NATIVE_ORDERED_NFA_BYTE_RANGE,
+            ],
+            range_count: 1,
+        };
+        assert!(!native_ordered_nfa_start_prefix_intersects_utf8_continuation(lead));
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_enforces_degree_cardinality_and_utf8_lead_bounds() {
+        for (cardinality, expected) in [
+            (96_u16, false),
+            (97, true),
+            (128, true),
+            (129, false),
+            (178, false),
+        ] {
+            let ranges = guarded_prefix_cardinality_ranges(cardinality, 32);
+            let program = guarded_prefix_program(EdgeKind::AssertWordUnicode, &ranges);
+            let view = program.native_ordered_nfa_view().unwrap();
+            let exact = view.start_prefix_first_set.unwrap();
+            assert_eq!(
+                exact.iter().map(|word| word.count_ones()).sum::<u32>(),
+                u32::from(cardinality),
+            );
+            assert_eq!(exact[2], 0);
+            assert_eq!(selected_start_prefix(&program).is_some(), expected);
+        }
+
+        let degree_31 = guarded_prefix_program(
+            EdgeKind::AssertWordUnicode,
+            &guarded_prefix_cardinality_ranges(97, 31),
+        );
+        assert!(selected_start_prefix(&degree_31).is_none());
+
+        for continuation_byte in [0x80, 0xbf] {
+            let continuation =
+                ranges_with_degree(vec![(0, 108), (continuation_byte, continuation_byte)], 32);
+            let continuation = guarded_prefix_program(EdgeKind::AssertWordUnicode, &continuation);
+            let continuation_view = continuation.native_ordered_nfa_view().unwrap();
+            let continuation_exact = continuation_view.start_prefix_first_set.unwrap();
+            assert_eq!(
+                continuation_exact
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                110,
+            );
+            assert_ne!(continuation_exact[2], 0);
+            assert!(continuation_view.start_closure_dispatch.is_none());
+            assert!(selected_start_prefix(&continuation).is_none());
+        }
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_enforces_exact_128_byte_cover_cap() {
+        let five_ranges = |last_end| {
+            ranges_with_degree(
+                vec![(0, 24), (26, 50), (52, 76), (78, 102), (192, last_end)],
+                32,
+            )
+        };
+
+        let admitted = guarded_prefix_program(EdgeKind::AssertWordUnicode, &five_ranges(218));
+        let admitted_view = admitted.native_ordered_nfa_view().unwrap();
+        let admitted_exact = admitted_view.start_prefix_first_set.unwrap();
+        assert_eq!(
+            admitted_exact
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>(),
+            127,
+        );
+        let admitted_plan = selected_start_prefix(&admitted)
+            .expect("the deterministic one-byte merge reaches the exact cover cap");
+        assert_eq!(prefix_candidate_bytes(admitted_plan), 128);
+        assert_eq!(
+            admitted_plan.ranges(),
+            &[
+                NativeOrderedNfaByteRange { start: 0, end: 50 },
+                NativeOrderedNfaByteRange { start: 52, end: 76 },
+                NativeOrderedNfaByteRange {
+                    start: 78,
+                    end: 102,
+                },
+                NativeOrderedNfaByteRange {
+                    start: 192,
+                    end: 218,
+                },
+            ],
+        );
+
+        let declined = guarded_prefix_program(EdgeKind::AssertWordUnicode, &five_ranges(219));
+        let declined_view = declined.native_ordered_nfa_view().unwrap();
+        let declined_exact = declined_view.start_prefix_first_set.unwrap();
+        assert_eq!(
+            declined_exact
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>(),
+            128,
+        );
+        let coalesced_129 = NativeOrderedNfaStartPrefixPlan {
+            ranges: [
+                NativeOrderedNfaByteRange { start: 0, end: 50 },
+                NativeOrderedNfaByteRange { start: 52, end: 76 },
+                NativeOrderedNfaByteRange {
+                    start: 78,
+                    end: 102,
+                },
+                NativeOrderedNfaByteRange {
+                    start: 192,
+                    end: 219,
+                },
+            ],
+            range_count: 4,
+        };
+        assert_eq!(prefix_candidate_bytes(coalesced_129), 129);
+        for byte in u8::MIN..=u8::MAX {
+            let index = usize::from(byte);
+            if declined_exact[index / 64] & (1_u64 << (index % 64)) != 0 {
+                assert!(native_ordered_nfa_start_prefix_contains(
+                    coalesced_129,
+                    byte,
+                ));
+            }
+        }
+        assert!(selected_start_prefix(&declined).is_none());
+    }
+
+    #[test]
+    fn guarded_unicode_word_prefix_rejects_a_cover_over_128_bytes() {
+        let ranges: Vec<_> = (0_u8..=126)
+            .step_by(2)
+            .chain((192_u8..=254).step_by(2))
+            .chain([255])
+            .map(|byte| (byte, byte))
+            .collect();
+        assert_eq!(ranges.len(), 97);
+        let program = guarded_prefix_program(EdgeKind::AssertWordUnicode, &ranges);
+        let view = program.native_ordered_nfa_view().unwrap();
+        let exact = view.start_prefix_first_set.unwrap();
+        assert_eq!(exact.iter().map(|word| word.count_ones()).sum::<u32>(), 97);
+        assert_eq!(exact[2], 0);
+        assert!(
+            derive_native_ordered_nfa_start_prefix_with_candidate_cap(
+                exact,
+                MAX_NATIVE_ORDERED_NFA_GUARDED_UNICODE_PREFIX_CANDIDATE_BYTES,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(selected_start_prefix(&program).is_none());
+    }
+
+    #[test]
+    fn go33484_unicode_dot_exact_178_start_set_remains_unselected() {
+        let program = span_program_with_mode(
+            r"^.{249}$",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let exact = view.start_prefix_first_set.unwrap();
+        assert_eq!(exact.iter().map(|word| word.count_ones()).sum::<u32>(), 178);
+        assert_eq!(view.raw.edge_kinds[0], EdgeKind::AssertHaystackStart);
+        assert!(view.start_closure_dispatch.is_none());
+        assert!(selected_start_prefix(&program).is_none());
     }
 
     #[test]
