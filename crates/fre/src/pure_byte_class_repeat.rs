@@ -511,6 +511,56 @@ impl Plan {
         Ok((matched, accounting))
     }
 
+    pub(crate) fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            let window_width = window
+                .end()
+                .checked_sub(window.start())
+                .expect("a validated window has ordered bounds");
+            if u64::try_from(window_width).is_err() {
+                return self
+                    .selected_search(haystack, window, limits)
+                    .map(|(span, _)| span.map(|(start, end)| Match { start, end }));
+            }
+            let owner = self.owner();
+            let Some(start) = owner.member_seek.seek_unmetered(
+                haystack,
+                window.start(),
+                window.end(),
+                owner.classifier.as_ref(),
+            ) else {
+                return Ok(None);
+            };
+            let minimum_end = start
+                .checked_add(1)
+                .expect("a member position before the window end can advance once");
+            if !owner.greedy {
+                return Ok(Some(Match {
+                    start,
+                    end: minimum_end,
+                }));
+            }
+            let end = owner
+                .run_end_seek
+                .seek_unmetered(
+                    haystack,
+                    minimum_end,
+                    window.end(),
+                    owner.classifier.as_ref(),
+                )
+                .unwrap_or(window.end());
+            return Ok(Some(Match { start, end }));
+        }
+        self.selected_search(haystack, window, limits)
+            .map(|(span, _)| span.map(|(start, end)| Match { start, end }))
+    }
+
     #[inline(never)]
     fn selected_window(
         &self,

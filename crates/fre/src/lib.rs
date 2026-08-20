@@ -12809,8 +12809,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+                .find_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::ForwardAnchored(forward) => forward
                 .find_window(
