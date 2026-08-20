@@ -993,6 +993,15 @@ impl PortableTextRegex {
         })
     }
 
+    pub(crate) fn endpoint_search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableTextSearchSession<'_>, SearchError> {
+        Ok(PortableTextSearchSession {
+            inner: self.inner.endpoint_search_session(limits)?,
+        })
+    }
+
     /// Iterate over every non-overlapping match with Rust text empty-match
     /// progress and original-haystack assertion context.
     ///
@@ -1156,6 +1165,16 @@ impl<'r> PortableTextSearchSession<'r> {
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         self.inner.workspace_setup_accounting()
+    }
+
+    pub(crate) fn is_match_accounted_at(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner.is_match_at(haystack.as_bytes(), start, limits)
     }
 
     /// Whether a selected match exists while reusing this session's workspace.

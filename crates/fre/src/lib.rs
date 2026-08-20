@@ -839,10 +839,13 @@ pub use search_aot_facade::{
     SearchExactLiteralCompiledAotV27Fallback, SearchExactLiteralCompiledAotV27Route,
 };
 pub use set::{
-    PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
-    PortableRegexSetBuildLimits, PortableRegexSetBuildReport, PortableRegexSetBuilder,
-    PortableRegexSetExecutionError, PortableRegexSetExecutionReport, PortableRegexSetRunLimits,
-    PortableSetMatches, PortableSetMatchesIntoIter, PortableSetMatchesIter,
+    PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PORTABLE_REGEX_SET_SESSION_SCHEMA_VERSION,
+    PortableRegexSet, PortableRegexSetBuildError, PortableRegexSetBuildLimits,
+    PortableRegexSetBuildReport, PortableRegexSetBuilder, PortableRegexSetExecutionError,
+    PortableRegexSetExecutionReport, PortableRegexSetRunLimits, PortableRegexSetSearchSession,
+    PortableRegexSetSessionError, PortableRegexSetSessionLimits,
+    PortableRegexSetSessionSetupReport, PortableSetMatches, PortableSetMatchesIntoIter,
+    PortableSetMatchesIter,
 };
 pub use split::{AggregateSplit, PortableSplit};
 pub use text::{
@@ -854,6 +857,7 @@ pub use text_match::{PortableTextBorrowedMatches, PortableTextMatch};
 pub use text_set::{
     PORTABLE_TEXT_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableTextRegexSet,
     PortableTextRegexSetBuildError, PortableTextRegexSetBuildReport, PortableTextRegexSetBuilder,
+    PortableTextRegexSetSearchSession,
 };
 
 use fre_automata::{
