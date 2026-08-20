@@ -19607,6 +19607,26 @@ impl<'r> PortableSearchSession<'r> {
         Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
     }
 
+    /// Return only the selected match while retaining the complete original
+    /// haystack and reusing K0 state.
+    ///
+    /// This is the value-only companion to [`Self::find_borrowed`]. It uses
+    /// the exact selected-span route of [`Self::find_value`] without
+    /// constructing facade diagnostic accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`Self::find_value`].
+    pub fn find_borrowed_value<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        limits: SearchLimits,
+    ) -> Result<Option<ByteMatch<'h>>, SearchError> {
+        self.find_value(haystack, limits)
+            .map(|matched| matched.map(|span| ByteMatch { haystack, span }))
+    }
+
     /// Return the selected match at or after `start`, reusing K0 state.
     ///
     /// # Errors
@@ -19653,6 +19673,29 @@ impl<'r> PortableSearchSession<'r> {
     ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
         let (matched, accounting) = self.find_at(haystack, start, limits)?;
         Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
+    }
+
+    /// Return only the selected match at or after `start` while retaining the
+    /// complete original haystack and reusing K0 state.
+    ///
+    /// This is the ranged value-only companion to
+    /// [`Self::find_at_borrowed`]. It preserves the exact range validation,
+    /// original-haystack assertion context and selected-span route of
+    /// [`Self::find_at_value`] without constructing facade diagnostic
+    /// accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::find_at_value`].
+    pub fn find_at_borrowed_value<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<ByteMatch<'h>>, SearchError> {
+        self.find_at_value(haystack, start, limits)
+            .map(|matched| matched.map(|span| ByteMatch { haystack, span }))
     }
 
     /// Search a range while assertions retain original-haystack context.

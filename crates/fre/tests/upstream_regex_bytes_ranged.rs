@@ -128,6 +128,12 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
             .0,
         None
     );
+    assert_eq!(
+        session
+            .find_at_borrowed_value(haystack, 2, SearchLimits::unlimited())
+            .expect("reused contextual borrowed value search"),
+        None
+    );
 }
 
 #[test]
@@ -155,6 +161,10 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                 .expect("reused full borrowed search");
             assert_eq!(borrowed(reused_full), expected_full);
             assert_accounting_plan(&reused_full_accounting, expected_plan);
+            let reused_full_value = session
+                .find_borrowed_value(haystack, SearchLimits::unlimited())
+                .expect("reused full borrowed value search");
+            assert_eq!(borrowed(reused_full_value), expected_full);
 
             for start in 0..=haystack.len() {
                 let expected_match = upstream.find_at(haystack, start);
@@ -207,9 +217,13 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                 let reused_borrowed = session
                     .find_at_borrowed(haystack, start, SearchLimits::unlimited())
                     .expect("reused ranged borrowed search");
+                let reused_borrowed_value = session
+                    .find_at_borrowed_value(haystack, start, SearchLimits::unlimited())
+                    .expect("reused ranged borrowed value search");
                 assert_eq!(span(reused_find.0), expected);
                 assert_eq!(reused_exists.0, exists);
                 assert_eq!(borrowed(reused_borrowed.0), expected_borrowed);
+                assert_eq!(borrowed(reused_borrowed_value), expected_borrowed);
                 assert_eq!(reused_borrowed.1, reused_find.1);
                 assert_accounting_plan(&reused_find.1, expected_plan);
                 assert_accounting_plan(&reused_exists.1, expected_plan);
@@ -475,6 +489,14 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
     ));
     assert!(matches!(
         session.find_at_borrowed(haystack, start, SearchLimits::unlimited()),
+        Err(SearchError::K0(K0SearchError::InvalidWindow {
+            start: 3,
+            end: 2,
+            haystack_len: 2,
+        }))
+    ));
+    assert!(matches!(
+        session.find_at_borrowed_value(haystack, start, SearchLimits::unlimited()),
         Err(SearchError::K0(K0SearchError::InvalidWindow {
             start: 3,
             end: 2,
