@@ -589,6 +589,20 @@ impl PortableTextRegexSet {
         self.is_match_at(haystack, 0, limits)
     }
 
+    /// Whether any pattern matches the full haystack without constructing set
+    /// or constituent execution reports.
+    ///
+    /// This operation deliberately has unlimited execution resources. Use
+    /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
+    /// must be enforced.
+    #[inline(always)]
+    pub fn is_match_value_unlimited(
+        &self,
+        haystack: &str,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at_unlimited(haystack, 0)
+    }
+
     /// Whether any pattern matches at or after byte offset `start`, retaining
     /// complete original-haystack context for assertions.
     ///
@@ -636,6 +650,51 @@ impl PortableTextRegexSet {
                 output_capacity_bytes: 0,
             },
         ))
+    }
+
+    /// Whether any pattern matches at or after `start` without constructing
+    /// set or constituent execution reports.
+    ///
+    /// This normalizes an interior UTF-8 offset once, preserves complete
+    /// original-haystack assertion context and short-circuits in source
+    /// order. This operation deliberately has unlimited execution resources.
+    /// Use [`Self::is_match_at`] when finite work, scratch, or pattern-count
+    /// limits must be enforced.
+    #[inline(always)]
+    pub fn is_match_value_at_unlimited(
+        &self,
+        haystack: &str,
+        start: usize,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at_unlimited_inner(haystack, start)
+    }
+
+    #[inline(never)]
+    fn is_match_value_at_unlimited_inner(
+        &self,
+        haystack: &str,
+        start: usize,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        let search_start = validate_text_start(haystack, start)?;
+        for (index, regex) in self.regexes.iter().enumerate() {
+            let matched = if text_set_constituent_value_route_is_direct(regex) {
+                regex.is_match_value_at(haystack, search_start, SearchLimits::unlimited())
+            } else {
+                regex
+                    .is_match_at(haystack, search_start, SearchLimits::unlimited())
+                    .map(|(matched, _)| matched)
+            }
+            .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                index,
+                total_work_before: 0,
+                remaining_total_work: u64::MAX,
+                source,
+            })?;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Return every matching pattern ID in ascending source order.
