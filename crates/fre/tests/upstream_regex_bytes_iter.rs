@@ -562,7 +562,7 @@ fn k0_cursor_matches_uncursored_sessions_and_exact_accounting() {
 
         // Give both fresh workspaces the same immutable start-filter state.
         regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("proof warm-up failed for {pattern:?}: {error}"));
 
         let upstream = regex::bytes::RegexBuilder::new(pattern)

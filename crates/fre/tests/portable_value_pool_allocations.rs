@@ -100,3 +100,34 @@ fn default_k0_value_calls_reuse_scratch_while_custom_limits_remain_one_shot() {
         assert!(call.change().allocations > 0);
     }
 }
+
+#[test]
+fn ordinary_k0_calls_reuse_scratch_without_allocating_after_warmup() {
+    let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .unwrap();
+    let haystack = b"xxxxxxxxabacabacz";
+
+    let cold = Region::new(GLOBAL);
+    assert_eq!(
+        regex
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end())),
+        Some((8, 17)),
+    );
+    assert!(cold.change().allocations > 0);
+
+    let warm = Region::new(GLOBAL);
+    for _ in 0..32 {
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((8, 17)),
+        );
+        assert!(regex.is_match(haystack));
+    }
+    assert_eq!(warm.change(), Stats::default());
+}

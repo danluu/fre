@@ -78,10 +78,10 @@ fn set_membership_delegates_the_exists_contract_and_its_exact_work_limit() {
     );
 
     let (exists, exists_accounting) = regex
-        .is_match(haystack, SearchLimits::unlimited())
+        .is_match_accounted(haystack, SearchLimits::unlimited())
         .expect("direct existence search");
     let (span, span_accounting) = regex
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("direct span search");
     assert!(exists);
     assert!(span.is_some());

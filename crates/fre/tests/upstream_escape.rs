@@ -62,7 +62,7 @@ fn escaped_patterns_match_the_original_text_literally() {
             .build()
             .unwrap_or_else(|error| panic!("escaped literal {literal:?} did not build: {error}"));
         let matched = regex
-            .find(literal.as_bytes(), SearchLimits::unlimited())
+            .find_accounted(literal.as_bytes(), SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("escaped literal {literal:?} failed to search: {error}"))
             .0
             .unwrap_or_else(|| panic!("escaped literal {literal:?} did not match itself"));

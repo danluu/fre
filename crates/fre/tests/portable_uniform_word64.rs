@@ -54,7 +54,9 @@ fn portable_find_windows_and_reused_iteration_share_the_uniform_runtime() {
         ),
         Some((10, 18))
     );
-    let (_, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = regex
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::PackedLiteralSet(accounting) = accounting else {
         panic!("finite language lost packed accounting")
     };

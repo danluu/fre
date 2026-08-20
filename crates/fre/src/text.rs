@@ -874,31 +874,56 @@ impl PortableTextRegex {
         &self.report
     }
 
-    /// Whether a selected match exists in a valid UTF-8 haystack.
+    /// Return whether this regex matches anywhere in a valid UTF-8 haystack.
+    ///
+    /// This is the Rust-compatible ordinary API. It has no caller-visible
+    /// work quota and automatically reuses the inner matcher's fixed,
+    /// construction-bounded scratch.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same allocation and internal-invariant conditions as
+    /// [`PortableRegex::is_match`].
+    #[must_use]
+    #[inline]
+    pub fn is_match(&self, haystack: &str) -> bool {
+        self.inner.is_match(haystack.as_bytes())
+    }
+
+    /// Whether a selected match exists with exact accounting.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError`] if checked search limits refuse execution.
-    pub fn is_match(
+    pub fn is_match_accounted(
         &self,
         haystack: &str,
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
-        self.inner.is_match(haystack.as_bytes(), limits)
+        self.inner.is_match_accounted(haystack.as_bytes(), limits)
     }
 
-    /// Whether a selected match exists without constructing facade diagnostic
-    /// accounting on the success path.
+    /// Whether a selected match exists under explicit work and scratch
+    /// limits, without constructing facade accounting.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] under the same contract as [`Self::is_match`].
+    /// Returns [`SearchError`] if checked search limits refuse execution.
+    pub fn is_match_with_limits(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.inner.is_match_with_limits(haystack.as_bytes(), limits)
+    }
+
+    /// Compatibility alias for [`Self::is_match_with_limits`].
     pub fn is_match_value(
         &self,
         haystack: &str,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        self.inner.is_match_value(haystack.as_bytes(), limits)
+        self.is_match_with_limits(haystack, limits)
     }
 
     /// Whether a selected match exists at or after the byte offset `start`.
@@ -946,28 +971,54 @@ impl PortableTextRegex {
 
     /// Return the selected leftmost-first match in byte offsets.
     ///
+    /// This is the Rust-compatible ordinary API. It has no caller-visible
+    /// work quota and automatically reuses the inner matcher's fixed,
+    /// construction-bounded scratch.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same allocation and internal-invariant conditions as
+    /// [`PortableRegex::find`].
+    #[must_use]
+    #[inline]
+    pub fn find(&self, haystack: &str) -> Option<Match> {
+        self.inner.find(haystack.as_bytes())
+    }
+
+    /// Return the selected leftmost-first match with exact accounting.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError`] if checked search limits refuse execution.
-    pub fn find(
+    pub fn find_accounted(
         &self,
         haystack: &str,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
-        self.inner.find(haystack.as_bytes(), limits)
+        self.inner.find_accounted(haystack.as_bytes(), limits)
     }
 
-    /// Return only the selected leftmost-first match in byte offsets.
+    /// Return the selected leftmost-first match under explicit work and
+    /// scratch limits, without constructing facade accounting.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] under the same contract as [`Self::find`].
+    /// Returns [`SearchError`] if checked search limits refuse execution.
+    pub fn find_with_limits(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.inner.find_with_limits(haystack.as_bytes(), limits)
+    }
+
+    /// Compatibility alias for [`Self::find_with_limits`].
     pub fn find_value(
         &self,
         haystack: &str,
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
-        self.inner.find_value(haystack.as_bytes(), limits)
+        self.find_with_limits(haystack, limits)
     }
 
     /// Prepare an explicit reusable session for repeated text value searches
@@ -1131,12 +1182,22 @@ impl PortableTextRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] if checked search limits refuse execution.
+    pub fn selected_end_accounted(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.inner
+            .selected_end_accounted(haystack.as_bytes(), limits)
+    }
+
+    /// Compatibility alias for [`Self::selected_end_accounted`].
     pub fn selected_end(
         &self,
         haystack: &str,
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
-        self.inner.selected_end(haystack.as_bytes(), limits)
+        self.selected_end_accounted(haystack, limits)
     }
 }
 
@@ -1385,7 +1446,7 @@ mod tests {
         let matched = format!("{absent}a---MANDATORY---z\n");
         for haystack in [&absent, &matched] {
             let expected = regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .expect("accounted text existence")
                 .0;
             assert_eq!(
@@ -1395,7 +1456,7 @@ mod tests {
                 expected,
             );
             let expected = regex
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .expect("accounted text span")
                 .0;
             assert_eq!(
@@ -1434,7 +1495,7 @@ mod tests {
         assert_eq!(regex.build_report().portable.plan, crate::PlanKind::K0);
         assert!(regex.build_report().portable.lowering.is_some());
         let (matched, accounting) = regex
-            .find("prefix\nSherlock Holmes\nsuffix", SearchLimits::unlimited())
+            .find_accounted("prefix\nSherlock Holmes\nsuffix", SearchLimits::unlimited())
             .expect("text K0 search");
         assert_eq!(matched.map(|value| (value.start(), value.end())), Some((7, 22)));
         assert!(matches!(accounting, SearchAccounting::K0(_)));
@@ -1443,6 +1504,44 @@ mod tests {
             .expect("text K0 session");
         assert_eq!(session.runtime_implementation_id(), "k0");
         assert!(session.workspace_setup_accounting().is_some());
+    }
+
+    #[test]
+    fn text_facade_exposes_ordinary_finite_and_accounted_search_surfaces() {
+        let regex = PortableTextRegex::new(r"(?m)^Sherlock Holmes$")
+            .expect("text API fixture lowers through K0");
+        let haystack = "prefix\nSherlock Holmes\nsuffix";
+        let expected = Some((7, 22));
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+
+        assert!(regex.find_with_limits(haystack, refusing).is_err());
+        assert!(regex.is_match_with_limits(haystack, refusing).is_err());
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(regex.is_match(haystack));
+
+        let (accounted, accounting) = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .expect("accounted text search succeeds");
+        assert_eq!(
+            accounted.map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(accounting.plan(), crate::PlanKind::K0);
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::default())
+                .expect("finite compatibility alias succeeds")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
     }
 
     #[test]
@@ -1600,17 +1699,13 @@ mod tests {
                 let expected = upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
-                let (actual, _) = fre
-                    .find(haystack, SearchLimits::unlimited())
-                    .expect("FRE text search executes");
+                let actual = fre.find(haystack);
                 assert_eq!(
                     actual.map(|matched| (matched.start(), matched.end())),
                     expected,
                     "pattern={pattern:?} haystack={haystack:?}"
                 );
-                let (exists, _) = fre
-                    .is_match(haystack, SearchLimits::unlimited())
-                    .expect("FRE text existence executes");
+                let exists = fre.is_match(haystack);
                 let (end, _) = fre
                     .selected_end(haystack, SearchLimits::unlimited())
                     .expect("FRE text end executes");
@@ -1652,9 +1747,7 @@ mod tests {
                 let expected = upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
-                let (actual, _) = fre
-                    .find(haystack, SearchLimits::unlimited())
-                    .expect("FRE text search executes");
+                let actual = fre.find(haystack);
                 assert_eq!(
                     actual.map(|matched| (matched.start(), matched.end())),
                     expected,
@@ -1932,9 +2025,7 @@ mod tests {
         let expected = upstream
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
-        let (actual, _) = fre
-            .find(haystack, SearchLimits::unlimited())
-            .expect("FRE text search executes");
+        let actual = fre.find(haystack);
         assert_eq!(
             actual.map(|matched| (matched.start(), matched.end())),
             expected

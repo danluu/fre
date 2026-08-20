@@ -873,8 +873,8 @@ fn run_semantic_contract(profile: RustProfile) -> Result<String, InventoryError>
         .map_err(|error| {
             InventoryError::new(format!("feature matrix literal build failed: {error}"))
         })?;
-    let (found, _) = regex
-        .find(b"xxneedleyy", SearchLimits::default())
+    let found = regex
+        .find_with_limits(b"xxneedleyy", SearchLimits::default())
         .map_err(|error| {
             InventoryError::new(format!("feature matrix literal search failed: {error}"))
         })?;
@@ -1266,8 +1266,8 @@ fn run_perl_unicode_contract() -> Result<String, InventoryError> {
         .profile(profile)
         .build()
         .map_err(|error| InventoryError::new(format!("unicode-perl build failed: {error}")))?;
-    let (found, _) = regex
-        .find(b" \xCE\xB2 ", SearchLimits::default())
+    let found = regex
+        .find_with_limits(b" \xCE\xB2 ", SearchLimits::default())
         .map_err(|error| InventoryError::new(format!("unicode-perl search failed: {error}")))?;
     let found =
         found.ok_or_else(|| InventoryError::new("unicode-perl search found no Unicode word"))?;
@@ -1435,8 +1435,8 @@ fn run_segment_unicode_contract() -> Result<String, InventoryError> {
         .profile(profile)
         .build()
         .map_err(|error| InventoryError::new(format!("unicode-segment build failed: {error}")))?;
-    let (found, _) = regex
-        .find(b"a\xCC\x81b", SearchLimits::default())
+    let found = regex
+        .find_with_limits(b"a\xCC\x81b", SearchLimits::default())
         .map_err(|error| InventoryError::new(format!("unicode-segment search failed: {error}")))?;
     let found = found
         .ok_or_else(|| InventoryError::new("unicode-segment search found no Extend scalar"))?;

@@ -8,13 +8,13 @@ fn borrowed_text_match_preserves_pinned_value_semantics_and_accounting() {
     let haystack = "Greek: αβγδ!";
 
     let (offset, offset_accounting) = regex
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("offset search");
     let (borrowed, borrowed_accounting) = regex
         .find_borrowed(haystack, SearchLimits::unlimited())
         .expect("borrowed search");
     let (repeated_offset, repeated_offset_accounting) = regex
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("repeated offset search");
     assert_eq!(repeated_offset, offset);
     // Preserve the first cold call above, but compare wrappers only after the

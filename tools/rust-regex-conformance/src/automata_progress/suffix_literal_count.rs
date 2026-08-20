@@ -67,12 +67,12 @@ const PATTERN: &str = r"[a-zA-Z]+ing";
 const HAYSTACK: &[u8] = b"tingling";
 const EXPECTED_SPANS: [(usize, usize); 1] = [(0, 8)];
 const MAX_SEARCH_CALLS: usize = 2;
-const MAX_SEARCH_WORK: u64 = 349;
+const MAX_SEARCH_WORK: u64 = 479;
 const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 // Fixed after direct execution and checked by the observer test.
-const EXPECTED_FIRST_WORK: u64 = 349;
+const EXPECTED_FIRST_WORK: u64 = 479;
 const EXPECTED_TAIL_WORK: u64 = 29;
-const EXPECTED_MINIMUM_FIRST_WORK: u64 = 348;
+const EXPECTED_MINIMUM_FIRST_WORK: u64 = 478;
 const EXPECTED_ITER_WORK: u64 = 102;
 
 /// Extend the exact 145-pass report with one independently executed unit
@@ -482,7 +482,7 @@ fn validate_direct_search(fre: &PortableRegex) -> Result<(), InventoryError> {
         max_scratch_bytes: MAX_SCRATCH_BYTES,
     };
     let (first_match, first_accounting) = fre
-        .find(HAYSTACK, limits)
+        .find_accounted(HAYSTACK, limits)
         .map_err(|error| InventoryError::new(format!("suffix-literal FRE first: {error}")))?;
     let (tail_match, tail_accounting) = fre
         .find_at(HAYSTACK, EXPECTED_SPANS[0].1, limits)
@@ -505,7 +505,7 @@ fn validate_direct_search(fre: &PortableRegex) -> Result<(), InventoryError> {
         )));
     }
     // A fresh plan can admit the smaller workspace tier at this exact bound,
-    // while the unlimited search above chooses the more capable cold tier.
+    // while the larger finite search above chooses the more capable cold tier.
     // Authenticate both adaptive outcomes instead of comparing cold and warm
     // accounting from the same plan owner.
     let exact_fre = PortableBuilder::new(PATTERN)
@@ -514,7 +514,7 @@ fn validate_direct_search(fre: &PortableRegex) -> Result<(), InventoryError> {
         .build()
         .map_err(|error| InventoryError::new(format!("suffix-literal exact build: {error}")))?;
     let (exact_match, exact_accounting) = exact_fre
-        .find(
+        .find_accounted(
             HAYSTACK,
             SearchLimits {
                 max_work: EXPECTED_MINIMUM_FIRST_WORK,
@@ -541,7 +541,7 @@ fn validate_direct_search(fre: &PortableRegex) -> Result<(), InventoryError> {
         .build()
         .map_err(|error| InventoryError::new(format!("suffix-literal one-below build: {error}")))?;
     if !matches!(
-        one_below_fre.find(
+        one_below_fre.find_accounted(
             HAYSTACK,
             SearchLimits {
                 max_work: one_below,

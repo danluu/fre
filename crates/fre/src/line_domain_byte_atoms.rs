@@ -1102,7 +1102,7 @@ mod tests {
             .unwrap();
         let haystack = b"..\r\nBravo\r\nbad\rDelta\nEcho";
         let (matched, accounting) = regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap();
         assert_eq!(matched.map(|span| (span.start(), span.end())), Some((4, 9)));
         let SearchAccounting::LineDomainByteAtoms(accounting) = accounting else {

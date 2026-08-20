@@ -28,7 +28,7 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
         .find(haystack)
         .map(|matched| (matched.start(), matched.end()));
     let (found, accounting) = actual
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("reverse-inner find");
     assert_eq!(
         found.map(|matched| (matched.start(), matched.end())),
@@ -189,14 +189,14 @@ fn accounting_refuses_one_below_source_independent_work_bound() {
     let regex = fre(PATTERN);
     let haystack = b"\xff\xce\xbbaaab\xce\xbb-xbaaabx-\x80aaaa";
     let (_, accounting) = regex
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("baseline search");
     let SearchAccounting::ReverseInner(accounting) = accounting else {
         panic!("reverse-inner accounting was not selected");
     };
     let exact = u64::try_from(accounting.upper_bounds.work).expect("small work bound");
     regex
-        .find(
+        .find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact,
@@ -205,7 +205,7 @@ fn accounting_refuses_one_below_source_independent_work_bound() {
         )
         .expect("exact work limit");
     assert!(matches!(
-        regex.find(
+        regex.find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact - 1,
@@ -269,7 +269,7 @@ fn middle_alternation_auto_uses_union_and_matches_force_k0() {
     assert_eq!(forced.build_report().plan, PlanKind::K0);
     let haystack = b"xxabcdyy-\xce\xbbzzefqq\xce\xbb-absent";
     let (_, accounting) = automatic
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("adaptive union search");
     let SearchAccounting::ReverseInner(accounting) = accounting else {
         panic!("middle alternation search retained another route");

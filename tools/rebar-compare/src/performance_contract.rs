@@ -805,7 +805,7 @@ pub enum PerformanceRunnerRoute {
     AggregateSingle,
     /// Ordered multi-pattern aggregate compile/count/span-sum/capture-count lifecycle.
     AggregateMany,
-    /// Portable line-oriented grep lifecycle.
+    /// Ordinary work-unlimited `PortableRegex::is_match` over bstr line domains.
     PortableGrep,
     /// Persistent-history capture lifecycle.
     Capture,

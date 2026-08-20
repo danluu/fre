@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rebar_compare::{Receipt, Report, Status};
+use rebar_compare::{Receipt, Report, Status, current_fre_adapter_id};
 use regex::bytes::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,7 +70,8 @@ const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
 const FORMAL_COMPILE_PLAN: &str = "compile-aggregate-continuation-program";
 #[cfg(test)]
 const FORMAL_AGGREGATE_OPERATION_PLAN: &str = "aggregate-continuation-program";
-const FORMAL_GREP_PLAN: &str = "rebar-lines-is-match-v3";
+const LEGACY_SEMANTIC_GREP_PLAN: &str = "rebar-lines-is-match-v3";
+const FORMAL_GREP_PLAN: &str = "rebar-lines-ordinary-is-match-v1";
 const RUNNER_WALL_TIMEOUT: Duration = Duration::from_secs(120);
 const RUNNER_CHILD_POLL: Duration = Duration::from_millis(5);
 const RUNNER_EXIT_PIPE_GRACE: Duration = Duration::from_secs(1);
@@ -267,7 +268,7 @@ fn main() -> Result<(), DynError> {
         warmup_iterations_per_process: 0,
         measured_iterations_per_process: 1,
         retry_policy: "none: any child/identity/guard failure aborts the whole campaign",
-        timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute through the source-independent certified Count portfolio with Aggregate Auto fallback; count-spans=the retained complete-span session visiting every start/end bound with checked end-start summation; grep=PortableRegex::is_match over bstr lines",
+        timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute through the source-independent certified Count portfolio with Aggregate Auto fallback; count-spans=the retained complete-span session visiting every start/end bound with checked end-start summation; grep=ordinary work-unlimited PortableRegex::is_match once per bstr line with construction-bounded matcher-owned automatic scratch; explicit finite grep sessions are a separately labeled robustness lane and are excluded",
         qualification,
         guard_before,
         guard_after,
@@ -713,12 +714,10 @@ fn qualify_rows(
         let expectations = FreExpectations {
             benchmark: &row.selected.fre.benchmark,
             model: &row.selected.fre.model,
-            plan: row
-                .selected
-                .fre
-                .candidate_plan
-                .as_deref()
-                .ok_or("FRE receipt lacks plan")?,
+            plan: runtime_candidate_plan(
+                &row.selected.fre.model,
+                row.selected.fre.candidate_plan.as_deref(),
+            )?,
             runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
         };
         let canonical_description = runners.fre.describe_fre(&canonical, expectations)?;
@@ -797,12 +796,10 @@ fn warm_all_scheduled_runners(
         let expectations = FreExpectations {
             benchmark: &row.selected.fre.benchmark,
             model: &row.selected.fre.model,
-            plan: row
-                .selected
-                .fre
-                .candidate_plan
-                .as_deref()
-                .ok_or("FRE receipt lacks plan")?,
+            plan: runtime_candidate_plan(
+                &row.selected.fre.model,
+                row.selected.fre.candidate_plan.as_deref(),
+            )?,
             runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
         };
         let warm_fre = || {
@@ -1385,12 +1382,10 @@ fn run_pair(
     let expectations = FreExpectations {
         benchmark: &row.selected.fre.benchmark,
         model: &row.selected.fre.model,
-        plan: row
-            .selected
-            .fre
-            .candidate_plan
-            .as_deref()
-            .ok_or("FRE receipt lacks plan")?,
+        plan: runtime_candidate_plan(
+            &row.selected.fre.model,
+            row.selected.fre.candidate_plan.as_deref(),
+        )?,
         runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
     };
     let (fre, reference_sample) = if fre_first {
@@ -1419,6 +1414,27 @@ fn run_pair(
         reference: reference_sample,
         ratio_ppm: ratio_ppm(fre.duration_ns, reference_sample.duration_ns)?,
     })
+}
+
+/// Project the authenticated legacy semantic receipt onto the exact runtime
+/// boundary used by this campaign. The grep operation's pattern, line domains,
+/// expected value, and selected matcher are unchanged; only the public search
+/// surface moved from an explicit finite session to ordinary `is_match`.
+fn runtime_candidate_plan<'a>(
+    model: &str,
+    receipt_plan: Option<&'a str>,
+) -> Result<&'a str, DynError> {
+    let receipt_plan = receipt_plan.ok_or("FRE receipt lacks plan")?;
+    if model != "grep" {
+        return Ok(receipt_plan);
+    }
+    if receipt_plan != LEGACY_SEMANTIC_GREP_PLAN && receipt_plan != FORMAL_GREP_PLAN {
+        return Err(format!(
+            "authenticated grep receipt has unexpected plan {receipt_plan:?}"
+        )
+        .into());
+    }
+    Ok(FORMAL_GREP_PLAN)
 }
 
 fn expected_grep_runtime(model: &str, job_id: &str) -> Option<&'static str> {
@@ -2446,10 +2462,10 @@ where
 }
 
 fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
+    let runtime_adapter = format!("adapter={}", current_fre_adapter_id());
     let required = [
         "fre.rebar.klv-runner.v1",
         "protocol=stratified-v1",
-        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v2",
         "report=fre.rebar.comparison.v2",
         "rebar=463d00f31887e84c38467805b9e3122c314b9521",
         "canonical-sha=",
@@ -2463,7 +2479,10 @@ fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
         "toolchain=",
         "target=",
     ];
-    if required.iter().any(|field| !version.contains(field)) || version.contains("unbound") {
+    if !version.contains(&runtime_adapter)
+        || required.iter().any(|field| !version.contains(field))
+        || version.contains("unbound")
+    {
         return Err(format!("FRE runner version is not fully bound: {version:?}").into());
     }
     Ok(())
@@ -2601,18 +2620,17 @@ impl PreparedRow<'_> {
             job_id: self.selected.fre.job_id.clone(),
             benchmark: self.selected.fre.benchmark.clone(),
             model: model.clone(),
-            candidate_plan: self
-                .selected
-                .fre
-                .candidate_plan
-                .clone()
-                .ok_or("FRE receipt lacks plan")?,
+            candidate_plan: runtime_candidate_plan(
+                &model,
+                self.selected.fre.candidate_plan.as_deref(),
+            )?
+            .to_owned(),
             expected_runtime: expected_runtime.map(str::to_owned),
             timed_api: match model.as_str() {
                 "compile" => "build_compile",
                 "count" => "count_value",
                 "count-spans" => "stream_spans_then_sum_every_start_end_bound",
-                "grep" => "line_loop_is_match",
+                "grep" => "line_loop_portable_regex_is_match_ordinary",
                 "regex-redux" => "complete_regex_redux_with_stage_receipt",
                 _ => return Err(format!("unexpected timed model {model}").into()),
             },
@@ -2870,6 +2888,39 @@ mod tests {
         assert_eq!(summary.median_twice_ns, 70);
         assert_eq!(summary.maximum_ns, 60);
         assert_eq!(summary.max_over_min_ppm, 6_000_000);
+    }
+
+    #[test]
+    fn legacy_semantic_grep_receipt_projects_only_to_the_ordinary_runtime_plan() {
+        assert_eq!(
+            runtime_candidate_plan("grep", Some(LEGACY_SEMANTIC_GREP_PLAN)).unwrap(),
+            FORMAL_GREP_PLAN,
+        );
+        assert_eq!(
+            runtime_candidate_plan("grep", Some(FORMAL_GREP_PLAN)).unwrap(),
+            FORMAL_GREP_PLAN,
+        );
+        assert_eq!(
+            runtime_candidate_plan("count", Some("aggregate-plan")).unwrap(),
+            "aggregate-plan",
+        );
+        assert!(runtime_candidate_plan("grep", Some("unreviewed-plan")).is_err());
+        assert!(runtime_candidate_plan("grep", None).is_err());
+    }
+
+    #[test]
+    fn fre_version_authentication_requires_the_current_runtime_adapter() {
+        let current = format!(
+            "fre.rebar.klv-runner.v1 protocol=stratified-v1 adapter={} report=fre.rebar.comparison.v2 rebar=463d00f31887e84c38467805b9e3122c314b9521 canonical-sha=sha canonical-tree=tree engine-sha=sha engine-tree=tree runner-sha=sha runner-tree=tree lock=lock profile=release toolchain=rust-1.93.0 target=aarch64-unknown-linux-gnu",
+            current_fre_adapter_id(),
+        );
+        authenticate_fre_version(&current).expect("current runtime adapter authenticates");
+
+        let legacy = current.replace(
+            current_fre_adapter_id(),
+            "fre-current-aggregate-capture-v10-portable-word-run-v2",
+        );
+        assert!(authenticate_fre_version(&legacy).is_err());
     }
 
     #[test]

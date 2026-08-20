@@ -360,11 +360,11 @@ fn k0_exists_and_span_match_direct_searches_across_limit_modes() {
 
         for haystack in [&absent[..], &present[..]] {
             let expected_exists = direct
-                .is_match(haystack, limits)
+                .is_match_accounted(haystack, limits)
                 .expect("accounted direct existence")
                 .0;
             let expected_span = direct
-                .find(haystack, limits)
+                .find_accounted(haystack, limits)
                 .expect("accounted direct span")
                 .0;
 

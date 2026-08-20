@@ -273,7 +273,9 @@ fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
                 }
             }
 
-            let cold_exists = regex.is_match(haystack, SearchLimits::unlimited()).unwrap();
+            let cold_exists = regex
+                .is_match_accounted(haystack, SearchLimits::unlimited())
+                .unwrap();
             let reused_exists = session
                 .is_match(haystack, SearchLimits::unlimited())
                 .unwrap();
@@ -285,7 +287,9 @@ fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
                 .selected_end(haystack, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(reused_end.0, cold_end.0);
-            let cold_find = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+            let cold_find = regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap();
             let reused_find = session.find(haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(reused_find.0, cold_find.0);
         }
@@ -419,7 +423,7 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
             .is_match(b"xxSherlock", SearchLimits::unlimited())
             .unwrap(),
         literal
-            .is_match(b"xxSherlock", SearchLimits::unlimited())
+            .is_match_accounted(b"xxSherlock", SearchLimits::unlimited())
             .unwrap()
     );
 }
@@ -778,7 +782,9 @@ fn portable_search_session_preserves_every_native_plan_family() {
     for (regex, expected_plan) in cases {
         assert_eq!(regex.build_report().plan, expected_plan);
         let expected_id = regex.runtime_implementation_id();
-        let expected = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+        let expected = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         let mut session = regex
             .search_session(SearchSessionLimits {
                 max_setup_work: 0,
@@ -831,7 +837,7 @@ fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
                 .find(haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let (actual, accounting) = fre
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap_or_else(|error| panic!("portable search failed for {pattern:?}: {error}"));
             assert_eq!(accounting.plan(), expected_plan);
             assert_eq!(
@@ -1112,7 +1118,7 @@ fn crlf_and_every_unicode_word_assertion_match_pinned_ranges() {
         .find(haystack)
         .map(|matched| (matched.start(), matched.end()));
     let actual = local_ascii
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .unwrap()
         .0
         .map(|matched| (matched.start(), matched.end()));
@@ -1136,7 +1142,7 @@ fn crlf_and_every_unicode_word_assertion_match_pinned_ranges() {
             .find(unicode_haystack)
             .map(|matched| (matched.start(), matched.end()));
         let actual = regex
-            .find(unicode_haystack, SearchLimits::unlimited())
+            .find_accounted(unicode_haystack, SearchLimits::unlimited())
             .unwrap()
             .0
             .map(|matched| (matched.start(), matched.end()));

@@ -54,7 +54,9 @@ fn sparse_and_dense_long_sources_match_upstream() {
         let expected = oracle
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
-        let (actual, accounting) = plan.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (actual, accounting) = plan
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(
             actual.map(|matched| (matched.start(), matched.end())),
             expected
@@ -89,7 +91,9 @@ fn prefix_overlap_preserves_leftmost_semantics() {
     let expected = oracle
         .find(&haystack)
         .map(|matched| (matched.start(), matched.end()));
-    let (actual, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (actual, accounting) = plan
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(
         actual.map(|matched| (matched.start(), matched.end())),
         expected
@@ -117,7 +121,9 @@ fn finite_extraction_order_controls_equal_start_tail_priority() {
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(expected, Some((260, 261)));
 
-    let (actual, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (actual, accounting) = plan
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(
         actual.map(|matched| (matched.start(), matched.end())),
         expected

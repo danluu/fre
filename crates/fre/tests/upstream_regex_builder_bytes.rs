@@ -429,13 +429,13 @@ fn every_ported_pinned_bytes_builder_example_passes() {
         .expect("case-insensitive builder example");
     assert!(
         case_insensitive
-            .is_match(b"FoObarQuUx", SearchLimits::unlimited())
+            .is_match_accounted(b"FoObarQuUx", SearchLimits::unlimited())
             .expect("case-insensitive positive search")
             .0
     );
     assert!(
         !case_insensitive
-            .is_match(b"fooBARquux", SearchLimits::unlimited())
+            .is_match_accounted(b"fooBARquux", SearchLimits::unlimited())
             .expect("local case-sensitive negative search")
             .0
     );
@@ -445,7 +445,7 @@ fn every_ported_pinned_bytes_builder_example_passes() {
         .build()
         .expect("multiline builder example");
     let matched = multi_line
-        .find(b"\nfoo\n", SearchLimits::unlimited())
+        .find_accounted(b"\nfoo\n", SearchLimits::unlimited())
         .expect("multiline search")
         .0
         .expect("multiline match");
@@ -457,7 +457,7 @@ fn every_ported_pinned_bytes_builder_example_passes() {
         .expect("dot-matches-new-line builder example");
     let haystack = b"foo\nbar";
     let matched = dot_matches_new_line
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("dot-matches-new-line search")
         .0
         .expect("dot-matches-new-line match");
@@ -468,7 +468,7 @@ fn every_ported_pinned_bytes_builder_example_passes() {
         .build()
         .expect("swap-greed builder example");
     let matched = swap_greed
-        .find(b"aaa", SearchLimits::unlimited())
+        .find_accounted(b"aaa", SearchLimits::unlimited())
         .expect("swap-greed search")
         .0
         .expect("swap-greed match");
@@ -486,7 +486,7 @@ fn every_ported_pinned_bytes_builder_example_passes() {
     .expect("ignore-whitespace builder example");
     assert!(
         ignore_whitespace
-            .is_match(b"aaa bbb", SearchLimits::unlimited())
+            .is_match_accounted(b"aaa bbb", SearchLimits::unlimited())
             .expect("ignore-whitespace search")
             .0
     );
@@ -497,7 +497,7 @@ fn every_ported_pinned_bytes_builder_example_passes() {
         .expect("octal builder example");
     assert!(
         octal
-            .is_match(b"a", SearchLimits::unlimited())
+            .is_match_accounted(b"a", SearchLimits::unlimited())
             .expect("octal search")
             .0
     );

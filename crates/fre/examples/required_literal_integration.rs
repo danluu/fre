@@ -7,7 +7,7 @@
 
 use std::{hint::black_box, time::Instant};
 
-use fre::{PlanKind, PlanSelection, PortableBuilder, SearchLimits};
+use fre::{PlanKind, PlanSelection, PortableBuilder};
 
 const ITERATIONS: usize = 300;
 
@@ -111,16 +111,12 @@ fn measure(case: &Case) {
         .find(&case.haystack)
         .map(|matched| (matched.start(), matched.end()));
     let actual = fre
-        .find(&case.haystack, SearchLimits::unlimited())
-        .unwrap()
-        .0
+        .find(&case.haystack)
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(actual, expected);
     for _ in 0..10 {
         black_box(
-            fre.find(black_box(&case.haystack), SearchLimits::unlimited())
-                .unwrap()
-                .0,
+            fre.find(black_box(&case.haystack)),
         );
         black_box(upstream.find(black_box(&case.haystack)));
     }
@@ -128,9 +124,7 @@ fn measure(case: &Case) {
         let started = Instant::now();
         for _ in 0..ITERATIONS {
             black_box(
-                fre.find(black_box(&case.haystack), SearchLimits::unlimited())
-                    .unwrap()
-                    .0,
+                fre.find(black_box(&case.haystack)),
             );
         }
         emit(

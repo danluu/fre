@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 /// Stable deterministic correctness-report schema.
 pub const REPORT_SCHEMA: &str = "fre.holdout.correctness.v1";
 /// Stable non-normative timing-diagnostic schema.
-pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v3";
+pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v4";
 /// Stable committed suite schema.
 pub const SUITE_SCHEMA: &str = "fre.holdout.suite.v1";
 /// Stable digest sidecar schema.
@@ -1121,7 +1121,8 @@ pub fn run_correctness(
         let oracle = oracle_regex(&case.pattern).map_err(|error| {
             HoldoutError::new(format!("case {} oracle construction: {error}", case.id))
         })?;
-        let hot = build_candidate(&case.pattern);
+        let hot_accounted = build_candidate(&case.pattern);
+        let hot_ordinary = build_candidate(&case.pattern);
         for input in authenticated
             .inputs
             .iter()
@@ -1138,16 +1139,26 @@ pub fn run_correctness(
             };
             for mode in [ExecutionMode::HotReuse, ExecutionMode::OneShot] {
                 for operation in [Operation::Find, Operation::Exists, Operation::SelectedEnd] {
-                    let expected = oracle_value(oracle_match, operation);
+                    let expected = oracle_value(&oracle, &input.haystack, operation);
                     let outcome = match mode {
-                        ExecutionMode::HotReuse => match &hot {
-                            Ok(regex) => execute_candidate(regex, &input.haystack, operation),
-                            Err(failure) => CandidateOutcome::Failure(failure.clone()),
-                        },
-                        ExecutionMode::OneShot => match build_candidate(&case.pattern) {
-                            Ok(regex) => execute_candidate(&regex, &input.haystack, operation),
-                            Err(failure) => CandidateOutcome::Failure(failure),
-                        },
+                        ExecutionMode::HotReuse => execute_candidate_with_ordinary_parity(
+                            &hot_accounted,
+                            &hot_ordinary,
+                            &input.haystack,
+                            operation,
+                            &expected,
+                        ),
+                        ExecutionMode::OneShot => {
+                            let accounted = build_candidate(&case.pattern);
+                            let ordinary = build_candidate(&case.pattern);
+                            execute_candidate_with_ordinary_parity(
+                                &accounted,
+                                &ordinary,
+                                &input.haystack,
+                                operation,
+                                &expected,
+                            )
+                        }
                     };
                     receipts
                         .try_reserve(1)
@@ -1178,12 +1189,12 @@ pub fn run_correctness(
     let mode_boundaries = BTreeMap::from([
         (
             ExecutionMode::HotReuse,
-            "one candidate construction per case; every changing haystack and operation reuses that immutable matcher"
+            "one candidate construction per case and API surface; every changing haystack and operation reuses its immutable matcher; the ordinary surface is checked outside all timing against the finite accounted receipt surface"
                 .to_string(),
         ),
         (
             ExecutionMode::OneShot,
-            "candidate construction occurs inside every (case,input,operation) receipt before exactly one search"
+            "one candidate construction per API surface occurs inside every (case,input,operation) receipt before one search on each; the ordinary result is checked outside all timing against the finite accounted receipt result"
                 .to_string(),
         ),
     ]);
@@ -1194,9 +1205,8 @@ pub fn run_correctness(
         json_schema_sha256: authenticated.json_schema_sha256.clone(),
         expanded_inputs_sha256: authenticated.expanded_inputs_sha256.clone(),
         oracle_identity: "regex::bytes 1.12.4; unicode=false; leftmost-first".to_string(),
-        candidate_identity:
-            "current fre::PortableBuilder auto plan; unicode=false; default checked limits"
-                .to_string(),
+        candidate_identity: "current fre::PortableBuilder auto plan; unicode=false; receipts use default checked limits and include untimed ordinary-API parity validation"
+            .to_string(),
         target_arch: std::env::consts::ARCH.to_string(),
         target_os: std::env::consts::OS.to_string(),
         target_pointer_width: usize::BITS,
@@ -1214,11 +1224,16 @@ fn oracle_regex(pattern: &str) -> Result<Regex, regex::Error> {
         .build()
 }
 
-fn oracle_value(matched: Option<SpanValue>, operation: Operation) -> SemanticValue {
+fn oracle_value(regex: &Regex, haystack: &[u8], operation: Operation) -> SemanticValue {
     match operation {
-        Operation::Find => SemanticValue::Span(matched),
-        Operation::Exists => SemanticValue::Boolean(matched.is_some()),
-        Operation::SelectedEnd => SemanticValue::End(matched.map(|span| span.end)),
+        Operation::Find => SemanticValue::Span(regex.find(haystack).map(|matched| SpanValue {
+            start: matched.start(),
+            end: matched.end(),
+        })),
+        Operation::Exists => SemanticValue::Boolean(regex.is_match(haystack)),
+        Operation::SelectedEnd => {
+            SemanticValue::End(regex.find(haystack).map(|matched| matched.end()))
+        }
     }
 }
 
@@ -1408,12 +1423,98 @@ fn classify_forward_anchored_build_error(
     }
 }
 
+#[cfg(test)]
 fn execute_candidate(
     regex: &PortableRegex,
     haystack: &[u8],
     operation: Operation,
 ) -> CandidateOutcome {
     execute_candidate_with_limits(regex, haystack, operation, SearchLimits::default())
+}
+
+fn execute_candidate_with_ordinary_parity(
+    accounted: &Result<PortableRegex, CandidateFailure>,
+    ordinary: &Result<PortableRegex, CandidateFailure>,
+    haystack: &[u8],
+    operation: Operation,
+    expected: &SemanticValue,
+) -> CandidateOutcome {
+    execute_candidate_with_ordinary_parity_and_limits(
+        accounted,
+        ordinary,
+        haystack,
+        operation,
+        expected,
+        SearchLimits::default(),
+    )
+}
+
+fn execute_candidate_with_ordinary_parity_and_limits(
+    accounted: &Result<PortableRegex, CandidateFailure>,
+    ordinary: &Result<PortableRegex, CandidateFailure>,
+    haystack: &[u8],
+    operation: Operation,
+    expected: &SemanticValue,
+    limits: SearchLimits,
+) -> CandidateOutcome {
+    // Validate the API that performance actually times independently of the
+    // finite diagnostic surface. In particular, a default finite scratch
+    // refusal must not prevent the ordinary, construction-bounded API from
+    // being checked against Rust.
+    let ordinary_value = match ordinary {
+        Ok(regex) => match execute_candidate_ordinary(regex, haystack, operation) {
+            Ok(value) => value,
+            Err(failure) => return CandidateOutcome::Failure(failure),
+        },
+        Err(failure) => return CandidateOutcome::Failure(failure.clone()),
+    };
+    if ordinary_value != *expected {
+        return CandidateOutcome::Failure(CandidateFailure {
+            status: Status::Fail,
+            code: "search.semantic.ordinary-oracle-parity".to_string(),
+            reason: format!(
+                "ordinary FRE value {ordinary_value:?} differs from Rust-regex value {expected:?}"
+            ),
+        });
+    }
+
+    let accounted = match accounted {
+        Ok(regex) => execute_candidate_with_limits(regex, haystack, operation, limits),
+        Err(failure) => CandidateOutcome::Failure(failure.clone()),
+    };
+    let (accounted_value, plan, work) = match accounted {
+        CandidateOutcome::Executed { value, plan, work } => (value, plan, work),
+        CandidateOutcome::Failure(failure) => return CandidateOutcome::Failure(failure),
+    };
+    if ordinary_value != accounted_value {
+        return CandidateOutcome::Failure(CandidateFailure {
+            status: Status::Fail,
+            code: "search.semantic.ordinary-accounted-parity".to_string(),
+            reason: format!(
+                "ordinary FRE value {ordinary_value:?} differs from finite accounted FRE value {accounted_value:?}"
+            ),
+        });
+    }
+    CandidateOutcome::Executed {
+        value: accounted_value,
+        plan,
+        work,
+    }
+}
+
+fn execute_candidate_ordinary(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    operation: Operation,
+) -> Result<SemanticValue, CandidateFailure> {
+    catch_unwind(AssertUnwindSafe(|| {
+        execute_candidate_ordinary_inner(regex, haystack, operation)
+    }))
+    .map_err(|_| CandidateFailure {
+        status: Status::Fault,
+        code: "search.panic.ordinary".to_string(),
+        reason: "candidate ordinary API panicked during search".to_string(),
+    })
 }
 
 fn execute_candidate_with_limits(
@@ -1447,7 +1548,7 @@ fn execute_candidate_inner(
 ) -> Result<(SemanticValue, SearchAccounting), SearchError> {
     match operation {
         Operation::Find => {
-            let (matched, accounting) = regex.find(haystack, limits)?;
+            let (matched, accounting) = regex.find_accounted(haystack, limits)?;
             Ok((
                 SemanticValue::Span(matched.map(|matched| SpanValue {
                     start: matched.start(),
@@ -1457,12 +1558,29 @@ fn execute_candidate_inner(
             ))
         }
         Operation::Exists => {
-            let (matched, accounting) = regex.is_match(haystack, limits)?;
+            let (matched, accounting) = regex.is_match_accounted(haystack, limits)?;
             Ok((SemanticValue::Boolean(matched), accounting))
         }
         Operation::SelectedEnd => {
-            let (end, accounting) = regex.selected_end(haystack, limits)?;
+            let (end, accounting) = regex.selected_end_accounted(haystack, limits)?;
             Ok((SemanticValue::End(end), accounting))
+        }
+    }
+}
+
+fn execute_candidate_ordinary_inner(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    operation: Operation,
+) -> SemanticValue {
+    match operation {
+        Operation::Find => SemanticValue::Span(regex.find(haystack).map(|matched| SpanValue {
+            start: matched.start(),
+            end: matched.end(),
+        })),
+        Operation::Exists => SemanticValue::Boolean(regex.is_match(haystack)),
+        Operation::SelectedEnd => {
+            SemanticValue::End(regex.find(haystack).map(|matched| matched.end()))
         }
     }
 }
@@ -1783,10 +1901,10 @@ pub fn run_performance(
             "warmup and measurement are independent complete sweeps in repetition-major, ascending input-ordinal order; every case input receives the policy repetition count"
                 .to_string(),
         measurement_scope:
-            "search elapsed_ns spans the result-only engine API call plus semantic value extraction; FRE uses find_value/is_match_value/selected_end_value with default checked limits, Rust-regex uses find/is_match, and error classification and report construction occur after the clock sample"
+            "search elapsed_ns spans the ordinary Rust-style engine API call plus semantic value extraction; FRE and Rust-regex both use find/is_match with no per-search work limit, selected-end maps ordinary find to the match end, and panic classification and report construction occur after the clock sample; finite-limit and accounting validation is untimed"
                 .to_string(),
         selected_end_adapter:
-            "Rust-regex has no selected_end method; both baselines invoke their result-only selected-span path once and map the selected match to end (Rust find, FRE selected_end_value)"
+            "neither timed baseline uses a selected_end-specific API; both invoke ordinary find exactly once and map the selected match to end"
                 .to_string(),
         builds,
         operations,
@@ -1956,40 +2074,12 @@ fn measure_fre_search(
 ) -> (u64, &'static str) {
     let started = Instant::now();
     let raw = catch_unwind(AssertUnwindSafe(|| {
-        execute_candidate_value_inner(regex, haystack, operation, SearchLimits::default())
+        execute_candidate_ordinary_inner(regex, haystack, operation)
     }));
     let elapsed = elapsed_ns(started);
-    let state = match &raw {
-        Ok(Ok(_)) => "executed",
-        Ok(Err(error)) if classify_search_error(error).status == Status::Unsupported => {
-            "unsupported"
-        }
-        Err(_) | Ok(Err(_)) => "fault",
-    };
+    let state = if raw.is_ok() { "executed" } else { "fault" };
     let _ = black_box(raw);
     (elapsed, state)
-}
-
-fn execute_candidate_value_inner(
-    regex: &PortableRegex,
-    haystack: &[u8],
-    operation: Operation,
-    limits: SearchLimits,
-) -> Result<SemanticValue, SearchError> {
-    match operation {
-        Operation::Find => regex.find_value(haystack, limits).map(|matched| {
-            SemanticValue::Span(matched.map(|matched| SpanValue {
-                start: matched.start(),
-                end: matched.end(),
-            }))
-        }),
-        Operation::Exists => regex
-            .is_match_value(haystack, limits)
-            .map(SemanticValue::Boolean),
-        Operation::SelectedEnd => regex
-            .selected_end_value(haystack, limits)
-            .map(SemanticValue::End),
-    }
 }
 
 fn build_timing_oracle(pattern: &str) -> Result<Regex, String> {
@@ -2005,15 +2095,8 @@ fn execute_timing_oracle(
     haystack: &[u8],
     operation: Operation,
 ) -> Result<SemanticValue, &'static str> {
-    catch_unwind(AssertUnwindSafe(|| match operation {
-        Operation::Find => SemanticValue::Span(regex.find(haystack).map(|matched| SpanValue {
-            start: matched.start(),
-            end: matched.end(),
-        })),
-        Operation::Exists => SemanticValue::Boolean(regex.is_match(haystack)),
-        Operation::SelectedEnd => {
-            SemanticValue::End(regex.find(haystack).map(|matched| matched.end()))
-        }
+    catch_unwind(AssertUnwindSafe(|| {
+        oracle_value(regex, haystack, operation)
     }))
     .map_err(|_| "rust-regex panicked during search")
 }
@@ -2213,30 +2296,76 @@ mod tests {
     }
 
     #[test]
-    fn performance_value_surface_matches_accounting_correctness_surface() {
+    fn ordinary_accounted_and_rust_surfaces_have_value_parity() {
         for (pattern, haystack) in [
             (r"(?:a+b|a)", b"xxaaabyy".as_slice()),
             (r"(?m:^a+)", b"z\naaa\nz".as_slice()),
             (r"a{0,100}b", b"aaaaaaaaab".as_slice()),
         ] {
             let regex = build_candidate(pattern).expect("comparison fixture builds");
+            let rust = oracle_regex(pattern).expect("comparison oracle builds");
             for operation in [Operation::Find, Operation::Exists, Operation::SelectedEnd] {
-                let accounted = execute_candidate_inner(
-                    &regex,
-                    haystack,
-                    operation,
-                    SearchLimits::default(),
-                )
-                .expect("accounting correctness surface executes")
-                .0;
-                let value = execute_candidate_value_inner(
-                    &regex,
-                    haystack,
-                    operation,
-                    SearchLimits::default(),
-                )
-                .expect("value performance surface executes");
-                assert_eq!(value, accounted, "pattern={pattern:?} operation={operation:?}");
+                let accounted =
+                    execute_candidate_inner(&regex, haystack, operation, SearchLimits::default())
+                        .expect("accounting correctness surface executes")
+                        .0;
+                let ordinary = execute_candidate_ordinary_inner(&regex, haystack, operation);
+                let rust = execute_timing_oracle(&rust, haystack, operation)
+                    .expect("Rust comparison surface executes");
+                assert_eq!(
+                    ordinary, accounted,
+                    "ordinary/accounted mismatch: pattern={pattern:?} operation={operation:?}"
+                );
+                assert_eq!(
+                    ordinary, rust,
+                    "ordinary/Rust mismatch: pattern={pattern:?} operation={operation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_oracle_check_precedes_an_explicit_finite_refusal() {
+        let accounted = build_candidate("a");
+        let ordinary = build_candidate("a");
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+
+        let correct = execute_candidate_with_ordinary_parity_and_limits(
+            &accounted,
+            &ordinary,
+            b"a",
+            Operation::Exists,
+            &SemanticValue::Boolean(true),
+            refusing,
+        );
+        match correct {
+            CandidateOutcome::Failure(failure) => {
+                assert_eq!(failure.status, Status::Unsupported);
+                assert_ne!(failure.code, "search.semantic.ordinary-oracle-parity");
+            }
+            CandidateOutcome::Executed { .. } => {
+                panic!("zero finite limits unexpectedly executed")
+            }
+        }
+
+        let deliberately_wrong_oracle = execute_candidate_with_ordinary_parity_and_limits(
+            &accounted,
+            &ordinary,
+            b"a",
+            Operation::Exists,
+            &SemanticValue::Boolean(false),
+            refusing,
+        );
+        match deliberately_wrong_oracle {
+            CandidateOutcome::Failure(failure) => {
+                assert_eq!(failure.status, Status::Fail);
+                assert_eq!(failure.code, "search.semantic.ordinary-oracle-parity");
+            }
+            CandidateOutcome::Executed { .. } => {
+                panic!("wrong ordinary oracle unexpectedly passed")
             }
         }
     }

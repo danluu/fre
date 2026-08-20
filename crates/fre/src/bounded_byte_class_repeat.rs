@@ -1020,7 +1020,7 @@ mod tests {
         ));
 
         let (matched, receipt) = range
-            .find(b"................................@@@@!", SearchLimits::unlimited())
+            .find_accounted(b"................................@@@@!", SearchLimits::unlimited())
             .expect("one bounded range search should succeed");
         assert_eq!(span(matched), Some((32, 36)));
         let receipt = accounting(receipt);
@@ -1815,7 +1815,7 @@ mod tests {
         let greedy = build("(?-u:[a-d]){3,7}");
         let haystack = b"aaaaaaaaX";
         let (exists, exists_accounting) = greedy
-            .is_match(haystack, SearchLimits::unlimited())
+            .is_match_accounted(haystack, SearchLimits::unlimited())
             .unwrap();
         assert!(exists);
         assert_eq!(accounting(exists_accounting).actual_work, 3);
@@ -1826,14 +1826,18 @@ mod tests {
         assert_eq!(earliest, Some(3));
         assert_eq!(accounting(earliest_accounting).actual_work, 3);
 
-        let (found, found_accounting) = greedy.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (found, found_accounting) = greedy
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(span(found), Some((0, 7)));
         let found_accounting = accounting(found_accounting);
         assert_eq!(found_accounting.actual_work, 7);
         assert_eq!(found_accounting.source_reads, 7);
 
         let lazy = build("(?-u:[a-d]){3,7}?");
-        let (found, lazy_accounting) = lazy.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (found, lazy_accounting) = lazy
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(span(found), Some((0, 3)));
         assert_eq!(accounting(lazy_accounting).actual_work, 3);
     }

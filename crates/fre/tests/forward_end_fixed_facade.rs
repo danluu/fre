@@ -38,7 +38,7 @@ fn red_forced_both_end_is_fixed_while_start_only_and_auto_stay_old() {
 
     assert_eq!(
         start_only
-            .find(b"aZx", SearchLimits::unlimited())
+            .find_accounted(b"aZx", SearchLimits::unlimited())
             .unwrap()
             .0
             .map(|matched| (matched.start(), matched.end())),
@@ -52,7 +52,7 @@ fn red_facade_projects_the_fixed_span_and_preserves_absolute_windows() {
     let haystack = b"aabZQ";
     assert!(
         regex
-            .is_match(haystack, SearchLimits::unlimited())
+            .is_match_accounted(haystack, SearchLimits::unlimited())
             .unwrap()
             .0
     );
@@ -65,7 +65,7 @@ fn red_facade_projects_the_fixed_span_and_preserves_absolute_windows() {
     );
     assert_eq!(
         regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap()
             .0
             .map(|matched| (matched.start(), matched.end())),
@@ -250,7 +250,9 @@ fn red_suffix_mismatch_has_fixed_upper_bounds_and_no_prefix_examinations() {
     for offset in 0..3 {
         let mut haystack = b"abZQX".to_vec();
         haystack[2 + offset] ^= 0x20;
-        let (matched, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+        let (matched, accounting) = regex
+            .find_accounted(&haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(matched, None, "offset={offset}");
         let SearchAccounting::ForwardAnchored(accounting) = accounting else {
             panic!("forced fixed route lost forward accounting")
@@ -410,7 +412,7 @@ fn fixed_facade_matches_pinned_rust_bytes_for_greedy_lazy_and_captures() {
                             .find(haystack)
                             .map(|matched| (matched.start(), matched.end()));
                         let actual = fre
-                            .find(haystack, SearchLimits::unlimited())
+                            .find_accounted(haystack, SearchLimits::unlimited())
                             .unwrap()
                             .0
                             .map(|matched| (matched.start(), matched.end()));
@@ -419,7 +421,9 @@ fn fixed_facade_matches_pinned_rust_bytes_for_greedy_lazy_and_captures() {
                             "pattern={pattern:?} haystack={haystack:?}"
                         );
                         assert_eq!(
-                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
                             expected.is_some()
                         );
                         assert_eq!(

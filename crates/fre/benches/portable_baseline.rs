@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use fre::{PlanKind, PortableBuilder, SearchLimits};
+use fre::{PlanKind, PortableBuilder};
 use fre_kernels::{LiteralSetBuildLimits, LiteralSetPlan, LiteralSetSearchLimits};
 
 const SEARCH_ITERS: usize = 2_000;
@@ -113,9 +113,7 @@ fn compare_search(case: &Case) {
         .find(&case.haystack)
         .map(|matched| (matched.start(), matched.end()));
     let actual = fre
-        .find(&case.haystack, SearchLimits::unlimited())
-        .expect("unlimited K0 search")
-        .0
+        .find(&case.haystack)
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(actual, expected);
     let fre_engine = match fre.build_report().plan {
@@ -138,15 +136,11 @@ fn compare_search(case: &Case) {
     };
 
     warm(|| {
-        fre.find(black_box(&case.haystack), SearchLimits::unlimited())
-            .expect("warm K0")
-            .0
+        fre.find(black_box(&case.haystack))
             .map_or(0, fre::Match::end)
     });
     let (elapsed, checksum) = measure(SEARCH_ITERS, || {
-        fre.find(black_box(&case.haystack), SearchLimits::unlimited())
-            .expect("measured K0")
-            .0
+        fre.find(black_box(&case.haystack))
             .map_or(0, fre::Match::end)
     });
     print_row(

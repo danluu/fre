@@ -18,7 +18,7 @@ The schema file is authenticated and its root identity is structurally checked. 
 
 ## Semantic contract
 
-The exact oracle is pinned `regex::bytes` 1.12.4 with Unicode disabled. It supplies Rust-regex leftmost-first `find`, `is_match`, and selected match end values. The candidate is the current `fre::PortableBuilder` auto plan under default checked limits.
+The exact oracle is pinned `regex::bytes` 1.12.4 with Unicode disabled. It supplies Rust-regex leftmost-first `find`, `is_match`, and selected match end values. The candidate is the current `fre::PortableBuilder` auto plan. Deterministic receipts use the explicit default checked limits, and the same correctness pass separately verifies that FRE's ordinary Rust-compatible API returns the identical value without a caller-supplied search quota.
 
 Each expanded input produces six receipts:
 
@@ -45,7 +45,7 @@ The strict gate rejects any `fail` or `fault` after writing the full report. `un
 
 Correctness output contains no clocks. Its receipt ordering, values, classifications, coverage maps, and receipt digest are deterministic for a fixed candidate and target. The report records target architecture, operating system, and pointer width explicitly; architecture-sensitive plan selection can therefore produce distinct, attributable receipts without changing the architecture-neutral expanded-input digest.
 
-Optional performance output has a separate `fre.holdout.performance.v3` schema. It times the result-only public APIs: FRE `find_value`, `is_match_value`, and `selected_end_value` under default checked limits versus Rust-regex `find` and `is_match`. Both engines automatically retain their implementation-owned search scratch across hot calls; the caller does not construct an explicit session. The deterministic correctness report continues to use FRE's accounting APIs so plan and work receipts remain available outside the timing boundary.
+Optional performance output has a separate `fre.holdout.performance.v4` schema. It times equivalent ordinary APIs: FRE and Rust-regex both use `find` and `is_match` without a per-search work quota, and the selected-end diagnostic invokes `find` once and projects the match end on both sides. Both engines automatically retain implementation-owned, construction-bounded search scratch across hot calls; the caller does not construct an explicit session. The deterministic correctness report continues to use FRE's finite accounting APIs so plan and work receipts remain available outside the timing boundary, and it checks those finite results against the ordinary API before any timing.
 
 The 2026-08-19 C9g diagnostic for automatic portable K0 scratch is summarized in [`docs/performance/automatic-portable-k0-scratch-c9g32-2026-08-19.md`](../../docs/performance/automatic-portable-k0-scratch-c9g32-2026-08-19.md). Raw timing samples remain external; the committed report contains only labeled diagnostic aggregates and reproduction hashes.
 

@@ -10,7 +10,7 @@ const PATTERNS: [&str; 3] = ["!", "[a-z]+", r"(?-u:[0-9]+)"];
 fn warm(regexes: &[PortableRegex], set: &PortableRegexSet) {
     for regex in regexes {
         let _ = regex
-            .is_match(b"", SearchLimits::unlimited())
+            .is_match_accounted(b"", SearchLimits::unlimited())
             .expect("direct warm-up search");
     }
     let _ = set
@@ -233,13 +233,13 @@ fn per_pattern_exists_work_limits_are_exact_with_the_total_budget_unlimited() {
         );
 
         let _ = regex
-            .is_match(b"", SearchLimits::unlimited())
+            .is_match_accounted(b"", SearchLimits::unlimited())
             .expect("direct warm-up search");
         let _ = set
             .matches(b"", PortableRegexSetRunLimits::unlimited())
             .expect("set warm-up search");
         let (matched, accounting) = regex
-            .is_match(haystack, SearchLimits::unlimited())
+            .is_match_accounted(haystack, SearchLimits::unlimited())
             .expect("direct existence work probe");
         assert!(matched, "{pattern:?}");
         let exact_work = accounting.work_or_linear_terms();

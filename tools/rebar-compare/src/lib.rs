@@ -183,8 +183,19 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v9";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
-/// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
-pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v3";
+/// Stable plan label for Rebar's ordinary `lines().is_match()` grep boundary.
+///
+/// The matcher is constructed before timing. Each timed operation invokes
+/// [`PortableRegex::is_match`] once for every `ByteSlice::lines` domain, just
+/// like the pinned Rust-regex adapter. No caller-supplied work quota is
+/// applied, and construction-bounded scratch is retained automatically by the
+/// matcher. Implementations may still maintain private counters.
+pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-ordinary-is-match-v1";
+/// Stable plan label for the explicitly finite plain-grep robustness lane.
+///
+/// This lane retains caller-selected work/scratch refusal and prepared-session
+/// accounting. It is not the Rust-comparable ordinary grep timing boundary.
+pub const CURRENT_FRE_REBAR_FINITE_GREP_PLAN: &str = "rebar-lines-finite-is-match-v3";
 /// Compatibility alias for the materialized per-line capture boundary.
 pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for aggregate-only capture-history quotient replay.
@@ -294,11 +305,13 @@ const FRE_ADAPTER_V150_ARBITRARY_ROOT_MASK: &str =
     "fre-current-aggregate-capture-v150-formal-arbitrary-nonnullable-first-byte-root-mask-v1-v149-formal-v148-unicode-ordered-many-continuation-literal-proof-and-v148-fixed-class-disjoint-suffix-scan-route-composition-v1";
 const FRE_ADAPTER_V151: &str =
     "fre-current-aggregate-capture-v151-formal-v150-reusable-bounded-backtrack-capture-iteration-and-v150-arbitrary-nonnullable-first-byte-root-mask-route-composition-v1";
+const FRE_ADAPTER_V152: &str =
+    "fre-current-aggregate-capture-v152-rust-compatible-ordinary-portable-grep-v1-v151-formal-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V151
+    FRE_ADAPTER_V152
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -617,7 +630,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V151
+        FRE_ADAPTER_V152
     }
 
     #[allow(
@@ -635,7 +648,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V151.to_string(),
+            adapter: FRE_ADAPTER_V152.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1296,6 +1309,16 @@ impl CandidateAdapter for CurrentFreAdapter {
             .availability
             .push_str(" while retaining the fair reducer boundary of ");
         identity.availability.push_str(FRE_ADAPTER_V130);
+        identity.identity.push_str(
+            "; rebar-ordinary-grep-v1 supersedes every earlier formal plain-grep timing claim: it constructs one PortableRegex before the public-operation boundary, iterates the exact bstr ByteSlice::lines domains inside that boundary, and calls the ordinary work-unlimited PortableRegex::is_match once per domain; the matcher's construction-bounded automatic scratch pool is cold on the first operation and retained for the steady operation, matching regex-automata's hidden cache lifetime",
+        );
+        identity
+            .availability
+            .push_str("; this v152 adapter retains every non-plain-grep route from ");
+        identity.availability.push_str(FRE_ADAPTER_V151);
+        identity.availability.push_str(
+            "; superseding every earlier plain-grep availability statement, formal Rust-comparable plain grep reports rebar-lines-ordinary-is-match-v1 and never uses a prepared token, explicit search session, or finite per-search work meter; CurrentFreGrepSession and current_fre_rebar_grep_session_with_limits remain available only as the separately labeled rebar-lines-finite-is-match-v3 robustness lane, while count, count-spans, capture, and regex-redux lifecycles retain their existing specialized boundaries",
+        );
         identity
     }
 
@@ -1759,8 +1782,11 @@ pub fn read_authenticated_report(path: &Path) -> Result<Report, CompareError> {
     Ok(report)
 }
 
-/// Return the exact single-search limits used by the authenticated current-FRE
-/// Rebar adapter.
+/// Return the exact single-search limits used by the finite grep robustness
+/// lane and other explicitly checked adapter helpers.
+///
+/// The Rust-comparable ordinary grep timing lane accepts no caller-supplied
+/// work quota and does not consume this policy.
 #[must_use]
 pub fn current_fre_rebar_search_limits() -> SearchLimits {
     let limits = RunLimits::default();
@@ -5589,6 +5615,26 @@ pub fn current_fre_rebar_portable_builder(
         .unicode(unicode))
 }
 
+/// Execute Rebar's Rust-comparable ordinary plain-grep operation.
+///
+/// Matcher construction belongs outside this function. The operation mirrors
+/// the pinned Rust adapter literally: iterate `ByteSlice::lines`, call the
+/// ordinary [`PortableRegex::is_match`] API exactly once per yielded domain,
+/// and count matching domains. The first call on a matcher initializes any
+/// automatic scratch pool lazily; later calls reuse it without a caller-owned
+/// session.
+#[inline]
+#[must_use]
+pub fn current_fre_rebar_ordinary_grep(regex: &PortableRegex, haystack: &[u8]) -> u64 {
+    let mut count = 0_u64;
+    for line in haystack.lines() {
+        if regex.is_match(line) {
+            count += 1;
+        }
+    }
+    count
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CurrentFreGrepLimits {
     search: SearchLimits,
@@ -5624,10 +5670,9 @@ const CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES: usize = 16;
     reason = "the exact caller-owned K0 workspace stays inline and construction remains outside the operation boundary"
 )]
 enum CurrentFreGrepRoute<'r> {
-    /// The only route admitted by the formal Rebar grep lifecycle. The search
-    /// workspace is deliberately created by the first operation so that the
-    /// first/steady distinction includes the same kind of lazy scratch setup
-    /// as the pinned Rust `Regex::is_match` API.
+    /// Explicitly finite per-line route used by robustness checks. The search
+    /// workspace is deliberately created by the first operation and retains
+    /// caller-selected work/scratch limits.
     RebarLines {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
@@ -5649,13 +5694,12 @@ enum CurrentFreGrepRoute<'r> {
     },
 }
 
-/// One already-built plain-grep artifact at the first/steady public-operation
-/// boundary used by the authenticated current-FRE Rebar adapter.
+/// One already-built explicitly finite plain-grep robustness artifact.
 ///
-/// The formal route invokes the retained matcher on every `ByteSlice::lines`
-/// domain. It never selects a whole-input stream, prefilters candidate lines,
-/// or fuses line iteration with matching. Its reusable search workspace is
-/// initialized by the first public operation and retained for steady calls.
+/// This is deliberately separate from the Rust-comparable ordinary benchmark
+/// boundary, which uses [`current_fre_rebar_ordinary_grep`]. The finite route
+/// invokes a retained checked matcher on every `ByteSlice::lines` domain and
+/// exposes typed work/scratch refusal for robustness testing.
 #[derive(Debug)]
 pub struct CurrentFreGrepSession<'r> {
     route: CurrentFreGrepRoute<'r>,
@@ -5666,6 +5710,12 @@ pub struct CurrentFreGrepSession<'r> {
 }
 
 impl CurrentFreGrepSession<'_> {
+    /// Stable identity for this explicitly finite robustness lane.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        CURRENT_FRE_REBAR_FINITE_GREP_PLAN
+    }
+
     /// Stable runtime identity inherited from the immutable semantic matcher.
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
@@ -5867,12 +5917,11 @@ impl CurrentFreGrepSession<'_> {
         )
     }
 
-    /// Execute one complete Rebar LF/CRLF plain-grep operation.
+    /// Execute one complete finite LF/CRLF plain-grep robustness operation.
     ///
-    /// The first call is the first-operation boundary and later calls on the
-    /// same value are steady operations. The first call initializes the
-    /// caller-owned search workspace before invoking the matcher on its first
-    /// line; later calls reuse it.
+    /// The first call initializes the caller-owned checked search workspace;
+    /// later calls reuse it. Rust-comparable benchmark timing instead uses
+    /// [`current_fre_rebar_ordinary_grep`].
     ///
     /// # Errors
     ///
@@ -5985,11 +6034,11 @@ impl CurrentFreGrepSession<'_> {
     }
 }
 
-/// Construct the default authenticated current-FRE plain-grep lifecycle.
+/// Construct the default explicitly finite plain-grep robustness lifecycle.
 ///
-/// Matcher construction occurs before the first public operation. Reusable
-/// search scratch is initialized by the first operation, matching the lazy
-/// first-call boundary of the pinned Rust reference API.
+/// This preserves the historical checked-session behavior for finite-limit
+/// tests and callers. The Rust-comparable plain-grep benchmark uses
+/// [`current_fre_rebar_ordinary_grep`] and does not construct this session.
 ///
 /// # Errors
 ///
@@ -6003,8 +6052,8 @@ pub fn current_fre_rebar_grep_session(
     current_fre_rebar_grep_session_with_limits(regex, haystack_len, &RunLimits::default())
 }
 
-/// Construct the authenticated plain-grep lifecycle under explicit adapter
-/// limits.
+/// Construct the finite plain-grep robustness lifecycle under explicit
+/// adapter limits.
 ///
 /// This is the limit-controlled counterpart to
 /// [`current_fre_rebar_grep_session`].
@@ -9127,7 +9176,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V151
+        if receipt.adapter == FRE_ADAPTER_V152
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -24683,12 +24732,19 @@ fn fre_grep(
         .map_err(|error| {
             ExecutionError::unsupported(format!("FRE build refused input: {error}"))
         })?;
-    let mut session =
-        current_fre_rebar_grep_session_with_limits(&regex, request.haystack.len(), limits)
-            .map_err(|error| {
-                ExecutionError::unsupported(format!("FRE grep session refused: {error}"))
-            })?;
-    let count = session.execute_inner(request.haystack)?;
+    // Keep the semantic/resource lane symmetric with the Rust adapter. This
+    // untimed preflight deliberately remains outside the raw ordinary grep
+    // timing helper, where both engines execute their natural line loop.
+    let mut line_events = 0_u64;
+    for _ in request.haystack.lines() {
+        charge(
+            &mut line_events,
+            1,
+            limits.reducer_steps,
+            "grep line events",
+        )?;
+    }
+    let count = current_fre_rebar_ordinary_grep(&regex, request.haystack);
     Ok(FreReduction {
         actual: count,
         plan: CURRENT_FRE_REBAR_GREP_PLAN.to_owned(),
@@ -26230,25 +26286,15 @@ mod tests {
             }
             "grep" => {
                 let [pattern] = patterns else {
-                    return Err("typed grep lifecycle requires exactly one pattern".to_string());
+                    return Err("ordinary grep requires exactly one pattern".to_string());
                 };
                 let regex = current_fre_rebar_portable_builder(pattern, unicode, case_insensitive)
                     .map_err(|error| error.to_string())?
                     .build()
                     .map_err(|error| error.to_string())?;
-                let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
-                    .map_err(|error| error.to_string())?;
-                if !matches!(&session.route, CurrentFreGrepRoute::RebarLines { .. }) {
-                    return Err(
-                        "typed grep lifecycle did not retain per-line semantic matching"
-                            .to_string(),
-                    );
-                }
                 require_typed_actual(
                     model,
-                    session
-                        .execute(haystack)
-                        .map_err(|error| error.to_string())?,
+                    current_fre_rebar_ordinary_grep(&regex, haystack),
                     expected,
                 )
             }
@@ -36143,11 +36189,12 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V151);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V152);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v151-formal-v150-reusable-bounded-backtrack-capture-iteration-and-v150-arbitrary-nonnullable-first-byte-root-mask-route-composition-v1"
+            "fre-current-aggregate-capture-v152-rust-compatible-ordinary-portable-grep-v1-v151-formal-route-composition-v1"
         );
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V151));
         assert!(current_identity.availability.contains(FRE_ADAPTER));
         assert!(
             current_identity
@@ -36184,6 +36231,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         ));
         assert!(current_identity.identity.contains(
             "composes the current CaptureIteration v6/accounting2 restarted-History authority"
+        ));
+        assert!(current_identity.identity.contains(
+            "rebar-ordinary-grep-v1 supersedes every earlier formal plain-grep timing claim"
+        ));
+        assert!(current_identity.availability.contains(
+            "CurrentFreGrepSession and current_fre_rebar_grep_session_with_limits remain available only as the separately labeled rebar-lines-finite-is-match-v3 robustness lane"
         ));
         assert_eq!(
             CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
@@ -38841,7 +38894,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn current_fre_grep_reuses_k0_workspace_across_lines() {
+    fn current_fre_grep_uses_the_ordinary_api_with_automatic_scratch() {
         let patterns = vec![r"\b[0-9A-Za-z_]{2,}\b".to_string()];
         assert_current_fre_execution(
             current_fre(
@@ -38880,6 +38933,52 @@ agggtaa[cgt]|[acg]ttaccct 0
             1,
             CURRENT_FRE_REBAR_GREP_PLAN,
         );
+    }
+
+    #[test]
+    fn ordinary_and_finite_grep_lanes_are_distinct_and_semantically_equal() {
+        let regex = current_fre_rebar_portable_builder(r"a.*b", false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let haystack = b"axb\r\nmiss\na\xffb\nlast";
+        let rust = rust_compile_options(&[r"a.*b".to_string()], false, false).unwrap();
+        let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
+
+        assert_eq!(current_fre_rebar_ordinary_grep(&regex, haystack), expected);
+        let mut finite = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert_eq!(finite.plan(), CURRENT_FRE_REBAR_FINITE_GREP_PLAN);
+        assert_ne!(finite.plan(), CURRENT_FRE_REBAR_GREP_PLAN);
+        assert_eq!(finite.execute(haystack).unwrap(), expected);
+    }
+
+    #[test]
+    fn ordinary_grep_semantic_lane_retains_the_symmetric_line_event_limit() {
+        let patterns = vec!["a".to_string()];
+        let haystack = b"a\na";
+        let limits = RunLimits {
+            reducer_steps: 1,
+            ..RunLimits::default()
+        };
+        let fre_error = fre_reducer(
+            CandidateRequest {
+                model: "grep",
+                patterns: &patterns,
+                haystack,
+                unicode: false,
+                case_insensitive: false,
+            },
+            &limits,
+        )
+        .expect_err("two lines exceed the one-event semantic limit");
+        assert_eq!(fre_error.status, Status::Fault);
+        assert!(fre_error.message.contains("grep line events needs 2 events"));
+
+        let rust = rust_compile_options(&patterns, false, false).unwrap();
+        let rust_error = grep(&rust, haystack, limits.reducer_steps)
+            .expect_err("Rust semantic lane enforces the same event limit");
+        assert_eq!(rust_error.status, fre_error.status);
+        assert_eq!(rust_error.message, fre_error.message);
     }
 
     #[test]
@@ -39014,9 +39113,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             regex.is_match_value(finite_line, one_below),
         );
 
-        // The formal public grep route retains one ordinary semantic matcher
-        // invocation for every ByteSlice::lines domain; the narrow prepared
-        // recognizer remains available only through the generic API above.
+        // The explicitly finite robustness route retains one checked semantic
+        // matcher invocation for every ByteSlice::lines domain; the narrow
+        // prepared recognizer remains available only through that finite API.
         let haystack = b"plain\r\nAKIA01234567ABCDEFGH\n\xffAIDA01234567ABCDEFGH\xfe\nlast";
         let rust = rust_compile_options(&[pattern.to_string()], false, false).unwrap();
         let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
@@ -39915,7 +40014,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 "prepared Unicode word run differed for exhaustive bytes {line:?}",
             );
             let (_, accounting) = regex
-                .is_match(line, SearchLimits::unlimited())
+                .is_match_accounted(line, SearchLimits::unlimited())
                 .expect("unlimited Unicode word run");
             assert!(
                 accounting.work_or_linear_terms()

@@ -7,13 +7,12 @@ use crate::{
     FRE_V1_DIAGNOSTIC_PATTERN_ENCODING, FRE_V1_DIAGNOSTIC_SEARCH, FRE_V1_JIT_DENY,
     FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE, FRE_V1_PLAN_EXACT_LITERAL,
     FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED, FRE_V1_PLAN_K0,
-    FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS,
-    FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
-    FRE_V1_PLAN_PACKED_LITERAL_SET, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
-    FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION, FRE_V1_PLAN_REQUIRED_LITERAL,
-    FRE_V1_PLAN_REVERSE_INNER, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL,
-    FRE_V1_PLAN_UNICODE_SCALAR_RUN, FRE_V1_PLAN_UNICODE_WORD_RUN,
-    FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_PATTERN_ENCODING,
+    FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
+    FRE_V1_PLAN_LITERAL_SET_DFA, FRE_V1_PLAN_PACKED_LITERAL_SET,
+    FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
+    FRE_V1_PLAN_REQUIRED_LITERAL, FRE_V1_PLAN_REVERSE_INNER, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL,
+    FRE_V1_PLAN_UNICODE_SCALAR_RUN, FRE_V1_PLAN_UNICODE_WORD_RUN, FRE_V1_PROFILE_RUST_BYTES,
+    FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_PATTERN_ENCODING,
     FRE_V1_STATUS_SEARCH_ERROR, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
     FRE_V1_STATUS_UNSUPPORTED_PROFILE, FreV1Config, FreV1ExistsResult, FreV1MatchResult,
     FreV1PlanInfo, FreV1SelectedEndResult, boundary::Outcome,
@@ -96,10 +95,11 @@ impl CompiledRegex {
 
     pub(crate) fn exists(&self, haystack: &[u8]) -> Result<FreV1ExistsResult, Outcome> {
         let matched = if self.search_limits == SearchLimits::unlimited() {
-            self.regex.is_match_value(haystack, self.search_limits)
+            self.regex
+                .is_match_with_limits(haystack, self.search_limits)
         } else {
             self.regex
-                .is_match(haystack, self.search_limits)
+                .is_match_accounted(haystack, self.search_limits)
                 .map(|(matched, _)| matched)
         }
         .map_err(|error| search_error(&error))?;
@@ -113,7 +113,7 @@ impl CompiledRegex {
 
     pub(crate) fn selected_end(&self, haystack: &[u8]) -> Result<FreV1SelectedEndResult, Outcome> {
         self.regex
-            .selected_end(haystack, self.search_limits)
+            .selected_end_accounted(haystack, self.search_limits)
             .map(|(end, _)| FreV1SelectedEndResult {
                 abi_version: crate::FRE_V1_ABI_VERSION,
                 struct_size: size_u32::<FreV1SelectedEndResult>(),
@@ -126,10 +126,10 @@ impl CompiledRegex {
 
     pub(crate) fn span(&self, haystack: &[u8]) -> Result<FreV1MatchResult, Outcome> {
         let matched = if self.search_limits == SearchLimits::unlimited() {
-            self.regex.find_value(haystack, self.search_limits)
+            self.regex.find_with_limits(haystack, self.search_limits)
         } else {
             self.regex
-                .find(haystack, self.search_limits)
+                .find_accounted(haystack, self.search_limits)
                 .map(|(matched, _)| matched)
         }
         .map_err(|error| search_error(&error))?;

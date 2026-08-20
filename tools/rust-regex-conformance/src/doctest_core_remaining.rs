@@ -98,14 +98,8 @@ fn build(pattern: &str) -> Result<fre::PortableRegex, RemainingCoreRefusal> {
 
 fn lazy_search() -> Result<String, RemainingCoreRefusal> {
     let regex = build("...")?;
-    let first = regex
-        .is_match(b"abc", SearchLimits::unlimited())
-        .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused"))?
-        .0;
-    let second = regex
-        .is_match(b"ac", SearchLimits::unlimited())
-        .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused"))?
-        .0;
+    let first = regex.is_match(b"abc");
+    let second = regex.is_match(b"ac");
     Ok(format!("{first},{second}"))
 }
 

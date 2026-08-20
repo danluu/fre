@@ -94,20 +94,20 @@ impl From<PortableTextMatch<'_>> for core::ops::Range<usize> {
 impl PortableTextRegex {
     /// Return the selected match while retaining the exact original haystack.
     ///
-    /// This is the borrowed-text companion to [`Self::find`]. It performs the
+    /// This is the borrowed-text companion to [`Self::find_accounted`]. It performs the
     /// same search exactly once and returns identical execution accounting;
     /// constructing [`PortableTextMatch`] allocates nothing.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError`] under the same resource contract as
-    /// [`Self::find`].
+    /// [`Self::find_accounted`].
     pub fn find_borrowed<'h>(
         &self,
         haystack: &'h str,
         limits: SearchLimits,
     ) -> Result<(Option<PortableTextMatch<'h>>, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.find(haystack, limits)?;
+        let (matched, accounting) = self.find_accounted(haystack, limits)?;
         Ok((
             matched.map(|span| PortableTextMatch::new(haystack, span)),
             accounting,

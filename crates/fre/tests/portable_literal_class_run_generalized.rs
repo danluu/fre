@@ -292,7 +292,7 @@ fn prefix_only_star_preserves_selected_greediness_and_shortest_end() {
     let haystack = b"!abcb!ac!";
     assert_eq!(
         regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap()
             .0
             .map(|matched| (matched.start(), matched.end())),
@@ -308,7 +308,7 @@ fn prefix_only_star_preserves_selected_greediness_and_shortest_end() {
     let oracle = shortest_oracle(r"a[bc]*");
     assert_eq!(
         regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap()
             .0
             .map(|matched| (matched.start(), matched.end())),
@@ -365,7 +365,9 @@ fn failed_overlapping_prefixes_skip_shared_runs_without_changing_results() {
     let expected = oracle(r"a[^z\r\n]*z")
         .find(&haystack)
         .map(|matched| (matched.start(), matched.end()));
-    let (actual, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (actual, accounting) = regex
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(
         actual.map(|matched| (matched.start(), matched.end())),
         expected
@@ -493,14 +495,16 @@ fn generalized_planner_build_and_search_limits_are_exact_at_the_facade() {
     }
 
     let haystack = b"--aaabc--";
-    let (_, accounting) = baseline.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = baseline
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
         panic!("wrong accounting family");
     };
     let exact_work = u64::try_from(accounting.work).unwrap();
     assert!(
         baseline
-            .find(
+            .find_accounted(
                 haystack,
                 SearchLimits {
                     max_work: exact_work,
@@ -510,7 +514,7 @@ fn generalized_planner_build_and_search_limits_are_exact_at_the_facade() {
             .is_ok()
     );
     assert!(matches!(
-        baseline.find(
+        baseline.find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact_work - 1,
@@ -534,7 +538,7 @@ fn large_windows_meter_actual_work_instead_of_refusing_the_full_envelope() {
         let mut haystack = matched.to_vec();
         haystack.resize(8 * 1024 * 1024, b'!');
         let (actual, accounting) = regex
-            .find(&haystack, SearchLimits::default())
+            .find_accounted(&haystack, SearchLimits::default())
             .unwrap_or_else(|error| panic!("large early match failed for {pattern:?}: {error}"));
         assert_eq!(
             actual.map(|matched| (matched.start(), matched.end())),
@@ -557,7 +561,7 @@ fn large_windows_meter_actual_work_instead_of_refusing_the_full_envelope() {
     let regex = portable(r"a[ab]*c");
     let haystack = vec![b'x'; 1024 * 1024];
     assert!(matches!(
-        regex.find(
+        regex.find_accounted(
             &haystack,
             SearchLimits {
                 max_work: 64,
@@ -627,7 +631,7 @@ fn randomized_64_byte_to_megabyte_windows_and_iteration_match_oracles() {
                 .find(&haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let (actual, accounting) = regex
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap_or_else(|error| {
                     panic!("full search failed pattern={pattern:?} size={size}: {error}")
                 });

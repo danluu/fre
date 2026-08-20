@@ -1,7 +1,8 @@
 //! Honest operation-specific facade for the currently certified FRE subsets.
 //!
-//! [`PortableRegex`] provides bounded single-search operations for the HIR
-//! subset that `fre-lower` can prove exact. With the default
+//! [`PortableRegex`] provides Rust-style ordinary `find`/`is_match` calls and
+//! explicit bounded/accounted search operations for the HIR subset that
+//! `fre-lower` can prove exact. With the default
 //! `qualified-exact-search-jit` feature, [`QualifiedExactSearch`] exposes an
 //! experimental, explicit opt-in 16-byte exact-literal JIT leaf with portable
 //! fallback outside its evidence-gated large-window envelope. No default
@@ -9360,6 +9361,7 @@ impl PortableK0Plan {
         incumbent_search_start: usize,
         suffix_search_start: usize,
         limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
     ) -> Result<K0PooledSpanRoute, K0SearchError> {
         // Reject every finite/invalid invocation before inspecting the source
         // or mutating the hidden value-only pool. Diagnostic APIs never call
@@ -9399,7 +9401,7 @@ impl PortableK0Plan {
         // layout, so whichever operation reaches the immutable owner first
         // cannot restrict later reverse-suffix execution.
         let Some(mut session) = self.automaton.try_checkout_pooled_search_session(
-            SearchSessionLimits::default(),
+            workspace_limits,
             true,
             true,
         )? else {
@@ -9434,7 +9436,7 @@ impl PortableK0Plan {
                 if execution.transient_loss {
                     self.automaton.refresh_pooled_search_session(
                         session,
-                        SearchSessionLimits::default(),
+                        workspace_limits,
                         true,
                         true,
                     )?;
@@ -9464,18 +9466,23 @@ impl PortableK0Plan {
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
         minimum_match_bytes: Option<usize>,
     ) -> Result<Option<K0PooledValue>, K0SearchError> {
-        // The Rust-like default value facade automatically owns its reusable
-        // K0 scratch. Unlimited calls may additionally consume the optional
-        // proof shortcuts below; default finite calls go straight to the
-        // generic pooled executor so their checked envelope stays exact.
+        // Both finite value calls and the Rust-style ordinary facade
+        // automatically own reusable K0 scratch. Work-unlimited calls may
+        // additionally consume the optional proof shortcuts below; default
+        // finite calls go straight to the generic pooled executor so their
+        // checked envelope stays exact. `workspace_limits` is independent:
+        // finite calls retain their explicit default quota, while ordinary
+        // calls admit the fixed plan-derived layout without a per-call quota.
         if limits == SearchLimits::default() {
             return self.pooled_workspace_value(
                 operation,
                 haystack,
                 window,
                 limits,
+                workspace_limits,
                 minimum_match_bytes,
             );
         }
@@ -9500,7 +9507,7 @@ impl PortableK0Plan {
                         haystack,
                         window,
                         limits,
-                        SearchSessionLimits::default(),
+                        workspace_limits,
                         proof.maximum_match_bytes(),
                     )
                     .map(|value| value.map(K0PooledValue::Exists)),
@@ -9510,7 +9517,7 @@ impl PortableK0Plan {
                         haystack,
                         window,
                         limits,
-                        SearchSessionLimits::default(),
+                        workspace_limits,
                         proof.maximum_match_bytes(),
                     )
                     .map(|value| value.map(K0PooledValue::Span)),
@@ -9631,6 +9638,7 @@ impl PortableK0Plan {
                 search_window.start(),
                 suffix_search_start,
                 limits,
+                workspace_limits,
             )? {
                 K0PooledSpanRoute::Complete(output) => {
                     return Ok(Some(K0PooledValue::Span(output)));
@@ -9644,6 +9652,7 @@ impl PortableK0Plan {
             haystack,
             search_window,
             limits,
+            workspace_limits,
             minimum_match_bytes,
         )
     }
@@ -9654,6 +9663,7 @@ impl PortableK0Plan {
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
         minimum_match_bytes: Option<usize>,
     ) -> Result<Option<K0PooledValue>, K0SearchError> {
         if window.start() > window.end() || window.end() > haystack.len() {
@@ -9664,7 +9674,7 @@ impl PortableK0Plan {
             minimum_match_bytes == Some(0) && !self.automaton.stats().has_assertions();
         let endpoint_eligible = positive || assertion_free_nullable;
         // Ordinary callers can freely alternate existence and full-span
-        // operations. Select one source-derived layout that supports both so
+        // operations. Select one source-free layout that supports both so
         // operation order cannot determine the retained capability.
         match operation {
             K0PooledValueOperation::Exists => self
@@ -9673,7 +9683,7 @@ impl PortableK0Plan {
                     haystack,
                     window,
                     limits,
-                    SearchSessionLimits::default(),
+                    workspace_limits,
                     endpoint_eligible,
                     positive,
                 )
@@ -9684,7 +9694,7 @@ impl PortableK0Plan {
                     haystack,
                     window,
                     limits,
-                    SearchSessionLimits::default(),
+                    workspace_limits,
                     endpoint_eligible,
                     positive,
                 )
@@ -10253,12 +10263,62 @@ impl PortableRegex {
         Ok(PortableSearchSession { plan })
     }
 
-    /// Whether a selected match exists.
+    /// Return whether this regex matches anywhere in `haystack`.
+    ///
+    /// This is the Rust-compatible convenience API. Search work has no
+    /// caller-visible quota, and generic K0 plans automatically retain a
+    /// source-free workspace in this immutable matcher. That workspace has a
+    /// fixed layout derived from the construction-bounded automaton; it never
+    /// grows with the haystack or during a search.
+    ///
+    /// Use [`Self::is_match_with_limits`] when a recoverable work or scratch
+    /// refusal is required, and [`Self::is_match_accounted`] when the exact
+    /// execution receipt is also required.
+    ///
+    /// # Panics
+    ///
+    /// Panics if fallible scratch allocation fails or a validated internal
+    /// invariant is violated. These failures are never converted into a
+    /// negative match result.
+    #[must_use]
+    #[inline]
+    pub fn is_match(&self, haystack: &[u8]) -> bool {
+        self.try_is_match_ordinary(haystack)
+            .unwrap_or_else(|error| panic!("PortableRegex::is_match failed: {error}"))
+    }
+
+    #[inline]
+    fn try_is_match_ordinary(&self, haystack: &[u8]) -> Result<bool, SearchError> {
+        let window = SearchWindow::full(haystack);
+        match &self.plan {
+            PortablePlan::K0(k0) => match k0.pooled_value(
+                K0PooledValueOperation::Exists,
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+                SearchSessionLimits::unlimited(),
+                self.report.minimum_match_bytes,
+            )? {
+                Some(K0PooledValue::Exists(value)) => Ok(value),
+                Some(K0PooledValue::Span(_)) => unreachable!("existence pool returned a span"),
+                None => k0
+                    .automaton
+                    .prepare::<Exists>()
+                    .search_window(haystack, window, SearchLimits::unlimited())
+                    .map(|report| report.into_output())
+                    .map_err(SearchError::from),
+            },
+            _ => self.is_match_window_value(haystack, window, SearchLimits::unlimited()),
+        }
+    }
+
+    /// Whether a selected match exists, with selected execution limits and an
+    /// exact accounting receipt.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError`] if scratch/work limits refuse the operation.
-    pub fn is_match(
+    pub fn is_match_accounted(
         &self,
         haystack: &[u8],
         limits: SearchLimits,
@@ -10266,11 +10326,11 @@ impl PortableRegex {
         self.is_match_window(haystack, SearchWindow::full(haystack), limits)
     }
 
-    /// Whether a selected match exists without constructing facade diagnostic
-    /// accounting on the success path.
+    /// Whether a selected match exists under explicit work and scratch
+    /// limits, without constructing facade diagnostic accounting.
     ///
-    /// This is the value-only counterpart to [`Self::is_match`]. It preserves
-    /// the same selected plan, checked execution limits and typed failures,
+    /// This is the finite value-only counterpart to [`Self::is_match`]. It
+    /// preserves the same selected plan, checked execution limits and typed failures,
     /// while keeping callers that only consume the boolean outside the
     /// [`SearchAccounting`] projection boundary. Under the default limits,
     /// generic K0 plans automatically retain bounded scratch in this immutable
@@ -10280,12 +10340,21 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] if scratch/work limits refuse the operation.
-    pub fn is_match_value(
+    pub fn is_match_with_limits(
         &self,
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
         self.is_match_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Compatibility alias for [`Self::is_match_with_limits`].
+    pub fn is_match_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.is_match_with_limits(haystack, limits)
     }
 
     /// Whether a selected match exists at or after `start`.
@@ -10823,6 +10892,7 @@ impl PortableRegex {
                 haystack,
                 window,
                 limits,
+                SearchSessionLimits::default(),
                 self.report.minimum_match_bytes,
             )? {
                 Some(K0PooledValue::Exists(value)) => Ok(value),
@@ -11268,7 +11338,7 @@ impl PortableRegex {
         clippy::too_many_lines,
         reason = "each native owner projects its selected endpoint and concrete accounting explicitly"
     )]
-    pub fn selected_end(
+    pub fn selected_end_accounted(
         &self,
         haystack: &[u8],
         limits: SearchLimits,
@@ -11536,6 +11606,15 @@ impl PortableRegex {
         }
     }
 
+    /// Compatibility alias for [`Self::selected_end_accounted`].
+    pub fn selected_end(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.selected_end_accounted(haystack, limits)
+    }
+
     /// Return only the profile-selected match end.
     ///
     /// This value-only projection shares the exact selected-span path with
@@ -11557,10 +11636,66 @@ impl PortableRegex {
 
     /// Return the profile-selected leftmost-first match.
     ///
+    /// This is the Rust-compatible convenience API. Search work has no
+    /// caller-visible quota. Generic K0 scratch and optional direct caches are
+    /// fixed by the construction-bounded automaton, retained automatically,
+    /// and never grow with the haystack or during a search.
+    ///
+    /// Use [`Self::find_with_limits`] when a recoverable work or scratch
+    /// refusal is required, and [`Self::find_accounted`] when the exact
+    /// execution receipt is also required.
+    ///
+    /// # Panics
+    ///
+    /// Panics if fallible scratch allocation fails or a validated internal
+    /// invariant is violated. These failures are never converted into no
+    /// match.
+    #[must_use]
+    #[inline]
+    pub fn find(&self, haystack: &[u8]) -> Option<Match> {
+        self.try_find_ordinary(haystack)
+            .unwrap_or_else(|error| panic!("PortableRegex::find failed: {error}"))
+    }
+
+    #[inline]
+    fn try_find_ordinary(&self, haystack: &[u8]) -> Result<Option<Match>, SearchError> {
+        let window = SearchWindow::full(haystack);
+        match &self.plan {
+            PortablePlan::K0(k0) => match k0.pooled_value(
+                K0PooledValueOperation::Span,
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+                SearchSessionLimits::unlimited(),
+                self.report.minimum_match_bytes,
+            )? {
+                Some(K0PooledValue::Span(value)) => Ok(value.map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                })),
+                Some(K0PooledValue::Exists(_)) => unreachable!("span pool returned existence"),
+                None => k0
+                    .automaton
+                    .prepare::<Span>()
+                    .search_window(haystack, window, SearchLimits::unlimited())
+                    .map(|report| {
+                        report.into_output().map(|span| Match {
+                            start: span.start(),
+                            end: span.end(),
+                        })
+                    })
+                    .map_err(SearchError::from),
+            },
+            _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
+        }
+    }
+
+    /// Return the selected match with explicit limits and accounting.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError`] if scratch/work limits refuse the operation.
-    pub fn find(
+    pub fn find_accounted(
         &self,
         haystack: &[u8],
         limits: SearchLimits,
@@ -11568,9 +11703,10 @@ impl PortableRegex {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
     }
 
-    /// Return only the profile-selected leftmost-first match.
+    /// Return only the profile-selected leftmost-first match under explicit
+    /// work and scratch limits.
     ///
-    /// This is the value-only counterpart to [`Self::find`]. It preserves the
+    /// This is the finite value-only counterpart to [`Self::find`]. It preserves the
     /// same selected plan, checked execution limits and typed failures. K0
     /// stays outside the facade [`SearchAccounting`] projection boundary;
     /// native owners retain their existing concrete search implementations.
@@ -11581,7 +11717,7 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] if scratch/work limits refuse the operation.
-    pub fn find_value(
+    pub fn find_with_limits(
         &self,
         haystack: &[u8],
         limits: SearchLimits,
@@ -11589,10 +11725,19 @@ impl PortableRegex {
         self.find_window_value(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Compatibility alias for [`Self::find_with_limits`].
+    pub fn find_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_with_limits(haystack, limits)
+    }
+
     /// Return the profile-selected leftmost-first match while retaining the
     /// exact original haystack.
     ///
-    /// This is the borrowed-byte companion to [`Self::find`]. It preserves the
+    /// This is the borrowed-byte companion to [`Self::find_accounted`]. It preserves the
     /// same selected span and execution accounting, while [`ByteMatch`]
     /// supplies the pinned Rust bytes match accessors and conversions.
     ///
@@ -11604,7 +11749,7 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: SearchLimits,
     ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.find(haystack, limits)?;
+        let (matched, accounting) = self.find_accounted(haystack, limits)?;
         Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
     }
 
@@ -12455,6 +12600,7 @@ impl PortableRegex {
                 haystack,
                 window,
                 limits,
+                SearchSessionLimits::default(),
                 self.report.minimum_match_bytes,
             )? {
                 Some(K0PooledValue::Span(value)) => Ok(value.map(|span| Match {
@@ -18552,7 +18698,7 @@ impl<'r> PortableSearchSession<'r> {
     /// # Errors
     ///
     /// Returns [`SearchError`] under the same per-invocation limits as
-    /// [`PortableRegex::is_match`].
+    /// [`PortableRegex::is_match_accounted`].
     pub fn is_match(
         &mut self,
         haystack: &[u8],
@@ -19419,7 +19565,7 @@ impl<'r> PortableSearchSession<'r> {
     /// # Errors
     ///
     /// Returns [`SearchError`] under the same per-invocation limits as
-    /// [`PortableRegex::find`].
+    /// [`PortableRegex::find_accounted`].
     pub fn find(
         &mut self,
         haystack: &[u8],
@@ -22071,7 +22217,8 @@ mod tests {
         CompatibilityProfile, GuardedLiteralSetSearchError, Hir, K0AbsoluteEndProof,
         K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
         K0MandatorySuffixPlan, K0MandatorySuffixRecoveryPlan, K0MandatorySuffixSpanOutcome,
-        K0NegativePrefilterOutcome, K0ReverseSuffixSpanAttempt, Match,
+        K0NegativePrefilterOutcome, K0PooledValue, K0PooledValueOperation,
+        K0ReverseSuffixSpanAttempt, Match,
         K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, K0SpanSourceCursor,
         OperationSemantics, PlanKind, PlanSelection,
         PackedLiteralSetError,
@@ -22338,7 +22485,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_k0_value_calls_automatically_reuse_source_bound_workspace() {
+    fn ordinary_k0_value_calls_automatically_reuse_source_free_workspace() {
         let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
             .unicode(false)
             .plan_selection(PlanSelection::ForceK0)
@@ -22350,7 +22497,7 @@ mod tests {
         // Accounting-returning calls retain their exact one-shot contract and
         // never consume or warm the value-only cache.
         let (accounted_first, first_accounting) = regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("first accounted span search succeeds");
         assert_eq!(accounted_first, expected);
         let SearchAccounting::K0(first_accounting) = first_accounting else {
@@ -22360,7 +22507,7 @@ mod tests {
         assert!(first_accounting.setup().allocated_bytes() > 0);
 
         let (accounted_second, second_accounting) = regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("second accounted span search succeeds");
         assert_eq!(accounted_second, expected);
         let SearchAccounting::K0(second_accounting) = second_accounting else {
@@ -22369,26 +22516,12 @@ mod tests {
         assert!(!second_accounting.setup().reused());
         assert!(second_accounting.setup().allocated_bytes() > 0);
 
-        // Unlimited value-only calls retain one source-bound selected
+        // Rust-style ordinary calls retain one source-free selected
         // workspace. Existence and span can be freely interleaved because the
         // layout is selected solely from immutable language facts.
-        assert_eq!(
-            regex
-                .find_value(haystack, SearchLimits::unlimited())
-                .expect("cold pooled span search succeeds"),
-            expected,
-        );
-        assert!(
-            regex
-                .is_match_value(haystack, SearchLimits::unlimited())
-                .expect("warm pooled existence search succeeds")
-        );
-        assert_eq!(
-            regex
-                .find_value(haystack, SearchLimits::unlimited())
-                .expect("warm pooled span search succeeds"),
-            expected,
-        );
+        assert_eq!(regex.find(haystack), expected);
+        assert!(regex.is_match(haystack));
+        assert_eq!(regex.find(haystack), expected);
 
         // The default finite value API owns the same cache policy. Its first
         // search pays for bounded construction and later calls reuse that
@@ -22424,7 +22557,7 @@ mod tests {
         };
         assert_eq!(
             finite
-                .find_value(haystack, custom_finite)
+                .find_with_limits(haystack, custom_finite)
                 .expect("custom finite value search succeeds"),
             expected,
         );
@@ -22441,12 +22574,73 @@ mod tests {
 
         // A clone has a fresh cache owner but identical semantics.
         let clone = regex.clone();
+        assert_eq!(clone.find(haystack), expected);
+    }
+
+    #[test]
+    fn rust_style_ordinary_api_is_work_unlimited_while_finite_and_accounted_apis_remain_explicit() {
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("ordinary API fixture builds through K0");
+        let haystack = b"xxxxxxxxabacabacz";
+        let expected = Some(Match { start: 8, end: 17 });
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+
+        assert!(regex.find_with_limits(haystack, refusing).is_err());
+        assert!(regex.is_match_with_limits(haystack, refusing).is_err());
+        assert_eq!(regex.find(haystack), expected);
+        assert!(regex.is_match(haystack));
+
+        let (accounted, accounting) = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .expect("explicit accounted search succeeds");
+        assert_eq!(accounted, expected);
+        assert_eq!(accounting.plan(), PlanKind::K0);
         assert_eq!(
-            clone
-                .find_value(haystack, SearchLimits::unlimited())
-                .expect("cloned value search succeeds"),
+            regex
+                .find_value(haystack, SearchLimits::default())
+                .expect("compatibility value alias remains finite"),
             expected,
         );
+    }
+
+    #[test]
+    fn rust_style_ordinary_api_admits_plan_derived_scratch_above_finite_default() {
+        let regex = PortableBuilder::new(r"(?-u:(?:a?){100000})")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("large but construction-bounded K0 fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused fixture is forced through K0");
+        };
+        let stats = plan.automaton.stats();
+        let mandatory_layout = fre_automata::WorkspaceShape::new(
+            stats.states(),
+            stats.edges(),
+            stats.zero_width_edges(),
+        )
+        .expect("validated K0 stats form a workspace shape")
+        .workspace_layout()
+        .expect("validated K0 workspace layout is representable");
+        assert!(
+            mandatory_layout.logical_bytes() > SearchLimits::default().max_scratch_bytes,
+            "fixture must exceed the explicit finite API's default scratch quota",
+        );
+
+        assert!(
+            regex
+                .find_with_limits(b"", SearchLimits::default())
+                .is_err(),
+            "the explicit finite API retains its caller-selected scratch refusal",
+        );
+        assert_eq!(regex.find(b""), Some(Match { start: 0, end: 0 }));
+        assert!(regex.is_match(b""));
     }
 
     #[test]
@@ -22580,23 +22774,44 @@ mod tests {
     #[test]
     fn ordinary_k0_pool_consumes_immutable_mandatory_cut_proof() {
         let regex = forced_k0_with_only_mandatory_cut(r"(?-u:[ab]{2}Z)");
-        let limits = SearchLimits::unlimited();
         let mut storage = vec![b'x'; 4_096];
 
-        assert_eq!(regex.find_value(&storage, limits).unwrap(), None);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused fixture is forced through K0");
+        };
+        assert!(
+            matches!(
+                plan.pooled_value(
+                    K0PooledValueOperation::Exists,
+                    &storage,
+                    SearchWindow::full(&storage),
+                    SearchLimits::unlimited(),
+                    SearchSessionLimits {
+                        max_setup_work: 0,
+                        max_scratch_bytes: 0,
+                    },
+                    regex.report.minimum_match_bytes,
+                )
+                .unwrap(),
+                Some(K0PooledValue::Exists(false)),
+            ),
+            "the work-unlimited mandatory-cut negative proof must complete without workspace allocation"
+        );
+
+        assert_eq!(regex.find(&storage), None);
 
         storage[3_000..3_003].copy_from_slice(b"abZ");
         let expected = Some(Match {
             start: 3_000,
             end: 3_003,
         });
-        assert_eq!(regex.find_value(&storage, limits).unwrap(), expected);
-        assert!(regex.is_match_value(&storage, limits).unwrap());
+        assert_eq!(regex.find(&storage), expected);
+        assert!(regex.is_match(&storage));
 
         // The first mandatory byte can be a rejected decoy. Its floor may be
         // weaker but must never skip the later selected match.
         storage[100] = b'Z';
-        assert_eq!(regex.find_value(&storage, limits).unwrap(), expected);
+        assert_eq!(regex.find(&storage), expected);
     }
 
     fn forced_k0_with_only_mandatory_suffix(pattern: &str) -> PortableRegex {
@@ -23676,7 +23891,10 @@ mod tests {
             expected,
         );
         assert_eq!(
-            regex.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+            regex
+                .find_accounted(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
             expected,
         );
         let PortablePlan::K0(plan) = &regex.plan else {
@@ -27573,6 +27791,8 @@ mod tests {
             SearchLimits::unlimited(),
             expected,
         );
+        assert_eq!(regex.find(&haystack), expected);
+        assert!(regex.is_match(&haystack));
 
         let finite = SearchLimits {
             max_work: u64::MAX - 1,
@@ -33805,7 +34025,9 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        let (matched, accounting) = regex.find(b"zzab123x", SearchLimits::unlimited()).unwrap();
+        let (matched, accounting) = regex
+            .find_accounted(b"zzab123x", SearchLimits::unlimited())
+            .unwrap();
         let matched = matched.unwrap();
         assert_eq!((matched.start(), matched.end()), (2, 7));
         assert!(accounting.work_or_linear_terms() > 0);
@@ -34074,7 +34296,7 @@ mod tests {
                 .find(haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let actual = regex
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end()));
@@ -34204,7 +34426,7 @@ mod tests {
         // implementation, so this boundary is architecture-independent.
         let haystack = b"";
         let (_, search) = baseline
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap();
         let SearchAccounting::LiteralClassRunLiteral(search) = search else {
             panic!("finite two-barrier route returned another accounting family");
@@ -34212,7 +34434,7 @@ mod tests {
         let exact_work = u64::try_from(search.work).unwrap();
         assert!(
             baseline
-                .find(
+                .find_accounted(
                     haystack,
                     SearchLimits {
                         max_work: exact_work,
@@ -34222,7 +34444,7 @@ mod tests {
                 .is_ok()
         );
         assert!(matches!(
-            baseline.find(
+            baseline.find_accounted(
                 haystack,
                 SearchLimits {
                     max_work: exact_work - 1,
@@ -34312,7 +34534,7 @@ mod tests {
                 PortablePlan::BoundedLiteralClassRun(_)
             ));
             let (matched, accounting) = regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .unwrap();
             assert!(matched);
             let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
@@ -34323,7 +34545,7 @@ mod tests {
                 max_work: exact_work,
                 max_scratch_bytes: 0,
             };
-            assert!(regex.is_match(haystack, exact).unwrap().0);
+            assert!(regex.is_match_accounted(haystack, exact).unwrap().0);
             assert!(regex.is_match_value(haystack, exact).unwrap());
 
             let mut session = regex
@@ -34337,7 +34559,7 @@ mod tests {
                 max_scratch_bytes: 0,
             };
             assert_eq!(
-                regex.is_match(haystack, one_below).unwrap_err(),
+                regex.is_match_accounted(haystack, one_below).unwrap_err(),
                 regex.is_match_value(haystack, one_below).unwrap_err()
             );
             assert_eq!(
@@ -34369,14 +34591,14 @@ mod tests {
                 .find(haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let actual = regex
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(actual, expected, "haystack={haystack:?}");
             assert_eq!(
                 regex
-                    .is_match(haystack, SearchLimits::unlimited())
+                    .is_match_accounted(haystack, SearchLimits::unlimited())
                     .unwrap()
                     .0,
                 expected.is_some(),
@@ -34493,7 +34715,7 @@ mod tests {
         assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
         assert_eq!(regex.build_report().lowering, None);
         let (matched, accounting) = regex
-            .find(b"zzSherlock", SearchLimits::unlimited())
+            .find_accounted(b"zzSherlock", SearchLimits::unlimited())
             .unwrap();
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
@@ -34840,7 +35062,7 @@ mod tests {
             session.selected_end_value(haystack, refused),
             Err(expected.clone()),
         );
-        assert_eq!(regex.find(haystack, refused), Err(expected.clone()));
+        assert_eq!(regex.find_accounted(haystack, refused), Err(expected.clone()));
 
         for window in [
             SearchWindow::new(4, 3),
@@ -35091,7 +35313,7 @@ mod tests {
             .unwrap();
         let haystack = b"xxaceace";
         let (_, accounting) = regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .unwrap();
         let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
             panic!("fixed owner lost its search accounting")
@@ -35104,14 +35326,17 @@ mod tests {
             max_work: accounting.upper_bounds.work.checked_sub(1).unwrap(),
             max_scratch_bytes: 0,
         };
-        assert_eq!(session.find(haystack, exact), regex.find(haystack, exact));
+        assert_eq!(
+            session.find(haystack, exact),
+            regex.find_accounted(haystack, exact)
+        );
         assert_eq!(
             session.find_value(haystack, exact),
             regex.find_value(haystack, exact),
         );
         assert_eq!(
             session.is_match(haystack, one_below),
-            regex.is_match(haystack, one_below),
+            regex.is_match_accounted(haystack, one_below),
         );
         assert_eq!(
             session.is_match_value(haystack, one_below),
@@ -35127,7 +35352,7 @@ mod tests {
         );
         assert_eq!(
             session.find(haystack, one_below),
-            regex.find(haystack, one_below),
+            regex.find_accounted(haystack, one_below),
         );
         assert_eq!(
             session.find_value(haystack, one_below),
@@ -35204,7 +35429,7 @@ mod tests {
             );
         }
 
-        let expected_error = regex.find(haystack, one_below).unwrap_err();
+        let expected_error = regex.find_accounted(haystack, one_below).unwrap_err();
         let mut refused = session.find_iter(
             haystack,
             PortableFindIterRunLimits {
@@ -35272,13 +35497,17 @@ mod tests {
                 let expected = upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
-                let (actual, _) = fre.find(haystack, SearchLimits::unlimited()).unwrap();
+                let (actual, _) = fre
+                    .find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap();
                 assert_eq!(
                     actual.map(|matched| (matched.start(), matched.end())),
                     expected,
                     "pattern={pattern:?}, haystack={haystack:?}"
                 );
-                let (exists, _) = fre.is_match(haystack, SearchLimits::unlimited()).unwrap();
+                let (exists, _) = fre
+                    .is_match_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap();
                 let (end, _) = fre
                     .selected_end(haystack, SearchLimits::unlimited())
                     .unwrap();
@@ -35317,7 +35546,9 @@ mod tests {
                 let expected = upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
-                let (actual, accounting) = fre.find(haystack, SearchLimits::unlimited()).unwrap();
+                let (actual, accounting) = fre
+                    .find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap();
                 assert_eq!(
                     actual.map(|matched| (matched.start(), matched.end())),
                     expected,
@@ -35370,14 +35601,14 @@ mod tests {
         }
 
         let (_, SearchAccounting::GuardedLiteralSet(accounting)) = fre
-            .find(b"zz dog", SearchLimits::unlimited())
+            .find_accounted(b"zz dog", SearchLimits::unlimited())
             .unwrap()
         else {
             panic!("guarded route returned another accounting family");
         };
         let exact = u64::try_from(accounting.upper_bounds.total_work).unwrap();
         assert!(fre
-            .find(
+            .find_accounted(
                 b"zz dog",
                 SearchLimits {
                     max_work: exact,
@@ -35386,7 +35617,7 @@ mod tests {
             )
             .is_ok());
         assert!(matches!(
-            fre.find(
+            fre.find_accounted(
                 b"zz dog",
                 SearchLimits {
                     max_work: exact - 1,
@@ -36034,7 +36265,9 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(fre.build_report().plan, PlanKind::LiteralSetDfa);
-        let (matched, accounting) = fre.find(b"xxfoobaz", SearchLimits::unlimited()).unwrap();
+        let (matched, accounting) = fre
+            .find_accounted(b"xxfoobaz", SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
             Some((2, 8))
@@ -36057,7 +36290,9 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(fre.build_report().plan, PlanKind::FixedPredicateWord64);
-        let (matched, accounting) = fre.find(b"xxbcf", SearchLimits::unlimited()).unwrap();
+        let (matched, accounting) = fre
+            .find_accounted(b"xxbcf", SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
             Some((2, 5))
@@ -36084,7 +36319,7 @@ mod tests {
             .unwrap();
         assert_eq!(paired.build_report().plan, PlanKind::FixedPredicateWord64);
         let (matched, accounting) = paired
-            .find(b"xxbe", SearchLimits::unlimited())
+            .find_accounted(b"xxbe", SearchLimits::unlimited())
             .unwrap();
         assert_eq!(matched, Some(Match { start: 2, end: 4 }));
         let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
@@ -36197,7 +36432,7 @@ mod tests {
                 "pattern={pattern}"
             );
             let (matched, accounting) = fixed
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(matched, Some(Match { start: 2, end: 4 }));
             match accounting {
@@ -36230,7 +36465,9 @@ mod tests {
                 .unwrap();
             assert_eq!(k0.build_report().plan, PlanKind::K0, "pattern={pattern}");
             assert_eq!(
-                k0.find(haystack, SearchLimits::unlimited()).unwrap().0,
+                k0.find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
                 Some(Match { start: 2, end: 4 }),
                 "pattern={pattern}"
             );
@@ -37730,7 +37967,7 @@ mod tests {
             .expect("one-byte consuming-first nullable loop is normalized");
         assert_eq!(consuming_first.build_report().plan, PlanKind::K0);
         let (matched, _) = consuming_first
-            .find(b"aaab", SearchLimits::unlimited())
+            .find_accounted(b"aaab", SearchLimits::unlimited())
             .expect("normalized K0 search succeeds");
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
@@ -37905,7 +38142,7 @@ mod tests {
         );
         assert_eq!(
             singleton_run
-                .find(b"ababa", SearchLimits::unlimited())
+                .find_accounted(b"ababa", SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end())),
@@ -37977,13 +38214,15 @@ mod tests {
             ));
         }
 
-        let (_, search) = baseline.find(b"aaaaZ", SearchLimits::unlimited()).unwrap();
+        let (_, search) = baseline
+            .find_accounted(b"aaaaZ", SearchLimits::unlimited())
+            .unwrap();
         let SearchAccounting::RequiredLiteral(search) = search else {
             panic!("forced required-literal search changed plans")
         };
         assert!(
             baseline
-                .find(
+                .find_accounted(
                     b"aaaaZ",
                     SearchLimits {
                         max_work: search.work_upper_bound,
@@ -37993,7 +38232,7 @@ mod tests {
                 .is_ok()
         );
         assert!(matches!(
-            baseline.find(
+            baseline.find_accounted(
                 b"aaaaZ",
                 SearchLimits {
                     max_work: search.work_upper_bound - 1,
@@ -38187,7 +38426,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             regex
-                .find(&[9, 0x80, 0xFF, 0x7F, 0xFE], SearchLimits::unlimited())
+                .find_accounted(&[9, 0x80, 0xFF, 0x7F, 0xFE], SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end())),
@@ -38247,7 +38486,8 @@ mod tests {
                                 .find(haystack)
                                 .map(|matched| (matched.start(), matched.end()));
                             let (actual, accounting) =
-                                fre.find(haystack, SearchLimits::unlimited()).unwrap();
+                                fre.find_accounted(haystack, SearchLimits::unlimited())
+                                    .unwrap();
                             assert_eq!(accounting.plan(), PlanKind::RequiredLiteral);
                             assert_eq!(
                                 actual.map(|matched| (matched.start(), matched.end())),
@@ -38255,7 +38495,9 @@ mod tests {
                                 "pattern={pattern:?}, haystack={haystack:?}"
                             );
                             assert_eq!(
-                                fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                                fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                                    .unwrap()
+                                    .0,
                                 expected.is_some()
                             );
                             assert_eq!(
@@ -38333,7 +38575,7 @@ mod tests {
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
                 assert_eq!(
-                    fre.find(haystack, SearchLimits::unlimited())
+                    fre.find_accounted(haystack, SearchLimits::unlimited())
                         .unwrap()
                         .0
                         .map(|matched| (matched.start(), matched.end())),
@@ -38341,7 +38583,9 @@ mod tests {
                     "pattern={pattern:?} haystack={haystack:?}",
                 );
                 assert_eq!(
-                    fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                    fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
                     expected.is_some(),
                     "pattern={pattern:?} haystack={haystack:?}",
                 );
@@ -38556,7 +38800,7 @@ mod tests {
                             .find(haystack)
                             .map(|matched| (matched.start(), matched.end()));
                         assert_eq!(
-                            fre.find(haystack, SearchLimits::unlimited())
+                            fre.find_accounted(haystack, SearchLimits::unlimited())
                                 .unwrap()
                                 .0
                                 .map(|matched| (matched.start(), matched.end())),
@@ -38564,7 +38808,9 @@ mod tests {
                             "pattern={pattern:?} haystack={haystack:?}",
                         );
                         assert_eq!(
-                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
                             expected.is_some(),
                             "pattern={pattern:?} haystack={haystack:?}",
                         );
@@ -38733,7 +38979,7 @@ mod tests {
                             .find(haystack)
                             .map(|matched| (matched.start(), matched.end()));
                         let actual = fre
-                            .find(haystack, SearchLimits::unlimited())
+                            .find_accounted(haystack, SearchLimits::unlimited())
                             .unwrap()
                             .0
                             .map(|matched| (matched.start(), matched.end()));
@@ -38742,7 +38988,9 @@ mod tests {
                             "pattern={pattern:?} haystack={haystack:?}"
                         );
                         assert_eq!(
-                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
                             expected.is_some(),
                             "pattern={pattern:?} haystack={haystack:?}"
                         );
@@ -38821,7 +39069,7 @@ mod tests {
 
         assert_eq!(fre.build_report().plan, PlanKind::RequiredLiteral);
         assert_eq!(
-            fre.find(haystack, SearchLimits::unlimited())
+            fre.find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end())),
@@ -38924,7 +39172,7 @@ mod tests {
         assert!(forced.build_report().required_literal.is_none());
         assert_eq!(
             forced
-                .find(b"bbbaba", SearchLimits::unlimited())
+                .find_accounted(b"bbbaba", SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end())),
@@ -39069,14 +39317,14 @@ mod tests {
         assert_eq!(accounting.scratch_bytes, 0);
 
         let (_, search) = baseline
-            .find(b"alphabetZborderedaba", SearchLimits::unlimited())
+            .find_accounted(b"alphabetZborderedaba", SearchLimits::unlimited())
             .unwrap();
         let SearchAccounting::ForwardAnchored(search) = search else {
             panic!("forced forward plan changed identities")
         };
         assert!(
             baseline
-                .find(
+                .find_accounted(
                     b"alphabetZborderedaba",
                     SearchLimits {
                         max_work: search.work_upper_bound,
@@ -39086,7 +39334,7 @@ mod tests {
                 .is_ok()
         );
         assert!(matches!(
-            baseline.find(
+            baseline.find_accounted(
                 b"alphabetZborderedaba",
                 SearchLimits {
                     max_work: search.work_upper_bound - 1,
@@ -39276,7 +39524,9 @@ mod tests {
             let expected = upstream
                 .find(&haystack)
                 .map(|matched| (matched.start(), matched.end()));
-            let (actual, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+            let (actual, accounting) = regex
+                .find_accounted(&haystack, SearchLimits::unlimited())
+                .unwrap();
             assert_eq!(
                 actual.map(|matched| (matched.start(), matched.end())),
                 expected,
@@ -39350,7 +39600,7 @@ mod tests {
             let mut checksum = 0_usize;
             for iteration in 0..iterations {
                 let (matched, accounting) = black_box(regex)
-                    .find(black_box(haystack), SearchLimits::unlimited())
+                    .find_accounted(black_box(haystack), SearchLimits::unlimited())
                     .unwrap();
                 checksum ^= matched.map_or(0, |matched| matched.end().rotate_left(7))
                     ^ usize::try_from(accounting.work_or_linear_terms()).unwrap_or(usize::MAX)
@@ -39412,11 +39662,11 @@ mod tests {
         haystack.push(b'Z');
         assert_eq!(
             dispatched
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0,
             established
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
         );
@@ -39569,7 +39819,8 @@ mod tests {
                                 .find(haystack)
                                 .map(|matched| (matched.start(), matched.end()));
                             let (actual, accounting) =
-                                fre.find(haystack, SearchLimits::unlimited()).unwrap();
+                                fre.find_accounted(haystack, SearchLimits::unlimited())
+                                    .unwrap();
                             assert_eq!(accounting.plan(), PlanKind::ForwardAnchored);
                             assert_eq!(
                                 actual.map(|matched| (matched.start(), matched.end())),
@@ -39577,7 +39828,9 @@ mod tests {
                                 "pattern={pattern:?}, haystack={haystack:?}"
                             );
                             assert_eq!(
-                                fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                                fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                                    .unwrap()
+                                    .0,
                                 expected.is_some()
                             );
                             assert_eq!(
@@ -39660,7 +39913,7 @@ mod tests {
         let haystack = [0, 0x80, 0xFF, 0x7F, 0xFE];
         assert_eq!(
             forward
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end())),
@@ -39686,9 +39939,12 @@ mod tests {
             b"abcQ".as_slice(),
             b"abcZZ".as_slice(),
         ] {
-            let forward_match = forward.find(haystack, SearchLimits::unlimited()).unwrap().0;
+            let forward_match = forward
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0;
             let required_match = required
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0;
             assert_eq!(forward_match, required_match, "haystack={haystack:?}");
@@ -39816,7 +40072,7 @@ mod tests {
         let mut haystack = vec![b'x'; 96];
         haystack.extend_from_slice("ΑΒΓΔΕΖyαβ".as_bytes());
         let (matched, accounting) = regex
-            .find(&haystack, SearchLimits::unlimited())
+            .find_accounted(&haystack, SearchLimits::unlimited())
             .unwrap();
         assert_eq!(matched.map(|matched| matched.range()), Some(96..108));
         let SearchAccounting::UnicodeScalarRun(accounting) = accounting else {
@@ -39842,7 +40098,7 @@ mod tests {
             max_scratch_bytes: usize::MAX,
         };
         assert!(matches!(
-            regex.find(&haystack, refused),
+            regex.find_accounted(&haystack, refused),
             Err(SearchError::UnicodeScalarRun(
                 fre_kernels::UnicodeScalarSearchError::WorkLimit { .. }
             ))

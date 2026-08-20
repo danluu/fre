@@ -304,7 +304,7 @@ fn selected_greedy_end_shortest_end_and_nonoverlap_match_pinned_bytes() {
             "{pattern:?}"
         );
         assert_eq!(
-            fre.find(haystack, SearchLimits::unlimited())
+            fre.find_accounted(haystack, SearchLimits::unlimited())
                 .expect("selected search")
                 .0
                 .map(Match::end),
@@ -376,7 +376,7 @@ fn bounded_mixed_runs_stop_after_lookahead_and_iterate_in_linear_work() {
     for length in [4_096_usize, 8_192] {
         let haystack = alternating(length);
         let (matched, accounting) = fre
-            .find(&haystack, SearchLimits::unlimited())
+            .find_accounted(&haystack, SearchLimits::unlimited())
             .expect("bounded-lookahead find");
         assert_eq!(
             matched.map(|span| (span.start(), span.end())),
@@ -436,7 +436,7 @@ fn selected_ascii_word_long_absent_sparse_and_short_dense_match_without_extra_wo
         .unwrap();
     let absent = vec![b'-'; length];
     let (matched, accounting) = fre
-        .find(&absent, SearchLimits::unlimited())
+        .find_accounted(&absent, SearchLimits::unlimited())
         .expect("long absent selected-word scan");
     assert_eq!(matched, None);
     assert_eq!(
@@ -461,7 +461,7 @@ fn selected_ascii_word_long_absent_sparse_and_short_dense_match_without_extra_wo
         .find(&sparse)
         .map(|matched| (matched.start(), matched.end()));
     let (actual, _) = fre
-        .find(&sparse, SearchLimits::unlimited())
+        .find_accounted(&sparse, SearchLimits::unlimited())
         .expect("long sparse selected-word scan");
     assert_eq!(
         actual.map(|matched| (matched.start(), matched.end())),
@@ -588,23 +588,23 @@ fn planner_storage_clone_and_search_limits_are_exactly_enforced() {
     let haystack = " -- ΑΒΓ-ДЕЖ ABC_X -- ".as_bytes();
     assert_eq!(
         cloned
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("clone search"),
         baseline
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("source search")
     );
 
     let (_, accounting) = baseline
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("work probe");
     let exact_work = SearchLimits {
         max_work: accounting.work_or_linear_terms(),
         max_scratch_bytes: 0,
     };
-    assert!(baseline.find(haystack, exact_work).is_ok());
+    assert!(baseline.find_accounted(haystack, exact_work).is_ok());
     assert!(matches!(
-        baseline.find(
+        baseline.find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact_work.max_work - 1,

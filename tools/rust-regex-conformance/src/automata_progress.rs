@@ -1647,9 +1647,7 @@ fn fre_earliest_match(
     for (pattern_id, pattern) in patterns.iter().enumerate() {
         let matched = PortableRegex::new(*pattern)
             .map_err(|error| format!("fre-build-pattern-{pattern_id}:{error}"))?
-            .find(haystack, SearchLimits::unlimited())
-            .map_err(|error| format!("fre-search-pattern-{pattern_id}:{error}"))?
-            .0;
+            .find(haystack);
         let Some(matched) = matched else {
             continue;
         };
@@ -1913,9 +1911,7 @@ fn run_match_len(
     for (pattern_id, pattern) in patterns.iter().enumerate() {
         let matched = PortableRegex::new(*pattern)
             .map_err(|error| format!("fre-match-len-build-{pattern_id}:{error}"))?
-            .find(haystack, SearchLimits::unlimited())
-            .map_err(|error| format!("fre-match-len-search-{pattern_id}:{error}"))?
-            .0;
+            .find(haystack);
         if let Some(matched) = matched.filter(|matched| matched.end() == haystack.len()) {
             fre_matches.push((matched.start(), pattern_id));
         }
@@ -2001,9 +1997,7 @@ fn run_try_search_overlapping_fwd(
     for (pattern_id, pattern) in patterns.iter().enumerate() {
         let matched = PortableRegex::new(*pattern)
             .map_err(|error| format!("fre-overlap-build-{pattern_id}:{error}"))?
-            .find(haystack, SearchLimits::unlimited())
-            .map_err(|error| format!("fre-overlap-search-{pattern_id}:{error}"))?
-            .0;
+            .find(haystack);
         if let Some(matched) = matched.filter(|matched| matched.end() == haystack.len()) {
             fre_matches.push((pattern_id, matched.start(), matched.end()));
         }
@@ -2036,9 +2030,7 @@ fn run_try_search_fwd(
         .map_err(|error| format!("upstream-search-first:{error}"))?;
     let fre_first = PortableRegex::new("foo[0-9]+")
         .map_err(|error| format!("fre-build-first:{error}"))?
-        .find(b"foo12345", SearchLimits::unlimited())
-        .map_err(|error| format!("fre-search-first:{error}"))?
-        .0;
+        .find(b"foo12345");
 
     let upstream_second = dense::DFA::new("abc|a")
         .map_err(|error| format!("upstream-build-second:{error}"))?
@@ -2046,9 +2038,7 @@ fn run_try_search_fwd(
         .map_err(|error| format!("upstream-search-second:{error}"))?;
     let fre_second = PortableRegex::new("abc|a")
         .map_err(|error| format!("fre-build-second:{error}"))?
-        .find(b"abc", SearchLimits::unlimited())
-        .map_err(|error| format!("fre-search-second:{error}"))?
-        .0;
+        .find(b"abc");
 
     Ok(vec![
         RegexAutomataAssertionExecution {
@@ -2078,13 +2068,7 @@ fn run_try_search_fwd_bounds(
     let upstream_subslice = upstream
         .try_search_fwd(&Input::new(&haystack[vector.range_start..vector.range_end]))
         .map_err(|error| format!("upstream-bounds-subslice:{error}"))?;
-    let fre_subslice = fre
-        .find(
-            &haystack[vector.range_start..vector.range_end],
-            SearchLimits::unlimited(),
-        )
-        .map_err(|error| format!("fre-bounds-subslice:{error}"))?
-        .0;
+    let fre_subslice = fre.find(&haystack[vector.range_start..vector.range_end]);
 
     let upstream_context = upstream
         .try_search_fwd(&Input::new(haystack).range(vector.range_start..vector.range_end))

@@ -151,7 +151,7 @@ fn sixty_four_stages_search_through_the_high_mask_bit() {
     let haystack = format!("{}tail", "a".repeat(64));
     let regex = build_auto(&pattern);
     let (matched, accounting) = regex
-        .find(haystack.as_bytes(), SearchLimits::unlimited())
+        .find_accounted(haystack.as_bytes(), SearchLimits::unlimited())
         .unwrap();
     assert_eq!(span(matched), Some((0, haystack.len())));
     assert!(matches!(
@@ -175,8 +175,13 @@ fn overlapping_tail_head_declines_to_the_existing_fallback() {
     let fallback = build_k0(pattern);
     assert_ne!(auto.runtime_implementation_id(), NULLABLE_OPTIONAL_CHAIN_PLAN_ID);
     assert_eq!(
-        span(auto.find(haystack, SearchLimits::unlimited()).unwrap().0),
-        span(fallback.find(haystack, SearchLimits::unlimited()).unwrap().0)
+        span(auto.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
+        span(
+            fallback
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+        )
     );
     assert_eq!(
         auto.shortest_match(haystack, SearchLimits::unlimited()).unwrap().0,
@@ -234,7 +239,9 @@ fn bounded_windows_and_selected_end_match_the_pinned_priority() {
 fn span_work_limit_accepts_the_exact_bound_and_rejects_one_below() {
     let regex = build_auto(r"(?-u:[ab]{0,3}?[ab]{0,2}zaz)");
     let haystack = b"xxabzazyyabzaz";
-    let (_, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = regex
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::NullableOptionalChain(accounting) = accounting else {
         panic!("expected nullable optional-chain accounting");
     };
@@ -242,14 +249,14 @@ fn span_work_limit_accepts_the_exact_bound_and_rejects_one_below() {
         max_work: accounting.work_upper_bound,
         max_scratch_bytes: 0,
     };
-    assert!(regex.find(haystack, exact).is_ok());
+    assert!(regex.find_accounted(haystack, exact).is_ok());
     assert!(regex.selected_end(haystack, exact).is_ok());
     let below = SearchLimits {
         max_work: accounting.work_upper_bound.checked_sub(1).unwrap(),
         max_scratch_bytes: 0,
     };
     assert!(matches!(
-        regex.find(haystack, below),
+        regex.find_accounted(haystack, below),
         Err(SearchError::NullableOptionalChain(
             NullableOptionalChainSearchError::WorkLimit { needed, limit }
         )) if needed == accounting.work_upper_bound && limit == below.max_work
@@ -401,7 +408,9 @@ fn text_facade_does_not_select_the_byte_optional_chain_route() {
         .unicode(false)
         .build()
         .unwrap();
-    let (_, accounting) = text.find("abcdtail", SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = text
+        .find_accounted("abcdtail", SearchLimits::unlimited())
+        .unwrap();
     assert!(!matches!(
         accounting,
         SearchAccounting::NullableOptionalChain(_)

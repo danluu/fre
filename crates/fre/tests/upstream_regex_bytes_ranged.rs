@@ -42,13 +42,13 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
         Some(0..4)
     );
     assert!(
-        fre.is_match(sliced, SearchLimits::unlimited())
+        fre.is_match_accounted(sliced, SearchLimits::unlimited())
             .expect("sliced existence search")
             .0
     );
     assert_eq!(
         span(
-            fre.find(sliced, SearchLimits::unlimited())
+            fre.find_accounted(sliced, SearchLimits::unlimited())
                 .expect("sliced span search")
                 .0
         ),
@@ -282,7 +282,9 @@ fn value_only_existence_preserves_plan_resource_refusals() {
     };
 
     for (fre, _, expected_plan) in ranged_cases() {
-        let reporting = fre.is_match(haystack, limits).map(|(matched, _)| matched);
+        let reporting = fre
+            .is_match_accounted(haystack, limits)
+            .map(|(matched, _)| matched);
         let value_only = fre.is_match_value(haystack, limits);
         assert_eq!(value_only, reporting, "cold {expected_plan:?}");
 

@@ -24,24 +24,23 @@ use fre::{
     AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
     BOUNDED_AFFIX_PLAN_ID,
 };
-use fre::{PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile};
+use fre::{PlanKind, SimdDispatchContext, simd_dispatch_profile};
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, CurrentFreRegexReduxStageReceipt,
-    REPORT_SCHEMA, current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreRegexReduxStageReceipt, REPORT_SCHEMA,
+    current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_complete_spans_regex_for_haystack, current_fre_rebar_grep_session,
+    current_fre_rebar_complete_spans_regex_for_haystack, current_fre_rebar_ordinary_grep,
     current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
-    current_fre_rebar_search_limits,
 };
 #[cfg(test)]
 use rebar_compare::{
     CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
-    CurrentFreAggregateOperationLifecycle, CurrentFreRegexReduxLifecycle, InputReceipt,
-    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
+    CurrentFreAggregateOperationLifecycle, CurrentFreGrepSession, CurrentFreRegexReduxLifecycle,
+    InputReceipt, current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
     current_fre_rebar_aggregate_many_run_limits,
-    current_fre_rebar_aggregate_many_streaming_run_limits,
-    current_fre_rebar_complete_spans_regex,
-    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_aggregate_many_streaming_run_limits, current_fre_rebar_complete_spans_regex,
+    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
+    current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     current_fre_validate_generic_span_sum_identity,
     performance_contract::{
@@ -110,10 +109,11 @@ fn print_version() -> Result<(), DynError> {
     let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
     let simd_capabilities = SimdDispatchContext::capture().capabilities();
     println!(
-        "{RUNNER_SCHEMA} protocol=stratified-v1 executor-protocol=anonymous-workload-v2 process-isolation=external-required adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=evidence-only facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+        "{RUNNER_SCHEMA} protocol=stratified-v1 executor-protocol=anonymous-workload-v2 process-isolation=external-required adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=evidence-only grep-api=portable-regex-ordinary-is-match-v1 finite-grep-plan={} facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
         current_fre_adapter_id(),
         fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
         fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+        rebar_compare::CURRENT_FRE_REBAR_FINITE_GREP_PLAN,
         env!("CARGO_PKG_VERSION"),
         simd_dispatch_profile().name(),
         simd_capabilities.architecture(),
@@ -1188,19 +1188,13 @@ fn execute_anonymous_grep(request: &ExecutorRequest) -> Result<ExecutorResponse,
     .build()?;
     let runtime = regex.runtime_implementation_id().to_string();
     require_grep_runtime_plan(&runtime, regex.build_report().plan)?;
-    let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())?;
-    let limits = current_fre_rebar_search_limits();
     let primed = if request.expected_priming_operations()? == 1 {
-        Some(execute_grep_session(
-            &mut session,
-            &benchmark.haystack,
-            limits,
-        )?)
+        Some(current_fre_rebar_ordinary_grep(&regex, &benchmark.haystack))
     } else {
         None
     };
     let start = Instant::now();
-    let actual = execute_grep_session(&mut session, &benchmark.haystack, limits)?;
+    let actual = current_fre_rebar_ordinary_grep(&regex, &benchmark.haystack);
     executor_response(
         request,
         rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN.to_string(),
@@ -1401,9 +1395,9 @@ fn model_performance_raw(
         "grep" => model_grep_performance_raw_with_measurement(
             benchmark,
             expectations,
-            |session, haystack, limits| {
+            |regex, haystack| {
                 let start = Instant::now();
-                let actual = execute_grep_session(session, haystack, limits)?;
+                let actual = current_fre_rebar_ordinary_grep(regex, haystack);
                 Ok((start.elapsed(), actual))
             },
         ),
@@ -1573,11 +1567,7 @@ fn model_grep_performance_raw_with_measurement<F>(
     measure: F,
 ) -> Result<PerformanceRawObservation, DynError>
 where
-    F: FnOnce(
-        &mut CurrentFreGrepSession<'_>,
-        &[u8],
-        SearchLimits,
-    ) -> Result<(Duration, u64), CompareError>,
+    F: FnOnce(&PortableRegex, &[u8]) -> Result<(Duration, u64), CompareError>,
 {
     let mut identity = performance_candidate_identity(benchmark, expectations)?;
     validate_performance_candidate_observation_request(&identity)?;
@@ -1588,7 +1578,7 @@ where
         benchmark.case_insensitive,
     )?
     .build()
-    .map_err(|error| CompareError::new(format!("FRE grep lifecycle build: {error}")))?;
+    .map_err(|error| CompareError::new(format!("FRE ordinary grep matcher build: {error}")))?;
     require_performance_plan(&expected_plan, rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN)?;
     let selected_runtime = regex.runtime_implementation_id().to_string();
     if let Some(expected_runtime) = expectations.runtime.as_deref() {
@@ -1596,31 +1586,24 @@ where
     }
     require_grep_runtime_plan(&selected_runtime, regex.build_report().plan)?;
     identity.candidate_runtime = Some(selected_runtime.clone());
-    let limits = current_fre_rebar_search_limits();
-    let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())?;
-    require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
         let primed = if steady {
-            Some(execute_grep_session(
-                &mut session,
-                &benchmark.haystack,
-                limits,
-            )?)
+            Some(current_fre_rebar_ordinary_grep(&regex, &benchmark.haystack))
         } else {
             None
         };
-        let (elapsed, actual) = measure(&mut session, &benchmark.haystack, limits)?;
-        require_matching_prime("grep lifecycle", primed, actual)?;
+        let (elapsed, actual) = measure(&regex, &benchmark.haystack)?;
+        require_matching_prime("ordinary grep lifecycle", primed, actual)?;
         Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
 
-fn execute_grep_session(
+#[cfg(test)]
+fn execute_finite_grep_session(
     session: &mut CurrentFreGrepSession<'_>,
     haystack: &[u8],
-    _limits: SearchLimits,
 ) -> Result<u64, CompareError> {
     session.execute(haystack)
 }
@@ -1812,11 +1795,9 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     )?;
     require_grep_runtime_plan(regex.runtime_implementation_id(), regex.build_report().plan)?;
     let haystack = benchmark.haystack.as_slice();
-    let limits = current_fre_rebar_search_limits();
-    let mut session = current_fre_rebar_grep_session(&regex, haystack.len())?;
     run(
         benchmark,
-        || execute_grep_session(&mut session, haystack, limits).map_err(Into::into),
+        || Ok(current_fre_rebar_ordinary_grep(&regex, haystack)),
         Ok,
     )
 }
@@ -3133,7 +3114,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_raw_mode_binds_runtime_and_reuses_one_session_for_steady_operation() {
+    fn grep_raw_mode_binds_runtime_and_reuses_automatic_scratch_for_steady_operation() {
         let benchmark = Benchmark {
             name: "grep/long-words-unicode".to_string(),
             model: "grep".to_string(),
@@ -3155,10 +3136,10 @@ mod tests {
         let first = model_grep_performance_raw_with_measurement(
             &benchmark,
             &first_expectations,
-            |session, haystack, limits| {
+            |regex, haystack| {
                 Ok((
                     Duration::from_nanos(53),
-                    execute_grep_session(session, haystack, limits)?,
+                    current_fre_rebar_ordinary_grep(regex, haystack),
                 ))
             },
         )
@@ -3180,11 +3161,11 @@ mod tests {
         let steady = model_grep_performance_raw_with_measurement(
             &benchmark,
             &steady_expectations,
-            |session, haystack, limits| {
+            |regex, haystack| {
                 measured.set(measured.get() + 1);
                 Ok((
                     Duration::from_nanos(59),
-                    execute_grep_session(session, haystack, limits)?,
+                    current_fre_rebar_ordinary_grep(regex, haystack),
                 ))
             },
         )
@@ -3202,10 +3183,10 @@ mod tests {
         let derived = model_grep_performance_raw_with_measurement(
             &benchmark,
             &derived_runtime,
-            |session, haystack, limits| {
+            |regex, haystack| {
                 Ok((
                     Duration::from_nanos(61),
-                    execute_grep_session(session, haystack, limits)?,
+                    current_fre_rebar_ordinary_grep(regex, haystack),
                 ))
             },
         )
@@ -3223,12 +3204,9 @@ mod tests {
         let error = model_grep_performance_raw_with_measurement(
             &malformed_pattern,
             &malformed_metadata,
-            |session, haystack, limits| {
+            |_regex, _haystack| {
                 ran.set(true);
-                Ok((
-                    Duration::from_nanos(1),
-                    execute_grep_session(session, haystack, limits)?,
-                ))
+                Ok((Duration::from_nanos(1), 0))
             },
         )
         .expect_err("malformed identity fails before constructing an invalid pattern");
@@ -3246,12 +3224,9 @@ mod tests {
             model_grep_performance_raw_with_measurement(
                 &benchmark,
                 &wrong_runtime,
-                |session, haystack, limits| {
+                |_regex, _haystack| {
                     ran.set(true);
-                    Ok((
-                        Duration::from_nanos(1),
-                        execute_grep_session(session, haystack, limits)?,
-                    ))
+                    Ok((Duration::from_nanos(1), 0))
                 },
             )
             .is_err()
@@ -3260,34 +3235,15 @@ mod tests {
     }
 
     #[test]
-    fn grep_runner_selects_the_reviewed_route_for_each_runtime() {
-        let limits = current_fre_rebar_search_limits();
-
+    fn ordinary_grep_runner_uses_public_is_match_for_each_runtime() {
         let literal = PortableRegex::new("ab").expect("exact literal");
         let literal_source = b"xxab\r\nmiss\nab";
-        let mut literal_session = current_fre_rebar_grep_session(&literal, literal_source.len())
-            .expect("whole-input literal session");
-        assert!(!literal_session.has_reusable_k0_workspace());
-        assert!(!literal_session.has_required_literal_prefilter());
-        assert_eq!(
-            execute_grep_session(&mut literal_session, literal_source, limits)
-                .expect("whole-input literal count"),
-            2
-        );
-        assert!(literal_session.has_reusable_k0_workspace());
+        assert_eq!(current_fre_rebar_ordinary_grep(&literal, literal_source), 2);
 
         let k0 = PortableRegex::new("a.*b").expect("K0 regex");
         assert_eq!(k0.build_report().plan, PlanKind::K0);
         let k0_source = b"axb\r\nmiss\nab";
-        let mut k0_session = current_fre_rebar_grep_session(&k0, k0_source.len())
-            .expect("retained per-line K0 search session");
-        assert!(!k0_session.has_reusable_k0_workspace());
-        assert!(!k0_session.has_required_literal_prefilter());
-        assert_eq!(
-            execute_grep_session(&mut k0_session, k0_source, limits).expect("per-line K0 count"),
-            2
-        );
-        assert!(k0_session.has_reusable_k0_workspace());
+        assert_eq!(current_fre_rebar_ordinary_grep(&k0, k0_source), 2);
 
         let finite = PortableRegex::new("a|ab").expect("finite language");
         assert!(matches!(
@@ -3295,15 +3251,24 @@ mod tests {
             PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
         ));
         let finite_source = b"ab\nmiss\na";
-        let mut fallback = current_fre_rebar_grep_session(&finite, finite_source.len())
-            .expect("pre-source fallback session");
-        assert!(!fallback.has_reusable_k0_workspace());
-        assert!(!fallback.has_required_literal_prefilter());
+        assert_eq!(current_fre_rebar_ordinary_grep(&finite, finite_source), 2);
+    }
+
+    #[test]
+    fn finite_grep_session_keeps_a_separate_robustness_identity() {
+        let regex = PortableRegex::new("a.*b").expect("K0 regex");
+        let source = b"axb\r\nmiss\nab";
+        let mut session = current_fre_rebar_grep_session(&regex, source.len())
+            .expect("finite per-line K0 search session");
         assert_eq!(
-            execute_grep_session(&mut fallback, finite_source, limits).expect("fallback count"),
+            session.plan(),
+            rebar_compare::CURRENT_FRE_REBAR_FINITE_GREP_PLAN
+        );
+        assert_ne!(session.plan(), rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN);
+        assert_eq!(
+            execute_finite_grep_session(&mut session, source).expect("finite grep count"),
             2
         );
-        assert!(fallback.has_reusable_k0_workspace());
     }
 
     struct ExactGrepPointCase {
@@ -3397,7 +3362,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires FRE_REBAR_BIN and FRE_REBAR_BENCH_DIR for the pinned expanded checkout"]
-    fn exact_14_grep_points_use_one_reusable_k0_search_session_without_a_clock() {
+    fn exact_14_grep_points_use_ordinary_api_with_automatic_scratch_without_a_clock() {
         let mut point_ids = BTreeSet::new();
         for case in EXACT_GREP_POINT_CASES {
             assert!(point_ids.insert(case.first_point));
@@ -3420,29 +3385,17 @@ mod tests {
             .expect("portable regex");
             assert_eq!(regex.build_report().plan, PlanKind::K0);
             assert_eq!(regex.runtime_implementation_id(), "k0");
-            let limits = current_fre_rebar_search_limits();
-            let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())
-                .expect("retained per-line K0 search session");
-            assert!(session.has_reusable_k0_workspace());
-
             let repeated = benchmark
                 .haystack
                 .lines()
-                .map(|line| {
-                    regex
-                        .is_match(line, limits)
-                        .expect("current per-line reference")
-                        .0
-                })
+                .map(|line| regex.is_match(line))
                 .filter(|matched| *matched)
                 .count();
             assert_eq!(u64::try_from(repeated).expect("line count"), case.expected);
 
-            let first = execute_grep_session(&mut session, &benchmark.haystack, limits)
-                .expect("first public operation");
+            let first = current_fre_rebar_ordinary_grep(&regex, &benchmark.haystack);
             assert_eq!(first, case.expected, "first point {}", case.first_point);
-            let steady = execute_grep_session(&mut session, &benchmark.haystack, limits)
-                .expect("steady public operation");
+            let steady = current_fre_rebar_ordinary_grep(&regex, &benchmark.haystack);
             assert_eq!(steady, case.expected, "steady point {}", case.steady_point);
         }
         assert_eq!(point_ids.len(), 14);

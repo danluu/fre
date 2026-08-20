@@ -6023,7 +6023,9 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
 
     let portable = portable_builder("foo").unicode(false).build().unwrap();
     assert_eq!(portable.build_report().plan, PlanKind::ExactLiteral);
-    let (matched, _) = portable.find(b"xxfoo", SearchLimits::default()).unwrap();
+    let (matched, _) = portable
+        .find_accounted(b"xxfoo", SearchLimits::default())
+        .unwrap();
     let matched = matched.unwrap();
     assert_eq!((matched.start(), matched.end()), (2, 5));
 }

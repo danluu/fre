@@ -38,7 +38,7 @@ fn pinned_shortest_examples_distinguish_earliest_accept_and_context() {
     );
     assert_eq!(
         greedy
-            .find(b"aaaaa", SearchLimits::unlimited())
+            .find_accounted(b"aaaaa", SearchLimits::unlimited())
             .expect("selected greedy span")
             .0
             .map(fre::Match::end),

@@ -28,10 +28,10 @@ fn root_finite_literals_keep_native_precedence_but_embedded_literals_share_k0() 
     assert_eq!((embedded_report.states, embedded_report.edges), (7, 9));
 
     let (root_match, root_search) = root
-        .find(b"xxbazbarfoo!", SearchLimits::unlimited())
+        .find_accounted(b"xxbazbarfoo!", SearchLimits::unlimited())
         .expect("root finite search");
     let (embedded_match, embedded_search) = embedded
-        .find(b"xxbazbarfoo!", SearchLimits::unlimited())
+        .find_accounted(b"xxbazbarfoo!", SearchLimits::unlimited())
         .expect("embedded K0 search");
     assert_eq!(
         root_match.map(|matched| (matched.start(), matched.end())),

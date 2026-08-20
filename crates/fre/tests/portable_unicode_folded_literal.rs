@@ -136,14 +136,16 @@ fn ordered_alternation_priority_and_shortest_end_match_regex_bytes() {
             .map(|matched| (matched.start(), matched.end()));
         let expected_shortest = expected.shortest_match(haystack);
         let (automatic_find, accounting) =
-            automatic.find(haystack, SearchLimits::unlimited()).unwrap();
+            automatic
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap();
         assert_eq!(span(automatic_find), expected_find, "{pattern}");
         assert!(matches!(
             accounting,
             SearchAccounting::UnicodeFoldedLiteral(_)
         ));
         let (exists, exists_accounting) = automatic
-            .is_match(haystack, SearchLimits::unlimited())
+            .is_match_accounted(haystack, SearchLimits::unlimited())
             .unwrap();
         assert!(exists);
         let SearchAccounting::UnicodeFoldedLiteral(exists_actual) = exists_accounting else {
@@ -151,7 +153,12 @@ fn ordered_alternation_priority_and_shortest_end_match_regex_bytes() {
         };
         assert_eq!(exists_actual.candidate_events, 1);
         assert_eq!(
-            span(forced.find(haystack, SearchLimits::unlimited()).unwrap().0),
+            span(
+                forced
+                    .find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+            ),
             expected_find,
             "forced K0 {pattern}"
         );
@@ -166,12 +173,12 @@ fn ordered_alternation_priority_and_shortest_end_match_regex_bytes() {
     }
 
     let long = auto_regex(LONG_FIRST)
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .unwrap()
         .0
         .unwrap();
     let short = auto_regex(SHORT_FIRST)
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .unwrap()
         .0
         .unwrap();
@@ -186,7 +193,7 @@ fn ordered_alternation_priority_and_shortest_end_match_regex_bytes() {
     assert_eq!(
         span(
             duplicates
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
         ),
@@ -197,7 +204,7 @@ fn ordered_alternation_priority_and_shortest_end_match_regex_bytes() {
     assert_eq!(
         span(
             forced_k0(DUPLICATE_PREFIX)
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
         ),
@@ -321,7 +328,9 @@ fn early_stop_actuals_exclude_later_candidates_and_limits_preflight() {
         .unwrap()
         .expect("folded plan publishes a source-independent envelope");
 
-    let (matched, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (matched, accounting) = regex
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(span(matched), Some((0, RUSSIAN.len())));
     let charged_work = accounting.work_or_linear_terms();
     let SearchAccounting::UnicodeFoldedLiteral(actual) = accounting else {
@@ -337,7 +346,7 @@ fn early_stop_actuals_exclude_later_candidates_and_limits_preflight() {
         max_work: u64::try_from(upper.work - 1).unwrap(),
         max_scratch_bytes: usize::MAX,
     };
-    let error = regex.find(&haystack, below).unwrap_err();
+    let error = regex.find_accounted(&haystack, below).unwrap_err();
     let SearchError::UnicodeFoldedLiteral(error) = error else {
         panic!("work refusal lost folded search identity");
     };
@@ -355,7 +364,9 @@ fn repeated_portable_folded_search_and_iteration_allocate_nothing() {
     let regex = auto_regex(RUSSIAN);
     let haystack = "ШЕРЛОК ХОЛМС; шерлок холмс".as_bytes();
     let region = Region::new(GLOBAL);
-    let (first, first_accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (first, first_accounting) = regex
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(span(first), Some((0, RUSSIAN.len())));
     for _ in 0..32 {
         assert!(
@@ -363,7 +374,9 @@ fn repeated_portable_folded_search_and_iteration_allocate_nothing() {
                 .is_match_value(haystack, SearchLimits::unlimited())
                 .unwrap()
         );
-        let (found, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (found, accounting) = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(span(found), span(first));
         assert_eq!(accounting, first_accounting);
         let mut matches = regex

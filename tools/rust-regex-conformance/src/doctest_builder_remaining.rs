@@ -3,7 +3,7 @@
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureSearchLimits, PortableBuilder,
     PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuilder,
-    PortableTextCaptureBuilder, PortableTextRegexSetBuilder, RustProfile, SearchLimits,
+    PortableTextCaptureBuilder, PortableTextRegexSetBuilder, RustProfile,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -321,9 +321,7 @@ fn byte_unicode_dot(set: bool) -> Result<String, BuilderRefusal> {
             .unicode(false)
             .build()
             .map_err(|_| BuilderRefusal::Unsupported("doctest.builder-build-refused"))?
-            .is_match(b"\xFF", SearchLimits::unlimited())
-            .map_err(|_| BuilderRefusal::Unsupported("doctest.builder-search-refused"))?
-            .0
+            .is_match(b"\xFF")
     };
     Ok(matched.to_string())
 }

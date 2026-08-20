@@ -334,21 +334,14 @@ fn time_search(
     let mut checksum = 0_u64;
     for iteration in 0..iterations {
         let value = match operation {
-            Operation::Exists => u64::from(
-                regex
-                    .is_match(black_box(&fixture.haystack), SearchLimits::unlimited())
-                    .map_err(|error| error.to_string())?
-                    .0,
-            ),
+            Operation::Exists => u64::from(regex.is_match(black_box(&fixture.haystack))),
             Operation::End => regex
                 .selected_end(black_box(&fixture.haystack), SearchLimits::unlimited())
                 .map_err(|error| error.to_string())?
                 .0
                 .map_or(0, |end| u64::try_from(end).unwrap_or(u64::MAX)),
             Operation::Span => regex
-                .find(black_box(&fixture.haystack), SearchLimits::unlimited())
-                .map_err(|error| error.to_string())?
-                .0
+                .find(black_box(&fixture.haystack))
                 .map_or(0, |matched| {
                     u64::try_from(matched.start().wrapping_add(matched.end())).unwrap_or(u64::MAX)
                 }),

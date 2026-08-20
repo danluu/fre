@@ -500,12 +500,12 @@ fn invalid_configuration_precedence_and_option_order_match_upstream() {
             "upstream order/{haystack:?}"
         );
         let actual_first = fre_first
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("first FRE search")
             .0
             .map(fre::Match::range);
         let actual_second = fre_second
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("second FRE search")
             .0
             .map(fre::Match::range);

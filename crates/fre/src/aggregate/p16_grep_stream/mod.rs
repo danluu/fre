@@ -1571,7 +1571,7 @@ mod tests {
                 |(line_ordinal, (line_start, line_content_end, line_source_end))| {
                     let line = &source[line_start..line_content_end];
                     let (selected, _) = regex
-                        .find(line, SearchLimits::unlimited())
+                        .find_accounted(line, SearchLimits::unlimited())
                         .expect("repeated current-plan search");
                     selected.map(|selected| PortableGrepMatch {
                         line_ordinal,

@@ -547,10 +547,10 @@ fn fre_transition_result(haystack: &[u8]) -> Result<bool, InventoryError> {
         ));
     }
     let (cold_observed, cold_accounting) = regex
-        .is_match(haystack, SearchLimits::unlimited())
+        .is_match_accounted(haystack, SearchLimits::unlimited())
         .map_err(|error| InventoryError::new(format!("run FRE transition regex: {error}")))?;
     let (observed, accounting) = regex
-        .is_match(haystack, SearchLimits::unlimited())
+        .is_match_accounted(haystack, SearchLimits::unlimited())
         .map_err(|error| InventoryError::new(format!("warm FRE transition regex: {error}")))?;
     let (SearchAccounting::K0(cold_accounting), SearchAccounting::K0(accounting)) =
         (cold_accounting, accounting)
@@ -605,10 +605,10 @@ fn fre_transition_result(haystack: &[u8]) -> Result<bool, InventoryError> {
         max_scratch_bytes: scratch,
     };
     let exact = regex
-        .is_match(haystack, exact_limits)
+        .is_match_accounted(haystack, exact_limits)
         .map_err(|error| InventoryError::new(format!("exact FRE transition regex: {error}")))?;
     let repeated = regex
-        .is_match(haystack, exact_limits)
+        .is_match_accounted(haystack, exact_limits)
         .map_err(|error| InventoryError::new(format!("repeat FRE transition regex: {error}")))?;
     if exact != (observed, SearchAccounting::K0(accounting)) || repeated != exact {
         return Err(InventoryError::new(
@@ -619,7 +619,7 @@ fn fre_transition_result(haystack: &[u8]) -> Result<bool, InventoryError> {
         .checked_sub(1)
         .ok_or_else(|| InventoryError::new("FRE transition work underflow"))?;
     if !matches!(
-        regex.is_match(
+        regex.is_match_accounted(
             haystack,
             SearchLimits {
                 max_work: one_below_work,
@@ -642,7 +642,7 @@ fn fre_transition_result(haystack: &[u8]) -> Result<bool, InventoryError> {
         .checked_sub(1)
         .ok_or_else(|| InventoryError::new("FRE transition scratch underflow"))?;
     if !matches!(
-        regex.is_match(
+        regex.is_match_accounted(
             haystack,
             SearchLimits {
                 max_work: work,

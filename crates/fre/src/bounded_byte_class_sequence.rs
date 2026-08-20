@@ -1832,7 +1832,7 @@ mod tests {
 
         let haystack = b"................................ABCxyz!";
         let (matched, receipt) = regex
-            .find(haystack, SearchLimits::unlimited())
+            .find_accounted(haystack, SearchLimits::unlimited())
             .expect("one bounded range sequence should search");
         assert_eq!(span(matched), Some((32, 38)));
         let receipt = accounting(receipt);
@@ -2167,7 +2167,7 @@ mod tests {
             Some(3),
         );
         assert_eq!(
-            span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+            span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
             Some((0, 5)),
         );
 
@@ -2179,7 +2179,7 @@ mod tests {
         assert_eq!(
             span(
                 declined
-                    .find(b"aaaa", SearchLimits::unlimited())
+                    .find_accounted(b"aaaa", SearchLimits::unlimited())
                     .unwrap()
                     .0,
             ),
@@ -2192,7 +2192,7 @@ mod tests {
         let bridged = build("(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Bb])");
         assert_ne!(bridged.runtime_implementation_id(), PLAN_ID);
         assert_eq!(
-            span(bridged.find(b"ABB", SearchLimits::unlimited()).unwrap().0),
+            span(bridged.find_accounted(b"ABB", SearchLimits::unlimited()).unwrap().0),
             Some((0, 3)),
         );
 
@@ -2212,7 +2212,7 @@ mod tests {
         assert_eq!(
             span(
                 overlapping
-                    .find(b"aCCCC", SearchLimits::unlimited())
+                    .find_accounted(b"aCCCC", SearchLimits::unlimited())
                     .unwrap()
                     .0
             ),
@@ -2244,7 +2244,7 @@ mod tests {
         ] {
             let expected_start = usize::from(haystack.first() == Some(&b'!'));
             assert!(regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0);
             assert_eq!(
@@ -2265,7 +2265,7 @@ mod tests {
                 Some(greedy_end),
             );
             assert_eq!(
-                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 Some((expected_start, greedy_end)),
             );
             assert_eq!(
@@ -2285,7 +2285,7 @@ mod tests {
         assert_eq!(
             span(
                 partial
-                    .find(b"QCaaabx", SearchLimits::unlimited())
+                    .find_accounted(b"QCaaabx", SearchLimits::unlimited())
                     .unwrap()
                     .0,
             ),
@@ -2324,7 +2324,7 @@ mod tests {
             (&b"!QQBBBBy!"[..], 1, 4, 8),
         ] {
             assert!(regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0);
             assert_eq!(
@@ -2345,7 +2345,7 @@ mod tests {
                 Some(greedy_end),
             );
             assert_eq!(
-                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 Some((expected_start, greedy_end)),
             );
             assert_eq!(
@@ -2401,7 +2401,7 @@ mod tests {
                 Some(greedy_end),
             );
             assert_eq!(
-                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 Some((expected_start, greedy_end)),
             );
             assert_eq!(
@@ -2415,7 +2415,7 @@ mod tests {
         }
 
         assert!(!regex
-            .is_match(b"WWaaaad", SearchLimits::unlimited())
+            .is_match_accounted(b"WWaaaad", SearchLimits::unlimited())
             .unwrap()
             .0);
     }
@@ -2435,7 +2435,7 @@ mod tests {
         ]
         .concat();
         let (matched, receipt) = regex
-            .find(&haystack, SearchLimits::unlimited())
+            .find_accounted(&haystack, SearchLimits::unlimited())
             .expect("the dense-successor fallback should search");
         assert_eq!(span(matched), Some((9, 14)));
         let receipt = accounting(receipt);
@@ -2481,7 +2481,7 @@ mod tests {
         assert_eq!(plan.owner().tail_seek, Some(SetSeek::One(0x7a)));
 
         let (matched, measured) = regex
-            .find(&haystack, SearchLimits::unlimited())
+            .find_accounted(&haystack, SearchLimits::unlimited())
             .expect("the tail anchor should search");
         assert_eq!(span(matched), Some((4, 10)));
         let measured = accounting(measured);
@@ -2493,7 +2493,7 @@ mod tests {
             max_scratch_bytes: 0,
         };
         let (matched, exact) = regex
-            .find(&haystack, exact_search)
+            .find_accounted(&haystack, exact_search)
             .expect("the exact tail-anchor work limit should close");
         assert_eq!(span(matched), Some((4, 10)));
         assert_eq!(accounting(exact).actual_work, measured.actual_work);
@@ -2503,7 +2503,7 @@ mod tests {
             max_scratch_bytes: 0,
         };
         assert!(matches!(
-            regex.find(&haystack, one_below_search),
+            regex.find_accounted(&haystack, one_below_search),
             Err(FacadeSearchError::BoundedByteClassSequence(
                 Error::WorkLimit { limit, .. }
             )) if limit == measured.actual_work - 1
@@ -2579,14 +2579,14 @@ mod tests {
                 Some(shortest_end),
             );
             assert_eq!(
-                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 Some((0, greedy_end)),
             );
         }
 
         for haystack in [&b"AB"[..], &b"AAAAAB"[..], &b"!AAB"[..]] {
             assert!(!regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0);
             assert_eq!(
@@ -2657,7 +2657,7 @@ mod tests {
         assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
         let haystack = b"aaaaW";
         assert_eq!(
-            span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+            span(regex.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
             Some((1, 5)),
         );
     }
@@ -2669,7 +2669,7 @@ mod tests {
 
         let exists = accounting(
             regex
-                .is_match(haystack, SearchLimits::unlimited())
+                .is_match_accounted(haystack, SearchLimits::unlimited())
                 .unwrap()
                 .1,
         );
@@ -2688,11 +2688,16 @@ mod tests {
                 .1,
         );
         assert_eq!(selected.operation, Operation::SelectedEnd);
-        let found = accounting(regex.find(haystack, SearchLimits::unlimited()).unwrap().1);
+        let found = accounting(
+            regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .1,
+        );
         assert_eq!(found.operation, Operation::Span);
 
         let error = regex
-            .is_match(
+            .is_match_accounted(
                 haystack,
                 SearchLimits {
                     max_work: 0,
@@ -2717,7 +2722,7 @@ mod tests {
             haystack.extend_from_slice(b"xaax");
         }
         let (matched, measured) = regex
-            .find(&haystack, SearchLimits::unlimited())
+            .find_accounted(&haystack, SearchLimits::unlimited())
             .unwrap();
         assert!(matched.is_none());
         let measured = accounting(measured);
@@ -3009,7 +3014,7 @@ mod tests {
             max_work: 0,
             max_scratch_bytes: 0,
         };
-        let (too_short, accounting) = regex.find(b"a", zero_work).unwrap();
+        let (too_short, accounting) = regex.find_accounted(b"a", zero_work).unwrap();
         assert_eq!(too_short, None);
         assert_eq!(accounting.work_or_linear_terms(), 0);
         assert!(matches!(

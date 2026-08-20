@@ -867,7 +867,7 @@ fn verify_byte(case: Case, tier: Tier) -> Result<Value, String> {
         .max(window_start);
 
     let (fre_exists, exists_accounting) = fre
-        .is_match(haystack, limits)
+        .is_match_accounted(haystack, limits)
         .map_err(|error| format!("{} FRE is_match: {error:?}", case.id))?;
     let rust_exists = rust.is_match(haystack);
     if fre_exists != rust_exists {
@@ -875,7 +875,7 @@ fn verify_byte(case: Case, tier: Tier) -> Result<Value, String> {
     }
 
     let (fre_find, find_accounting) = fre
-        .find(haystack, limits)
+        .find_accounted(haystack, limits)
         .map_err(|error| format!("{} FRE find: {error:?}", case.id))?;
     let rust_find = rust.find(haystack);
     if optional_fre_span(fre_find) != optional_rust_byte_span(rust_find) {
@@ -1062,9 +1062,9 @@ fn verify_byte(case: Case, tier: Tier) -> Result<Value, String> {
         return Err(format!("{} recovery output differs", case.id));
     }
     let default_result = fre
-        .find(haystack, SearchLimits::default())
+        .find_with_limits(haystack, SearchLimits::default())
         .map_err(|error| format!("{} default finite search: {error:?}", case.id))?;
-    if default_result.0 != fre_find {
+    if default_result != fre_find {
         return Err(format!("{} default finite output differs", case.id));
     }
 
@@ -1181,13 +1181,13 @@ fn verify_text(case: Case, tier: Tier) -> Result<Value, String> {
     }
 
     let (fre_exists, exists_accounting) = fre
-        .is_match(&haystack, limits)
+        .is_match_accounted(&haystack, limits)
         .map_err(|error| format!("{} FRE text is_match: {error:?}", case.id))?;
     if fre_exists != rust.is_match(&haystack) {
         return Err(format!("{} text is_match differs from Rust", case.id));
     }
     let (fre_find, find_accounting) = fre
-        .find(&haystack, limits)
+        .find_accounted(&haystack, limits)
         .map_err(|error| format!("{} FRE text find: {error:?}", case.id))?;
     if optional_fre_span(fre_find) != optional_rust_span(rust.find(&haystack)) {
         return Err(format!("{} text find differs from Rust", case.id));
@@ -1438,7 +1438,7 @@ fn time_fre_byte(
         _ => {
             black_box(
                 regex
-                    .find(haystack, limits)
+                    .find_with_limits(haystack, limits)
                     .map_err(|error| format!("warm direct find: {error:?}"))?,
             );
         }
@@ -1450,15 +1450,14 @@ fn time_fre_byte(
         match operation.id {
             "byte_direct_is_match" => {
                 let value = regex
-                    .is_match_value(haystack, limits)
+                    .is_match_with_limits(haystack, limits)
                     .map_err(|error| format!("FRE is_match: {error:?}"))?;
                 checksum = checksum.wrapping_add(u64::from(value));
             }
             "byte_direct_find_owned" => {
                 if let Some(matched) = regex
-                    .find(haystack, limits)
+                    .find_with_limits(haystack, limits)
                     .map_err(|error| format!("FRE find: {error:?}"))?
-                    .0
                 {
                     update_checksum(&mut checksum, matched.start(), matched.end(), ordinal);
                 }
@@ -1630,7 +1629,7 @@ fn time_fre_text(
     }
     black_box(
         regex
-            .find(&haystack, limits)
+            .find_with_limits(&haystack, limits)
             .map_err(|error| format!("FRE text warm find: {error:?}"))?,
     );
     let mut checksum = 0_u64;
@@ -1639,16 +1638,14 @@ fn time_fre_text(
         match operation.id {
             "text_direct_is_match" => {
                 let value = regex
-                    .is_match(&haystack, limits)
-                    .map_err(|error| format!("FRE text is_match: {error:?}"))?
-                    .0;
+                    .is_match_with_limits(&haystack, limits)
+                    .map_err(|error| format!("FRE text is_match: {error:?}"))?;
                 checksum = checksum.wrapping_add(u64::from(value));
             }
             "text_direct_find" => {
                 if let Some(matched) = regex
-                    .find(&haystack, limits)
+                    .find_with_limits(&haystack, limits)
                     .map_err(|error| format!("FRE text find: {error:?}"))?
-                    .0
                 {
                     update_checksum(&mut checksum, matched.start(), matched.end(), ordinal);
                 }

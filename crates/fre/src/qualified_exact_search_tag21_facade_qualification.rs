@@ -505,7 +505,7 @@ fn encode_span(span: Option<Match>) -> u64 {
 
 fn portable_value(portable: &PortableRegex, haystack: &[u8]) -> u64 {
     let (matched, _) = portable
-        .find(black_box(haystack), SearchLimits::unlimited())
+        .find_accounted(black_box(haystack), SearchLimits::unlimited())
         .expect("portable facade search");
     encode_span(matched)
 }

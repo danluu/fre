@@ -2118,20 +2118,12 @@ fn run_context_probe(text: bool, range: bool) -> Execution {
             .build()
             .map_err(|_| unsupported("doctest.context-text-build-refused"))?;
         let sliced = if range {
-            regex
-                .find(&HAYSTACK[2..], SearchLimits::unlimited())
-                .map_err(|_| unsupported("doctest.context-text-search-refused"))?
-                .0
-                .map_or_else(
-                    || "_".to_owned(),
-                    |matched| format!("{}-{}", matched.start(), matched.end()),
-                )
+            regex.find(&HAYSTACK[2..]).map_or_else(
+                || "_".to_owned(),
+                |matched| format!("{}-{}", matched.start(), matched.end()),
+            )
         } else {
-            regex
-                .is_match(&HAYSTACK[2..], SearchLimits::unlimited())
-                .map_err(|_| unsupported("doctest.context-text-search-refused"))?
-                .0
-                .to_string()
+            regex.is_match(&HAYSTACK[2..]).to_string()
         };
         let contextual = regex
             .find_window(
@@ -2270,22 +2262,14 @@ fn build_regex(builder: PortableBuilder) -> Result<fre::PortableRegex, Execution
 }
 
 fn is_match(regex: &fre::PortableRegex, haystack: &[u8]) -> Result<bool, ExecutionRefusal> {
-    regex
-        .is_match(haystack, SearchLimits::unlimited())
-        .map(|result| result.0)
-        .map_err(|_| unsupported("doctest.search-refused"))
+    Ok(regex.is_match(haystack))
 }
 
 fn one_range(regex: &fre::PortableRegex, haystack: &[u8]) -> Result<String, ExecutionRefusal> {
-    regex
-        .find(haystack, SearchLimits::unlimited())
-        .map_err(|_| unsupported("doctest.search-refused"))
-        .map(|(matched, _)| {
-            matched.map_or_else(
-                || "_".to_owned(),
-                |matched| format!("{}-{}", matched.start(), matched.end()),
-            )
-        })
+    Ok(regex.find(haystack).map_or_else(
+        || "_".to_owned(),
+        |matched| format!("{}-{}", matched.start(), matched.end()),
+    ))
 }
 
 fn all_ranges(regex: &fre::PortableRegex, haystack: &[u8]) -> Result<String, ExecutionRefusal> {

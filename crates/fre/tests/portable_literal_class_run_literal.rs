@@ -146,7 +146,7 @@ fn selected_and_shortest_preserve_both_greedy_ambiguity_families() {
     let regex = portable(r"[ab]+aba");
     let haystack = b"!aababa!";
     let selected = regex
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .unwrap()
         .0
         .map(|matched| (matched.start(), matched.end()));
@@ -171,7 +171,7 @@ fn selected_and_shortest_preserve_both_greedy_ambiguity_families() {
     let prefix_only = portable(r"item[0-2]+");
     let haystack = b"!item01221!";
     let selected = prefix_only
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .unwrap()
         .0
         .map(|matched| (matched.start(), matched.end()));
@@ -478,14 +478,16 @@ fn planner_build_and_search_limits_have_exact_one_below_boundaries() {
     }
 
     let haystack = b"--ab    cd--";
-    let (_, accounting) = baseline.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = baseline
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
         panic!("wrong accounting family");
     };
     let exact_work = u64::try_from(accounting.work).unwrap();
     assert!(
         baseline
-            .find(
+            .find_accounted(
                 haystack,
                 SearchLimits {
                     max_work: exact_work,
@@ -495,7 +497,7 @@ fn planner_build_and_search_limits_have_exact_one_below_boundaries() {
             .is_ok()
     );
     assert!(matches!(
-        baseline.find(
+        baseline.find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact_work - 1,

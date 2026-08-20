@@ -1311,7 +1311,7 @@ mod tests {
         };
         assert!(plan.owner().classifier.is_none());
         let (matched, receipt) = regex
-            .find(b"!!ABCDEFGHIJKLMNOPQRSTUVWXYZ!!", SearchLimits::unlimited())
+            .find_accounted(b"!!ABCDEFGHIJKLMNOPQRSTUVWXYZ!!", SearchLimits::unlimited())
             .expect("one range search should succeed");
         assert_eq!(span(matched), Some((2, 28)));
         let receipt = accounting(receipt);
@@ -1383,7 +1383,7 @@ mod tests {
         assert_eq!(
             span(
                 small_holey
-                    .find(b"!!acacacacacacacacacacb", SearchLimits::unlimited())
+                    .find_accounted(b"!!acacacacacacacacacacb", SearchLimits::unlimited())
                     .expect("the complement-backed run-end seek should succeed")
                     .0
             ),
@@ -1437,19 +1437,23 @@ mod tests {
     fn polarity_greediness_full_set_and_invalid_windows_are_exact() {
         let positive = build("(?-u:[abc])+");
         let (matched, positive_accounting) =
-            positive.find(b"zabcc!", SearchLimits::unlimited()).unwrap();
+            positive
+                .find_accounted(b"zabcc!", SearchLimits::unlimited())
+                .unwrap();
         assert_eq!(span(matched), Some((1, 5)));
         assert_eq!(accounting(positive_accounting).operation, Operation::Span);
 
         let negative = build("(?-u:[^x])+?");
         let (matched, negative_accounting) =
-            negative.find(b"xab", SearchLimits::unlimited()).unwrap();
+            negative
+                .find_accounted(b"xab", SearchLimits::unlimited())
+                .unwrap();
         assert_eq!(span(matched), Some((1, 2)));
         assert_eq!(accounting(negative_accounting).operation, Operation::Span);
 
         let all = build("(?s-u:.)+");
         let (matched, all_accounting) = all
-            .find(b"\0\n\x80\xff", SearchLimits::unlimited())
+            .find_accounted(b"\0\n\x80\xff", SearchLimits::unlimited())
             .unwrap();
         assert_eq!(span(matched), Some((0, 4)));
         let all_accounting = accounting(all_accounting);
@@ -1598,7 +1602,7 @@ mod tests {
             let measured = match operation {
                 Operation::Exists => accounting(
                     regex
-                        .is_match(haystack, SearchLimits::unlimited())
+                        .is_match_accounted(haystack, SearchLimits::unlimited())
                         .unwrap()
                         .1,
                 ),
@@ -1615,7 +1619,12 @@ mod tests {
                         .1,
                 ),
                 Operation::Span => {
-                    accounting(regex.find(haystack, SearchLimits::unlimited()).unwrap().1)
+                    accounting(
+                        regex
+                            .find_accounted(haystack, SearchLimits::unlimited())
+                            .unwrap()
+                            .1,
+                    )
                 }
             };
             assert_eq!(measured.operation, operation);
@@ -1627,14 +1636,16 @@ mod tests {
                 max_scratch_bytes: 0,
             };
             let exact_accounting = match operation {
-                Operation::Exists => accounting(regex.is_match(haystack, exact).unwrap().1),
+                Operation::Exists => {
+                    accounting(regex.is_match_accounted(haystack, exact).unwrap().1)
+                }
                 Operation::EarliestEnd => {
                     accounting(regex.shortest_match(haystack, exact).unwrap().1)
                 }
                 Operation::SelectedEnd => {
                     accounting(regex.selected_end(haystack, exact).unwrap().1)
                 }
-                Operation::Span => accounting(regex.find(haystack, exact).unwrap().1),
+                Operation::Span => accounting(regex.find_accounted(haystack, exact).unwrap().1),
             };
             assert_eq!(exact_accounting.actual_work, measured.actual_work);
 
@@ -1643,10 +1654,12 @@ mod tests {
                 max_scratch_bytes: 0,
             };
             let error = match operation {
-                Operation::Exists => regex.is_match(haystack, one_below).unwrap_err(),
+                Operation::Exists => regex
+                    .is_match_accounted(haystack, one_below)
+                    .unwrap_err(),
                 Operation::EarliestEnd => regex.shortest_match(haystack, one_below).unwrap_err(),
                 Operation::SelectedEnd => regex.selected_end(haystack, one_below).unwrap_err(),
-                Operation::Span => regex.find(haystack, one_below).unwrap_err(),
+                Operation::Span => regex.find_accounted(haystack, one_below).unwrap_err(),
             };
             assert!(matches!(
                 error,
@@ -1659,7 +1672,7 @@ mod tests {
 
         let small = build("a+");
         assert!(matches!(
-            small.is_match(
+            small.is_match_accounted(
                 b"zzza",
                 SearchLimits {
                     max_work: 2,
@@ -1723,7 +1736,9 @@ mod tests {
         assert_eq!(session.runtime_implementation_id(), PLAN_ID);
         assert!(session.workspace_setup_accounting().is_none());
 
-        let direct = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+        let direct = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         let reused = session.find(haystack, SearchLimits::unlimited()).unwrap();
         assert_eq!(direct.0, reused.0);
         assert_eq!(

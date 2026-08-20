@@ -147,6 +147,22 @@ fn performance_report_has_both_engines_and_identical_modes() {
     let performance =
         run_performance(&authenticated, &correctness).expect("fixture performance diagnostics");
     assert_eq!(performance.schema, PERFORMANCE_SCHEMA);
+    assert_eq!(PERFORMANCE_SCHEMA, "fre.holdout.performance.v4");
+    assert!(
+        performance
+            .measurement_scope
+            .contains("FRE and Rust-regex both use find/is_match")
+    );
+    assert!(
+        performance
+            .measurement_scope
+            .contains("finite-limit and accounting validation is untimed")
+    );
+    assert!(
+        performance
+            .selected_end_adapter
+            .contains("both invoke ordinary find exactly once")
+    );
     assert!(!performance.normative);
     assert!(!performance.planner_feedback_permitted);
     assert_eq!(performance.builds.len(), 2);

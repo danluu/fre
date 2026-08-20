@@ -178,8 +178,8 @@ fn tail_head_anywhere_in_a_token_declines_the_direct_route() {
         );
         enumerate_haystacks(b"abcdxyz", 4, |haystack| {
             assert_eq!(
-                span(auto.find(haystack, SearchLimits::unlimited()).unwrap().0),
-                span(k0.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(auto.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(k0.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 "pattern={pattern:?} haystack={haystack:?}",
             );
         });
@@ -285,7 +285,7 @@ fn captures_and_greedy_modes_keep_match_span_parity() {
         );
         for haystack in [b"abcdabz".as_slice(), b"xxcdz".as_slice(), b"z".as_slice()] {
             assert_eq!(
-                span(auto.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                span(auto.find_accounted(haystack, SearchLimits::unlimited()).unwrap().0),
                 upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end())),
@@ -303,7 +303,9 @@ fn captures_and_greedy_modes_keep_match_span_parity() {
 fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
     let regex = build_auto(r"(?-u:(?:a|aa|ba){0,5}z)");
     let haystack = b"xxaabaabazyy";
-    let (_, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = regex
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::NullableOptionalChain(accounting) = accounting else {
         panic!("expected nullable finite-token accounting");
     };
@@ -317,14 +319,14 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         513 * core::mem::size_of::<u64>(),
     );
     assert_eq!(accounting.actual_scratch_bytes, accounting.scratch_bytes);
-    assert!(regex.find(haystack, exact).is_ok());
+    assert!(regex.find_accounted(haystack, exact).is_ok());
     assert!(regex.selected_end(haystack, exact).is_ok());
     let below = SearchLimits {
         max_work: accounting.work_upper_bound.checked_sub(1).unwrap(),
         max_scratch_bytes: 0,
     };
     assert!(matches!(
-        regex.find(haystack, below),
+        regex.find_accounted(haystack, below),
         Err(SearchError::NullableOptionalChain(
             NullableOptionalChainSearchError::WorkLimit { needed, limit }
         )) if needed == accounting.work_upper_bound && limit == below.max_work
@@ -334,7 +336,7 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         max_scratch_bytes: usize::from(accounting.scratch_bytes.checked_sub(1).unwrap()),
     };
     assert!(matches!(
-        regex.find(haystack, scratch_below),
+        regex.find_accounted(haystack, scratch_below),
         Err(SearchError::NullableOptionalChain(
             NullableOptionalChainSearchError::ScratchLimit { needed, limit }
         )) if needed == usize::from(accounting.scratch_bytes)
@@ -344,12 +346,12 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         max_work: u64::MAX,
         max_scratch_bytes: 0,
     };
-    assert!(regex.is_match(haystack, scratch_free).is_ok());
+    assert!(regex.is_match_accounted(haystack, scratch_free).is_ok());
     assert!(regex.shortest_match(haystack, scratch_free).is_ok());
 
     let no_tail = b"xxaabaabayy";
     let (matched, no_tail_accounting) = regex
-        .find(no_tail, SearchLimits::unlimited())
+        .find_accounted(no_tail, SearchLimits::unlimited())
         .unwrap();
     assert!(matched.is_none());
     let SearchAccounting::NullableOptionalChain(no_tail_accounting) = no_tail_accounting else {
@@ -362,7 +364,7 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         max_scratch_bytes: usize::from(no_tail_accounting.scratch_bytes) - 1,
     };
     assert!(matches!(
-        regex.find(no_tail, no_tail_below),
+        regex.find_accounted(no_tail, no_tail_below),
         Err(SearchError::NullableOptionalChain(
             NullableOptionalChainSearchError::ScratchLimit { needed, limit }
         )) if needed == usize::from(no_tail_accounting.scratch_bytes)

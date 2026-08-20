@@ -51,7 +51,7 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
         .find(haystack)
         .map(|matched| (matched.start(), matched.end()));
     let (found, accounting) = actual
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("prefix/class find");
     assert_eq!(
         found.map(|matched| (matched.start(), matched.end())),
@@ -71,7 +71,7 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
     );
     assert_eq!(
         actual
-            .is_match(haystack, SearchLimits::unlimited())
+            .is_match_accounted(haystack, SearchLimits::unlimited())
             .expect("accounted is_match")
             .0,
         expected.is_match(haystack),
@@ -313,7 +313,7 @@ fn search_limits_use_the_published_source_independent_envelope() {
         .expect("prefix/class build accounting");
     let haystack = b"xxxxxxxxab12345";
     let (_, accounting) = actual
-        .find(haystack, SearchLimits::unlimited())
+        .find_accounted(haystack, SearchLimits::unlimited())
         .expect("baseline search");
     let SearchAccounting::PrefixClassAlternation(accounting) = accounting else {
         panic!("prefix/class accounting was not selected")
@@ -322,7 +322,7 @@ fn search_limits_use_the_published_source_independent_envelope() {
     assert_eq!(build.peak_bytes, accounting.upper_bounds.peak_bytes);
     let exact = u64::try_from(accounting.upper_bounds.work).expect("small work bound");
     actual
-        .find(
+        .find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact,
@@ -331,7 +331,7 @@ fn search_limits_use_the_published_source_independent_envelope() {
         )
         .expect("exact work envelope");
     assert!(matches!(
-        actual.find(
+        actual.find_accounted(
             haystack,
             SearchLimits {
                 max_work: exact - 1,
@@ -353,7 +353,7 @@ fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
     let haystack = b"xxab123!cdAZ";
 
     let (expected_exists, exists_accounting) = actual
-        .is_match(haystack, SearchLimits::unlimited())
+        .is_match_accounted(haystack, SearchLimits::unlimited())
         .expect("baseline existence search");
     let SearchAccounting::PrefixClassAlternation(exists_accounting) = exists_accounting else {
         panic!("prefix/class existence accounting was not selected")
@@ -375,7 +375,7 @@ fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
     assert_eq!(
         expected_exists,
         actual
-            .is_match(haystack, exact_exists)
+            .is_match_accounted(haystack, exact_exists)
             .expect("exact existence envelope")
             .0
     );
@@ -384,7 +384,7 @@ fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
         ..exact_exists
     };
     assert!(matches!(
-        actual.is_match(haystack, below_exists),
+        actual.is_match_accounted(haystack, below_exists),
         Err(SearchError::PrefixClassAlternation(_))
     ));
 
@@ -688,7 +688,7 @@ fn native_iterator_prepays_one_affine_joint_stream_envelope() {
         for repetitions in [64_usize, 128, 256] {
             let haystack = b"ab0!".repeat(repetitions);
             let (_, baseline) = actual
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .expect("ordinary prefix/class baseline");
             let SearchAccounting::PrefixClassAlternation(baseline) = baseline else {
                 panic!("prefix/class baseline accounting was not selected")

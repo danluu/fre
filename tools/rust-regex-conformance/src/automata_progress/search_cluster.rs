@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fre::{PortableFindIterLimits, PortableRegex, PortableRegexSet, SearchLimits};
+use fre::{PortableFindIterLimits, PortableRegex, PortableRegexSet};
 use regex_automata::dfa::regex::Regex as UpstreamRegex;
 
 use super::{
@@ -462,10 +462,7 @@ fn execute_is_match() -> Result<Vec<RegexAutomataAssertionExecution>, InventoryE
     let mut executions = Vec::new();
     for (assertion, haystack) in IS_MATCH_ASSERTIONS.iter().zip(vectors) {
         let upstream_observed = upstream.is_match(haystack);
-        let fre_observed = fre
-            .is_match(haystack, SearchLimits::unlimited())
-            .map_err(fre_search)?
-            .0;
+        let fre_observed = fre.is_match(haystack);
         executions.push(observation(
             assertion,
             format!("bool:{upstream_observed}"),
@@ -532,11 +529,9 @@ fn execute_pattern_len() -> Result<Vec<RegexAutomataAssertionExecution>, Invento
 }
 
 fn fre_find(pattern: &str, haystack: &[u8]) -> Result<Option<fre::Match>, InventoryError> {
-    PortableRegex::new(pattern)
+    Ok(PortableRegex::new(pattern)
         .map_err(fre_build)?
-        .find(haystack, SearchLimits::unlimited())
-        .map(|result| result.0)
-        .map_err(fre_search)
+        .find(haystack))
 }
 
 fn upstream_match(matched: Option<regex_automata::Match>) -> String {

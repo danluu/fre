@@ -84,7 +84,7 @@ fn text_value_singletons_and_sessions_match_accounted_and_pinned_searches() {
                 .find(haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let accounted = fre
-                .find(haystack, SearchLimits::unlimited())
+                .find_accounted(haystack, SearchLimits::unlimited())
                 .expect("accounted text find")
                 .0
                 .map(|matched| (matched.start(), matched.end()));
@@ -109,7 +109,7 @@ fn text_value_singletons_and_sessions_match_accounted_and_pinned_searches() {
                 expected_exists,
             );
             assert_eq!(
-                fre.is_match(haystack, SearchLimits::unlimited())
+                fre.is_match_accounted(haystack, SearchLimits::unlimited())
                     .expect("accounted text existence")
                     .0,
                 expected_exists,

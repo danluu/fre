@@ -10,7 +10,7 @@ use std::{
 use fre::{
     BuildFailureClass, CaptureAggregateLimits, CaptureBuilder, CaptureSearchLimits,
     PortableBuilder, PortableFindIterLimits, PortableRegex, PortableTextBuilder,
-    PortableTextCaptureBuilder, PortableTextCaptures, RustProfile, SearchLimits,
+    PortableTextCaptureBuilder, PortableTextCaptures, RustProfile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -815,10 +815,7 @@ fn execute_is_match(pattern: &str, haystack: &[u8]) -> Result<Vec<u8>, Execution
         .profile(RustProfile::regex_1_12_4())
         .build()
         .map_err(|error| build_refusal(&error))?;
-    let matched = regex
-        .is_match(haystack, SearchLimits::unlimited())
-        .map_err(|_| unsupported("misc-regression.search-refused"))?
-        .0;
+    let matched = regex.is_match(haystack);
     Ok(matched.to_string().into_bytes())
 }
 
@@ -830,14 +827,8 @@ fn execute_text_matches(
     let regex = PortableTextBuilder::new(pattern)
         .build()
         .map_err(|_| unsupported("misc-regression.text-build-refused"))?;
-    let negative = regex
-        .is_match(negative, SearchLimits::unlimited())
-        .map_err(|_| unsupported("misc-regression.text-search-refused"))?
-        .0;
-    let positive = regex
-        .is_match(positive, SearchLimits::unlimited())
-        .map_err(|_| unsupported("misc-regression.text-search-refused"))?
-        .0;
+    let negative = regex.is_match(negative);
+    let positive = regex.is_match(positive);
     Ok(format!("{negative},{positive}").into_bytes())
 }
 

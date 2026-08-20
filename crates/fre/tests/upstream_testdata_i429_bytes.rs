@@ -95,7 +95,7 @@ fn qualified_issue_429_byte_adapter_matches_pinned_upstream() {
         let expected_is_match = upstream.is_match(case.haystack);
         assert!(expected_is_match, "{} upstream is-match fixture", case.id);
         let (actual_is_match, accounting) = fre
-            .is_match(case.haystack, SearchLimits::unlimited())
+            .is_match_accounted(case.haystack, SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("{}: FRE is-match: {error}", case.id));
         assert_eq!(accounting.plan(), PlanKind::K0, "{}", case.id);
         assert_eq!(actual_is_match, expected_is_match, "{} is-match", case.id);

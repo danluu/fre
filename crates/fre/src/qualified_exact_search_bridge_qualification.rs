@@ -418,7 +418,7 @@ fn build_bridge(workload: QualifiedExactSearchWorkload) -> QualifiedExactSearchF
 
 fn portable_value(portable: &PortableRegex, operation: Operation, haystack: &[u8]) -> u64 {
     let (matched, _) = portable
-        .find(black_box(haystack), SearchLimits::unlimited())
+        .find_accounted(black_box(haystack), SearchLimits::unlimited())
         .expect("portable search");
     operation.encode(matched.map(|span| (span.start(), span.end())))
 }

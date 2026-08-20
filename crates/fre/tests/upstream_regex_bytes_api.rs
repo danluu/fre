@@ -455,7 +455,7 @@ fn capture_free_locations_read_matches_pinned_bytes_across_every_portable_plan()
         // same warm specialization state so their exact accounting remains
         // directly comparable.
         let _ = fre
-            .find(b"", fre::SearchLimits::unlimited())
+            .find_accounted(b"", fre::SearchLimits::unlimited())
             .expect("warm capture-free whole-match search");
 
         for &haystack in haystacks {
@@ -482,7 +482,7 @@ fn capture_free_locations_read_matches_pinned_bytes_across_every_portable_plan()
                 fre.as_str()
             );
             let (_, find_accounting) = fre
-                .find(haystack, fre::SearchLimits::unlimited())
+                .find_accounted(haystack, fre::SearchLimits::unlimited())
                 .expect("comparison whole-match search");
             assert_eq!(accounting, find_accounting, "pattern={:?}", fre.as_str());
         }
@@ -752,10 +752,10 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
         // start filter. Warm once before comparing offset and borrowed-match
         // projections so both calls carry the same exact accounting state.
         let _ = fre
-            .find(haystack, fre::SearchLimits::unlimited())
+            .find_accounted(haystack, fre::SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("FRE warm-up search failed for {name}: {error}"));
         let (actual, offset_accounting) = fre
-            .find(haystack, fre::SearchLimits::unlimited())
+            .find_accounted(haystack, fre::SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("FRE search failed for {name}: {error}"));
         let actual = actual.unwrap_or_else(|| panic!("FRE found no match for {name}"));
         let (borrowed, borrowed_accounting) = fre

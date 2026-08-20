@@ -116,7 +116,9 @@ fn default_large_cartesian_languages_select_certified_fixed_reducers() {
     ];
     for (pattern, haystack, reducer) in cases {
         let regex = build_auto(pattern);
-        let (matched, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (matched, accounting) = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert!(matched.is_some(), "pattern={pattern:?}");
         if let Some(reducer) = reducer {
             assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
@@ -168,7 +170,7 @@ fn fixed_predicate_auto_route_matrix_admits_selective_words_through_width_64() {
                 let regex = build_auto(&pattern);
                 let word = matrix_word(width, reducer, anchor_offset);
                 let (matched, accounting) = regex
-                    .find(&word, SearchLimits::unlimited())
+                    .find_accounted(&word, SearchLimits::unlimited())
                     .unwrap_or_else(|error| {
                         panic!(
                             "matrix search failed width={width} reducer={reducer:?} offset={anchor_offset:?}: {error:?}"
@@ -325,10 +327,10 @@ fn assert_structural_wide_parity_with_anchor(
 
     for haystack in structural_wide_haystacks(&word) {
         let limits = SearchLimits::unlimited();
-        let (auto_match, accounting) = auto.find(&haystack, limits).unwrap();
+        let (auto_match, accounting) = auto.find_accounted(&haystack, limits).unwrap();
         assert_eq!(
             span(auto_match),
-            span(k0.find(&haystack, limits).unwrap().0)
+            span(k0.find_accounted(&haystack, limits).unwrap().0)
         );
         assert_eq!(
             matches!(accounting, SearchAccounting::FixedPredicateWord64(_)),
@@ -430,7 +432,9 @@ fn wide_universal_positions_charge_no_verification_work() {
     let (pattern, _) = structural_wide_case(64, 0, "Q");
     let regex = build_auto(&pattern);
     let haystack = vec![0xFF; 1024];
-    let (matched, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (matched, accounting) = regex
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     assert_eq!(matched, None);
     let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
         panic!("wide V=0 route lost fixed-predicate accounting");
@@ -465,7 +469,9 @@ fn wide_set_fallback_can_handoff_to_shift_and() {
     for start in 0..=haystack.len() - width {
         haystack[start + anchor_offset] = b'Q';
     }
-    let (_, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = regex
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
         panic!("wide set-fallback route lost fixed-predicate accounting");
     };
@@ -492,8 +498,8 @@ fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
         for haystack in matrix_haystacks(width, reducer, anchor_offset) {
             let limits = SearchLimits::unlimited();
             assert_eq!(
-                span(auto.find(&haystack, limits).unwrap().0),
-                span(k0.find(&haystack, limits).unwrap().0)
+                span(auto.find_accounted(&haystack, limits).unwrap().0),
+                span(k0.find_accounted(&haystack, limits).unwrap().0)
             );
             assert_eq!(
                 span(auto.find_value(&haystack, limits).unwrap()),
@@ -740,7 +746,9 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
     ));
 
     let haystack = b"--Qacegikmortvx0--";
-    let (_, accounting) = baseline.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = baseline
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
         panic!("expected fixed-predicate accounting");
     };
@@ -748,14 +756,14 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
         max_work: accounting.upper_bounds.work,
         max_scratch_bytes: 0,
     };
-    assert!(baseline.find(haystack, exact_search).is_ok());
+    assert!(baseline.find_accounted(haystack, exact_search).is_ok());
     assert!(baseline.find_value(haystack, exact_search).is_ok());
     let below_search = SearchLimits {
         max_work: accounting.upper_bounds.work - 1,
         max_scratch_bytes: 0,
     };
     assert!(matches!(
-        baseline.find(haystack, below_search),
+        baseline.find_accounted(haystack, below_search),
         Err(SearchError::FixedPredicateWord64(
             fre::FixedPredicateWord64SearchError::WorkLimit { .. }
         ))
@@ -1062,7 +1070,7 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
                     .find(&haystack)
                     .map(|matched| (matched.start(), matched.end()));
                 let (auto_first, accounting) = auto
-                    .find(&haystack, SearchLimits::unlimited())
+                    .find_accounted(&haystack, SearchLimits::unlimited())
                     .unwrap();
                 match (expected_fixed, expected_kind, accounting) {
                     (
@@ -1081,7 +1089,11 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
                 }
                 assert_eq!(span(auto_first), expected_first);
                 assert_eq!(
-                    span(k0.find(&haystack, SearchLimits::unlimited()).unwrap().0),
+                    span(
+                        k0.find_accounted(&haystack, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                    ),
                     expected_first
                 );
                 assert_eq!(
@@ -1223,7 +1235,7 @@ fn fixed_predicate_precedes_finite_products_but_not_true_alternation() {
         "an exact two-byte anchor preserves precedence over a fitting finite product"
     );
     let (_, two_byte_accounting) = two_byte_anchor
-        .find(b"--ad--", SearchLimits::unlimited())
+        .find_accounted(b"--ad--", SearchLimits::unlimited())
         .unwrap();
     assert!(matches!(
         two_byte_accounting,
@@ -1248,7 +1260,7 @@ fn fixed_predicate_precedes_finite_products_but_not_true_alternation() {
                 .find(&haystack)
                 .map(|matched| (matched.start(), matched.end()));
             let actual = fixed
-                .find(&haystack, SearchLimits::unlimited())
+                .find_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .map(|matched| (matched.start(), matched.end()));
@@ -1399,7 +1411,9 @@ fn unicode_classes_and_profiles_remain_k0_and_match_regex_bytes() {
                 let expected = upstream
                     .find(haystack)
                     .map(|matched| (matched.start(), matched.end()));
-                let (actual, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+                let (actual, accounting) = regex
+                    .find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap();
                 assert_eq!(span(actual), expected, "pattern={pattern:?}");
                 assert!(matches!(accounting, SearchAccounting::K0(_)));
                 assert_eq!(

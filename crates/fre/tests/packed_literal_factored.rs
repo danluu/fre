@@ -47,7 +47,7 @@ fn build(pattern: &str) -> fre::PortableRegex {
 
 fn is_factored(regex: &fre::PortableRegex) -> bool {
     let (_, accounting) = regex
-        .find(b"a factored accounting probe", SearchLimits::unlimited())
+        .find_accounted(b"a factored accounting probe", SearchLimits::unlimited())
         .unwrap();
     let SearchAccounting::PackedLiteralSet(accounting) = accounting else {
         panic!("packed plan reported another search family")
@@ -117,14 +117,18 @@ fn factored_route_matches_rust_regex_on_hits_misses_and_malformed_bytes() {
         let expected = oracle
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
-        let (actual, _) = fre.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (actual, _) = fre
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
         assert_eq!(
             actual.map(|matched| (matched.start(), matched.end())),
             expected,
             "haystack={haystack:?}"
         );
         assert_eq!(
-            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+            fre.is_match_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
             expected.is_some()
         );
         assert_eq!(
@@ -160,7 +164,9 @@ fn factored_route_has_exact_persistent_and_search_work_boundaries() {
     ));
 
     let haystack = b"a long miss exercises the retained factored column owner";
-    let (_, accounting) = exact.find(haystack, SearchLimits::unlimited()).unwrap();
+    let (_, accounting) = exact
+        .find_accounted(haystack, SearchLimits::unlimited())
+        .unwrap();
     let SearchAccounting::PackedLiteralSet(accounting) = accounting else {
         panic!("factored route reported another search family")
     };
@@ -170,13 +176,13 @@ fn factored_route_has_exact_persistent_and_search_work_boundaries() {
         max_work: work,
         max_scratch_bytes: 0,
     };
-    exact.find(haystack, exact_work).unwrap();
+    exact.find_accounted(haystack, exact_work).unwrap();
     let one_below = SearchLimits {
         max_work: work - 1,
         max_scratch_bytes: 0,
     };
     assert!(matches!(
-        exact.find(haystack, one_below),
+        exact.find_accounted(haystack, one_below),
         Err(SearchError::PackedLiteralSet(PackedLiteralSetError::WorkLimit {
             needed,
             limit
@@ -193,17 +199,25 @@ fn factored_route_has_zero_steady_allocations() {
     assert!(is_factored(&regex));
     let mut haystack = vec![b'!'; 8_192];
     haystack[8_184..8_188].copy_from_slice(b"f5Qy");
-    let expected = regex.find(&haystack, SearchLimits::unlimited()).unwrap().0;
+    let expected = regex
+        .find_accounted(&haystack, SearchLimits::unlimited())
+        .unwrap()
+        .0;
 
     let region = Region::new(GLOBAL);
     for _ in 0..32 {
         assert_eq!(
-            black_box(regex.find(&haystack, SearchLimits::unlimited()).unwrap().0),
+            black_box(
+                regex
+                    .find_accounted(&haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+            ),
             expected
         );
         assert!(
             regex
-                .is_match(&haystack, SearchLimits::unlimited())
+                .is_match_accounted(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
         );

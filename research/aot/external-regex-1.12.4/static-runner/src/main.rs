@@ -205,7 +205,9 @@ fn inspect(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
             let fixture = load_fixture(root, row)?;
             let literal = decode_hex(&candidate.literal_hex)?;
             verify_oracle(fixture.bytes(), &literal, row)?;
-            let portable_match = portable.find(fixture.bytes(), SearchLimits::unlimited())?.0;
+            let portable_match = portable
+                .find_accounted(fixture.bytes(), SearchLimits::unlimited())?
+                .0;
             let automatic_match = find_automatic(&portable, automatic.as_ref(), fixture.bytes())?;
             require(
                 project(portable_match) == row.expected_leftmost_span
@@ -437,7 +439,9 @@ fn verify_pair(
     haystack: &[u8],
     row: &FixtureRow,
 ) -> Result<(), DynError> {
-    let portable_match = portable.find(haystack, SearchLimits::unlimited())?.0;
+    let portable_match = portable
+        .find_accounted(haystack, SearchLimits::unlimited())?
+        .0;
     let automatic_match = find_automatic(portable, automatic, haystack)?;
     require(
         project(portable_match) == row.expected_leftmost_span
@@ -534,7 +538,7 @@ fn measure_portable(
 ) -> Result<Measurement, DynError> {
     measure(iterations, || {
         Ok(portable
-            .find(black_box(haystack), SearchLimits::unlimited())?
+            .find_accounted(black_box(haystack), SearchLimits::unlimited())?
             .0)
     })
 }
@@ -558,7 +562,9 @@ fn find_automatic(
     if let Some(automatic) = automatic {
         Ok(automatic.find(haystack, SearchLimits::unlimited())?.0)
     } else {
-        Ok(portable.find(haystack, SearchLimits::unlimited())?.0)
+        Ok(portable
+            .find_accounted(haystack, SearchLimits::unlimited())?
+            .0)
     }
 }
 
