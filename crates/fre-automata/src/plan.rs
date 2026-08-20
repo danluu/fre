@@ -1209,26 +1209,34 @@ impl PooledWorkspacePool {
 
     fn return_workspace(&self, workspace: K0Workspace) {
         let workspace = match self.owner.try_checkout() {
-            Some(mut owner) if owner.value().is_none() => {
-                match owner.try_insert(workspace) {
-                    Ok(()) => {
-                        owner.commit();
+            Some(mut owner) => {
+                let replace_owner = owner.value().is_none_or(|incumbent| {
+                    workspace.selected_capability_rank()
+                        > incumbent.selected_capability_rank()
+                });
+                if replace_owner {
+                    let displaced = owner.take();
+                    owner
+                        .try_insert(workspace)
+                        .expect("selected owner return slot is empty");
+                    owner.commit();
+                    let Some(displaced) = displaced else {
                         return;
-                    }
-                    Err(workspace) => {
-                        owner.commit();
-                        workspace
-                    }
+                    };
+                    displaced
+                } else {
+                    owner.commit();
+                    workspace
                 }
-            }
-            Some(owner) => {
-                owner.commit();
-                workspace
             }
             None => workspace,
         };
         if let Ok(mut fallback) = self.fallback.lock() {
-            if fallback.is_none() {
+            let replace_fallback = fallback.as_ref().is_none_or(|incumbent| {
+                workspace.selected_capability_rank()
+                    > incumbent.selected_capability_rank()
+            });
+            if replace_fallback {
                 *fallback = Some(workspace);
             }
         }
@@ -1381,6 +1389,20 @@ impl Automaton {
             && workspace.retained_bytes() <= payload_limits.max_scratch_bytes
     }
 
+    fn pooled_workspace_residual_limits(
+        limits: WorkspaceLimits,
+        incumbent: &K0Workspace,
+    ) -> Option<WorkspaceLimits> {
+        Some(WorkspaceLimits {
+            max_setup_work: limits
+                .max_setup_work
+                .checked_sub(incumbent.construction_accounting().work())?,
+            max_scratch_bytes: limits
+                .max_scratch_bytes
+                .checked_sub(incumbent.retained_bytes())?,
+        })
+    }
+
     fn pooled_workspace_mandatory_layout_fits(
         &self,
         limits: WorkspaceLimits,
@@ -1420,25 +1442,38 @@ impl Automaton {
     /// large owner-or-fallback checkout enum.
     ///
     /// This is a warm-only probe: a missing pool, non-owner caller, empty
-    /// lane, or incompatible retained envelope returns `None` without
-    /// constructing or moving a workspace. The caller then enters the exact
-    /// ordinary checkout path. As with that path, only `Ok` retains mutated
-    /// scratch; an error drops the guard and discards the workspace.
+    /// lane, incompatible retained envelope, or insufficient operation
+    /// capability returns `None` without constructing or moving a workspace.
+    /// The caller then enters the exact ordinary checkout path, which may
+    /// promote a weaker owner transactionally. As with that path, only `Ok`
+    /// retains mutated scratch; an error drops the guard and discards the
+    /// workspace.
     #[inline]
     pub(crate) fn try_with_warm_owner_workspace<T, F>(
         &self,
         limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
         execute: F,
     ) -> Option<Result<T, SearchError>>
     where
         F: FnOnce(&mut K0Workspace) -> Result<T, SearchError>,
     {
+        let payload_limits = Self::pooled_workspace_payload_limits(limits)?;
         let pool = self.pooled_workspace.get()?;
         let mut owner = pool.owner.try_checkout()?;
-        if !owner
-            .value()
-            .is_some_and(|workspace| Self::pooled_workspace_fits(workspace, limits))
-        {
+        let compatible = owner.value().is_some_and(|workspace| {
+            Self::pooled_workspace_fits(workspace, limits)
+                && workspace
+                    .supports_selected_capabilities(
+                        self,
+                        payload_limits,
+                        endpoint_eligible,
+                        bidirectional,
+                    )
+                    .unwrap_or(false)
+        });
+        if !compatible {
             owner.commit();
             return None;
         }
@@ -1485,14 +1520,138 @@ impl Automaton {
                     }
                 }
                 if let Some(workspace) = owner.value() {
-                    if Self::pooled_workspace_fits(workspace, limits) {
+                    if !Self::pooled_workspace_fits(workspace, limits) {
+                        owner.commit();
+                        return Ok(None);
+                    }
+                    match workspace.supports_selected_capabilities(
+                        self,
+                        payload_limits,
+                        endpoint_eligible,
+                        bidirectional,
+                    ) {
+                        Ok(true) => {
+                            return Ok(Some(PooledWorkspaceCheckout {
+                                storage: PooledWorkspaceStorage::Owner(owner),
+                                cold_setup: None,
+                            }));
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            owner.commit();
+                            return Err(error);
+                        }
+                    }
+
+                    // A non-owner may already have returned a stronger lane.
+                    // Prefer that retained workspace before allocating a
+                    // replacement, while keeping the weaker owner published
+                    // until the stronger search succeeds.
+                    if let Some(candidate) = pool.take_fallback() {
+                        let candidate_fits = Self::pooled_workspace_fits(&candidate, limits);
+                        let candidate_supports = candidate_fits
+                            && candidate
+                                .supports_selected_capabilities(
+                                    self,
+                                    payload_limits,
+                                    endpoint_eligible,
+                                    bidirectional,
+                                )
+                                .unwrap_or(false);
+                        if candidate_supports {
+                            // Execute the stronger fallback by value while the
+                            // weaker owner remains published. Only a successful
+                            // return may displace that incumbent.
+                            owner.commit();
+                            return Ok(Some(PooledWorkspaceCheckout {
+                                storage: PooledWorkspaceStorage::Owned {
+                                    workspace: Some(candidate),
+                                    return_to: Some(pool),
+                                },
+                                cold_setup: None,
+                            }));
+                        }
+                        if !candidate_fits {
+                            pool.return_workspace(candidate);
+                            return Ok(Some(PooledWorkspaceCheckout {
+                                storage: PooledWorkspaceStorage::Owner(owner),
+                                cold_setup: None,
+                            }));
+                        }
+                        if candidate.selected_capability_rank()
+                            > owner
+                                .value()
+                                .expect("capability promotion retains its owner")
+                                .selected_capability_rank()
+                        {
+                            // Even though this candidate cannot satisfy the
+                            // complete request, retain its intermediate tier
+                            // before attempting a stronger replacement. A
+                            // failed promotion must never lower capability.
+                            let displaced = owner
+                                .take()
+                                .expect("intermediate promotion retains its weaker owner");
+                            owner
+                                .try_insert(candidate)
+                                .expect("vacated owner accepts intermediate capability");
+                            drop(displaced);
+                        } else {
+                            // A fitting duplicate cannot remain retained while
+                            // the owner also admits a bounded replacement.
+                            drop(candidate);
+                        }
+                    }
+
+                    // Keep the weaker owner published until a complete
+                    // replacement has constructed and executed successfully.
+                    // Charge the incumbent before admitting the temporary
+                    // replacement so this invocation cannot exceed its
+                    // aggregate workspace envelope.
+                    let Some(residual_limits) = Self::pooled_workspace_residual_limits(
+                        payload_limits,
+                        owner
+                            .value()
+                            .expect("capability promotion retains its weaker owner"),
+                    ) else {
+                        return Ok(Some(PooledWorkspaceCheckout {
+                            storage: PooledWorkspaceStorage::Owner(owner),
+                            cold_setup: None,
+                        }));
+                    };
+                    let Ok(replacement) = K0Workspace::new_selected(
+                        self,
+                        residual_limits,
+                        endpoint_eligible,
+                        bidirectional,
+                    ) else {
+                        return Ok(Some(PooledWorkspaceCheckout {
+                            storage: PooledWorkspaceStorage::Owner(owner),
+                            cold_setup: None,
+                        }));
+                    };
+                    if !replacement
+                        .supports_selected_capabilities(
+                            self,
+                            payload_limits,
+                            endpoint_eligible,
+                            bidirectional,
+                        )
+                        .unwrap_or(false)
+                    {
                         return Ok(Some(PooledWorkspaceCheckout {
                             storage: PooledWorkspaceStorage::Owner(owner),
                             cold_setup: None,
                         }));
                     }
+                    let cold_setup = replacement.construction_accounting();
                     owner.commit();
-                    return Ok(None);
+                    return Ok(Some(PooledWorkspaceCheckout {
+                        storage: PooledWorkspaceStorage::Owned {
+                            workspace: Some(replacement),
+                            return_to: Some(pool),
+                        },
+                        cold_setup: Some(cold_setup),
+                    }));
                 }
                 if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
                     return Ok(None);
@@ -1514,17 +1673,43 @@ impl Automaton {
             }
 
             if let Some(workspace) = pool.take_fallback() {
-                if Self::pooled_workspace_fits(&workspace, limits) {
-                    return Ok(Some(PooledWorkspaceCheckout {
-                        storage: PooledWorkspaceStorage::Owned {
-                            workspace: Some(workspace),
-                            return_to: Some(pool),
-                        },
-                        cold_setup: None,
-                    }));
+                if !Self::pooled_workspace_fits(&workspace, limits) {
+                    pool.return_workspace(workspace);
+                    return Ok(None);
                 }
-                pool.return_workspace(workspace);
-                return Ok(None);
+                match workspace.supports_selected_capabilities(
+                    self,
+                    payload_limits,
+                    endpoint_eligible,
+                    bidirectional,
+                ) {
+                    Ok(true) => {
+                        return Ok(Some(PooledWorkspaceCheckout {
+                            storage: PooledWorkspaceStorage::Owned {
+                                workspace: Some(workspace),
+                                return_to: Some(pool),
+                            },
+                            cold_setup: None,
+                        }));
+                    }
+                    Ok(false) => {
+                        // A non-owner cannot account for or reserve the owner
+                        // lane that remains live concurrently. Execute through
+                        // this weaker workspace's canonical fallback; the owner
+                        // thread performs any later transactional promotion.
+                        return Ok(Some(PooledWorkspaceCheckout {
+                            storage: PooledWorkspaceStorage::Owned {
+                                workspace: Some(workspace),
+                                return_to: Some(pool),
+                            },
+                            cold_setup: None,
+                        }));
+                    }
+                    Err(error) => {
+                        pool.return_workspace(workspace);
+                        return Err(error);
+                    }
+                }
             }
             // The optional selected session may have a tighter setup envelope
             // than the canonical one-shot call. Decline before allocating
@@ -1644,6 +1829,8 @@ impl Automaton {
     /// The owner thread borrows its workspace in place without locking or
     /// moving it. A non-owner caller moves a workspace out of the fallback
     /// slot, and concurrent misses construct independent bounded workspaces.
+    /// A one-time capability promotion retains the weaker lane until its
+    /// bounded replacement executes successfully.
     pub(crate) fn try_checkout_pooled_workspace(
         &self,
         limits: WorkspaceLimits,
@@ -1680,6 +1867,7 @@ impl Automaton {
     /// Adopt a successfully used unleased workspace when this automaton
     /// already owns a pool. Explicit sessions can cross the hidden facade
     /// return boundary, so their lack of a checkout token must not panic.
+    /// Each lane retains the strongest operation capability returned to it.
     pub(crate) fn adopt_unleased_pooled_workspace(&self, workspace: K0Workspace) {
         if let Some(pool) = self.pooled_workspace.get() {
             pool.return_workspace(workspace);
@@ -2929,6 +3117,8 @@ mod tests {
 
         let cold_probe = automaton.try_with_warm_owner_workspace(
             limits,
+            true,
+            true,
             |_| Ok::<_, SearchError>(7_u8),
         );
         assert!(cold_probe.is_none());
@@ -2940,8 +3130,26 @@ mod tests {
         assert!(cold.cold_setup.is_some());
         cold.commit();
 
+        let refused = automaton.try_with_warm_owner_workspace(
+            WorkspaceLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            },
+            true,
+            true,
+            |_| -> Result<(), SearchError> {
+                panic!("an inadmissible warm probe must not execute")
+            },
+        );
+        assert!(refused.is_none());
+        let still_warm = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("refused warm probe preserves the retained owner");
+        assert!(still_warm.cold_setup.is_none());
+        still_warm.commit();
+
         let warm = automaton
-            .try_with_warm_owner_workspace(limits, |_workspace| {
+            .try_with_warm_owner_workspace(limits, true, true, |_workspace| {
                 Ok::<_, SearchError>(11_u8)
             })
             .expect("publishing thread reaches the warm owner lane")
@@ -2954,7 +3162,7 @@ mod tests {
         retained.commit();
 
         let failed = automaton
-            .try_with_warm_owner_workspace(limits, |_| {
+            .try_with_warm_owner_workspace(limits, true, true, |_| {
                 Err::<(), _>(SearchError::InternalInvariant {
                     detail: "focused warm-owner failure",
                 })
@@ -2989,6 +3197,8 @@ mod tests {
                         automaton
                             .try_with_warm_owner_workspace(
                                 limits,
+                                true,
+                                true,
                                 |_| Ok::<_, SearchError>(()),
                             )
                             .is_none(),
@@ -3033,7 +3243,9 @@ mod tests {
         cold.commit();
 
         let warm = automaton
-            .try_with_warm_owner_workspace(limits, |_| Ok::<_, SearchError>(17_u8))
+            .try_with_warm_owner_workspace(limits, true, true, |_| {
+                Ok::<_, SearchError>(17_u8)
+            })
             .expect("exact default limits reach the populated owner")
             .expect("default warm transaction succeeds");
         assert_eq!(warm, 17);
@@ -3046,6 +3258,8 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = automaton.try_with_warm_owner_workspace(
                 limits,
+                true,
+                true,
                 |_| -> Result<(), SearchError> { panic!("focused warm-owner panic") },
             );
         }));
@@ -3272,6 +3486,353 @@ mod tests {
             .expect("refused replacement leaves the owner warm");
         assert!(warm.cold_setup.is_none());
         warm.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_promotes_transactionally_and_never_downgrades() {
+        let automaton = compile_ranges(&[(b'a', b'a')]);
+        let limits = WorkspaceLimits::unlimited();
+
+        let endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("endpoint workspace constructs");
+        assert!(
+            endpoint
+                .supports_selected_capabilities(&automaton, limits, true, false)
+                .unwrap()
+        );
+        assert!(
+            !endpoint
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        endpoint.commit();
+
+        let abandoned = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("bidirectional promotion constructs");
+        assert!(abandoned.cold_setup.is_some());
+        assert!(
+            abandoned
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        drop(abandoned);
+
+        let retained_endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("abandoned promotion preserves the endpoint owner");
+        assert!(retained_endpoint.cold_setup.is_none());
+        assert!(
+            !retained_endpoint
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        retained_endpoint.commit();
+
+        let bidirectional = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("second bidirectional promotion constructs");
+        assert!(bidirectional.cold_setup.is_some());
+        bidirectional.commit();
+
+        let exists_after_span = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("stronger workspace satisfies endpoint request");
+        assert!(exists_after_span.cold_setup.is_none());
+        assert!(
+            exists_after_span
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap(),
+            "an endpoint request must not downgrade a retained bidirectional owner",
+        );
+        exists_after_span.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_interleaved_returns_keep_the_strongest_capability() {
+        let automaton = compile_ranges(&[(b'a', b'a')]);
+        let limits = WorkspaceLimits::unlimited();
+
+        // Keep the endpoint owner checked out so the second caller constructs
+        // through the non-owner lane, then return the stronger lane first.
+        let endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("endpoint owner constructs");
+        let bidirectional = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("concurrent bidirectional lane constructs");
+        assert!(bidirectional.cold_setup.is_some());
+        bidirectional.commit();
+        endpoint.commit();
+
+        let retained = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("stronger fallback promotes without rebuilding");
+        assert!(retained.cold_setup.is_none());
+        assert!(
+            retained
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap(),
+            "a late endpoint return must not displace bidirectional state",
+        );
+        retained.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_stronger_fallback_failure_preserves_weaker_owner() {
+        let automaton = compile_ranges(&[(b'a', b'a')]);
+        let limits = WorkspaceLimits::unlimited();
+
+        let endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("endpoint owner constructs");
+        let bidirectional = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("parallel bidirectional lane constructs");
+        bidirectional.commit();
+        endpoint.commit();
+
+        let candidate = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("stronger fallback checks out transactionally");
+        assert!(candidate.cold_setup.is_none());
+        assert!(
+            candidate
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        drop(candidate);
+
+        let retained_endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("failed stronger execution leaves endpoint owner published");
+        assert!(retained_endpoint.cold_setup.is_none());
+        assert!(
+            !retained_endpoint
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        retained_endpoint.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_nonowner_declines_parallel_capability_promotion() {
+        let automaton = compile_ranges(&[(b'a', b'a')]);
+        let limits = WorkspaceLimits::unlimited();
+
+        let owner = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("endpoint owner constructs");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let fallback = automaton
+                        .try_checkout_pooled_workspace(limits, true, false)
+                        .expect("parallel endpoint fallback constructs");
+                    assert!(fallback.cold_setup.is_some());
+                    fallback.commit();
+                })
+                .join()
+                .unwrap();
+        });
+        owner.commit();
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let fallback = automaton
+                        .try_checkout_pooled_workspace(limits, true, true)
+                        .expect("nonowner executes through retained fallback");
+                    assert!(fallback.cold_setup.is_none());
+                    assert!(
+                        !fallback
+                            .supports_selected_capabilities(
+                                &automaton,
+                                limits,
+                                true,
+                                true,
+                            )
+                            .unwrap(),
+                        "a nonowner must not fund a third concurrent workspace",
+                    );
+                    fallback.commit();
+                })
+                .join()
+                .unwrap();
+        });
+
+        let promoted = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("owner thread performs the bounded promotion");
+        assert!(promoted.cold_setup.is_some());
+        assert!(
+            promoted
+                .supports_selected_capabilities(&automaton, limits, true, true)
+                .unwrap()
+        );
+        promoted.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_failed_three_tier_promotion_keeps_intermediate_capability() {
+        let automaton = compile_ranges(&[(b'a', b'a')]);
+        let endpoint_layout = K0Workspace::new_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        let bidirectional_layout = K0Workspace::new_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let limits = WorkspaceLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: endpoint_layout
+                .retained_bytes()
+                .checked_add(bidirectional_layout.retained_bytes())
+                .and_then(|bytes| bytes.checked_add(Automaton::pooled_workspace_owner_bytes()))
+                .and_then(|bytes| bytes.checked_sub(1))
+                .unwrap(),
+        };
+
+        let pike = automaton
+            .try_checkout_pooled_workspace(limits, false, false)
+            .expect("Pike owner constructs");
+        let endpoint = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("parallel endpoint fallback constructs");
+        endpoint.commit();
+        pike.commit();
+
+        let retained = automaton
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("one-below reverse promotion keeps its best incumbent");
+        assert!(retained.cold_setup.is_none());
+        assert!(
+            retained
+                .supports_selected_capabilities(
+                    &automaton,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    false,
+                )
+                .unwrap(),
+            "the endpoint fallback must replace the weaker Pike owner",
+        );
+        assert!(
+            !retained
+                .supports_selected_capabilities(
+                    &automaton,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap(),
+            "the one-below envelope must still refuse reverse capability",
+        );
+        retained.commit();
+    }
+
+    #[test]
+    fn pooled_workspace_promotion_obeys_exact_aggregate_limits() {
+        fn aggregate_limits(automaton: &Automaton) -> WorkspaceLimits {
+            let endpoint = K0Workspace::new_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap();
+            let bidirectional = K0Workspace::new_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            WorkspaceLimits {
+                max_setup_work: endpoint
+                    .construction_accounting()
+                    .work()
+                    .checked_add(bidirectional.construction_accounting().work())
+                    .and_then(|work| {
+                        work.checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                    })
+                    .unwrap(),
+                max_scratch_bytes: endpoint
+                    .retained_bytes()
+                    .checked_add(bidirectional.retained_bytes())
+                    .and_then(|bytes| bytes.checked_add(Automaton::pooled_workspace_owner_bytes()))
+                    .unwrap(),
+            }
+        }
+
+        let exact = compile_ranges(&[(b'a', b'a')]);
+        let limits = aggregate_limits(&exact);
+        let endpoint = exact
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("aggregate envelope admits endpoint owner");
+        endpoint.commit();
+        let promoted = exact
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("exact aggregate envelope admits promotion");
+        assert!(promoted.cold_setup.is_some());
+        assert!(
+            promoted
+                .supports_selected_capabilities(
+                    &exact,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap()
+        );
+        promoted.commit();
+
+        for (resource, limits) in [
+            (
+                "setup work",
+                WorkspaceLimits {
+                    max_setup_work: limits.max_setup_work - 1,
+                    ..limits
+                },
+            ),
+            (
+                "scratch bytes",
+                WorkspaceLimits {
+                    max_scratch_bytes: limits.max_scratch_bytes - 1,
+                    ..limits
+                },
+            ),
+        ] {
+            let refused = compile_ranges(&[(b'a', b'a')]);
+            let endpoint = refused
+                .try_checkout_pooled_workspace(limits, true, false)
+                .expect("one-below aggregate envelope still admits endpoint owner");
+            endpoint.commit();
+            let fallback = refused
+                .try_checkout_pooled_workspace(limits, true, true)
+                .expect("one-below promotion executes through retained endpoint state");
+            assert!(fallback.cold_setup.is_none());
+            assert!(
+                !fallback
+                    .supports_selected_capabilities(
+                        &refused,
+                        WorkspaceLimits::unlimited(),
+                        true,
+                        true,
+                    )
+                    .unwrap(),
+                "one-below {resource} must not retain a partial promotion",
+            );
+            fallback.commit();
+        }
     }
 
     #[test]

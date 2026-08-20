@@ -16,12 +16,15 @@ Key invariants:
 - accept states have no outgoing edges;
 - every index, table dimension, storage charge, scratch charge, and work charge
   is checked;
-- `K0Workspace` exposes a fixed, auditable layout for repeated calls: its
-  backing vectors are fully initialized once, never grow during search, and
-  report allocator-visible retained capacity;
+- `K0Workspace` exposes a fixed, auditable layout for repeated calls: direct
+  transition rows reserve their final capacity up front and initialize only
+  as states become live, no backing vector allocates or grows retained capacity
+  during search, and allocator-visible retained capacity remains reported;
 - one-shot calls remain available and report cold allocation/initialization,
   while reusable calls split their constant logical reset work from transition
   work and report zero per-call allocation;
+- setup `initialized_bytes` covers setup-phase writes, while demand-initialized
+  transition rows and cache cells are charged to execution work;
 - workspace shape mismatches and per-call scratch limits are errors rather than
   implicit resizing;
 - logical thread lengths are reset before every invocation, including after an

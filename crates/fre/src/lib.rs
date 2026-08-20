@@ -9674,9 +9674,10 @@ impl PortableK0Plan {
         let assertion_free_nullable =
             minimum_match_bytes == Some(0) && !self.automaton.stats().has_assertions();
         let endpoint_eligible = positive || assertion_free_nullable;
-        // Ordinary callers can freely alternate existence and full-span
-        // operations. Select one source-free layout that supports both so
-        // operation order cannot determine the retained capability.
+        // Existence needs only the forward endpoint cache. If a later Span
+        // call needs reverse recovery, the automaton-owned pool constructs a
+        // complete bidirectional replacement while retaining this workspace,
+        // then publishes the stronger workspace only after successful execution.
         match operation {
             K0PooledValueOperation::Exists => self
                 .automaton
@@ -9686,7 +9687,7 @@ impl PortableK0Plan {
                     limits,
                     workspace_limits,
                     endpoint_eligible,
-                    positive,
+                    false,
                 )
                 .map(|value| value.map(K0PooledValue::Exists)),
             K0PooledValueOperation::Span => self
@@ -22518,8 +22519,10 @@ mod tests {
         assert!(second_accounting.setup().allocated_bytes() > 0);
 
         // Rust-style ordinary calls retain one source-free selected
-        // workspace. Existence and span can be freely interleaved because the
-        // layout is selected solely from immutable language facts.
+        // workspace. Existence starts with endpoint-only state; the first Span
+        // promotes it transactionally, and later calls reuse the stronger
+        // workspace regardless of operation order.
+        assert!(regex.is_match(haystack));
         assert_eq!(regex.find(haystack), expected);
         assert!(regex.is_match(haystack));
         assert_eq!(regex.find(haystack), expected);
@@ -22573,9 +22576,11 @@ mod tests {
             ))
         ));
 
-        // A clone has a fresh cache owner but identical semantics.
+        // A clone has a fresh cache owner but identical semantics. Starting
+        // with Span retains bidirectional state for the following Exists call.
         let clone = regex.clone();
         assert_eq!(clone.find(haystack), expected);
+        assert!(clone.is_match(haystack));
     }
 
     #[test]

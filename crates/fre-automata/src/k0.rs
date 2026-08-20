@@ -2630,8 +2630,12 @@ pub struct WorkspaceLayout {
     reverse_item_capacity: usize,
     reverse_context_slots: usize,
     logical_bytes: usize,
+    // Full logical cache initialization is retained for compiler-prefill
+    // accounting. Runtime construction defers direct-row sentinel writes.
     initialized_bytes: usize,
     construction_work: u64,
+    runtime_initialized_bytes: usize,
+    runtime_construction_work: u64,
 }
 
 impl WorkspaceLayout {
@@ -2856,6 +2860,18 @@ impl WorkspaceLayout {
                 detail: "compiler K0 identity-index work exceeds construction work",
             },
         )?;
+        self.runtime_initialized_bytes = self
+            .runtime_initialized_bytes
+            .checked_sub(index_bytes)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "compiler K0 identity-index bytes exceed runtime initialized bytes",
+            })?;
+        self.runtime_construction_work = self
+            .runtime_construction_work
+            .checked_sub(omitted_work)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "compiler K0 identity-index work exceeds runtime construction work",
+            })?;
         Ok(self)
     }
 
@@ -2966,6 +2982,18 @@ impl WorkspaceLayout {
             },
         )?;
         Ok((work, initialized_bytes))
+    }
+
+    /// Runtime direct rows retain their final allocation from construction,
+    /// but sentinel-initialize only the rows that become live. Unlike the AOT
+    /// compiler reservation, runtime metadata and item arenas remain eagerly
+    /// initialized, and contextual transition stores retain their existing
+    /// fixed initialization contract.
+    const fn runtime_reserved_construction(self) -> (u64, usize) {
+        (
+            self.runtime_construction_work,
+            self.runtime_initialized_bytes,
+        )
     }
 
     #[allow(
@@ -3206,6 +3234,54 @@ impl WorkspaceLayout {
                 computation: "workspace construction work conversion",
             }
         })?;
+        let stride = usize::try_from(direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "workspace direct-row stride does not fit usize",
+            }
+        })?;
+        let deferred_forward_rows = if lazy_context_slots == 0 {
+            lazy_state_capacity.checked_mul(stride).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "runtime K0 deferred forward row cells",
+                },
+            )?
+        } else {
+            0
+        };
+        let deferred_reverse_rows = if reverse_context_slots == 0 {
+            reverse_state_capacity.checked_mul(stride).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "runtime K0 deferred reverse row cells",
+                },
+            )?
+        } else {
+            0
+        };
+        let deferred_rows = deferred_forward_rows
+            .checked_add(deferred_reverse_rows)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "runtime K0 deferred direct-row cells",
+            })?;
+        let deferred_work = u64::try_from(deferred_rows).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "runtime K0 deferred direct-row work conversion",
+            }
+        })?;
+        let deferred_bytes = deferred_rows.checked_mul(size_of::<u32>()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "runtime K0 deferred direct-row bytes",
+            },
+        )?;
+        let runtime_construction_work = construction_work.checked_sub(deferred_work).ok_or(
+            SearchError::InternalInvariant {
+                detail: "runtime K0 deferred row work exceeds construction work",
+            },
+        )?;
+        let runtime_initialized_bytes = initialized_bytes.checked_sub(deferred_bytes).ok_or(
+            SearchError::InternalInvariant {
+                detail: "runtime K0 deferred row bytes exceed initialized bytes",
+            },
+        )?;
         Ok(Self {
             states,
             edges,
@@ -3221,6 +3297,8 @@ impl WorkspaceLayout {
             logical_bytes,
             initialized_bytes,
             construction_work,
+            runtime_initialized_bytes,
+            runtime_construction_work,
         })
     }
 
@@ -3256,8 +3334,12 @@ impl WorkspaceLayout {
 
     /// Exact logical constructor charge for this layout.
     #[must_use]
+    #[allow(
+        clippy::misnamed_getters,
+        reason = "the private sibling field retains the compiler-prefill charge"
+    )]
     pub const fn construction_work(self) -> u64 {
-        self.construction_work
+        self.runtime_construction_work
     }
 }
 
@@ -4086,8 +4168,9 @@ enum LazyInitialKind {
 /// This deliberately projects semantic components instead of the private
 /// lazy-workspace layout. The row address stays valid while the borrowed
 /// workspace remains at the same address and no mutable callback starts.
-/// Direct rows are fixed-capacity and initialized at construction; later K0
-/// publication changes only an existing `u32` cell. A native caller must
+/// Direct rows retain fixed capacity at construction and initialize one
+/// sentinel row when its state is published; later K0 publication changes
+/// only an existing `u32` cell. A native caller must
 /// nevertheless re-enter K0 at its first unpublished cell, or before it would
 /// execute one of the learned-loop rows below without an independent
 /// authenticated scanner that owns that exact row and skip.
@@ -4350,7 +4433,10 @@ impl LazyWorkspace {
             scratch_len: 0,
             frontier: allocate_slots(layout.states, 0_u32, total_bytes)?,
             frontier_len: 0,
-            rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
+            // Reserve the complete immutable row arena so searches never
+            // allocate, but initialize each sentinel row only when its state
+            // is transactionally published.
+            rows: reserve_slots(row_cells, total_bytes)?,
             direct_row_stride: layout.direct_row_stride,
             context: ContextTransitionStore::new(
                 layout.lazy_context_slots,
@@ -4484,7 +4570,55 @@ impl LazyWorkspace {
     }
 
     fn is_allocated(&self) -> bool {
-        !self.rows.is_empty() || self.context.is_allocated()
+        !self.offsets.is_empty() || self.context.is_allocated()
+    }
+
+    fn direct_row_initialization_for(
+        &self,
+        state_len: usize,
+    ) -> Result<(usize, usize), SearchError> {
+        if self.context.is_allocated() {
+            return Ok((0, 0));
+        }
+        if state_len > self.offsets.len() {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA row initialization exceeds its state arena",
+            });
+        }
+        let stride = usize::try_from(self.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "lazy DFA row stride does not fit usize",
+            }
+        })?;
+        let target = state_len.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "lazy DFA initialized row cells",
+            },
+        )?;
+        if target > self.rows.capacity() {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA row initialization exceeds its reservation",
+            });
+        }
+        let added = target.saturating_sub(self.rows.len());
+        Ok((target.max(self.rows.len()), added))
+    }
+
+    fn initialize_direct_rows_through(
+        &mut self,
+        state_len: usize,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<(), SearchError> {
+        let (target, added) = self.direct_row_initialization_for(state_len)?;
+        meter.charge(
+            u64::try_from(added).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "lazy DFA row initialization work conversion",
+            })?,
+            position,
+        )?;
+        self.rows.resize(target, LAZY_CELL_UNFILLED);
+        Ok(())
     }
 
     fn is_bound_to(&self, automaton: &Automaton) -> bool {
@@ -4835,15 +4969,17 @@ impl LazyWorkspace {
         let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
             computation: "lazy DFA initial item work",
         })?;
-        meter.charge(item_work, position)?;
-        let hash = lazy_hash(&self.scratch[..item_count], pending);
-        meter.charge(item_work, position)?;
-        self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
-        self.offsets[0] = 0;
-        self.lengths[0] =
+        let encoded_item_count =
             u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA initial length does not fit u32",
             })?;
+        meter.charge(item_work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], pending);
+        meter.charge(item_work, position)?;
+        self.initialize_direct_rows_through(1, meter, position)?;
+        self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
+        self.offsets[0] = 0;
+        self.lengths[0] = encoded_item_count;
         self.modes[0] = u8::from(pending);
         self.hashes[0] = hash;
         self.state_len = 1;
@@ -5157,6 +5293,17 @@ impl LazyWorkspace {
                     computation: "lazy DFA speculative item end",
                 })?;
         let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
+        let next_state_len = self
+            .state_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA state count",
+            })?;
+        let row_initialization = if can_publish {
+            self.direct_row_initialization_for(next_state_len)?.1
+        } else {
+            0
+        };
         let publication_work = if can_publish { item_count.max(1) } else { 0 };
         let use_index = !self.index.is_empty() && self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
         let bootstraps_index = can_publish
@@ -5204,6 +5351,7 @@ impl LazyWorkspace {
             )
             .and_then(|work| work.checked_add(item_count))
             .and_then(|work| work.checked_add(publication_work))
+            .and_then(|work| work.checked_add(row_initialization))
             .and_then(|work| work.checked_add(index_publication_work))
             .and_then(|work| work.checked_add(bootstrap_work))
             .and_then(|work| work.checked_add(promotion_work))
@@ -5252,12 +5400,6 @@ impl LazyWorkspace {
         if !can_publish {
             return Ok(LazyInterned::CapacityFull);
         }
-        let next_state_len = self
-            .state_len
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA state count",
-            })?;
         let indexed_state = u32::try_from(self.state_len).map_err(|_| {
             SearchError::InternalInvariant {
                 detail: "lazy DFA state does not fit u32",
@@ -5295,6 +5437,7 @@ impl LazyWorkspace {
         if insertion_slot.is_some() && promotion.is_none() {
             meter.charge(1, position)?;
         }
+        self.initialize_direct_rows_through(next_state_len, meter, position)?;
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
         let state = self.state_len;
         self.offsets[state] = self.item_len;
@@ -5420,7 +5563,9 @@ impl ReverseWorkspace {
             scratch_len: 0,
             frontier: allocate_slots(layout.edges, 0_u32, total_bytes)?,
             frontier_len: 0,
-            rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
+            // As in the forward cache, retain final capacity without paying
+            // to touch rows that this workspace never learns.
+            rows: reserve_slots(row_cells, total_bytes)?,
             direct_row_stride: layout.direct_row_stride,
             context: ContextTransitionStore::new(
                 layout.reverse_context_slots,
@@ -5614,7 +5759,55 @@ impl ReverseWorkspace {
     }
 
     fn is_allocated(&self) -> bool {
-        !self.rows.is_empty() || self.context.is_allocated()
+        !self.offsets.is_empty() || self.context.is_allocated()
+    }
+
+    fn direct_row_initialization_for(
+        &self,
+        state_len: usize,
+    ) -> Result<(usize, usize), SearchError> {
+        if self.context.is_allocated() {
+            return Ok((0, 0));
+        }
+        if state_len > self.offsets.len() {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA row initialization exceeds its state arena",
+            });
+        }
+        let stride = usize::try_from(self.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA row stride does not fit usize",
+            }
+        })?;
+        let target = state_len.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "reverse DFA initialized row cells",
+            },
+        )?;
+        if target > self.rows.capacity() {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA row initialization exceeds its reservation",
+            });
+        }
+        let added = target.saturating_sub(self.rows.len());
+        Ok((target.max(self.rows.len()), added))
+    }
+
+    fn initialize_direct_rows_through(
+        &mut self,
+        state_len: usize,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<(), SearchError> {
+        let (target, added) = self.direct_row_initialization_for(state_len)?;
+        meter.charge(
+            u64::try_from(added).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "reverse DFA row initialization work conversion",
+            })?,
+            position,
+        )?;
+        self.rows.resize(target, LAZY_CELL_UNFILLED);
+        Ok(())
     }
 
     fn is_bound_to(&self, automaton: &Automaton) -> bool {
@@ -5867,15 +6060,17 @@ impl ReverseWorkspace {
         let work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
             computation: "reverse DFA initial item work",
         })?;
-        meter.charge(work, position)?;
-        let hash = lazy_hash(&self.scratch[..item_count], false);
-        meter.charge(work, position)?;
-        self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
-        self.offsets[0] = 0;
-        self.lengths[0] =
+        let encoded_item_count =
             u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
                 detail: "reverse DFA initial length does not fit u32",
             })?;
+        meter.charge(work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], false);
+        meter.charge(work, position)?;
+        self.initialize_direct_rows_through(1, meter, position)?;
+        self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
+        self.offsets[0] = 0;
+        self.lengths[0] = encoded_item_count;
         self.hashes[0] = hash;
         self.state_len = 1;
         self.item_len = item_count;
@@ -6173,6 +6368,17 @@ impl ReverseWorkspace {
                     computation: "reverse DFA speculative item end",
                 })?;
         let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
+        let next_state_len = self
+            .state_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA state count",
+            })?;
+        let row_initialization = if can_publish {
+            self.direct_row_initialization_for(next_state_len)?.1
+        } else {
+            0
+        };
         let publication_work = if can_publish { item_count.max(1) } else { 0 };
         let use_index = !self.index.is_empty() && self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
         let bootstraps_index = can_publish
@@ -6215,6 +6421,7 @@ impl ReverseWorkspace {
             )
             .and_then(|work| work.checked_add(item_count))
             .and_then(|work| work.checked_add(publication_work))
+            .and_then(|work| work.checked_add(row_initialization))
             .and_then(|work| work.checked_add(index_publication_work))
             .and_then(|work| work.checked_add(bootstrap_work))
             .and_then(|work| work.checked_add(promotion_work))
@@ -6259,12 +6466,6 @@ impl ReverseWorkspace {
         if !can_publish {
             return Ok(LazyInterned::CapacityFull);
         }
-        let next_state_len = self
-            .state_len
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "reverse DFA state count",
-            })?;
         let indexed_state = u32::try_from(self.state_len).map_err(|_| {
             SearchError::InternalInvariant {
                 detail: "reverse DFA state does not fit u32",
@@ -6302,6 +6503,7 @@ impl ReverseWorkspace {
         if insertion_slot.is_some() && promotion.is_none() {
             meter.charge(1, position)?;
         }
+        self.initialize_direct_rows_through(next_state_len, meter, position)?;
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
         let state = self.state_len;
         self.offsets[state] = self.item_len;
@@ -7035,12 +7237,13 @@ impl K0FullyPrefilledRootProjection<'_> {
 
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
 ///
-/// Runtime-created backing vectors retain their full initialized length.
-/// Separate logical lengths control which thread slots are live, so execution
-/// cannot trigger a reserve or resize. The private slow compiler is the sole
-/// exception: it reserves one final-capacity owner, appends initialized cache
-/// ranges before publication, and never exposes that owner through runtime
-/// workspace APIs. A runtime workspace is compatible with every validated
+/// Runtime-created vectors reserve their full retained capacity. Pike scratch,
+/// cache metadata, and contextual stores retain their full initialized length;
+/// direct transition rows append sentinel-initialized ranges as states become
+/// live. Those appends remain within reserved capacity, cannot allocate, and
+/// are charged to execution work rather than setup `initialized_bytes`. The
+/// private slow compiler similarly appends initialized cache ranges before
+/// publication. A runtime workspace is compatible with every validated
 /// automaton having the exact layout returned by [`Self::layout`].
 #[derive(Debug)]
 pub struct K0Workspace {
@@ -8049,10 +8252,11 @@ impl K0CompilerPrefill {
 }
 
 impl K0Workspace {
-    /// Allocate and fully initialize fixed-capacity workspace for `automaton`.
+    /// Allocate fixed-capacity workspace for `automaton`.
     ///
     /// Both the logical payload and allocator-reported retained capacity are
-    /// checked against `limits`. The returned object never grows implicitly.
+    /// checked against `limits`. Direct transition rows reserve their final
+    /// capacity here and initialize without allocation as states become live.
     ///
     /// # Errors
     ///
@@ -8068,7 +8272,8 @@ impl K0Workspace {
     /// workspace. Assertion-free byte automata add fixed-capacity direct rows;
     /// assertion-bearing byte automata instead key a bounded transition store
     /// by the exact enabled-assertion mask at each boundary. Neither store
-    /// grows during a search. Assertion-free nullable graphs retain their
+    /// allocates or grows its retained capacity during a search.
+    /// Assertion-free nullable graphs retain their
     /// ordered higher-priority consuming prefix plus the initial empty match;
     /// contextual nullable and empty-language graphs remain on Pike. Span
     /// operations use Pike unless an empty result needs no reverse recovery.
@@ -8088,9 +8293,9 @@ impl K0Workspace {
     /// that recovers exact starts for full-span operations.
     ///
     /// Structurally ineligible graphs retain the ordinary Pike layout. The
-    /// reverse incoming-edge CSR and direct or assertion-contextual cache are
-    /// fixed and fully initialized before this method returns; searches never
-    /// grow them.
+    /// reverse incoming-edge CSR and assertion-contextual caches are fully
+    /// initialized before this method returns. Direct rows reserve their final
+    /// capacity and initialize without allocation as states become live.
     ///
     /// # Errors
     ///
@@ -8122,8 +8327,23 @@ impl K0Workspace {
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Self, SearchError> {
+        let layout = Self::selected_layout(
+            automaton,
+            limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        Self::new_with_layout(automaton, limits, layout)
+    }
+
+    fn selected_layout(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<WorkspaceLayout, SearchError> {
         let fits = |layout: WorkspaceLayout| {
-            layout.construction_work <= limits.max_setup_work
+            layout.runtime_reserved_construction().0 <= limits.max_setup_work
                 && layout.logical_bytes <= limits.max_scratch_bytes
         };
         let admitted = |layout: Result<WorkspaceLayout, SearchError>| {
@@ -8135,7 +8355,7 @@ impl K0Workspace {
         let admitted_bidirectional = |layout: Result<WorkspaceLayout, SearchError>| {
             admitted(layout).filter(|layout| layout.reverse_state_capacity != 0)
         };
-        let layout = (endpoint_eligible && bidirectional)
+        (endpoint_eligible && bidirectional)
             .then(|| {
                 admitted_bidirectional(WorkspaceLayout::for_bidirectional_automaton(automaton))
             })
@@ -8168,8 +8388,49 @@ impl K0Workspace {
             .map_or_else(
                 || WorkspaceLayout::for_automaton(automaton),
                 Result::<_, SearchError>::Ok,
-            )?;
-        Self::new_with_layout(automaton, limits, layout)
+            )
+    }
+
+    /// Report whether this owner supplies the endpoint/reverse capabilities
+    /// that selection under the same resource envelope would construct.
+    ///
+    /// Cache width is intentionally ignored: narrow and wide caches satisfy
+    /// the same operations. A bidirectional owner satisfies an endpoint
+    /// request, while a selected Pike fallback requires no promotion.
+    pub(crate) fn supports_selected_capabilities(
+        &self,
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<bool, SearchError> {
+        if self.bound_automaton_identity != automaton.identity() {
+            return Ok(false);
+        }
+        if (!endpoint_eligible || self.bound_capabilities.lazy)
+            && (!endpoint_eligible || !bidirectional || self.bound_capabilities.reverse)
+        {
+            return Ok(true);
+        }
+        let selected = Self::selected_layout(
+            automaton,
+            limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        let wants_lazy = selected.lazy_state_capacity != 0;
+        let wants_reverse = selected.reverse_state_capacity != 0;
+        Ok((!wants_lazy || self.bound_capabilities.lazy)
+            && (!wants_reverse || self.bound_capabilities.reverse))
+    }
+
+    /// Monotonic operation capability retained by this selected workspace.
+    ///
+    /// Cache width and contextual layout details do not change which public
+    /// operations the workspace can accelerate, so they are deliberately not
+    /// part of this ordering.
+    pub(crate) fn selected_capability_rank(&self) -> u8 {
+        u8::from(self.bound_capabilities.lazy) + u8::from(self.bound_capabilities.reverse)
     }
 
     fn new_mode(
@@ -8186,10 +8447,11 @@ impl K0Workspace {
         limits: WorkspaceLimits,
         layout: WorkspaceLayout,
     ) -> Result<Self, SearchError> {
-        if layout.construction_work > limits.max_setup_work {
+        let (construction_work, initialized_bytes) = layout.runtime_reserved_construction();
+        if construction_work > limits.max_setup_work {
             return Err(SearchError::WorkspaceSetupWorkLimitExceeded {
                 limit: limits.max_setup_work,
-                needed: layout.construction_work,
+                needed: construction_work,
             });
         }
         if layout.logical_bytes > limits.max_scratch_bytes {
@@ -8225,9 +8487,9 @@ impl K0Workspace {
         }
 
         let construction = SetupAccounting {
-            work: layout.construction_work,
+            work: construction_work,
             allocated_bytes: retained_bytes,
-            initialized_bytes: layout.initialized_bytes,
+            initialized_bytes,
             retained_bytes,
             reused: false,
         };
@@ -8564,7 +8826,7 @@ impl K0Workspace {
         if self.bound_automaton_identity != automaton.identity()
             || !lazy.is_allocated()
             || !lazy.is_bound_to(automaton)
-            || lazy.rows.is_empty()
+            || lazy.rows.capacity() == 0
             || lazy.direct_row_stride == 0
         {
             return None;
@@ -9655,7 +9917,7 @@ impl<'a> K0SearchSession<'a> {
     ) -> Result<Option<Self>, SearchError> {
         let fits = |layout: WorkspaceLayout| {
             layout.reverse_state_capacity != 0
-                && layout.construction_work <= limits.max_setup_work
+                && layout.runtime_construction_work <= limits.max_setup_work
                 && layout.logical_bytes <= limits.max_scratch_bytes
         };
         let finish = |workspace: K0Workspace| {
@@ -21014,7 +21276,14 @@ fn try_replace_lazy_cache(
             computation: "lazy cache replacement destination rows",
         },
     )?;
-    if replacement_row_cells > lazy.rows.len() {
+    let row_capacity_cells = lazy.offsets.len().checked_mul(stride).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement row capacity",
+        },
+    )?;
+    if replacement_row_cells > row_capacity_cells
+        || replacement_row_cells > lazy.rows.capacity()
+    {
         return Ok(None);
     }
     let retained_source_items = initial_len.checked_add(source_len).ok_or(
@@ -21039,7 +21308,9 @@ fn try_replace_lazy_cache(
         && lazy.hashes.len() >= 3
         && three_state_items <= lazy.items.len()
         && source_len <= lazy.frontier.len()
-        && three_state_row_cells.is_some_and(|cells| cells <= lazy.rows.len());
+        && three_state_row_cells.is_some_and(|cells| {
+            cells <= row_capacity_cells && cells <= lazy.rows.capacity()
+        });
     let row_clear_cells = lazy.state_len.checked_mul(stride).ok_or(
         SearchError::ArithmeticOverflow {
             computation: "lazy cache replacement live rows",
@@ -21086,6 +21357,14 @@ fn try_replace_lazy_cache(
     } else {
         0
     };
+    let replacement_initialized_rows = if preserve_distinct_source {
+        three_state_row_cells.ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement initialized rows",
+        })?
+    } else {
+        replacement_row_cells
+    };
+    let row_initialization = replacement_initialized_rows.saturating_sub(lazy.rows.len());
 
     // One target hash, comparisons against both retained identities, and at
     // most three item publications are the only item-linear work. The source
@@ -21100,6 +21379,7 @@ fn try_replace_lazy_cache(
     let scalar_work = if preserve_distinct_source { 16 } else { 13 };
     let replacement_work = row_clear_cells
         .checked_add(index_clear_slots)
+        .and_then(|work| work.checked_add(row_initialization))
         // Initial compaction is one overlap-safe `copy_within`; unlike the
         // optional source snapshot it no longer takes a second item pass.
         .and_then(|work| work.checked_add(initial_len))
@@ -21155,13 +21435,15 @@ fn try_replace_lazy_cache(
     let source_cell_index = source_new_state.map(|state| {
         direct_row_cell_index(state, class, lazy.direct_row_stride)
     });
-    if source_cell_index.is_some_and(|index| index >= lazy.rows.len()) {
+    if source_cell_index.is_some_and(|index| index >= replacement_initialized_rows) {
         return Err(SearchError::InternalInvariant {
             detail: "lazy cache replacement source cell is outside the row arena",
         });
     }
     if source_cell_index.is_some_and(|index| {
-        index >= row_clear_cells && lazy.rows[index] != LAZY_CELL_UNFILLED
+        index >= row_clear_cells
+            && index < lazy.rows.len()
+            && lazy.rows[index] != LAZY_CELL_UNFILLED
     }) {
         return Err(SearchError::InternalInvariant {
             detail: "lazy cache replacement unused source row retained stale authority",
@@ -21175,6 +21457,16 @@ fn try_replace_lazy_cache(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy cache replacement retained state count",
         })?;
+    let final_row_cells = state_len.checked_mul(stride).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement final row cells",
+        },
+    )?;
+    if source_cell_index.is_some_and(|index| index >= final_row_cells) {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy cache replacement source cell exceeds its final rows",
+        });
+    }
     let target_publication = target_needs_publication.then_some(if preserve_distinct_source {
         (2_usize, retained_source_items, three_state_items)
     } else {
@@ -21203,7 +21495,10 @@ fn try_replace_lazy_cache(
     // cleared its then-live row/index prefix. Therefore the current live
     // prefixes cover every slot this generation could have republished; an
     // older, larger generation cannot leave authority in the unused tail.
+    lazy.rows
+        .resize(replacement_initialized_rows.max(lazy.rows.len()), LAZY_CELL_UNFILLED);
     lazy.rows[..row_clear_cells].fill(LAZY_CELL_UNFILLED);
+    lazy.rows.truncate(final_row_cells);
     lazy.index[..index_clear_slots].fill(LAZY_NO_STATE);
     lazy.items.copy_within(initial_offset..initial_end, 0);
     lazy.offsets[0] = 0;
@@ -23324,6 +23619,8 @@ fn fully_prefilled_byte_row_offset(
 /// Materialize one absolute-token raw-byte view into the unused suffix of an
 /// already initialized compact-row arena. A capacity decline writes nothing;
 /// every other failure remains private to the staged workspace transaction.
+/// `logical_row_cells` is the authenticated layout reservation; allocator
+/// over-allocation in `rows.capacity()` never expands that logical arena.
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::too_many_lines,
@@ -23332,10 +23629,11 @@ fn fully_prefilled_byte_row_offset(
 #[cold]
 fn try_materialize_fully_prefilled_byte_rows(
     automaton: &Automaton,
-    rows: &mut [u32],
+    rows: &mut Vec<u32>,
     compact_stride: u32,
     state_len: usize,
     compact_cells: usize,
+    logical_row_cells: usize,
     meter: &mut WorkMeter,
 ) -> Result<Option<usize>, SearchError> {
     let stride = usize::try_from(compact_stride).map_err(|_| {
@@ -23360,7 +23658,15 @@ fn try_materialize_fully_prefilled_byte_rows(
     let Some(byte_row_end) = byte_row_base.checked_add(byte_cells) else {
         return Ok(None);
     };
-    if byte_cells == 0 || byte_row_end > rows.len() {
+    if compact_cells > logical_row_cells {
+        return Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled compact rows exceed their logical reservation",
+        });
+    }
+    if byte_cells == 0
+        || byte_row_end > logical_row_cells
+        || byte_row_end > rows.capacity()
+    {
         return Ok(None);
     }
     let last_state = u32::try_from(state_len - 1).map_err(|_| {
@@ -23378,6 +23684,14 @@ fn try_materialize_fully_prefilled_byte_rows(
             detail: "fully-prefilled byte rows do not close their admitted arena",
         });
     }
+    let added = byte_row_end.saturating_sub(rows.len());
+    meter.charge(
+        u64::try_from(added).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "fully-prefilled raw-byte row initialization conversion",
+        })?,
+        0,
+    )?;
+    rows.resize(byte_row_end.max(rows.len()), LAZY_CELL_UNFILLED);
 
     for state in 0..state_len {
         for byte in u8::MIN..=u8::MAX {
@@ -23967,12 +24281,20 @@ fn prefill_complete_caches_transaction_impl(
             try_derive_lazy_loop_skip(automaton, &mut staged, &mut meter)?;
             let forward_stride = staged.lazy.direct_row_stride;
             let forward_state_len = staged.lazy.state_len;
+            let forward_logical_cells = staged
+                .layout
+                .lazy_state_capacity
+                .checked_mul(stride)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "compiler-private forward logical row cells",
+                })?;
             let forward_byte_rows = match try_materialize_fully_prefilled_byte_rows(
                 automaton,
                 &mut staged.lazy.rows,
                 forward_stride,
                 forward_state_len,
                 forward_cells,
+                forward_logical_cells,
                 &mut meter,
             )? {
                 Some(base) => {
@@ -23987,12 +24309,20 @@ fn prefill_complete_caches_transaction_impl(
             let reverse_byte_rows = if staged.reverse.is_allocated() {
                 let reverse_stride = staged.reverse.direct_row_stride;
                 let reverse_state_len = staged.reverse.state_len;
+                let reverse_logical_cells = staged
+                    .layout
+                    .reverse_state_capacity
+                    .checked_mul(stride)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "compiler-private reverse logical row cells",
+                    })?;
                 match try_materialize_fully_prefilled_byte_rows(
                     automaton,
                     &mut staged.reverse.rows,
                     reverse_stride,
                     reverse_state_len,
                     reverse_cells,
+                    reverse_logical_cells,
                     &mut meter,
                 )? {
                     Some(_) => {
@@ -24345,6 +24675,15 @@ fn lazy_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError> {
             computation: "lazy DFA initial epsilon-edge count",
         }
     })?;
+    let row_initialization = if automaton.stats().assertion_edges() == 0 {
+        u64::try_from(automaton.byte_classes().count()).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "lazy DFA initial row initialization",
+            }
+        })?
+    } else {
+        0
+    };
     states
         .checked_mul(2)
         .and_then(|work| {
@@ -24353,6 +24692,7 @@ fn lazy_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError> {
                 .and_then(|edges| work.checked_add(edges))
         })
         .and_then(|work| work.checked_add(2))
+        .and_then(|work| work.checked_add(row_initialization))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA initial preparation work",
         })
@@ -26502,6 +26842,15 @@ fn reverse_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError>
             computation: "reverse DFA initial consuming-edge count",
         }
     })?;
+    let row_initialization = if automaton.stats().assertion_edges() == 0 {
+        u64::try_from(automaton.byte_classes().count()).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "reverse DFA initial row initialization",
+            }
+        })?
+    } else {
+        0
+    };
     states
         .checked_mul(3)
         .and_then(|work| {
@@ -26515,6 +26864,7 @@ fn reverse_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError>
                 .and_then(|items| work.checked_add(items))
         })
         .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(row_initialization))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "reverse DFA initial preparation work",
         })
@@ -39387,12 +39737,14 @@ mod tests {
         let workspace =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(workspace.retained_bytes(), full.logical_bytes());
+        assert!(workspace.lazy.rows.is_empty());
+        assert!(workspace.reverse.rows.is_empty());
         assert_eq!(
-            workspace.lazy.rows.len(),
+            workspace.lazy.rows.capacity(),
             endpoint.lazy_state_capacity * usize::try_from(endpoint.direct_row_stride).unwrap()
         );
         assert_eq!(
-            workspace.reverse.rows.len(),
+            workspace.reverse.rows.capacity(),
             full.reverse_state_capacity * usize::try_from(full.direct_row_stride).unwrap()
         );
         let final_state = u32::try_from(endpoint.lazy_state_capacity - 1).unwrap();
@@ -42034,6 +42386,7 @@ mod tests {
         assert!(tiny_workspace.lazy.index.is_empty());
 
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let row_work = plan.byte_classes().count();
         let mut workspace =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(workspace.lazy.index.len(), 512);
@@ -42044,7 +42397,7 @@ mod tests {
             workspace.lazy.intern_initial(false, &mut initial, 0),
             Ok(0)
         );
-        assert_eq!(initial.consumed, 2);
+        assert_eq!(initial.consumed, u64::try_from(2 + row_work).unwrap());
         assert!(workspace
             .lazy
             .index
@@ -42054,7 +42407,7 @@ mod tests {
         // Even with a preallocated index, small publication is the exact
         // baseline linear transaction and leaves every index slot untouched.
         stage(&mut workspace, 512);
-        let mut refused = WorkMeter::new(3, 0);
+        let mut refused = WorkMeter::new(u64::try_from(3 + row_work).unwrap(), 0);
         assert_eq!(
             workspace
                 .lazy
@@ -42063,14 +42416,14 @@ mod tests {
         );
         assert_eq!(refused.consumed, 0);
 
-        let mut publish = WorkMeter::new(4, 0);
+        let mut publish = WorkMeter::new(u64::try_from(4 + row_work).unwrap(), 0);
         assert_eq!(
             workspace
                 .lazy
                 .intern_speculative(false, &mut publish, 0, 0),
             Ok(super::LazyInterned::State(1))
         );
-        assert_eq!(publish.consumed, 3);
+        assert_eq!(publish.consumed, u64::try_from(3 + row_work).unwrap());
 
         for item in 1..14_u32 {
             stage(&mut workspace, item);
@@ -42117,6 +42470,7 @@ mod tests {
             .checked_mul(2)
             .and_then(|work| work.checked_add(2))
             .and_then(|work| work.checked_add(super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK))
+            .and_then(|work| work.checked_add(row_work))
             .unwrap();
         let mut boundary_refused = WorkMeter::new(
             u64::try_from(bootstrap_bound.checked_sub(1).unwrap()).unwrap(),
@@ -42175,7 +42529,10 @@ mod tests {
                 .intern_speculative(false, &mut clustered_publish, 0, 0),
             Ok(super::LazyInterned::State(16))
         );
-        assert_eq!(clustered_publish.consumed, 7);
+        assert_eq!(
+            clustered_publish.consumed,
+            u64::try_from(7 + row_work).unwrap()
+        );
 
         stage(&mut workspace, 1536);
         let mut clustered_hit = WorkMeter::new(u64::MAX, 0);
@@ -42263,6 +42620,7 @@ mod tests {
             .checked_add(1)
             .and_then(|work| work.checked_mul(2))
             .and_then(|work| work.checked_add(3))
+            .and_then(|work| work.checked_add(row_work))
             .unwrap();
         let mut indexed_refused = WorkMeter::new(
             u64::try_from(indexed_publication_bound - 1).unwrap(),
@@ -42376,6 +42734,7 @@ mod tests {
             .checked_mul(2)
             .and_then(|work| work.checked_add(2))
             .and_then(|work| work.checked_add(super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK))
+            .and_then(|work| work.checked_add(row_work))
             .unwrap();
         let mut threshold_refused =
             WorkMeter::new(
@@ -42581,6 +42940,7 @@ mod tests {
             .and_then(|work| work.checked_mul(2))
             .and_then(|work| work.checked_add(2))
             .and_then(|work| work.checked_add(promotion_work))
+            .and_then(|work| work.checked_add(plan.byte_classes().count()))
             .unwrap();
         let before_index = workspace.lazy.index.clone();
         let before_items = workspace.lazy.items.clone();
@@ -42705,6 +43065,7 @@ mod tests {
         }
 
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let row_work = plan.byte_classes().count();
         let mut workspace =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(workspace.reverse.index.len(), 128);
@@ -42730,7 +43091,8 @@ mod tests {
         let linear_states = super::LAZY_HASH_INDEX_MIN_STATES - 1;
         let bootstrap_bound = linear_states * 2
             + 2
-            + super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK;
+            + super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
+            + row_work;
         let mut refused =
             WorkMeter::new(u64::try_from(bootstrap_bound - 1).unwrap(), 0);
         assert_eq!(
@@ -43116,6 +43478,12 @@ mod tests {
                 0,
             )
             .unwrap()
+            .checked_sub(
+                forward_states
+                    .checked_mul(usize::try_from(endpoint.direct_row_stride).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
             .checked_add(7)
             .and_then(|work| {
                 work.checked_add(usize::from(super::lazy_index_admitted(forward_states)))
@@ -43139,8 +43507,9 @@ mod tests {
                 },
             )
             .unwrap();
+            assert!(exact_endpoint.lazy.rows.is_empty(), "{name}: forward rows are deferred");
             assert_eq!(
-                exact_endpoint.lazy.rows.len(),
+                exact_endpoint.lazy.rows.capacity(),
                 forward_states
                     .checked_mul(usize::try_from(endpoint.direct_row_stride).unwrap())
                     .unwrap(),
@@ -43200,8 +43569,9 @@ mod tests {
             );
             let exact_full =
                 K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+            assert!(exact_full.reverse.rows.is_empty(), "{name}: reverse rows are deferred");
             assert_eq!(
-                exact_full.reverse.rows.len(),
+                exact_full.reverse.rows.capacity(),
                 reverse_states
                     .checked_mul(usize::try_from(full.direct_row_stride).unwrap())
                     .unwrap(),
@@ -63087,6 +63457,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_byte_overlay_cannot_use_allocator_capacity_beyond_the_logical_layout() {
+        let plan = byte_chain(&[(b'a', b'a')]);
+        let stride = plan.byte_classes().count();
+        let physical_cells = stride.checked_add(super::BYTE_ALPHABET).unwrap();
+        let mut rows = Vec::with_capacity(physical_cells);
+        rows.resize(stride, 0);
+        assert!(rows.capacity() >= physical_cells);
+        let before = rows.clone();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::try_materialize_fully_prefilled_byte_rows(
+                &plan,
+                &mut rows,
+                u32::try_from(stride).unwrap(),
+                1,
+                stride,
+                stride,
+                &mut meter,
+            ),
+            Ok(None),
+        );
+        assert_eq!(rows, before);
+        assert_eq!(meter.consumed, 0);
+    }
+
+    #[test]
     fn fully_prefilled_resume_map_projects_compact_and_raw_row_formulas() {
         let plan = byte_chain(&[
             (b'a', b'a'),
@@ -64457,7 +64853,23 @@ mod tests {
             .lazy_state_capacity
             .checked_mul(super::BYTE_ALPHABET)
             .unwrap();
-        assert_eq!(workspace.lazy.rows.len(), exact_row_cells);
+        assert!(workspace.lazy.rows.is_empty());
+        assert_eq!(workspace.lazy.rows.capacity(), exact_row_cells);
+        let reserved_row_capacity = workspace.lazy.rows.capacity();
+        let construction = workspace.construction_accounting();
+        let deferred_row_bytes = exact_row_cells
+            .checked_mul(core::mem::size_of::<u32>())
+            .unwrap();
+        assert_eq!(construction.work(), layout.runtime_construction_work);
+        assert_eq!(
+            construction.initialized_bytes(),
+            layout
+                .initialized_bytes
+                .checked_sub(deferred_row_bytes)
+                .unwrap()
+        );
+        assert_eq!(construction.initialized_bytes(), layout.runtime_initialized_bytes);
+        assert_eq!(construction.retained_bytes(), layout.logical_bytes());
         assert_eq!(
             workspace.lazy.row_offset(1).unwrap() - workspace.lazy.row_offset(0).unwrap(),
             layout.direct_row_stride
@@ -64505,6 +64917,14 @@ mod tests {
         let mut initialization = WorkMeter::new(u64::MAX, 0);
         assert!(
             super::prepare_lazy(&plan, &mut workspace, &mut initialization, 0, 0).unwrap()
+        );
+        assert_eq!(workspace.lazy.rows.len(), workspace.lazy.state_len * stride);
+        assert_eq!(workspace.lazy.rows.capacity(), reserved_row_capacity);
+        assert!(initialization.consumed >= u64::try_from(stride).unwrap());
+        assert_eq!(
+            workspace.construction_accounting(),
+            construction,
+            "execution-time row publication is work, not setup initialization"
         );
         let state = workspace.lazy.initial;
         assert_eq!(
@@ -64658,10 +65078,8 @@ mod tests {
             layout,
             "cache-key normalization must not change the workspace contract"
         );
-        assert_eq!(
-            workspace.lazy.rows.len(),
-            exact_row_cells
-        );
+        assert_eq!(workspace.lazy.rows.len(), workspace.lazy.state_len * stride);
+        assert_eq!(workspace.lazy.rows.capacity(), reserved_row_capacity);
     }
 
     #[test]
@@ -64718,6 +65136,10 @@ mod tests {
         assert_eq!(workspace.reverse.cell(state, class).unwrap(), cell);
         assert_eq!(
             workspace.reverse.rows.len(),
+            workspace.reverse.state_len * plan.byte_classes().count()
+        );
+        assert_eq!(
+            workspace.reverse.rows.capacity(),
             layout.reverse_state_capacity * plan.byte_classes().count()
         );
         assert_eq!(plan.bidirectional_workspace_layout().unwrap(), layout);
@@ -64841,6 +65263,10 @@ mod tests {
         );
         assert_eq!(
             workspace.lazy.rows.len(),
+            workspace.lazy.state_len * plan.byte_classes().count()
+        );
+        assert_eq!(
+            workspace.lazy.rows.capacity(),
             layout.lazy_state_capacity * plan.byte_classes().count()
         );
     }
