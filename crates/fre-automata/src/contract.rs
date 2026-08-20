@@ -171,9 +171,11 @@ impl SearchAccounting {
 /// `allocated_bytes` counts retained heap payload obtained during this call. It
 /// is zero for a warm reusable-workspace call, while a cold reusable call may
 /// retain one immutable plan-side proof. `initialized_bytes` counts payload
-/// bytes logically written during construction, a generation-table reset, or
-/// transactional proof publication. Such a proof is published only after the
-/// execution loop succeeds.
+/// bytes logically written by setup: construction, a generation-table reset,
+/// or transactional proof publication. It deliberately excludes transition
+/// cache rows and cells initialized while executing the automaton; those
+/// writes are charged as execution work. A plan-side proof is published only
+/// after the execution loop succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupAccounting {
     pub(crate) work: u64,
@@ -206,7 +208,10 @@ impl SetupAccounting {
         self.allocated_bytes
     }
 
-    /// Payload bytes initialized or cleared by this call.
+    /// Payload bytes initialized or cleared by this call's setup phase.
+    ///
+    /// This excludes lazy transition-cache publication performed by the
+    /// execution loop, whose writes are represented by the work charge.
     #[must_use]
     pub const fn initialized_bytes(self) -> usize {
         self.initialized_bytes
@@ -731,11 +736,16 @@ impl Automaton {
         {
             return Ok(None);
         }
-        let warm = self.try_with_warm_owner_workspace(workspace_limits, |workspace| {
-            crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
-                self, haystack, window, workspace, limits,
-            )
-        });
+        let warm = self.try_with_warm_owner_workspace(
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+            |workspace| {
+                crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+                    self, haystack, window, workspace, limits,
+                )
+            },
+        );
         if let Some(result) = warm {
             return result.map(Some);
         }
@@ -824,11 +834,16 @@ impl Automaton {
         {
             return Ok(None);
         }
-        let warm = self.try_with_warm_owner_workspace(workspace_limits, |workspace| {
-            crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
-                self, haystack, window, workspace, limits,
-            )
-        });
+        let warm = self.try_with_warm_owner_workspace(
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+            |workspace| {
+                crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+                    self, haystack, window, workspace, limits,
+                )
+            },
+        );
         if let Some(result) = warm {
             return result.map(Some);
         }
