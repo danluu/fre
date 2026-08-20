@@ -85,6 +85,9 @@ typedef uint32_t fre_v1_status;
 /* Local syntax/configuration/non-resource diagnostics were checked. This does
  * not promise the pinned upstream compiled-size threshold. */
 #define FRE_V1_ADMISSION_STRICT_CHECKED UINT32_C(1)
+/* Source-compatible spelling retained from the exact-oracle design. No
+ * upstream oracle is pending; this is the same numeric strict-local state. */
+#define FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING FRE_V1_ADMISSION_STRICT_CHECKED
 
 typedef struct fre_v1_regex fre_v1_regex;
 

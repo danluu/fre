@@ -69,6 +69,12 @@ pub const FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS: u32 = 16;
 ///
 /// This does not promise the pinned upstream compiled-size threshold.
 pub const FRE_V1_ADMISSION_STRICT_CHECKED: u32 = 1;
+/// Compatibility spelling for the former pending-upstream-oracle state.
+///
+/// Native-size admission completes locally, so this has the same ABI value as
+/// [`FRE_V1_ADMISSION_STRICT_CHECKED`].
+#[deprecated(since = "0.1.0", note = "use FRE_V1_ADMISSION_STRICT_CHECKED")]
+pub const FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING: u32 = FRE_V1_ADMISSION_STRICT_CHECKED;
 
 pub const FRE_V1_DIAGNOSTIC_CAPACITY: usize = 256;
 

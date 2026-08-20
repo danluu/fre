@@ -454,8 +454,7 @@ fn compile_request_size_limit_is_native_and_last_setter_wins() {
     let target = Target::x86_64_linux();
     let default = CompileRequest::new("a", target);
     assert_eq!(default.limits.max_program_bytes, 10 * 1_048_576);
-    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
-        default.profile.constructor
+    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = default.profile.constructor
     else {
         panic!("default AOT request lost its Rust-like constructor stamp");
     };
@@ -463,9 +462,7 @@ fn compile_request_size_limit_is_native_and_last_setter_wins() {
 
     let mut wide = CompileLimitsV1::default();
     wide.max_program_bytes = 23 * 1_048_576;
-    let limits_last = CompileRequest::new("a", target)
-        .size_limit(17)
-        .limits(wide);
+    let limits_last = CompileRequest::new("a", target).size_limit(17).limits(wide);
     assert_eq!(limits_last.limits.max_program_bytes, wide.max_program_bytes);
     let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
         limits_last.profile.constructor
@@ -474,9 +471,7 @@ fn compile_request_size_limit_is_native_and_last_setter_wins() {
     };
     assert_eq!(size_limit, u64::try_from(wide.max_program_bytes).unwrap());
 
-    let size_last = CompileRequest::new("a", target)
-        .limits(wide)
-        .size_limit(17);
+    let size_last = CompileRequest::new("a", target).limits(wide).size_limit(17);
     assert_eq!(size_last.limits.max_program_bytes, 17);
     let rebar = CompileRequest::new("a", target)
         .size_limit(17)

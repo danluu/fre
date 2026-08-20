@@ -56,6 +56,16 @@ pub enum PortableTextRegexSetBuildError {
         index: usize,
         source: PortableTextBuildError,
     },
+    /// Legacy exact-upstream aggregate-admission failure.
+    ///
+    /// Native-size text-set construction no longer emits this variant.
+    #[deprecated(
+        since = "0.1.0",
+        note = "aggregate size_limit now reports PersistentLimit"
+    )]
+    UpstreamAdmission {
+        source: fre_syntax::ParseError,
+    },
     ArithmeticOverflow {
         computation: &'static str,
     },
@@ -89,6 +99,11 @@ impl fmt::Display for PortableTextRegexSetBuildError {
                     "portable text regex set pattern {index} failed: {source}"
                 )
             }
+            #[allow(deprecated)]
+            Self::UpstreamAdmission { source } => write!(
+                formatter,
+                "legacy upstream text regex set admission failed: {source}"
+            ),
             Self::ArithmeticOverflow { computation } => write!(
                 formatter,
                 "portable text regex set overflow computing {computation}"
@@ -101,6 +116,8 @@ impl std::error::Error for PortableTextRegexSetBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pattern { source, .. } => Some(source),
+            #[allow(deprecated)]
+            Self::UpstreamAdmission { source } => Some(source),
             _ => None,
         }
     }

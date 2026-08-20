@@ -369,8 +369,7 @@ fn size_limit_caps_the_fre_text_representation_at_its_exact_boundary() {
     let CompatibilityProfile::RustText(profile) = exact.profile() else {
         panic!("text builder published a non-text profile");
     };
-    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor
-    else {
+    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor else {
         panic!("text builder lost constructor identity");
     };
     assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));

@@ -1307,6 +1307,7 @@ fn classify_build_error(error: &BuildError) -> CandidateFailure {
     }
 }
 
+#[allow(deprecated)]
 fn classify_syntax_build_error(error: &fre_syntax::ParseError) -> (Status, &'static str) {
     match &error.category {
         fre_syntax::ErrorCategory::FreResourceLimit { .. }
@@ -1318,6 +1319,7 @@ fn classify_syntax_build_error(error: &fre_syntax::ParseError) -> (Status, &'sta
         }
         fre_syntax::ErrorCategory::InvalidPatternEncoding
         | fre_syntax::ErrorCategory::UpstreamRustSyntax
+        | fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { .. }
         | fre_syntax::ErrorCategory::Re2Syntax { .. }
         | fre_syntax::ErrorCategory::InvalidConfiguration => {
             (Status::Fault, "build.fault.syntax-or-profile")

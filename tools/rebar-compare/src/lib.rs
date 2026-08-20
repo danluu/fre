@@ -36640,10 +36640,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 53);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION, 3);
         assert_eq!(fre::AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, 2);
-        assert_eq!(
-            fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,
-            89
-        );
+        assert_eq!(fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT, 89);
         assert_eq!(fre::UNICODE_SCALAR_LEGAL_START_BYTE_COUNT, 179);
         assert_eq!(
             fre::UNICODE_SCALAR_CURSOR_COUNT_MAX_LEADING_BYTE_COUNT,

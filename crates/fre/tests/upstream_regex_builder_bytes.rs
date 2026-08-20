@@ -64,8 +64,7 @@ fn size_limit_caps_the_fre_persistent_representation_at_its_exact_boundary() {
     let CompatibilityProfile::RustBytes(profile) = exact.profile() else {
         panic!("portable bytes builder published a non-bytes profile");
     };
-    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor
-    else {
+    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor else {
         panic!("configured builder lost its high-level constructor identity");
     };
     assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
@@ -114,7 +113,11 @@ fn size_limit_caps_the_fre_persistent_representation_at_its_exact_boundary() {
 
 #[test]
 fn set_size_limit_is_one_aggregate_fre_persistent_cap() {
-    let patterns = vec!["(a)".to_owned(), "bravo".to_owned(), "charlie|delta".to_owned()];
+    let patterns = vec![
+        "(a)".to_owned(),
+        "bravo".to_owned(),
+        "charlie|delta".to_owned(),
+    ];
     let mut unbounded_limits = PortableRegexSetBuildLimits::default();
     unbounded_limits.max_persistent_bytes = usize::MAX;
     unbounded_limits.pattern.max_persistent_bytes = usize::MAX;
@@ -136,7 +139,9 @@ fn set_size_limit_is_one_aggregate_fre_persistent_cap() {
     assert_eq!(exact.build_report().charged_persistent_bytes, needed);
     assert_eq!(exact.build_report().limits.max_persistent_bytes, needed);
     for index in 0..exact.len() {
-        let report = exact.pattern_build_report(index).expect("constituent report");
+        let report = exact
+            .pattern_build_report(index)
+            .expect("constituent report");
         assert_eq!(report.persistent_byte_limit, usize::MAX);
         let CompatibilityProfile::RustBytes(profile) = &report.profile else {
             panic!("set constituent published a non-bytes profile");

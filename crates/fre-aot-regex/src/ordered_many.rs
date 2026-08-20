@@ -164,7 +164,17 @@ impl OrderedManyCompileRequest {
     #[must_use]
     pub fn limits(mut self, limits: OrderedManyCompileLimits) -> Self {
         self.limits = limits;
-        set_rust_profile_compiled_size_limit(&mut self.profile, limits.max_program_bytes_per_row);
+        // Ordered-many owns independent single-regex programs. Do not rewrite
+        // a caller-supplied set-constructor identity with this per-row limit.
+        if matches!(
+            &self.profile.constructor,
+            RustConstructor::RegexBuilder { .. }
+        ) {
+            set_rust_profile_compiled_size_limit(
+                &mut self.profile,
+                limits.max_program_bytes_per_row,
+            );
+        }
         self
     }
 

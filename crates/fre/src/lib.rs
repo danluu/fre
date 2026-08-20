@@ -1317,11 +1317,13 @@ pub enum BuildFailureClass {
 impl BuildError {
     /// Classify this failure without inspecting its human-readable message.
     #[must_use]
+    #[allow(deprecated)]
     pub fn failure_class(&self) -> BuildFailureClass {
         match self {
             Self::Syntax(error) => match &error.category {
                 fre_syntax::ErrorCategory::InvalidPatternEncoding
                 | fre_syntax::ErrorCategory::UpstreamRustSyntax
+                | fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { .. }
                 | fre_syntax::ErrorCategory::Re2Syntax { .. } => BuildFailureClass::ExpectedInvalid,
                 fre_syntax::ErrorCategory::FreResourceLimit { .. }
                 | fre_syntax::ErrorCategory::StrictQualificationFailure { .. } => {
@@ -5402,6 +5404,78 @@ pub struct PortableBuilder {
     retained_find_iter: bool,
 }
 
+/// Single-owner syntax result authenticated against one portable builder.
+///
+/// This is the reusable parse/plan seam for byte and text facades. It prevents
+/// an internal caller from pairing a canonical HIR with different profile,
+/// admission or hard-safety identities while avoiding a duplicate parse.
+struct PortableParsedBuildContext {
+    source: Box<str>,
+    admission: AdmissionStatus,
+    syntax: ParseSummary,
+    rust: fre_syntax::RustParsed,
+}
+
+impl PortableParsedBuildContext {
+    fn authenticate(
+        builder: &PortableBuilder,
+        parsed: fre_syntax::ParseAttempt,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, BuildError> {
+        if !parsed.closes() {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received an unauthenticated parse attempt",
+            ));
+        }
+        let (parsed, _receipt) = parsed.into_parts();
+        if parsed.key.schema_version != fre_syntax::SCHEMA_VERSION {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received another parse schema",
+            ));
+        }
+        if &parsed.key.profile != profile {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received a parsed record for another profile",
+            ));
+        }
+        if parsed.key.admission != builder.limits.admission {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received another parse admission policy",
+            ));
+        }
+        if parsed.key.safety != builder.limits.syntax_safety {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received another parse safety envelope",
+            ));
+        }
+        let expected_admission = match builder.limits.admission {
+            AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
+            AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
+        };
+        if parsed.admission_status != expected_admission {
+            return Err(BuildError::InternalInvariant(
+                "portable builder received inconsistent admission evidence",
+            ));
+        }
+        let source = String::from_utf8(parsed.key.pattern.into_bytes())
+            .map_err(|_| {
+                BuildError::InternalInvariant("Rust parse retained a non-UTF-8 source pattern")
+            })?
+            .into_boxed_str();
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            return Err(BuildError::InternalInvariant(
+                "Rust bytes request produced a non-Rust canonical pattern",
+            ));
+        };
+        Ok(Self {
+            source,
+            admission: parsed.admission_status,
+            syntax: parsed.summary,
+            rust,
+        })
+    }
+}
+
 pub(crate) fn rust_profile_size_limit(profile: &RustProfile) -> Option<usize> {
     match &profile.constructor {
         fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
@@ -5824,33 +5898,28 @@ impl PortableBuilder {
         let request = fre_syntax::ParseRequest::rust(pattern, profile.clone())
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let parsed = fre_syntax::parse(request)?;
-        self.build_from_parsed_record(parsed)
+        let parsed = fre_syntax::parse_attempt(request)
+            .map_err(fre_syntax::ParseAttemptError::into_source)?;
+        self.build_from_parse_attempt(parsed)
     }
 
-    pub(crate) fn build_from_parsed_record(
+    /// Plan from one already-closed Rust-bytes parse transaction.
+    ///
+    /// The parse attempt, rather than `self.pattern`, owns the authoritative
+    /// source. This permits the text facade to reuse its bytes-equivalence HIR
+    /// without cloning or parsing the source a third time.
+    pub(crate) fn build_from_parse_attempt(
         self,
-        parsed: fre_syntax::ParseRecord,
+        parsed: fre_syntax::ParseAttempt,
     ) -> Result<PortableRegex, BuildError> {
         let profile = CompatibilityProfile::RustBytes(self.profile.clone());
-        if parsed.key.profile != profile {
-            return Err(BuildError::InternalInvariant(
-                "portable builder received a parsed record for another profile",
-            ));
-        }
-        let source = String::from_utf8(parsed.key.pattern.into_bytes())
-            .map_err(|_| {
-                BuildError::InternalInvariant("Rust parse retained a non-UTF-8 source pattern")
-            })?
-            .into_boxed_str();
+        let PortableParsedBuildContext {
+            source,
+            admission,
+            syntax,
+            rust,
+        } = PortableParsedBuildContext::authenticate(&self, parsed, &profile)?;
         let source_storage_bytes = source.len();
-        let admission = parsed.admission_status;
-        let syntax = parsed.summary;
-        let CanonicalPattern::Rust(rust) = parsed.pattern else {
-            return Err(BuildError::InternalInvariant(
-                "Rust bytes request produced a non-Rust canonical pattern",
-            ));
-        };
         let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
             BuildError::InternalInvariant("syntax capture count does not fit usize")
         })?;
@@ -23091,47 +23160,36 @@ fn unicode_scalar_search_limits(limits: SearchLimits) -> UnicodeScalarSearchLimi
 #[cfg(test)]
 mod tests {
     use super::{
-        Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
-        CompatibilityProfile, GuardedLiteralSetSearchError, Hir, K0AbsoluteEndProof,
-        K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
-        K0MandatorySuffixPlan, K0MandatorySuffixRecoveryPlan, K0MandatorySuffixSpanOutcome,
-        K0NegativePrefilterOutcome, K0PooledValue, K0PooledValueOperation,
-        K0ReverseSuffixSpanAttempt, Match,
-        K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, K0SpanSourceCursor,
-        OperationSemantics, PlanKind, PlanSelection,
-        PackedLiteralSetError,
-        PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-        PortableFindIterRunLimits, PortableFindIterStepAccounting, PortablePlan, PortableRegex,
-        PortableSearchSession, PortableSearchSessionPlan, PortableSpanVisitLimits,
-        SearchAccounting, SearchError, SearchLimits,
-        SearchSessionLimits, SearchWindow,
-        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
-        SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
-        K0NegativePrefilterClassState, K0NegativePrefilterState,
-        K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
+        ASCII_RUN_SCANNER_BUILD_WORK, Automaton, BYTE_SET_BLOCK_BYTES, BuildError, BuildLimits,
+        CanonicalPattern, CaptureFreeOperation, CompatibilityProfile, GuardedLiteralSetSearchError,
+        Hir, K0_FINITE_SUFFIX_INCUMBENT_ROUTE, K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
         K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
-        K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK,
+        K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK, K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
         K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT, K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES,
-        k0_finite_prefix_hedge_window, k0_finite_suffix_prefix_hedge_bytes,
-        k0_finite_suffix_incumbent_single_pass_negative,
-        k0_mandatory_suffix_completed_negative_is_useful, K0FinitePrefixExistsHedge,
-        K0FiniteSuffixDirectRoute,
-        observe_k0_finite_suffix_direct_incumbent,
-        observe_k0_finite_suffix_incumbent, observe_k0_finite_suffix_loss,
-        observe_k0_finite_suffix_win, observe_k0_mandatory_suffix_completed_negative,
-        run_k0_finite_prefix_exists_hedge, run_k0_negative_prefilter,
-        select_k0_finite_suffix_direct_route, select_k0_finite_suffix_route,
-        try_build_k0_mandatory_cut,
-        try_build_k0_mandatory_suffix, try_build_k0_packed_frontier,
-        try_box_bounded_literal_class_run_owner,
-        try_box_bounded_delimited_segment_owner,
-        try_box_universal_finite_greedy_corridor_owner, try_k0_mandatory_suffix_exists,
-        try_k0_mandatory_suffix_span_start,
-        try_k0_mandatory_suffix_span_start_for_iteration,
-        try_execute_k0_reverse_suffix_span,
-        ASCII_RUN_SCANNER_BUILD_WORK, BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
-        K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
-        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID,
+        K0AbsoluteEndProof, K0FinitePrefixExistsHedge, K0FiniteSuffixDirectRoute,
+        K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome, K0MandatorySuffixPlan,
+        K0MandatorySuffixRecoveryPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterClassState,
+        K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
+        K0PackedFrontierPlan, K0PooledValue, K0PooledValueOperation, K0ReverseSuffixSpanAttempt,
+        K0SpanSourceCursor, LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, Match,
+        OperationSemantics, PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
+        PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
+        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+        PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
+        PortablePlan, PortableRegex, PortableSearchSession, PortableSearchSessionPlan,
+        PortableSpanVisitLimits, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
+        SearchWindow, SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+        k0_finite_prefix_hedge_window, k0_finite_suffix_incumbent_single_pass_negative,
+        k0_finite_suffix_prefix_hedge_bytes, k0_mandatory_suffix_completed_negative_is_useful,
+        observe_k0_finite_suffix_direct_incumbent, observe_k0_finite_suffix_incumbent,
+        observe_k0_finite_suffix_loss, observe_k0_finite_suffix_win,
+        observe_k0_mandatory_suffix_completed_negative, run_k0_finite_prefix_exists_hedge,
+        run_k0_negative_prefilter, select_k0_finite_suffix_direct_route,
+        select_k0_finite_suffix_route, try_box_bounded_delimited_segment_owner,
+        try_box_bounded_literal_class_run_owner, try_box_universal_finite_greedy_corridor_owner,
+        try_build_k0_mandatory_cut, try_build_k0_mandatory_suffix, try_build_k0_packed_frontier,
+        try_execute_k0_reverse_suffix_span, try_k0_mandatory_suffix_exists,
+        try_k0_mandatory_suffix_span_start, try_k0_mandatory_suffix_span_start_for_iteration,
     };
     use fre_automata::{
         MandatoryCutAnalysisLimits, MandatorySuffixAnalysisLimits, MaximumConsumedDistance,
@@ -23145,6 +23203,32 @@ mod tests {
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    #[test]
+    fn parsed_build_context_authenticates_and_owns_the_attempt_source() {
+        let builder = PortableBuilder::new("sentinel-is-not-authoritative").unicode(false);
+        let profile = CompatibilityProfile::RustBytes(builder.profile.clone());
+        let request = fre_syntax::ParseRequest::rust("a", profile.clone())
+            .with_admission(builder.limits.admission)
+            .with_safety_envelope(builder.limits.syntax_safety);
+        let parsed = fre_syntax::parse_attempt(request).expect("closed Rust parse attempt");
+        let context = PortableParsedBuildContext::authenticate(&builder, parsed, &profile)
+            .expect("matching builder policy authenticates the attempt");
+        assert_eq!(&*context.source, "a");
+
+        let mismatched = PortableBuilder::new("a").unicode(true);
+        let mismatched_profile = CompatibilityProfile::RustBytes(mismatched.profile.clone());
+        let request = fre_syntax::ParseRequest::rust("a", profile)
+            .with_admission(mismatched.limits.admission)
+            .with_safety_envelope(mismatched.limits.syntax_safety);
+        let parsed = fre_syntax::parse_attempt(request).expect("closed Rust parse attempt");
+        assert!(matches!(
+            PortableParsedBuildContext::authenticate(&mismatched, parsed, &mismatched_profile),
+            Err(BuildError::InternalInvariant(
+                "portable builder received a parsed record for another profile"
+            ))
+        ));
+    }
 
     fn finite_two_barrier_has_vector_scanner() -> bool {
         let dispatch = SimdDispatchContext::capture();

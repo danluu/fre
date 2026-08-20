@@ -4090,10 +4090,8 @@ impl AggregateBuildReport {
             }) == Some(self.syntax.parse_work)
             && matches!(
                 (self.build_limits.admission, self.admission),
-                (
-                    AdmissionPolicy::Strict(_),
-                    AdmissionStatus::StrictChecked,
-                ) | (AdmissionPolicy::Quota(_), AdmissionStatus::QuotaChecked)
+                (AdmissionPolicy::Strict(_), AdmissionStatus::StrictChecked,)
+                    | (AdmissionPolicy::Quota(_), AdmissionStatus::QuotaChecked)
             )
             && plan.stage() == construction_stage_for_report(self)
             && construction_stage_closes_plan(plan.stage(), self.plan, self.plan_identity)

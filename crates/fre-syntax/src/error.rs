@@ -18,6 +18,19 @@ pub struct SourceSpan {
 pub enum ErrorCategory {
     InvalidPatternEncoding,
     UpstreamRustSyntax,
+    /// Legacy exact-upstream compiled-size diagnostic.
+    ///
+    /// Native-size admission no longer emits this category. It remains in the
+    /// public enum so callers compiled against the earlier schema can continue
+    /// to name and deserialize the variant while migrating to FRE resource
+    /// limits.
+    #[deprecated(
+        since = "0.1.0",
+        note = "FRE size_limit now reports native representation limits"
+    )]
+    UpstreamRustCompiledTooBig {
+        limit: u64,
+    },
     Re2Syntax {
         /// Numeric `RE2::ErrorCode` at the pinned revision.
         code: u8,
@@ -200,6 +213,43 @@ impl fmt::Display for ParseAttemptError {
 }
 
 impl std::error::Error for ParseAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Legacy result wrapper for Rust regex-set admission.
+///
+/// The compatibility shim now checks local syntax/configuration in source
+/// order. Native aggregate representation limits are enforced by the FRE set
+/// builder that owns the selected artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustRegexSetAdmissionError {
+    pub pattern: Option<usize>,
+    pub source: ParseError,
+}
+
+#[allow(deprecated)]
+impl fmt::Display for RustRegexSetAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(pattern) = self.pattern {
+            write!(
+                formatter,
+                "Rust regex set pattern {pattern} failed local admission: {}",
+                self.source
+            )
+        } else {
+            write!(
+                formatter,
+                "Rust regex set local admission failed: {}",
+                self.source
+            )
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl std::error::Error for RustRegexSetAdmissionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }

@@ -140,7 +140,7 @@ fn compile_and_retained_limit_paths_bind_the_typed_plan() {
     let count = current_fre_rebar_aggregate_builder(PATTERN, true, false)
         .build_count()
         .expect("count plan");
-        assert_eq!(count.build_report().schema_version, 53);
+    assert_eq!(count.build_report().schema_version, 53);
     assert_eq!(count.build_report().plan, AggregatePlanKind::ReverseInner);
     let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity else {
         panic!("adaptive reverse-inner plan retained another identity");

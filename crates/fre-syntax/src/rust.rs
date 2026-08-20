@@ -16,8 +16,8 @@ const MAX_UNICODE_SEGMENT_ALIAS_BYTES: usize = 20;
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CompatibilityProfile, ErrorCategory,
     ParseAttemptActual, ParseError, ParseRequest, ParseSummary, ResourceKind, RustAstOptions,
-    RustAstRecord, RustConstructor, RustOptions, RustUnicodeFeatures, SCHEMA_VERSION,
-    SafetyEnvelope, UnicodeVersion,
+    RustAstRecord, RustConstructor, RustOptions, RustRegexSetAdmissionError, RustUnicodeFeatures,
+    SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
 };
 
 // The 0.8.11 AST parser is single-pass. Its final AST can contain synthetic
@@ -225,6 +225,42 @@ fn record_opaque_parser_invocation(
                     "parse-attempt opaque parser invocation counter overflowed",
                 )
             })?;
+    Ok(())
+}
+
+#[allow(deprecated)]
+pub(crate) fn validate_regex_set_local_admission<P: AsRef<str>>(
+    patterns: &[P],
+    profile: &CompatibilityProfile,
+) -> Result<(), RustRegexSetAdmissionError> {
+    let options = match profile {
+        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => {
+            &rust.options
+        }
+        CompatibilityProfile::Re2(_) => {
+            return Err(RustRegexSetAdmissionError {
+                pattern: None,
+                source: ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::InvalidConfiguration,
+                    "Rust regex set admission requires a Rust profile",
+                ),
+            });
+        }
+    };
+    validate_rust_configuration(profile, options).map_err(|source| RustRegexSetAdmissionError {
+        pattern: None,
+        source,
+    })?;
+    for (pattern, source) in patterns.iter().enumerate() {
+        let request = ParseRequest::rust(source.as_ref(), profile.clone());
+        crate::parse(request)
+            .map(|_| ())
+            .map_err(|source| RustRegexSetAdmissionError {
+                pattern: Some(pattern),
+                source,
+            })?;
+    }
     Ok(())
 }
 

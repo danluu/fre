@@ -127,6 +127,26 @@ emitter.
    selected-plan search failure is returned, never retried through a different
    engine.
 
+## Native `size_limit` artifact basis
+
+The Rust-like `size_limit` spelling is retained across facades, but it limits
+the FRE artifact that each facade owns. It is not an oracle for the exact
+threshold at which `regex` or `regex-automata` would reject the same source.
+
+| Facade | Artifact charged to `size_limit` | Scope |
+|---|---|---|
+| `PortableBuilder` / `PortableTextBuilder` | retained source, capture-name metadata, and the selected portable plan (`charged_persistent_bytes`) | one matcher |
+| portable byte/text set builders | source vectors and all retained constituent matchers (`charged_persistent_bytes`) | one aggregate cap, enforced in source order; constituent `BuildLimits` remain separate |
+| AOT `CompileRequest` | stable serialized semantic program | one pattern |
+| AOT `RegexSetCompileRequest` | sum of stable serialized semantic programs | one aggregate cap, enforced in source order |
+| AOT `OrderedManyCompileRequest` | stable serialized semantic program | per row; the separate total-program limit still caps the complete request |
+| AOT `CaptureCompileRequest` | capture-free selector program | one selector; capture schema/replay and one-pass sidecars retain their separately typed limits |
+
+For Rust builder identities, setter order is intentional: the last applicable
+`profile`, `limits`, `max_persistent_bytes`, or `size_limit` call determines the
+native ceiling. A `RebarMeta` identity has no Rust-like size field and keeps its
+explicit FRE limit instead.
+
 ## Adding a production engine
 
 A new execution strategy belongs behind a typed canonical-plan contract. Its

@@ -16,7 +16,10 @@ mod rust;
 pub use admission::{
     AdmissionPolicy, QuotaBounded, ResourceKind, SafetyEnvelope, StrictAdmission, SyntaxQuotas,
 };
-pub use error::{ErrorCategory, ParseAttemptError, ParseError, SourceSpan};
+#[allow(deprecated)]
+pub use error::{
+    ErrorCategory, ParseAttemptError, ParseError, RustRegexSetAdmissionError, SourceSpan,
+};
 /// Direct, pinned RE2 syntax types retained by [`CanonicalPattern::Re2`].
 pub use fre_re2_syntax as re2_syntax;
 pub use parsed::{
@@ -171,6 +174,49 @@ pub fn parse_rust_ast_with_options(
             request.profile().clone(),
             ErrorCategory::InvalidConfiguration,
             "Rust AST parsing requires a Rust profile",
+        )),
+    }
+}
+
+/// Compatibility shim for the former exact upstream regex-set oracle.
+///
+/// This validates the pinned Rust syntax/configuration locally in source
+/// order. It does not build a shadow `regex-automata` matcher and does not
+/// enforce an upstream compiled-size threshold. The owning FRE set builder
+/// applies `size_limit` once to its selected aggregate representation.
+///
+/// # Errors
+///
+/// Returns the first indexed syntax error, or an unindexed invalid-profile
+/// error for an empty or otherwise invalid request.
+#[deprecated(
+    since = "0.1.0",
+    note = "use the FRE regex-set builder and its native size limit"
+)]
+#[allow(deprecated)]
+pub fn validate_rust_regex_set_admission<P: AsRef<str>>(
+    patterns: &[P],
+    profile: &CompatibilityProfile,
+) -> Result<(), RustRegexSetAdmissionError> {
+    rust::validate_regex_set_local_admission(patterns, profile)
+}
+
+/// Compatibility entry point for parsing one already-grouped set constituent.
+///
+/// Native-size admission has no separate upstream aggregate oracle, so this is
+/// now equivalent to [`parse`] after checking for a Rust profile.
+#[doc(hidden)]
+#[deprecated(
+    since = "0.1.0",
+    note = "use parse; aggregate native limits belong to the FRE set builder"
+)]
+pub fn parse_rust_regex_set_constituent(request: ParseRequest) -> Result<ParseRecord, ParseError> {
+    match request.profile() {
+        CompatibilityProfile::RustText(_) | CompatibilityProfile::RustBytes(_) => parse(request),
+        CompatibilityProfile::Re2(_) => Err(ParseError::new(
+            request.profile().clone(),
+            ErrorCategory::InvalidConfiguration,
+            "Rust regex set constituent parsing requires a Rust profile",
         )),
     }
 }

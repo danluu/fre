@@ -11,8 +11,7 @@ use crate::{
     PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
     PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
     SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
-    reserve_planner, rust_profile_size_limit, set_rust_profile_size_limit,
-    charge_planner, finite,
+    charge_planner, finite, reserve_planner, rust_profile_size_limit, set_rust_profile_size_limit,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -381,10 +380,10 @@ impl PortableTextBuilder {
         let bytes_request = ParseRequest::rust(pattern, bytes_profile)
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let bytes =
-            fre_syntax::parse(bytes_request).map_err(PortableTextBuildError::BytesProofSyntax)?;
-        let bytes_syntax = bytes.summary.clone();
-        let CanonicalPattern::Rust(bytes_pattern) = &bytes.pattern else {
+        let bytes = fre_syntax::parse_attempt(bytes_request)
+            .map_err(|error| PortableTextBuildError::BytesProofSyntax(error.into_source()))?;
+        let bytes_syntax = bytes.record().summary.clone();
+        let CanonicalPattern::Rust(bytes_pattern) = &bytes.record().pattern else {
             return Err(PortableTextBuildError::InternalInvariant(
                 "RustBytes proof parse produced a non-Rust pattern",
             ));
@@ -407,6 +406,9 @@ impl PortableTextBuilder {
             });
         }
 
+        // The source owner has moved into `bytes`; the empty pattern is only a
+        // sentinel. `build_from_parse_attempt` must obtain the authoritative
+        // source and HIR from that closed attempt and must not parse this field.
         let mut inner_builder = PortableBuilder::new(String::new())
             .set_constituent_profile(self.profile)
             .limits(self.limits)
@@ -416,7 +418,7 @@ impl PortableTextBuilder {
             inner_builder = inner_builder.with_utf8_start_guard();
         }
         let inner = inner_builder
-            .build_from_parsed_record(bytes)
+            .build_from_parse_attempt(bytes)
             .map_err(PortableTextBuildError::Portable)?;
         let report = PortableTextBuildReport {
             profile: text_profile.clone(),

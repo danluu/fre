@@ -55,6 +55,57 @@ fn native_per_row_size_limit_is_synchronized_and_last_setter_wins() {
 }
 
 #[test]
+fn per_row_limits_do_not_rewrite_a_set_constructor_identity() {
+    let profile = RustProfile::regex_set_1_12_4();
+    let profile_limit = profile_size_limit(&profile);
+    let mut limits = OrderedManyCompileLimits::default();
+    limits.max_program_bytes_per_row = 12_345;
+
+    let request = one_row_request().profile(profile).limits(limits);
+    assert_eq!(12_345, request.limits.max_program_bytes_per_row);
+    assert_eq!(profile_limit, profile_size_limit(&request.profile));
+    assert!(matches!(
+        request.profile.constructor,
+        RustConstructor::RegexSetBuilder { .. }
+    ));
+}
+
+#[test]
+fn size_limit_is_the_exact_per_row_program_boundary() {
+    let measured = compile_ordered_many(
+        one_row_request()
+            .size_limit(usize::MAX)
+            .mode(CompileMode::Fast),
+    )
+    .expect("measure one native row");
+    let needed = measured.stats().serialized_program_bytes;
+    assert!(needed > 0);
+
+    let exact = compile_ordered_many(one_row_request().size_limit(needed).mode(CompileMode::Fast))
+        .expect("the exact per-row native boundary is inclusive");
+    assert_eq!(needed, exact.stats().serialized_program_bytes);
+
+    assert!(matches!(
+        compile_ordered_many(
+            one_row_request()
+                .size_limit(needed - 1)
+                .mode(CompileMode::Fast)
+        ),
+        Err(OrderedManyCompileError::Row {
+            row: 0,
+            pattern_id,
+            source: CompileError::Resource {
+                resource: CompileResource::ProgramBytes,
+                required,
+                limit,
+            },
+        }) if pattern_id == OrderedManyPatternId::new(7)
+            && required == needed
+            && limit == needed - 1
+    ));
+}
+
+#[test]
 fn direct_request_cannot_bypass_the_profile_native_program_limit() {
     let mut request = one_row_request().size_limit(0);
     request.limits.max_program_bytes_per_row = usize::MAX;

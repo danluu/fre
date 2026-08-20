@@ -205,6 +205,16 @@ pub enum RegexSetCompileError {
     UnsupportedProfile {
         requirement: &'static str,
     },
+    /// Legacy exact-upstream aggregate-admission failure.
+    ///
+    /// Native-size compilation no longer emits this variant.
+    #[deprecated(
+        since = "0.1.0",
+        note = "aggregate size_limit now reports TotalProgramBytesLimit"
+    )]
+    AggregateAdmission {
+        source: fre_syntax::ParseError,
+    },
     /// First indexed constituent compilation failure.
     Pattern {
         pattern: usize,
@@ -248,6 +258,10 @@ impl fmt::Display for RegexSetCompileError {
             Self::UnsupportedProfile { requirement } => {
                 write!(formatter, "unsupported regex-set profile: {requirement}")
             }
+            #[allow(deprecated)]
+            Self::AggregateAdmission { source } => {
+                write!(formatter, "legacy regex-set aggregate admission: {source}")
+            }
             Self::Pattern { pattern, source } => {
                 write!(formatter, "regex-set pattern {pattern}: {source}")
             }
@@ -285,6 +299,8 @@ impl std::error::Error for RegexSetCompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pattern { source, .. } => Some(source),
+            #[allow(deprecated)]
+            Self::AggregateAdmission { source } => Some(source),
             Self::PatternLimit { .. }
             | Self::PatternBytesLimit { .. }
             | Self::UnsupportedProfile { .. }
@@ -1023,8 +1039,8 @@ pub fn compile_regex_set(
     let mut total_program_bytes = 0usize;
     for (pattern, source) in patterns.into_iter().enumerate() {
         let parsed = fre_syntax::parse(ParseRequest::rust(source, compatibility.clone()))
-        .map_err(CompileError::from)
-        .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
+            .map_err(CompileError::from)
+            .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
         let CanonicalPattern::Rust(parsed) = parsed.pattern else {
             return Err(RegexSetCompileError::Pattern {
                 pattern,

@@ -625,6 +625,17 @@ pub enum AdmissionStatus {
 }
 
 impl AdmissionStatus {
+    /// Compatibility spelling for the former pending-oracle state.
+    ///
+    /// No upstream oracle is pending under the native-size contract; the
+    /// value is therefore an alias for [`Self::StrictChecked`].
+    #[allow(non_upper_case_globals)]
+    #[deprecated(
+        since = "0.1.0",
+        note = "native-size admission is complete after StrictChecked"
+    )]
+    pub const UpstreamOraclePending: Self = Self::StrictChecked;
+
     pub(crate) const fn from_policy(policy: AdmissionPolicy) -> Self {
         match policy {
             AdmissionPolicy::Strict(_) => Self::StrictChecked,

@@ -414,8 +414,7 @@ impl CompileRequest {
     /// use that cache, so this does not change compilation or execution.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
-        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } =
-            &mut self.profile.constructor
+        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } = &mut self.profile.constructor
         {
             *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
         }

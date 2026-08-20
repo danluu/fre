@@ -104,10 +104,7 @@ impl CaptureCompileRequest {
     #[must_use]
     pub fn limits(mut self, limits: CaptureCompileLimits) -> Self {
         self.limits = limits;
-        set_rust_profile_compiled_size_limit(
-            &mut self.profile,
-            limits.selector.max_program_bytes,
-        );
+        set_rust_profile_compiled_size_limit(&mut self.profile, limits.selector.max_program_bytes);
         self
     }
 
@@ -124,8 +121,7 @@ impl CaptureCompileRequest {
     /// not use that cache, so this does not change compilation or execution.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
-        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } =
-            &mut self.profile.constructor
+        if let RustConstructor::RegexBuilder { dfa_size_limit, .. } = &mut self.profile.constructor
         {
             *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
         }
@@ -572,10 +568,7 @@ pub fn compile_captures(
         mut limits,
     } = request;
     if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
-        limits.selector.max_program_bytes = limits
-            .selector
-            .max_program_bytes
-            .min(profile_limit);
+        limits.selector.max_program_bytes = limits.selector.max_program_bytes.min(profile_limit);
     }
     if level != CaptureLevel::All {
         return Err(CaptureCompileError::InternalInvariant(
