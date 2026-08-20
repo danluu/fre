@@ -1127,6 +1127,115 @@ impl Automaton {
         result.map(Some)
     }
 
+    /// Search for the first accepting endpoint through the automaton-owned
+    /// optional value-only workspace.
+    ///
+    /// The outer option distinguishes an unavailable optional workspace from
+    /// the inner option's no-match result. See
+    /// [`Self::search_window_with_optional_pooled_exists_value`] for the
+    /// ownership, fallback, and error contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if pooled execution fails, or if cold workspace
+    /// construction fails under the exact default finite envelope. Invalid
+    /// windows and custom finite limits decline before pooled execution;
+    /// unlimited optional construction failures remain `Ok(None)`.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_earliest_end_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+    ) -> Result<Option<Option<usize>>, SearchError> {
+        if (limits != SearchLimits::unlimited() && limits != SearchLimits::default())
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let workspace_limits =
+            Self::pooled_workspace_limits_for_search(workspace_limits, limits);
+        let warm = self.try_with_warm_owner_workspace(
+            workspace_limits,
+            endpoint_eligible,
+            false,
+            |workspace| {
+                crate::k0::search_prevalidated_earliest_end_value_with_authenticated_workspace_and_external_scratch(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    limits,
+                    Self::pooled_workspace_owner_bytes(),
+                )
+            },
+        );
+        if let Some(result) = warm {
+            return result.map(Some);
+        }
+        self.search_window_with_optional_pooled_earliest_end_value_slow(
+            haystack,
+            window,
+            limits,
+            workspace_limits,
+            endpoint_eligible,
+        )
+    }
+
+    #[inline(never)]
+    fn search_window_with_optional_pooled_earliest_end_value_slow(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+    ) -> Result<Option<Option<usize>>, SearchError> {
+        let checkout = self.try_checkout_pooled_workspace_with_setup(
+            workspace_limits,
+            limits.max_work,
+            endpoint_eligible,
+            false,
+        );
+        let Some(mut checkout) = (match checkout {
+            Ok(checkout) => checkout,
+            Err(_) if limits == SearchLimits::unlimited() => return Ok(None),
+            Err(error) => return Err(error),
+        })
+        else {
+            return Ok(None);
+        };
+        let external_scratch_bytes = checkout.external_retained_scratch_bytes();
+        let result = match (limits == SearchLimits::default(), checkout.cold_setup) {
+            (true, Some(setup)) => {
+                crate::k0::search_prevalidated_earliest_end_value_with_authenticated_workspace_and_setup(
+                    self,
+                    haystack,
+                    window,
+                    &mut checkout,
+                    limits,
+                    setup,
+                    external_scratch_bytes,
+                )
+            }
+            _ => crate::k0::search_prevalidated_earliest_end_value_with_authenticated_workspace_and_external_scratch(
+                self,
+                haystack,
+                window,
+                &mut checkout,
+                limits,
+                external_scratch_bytes,
+            ),
+        };
+        if result.is_ok() {
+            checkout.commit();
+        }
+        result.map(Some)
+    }
+
     /// Search for a selected span through the automaton-owned optional
     /// value-only workspace.
     ///

@@ -18653,6 +18653,86 @@ pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace_and_
     .map(|report| report.found.is_some())
 }
 
+pub(crate) fn search_prevalidated_earliest_end_value_with_authenticated_workspace_and_external_scratch(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    external_scratch_bytes: usize,
+) -> Result<Option<usize>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        if external_scratch_bytes != 0 {
+            return Err(SearchError::InvalidResumeState {
+                detail: "pooled K0 workspace belongs to another automaton",
+            });
+        }
+        return search_with_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            OutputContract::EarliestEnd,
+        )
+        .map(|report| report.found.map(MatchSpan::end));
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    let total_retained_bytes = workspace
+        .retained_bytes
+        .checked_add(external_scratch_bytes)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "aggregate retained K0 scratch bytes",
+        })?;
+    if total_retained_bytes > limits.max_scratch_bytes {
+        return Err(SearchError::ResourceLimit {
+            resource: ResourceKind::ScratchBytes,
+            needed: total_retained_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+    apply_external_growth_scratch_envelope(workspace, total_retained_bytes, limits)?;
+    execute_bound_prevalidated_with_external_scratch(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        OutputContract::EarliestEnd,
+        workspace.bound_capabilities,
+        external_scratch_bytes,
+    )
+    .map(|report| report.found.map(MatchSpan::end))
+}
+
+pub(crate) fn search_prevalidated_earliest_end_value_with_authenticated_workspace_and_setup(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+    external_scratch_bytes: usize,
+) -> Result<Option<usize>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "cold pooled K0 workspace belongs to another automaton",
+        });
+    }
+    execute(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        OutputContract::EarliestEnd,
+        true,
+        external_scratch_bytes,
+    )
+    .map(|report| report.found.map(MatchSpan::end))
+}
+
 pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
     automaton: &Automaton,
     haystack: &[u8],

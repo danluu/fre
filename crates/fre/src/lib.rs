@@ -9773,6 +9773,30 @@ impl PortableK0Plan {
                 .map(|value| value.map(K0PooledValue::Span)),
         }
     }
+
+    fn pooled_earliest_end_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
+        minimum_match_bytes: Option<usize>,
+    ) -> Result<Option<Option<usize>>, K0SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let positive = matches!(minimum_match_bytes, Some(minimum) if minimum > 0);
+        let assertion_free_nullable =
+            minimum_match_bytes == Some(0) && !self.automaton.stats().has_assertions();
+        self.automaton
+            .search_window_with_optional_pooled_earliest_end_value(
+                haystack,
+                window,
+                limits,
+                workspace_limits,
+                positive || assertion_free_nullable,
+            )
+    }
 }
 
 enum PortablePlan {
@@ -11168,6 +11192,17 @@ impl PortableRegex {
             return plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from);
+        }
+        if let PortablePlan::K0(k0) = &self.plan
+            && let Some(end) = k0.pooled_earliest_end_value(
+                haystack,
+                window,
+                limits,
+                SearchSessionLimits::default(),
+                self.report.minimum_match_bytes,
+            )?
+        {
+            return Ok(end);
         }
         self.shortest_match_window(haystack, window, limits)
             .map(|(output, _)| output)
