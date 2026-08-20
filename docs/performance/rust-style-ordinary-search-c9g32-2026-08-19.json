@@ -322,7 +322,9 @@
       "failed": 0
     },
     "rust_regex_conformance_tests": {
-      "passed": 180,
+      "library_passed": 180,
+      "integration_passed": 1,
+      "total_passed": 181,
       "failed": 0,
       "ignored": 10
     }

@@ -14,12 +14,13 @@ selected-end diagnostic invokes ordinary `find` exactly once and projects the
 end on both engines. Finite-limit and accounting checks remain in the untimed
 correctness pass.
 
-## Validation before timing
+## Validation
 
 The exact source passed 754 FRE library tests (5 ignored), 8 holdout unit
 tests, 4 frozen-suite tests, 290 Rebar library tests (24 ignored), 15
-`fre-capi` tests, and 180 Rust-regex conformance tests (10 ignored), with no
-failures. The stack-heavy Rebar and conformance runs used the established
+`fre-capi` tests, 180 Rust-regex conformance library tests (10 ignored), and
+one conformance integration test, with no failures. The stack-heavy Rebar and
+conformance runs used the established
 `RUST_MIN_STACK=33554432` after libtest's default worker stack overflowed;
 there was no assertion failure, and the setting changes only the test-harness
 thread stack.
