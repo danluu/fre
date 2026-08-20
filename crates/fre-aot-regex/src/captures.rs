@@ -102,7 +102,7 @@ impl CaptureCompileRequest {
     }
 
     #[must_use]
-    pub fn limits(mut self, limits: CaptureCompileLimits) -> Self {
+    pub const fn limits(mut self, limits: CaptureCompileLimits) -> Self {
         self.limits = limits;
         set_rust_profile_compiled_size_limit(&mut self.profile, limits.selector.max_program_bytes);
         self

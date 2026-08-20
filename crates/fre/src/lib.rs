@@ -5502,11 +5502,13 @@ pub(crate) fn default_portable_build_limits(profile: &RustProfile) -> BuildLimit
     limits
 }
 
-pub(crate) fn set_rust_profile_size_limit(profile: &mut RustProfile, bytes: usize) {
+pub(crate) const fn set_rust_profile_size_limit(profile: &mut RustProfile, bytes: usize) {
     match &mut profile.constructor {
         fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
         | fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } => {
-            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+            // Every Rust 1.93 target pointer width fits in `u64`, so this is
+            // equivalent to the former saturating conversion and is const.
+            *size_limit = bytes as u64;
         }
         fre_syntax::RustConstructor::RebarMeta { .. } => {}
     }
@@ -5834,7 +5836,7 @@ impl PortableBuilder {
 
     /// Replace every checked construction limit.
     #[must_use]
-    pub fn limits(mut self, limits: BuildLimits) -> Self {
+    pub const fn limits(mut self, limits: BuildLimits) -> Self {
         self.limits = limits;
         if matches!(
             &self.profile.constructor,
@@ -5848,7 +5850,7 @@ impl PortableBuilder {
     /// Set the total logical persistent-byte ceiling for the published
     /// matcher without changing any plan-specific construction limits.
     #[must_use]
-    pub fn max_persistent_bytes(mut self, limit: usize) -> Self {
+    pub const fn max_persistent_bytes(mut self, limit: usize) -> Self {
         self.limits.max_persistent_bytes = limit;
         if matches!(
             &self.profile.constructor,

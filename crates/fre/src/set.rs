@@ -281,7 +281,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
 
     /// Replace all set-wide and per-pattern construction limits.
     #[must_use]
-    pub fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {
+    pub const fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {
         self.limits = limits;
         if matches!(
             &self.profile.constructor,

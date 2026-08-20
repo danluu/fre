@@ -336,7 +336,7 @@ impl PortableTextBuilder {
 
     /// Replace every checked construction limit.
     #[must_use]
-    pub fn limits(mut self, limits: BuildLimits) -> Self {
+    pub const fn limits(mut self, limits: BuildLimits) -> Self {
         self.limits = limits;
         if matches!(
             &self.profile.constructor,

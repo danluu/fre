@@ -388,7 +388,7 @@ impl CompileRequest {
     }
 
     #[must_use]
-    pub fn limits(mut self, limits: CompileLimitsV1) -> Self {
+    pub const fn limits(mut self, limits: CompileLimitsV1) -> Self {
         self.limits = limits;
         set_rust_profile_compiled_size_limit(&mut self.profile, limits.max_program_bytes);
         self
@@ -432,11 +432,16 @@ pub(crate) fn rust_profile_compiled_size_limit(profile: &RustProfile) -> Option<
     }
 }
 
-pub(crate) fn set_rust_profile_compiled_size_limit(profile: &mut RustProfile, bytes: usize) {
+pub(crate) const fn set_rust_profile_compiled_size_limit(
+    profile: &mut RustProfile,
+    bytes: usize,
+) {
     match &mut profile.constructor {
         RustConstructor::RegexBuilder { size_limit, .. }
         | RustConstructor::RegexSetBuilder { size_limit, .. } => {
-            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+            // Every Rust 1.93 target pointer width fits in `u64`, so this is
+            // equivalent to the former saturating conversion and is const.
+            *size_limit = bytes as u64;
         }
         RustConstructor::RebarMeta { .. } => {}
     }

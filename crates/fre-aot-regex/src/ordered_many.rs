@@ -162,7 +162,7 @@ impl OrderedManyCompileRequest {
 
     /// Select explicit construction limits.
     #[must_use]
-    pub fn limits(mut self, limits: OrderedManyCompileLimits) -> Self {
+    pub const fn limits(mut self, limits: OrderedManyCompileLimits) -> Self {
         self.limits = limits;
         // Ordered-many owns independent single-regex programs. Do not rewrite
         // a caller-supplied set-constructor identity with this per-row limit.
