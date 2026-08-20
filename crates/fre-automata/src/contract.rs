@@ -2256,6 +2256,28 @@ impl K0SearchSession<'_> {
         self.search_exists_value_untyped(haystack, window, limits)
     }
 
+    /// Return only the first accepting endpoint, allowing an authenticated
+    /// warm session to omit diagnostic report construction for unlimited
+    /// assertion-free calls.
+    ///
+    /// Finite limits and every cold, contextual, or structurally ineligible
+    /// invocation use the ordinary report-producing executor with unchanged
+    /// accounting and error precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// execution failure.
+    #[doc(hidden)]
+    pub fn search_earliest_end_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.search_earliest_end_value_untyped(haystack, window, limits)
+    }
+
     /// Try only the authenticated report-free warm existence route.
     ///
     /// `Ok(None)` is a transactional decline: no semantic search completed,

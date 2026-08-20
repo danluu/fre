@@ -11858,6 +11858,55 @@ impl<'a> K0SearchSession<'a> {
         .map(|report| report.found.is_some())
     }
 
+    /// Project a warmed assertion-free earliest endpoint without diagnostics.
+    ///
+    /// The retained reader is deliberately transactional: it only reads a
+    /// complete authenticated direct path. A cold proof, contextual graph,
+    /// saturated cache, or first unpublished cell re-enters the ordinary
+    /// report-producing executor from the original window. Finite invocations
+    /// always use that canonical path so their exact accounting and refusal
+    /// precedence remain unchanged.
+    pub(crate) fn search_earliest_end_value_untyped(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.validate_generic_search_limits(limits)?;
+        validate_window(haystack, window)?;
+        if limits == SearchLimits::unlimited()
+            && self.capabilities.lazy
+            && !self.capabilities.contextual
+            && self.workspace.lazy.is_bound_to(self.automaton)
+            && self.workspace.lazy.initialized
+            && !self.workspace.lazy.declined
+        {
+            if let Some(proof) = self.automaton.start_filter_proof.get() {
+                if let Some(found) = try_warm_direct_earliest_end(
+                    self.automaton,
+                    haystack,
+                    window,
+                    &self.workspace,
+                    proof,
+                )?
+                {
+                    return Ok(found);
+                }
+            }
+        }
+
+        execute_bound_prevalidated(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+            OutputContract::EarliestEnd,
+            self.capabilities,
+        )
+        .map(|report| report.found.map(MatchSpan::end))
+    }
+
     pub(crate) fn try_search_warm_exists_value_untyped(
         &mut self,
         haystack: &[u8],
@@ -15036,6 +15085,300 @@ std::thread_local! {
     /// thread. Production builds contain neither the slot nor its update.
     static CONTINUED_SET_GUARD_SCANS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+/// Complete a read-only earliest-end projection after checking that its
+/// omitted diagnostic work still fits the canonical unlimited counter.
+#[allow(
+    clippy::option_option,
+    reason = "the outer option is warm admission and the inner option is the earliest-end value"
+)]
+fn complete_warm_direct_earliest_end(
+    meter: &mut WorkMeter,
+    direct_steps: &mut usize,
+    position: usize,
+    output: Option<usize>,
+) -> Result<Option<Option<usize>>, SearchError> {
+    settle_warm_direct_exists_steps(meter, direct_steps, position)?;
+    Ok(Some(output))
+}
+
+/// Read one complete authenticated assertion-free direct path and return the
+/// first accepting boundary without constructing a diagnostic report.
+///
+/// This reader publishes nothing and mutates neither cache policy nor
+/// invocation scratch. Its first unpublished cell is therefore a
+/// transactional decline that permits an exact full-window replay through the
+/// ordinary executor.
+#[allow(
+    clippy::option_option,
+    reason = "the outer option is warm admission and the inner option is the earliest-end value"
+)]
+#[inline]
+fn try_warm_direct_earliest_end(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    proof: &StartFilterProof,
+) -> Result<Option<Option<usize>>, SearchError> {
+    if workspace.lazy.saturated {
+        return Ok(None);
+    }
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm earliest-end window exceeds the validated haystack",
+        })?;
+    let nullable_initial = matches!(
+        workspace.lazy.initial_kind,
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+    );
+    if proof.force_haystack_start || proof.relaxed_nullable != nullable_initial {
+        return Ok(None);
+    }
+    match workspace.lazy.initial_kind {
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
+            return Ok(Some(Some(window.start())));
+        }
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => {}
+        LazyInitialKind::Uninitialized => return Ok(None),
+    }
+    if workspace.lazy.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+
+    let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
+    let (mut state, mut position, consumed, engine_candidate) =
+        match warm_bounded_start(haystack, window, proof)? {
+            WarmBoundedStart::Exhausted => return Ok(Some(None)),
+            WarmBoundedStart::ResumeAt { position, work } => {
+                let consumed = INVOCATION_RESET_WORK.checked_add(work).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm earliest-end prefix work",
+                    },
+                )?;
+                return continue_warm_direct_earliest_end(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    proof,
+                    initial_row,
+                    initial_row,
+                    position,
+                    consumed,
+                    None,
+                );
+            }
+            WarmBoundedStart::Candidate { position, work } => (
+                initial_row,
+                position,
+                INVOCATION_RESET_WORK.checked_add(work).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm earliest-end prefix work",
+                    },
+                )?,
+                proof
+                    .probe()
+                    .filter(|probe| !probe.is_guard_pair())
+                    .map(|_| position),
+            ),
+        };
+    let mut direct_steps = 0usize;
+    let inline_end = position
+        .saturating_add(WARM_EXISTS_INLINE_BYTES)
+        .min(window.end());
+    while position < inline_end {
+        let byte = haystack[position];
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = workspace.lazy.direct_cell(state, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated warm projection is strictly below its slice ceiling"
+        )]
+        {
+            position += 1;
+            direct_steps += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            let mut meter = WorkMeter::new(u64::MAX, consumed);
+            return complete_warm_direct_earliest_end(
+                &mut meter,
+                &mut direct_steps,
+                position,
+                Some(position),
+            );
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            let mut meter = WorkMeter::new(u64::MAX, consumed);
+            return complete_warm_direct_earliest_end(
+                &mut meter,
+                &mut direct_steps,
+                position,
+                None,
+            );
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm earliest-end encoded state underflowed",
+            })?;
+        if state == initial_row && proof.scanner.is_some() {
+            let consumed = settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
+            return continue_warm_direct_earliest_end(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                proof,
+                initial_row,
+                state,
+                position,
+                consumed,
+                engine_candidate,
+            );
+        }
+    }
+    let consumed = settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
+    if position == window.end() {
+        return Ok(Some(None));
+    }
+    continue_warm_direct_earliest_end(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        proof,
+        initial_row,
+        state,
+        position,
+        consumed,
+        engine_candidate,
+    )
+}
+
+#[allow(
+    clippy::option_option,
+    clippy::too_many_arguments,
+    reason = "the outlined read-only continuation keeps its exact DFA and scanner state explicit"
+)]
+#[inline(never)]
+fn continue_warm_direct_earliest_end(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    proof: &StartFilterProof,
+    initial_row: u32,
+    mut state: u32,
+    mut position: usize,
+    consumed: u64,
+    mut engine_candidate: Option<usize>,
+) -> Result<Option<Option<usize>>, SearchError> {
+    let mut meter = WorkMeter::new(u64::MAX, consumed);
+    let mut direct_steps = 0usize;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+
+    loop {
+        if state == initial_row {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return complete_warm_direct_earliest_end(
+                        &mut meter,
+                        &mut direct_steps,
+                        position,
+                        None,
+                    );
+                }
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_warm_direct_earliest_end(
+                    &mut meter,
+                    &mut direct_steps,
+                    position,
+                    None,
+                );
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "warm earliest-end position exceeded the validated window",
+            });
+        }
+
+        let byte = haystack[position];
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = workspace.lazy.direct_cell(state, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated warm projection is strictly below its slice ceiling"
+        )]
+        {
+            position += 1;
+            direct_steps += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return complete_warm_direct_earliest_end(
+                &mut meter,
+                &mut direct_steps,
+                position,
+                Some(position),
+            );
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_warm_direct_earliest_end(
+                &mut meter,
+                &mut direct_steps,
+                position,
+                None,
+            );
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm earliest-end encoded state underflowed",
+            })?;
+    }
 }
 
 /// Exact invocation-local state at the first unpublished direct transition of
@@ -75413,6 +75756,139 @@ mod tests {
         ));
         assert_eq!(session.workspace.generation, before_invalid_generation);
         assert_eq!(session.workspace.lazy.rows, before_invalid_rows);
+    }
+
+    #[test]
+    fn retained_earliest_end_value_is_read_only_and_preserves_order_and_limits() {
+        let plan = a_plus(true);
+        let haystack = b"aaa";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let warmed = session
+            .search_window::<EarliestEnd>(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warmed.into_output(), Some(1));
+
+        let before_generation = session.workspace.generation;
+        let before_current = session.workspace.current_len;
+        let before_roots = session.workspace.roots_len;
+        let before_stack = session.workspace.stack_len;
+        let before_frontier = session.workspace.lazy.frontier_len;
+        let before_rows = session.workspace.lazy.rows.clone();
+        assert_eq!(
+            session
+                .search_earliest_end_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(1),
+            "earliest acceptance must not become the greedy selected endpoint",
+        );
+        assert_eq!(session.workspace.generation, before_generation);
+        assert_eq!(session.workspace.current_len, before_current);
+        assert_eq!(session.workspace.roots_len, before_roots);
+        assert_eq!(session.workspace.stack_len, before_stack);
+        assert_eq!(session.workspace.lazy.frontier_len, before_frontier);
+        assert_eq!(session.workspace.lazy.rows, before_rows);
+
+        let later = b"baa";
+        assert_eq!(
+            session
+                .search_earliest_end_value(
+                    later,
+                    SearchWindow::full(later),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(2),
+        );
+        assert_eq!(session.workspace.generation, before_generation);
+        assert_eq!(session.workspace.lazy.rows, before_rows);
+
+        let absent = b"bbb";
+        assert_eq!(
+            session
+                .search_earliest_end_value(
+                    absent,
+                    SearchWindow::full(absent),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        assert_eq!(session.workspace.generation, before_generation);
+        assert_eq!(session.workspace.lazy.rows, before_rows);
+
+        let measured = session
+            .search_window::<EarliestEnd>(haystack, window, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        let retained = session.retained_scratch_bytes();
+        assert_eq!(
+            session
+                .search_earliest_end_value(
+                    haystack,
+                    window,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap(),
+            Some(1),
+        );
+        let one_below = measured.checked_sub(1).unwrap();
+        assert!(matches!(
+            session.search_earliest_end_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work: one_below,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below
+        ));
+        assert!(matches!(
+            session.search_earliest_end_value(
+                haystack,
+                SearchWindow::new(2, 1),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow { start: 2, end: 1, .. })
+        ));
+
+        let nullable = a_star(true);
+        let mut nullable_session = K0SearchSession::new_selected(
+            &nullable,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let nullable_window = SearchWindow::new(2, haystack.len());
+        assert_eq!(
+            nullable_session
+                .search_window::<EarliestEnd>(
+                    haystack,
+                    nullable_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(2),
+        );
+        assert_eq!(
+            nullable_session
+                .search_earliest_end_value(
+                    haystack,
+                    nullable_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(2),
+        );
     }
 
     #[test]

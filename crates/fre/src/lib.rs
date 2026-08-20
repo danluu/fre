@@ -19994,7 +19994,7 @@ impl<'r> PortableSearchSession<'r> {
                                 first_unproved_start,
                             } => {
                                 return session
-                                    .search_window::<EarliestEnd>(
+                                    .search_earliest_end_value(
                                         haystack,
                                         SearchWindow::new(
                                             first_unproved_start.min(window.end()),
@@ -20002,7 +20002,6 @@ impl<'r> PortableSearchSession<'r> {
                                         ),
                                         limits,
                                     )
-                                    .map(fre_automata::SearchReport::into_output)
                                     .map_err(SearchError::from);
                             }
                         }
@@ -20024,11 +20023,11 @@ impl<'r> PortableSearchSession<'r> {
                         let mut next_state = *correlated_terminal_earliest_end_state;
                         match next_state.select(window_bytes) {
                             correlated_bounded_alternation::Route::Bypass => {
-                                let report = session
-                                    .search_window::<EarliestEnd>(haystack, window, limits)
+                                let output = session
+                                    .search_earliest_end_value(haystack, window, limits)
                                     .map_err(SearchError::from)?;
                                 *correlated_terminal_earliest_end_state = next_state;
-                                return Ok(report.into_output());
+                                return Ok(output);
                             }
                             correlated_bounded_alternation::Route::Learn { class_index } => {
                                 let report = session
@@ -20057,11 +20056,11 @@ impl<'r> PortableSearchSession<'r> {
                                 incumbent_transition_work,
                             )? {
                                 K0CorrelatedTerminalAttempt::Bypass => {
-                                    let report = session
-                                        .search_window::<EarliestEnd>(haystack, window, limits)
+                                    let output = session
+                                        .search_earliest_end_value(haystack, window, limits)
                                         .map_err(SearchError::from)?;
                                     *correlated_terminal_earliest_end_state = next_state;
-                                    return Ok(report.into_output());
+                                    return Ok(output);
                                 }
                                 K0CorrelatedTerminalAttempt::Complete { output, won } => {
                                     if won {
@@ -20086,8 +20085,7 @@ impl<'r> PortableSearchSession<'r> {
                     return Ok(matched.then_some(window.end()));
                 }
                     session
-                        .search_window::<EarliestEnd>(haystack, window, limits)
-                        .map(fre_automata::SearchReport::into_output)
+                        .search_earliest_end_value(haystack, window, limits)
                         .map_err(SearchError::from)
                 })();
                 result.map_err(|error| invocation.map_error(error))
