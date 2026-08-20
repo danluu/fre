@@ -11187,6 +11187,9 @@ impl PortableRegex {
                     literal_class_run_literal_limits(limits),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::PureByteClassRepeat(plan) => plan
+                .earliest_end_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
             PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from),

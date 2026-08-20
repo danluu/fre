@@ -446,6 +446,48 @@ impl Plan {
         Ok((end, accounting))
     }
 
+    pub(crate) fn earliest_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        validate_window(haystack, window)?;
+        let window_width = window
+            .end()
+            .checked_sub(window.start())
+            .expect("a validated window has ordered bounds");
+        let owner = self.owner();
+        if limits == SearchLimits::unlimited() && u64::try_from(window_width).is_ok() {
+            return Ok(owner
+                .member_seek
+                .seek_unmetered(
+                    haystack,
+                    window.start(),
+                    window.end(),
+                    owner.classifier.as_ref(),
+                )
+                .map(|start| {
+                    start
+                        .checked_add(1)
+                        .expect("a member position before the window end can advance once")
+                }));
+        }
+        let mut meter = WorkMeter::new(limits.max_work);
+        let start = owner.member_seek.seek(
+            haystack,
+            window.start(),
+            window.end(),
+            &mut meter,
+            owner.classifier.as_ref(),
+        )?;
+        Ok(start.map(|start| {
+            start
+                .checked_add(1)
+                .expect("a member position before the window end can advance once")
+        }))
+    }
+
     pub(crate) fn selected_end_window(
         &self,
         haystack: &[u8],
