@@ -114,6 +114,26 @@ impl PortableTextRegex {
         ))
     }
 
+    /// Return the selected match while retaining the exact original haystack,
+    /// without constructing facade diagnostic accounting.
+    ///
+    /// This is the value-only companion to [`Self::find_borrowed`]. Search
+    /// selection, resource limits, errors and the borrowed text are identical;
+    /// only the accounting projection is omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same resource contract as
+    /// [`PortableTextRegex::find_value`].
+    pub fn find_borrowed_value<'h>(
+        &self,
+        haystack: &'h str,
+        limits: SearchLimits,
+    ) -> Result<Option<PortableTextMatch<'h>>, SearchError> {
+        self.find_value(haystack, limits)
+            .map(|matched| matched.map(|span| PortableTextMatch::new(haystack, span)))
+    }
+
     /// Return the selected match at or after `start` while retaining the
     /// complete original haystack.
     ///
@@ -136,6 +156,26 @@ impl PortableTextRegex {
             matched.map(|span| PortableTextMatch::new(haystack, span)),
             accounting,
         ))
+    }
+
+    /// Return the selected match at or after `start` while retaining the
+    /// complete original haystack and omitting facade diagnostic accounting.
+    ///
+    /// Interior UTF-8 offsets have exactly the normalization and assertion
+    /// context of [`Self::find_at_borrowed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableTextRegex::find_at_value`].
+    pub fn find_at_borrowed_value<'h>(
+        &self,
+        haystack: &'h str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<PortableTextMatch<'h>>, SearchError> {
+        self.find_at_value(haystack, start, limits)
+            .map(|matched| matched.map(|span| PortableTextMatch::new(haystack, span)))
     }
 
     /// Iterate over non-overlapping matches that retain the original haystack.

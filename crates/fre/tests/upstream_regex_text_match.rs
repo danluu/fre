@@ -13,6 +13,9 @@ fn borrowed_text_match_preserves_pinned_value_semantics_and_accounting() {
     let (borrowed, borrowed_accounting) = regex
         .find_borrowed(haystack, SearchLimits::unlimited())
         .expect("borrowed search");
+    let borrowed_value = regex
+        .find_borrowed_value(haystack, SearchLimits::unlimited())
+        .expect("borrowed value search");
     let (repeated_offset, repeated_offset_accounting) = regex
         .find_accounted(haystack, SearchLimits::unlimited())
         .expect("repeated offset search");
@@ -24,6 +27,7 @@ fn borrowed_text_match_preserves_pinned_value_semantics_and_accounting() {
 
     let offset = offset.expect("offset match");
     let borrowed = borrowed.expect("borrowed match");
+    let borrowed_value = borrowed_value.expect("borrowed value match");
     assert_eq!(borrowed.start(), 7);
     assert_eq!(borrowed.end(), 15);
     assert_eq!(borrowed.len(), 8);
@@ -32,6 +36,8 @@ fn borrowed_text_match_preserves_pinned_value_semantics_and_accounting() {
     assert_eq!(borrowed.as_str(), "αβγδ");
     assert_eq!(borrowed.range(), offset.range());
     assert_eq!(borrowed.as_str().as_ptr(), haystack[7..15].as_ptr());
+    assert_eq!(borrowed_value, borrowed);
+    assert_eq!(borrowed_value.as_str().as_ptr(), haystack[7..15].as_ptr());
     assert_eq!(
         format!("{borrowed:?}"),
         "PortableTextMatch { start: 7, end: 15, string: \"αβγδ\" }"
@@ -53,6 +59,9 @@ fn borrowed_text_find_at_preserves_scalar_normalization_and_original_context() {
     let (borrowed, borrowed_accounting) = scalar
         .find_at_borrowed(haystack, 1, SearchLimits::unlimited())
         .expect("borrowed ranged search");
+    let borrowed_value = scalar
+        .find_at_borrowed_value(haystack, 1, SearchLimits::unlimited())
+        .expect("borrowed ranged value search");
     let (repeated_offset, repeated_offset_accounting) = scalar
         .find_at(haystack, 1, SearchLimits::unlimited())
         .expect("repeated offset ranged search");
@@ -65,6 +74,7 @@ fn borrowed_text_find_at_preserves_scalar_normalization_and_original_context() {
     let borrowed = borrowed.expect("borrowed match");
     assert_eq!(borrowed.range(), 3..4);
     assert_eq!(borrowed.as_str(), "a");
+    assert_eq!(borrowed_value, Some(borrowed));
 
     let offset_error = scalar
         .find_at(haystack, haystack.len() + 1, SearchLimits::unlimited())
@@ -72,7 +82,11 @@ fn borrowed_text_find_at_preserves_scalar_normalization_and_original_context() {
     let borrowed_error = scalar
         .find_at_borrowed(haystack, haystack.len() + 1, SearchLimits::unlimited())
         .expect_err("borrowed API rejects an out-of-bounds start");
+    let borrowed_value_error = scalar
+        .find_at_borrowed_value(haystack, haystack.len() + 1, SearchLimits::unlimited())
+        .expect_err("borrowed value API rejects an out-of-bounds start");
     assert_eq!(borrowed_error, offset_error);
+    assert_eq!(borrowed_value_error, offset_error);
 
     let contextual = PortableTextRegex::new(r"\bchew\b").expect("proved assertion regex");
     let context_haystack = "eschew chew";
@@ -82,6 +96,11 @@ fn borrowed_text_find_at_preserves_scalar_normalization_and_original_context() {
     let matched = matched.expect("second word is selected");
     assert_eq!(matched.range(), 7..11);
     assert_eq!(matched.as_str(), "chew");
+    let matched_value = contextual
+        .find_at_borrowed_value(context_haystack, 2, SearchLimits::unlimited())
+        .expect("contextual ranged value search")
+        .expect("second word is selected by value route");
+    assert_eq!(matched_value, matched);
 }
 
 #[test]
