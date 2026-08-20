@@ -1,8 +1,11 @@
 use core::fmt;
+use std::borrow::Cow;
 
 use crate::{
     AggregateCacheIdentity, AggregateExecutionDetails, AggregateExecutionSource,
-    AggregateRunLimits, AggregateSpans, AggregateSpansRegex, Match, PortableRegex,
+    AggregateRunLimits, AggregateSpans, AggregateSpansRegex, Match, PortableFindIterError,
+    PortableFindIterLimits, PortableFindIterRunLimits, PortableRegex, PortableSearchSession,
+    SearchError,
 };
 
 /// A byte source accepted by the literal/no-expansion replacement facade.
@@ -75,6 +78,101 @@ impl LiteralReplacer for std::borrow::Cow<'_, str> {
 impl<T: LiteralReplacer + ?Sized> LiteralReplacer for &T {
     fn literal_bytes(&self) -> &[u8] {
         (*self).literal_bytes()
+    }
+}
+
+/// Output-allocation policy for one value-only literal replacement.
+///
+/// Search setup, per-search work and the iterator call cap remain governed by
+/// [`PortableFindIterLimits`] or [`PortableFindIterRunLimits`]. These two
+/// ceilings cover only the logical replacement result and, when a match is
+/// replaced, its FRE-owned output allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValueReplacementOutputLimits {
+    /// Maximum logical length of the returned byte string.
+    ///
+    /// This applies to a borrowed no-match result as well as an owned replaced
+    /// result, even though the borrowed result retains no output allocation.
+    pub max_output_bytes: usize,
+    /// Maximum allocator-observed retained capacity of an owned result.
+    pub max_output_capacity_bytes: usize,
+}
+
+impl Default for ValueReplacementOutputLimits {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 67_108_864,
+            max_output_capacity_bytes: 67_108_864,
+        }
+    }
+}
+
+/// Typed refusal from first-match value-only literal replacement.
+///
+/// The value route intentionally exposes no aggregate selector receipt. Setup
+/// and iteration failures are preserved losslessly, while every output
+/// failure occurs before replacement bytes are published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortableValueReplacementError {
+    /// Fresh value-iterator session construction was refused.
+    Setup(SearchError),
+    /// The first contextual iterator search was refused.
+    Iteration(PortableFindIterError),
+    /// Exact result-length arithmetic overflowed `usize`.
+    OutputSizeOverflow,
+    /// The exact logical result length exceeded its ceiling.
+    OutputBytesLimit { needed: usize, limit: usize },
+    /// The allocator-observed retained output capacity exceeded its ceiling.
+    OutputCapacityBytesLimit { needed: usize, limit: usize },
+    /// The single exact output reservation failed.
+    AllocationFailed { requested: usize },
+    /// A selected whole-match span violated the value-iterator contract.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for PortableValueReplacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setup(error) => {
+                write!(formatter, "value replacement session setup failed: {error}")
+            }
+            Self::Iteration(error) => {
+                write!(formatter, "value replacement search failed: {error}")
+            }
+            Self::OutputSizeOverflow => {
+                formatter.write_str("value replacement output size overflowed usize")
+            }
+            Self::OutputBytesLimit { needed, limit } => write!(
+                formatter,
+                "value replacement output needs {needed} bytes, exceeding the {limit}-byte limit"
+            ),
+            Self::OutputCapacityBytesLimit { needed, limit } => write!(
+                formatter,
+                "value replacement output capacity is {needed} bytes, exceeding the {limit}-byte capacity limit"
+            ),
+            Self::AllocationFailed { requested } => write!(
+                formatter,
+                "failed to allocate {requested} value replacement output bytes"
+            ),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "value replacement invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PortableValueReplacementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Setup(error) => Some(error),
+            Self::Iteration(error) => Some(error),
+            Self::OutputSizeOverflow
+            | Self::OutputBytesLimit { .. }
+            | Self::OutputCapacityBytesLimit { .. }
+            | Self::AllocationFailed { .. }
+            | Self::InternalInvariant(_) => None,
+        }
     }
 }
 
@@ -564,6 +662,39 @@ impl std::error::Error for FunctionalReplacementErrorSource {
 }
 
 impl PortableRegex {
+    /// Replace the first selected byte match with literal bytes through the
+    /// value-only iterator route.
+    ///
+    /// `$` has no special meaning: this is the bounded counterpart of pinned
+    /// Rust bytes replacement with [`NoExpand`]. A no-match result borrows the
+    /// original haystack and retains no output allocation. A matched result is
+    /// preflighted exactly, reserved once and returned owned.
+    ///
+    /// This method intentionally exposes no aggregate selector receipt. Use
+    /// [`AggregateSpansRegex::replace_literal`] when complete match selection
+    /// and its execution accounting are required.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed setup, first-search, output-bound, allocation or
+    /// invariant refusal. The iterator call cap is consumed only for the first
+    /// hit or miss; a successful hit never probes for a later match.
+    pub fn replace_literal_value<'h, R: LiteralReplacer>(
+        &self,
+        haystack: &'h [u8],
+        replacement: R,
+        iterator_limits: PortableFindIterLimits,
+        output_limits: ValueReplacementOutputLimits,
+    ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
+        let replacement = replacement.literal_bytes();
+        let mut matches = self
+            .find_iter_value(haystack, iterator_limits)
+            .map_err(PortableValueReplacementError::Setup)?;
+        let first = matches.next();
+        drop(matches);
+        replace_first_literal_value(haystack, replacement, first, output_limits)
+    }
+
     /// Expand one pinned Rust bytes replacement template from capture values.
     ///
     /// `captures` is in capture-index order and must contain exactly
@@ -631,6 +762,110 @@ impl PortableRegex {
             },
         })
     }
+}
+
+impl PortableSearchSession<'_> {
+    /// Replace the first selected byte match with literal bytes while reusing
+    /// this session's already allocated search workspace.
+    ///
+    /// Semantics and output limits are identical to
+    /// [`PortableRegex::replace_literal_value`]. Constructing the value
+    /// iterator allocates no search workspace; only a matched owned result may
+    /// retain a new output allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed first-search, output-bound, allocation or invariant
+    /// refusal. Search failure leaves the session reusable under its existing
+    /// per-search transaction contract.
+    pub fn replace_literal_value<'h, R: LiteralReplacer>(
+        &mut self,
+        haystack: &'h [u8],
+        replacement: R,
+        iterator_limits: PortableFindIterRunLimits,
+        output_limits: ValueReplacementOutputLimits,
+    ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
+        let replacement = replacement.literal_bytes();
+        let first = {
+            let mut matches = self.find_iter_value(haystack, iterator_limits);
+            matches.next()
+        };
+        replace_first_literal_value(haystack, replacement, first, output_limits)
+    }
+}
+
+fn replace_first_literal_value<'h>(
+    haystack: &'h [u8],
+    replacement: &[u8],
+    first: Option<Result<Match, PortableFindIterError>>,
+    limits: ValueReplacementOutputLimits,
+) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
+    let Some(matched) = first
+        .transpose()
+        .map_err(PortableValueReplacementError::Iteration)?
+    else {
+        enforce_value_replacement_output_bytes(haystack.len(), limits.max_output_bytes)?;
+        return Ok(Cow::Borrowed(haystack));
+    };
+    if matched.start() > matched.end() || matched.end() > haystack.len() {
+        return Err(PortableValueReplacementError::InternalInvariant(
+            "selected span is not ordered within the haystack",
+        ));
+    }
+    let retained_haystack_bytes = haystack
+        .len()
+        .checked_sub(matched.len())
+        .ok_or(PortableValueReplacementError::OutputSizeOverflow)?;
+    let output_bytes = retained_haystack_bytes
+        .checked_add(replacement.len())
+        .ok_or(PortableValueReplacementError::OutputSizeOverflow)?;
+    enforce_value_replacement_output_bytes(output_bytes, limits.max_output_bytes)?;
+
+    let mut output = Vec::new();
+    output.try_reserve_exact(output_bytes).map_err(|_| {
+        PortableValueReplacementError::AllocationFailed {
+            requested: output_bytes,
+        }
+    })?;
+    let output_capacity = output.capacity();
+    if output_capacity > limits.max_output_capacity_bytes {
+        return Err(PortableValueReplacementError::OutputCapacityBytesLimit {
+            needed: output_capacity,
+            limit: limits.max_output_capacity_bytes,
+        });
+    }
+
+    let prefix =
+        haystack
+            .get(..matched.start())
+            .ok_or(PortableValueReplacementError::InternalInvariant(
+                "selected span starts outside the haystack",
+            ))?;
+    let suffix =
+        haystack
+            .get(matched.end()..)
+            .ok_or(PortableValueReplacementError::InternalInvariant(
+                "selected span ends outside the haystack",
+            ))?;
+    output.extend_from_slice(prefix);
+    output.extend_from_slice(replacement);
+    output.extend_from_slice(suffix);
+    if output.len() != output_bytes {
+        return Err(PortableValueReplacementError::InternalInvariant(
+            "preflight and copied output lengths differ",
+        ));
+    }
+    Ok(Cow::Owned(output))
+}
+
+fn enforce_value_replacement_output_bytes(
+    needed: usize,
+    limit: usize,
+) -> Result<(), PortableValueReplacementError> {
+    if needed > limit {
+        return Err(PortableValueReplacementError::OutputBytesLimit { needed, limit });
+    }
+    Ok(())
 }
 
 impl AggregateSpansRegex {

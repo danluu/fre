@@ -812,7 +812,8 @@ pub use replacement::{
     FunctionalReplacementLimits, FunctionalReplacementReport, FunctionalReplacementResult,
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
-    LiteralReplacementResult, LiteralReplacer, NoExpand,
+    LiteralReplacementResult, LiteralReplacer, NoExpand, PortableValueReplacementError,
+    ValueReplacementOutputLimits,
 };
 pub use search_aot::{
     SEARCH_EXACT_LITERAL_AOT_FIXED_BUILD_POLICY_VERSION,
