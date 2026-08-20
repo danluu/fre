@@ -11,24 +11,35 @@ use fre_aot_regex::{
 };
 use fre_syntax::RustProfile;
 
-#[derive(Debug)]
-struct Pattern {
-    id: String,
-    case_insensitive: bool,
-    source: String,
-}
+mod build_support;
+
+use build_support::{
+    BuildMode, BuildOutput, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy, patterns_path,
+    read_patterns,
+};
 
 #[allow(
     clippy::too_many_lines,
     reason = "artifact compilation and generated registry construction form one build transaction"
 )]
 fn main() {
-    println!("cargo:rerun-if-changed=patterns.tsv");
+    println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_FEATURES");
     println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_PATTERN_FILTER");
+    println!("cargo:rerun-if-env-changed={PATTERNS_FILE_ENV}");
+    println!("cargo:rerun-if-env-changed={VARIANTS_ENV}");
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("Cargo supplies CARGO_MANIFEST_DIR"),
+    );
+    let patterns_path = patterns_path(&manifest_dir, env::var_os(PATTERNS_FILE_ENV).as_deref())
+        .unwrap_or_else(|error| panic!("AOT patterns path: {error}"));
+    println!("cargo:rerun-if-changed={}", patterns_path.display());
+    let variant_policy = VariantPolicy::parse(env::var_os(VARIANTS_ENV).as_deref())
+        .unwrap_or_else(|error| panic!("AOT variant policy: {error}"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     let target = target().unwrap_or_else(|error| panic!("AOT target: {error}"));
-    let mut patterns = read_patterns(Path::new("patterns.tsv"));
+    let mut patterns = read_patterns(&patterns_path)
+        .unwrap_or_else(|error| panic!("AOT patterns manifest: {error}"));
     if let Some(filter) = env::var_os("FRE_RIPGREP_AOT_PATTERN_FILTER") {
         let ids = filter.to_string_lossy();
         let ids = ids.split(',').collect::<Vec<_>>();
@@ -38,22 +49,42 @@ fn main() {
             "FRE_RIPGREP_AOT_PATTERN_FILTER selected no patterns"
         );
     }
-    let mut generated = String::from(
-        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive fill ABI types are absent when every selected artifact takes a compatibility route\")]\nuse super::{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
+    let mut generated = format!(
+        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive fill ABI types are absent when every selected artifact takes a compatibility route\")]\nuse super::{{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans}};\n\npub(super) const BUILD_VARIANT_POLICY: &str = {:?};\npub(super) const BUILD_PATTERN_COUNT: usize = {};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {{\n",
+        variant_policy.name(),
+        patterns.len(),
     );
     let mut native_fills = String::new();
     let mut rows = String::new();
     let mut objects = Vec::new();
 
     for pattern in &patterns {
-        for (mode, mode_name, mode_source) in [
-            (CompileMode::Fast, "fast", "AotMode::Fast"),
-            (CompileMode::Optimizing, "optimizing", "AotMode::Optimizing"),
+        for (mode, mode_name, mode_source, build_mode) in [
+            (CompileMode::Fast, "fast", "AotMode::Fast", BuildMode::Fast),
+            (
+                CompileMode::Optimizing,
+                "optimizing",
+                "AotMode::Optimizing",
+                BuildMode::Optimizing,
+            ),
         ] {
-            for (output, output_name, output_source) in [
-                (OutputContract::Exists, "exists", "AotOutput::Exists"),
-                (OutputContract::Span, "span", "AotOutput::Span"),
+            for (output, output_name, output_source, build_output) in [
+                (
+                    OutputContract::Exists,
+                    "exists",
+                    "AotOutput::Exists",
+                    BuildOutput::Exists,
+                ),
+                (
+                    OutputContract::Span,
+                    "span",
+                    "AotOutput::Span",
+                    BuildOutput::Span,
+                ),
             ] {
+                if !variant_policy.includes(build_mode, build_output) {
+                    continue;
+                }
                 let mut profile = RustProfile::default();
                 profile.options.case_insensitive = pattern.case_insensitive;
                 let compiled = compile(
@@ -102,9 +133,7 @@ fn main() {
                         "native-trusted-preflight-runtime-bulk"
                     }
                     Some(PreparedBulkStrategy::NativeFrozenLoop) => "native-frozen-loop",
-                    Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => {
-                        "native-ordered-nfa-loop"
-                    }
+                    Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => "native-ordered-nfa-loop",
                     None if has_prepared_entry => "compatibility",
                     None => "none",
                 };
@@ -249,39 +278,6 @@ fn main() {
     if !objects.is_empty() {
         make_archive(&out_dir, &objects);
     }
-}
-
-fn read_patterns(path: &Path) -> Vec<Pattern> {
-    let text = fs::read_to_string(path).expect("read patterns.tsv");
-    let patterns = text
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let mut columns = line.splitn(3, '\t');
-            let id = columns.next().expect("pattern id").to_owned();
-            assert!(
-                id.bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-                "pattern id must be a Rust identifier suffix: {id:?}"
-            );
-            let case_insensitive = match columns.next() {
-                Some("0") => false,
-                Some("1") => true,
-                other => panic!("invalid case-insensitive field for {id}: {other:?}"),
-            };
-            let source = columns
-                .next()
-                .unwrap_or_else(|| panic!("missing pattern for {id}"))
-                .to_owned();
-            Pattern {
-                id,
-                case_insensitive,
-                source,
-            }
-        })
-        .collect::<Vec<_>>();
-    assert!(!patterns.is_empty(), "patterns.tsv must not be empty");
-    patterns
 }
 
 fn target() -> Result<Target, String> {

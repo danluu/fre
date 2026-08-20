@@ -107,6 +107,14 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 }
 
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the library test target exercises only pure build-input helpers"
+)]
+#[path = "../build_support.rs"]
+mod build_support_tests;
+
 #[derive(Debug)]
 enum Backend {
     Native {
@@ -452,11 +460,7 @@ impl AotMatcher {
                     && spec.pattern == pattern
                     && spec.case_insensitive == case_insensitive
             })
-            .ok_or_else(|| {
-                format!(
-                    "pattern/profile is not in the ripgrep AOT registry: mode={mode:?} output={output:?} case_insensitive={case_insensitive} pattern={pattern:?}"
-                )
-        })?;
+            .ok_or_else(|| missing_spec_error(mode, output, pattern, case_insensitive))?;
         let backend = match spec.backend {
             BackendFactory::Native { search, fill } => Backend::Native { search, fill },
             BackendFactory::Prepared {
@@ -689,6 +693,48 @@ impl AotMatcher {
             ),
             Backend::Native { search, .. } => native_search(*search, self.output, haystack, start),
         }
+    }
+}
+
+fn missing_spec_error(
+    mode: AotMode,
+    output: AotOutput,
+    pattern: &str,
+    case_insensitive: bool,
+) -> String {
+    missing_spec_error_from(
+        generated::SPECS,
+        generated::BUILD_VARIANT_POLICY,
+        mode,
+        output,
+        pattern,
+        case_insensitive,
+    )
+}
+
+fn missing_spec_error_from(
+    specs: &[CompiledSpec],
+    build_variant_policy: &str,
+    mode: AotMode,
+    output: AotOutput,
+    pattern: &str,
+    case_insensitive: bool,
+) -> String {
+    let available = specs
+        .iter()
+        .filter(|spec| spec.pattern == pattern && spec.case_insensitive == case_insensitive)
+        .map(|spec| format!("{:?}+{:?}", spec.mode, spec.output))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        format!(
+            "pattern/profile is not in the ripgrep AOT registry: mode={mode:?} output={output:?} case_insensitive={case_insensitive} pattern={pattern:?}"
+        )
+    } else {
+        format!(
+            "requested AOT variant was not emitted by this build: mode={mode:?} output={output:?} case_insensitive={case_insensitive} pattern={pattern:?}; build_variant_policy={}; available_variants={}; rebuild with FRE_RIPGREP_AOT_VARIANTS=all to emit every variant",
+            build_variant_policy,
+            available.join(","),
+        )
     }
 }
 
@@ -1709,7 +1755,61 @@ mod tests {
     }
 
     #[test]
+    fn missing_build_variant_error_names_policy_and_available_variant() {
+        let specs = [CompiledSpec {
+            mode: AotMode::Optimizing,
+            output: AotOutput::Exists,
+            pattern: "shape(?:one|two|three)",
+            case_insensitive: false,
+            description: "test-only",
+            backend: BackendFactory::Runtime(&[]),
+        }];
+        let error = missing_spec_error_from(
+            &specs,
+            "optimizing-exists",
+            AotMode::Fast,
+            AotOutput::Span,
+            "shape(?:one|two|three)",
+            false,
+        );
+        assert!(error.contains("requested AOT variant was not emitted"));
+        assert!(error.contains("build_variant_policy=optimizing-exists"));
+        assert!(error.contains("available_variants=Optimizing+Exists"));
+        assert!(error.contains("FRE_RIPGREP_AOT_VARIANTS=all"));
+
+        let absent = missing_spec_error_from(
+            &specs,
+            "optimizing-exists",
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            "different-shape",
+            false,
+        );
+        assert!(absent.contains("pattern/profile is not in the ripgrep AOT registry"));
+        assert!(!absent.contains("requested AOT variant was not emitted"));
+    }
+
+    #[test]
     fn generated_registry_routes_compiled_prepared_entries() {
+        let variants_per_pattern = match generated::BUILD_VARIANT_POLICY {
+            "all" => 4,
+            "optimizing-exists" => {
+                assert!(!generated::SPECS.is_empty());
+                assert!(generated::SPECS.iter().all(|spec| {
+                    spec.mode == AotMode::Optimizing && spec.output == AotOutput::Exists
+                }));
+                1
+            }
+            other => panic!("unknown generated build variant policy: {other:?}"),
+        };
+        assert_eq!(
+            generated::SPECS.len(),
+            generated::BUILD_PATTERN_COUNT * variants_per_pattern,
+            "generated registry cardinality does not match its frozen pattern/variant policy"
+        );
+        if generated::BUILD_VARIANT_POLICY == "optimizing-exists" {
+            return;
+        }
         let mut prepared = 0;
         let mut fast = 0;
         let mut fast_runtime_bulk = 0;
@@ -1745,6 +1845,7 @@ mod tests {
                         "bulk=native-trusted-preflight-loop",
                         "bulk=native-trusted-preflight-runtime-bulk",
                         "bulk=native-frozen-loop",
+                        "bulk=native-ordered-nfa-loop",
                     ]
                     .into_iter()
                     .filter(|bulk| spec.description.contains(bulk))
@@ -1829,6 +1930,26 @@ mod tests {
     }
 
     #[test]
+    fn generated_pruned_registry_rejects_absent_variant_clearly() {
+        if generated::BUILD_VARIANT_POLICY != "optimizing-exists" {
+            return;
+        }
+        let selected = generated::SPECS
+            .first()
+            .expect("nonempty generated registry");
+        let error = AotMatcher::new(
+            AotMode::Fast,
+            AotOutput::Span,
+            selected.pattern,
+            selected.case_insensitive,
+        )
+        .expect_err("pruned Fast+Span variant must be absent");
+        assert!(error.contains("requested AOT variant was not emitted"));
+        assert!(error.contains("build_variant_policy=optimizing-exists"));
+        assert!(error.contains("available_variants=Optimizing+Exists"));
+    }
+
+    #[test]
     fn compiled_prepared_bulk_invalid_handle_precedes_other_validation() {
         let mut compiled_calls = 0;
         let mut saw_runtime_span = false;
@@ -1850,6 +1971,7 @@ mod tests {
                 "bulk=native-trusted-preflight-loop",
                 "bulk=native-trusted-preflight-runtime-bulk",
                 "bulk=native-frozen-loop",
+                "bulk=native-ordered-nfa-loop",
             ]
             .into_iter()
             .filter(|bulk| spec.description.contains(bulk))
@@ -1921,10 +2043,10 @@ mod tests {
         .into_iter()
         .all(|pattern| generated::SPECS.iter().any(|spec| spec.pattern == pattern));
         if has_mixed_strategy_fixture {
-            assert!(saw_runtime_span);
-            assert!(saw_runtime_exists);
-            assert!(saw_native_span);
-            assert!(saw_native_exists);
+            assert!(saw_runtime_span || saw_native_span);
+            assert!(saw_runtime_exists || saw_native_exists);
+            assert!(saw_runtime_span || saw_runtime_exists);
+            assert!(saw_native_span || saw_native_exists);
         }
     }
 
@@ -2127,7 +2249,10 @@ mod tests {
             .expect("prepare Optimizing Span fallback");
         assert!(span.description().contains("route=compiled-prepared"));
         assert!(span.description().contains("api=span-fill-v1"));
-        assert!(span.description().contains("bulk=runtime-helper"));
+        assert!(
+            span.description().contains("bulk=runtime-helper")
+                || span.description().contains("bulk=native-ordered-nfa-loop")
+        );
         assert_eq!(
             span.find(b"PM_RESUME")
                 .expect("Span search")

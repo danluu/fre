@@ -1,0 +1,4 @@
+# Public generated shapes used to exercise external-manifest builds.
+literal_alt	0	(?:alpha|bravo|charlie|delta)
+word_alt_ci	1	\b(?:north|south|east|west)\b
+optional_suffix	0	(?:red|green|blue)(?:-[0-9]+)?
