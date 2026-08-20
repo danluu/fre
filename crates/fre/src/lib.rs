@@ -10956,12 +10956,11 @@ impl PortableRegex {
                 bounded_delimited_segment_is_match_window_value(plan, haystack, window, limits)
             }
             PortablePlan::LiteralClassRunLiteral(plan) => plan
-                .shortest_window(
+                .is_match_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::LiteralClassRunSearch(plan) => plan
                 .is_match_window_value(

@@ -1430,6 +1430,89 @@ impl LiteralClassRunLiteralPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Whether any selected match exists without retaining diagnostic
+    /// accounting for the admitted unguarded full-envelope route.
+    #[inline]
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        if self.boundary_semantics() != BoundarySemantics::Unguarded
+            || self.suffix_is_inside_class()
+            || limits != SearchLimits::unlimited()
+        {
+            return self
+                .shortest_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some());
+        }
+        let (upper, _, _, meter) = self.search_preflight(haystack.len(), window, limits)?;
+        if !meter.work_envelope_admitted
+            || upper.anchor_candidates > limits.max_candidate_visits
+        {
+            return self
+                .shortest_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some());
+        }
+        let slice = &haystack[window.start()..window.end()];
+        Ok(self.search_general_exists_value(slice))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the admitted value route keeps every anchor and run offset within its validated slice"
+    )]
+    fn search_general_exists_value(&self, haystack: &[u8]) -> bool {
+        let mut cursor = 0_usize;
+        loop {
+            let Some(relative) = self.anchor.find(&haystack[cursor..]) else {
+                return false;
+            };
+            let anchor_start = cursor + relative;
+            match self.anchor_kind {
+                Anchor::Prefix => {
+                    let anchor_end = anchor_start + self.prefix().len();
+                    if let Some(run_end) = scan_class_run_forward_value(
+                        haystack,
+                        self.class,
+                        self.ascii_scanner.as_ref(),
+                        anchor_end,
+                    ) {
+                        if haystack
+                            .get(run_end..)
+                            .is_some_and(|remaining| remaining.starts_with(self.suffix()))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                Anchor::Suffix => {
+                    if let Some(run_start) = scan_class_run_backward_value(
+                        haystack,
+                        self.class,
+                        self.ascii_scanner.as_ref(),
+                        anchor_start,
+                    ) {
+                        if let Some(prefix_start) = run_start.checked_sub(self.prefix().len()) {
+                            if haystack
+                                .get(prefix_start..run_start)
+                                .is_some_and(|actual| actual == self.prefix())
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Anchor::CompleteAsciiWordSuffix => {
+                    debug_assert!(false, "guarded value route must use incumbent search");
+                    return false;
+                }
+            }
+            cursor = anchor_start + 1;
+        }
+    }
+
     fn search_window(
         &self,
         haystack: &[u8],
