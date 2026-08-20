@@ -73,7 +73,7 @@ emitter.
 |---|---|---|---|
 | `fre-syntax` | pattern bytes, versioned compatibility profile, admission policy, hard safety envelope | canonical Rust HIR, direct RE2 AST, or RE2 literal plus resource summary and cache identity | parser/profile identity, bounded accounting, typed exact diagnostics, and explicit constructor-admission status |
 | `fre-lower` | Rust HIR and operation semantics | raw or independently validated prioritized byte automaton | iterative checked construction, explicit feature refusal, parse-to-search differentials |
-| `fre-automata` | CSR structure-of-arrays Thompson graph | typed exists, selected-end, or span report | structural validation, nonrecursive K0 execution, fixed reusable scratch, checked setup/transition work, priority/anchor tests |
+| `fre-automata` | CSR structure-of-arrays Thompson graph | typed exists, selected-end, or span report | structural validation, nonrecursive K0 execution, adaptive or fixed reusable scratch, checked setup/growth/transition work, priority/anchor tests |
 | `fre-reference` | small direct semantic AST | exact small-case matches, captures, and global sequences | independent semantics and fuel/resource failures; never performance |
 | `fre-conformance` | canonical cases and adapters | replayable differential records | cross-layer equality, unsupported classification, deterministic generation and minimization |
 | `fre-iterator-lab` | restricted capture-free byte models | whole-operation candidate traces | prove/falsify exact bounded iteration; never silently become production |
@@ -108,9 +108,13 @@ emitter.
    capture-free operation. Nullable unbounded repetition is currently rejected
    because ordinary generation dedup is not an adequate priority proof.
 3. `fre-automata` validates all table dimensions and payloads before freezing a
-   plan. One-shot calls report cold setup; reusable calls require a fixed-shape
-   `K0Workspace`, allocate nothing, charge reset plus transition work, retain
-   original-haystack assertion context, and recover cleanly after errors.
+   plan. One-shot calls report cold setup. Reusable calls use a shape-bound
+   `K0Workspace`, charge reset plus transition work, retain original-haystack
+   assertion context, and recover cleanly after errors. Adaptive workspaces may
+   transactionally grow cache capacity within their admitted ceiling and
+   report that traffic; public fixed workspaces do not grow. The plan-owned
+   immutable start-filter proof is separate and may publish on a cold search
+   unless prepared beforehand.
 4. A plan is operation-typed. Exists, selected-end, span, capture, aggregate
    iteration, replacement, and set matching are distinct contracts even when a
    future planner shares an executor.

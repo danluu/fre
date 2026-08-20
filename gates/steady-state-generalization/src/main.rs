@@ -4,8 +4,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use fre::{
-    PortableFindIterRunLimits, PortableRegex, PortableSearchSession, SearchLimits,
-    SearchSessionLimits, SearchSessionSetupAccounting,
+    CacheGrowthAccounting, PortableFindIterAccounting, PortableFindIterRunLimits, PortableRegex,
+    PortableSearchSession, SearchAccounting, SearchLimits, SearchSessionLimits,
+    SearchSessionSetupAccounting,
 };
 use regex_automata::{
     Input, MatchError, meta,
@@ -14,8 +15,8 @@ use regex_automata::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const SCHEMA: &str = "fre.steady-state-generalization.v1";
-const PLAN_ID: &str = "general-byte-steady-v1";
+const SCHEMA: &str = "fre.steady-state-generalization.v2";
+const PLAN_ID: &str = "general-byte-adaptive-steady-v2";
 const GENERATOR_ID: &str = "background-cycle-token-plant-v2";
 const RUST_PLAN_ID: &str = "regex_automata::meta::Regex/caller-owned-Cache/syntax-utf8-false";
 const DESIGNED_ON_SOURCE: &str = "8810cc1b4f409627b6bcc44756dfd2962b7cd6b7";
@@ -293,6 +294,57 @@ impl Digest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+struct GrowthAccounting {
+    events: usize,
+    allocated_bytes: usize,
+    initialized_bytes: usize,
+    retained_delta: usize,
+    peak_scratch_bytes: usize,
+}
+
+impl GrowthAccounting {
+    const fn from_growth(growth: CacheGrowthAccounting) -> Self {
+        Self {
+            events: growth.events(),
+            allocated_bytes: growth.allocated_bytes(),
+            initialized_bytes: growth.initialized_bytes(),
+            retained_delta: growth.retained_delta(),
+            peak_scratch_bytes: growth.peak_scratch_bytes(),
+        }
+    }
+
+    fn from_search(accounting: &SearchAccounting) -> Self {
+        accounting
+            .cache_growth()
+            .map_or_else(Self::default, Self::from_growth)
+    }
+
+    const fn from_iterator(accounting: PortableFindIterAccounting) -> Self {
+        Self {
+            events: accounting.cache_growth_events,
+            allocated_bytes: accounting.cache_growth_allocated_bytes,
+            initialized_bytes: accounting.cache_growth_initialized_bytes,
+            retained_delta: accounting.cache_growth_retained_delta,
+            peak_scratch_bytes: accounting.cache_growth_peak_scratch_bytes,
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.events == 0
+            && self.allocated_bytes == 0
+            && self.initialized_bytes == 0
+            && self.retained_delta == 0
+            && self.peak_scratch_bytes == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FreOutcome {
+    digest: Digest,
+    growth: GrowthAccounting,
+}
+
 fn mix64(mut value: u64) -> u64 {
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -466,6 +518,56 @@ fn fre_outcome(
     Ok(digest)
 }
 
+fn fre_accounted_outcome(
+    session: &mut PortableSearchSession<'_>,
+    operation: Operation,
+    haystack: &[u8],
+) -> Result<FreOutcome, String> {
+    let mut digest = Digest::default();
+    let growth;
+    match operation {
+        Operation::IsMatch => {
+            let (matched, accounting) = session
+                .is_match(haystack, SearchLimits::unlimited())
+                .map_err(|error| format!("FRE is_match: {error:?}"))?;
+            if matched {
+                digest.push(0, 0);
+            }
+            growth = GrowthAccounting::from_search(&accounting);
+        }
+        Operation::Find => {
+            let (matched, accounting) = session
+                .find(haystack, SearchLimits::unlimited())
+                .map_err(|error| format!("FRE find: {error:?}"))?;
+            if let Some(matched) = matched {
+                digest.push(matched.start(), matched.end());
+            }
+            growth = GrowthAccounting::from_search(&accounting);
+        }
+        Operation::FindAt => {
+            let (matched, accounting) = session
+                .find_at(haystack, find_at_start(haystack), SearchLimits::unlimited())
+                .map_err(|error| format!("FRE find_at: {error:?}"))?;
+            if let Some(matched) = matched {
+                digest.push(matched.start(), matched.end());
+            }
+            growth = GrowthAccounting::from_search(&accounting);
+        }
+        Operation::Iterate => {
+            let mut matches = session.find_iter(haystack, PortableFindIterRunLimits::unlimited());
+            for item in matches.by_ref() {
+                let matched = item.map_err(|error| format!("FRE iterator: {error:?}"))?;
+                digest.push(matched.start(), matched.end());
+            }
+            growth = GrowthAccounting::from_iterator(matches.accounting());
+        }
+        Operation::SessionSetup => {
+            return Err("session_setup has no search outcome".to_owned());
+        }
+    }
+    Ok(FreOutcome { digest, growth })
+}
+
 fn rust_outcome(
     regex: &meta::Regex,
     cache: &mut meta::Cache,
@@ -532,21 +634,46 @@ fn build_plans(case: Case) -> Result<(PortableRegex, meta::Regex), String> {
 fn verify_workload(case: Case, size: usize, density: Density) -> Result<Value, String> {
     let haystack = haystack(case, size, density);
     let (fre, rust) = build_plans(case)?;
-    let mut fre_session = fre
-        .search_session(SearchSessionLimits::unlimited())
-        .map_err(|error| format!("{} FRE session: {error:?}", case.id))?;
-    let mut rust_cache = rust.create_cache();
     let fre_plan = fre.runtime_implementation_id();
-    let session_plan = fre_session.runtime_implementation_id();
-    let setup = setup_json(fre_session.workspace_setup_accounting());
+    let mut session_plan = None;
+    let mut setup = None;
     let mut semantics = serde_json::Map::new();
+    let mut cache_growth = serde_json::Map::new();
     for &operation in OPERATIONS {
         if operation == Operation::SessionSetup {
             continue;
         }
-        let fre_result = fre_outcome(&mut fre_session, operation, &haystack)?;
+        // Each operation owns fresh state so its first-call growth receipt is
+        // independent of the ordering of the verification matrix.
+        let mut fre_session = fre
+            .search_session(SearchSessionLimits::unlimited())
+            .map_err(|error| format!("{} FRE session: {error:?}", case.id))?;
+        let current_plan = fre_session.runtime_implementation_id();
+        if let Some(expected_plan) = session_plan {
+            if current_plan != expected_plan {
+                return Err(format!(
+                    "{} session plan changed across fresh operation sessions: {expected_plan:?} != {current_plan:?}",
+                    case.id,
+                ));
+            }
+        } else {
+            session_plan = Some(current_plan);
+        }
+        let current_setup = setup_json(fre_session.workspace_setup_accounting());
+        if let Some(expected_setup) = setup.as_ref() {
+            if &current_setup != expected_setup {
+                return Err(format!(
+                    "{} session setup changed across fresh operation sessions",
+                    case.id,
+                ));
+            }
+        } else {
+            setup = Some(current_setup);
+        }
+        let mut rust_cache = rust.create_cache();
+        let fre_result = fre_accounted_outcome(&mut fre_session, operation, &haystack)?;
         let rust_result = rust_outcome(&rust, &mut rust_cache, operation, &haystack)?;
-        if fre_result != rust_result {
+        if fre_result.digest != rust_result {
             return Err(format!(
                 "{} / {size} / {} / {} differs: FRE {fre_result:?}, Rust {rust_result:?}",
                 case.id,
@@ -556,7 +683,11 @@ fn verify_workload(case: Case, size: usize, density: Density) -> Result<Value, S
         }
         semantics.insert(
             operation.id().to_owned(),
-            serde_json::to_value(fre_result).map_err(|error| error.to_string())?,
+            serde_json::to_value(fre_result.digest).map_err(|error| error.to_string())?,
+        );
+        cache_growth.insert(
+            operation.id().to_owned(),
+            serde_json::to_value(fre_result.growth).map_err(|error| error.to_string())?,
         );
     }
     Ok(json!({
@@ -565,10 +696,11 @@ fn verify_workload(case: Case, size: usize, density: Density) -> Result<Value, S
         "size": size,
         "density": density,
         "fre_regex_plan": fre_plan,
-        "fre_session_plan": session_plan,
-        "fre_session_setup": setup,
+        "fre_session_plan": session_plan.expect("the operation matrix is nonempty"),
+        "fre_session_setup": setup.expect("the operation matrix is nonempty"),
         "rust_plan": RUST_PLAN_ID,
         "semantics": semantics,
+        "fre_cache_growth": cache_growth,
     }))
 }
 
@@ -611,7 +743,7 @@ fn time_fre(
     operation: Operation,
     haystack: &[u8],
     iterations: usize,
-) -> Result<(u128, u64, &'static str, Value), String> {
+) -> Result<(u128, u64, &'static str, Value, Value), String> {
     if operation == Operation::SessionSetup {
         let warm = regex
             .search_session(SearchSessionLimits::unlimited())
@@ -635,7 +767,13 @@ fn time_fre(
             );
             black_box(session);
         }
-        return Ok((timer.elapsed().as_nanos(), black_box(checksum), plan, setup));
+        return Ok((
+            timer.elapsed().as_nanos(),
+            black_box(checksum),
+            plan,
+            setup,
+            Value::Null,
+        ));
     }
 
     let mut session = regex
@@ -643,14 +781,50 @@ fn time_fre(
         .map_err(|error| format!("FRE session setup: {error:?}"))?;
     let plan = session.runtime_implementation_id();
     let setup = setup_json(session.workspace_setup_accounting());
-    black_box(fre_outcome(&mut session, operation, black_box(haystack))?);
+    let warm = fre_accounted_outcome(&mut session, operation, black_box(haystack))?;
+    black_box(warm.digest);
+    let stabilization = fre_accounted_outcome(&mut session, operation, black_box(haystack))?;
+    if stabilization.digest != warm.digest {
+        return Err(format!(
+            "FRE steady {operation:?} stabilization changed the warm semantic digest"
+        ));
+    }
+    if !stabilization.growth.is_empty() {
+        return Err(format!(
+            "FRE steady {operation:?} grew cache during its stabilization probe: {:?}",
+            stabilization.growth,
+        ));
+    }
     let timer = Instant::now();
     let mut checksum = 0_u64;
     for ordinal in 0..iterations {
         let outcome = fre_outcome(&mut session, operation, black_box(haystack))?;
         checksum = fold_timed_checksum(checksum, black_box(outcome), ordinal);
     }
-    Ok((timer.elapsed().as_nanos(), black_box(checksum), plan, setup))
+    let elapsed = timer.elapsed().as_nanos();
+    let post = fre_accounted_outcome(&mut session, operation, black_box(haystack))?;
+    if post.digest != warm.digest {
+        return Err(format!(
+            "FRE steady {operation:?} post-timing probe changed the warm semantic digest"
+        ));
+    }
+    if !post.growth.is_empty() {
+        return Err(format!(
+            "FRE steady {operation:?} grew cache during its post-timing probe: {:?}",
+            post.growth,
+        ));
+    }
+    Ok((
+        elapsed,
+        black_box(checksum),
+        plan,
+        setup,
+        json!({
+            "warm": warm.growth,
+            "stabilization": stabilization.growth,
+            "post": post.growth,
+        }),
+    ))
 }
 
 fn time_rust(
@@ -716,15 +890,15 @@ fn point(
         serde_json::to_value(fre_result).map_err(|error| error.to_string())?
     };
 
-    let (elapsed_ns, checksum, runtime_plan, session_setup) = match engine {
+    let (elapsed_ns, checksum, runtime_plan, session_setup, cache_growth) = match engine {
         "fre" => {
-            let (elapsed, checksum, runtime_plan, setup) =
+            let (elapsed, checksum, runtime_plan, setup, growth) =
                 time_fre(&fre, operation, &haystack, iterations)?;
-            (elapsed, checksum, runtime_plan, setup)
+            (elapsed, checksum, runtime_plan, setup, growth)
         }
         "rust" => {
             let (elapsed, checksum) = time_rust(&rust, operation, &haystack, iterations)?;
-            (elapsed, checksum, RUST_PLAN_ID, Value::Null)
+            (elapsed, checksum, RUST_PLAN_ID, Value::Null, Value::Null)
         }
         _ => return Err(format!("unknown engine {engine:?}; expected fre or rust")),
     };
@@ -749,8 +923,9 @@ fn point(
         "semantic": semantic,
         "runtime_plan": runtime_plan,
         "session_setup": session_setup,
+        "cache_growth": cache_growth,
         "rust_state_policy": RUST_PLAN_ID,
-        "fre_state_policy": "caller-owned PortableSearchSession; no setup in steady lane",
+        "fre_state_policy": "caller-owned adaptive PortableSearchSession; one accounted exact warm; accounted stabilization and post probes must have zero growth; the original operation path alone is timed",
     }))
 }
 
@@ -793,7 +968,7 @@ fn catalog() -> Value {
         "cases": CASES,
         "points": points,
         "state_policy": {
-            "fre": "one caller-owned PortableSearchSession, one untimed warm operation",
+            "fre": "one caller-owned adaptive PortableSearchSession; one accounted exact warm; zero-growth accounted stabilization and post probes; original operation path timed without growth observation",
             "rust": RUST_PLAN_ID,
             "iteration": "both engines use caller-owned state for the complete iterator",
         },

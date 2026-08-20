@@ -64,6 +64,7 @@ dependencies = [
  "fre-capture-lab",
  "fre-exact-alloc",
  "fre-jit-aarch64",
+ "fre-jit-cache",
  "fre-jit-runtime",
  "fre-kernel-ir",
  "fre-kernels",
@@ -71,6 +72,7 @@ dependencies = [
  "fre-syntax",
  "memchr",
  "regex-syntax",
+ "sha2",
 ]
 
 [[package]]
@@ -88,6 +90,7 @@ dependencies = [
 name = "fre-automata"
 version = "0.1.0"
 dependencies = [
+ "fre-exact-alloc",
  "fre-simd-kernels",
  "memchr",
  "regex-syntax",
@@ -98,7 +101,9 @@ name = "fre-capture-lab"
 version = "0.1.0"
 dependencies = [
  "fre-exact-alloc",
+ "memchr",
  "regex-syntax",
+ "sha2",
 ]
 
 [[package]]
@@ -115,11 +120,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-jit-cache"
+version = "0.1.0"
+dependencies = [
+ "fre-jit-aarch64",
+ "fre-jit-runtime",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
 name = "fre-jit-runtime"
 version = "0.1.0"
 dependencies = [
  "fre-jit-aarch64",
  "fre-kernel-ir",
+ "fre-kernels",
+ "fre-target-features",
  "libc",
 ]
 
@@ -136,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
+ "fre-kernel-ir",
  "fre-simd-kernels",
  "memchr",
 ]

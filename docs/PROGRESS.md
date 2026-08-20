@@ -19,8 +19,9 @@ an open P0 row.
   admission, and the direct pinned RE2 AST integrated without claiming program
   construction admission.
 - [x] `fre-automata`: bounded table-structured K0 search floor for capture-free
-  byte NFAs, plus fixed-capacity reusable scratch with separate setup and
-  transition accounting.
+  byte NFAs, plus adaptive and fixed-capacity reusable scratch with separate
+  setup, cache-growth, and transition accounting; cold immutable plan-proof
+  publication remains explicit.
 - [x] `rebar-manifest`: deterministic 3,859-job runner inventory and audited
   Rust-regex/RE2 adapter metadata, with exact target-job execution retained in
   the separate comparison report.

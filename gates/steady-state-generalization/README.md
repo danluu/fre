@@ -32,16 +32,22 @@ across all nine content coordinates.
 
 ## Fair steady-state state ownership
 
-Every steady FRE point constructs exactly one `PortableSearchSession` before
-timing and calls the session methods, including
+Every steady FRE point constructs exactly one adaptive
+`PortableSearchSession` before timing and calls the session methods, including
 `PortableSearchSession::find_iter`. Every Rust point constructs exactly one
 `regex_automata::meta::Cache` before timing and calls `search_with` or
 `search_half_with`. Complete Rust iteration uses the crate's public
 `util::iter::Searcher` with that same caller-owned cache. Both states receive
-one untimed warm operation. There is no hidden pool and no setup in a steady
-lane. Rust syntax is explicitly configured with `utf8(false)` so the byte
-comparator accepts the arbitrary-byte case without changing Unicode pattern
-semantics.
+one untimed operation identical to the measured operation. FRE records cache
+growth from that warm operation, then runs an identical accounted
+stabilization probe and requires its growth ledger to be empty. Only the
+original operation path is timed; growth observation stays outside the timer.
+An accounted post-timing probe must also report no growth, so a point that is
+not actually steady is rejected. There is no hidden pool and session
+construction remains outside a steady lane, while demand growth belongs to
+execution. Rust syntax is explicitly configured with `utf8(false)` so the
+byte comparator accepts the arbitrary-byte case without changing Unicode
+pattern semantics.
 
 `is_match` uses Rust's explicit-cache half-search in earliest mode, matching
 the intent of its high-level existence API while avoiding that API's internal
@@ -69,10 +75,11 @@ does not pin CPUs or use cgroups.
 
 `verify` is clock-free and checks every steady operation against the Rust
 engine with caller-owned caches. `catalog`, `verify`, and `point` all report
-the plan identity and a deterministic FNV-1a checksum over the complete
+the v2 plan identity and a deterministic FNV-1a checksum over the complete
 matrix definition. A point also reports the untimed semantic digest, the
 timed checksum, FRE runtime plan identity, and visible FRE session setup
-accounting.
+accounting, plus separate warm, stabilization, and post-timing cache-growth
+ledgers.
 
 ## Complete campaign
 

@@ -8,10 +8,10 @@ use regex_syntax::hir::{Hir, HirKind, Look, LookSet};
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
     PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-    PortableFindIterRunLimits, PortableMatches, PortableRegex, PortableSearchSession,
-    PortableSessionMatches, RustProfile, SearchAccounting, SearchError, SearchLimits,
-    SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow, charge_planner, finite,
-    reserve_planner,
+    PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
+    PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
+    SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
+    charge_planner, finite, reserve_planner,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -877,8 +877,8 @@ impl PortableTextRegex {
     /// Return whether this regex matches anywhere in a valid UTF-8 haystack.
     ///
     /// This is the Rust-compatible ordinary API. It has no caller-visible
-    /// work quota and automatically reuses the inner matcher's fixed,
-    /// construction-bounded scratch.
+    /// work quota and automatically reuses the inner matcher's
+    /// construction-bounded adaptive scratch.
     ///
     /// # Panics
     ///
@@ -972,8 +972,8 @@ impl PortableTextRegex {
     /// Return the selected leftmost-first match in byte offsets.
     ///
     /// This is the Rust-compatible ordinary API. It has no caller-visible
-    /// work quota and automatically reuses the inner matcher's fixed,
-    /// construction-bounded scratch.
+    /// work quota and automatically reuses the inner matcher's
+    /// construction-bounded adaptive scratch.
     ///
     /// # Panics
     ///
@@ -1024,12 +1024,12 @@ impl PortableTextRegex {
     /// Prepare an explicit reusable session for repeated text value searches
     /// and match iteration.
     ///
-    /// K0 workspace construction and its setup limits are paid once here.
-    /// Each subsequent value search or [`PortableTextSearchSession::find_iter`]
-    /// borrows this session mutably and allocates no new K0 workspace.
-    /// Iterators start independent whole-iterator accounting. The wrapper
-    /// preserves this matcher's text equivalence proof, so scalar-wise
-    /// empty-match progress is not exposed on an arbitrary byte matcher.
+    /// K0 admits its workspace ceiling and allocates a compact cache seed here.
+    /// A subsequent value search or [`PortableTextSearchSession::find_iter`]
+    /// may grow that cache transactionally under its per-call limits. Iterators
+    /// start independent whole-iterator accounting. The wrapper preserves this
+    /// matcher's text equivalence proof, so scalar-wise empty-match progress is
+    /// not exposed on an arbitrary byte matcher.
     ///
     /// # Errors
     ///
@@ -1044,12 +1044,36 @@ impl PortableTextRegex {
         })
     }
 
-    pub(crate) fn endpoint_search_session(
+    /// Prepare a fixed-capacity text session whose K0 cache never grows during
+    /// a search.
+    ///
+    /// This is the text-safe counterpart of
+    /// [`PortableRegex::fixed_search_session`]. It preserves this matcher's
+    /// UTF-8 equivalence proof while putting all K0 capacity allocation in the
+    /// source-free session-construction boundary. Call
+    /// [`PortableTextSearchSession::prepare_k0_start_filter`] as a second
+    /// source-free setup step when the later measured region must also exclude
+    /// the optional immutable plan-proof allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same fixed setup contract as
+    /// [`PortableRegex::fixed_search_session`].
+    pub fn fixed_search_session(
         &self,
         limits: SearchSessionLimits,
     ) -> Result<PortableTextSearchSession<'_>, SearchError> {
         Ok(PortableTextSearchSession {
-            inner: self.inner.endpoint_search_session(limits)?,
+            inner: self.inner.fixed_search_session(limits)?,
+        })
+    }
+
+    pub(crate) fn fixed_endpoint_search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableTextSearchSession<'_>, SearchError> {
+        Ok(PortableTextSearchSession {
+            inner: self.inner.fixed_endpoint_search_session(limits)?,
         })
     }
 
@@ -1220,12 +1244,30 @@ impl<'r> PortableTextSearchSession<'r> {
 
     /// One-time K0 workspace allocation and initialization facts.
     ///
-    /// These are charged once when [`PortableTextRegex::search_session`]
-    /// constructs this session, not once per iterator. Native plans return
-    /// `None`.
+    /// These are charged once when [`PortableTextRegex::search_session`] or
+    /// [`PortableTextRegex::fixed_search_session`] constructs this session,
+    /// not once per iterator. Native plans return `None`.
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         self.inner.workspace_setup_accounting()
+    }
+
+    /// Settle the optional immutable K0 start-filter proof under one complete
+    /// source-free setup envelope.
+    ///
+    /// This is the text-safe counterpart of
+    /// [`PortableSearchSession::prepare_k0_start_filter`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same setup contract as the byte
+    /// session method.
+    #[doc(hidden)]
+    pub fn prepare_k0_start_filter(
+        &mut self,
+        limits: SearchSessionLimits,
+    ) -> Result<Option<PortableK0StartFilterSetupAccounting>, SearchError> {
+        self.inner.prepare_k0_start_filter(limits)
     }
 
     pub(crate) fn is_match_accounted_at(
@@ -1504,6 +1546,11 @@ mod tests {
             .expect("text K0 session");
         assert_eq!(session.runtime_implementation_id(), "k0");
         assert!(session.workspace_setup_accounting().is_some());
+        let fixed = regex
+            .fixed_search_session(SearchSessionLimits::unlimited())
+            .expect("fixed text K0 session");
+        assert_eq!(fixed.runtime_implementation_id(), "k0");
+        assert!(fixed.workspace_setup_accounting().is_some());
     }
 
     #[test]

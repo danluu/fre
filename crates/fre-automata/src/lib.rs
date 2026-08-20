@@ -33,8 +33,9 @@ mod unicode_look;
 mod unicode_perl_word_v16;
 
 pub use contract::{
-    EarliestEnd, Exists, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan, Operation,
-    OutputContract, SearchAccounting, SearchReport, SelectedEnd, SetupAccounting, Span, TypedPlan,
+    CacheGrowthAccounting, EarliestEnd, Exists, K0OrderedResumeCompletion, K0OrderedResumeValue,
+    MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport, SelectedEnd,
+    SetupAccounting, Span, TypedPlan,
 };
 pub use epsilon_closure_dispatch::{
     COMPILER_PRIVATE_EPSILON_CLOSURE_START_MAX_INSTRUCTIONS,

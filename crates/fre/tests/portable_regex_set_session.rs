@@ -160,6 +160,36 @@ fn construction_receipts_close_over_full_descriptor_vector_and_k0_workspaces() {
 
 #[test]
 fn construction_limits_admit_exact_receipts_and_reject_below_descriptor_floors() {
+    fn minimum_u64(upper: u64, mut admits: impl FnMut(u64) -> bool) -> u64 {
+        assert!(admits(upper));
+        let mut low = 0_u64;
+        let mut high = upper;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if admits(middle) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    }
+
+    fn minimum_usize(upper: usize, mut admits: impl FnMut(usize) -> bool) -> usize {
+        assert!(admits(upper));
+        let mut low = 0_usize;
+        let mut high = upper;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if admits(middle) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    }
+
     let bytes = PortableRegexSet::new(K0_PATTERNS).expect("K0 byte set");
     let byte_probe = bytes
         .search_session(PortableRegexSetSessionLimits::unlimited())
@@ -179,6 +209,58 @@ fn construction_limits_admit_exact_receipts_and_reject_below_descriptor_floors()
             .charged_setup_work,
         byte_probe.charged_setup_work
     );
+    let byte_minimum_setup = minimum_u64(byte_probe.charged_setup_work, |maximum| {
+        bytes
+            .search_session(PortableRegexSetSessionLimits {
+                max_total_setup_work: maximum,
+                ..byte_exact
+            })
+            .is_ok()
+    });
+    assert!(byte_minimum_setup > 0);
+    assert_eq!(
+        bytes
+            .search_session(PortableRegexSetSessionLimits {
+                max_total_setup_work: byte_minimum_setup,
+                ..byte_exact
+            })
+            .expect("exact minimum byte setup")
+            .setup_report()
+            .charged_setup_work,
+        byte_minimum_setup,
+    );
+    assert!(bytes
+        .search_session(PortableRegexSetSessionLimits {
+            max_total_setup_work: byte_minimum_setup - 1,
+            ..byte_exact
+        })
+        .is_err());
+    let byte_minimum_retained = minimum_usize(byte_probe.charged_retained_bytes, |maximum| {
+        bytes
+            .search_session(PortableRegexSetSessionLimits {
+                max_total_retained_bytes: maximum,
+                ..byte_exact
+            })
+            .is_ok()
+    });
+    assert!(byte_minimum_retained > 0);
+    assert_eq!(
+        bytes
+            .search_session(PortableRegexSetSessionLimits {
+                max_total_retained_bytes: byte_minimum_retained,
+                ..byte_exact
+            })
+            .expect("exact minimum byte retention")
+            .setup_report()
+            .charged_retained_bytes,
+        byte_minimum_retained,
+    );
+    assert!(bytes
+        .search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: byte_minimum_retained - 1,
+            ..byte_exact
+        })
+        .is_err());
     assert!(matches!(
         bytes.search_session(PortableRegexSetSessionLimits {
             max_pattern_sessions: K0_PATTERNS.len() - 1,
@@ -226,6 +308,54 @@ fn construction_limits_admit_exact_receipts_and_reject_below_descriptor_floors()
         exact.charged_retained_bytes,
         text_probe.charged_retained_bytes
     );
+    let text_minimum_setup = minimum_u64(text_probe.charged_setup_work, |maximum| {
+        text.search_session(PortableRegexSetSessionLimits {
+            max_total_setup_work: maximum,
+            ..text_exact
+        })
+        .is_ok()
+    });
+    assert!(text_minimum_setup > 0);
+    assert_eq!(
+        text.search_session(PortableRegexSetSessionLimits {
+            max_total_setup_work: text_minimum_setup,
+            ..text_exact
+        })
+        .expect("exact minimum text setup")
+        .setup_report()
+        .charged_setup_work,
+        text_minimum_setup,
+    );
+    assert!(text
+        .search_session(PortableRegexSetSessionLimits {
+            max_total_setup_work: text_minimum_setup - 1,
+            ..text_exact
+        })
+        .is_err());
+    let text_minimum_retained = minimum_usize(text_probe.charged_retained_bytes, |maximum| {
+        text.search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: maximum,
+            ..text_exact
+        })
+        .is_ok()
+    });
+    assert!(text_minimum_retained > 0);
+    assert_eq!(
+        text.search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: text_minimum_retained,
+            ..text_exact
+        })
+        .expect("exact minimum text retention")
+        .setup_report()
+        .charged_retained_bytes,
+        text_minimum_retained,
+    );
+    assert!(text
+        .search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: text_minimum_retained - 1,
+            ..text_exact
+        })
+        .is_err());
     assert!(
         text.search_session(PortableRegexSetSessionLimits {
             max_total_setup_work: text_probe.session_initialization_work - 1,

@@ -19,6 +19,13 @@ schedules. Timing uses four independently launched processes per point, a
 precommitted randomized schedule, at most 96 dispatched processes, and no
 affinity, cgroups, retries, or exclusions.
 
+The frozen v1 receipt keeps its existing work/setup projection for
+backward-compatible base-versus-candidate builds. Its setup→first→warm
+session operations use the default adaptive constructors, so cache-growth
+initialization remains included in `SearchAccounting` work and in the measured
+transition, but v1 does not serialize the newer cache-growth event/byte ledger.
+Publishing those fields requires a separately baselined v2 receipt.
+
 Typical handoff:
 
 ```text

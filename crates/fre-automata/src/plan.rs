@@ -526,6 +526,15 @@ impl SearchWindow {
 /// `max_work` covers setup plus transitions. A one-shot call therefore charges
 /// cold workspace construction, while a reusable call charges only logical
 /// reset (and, extremely rarely, generation-table clearing) before transitions.
+/// Demand-grown cache allocation, initialization, copying, and publication are
+/// execution work and must fit the same bound. `max_scratch_bytes` bounds the
+/// invocation's active scratch high-water mark, including already retained
+/// workspace payload, externally retained continuation state, and any staged
+/// replacement arena held during transactional cache growth.
+/// A cache-growth transaction charges its complete deterministic allocation
+/// plan when admitted; if a later fallible allocation obtains only a prefix of
+/// that plan, the discarded byte traffic is reported but the logical work
+/// charge is not rolled back.
 /// Unless an operation-aware prepared facade has already settled the policy,
 /// the first successful search on an immutable [`Automaton`] also charges its
 /// bounded full-byte start-filter proof and scanner/secondary-filter
@@ -1107,18 +1116,7 @@ impl StartFilterProofCell {
 }
 
 fn try_start_filter_proof_owner(proof: &StartFilterProof) -> Option<Box<[StartFilterProof; 1]>> {
-    let mut slot = Vec::new();
-    slot.try_reserve_exact(1).ok()?;
-    // `into_boxed_slice` is allocation-free only when length equals
-    // capacity. An allocator may legally grant more than was requested; in
-    // that unusual case, decline publication instead of invoking an
-    // infallible shrinking allocation.
-    if slot.capacity() != 1 {
-        return None;
-    }
-    slot.push(*proof);
-    let owner: Box<[StartFilterProof]> = slot.into_boxed_slice();
-    owner.try_into().ok()
+    fre_exact_alloc::try_box_preserve([*proof]).ok()
 }
 
 /// Immutable structure-of-arrays prioritized Thompson graph.
@@ -1259,6 +1257,20 @@ impl PooledWorkspaceReturn<'_> {
 }
 
 impl<'a> PooledWorkspaceCheckout<'a> {
+    /// Retained pool owner bytes live alongside the checked-out workspace.
+    /// An uncached allocation-failure fallback has no published pool owner.
+    pub(crate) const fn external_retained_scratch_bytes(&self) -> usize {
+        match &self.storage {
+            PooledWorkspaceStorage::Owner(_) | PooledWorkspaceStorage::Owned {
+                return_to: Some(_),
+                ..
+            } => Automaton::pooled_workspace_owner_bytes(),
+            PooledWorkspaceStorage::Owned {
+                return_to: None, ..
+            } => 0,
+        }
+    }
+
     pub(crate) fn commit(self) {
         match self.storage {
             PooledWorkspaceStorage::Owner(owner) => owner.commit(),
@@ -1366,8 +1378,88 @@ impl Automaton {
 
     const POOLED_WORKSPACE_OWNER_PUBLICATION_WORK: u64 = 1;
 
-    const fn pooled_workspace_owner_bytes() -> usize {
+    pub(crate) const fn pooled_workspace_owner_bytes() -> usize {
         size_of::<PooledWorkspacePool>()
+    }
+
+    pub(crate) fn pooled_workspace_limits_for_search(
+        workspace_limits: WorkspaceLimits,
+        search_limits: SearchLimits,
+    ) -> WorkspaceLimits {
+        if search_limits == SearchLimits::unlimited() {
+            return workspace_limits;
+        }
+        WorkspaceLimits {
+            // A warm lane does not owe its historical construction work to
+            // this invocation. Only active retained scratch is shared with
+            // the search envelope; cold construction receives a separate
+            // work cap at checkout.
+            max_setup_work: workspace_limits.max_setup_work,
+            max_scratch_bytes: workspace_limits
+                .max_scratch_bytes
+                .min(search_limits.max_scratch_bytes),
+        }
+    }
+
+    const fn pooled_new_workspace_limits(
+        limits: WorkspaceLimits,
+        max_new_setup_work: u64,
+    ) -> WorkspaceLimits {
+        WorkspaceLimits {
+            max_setup_work: if limits.max_setup_work < max_new_setup_work {
+                limits.max_setup_work
+            } else {
+                max_new_setup_work
+            },
+            max_scratch_bytes: limits.max_scratch_bytes,
+        }
+    }
+
+    fn pooled_owner_publication_setup(
+        setup: SetupAccounting,
+        owner_initialized: bool,
+        owner_retained: bool,
+    ) -> Result<SetupAccounting, SearchError> {
+        let owner_bytes = Self::pooled_workspace_owner_bytes();
+        Ok(SetupAccounting {
+            work: setup
+                .work
+                .checked_add(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "pooled workspace owner publication work",
+                })?,
+            allocated_bytes: if owner_retained {
+                setup
+                    .allocated_bytes
+                    .checked_add(owner_bytes)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "pooled workspace owner allocated bytes",
+                    })?
+            } else {
+                setup.allocated_bytes
+            },
+            initialized_bytes: if owner_initialized {
+                setup
+                    .initialized_bytes
+                    .checked_add(owner_bytes)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "pooled workspace owner initialized bytes",
+                    })?
+            } else {
+                setup.initialized_bytes
+            },
+            retained_bytes: if owner_retained {
+                setup
+                    .retained_bytes
+                    .checked_add(owner_bytes)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "pooled workspace owner retained bytes",
+                    })?
+            } else {
+                setup.retained_bytes
+            },
+            reused: false,
+        })
     }
 
     fn pooled_workspace_payload_limits(limits: WorkspaceLimits) -> Option<WorkspaceLimits> {
@@ -1385,8 +1477,15 @@ impl Automaton {
         let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
             return false;
         };
-        workspace.construction_accounting().work() <= payload_limits.max_setup_work
-            && workspace.retained_bytes() <= payload_limits.max_scratch_bytes
+        Self::pooled_workspace_fits_payload(workspace, payload_limits)
+    }
+
+    fn pooled_workspace_fits_payload(
+        workspace: &K0Workspace,
+        payload_limits: WorkspaceLimits,
+    ) -> bool {
+        workspace.admitted_setup_work() <= payload_limits.max_setup_work
+            && workspace.admitted_scratch_bytes() <= payload_limits.max_scratch_bytes
     }
 
     fn pooled_workspace_residual_limits(
@@ -1396,10 +1495,10 @@ impl Automaton {
         Some(WorkspaceLimits {
             max_setup_work: limits
                 .max_setup_work
-                .checked_sub(incumbent.construction_accounting().work())?,
+                .checked_sub(incumbent.admitted_setup_work())?,
             max_scratch_bytes: limits
                 .max_scratch_bytes
-                .checked_sub(incumbent.retained_bytes())?,
+                .checked_sub(incumbent.admitted_scratch_bytes())?,
         })
     }
 
@@ -1410,6 +1509,62 @@ impl Automaton {
         let layout = WorkspaceLayout::for_automaton(self)?;
         Ok(layout.construction_work() <= limits.max_setup_work
             && layout.logical_bytes() <= limits.max_scratch_bytes)
+    }
+
+    fn try_new_pooled_promotion_with<C>(
+        &self,
+        payload_limits: WorkspaceLimits,
+        residual_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+        construct: C,
+    ) -> Result<Option<K0Workspace>, SearchError>
+    where
+        C: FnOnce(
+            &Automaton,
+            WorkspaceLimits,
+            bool,
+            bool,
+        ) -> Result<K0Workspace, SearchError>,
+    {
+        let required_rank = K0Workspace::selected_adaptive_capability_rank(
+            self,
+            payload_limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        let residual_rank = K0Workspace::selected_adaptive_capability_rank(
+            self,
+            residual_limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        if residual_rank < required_rank {
+            return Ok(None);
+        }
+        if residual_rank > required_rank {
+            return Err(SearchError::InternalInvariant {
+                detail: "residual pooled K0 envelope selected a stronger capability tier",
+            });
+        }
+
+        let replacement = construct(
+            self,
+            residual_limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        if !replacement.supports_selected_capabilities(
+            self,
+            payload_limits,
+            endpoint_eligible,
+            bidirectional,
+        )? {
+            return Err(SearchError::InternalInvariant {
+                detail: "preflighted pooled K0 replacement lacks its selected capability tier",
+            });
+        }
+        Ok(Some(replacement))
     }
 
     /// Construct a genuinely fresh selected workspace under the same payload
@@ -1429,7 +1584,7 @@ impl Automaton {
         if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
             return Ok(None);
         }
-        K0Workspace::new_selected(
+        K0Workspace::new_adaptive_selected(
             self,
             payload_limits,
             endpoint_eligible,
@@ -1495,6 +1650,7 @@ impl Automaton {
     fn try_checkout_pooled_workspace_with<A>(
         &self,
         limits: WorkspaceLimits,
+        max_new_setup_work: u64,
         endpoint_eligible: bool,
         bidirectional: bool,
         allocate_owner: A,
@@ -1510,6 +1666,8 @@ impl Automaton {
         let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
             return Ok(None);
         };
+        let cold_limits =
+            Self::pooled_new_workspace_limits(payload_limits, max_new_setup_work);
         if let Some(pool) = self.pooled_workspace.get() {
             if let Some(mut owner) = pool.owner.try_checkout() {
                 if owner.value().is_none() {
@@ -1548,16 +1706,38 @@ impl Automaton {
                     // replacement, while keeping the weaker owner published
                     // until the stronger search succeeds.
                     if let Some(candidate) = pool.take_fallback() {
-                        let candidate_fits = Self::pooled_workspace_fits(&candidate, limits);
-                        let candidate_supports = candidate_fits
-                            && candidate
-                                .supports_selected_capabilities(
-                                    self,
-                                    payload_limits,
-                                    endpoint_eligible,
-                                    bidirectional,
-                                )
-                                .unwrap_or(false);
+                        let candidate_fits = Self::pooled_workspace_residual_limits(
+                            payload_limits,
+                            owner
+                                .value()
+                                .expect("fallback inspection retains its weaker owner"),
+                        )
+                        .is_some_and(|residual_limits| {
+                            Self::pooled_workspace_fits_payload(
+                                &candidate,
+                                residual_limits,
+                            )
+                        });
+                        if !candidate_fits {
+                            pool.return_workspace(candidate);
+                            return Ok(Some(PooledWorkspaceCheckout {
+                                storage: PooledWorkspaceStorage::Owner(owner),
+                                cold_setup: None,
+                            }));
+                        }
+                        let candidate_supports = match candidate.supports_selected_capabilities(
+                            self,
+                            payload_limits,
+                            endpoint_eligible,
+                            bidirectional,
+                        ) {
+                            Ok(supports) => supports,
+                            Err(error) => {
+                                pool.return_workspace(candidate);
+                                owner.commit();
+                                return Err(error);
+                            }
+                        };
                         if candidate_supports {
                             // Execute the stronger fallback by value while the
                             // weaker owner remains published. Only a successful
@@ -1568,13 +1748,6 @@ impl Automaton {
                                     workspace: Some(candidate),
                                     return_to: Some(pool),
                                 },
-                                cold_setup: None,
-                            }));
-                        }
-                        if !candidate_fits {
-                            pool.return_workspace(candidate);
-                            return Ok(Some(PooledWorkspaceCheckout {
-                                storage: PooledWorkspaceStorage::Owner(owner),
                                 cold_setup: None,
                             }));
                         }
@@ -1618,31 +1791,26 @@ impl Automaton {
                             cold_setup: None,
                         }));
                     };
-                    let Ok(replacement) = K0Workspace::new_selected(
-                        self,
+                    // Historical setup for the retained incumbent belongs to
+                    // the pool envelope, not this invocation. Cap only the
+                    // replacement transaction by the current search's work
+                    // allowance after deriving the aggregate residual.
+                    let replacement_limits = Self::pooled_new_workspace_limits(
                         residual_limits,
+                        max_new_setup_work,
+                    );
+                    let Some(replacement) = self.try_new_pooled_promotion_with(
+                        payload_limits,
+                        replacement_limits,
                         endpoint_eligible,
                         bidirectional,
-                    ) else {
+                        K0Workspace::new_adaptive_selected,
+                    )? else {
                         return Ok(Some(PooledWorkspaceCheckout {
                             storage: PooledWorkspaceStorage::Owner(owner),
                             cold_setup: None,
                         }));
                     };
-                    if !replacement
-                        .supports_selected_capabilities(
-                            self,
-                            payload_limits,
-                            endpoint_eligible,
-                            bidirectional,
-                        )
-                        .unwrap_or(false)
-                    {
-                        return Ok(Some(PooledWorkspaceCheckout {
-                            storage: PooledWorkspaceStorage::Owner(owner),
-                            cold_setup: None,
-                        }));
-                    }
                     let cold_setup = replacement.construction_accounting();
                     owner.commit();
                     return Ok(Some(PooledWorkspaceCheckout {
@@ -1653,12 +1821,12 @@ impl Automaton {
                         cold_setup: Some(cold_setup),
                     }));
                 }
-                if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+                if !self.pooled_workspace_mandatory_layout_fits(cold_limits)? {
                     return Ok(None);
                 }
-                let workspace = K0Workspace::new_selected(
+                let workspace = K0Workspace::new_adaptive_selected(
                     self,
-                    payload_limits,
+                    cold_limits,
                     endpoint_eligible,
                     bidirectional,
                 )?;
@@ -1715,12 +1883,12 @@ impl Automaton {
             // than the canonical one-shot call. Decline before allocating
             // when even its mandatory Pike layout cannot fit; a populated hot
             // lane above never recomputes this cold layout.
-            if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+            if !self.pooled_workspace_mandatory_layout_fits(cold_limits)? {
                 return Ok(None);
             }
-            let workspace = K0Workspace::new_selected(
+            let workspace = K0Workspace::new_adaptive_selected(
                 self,
-                payload_limits,
+                cold_limits,
                 endpoint_eligible,
                 bidirectional,
             )?;
@@ -1734,16 +1902,27 @@ impl Automaton {
             }));
         }
 
-        // Construct the complete selected workspace before allocating or
+        // Construct the admitted selected workspace seed before allocating or
         // publishing its owner. A refusal therefore leaves no empty retained
         // cache behind. Result-bearing finite callers propagate that setup
         // failure; legacy unlimited optional callers may still decline to
         // their canonical path.
-        if !self.pooled_workspace_mandatory_layout_fits(payload_limits)? {
+        let Some(initial_max_setup_work) = max_new_setup_work
+            .checked_sub(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+        else {
+            return Ok(None);
+        };
+        let initial_cold_limits =
+            Self::pooled_new_workspace_limits(payload_limits, initial_max_setup_work);
+        if !self.pooled_workspace_mandatory_layout_fits(initial_cold_limits)? {
             return Ok(None);
         }
-        let workspace =
-            K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)?;
+        let workspace = K0Workspace::new_adaptive_selected(
+            self,
+            initial_cold_limits,
+            endpoint_eligible,
+            bidirectional,
+        )?;
         let cold_setup = workspace.construction_accounting();
         let owner = match allocate_owner(PooledWorkspacePool::with_owner(workspace)) {
             Ok(owner) => owner,
@@ -1756,7 +1935,11 @@ impl Automaton {
                         workspace: owner.into_owner_workspace(),
                         return_to: None,
                     },
-                    cold_setup: Some(cold_setup),
+                    cold_setup: Some(Self::pooled_owner_publication_setup(
+                        cold_setup,
+                        false,
+                        false,
+                    )?),
                 }));
             }
         };
@@ -1773,34 +1956,8 @@ impl Automaton {
                     .owner
                     .try_checkout()
                     .expect("publishing thread retains its initial reservation");
-                let owner_bytes = Self::pooled_workspace_owner_bytes();
-                let cold_setup = SetupAccounting {
-                    work: cold_setup
-                        .work
-                        .checked_add(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "pooled workspace owner publication work",
-                        })?,
-                    allocated_bytes: cold_setup
-                        .allocated_bytes
-                        .checked_add(owner_bytes)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "pooled workspace owner allocated bytes",
-                        })?,
-                    initialized_bytes: cold_setup
-                        .initialized_bytes
-                        .checked_add(owner_bytes)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "pooled workspace owner initialized bytes",
-                        })?,
-                    retained_bytes: cold_setup
-                        .retained_bytes
-                        .checked_add(owner_bytes)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "pooled workspace owner retained bytes",
-                        })?,
-                    reused: false,
-                };
+                let cold_setup =
+                    Self::pooled_owner_publication_setup(cold_setup, true, true)?;
                 Ok(Some(PooledWorkspaceCheckout {
                     storage: PooledWorkspaceStorage::Owner(owner),
                     cold_setup: Some(cold_setup),
@@ -1817,7 +1974,11 @@ impl Automaton {
                         workspace,
                         return_to: Some(pool),
                     },
-                    cold_setup: Some(cold_setup),
+                    cold_setup: Some(Self::pooled_owner_publication_setup(
+                        cold_setup,
+                        true,
+                        false,
+                    )?),
                 }))
             }
         }
@@ -1839,6 +2000,7 @@ impl Automaton {
     ) -> Option<PooledWorkspaceCheckout<'_>> {
         self.try_checkout_pooled_workspace_with(
             limits,
+            u64::MAX,
             endpoint_eligible,
             bidirectional,
             fre_exact_alloc::try_box_preserve,
@@ -1853,11 +2015,13 @@ impl Automaton {
     pub(crate) fn try_checkout_pooled_workspace_with_setup(
         &self,
         limits: WorkspaceLimits,
+        max_new_setup_work: u64,
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Option<PooledWorkspaceCheckout<'_>>, SearchError> {
         self.try_checkout_pooled_workspace_with(
             limits,
+            max_new_setup_work,
             endpoint_eligible,
             bidirectional,
             fre_exact_alloc::try_box_preserve,
@@ -2840,6 +3004,35 @@ mod tests {
             .expect("focused byte ranges form a valid automaton")
     }
 
+    fn compile_three_way_bytes() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 4, 5, 6, 6],
+                edge_targets: vec![1, 2, 3, 4, 4, 4],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, b'a', b'b', b'c'],
+                byte_ends: vec![0, 0, 0, b'a', b'b', b'c'],
+            },
+            CompileLimits::default(),
+        )
+        .expect("focused three-way byte alternation forms a valid automaton")
+    }
+
     #[test]
     fn compiler_private_start_filter_proof_charge_tracks_all_three_states() {
         let unsettled = compile_ranges(&[(b'a', b'a')]);
@@ -3111,6 +3304,81 @@ mod tests {
     }
 
     #[test]
+    fn pooled_workspace_adaptive_seed_charges_actual_setup_and_full_scratch_ceiling() {
+        let automaton = compile_three_way_bytes();
+        let seed = K0Workspace::new_adaptive_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .expect("focused adaptive endpoint workspace constructs");
+        assert!(
+            seed.retained_bytes() < seed.admitted_scratch_bytes(),
+            "fixture must reserve a smaller live seed than its admitted scratch ceiling",
+        );
+        assert_eq!(
+            seed.construction_accounting().work(),
+            seed.admitted_setup_work(),
+            "adaptive setup admission charges only actual seed construction",
+        );
+        let fixed =
+            K0Workspace::new_selected(&automaton, WorkspaceLimits::unlimited(), true, false)
+                .expect("focused fixed endpoint workspace constructs");
+        assert!(
+            seed.admitted_setup_work() < fixed.construction_accounting().work(),
+            "fixture must distinguish seed setup from hypothetical fixed construction",
+        );
+        drop(fixed);
+        let limits = WorkspaceLimits {
+            max_setup_work: seed
+                .admitted_setup_work()
+                .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                .unwrap(),
+            max_scratch_bytes: seed
+                .admitted_scratch_bytes()
+                .checked_add(Automaton::pooled_workspace_owner_bytes())
+                .unwrap(),
+        };
+        drop(seed);
+
+        let cold = automaton
+            .try_checkout_pooled_workspace(limits, true, false)
+            .expect("exact seed-setup and admitted-scratch ceilings construct the owner");
+        assert!(cold.cold_setup.is_some());
+        cold.commit();
+
+        for (resource, one_below) in [
+            (
+                "setup work",
+                WorkspaceLimits {
+                    max_setup_work: limits.max_setup_work - 1,
+                    ..limits
+                },
+            ),
+            (
+                "scratch bytes",
+                WorkspaceLimits {
+                    max_scratch_bytes: limits.max_scratch_bytes - 1,
+                    ..limits
+                },
+            ),
+        ] {
+            assert!(
+                automaton
+                    .try_checkout_pooled_workspace(one_below, true, false)
+                    .is_none(),
+                "an adaptive owner must not escape its one-below {resource} ceiling",
+            );
+            let warm = automaton
+                .try_checkout_pooled_workspace(limits, true, false)
+                .expect("one-below refusal preserves the exactly admitted owner");
+            assert!(warm.cold_setup.is_none());
+            warm.commit();
+        }
+    }
+
+    #[test]
     fn pooled_workspace_warm_owner_executes_in_place_and_falls_back_transactionally() {
         let automaton = compile_ranges(&[(b'a', b'z')]);
         let limits = WorkspaceLimits::unlimited();
@@ -3330,6 +3598,18 @@ mod tests {
     #[test]
     fn pooled_workspace_cold_publication_race_preserves_both_return_lanes() {
         let automaton = compile_ranges(&[(b'a', b'z')]);
+        let payload_limits = Automaton::pooled_workspace_payload_limits(
+            WorkspaceLimits::unlimited(),
+        )
+        .unwrap();
+        let expected_setup = K0Workspace::new_adaptive_selected(
+            &automaton,
+            payload_limits,
+            true,
+            true,
+        )
+        .unwrap()
+        .construction_accounting();
         let publish = Arc::new(Barrier::new(2));
         let checked_out = Arc::new(Barrier::new(2));
         let lanes = std::thread::scope(|scope| {
@@ -3342,6 +3622,7 @@ mod tests {
                         let checkout = automaton
                             .try_checkout_pooled_workspace_with(
                                 WorkspaceLimits::unlimited(),
+                                u64::MAX,
                                 true,
                                 true,
                                 move |owner| {
@@ -3355,9 +3636,12 @@ mod tests {
                             &checkout.storage,
                             PooledWorkspaceStorage::Owner(_)
                         );
+                        let cold_setup = checkout
+                            .cold_setup
+                            .expect("racing cold construction reports setup");
                         checked_out.wait();
                         checkout.commit();
-                        is_owner
+                        (is_owner, cold_setup)
                     })
                 })
                 .collect();
@@ -3366,8 +3650,39 @@ mod tests {
                 .map(|thread| thread.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        assert_eq!(lanes.iter().filter(|&&owner| owner).count(), 1);
-        assert_eq!(lanes.iter().filter(|&&owner| !owner).count(), 1);
+        assert_eq!(lanes.iter().filter(|(owner, _)| *owner).count(), 1);
+        assert_eq!(lanes.iter().filter(|(owner, _)| !*owner).count(), 1);
+        let owner_bytes = Automaton::pooled_workspace_owner_bytes();
+        for (is_owner, setup) in lanes {
+            assert_eq!(
+                setup.work(),
+                expected_setup
+                    .work()
+                    .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                    .unwrap(),
+            );
+            assert_eq!(
+                setup.allocated_bytes(),
+                expected_setup
+                    .allocated_bytes()
+                    .checked_add(if is_owner { owner_bytes } else { 0 })
+                    .unwrap(),
+            );
+            assert_eq!(
+                setup.initialized_bytes(),
+                expected_setup
+                    .initialized_bytes()
+                    .checked_add(owner_bytes)
+                    .unwrap(),
+            );
+            assert_eq!(
+                setup.retained_bytes(),
+                expected_setup
+                    .retained_bytes()
+                    .checked_add(if is_owner { owner_bytes } else { 0 })
+                    .unwrap(),
+            );
+        }
         let pool = automaton.pooled_workspace.get().unwrap();
         assert!(pool.fallback.lock().unwrap().is_some());
     }
@@ -3486,6 +3801,147 @@ mod tests {
             .expect("refused replacement leaves the owner warm");
         assert!(warm.cold_setup.is_none());
         warm.commit();
+    }
+
+    #[test]
+    fn pooled_search_session_checkout_and_refresh_are_unlimited_only() {
+        let declined = compile_three_way_bytes();
+        assert!(declined
+            .try_checkout_pooled_search_session(
+                WorkspaceLimits::default(),
+                true,
+                true,
+            )
+            .unwrap()
+            .is_none());
+        assert!(
+            declined.pooled_workspace.get().is_none(),
+            "finite checkout must not inspect or populate the optional pool",
+        );
+
+        let automaton = compile_three_way_bytes();
+        let admitted_replacement = K0SearchSession::new_adaptive_selected(
+            &automaton,
+            WorkspaceLimits::default(),
+            true,
+            true,
+        )
+        .expect("the finite fixture would otherwise admit reverse replacement");
+        assert!(admitted_replacement.positive_end_verifier_available());
+        drop(admitted_replacement);
+
+        let endpoint = automaton
+            .try_checkout_pooled_search_session(
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap()
+            .expect("unlimited endpoint session constructs");
+        assert!(!endpoint.positive_end_verifier_available());
+        automaton
+            .refresh_pooled_search_session(
+                endpoint,
+                WorkspaceLimits::default(),
+                true,
+                true,
+            )
+            .expect("finite refresh restores the checked-out session");
+
+        let restored = automaton
+            .try_checkout_pooled_search_session(
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap()
+            .expect("restored endpoint session remains available");
+        assert!(
+            !restored.positive_end_verifier_available(),
+            "finite refresh must not replace the endpoint lane",
+        );
+        automaton.return_pooled_search_session(restored).unwrap();
+    }
+
+    #[test]
+    fn pooled_search_session_rejects_finite_generic_searches_but_allows_verifiers() {
+        fn assert_finite_pooled_error<T>(result: Result<T, SearchError>) {
+            assert!(matches!(
+                result,
+                Err(SearchError::InvalidResumeState {
+                    detail: "pooled K0 sessions require unlimited generic search limits",
+                })
+            ));
+        }
+
+        let automaton = compile_ranges(&[(b'a', b'z')]);
+        let mut session = automaton
+            .try_checkout_pooled_search_session(
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap()
+            .expect("unlimited bidirectional session constructs");
+        assert!(session.positive_end_verifier_available());
+        let haystack = b"a";
+        let window = SearchWindow::full(haystack);
+        let finite = SearchLimits::default();
+
+        assert_finite_pooled_error(session.search::<Exists>(haystack, finite));
+        assert_finite_pooled_error(session.search_exists_value(haystack, window, finite));
+        assert_finite_pooled_error(
+            session.try_search_warm_exists_value_with_limits(haystack, window, finite),
+        );
+        assert_finite_pooled_error(
+            session.search_exact_start_exists_value(haystack, window, finite),
+        );
+        assert_finite_pooled_error(
+            session.search_selected_end_value(haystack, window, finite),
+        );
+        assert_finite_pooled_error(
+            session.search_proved_exact_start_selected_end_value(
+                haystack,
+                window,
+                finite,
+            ),
+        );
+        assert_finite_pooled_error(session.search_span_value(haystack, window, finite));
+        assert_finite_pooled_error(session.search_span_at_cursor(haystack, 0, finite));
+        let mut source = crate::K0SpanSourceCursor::new(haystack);
+        assert_finite_pooled_error(
+            session.search_span_value_at_source_cursor(&mut source, 0, finite),
+        );
+        assert_finite_pooled_error(
+            session.search_span_at_source_cursor(&mut source, 0, finite),
+        );
+
+        session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                1,
+                crate::K0PositiveEndLimits::unlimited(),
+            )
+            .expect("private positive-end verifier remains finite-capable");
+        session
+            .try_earliest_start_ending_at(
+                haystack,
+                window,
+                1,
+                crate::K0PositiveEndLimits::unlimited(),
+            )
+            .expect("private earliest-start verifier remains finite-capable");
+        automaton.return_pooled_search_session(session).unwrap();
+
+        let mut explicit = K0SearchSession::new_adaptive_selected(
+            &automaton,
+            WorkspaceLimits::default(),
+            true,
+            true,
+        )
+        .expect("explicit finite session constructs");
+        assert!(explicit.search::<Exists>(haystack, finite).is_ok());
     }
 
     #[test]
@@ -3740,16 +4196,268 @@ mod tests {
     }
 
     #[test]
-    fn pooled_workspace_promotion_obeys_exact_aggregate_limits() {
-        fn aggregate_limits(automaton: &Automaton) -> WorkspaceLimits {
-            let endpoint = K0Workspace::new_selected(
+    fn pooled_promotion_preflight_skips_weaker_residual_and_propagates_failures() {
+        let automaton = compile_three_way_bytes();
+        let required = K0Workspace::new_adaptive_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let payload_limits = WorkspaceLimits {
+            max_setup_work: required.admitted_setup_work(),
+            max_scratch_bytes: required.admitted_scratch_bytes(),
+        };
+        assert_eq!(required.selected_capability_rank(), 2);
+        drop(required);
+
+        let pike = K0Workspace::new_adaptive_selected(
+            &automaton,
+            WorkspaceLimits::unlimited(),
+            false,
+            false,
+        )
+        .unwrap();
+        let insufficient_residual = WorkspaceLimits {
+            max_setup_work: pike.admitted_setup_work(),
+            max_scratch_bytes: pike.admitted_scratch_bytes(),
+        };
+        drop(pike);
+
+        let calls = std::cell::Cell::new(0_usize);
+        for _ in 0..2 {
+            let declined = automaton
+                .try_new_pooled_promotion_with(
+                    payload_limits,
+                    insufficient_residual,
+                    true,
+                    true,
+                    |_, _, _, _| {
+                        calls.set(calls.get() + 1);
+                        Err(SearchError::ScratchAllocationFailed { requested: 17 })
+                    },
+                )
+                .unwrap();
+            assert!(declined.is_none());
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "a deterministically weaker residual tier must not allocate, even on retry",
+        );
+
+        let construction_error = SearchError::ScratchAllocationFailed { requested: 23 };
+        let error = automaton
+            .try_new_pooled_promotion_with(
+                payload_limits,
+                payload_limits,
+                true,
+                true,
+                |_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    Err(construction_error.clone())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, construction_error);
+        assert_eq!(calls.get(), 1);
+
+        let endpoint = K0Workspace::new_adaptive_selected(
+            &automaton,
+            payload_limits,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            automaton.try_new_pooled_promotion_with(
+                payload_limits,
+                payload_limits,
+                true,
+                true,
+                |_, _, _, _| Ok(endpoint),
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "preflighted pooled K0 replacement lacks its selected capability tier",
+            })
+        ));
+    }
+
+    #[test]
+    fn finite_search_scratch_clamps_mismatched_pool_promotion_exactly() {
+        fn aggregate_scratch_limit(automaton: &Automaton) -> usize {
+            let endpoint = K0Workspace::new_adaptive_selected(
                 automaton,
                 WorkspaceLimits::unlimited(),
                 true,
                 false,
             )
             .unwrap();
-            let bidirectional = K0Workspace::new_selected(
+            let bidirectional = K0Workspace::new_adaptive_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            endpoint
+                .admitted_scratch_bytes()
+                .checked_add(bidirectional.admitted_scratch_bytes())
+                .and_then(|bytes| bytes.checked_add(Automaton::pooled_workspace_owner_bytes()))
+                .unwrap()
+        }
+
+        let caller_workspace = WorkspaceLimits::unlimited();
+        assert_eq!(
+            Automaton::pooled_workspace_limits_for_search(
+                caller_workspace,
+                SearchLimits::unlimited(),
+            ),
+            caller_workspace,
+            "the exact unlimited sentinel must preserve its independent pool envelope",
+        );
+        let work_clamped = Automaton::pooled_workspace_limits_for_search(
+            caller_workspace,
+            SearchLimits {
+                max_work: 73,
+                max_scratch_bytes: usize::MAX,
+            },
+        );
+        assert_eq!(work_clamped.max_setup_work, u64::MAX);
+        assert_eq!(work_clamped.max_scratch_bytes, usize::MAX);
+        assert_eq!(
+            Automaton::pooled_new_workspace_limits(work_clamped, 73).max_setup_work,
+            73,
+            "only a newly constructed lane owes setup to the finite search",
+        );
+
+        let exact = compile_three_way_bytes();
+        let exact_scratch = aggregate_scratch_limit(&exact);
+        let exact_limits = Automaton::pooled_workspace_limits_for_search(
+            caller_workspace,
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: exact_scratch,
+            },
+        );
+        assert_eq!(exact_limits.max_scratch_bytes, exact_scratch);
+        let endpoint = exact
+            .try_checkout_pooled_workspace(exact_limits, true, false)
+            .expect("finite exact aggregate admits the endpoint incumbent");
+        endpoint.commit();
+        let promoted = exact
+            .try_checkout_pooled_workspace(exact_limits, true, true)
+            .expect("finite exact aggregate admits the bidirectional replacement");
+        assert!(promoted.cold_setup.is_some());
+        assert!(promoted
+            .supports_selected_capabilities(
+                &exact,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap());
+        promoted.commit();
+
+        let refused = compile_three_way_bytes();
+        let one_below_scratch = aggregate_scratch_limit(&refused)
+            .checked_sub(1)
+            .unwrap();
+        let one_below_limits = Automaton::pooled_workspace_limits_for_search(
+            caller_workspace,
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: one_below_scratch,
+            },
+        );
+        let endpoint = refused
+            .try_checkout_pooled_workspace(one_below_limits, true, false)
+            .expect("one-below aggregate still admits its endpoint incumbent");
+        endpoint.commit();
+        for _ in 0..2 {
+            let retained = refused
+                .try_checkout_pooled_workspace(one_below_limits, true, true)
+                .expect("one-below aggregate reuses the endpoint without promotion");
+            assert!(retained.cold_setup.is_none());
+            assert!(!retained
+                .supports_selected_capabilities(
+                    &refused,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap());
+            retained.commit();
+        }
+    }
+
+    #[test]
+    fn finite_search_work_reserves_publication_without_recharging_warm_history() {
+        let exact = compile_three_way_bytes();
+        let pool_limits = WorkspaceLimits::unlimited();
+        let payload_limits =
+            Automaton::pooled_workspace_payload_limits(pool_limits).unwrap();
+        let seed = K0Workspace::new_adaptive_selected(
+            &exact,
+            payload_limits,
+            false,
+            false,
+        )
+        .unwrap();
+        let seed_setup = seed.construction_accounting();
+        let exact_work = seed_setup
+            .work()
+            .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+            .unwrap();
+        drop(seed);
+
+        let checkout = exact
+            .try_checkout_pooled_workspace_with_setup(
+                pool_limits,
+                exact_work,
+                false,
+                false,
+            )
+            .unwrap()
+            .expect("exact work admits workspace plus owner publication");
+        assert_eq!(checkout.cold_setup.unwrap().work(), exact_work);
+        checkout.commit();
+
+        let warm = exact
+            .try_checkout_pooled_workspace_with_setup(pool_limits, 0, false, false)
+            .unwrap()
+            .expect("warm workspace does not owe historical construction work");
+        assert!(warm.cold_setup.is_none());
+        warm.commit();
+
+        let refused = compile_three_way_bytes();
+        assert!(refused
+            .try_checkout_pooled_workspace_with_setup(
+                pool_limits,
+                exact_work.checked_sub(1).unwrap(),
+                false,
+                false,
+            )
+            .unwrap()
+            .is_none());
+        assert!(
+            refused.pooled_workspace.get().is_none(),
+            "one-below work must decline before constructing or publishing",
+        );
+    }
+
+    #[test]
+    fn retained_stronger_fallback_obeys_exact_aggregate_limits() {
+        fn aggregate_limits(automaton: &Automaton) -> WorkspaceLimits {
+            let endpoint = K0Workspace::new_adaptive_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap();
+            let bidirectional = K0Workspace::new_adaptive_selected(
                 automaton,
                 WorkspaceLimits::unlimited(),
                 true,
@@ -3758,22 +4466,158 @@ mod tests {
             .unwrap();
             WorkspaceLimits {
                 max_setup_work: endpoint
-                    .construction_accounting()
-                    .work()
-                    .checked_add(bidirectional.construction_accounting().work())
+                    .admitted_setup_work()
+                    .checked_add(bidirectional.admitted_setup_work())
+                    .and_then(|work| {
+                        work.checked_add(
+                            Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK,
+                        )
+                    })
+                    .unwrap(),
+                max_scratch_bytes: endpoint
+                    .admitted_scratch_bytes()
+                    .checked_add(bidirectional.admitted_scratch_bytes())
+                    .and_then(|bytes| {
+                        bytes.checked_add(Automaton::pooled_workspace_owner_bytes())
+                    })
+                    .unwrap(),
+            }
+        }
+
+        fn retain_endpoint_and_bidirectional_fallback(automaton: &Automaton) {
+            let endpoint = automaton
+                .try_checkout_pooled_workspace(
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    false,
+                )
+                .expect("endpoint owner constructs");
+            let bidirectional = automaton
+                .try_checkout_pooled_workspace(
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .expect("parallel bidirectional fallback constructs");
+            bidirectional.commit();
+            endpoint.commit();
+        }
+
+        let exact = compile_three_way_bytes();
+        let limits = aggregate_limits(&exact);
+        retain_endpoint_and_bidirectional_fallback(&exact);
+        let candidate = exact
+            .try_checkout_pooled_workspace(limits, true, true)
+            .expect("exact aggregate envelope admits retained stronger fallback");
+        assert!(candidate.cold_setup.is_none());
+        assert!(candidate
+            .supports_selected_capabilities(
+                &exact,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap());
+        candidate.commit();
+
+        for (resource, one_below) in [
+            (
+                "setup work",
+                WorkspaceLimits {
+                    max_setup_work: limits.max_setup_work.checked_sub(1).unwrap(),
+                    ..limits
+                },
+            ),
+            (
+                "scratch bytes",
+                WorkspaceLimits {
+                    max_scratch_bytes: limits.max_scratch_bytes.checked_sub(1).unwrap(),
+                    ..limits
+                },
+            ),
+        ] {
+            let refused = compile_three_way_bytes();
+            retain_endpoint_and_bidirectional_fallback(&refused);
+            for _ in 0..2 {
+                let retained = refused
+                    .try_checkout_pooled_workspace(one_below, true, true)
+                    .expect("one-below aggregate executes through weaker owner");
+                assert!(retained.cold_setup.is_none());
+                assert!(
+                    !retained
+                        .supports_selected_capabilities(
+                            &refused,
+                            WorkspaceLimits::unlimited(),
+                            true,
+                            true,
+                        )
+                        .unwrap(),
+                    "one-below {resource} must not execute the concurrent fallback",
+                );
+                retained.commit();
+            }
+            assert!(
+                refused
+                    .pooled_workspace
+                    .get()
+                    .unwrap()
+                    .fallback
+                    .lock()
+                    .unwrap()
+                    .is_some(),
+                "refused candidate remains available for a later wider call",
+            );
+        }
+    }
+
+    #[test]
+    fn pooled_workspace_promotion_obeys_exact_aggregate_limits() {
+        fn aggregate_limits(automaton: &Automaton) -> WorkspaceLimits {
+            let endpoint = K0Workspace::new_adaptive_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap();
+            let bidirectional = K0Workspace::new_adaptive_selected(
+                automaton,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            assert!(
+                endpoint.retained_bytes() < endpoint.admitted_scratch_bytes(),
+                "promotion fixture must retain a smaller endpoint seed",
+            );
+            assert_eq!(
+                endpoint.construction_accounting().work(),
+                endpoint.admitted_setup_work(),
+                "promotion admission must charge actual endpoint seed setup",
+            );
+            assert_eq!(
+                bidirectional.construction_accounting().work(),
+                bidirectional.admitted_setup_work(),
+                "promotion admission must charge actual bidirectional seed setup",
+            );
+            WorkspaceLimits {
+                max_setup_work: endpoint
+                    .admitted_setup_work()
+                    .checked_add(bidirectional.admitted_setup_work())
                     .and_then(|work| {
                         work.checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
                     })
                     .unwrap(),
                 max_scratch_bytes: endpoint
-                    .retained_bytes()
-                    .checked_add(bidirectional.retained_bytes())
+                    .admitted_scratch_bytes()
+                    .checked_add(bidirectional.admitted_scratch_bytes())
                     .and_then(|bytes| bytes.checked_add(Automaton::pooled_workspace_owner_bytes()))
                     .unwrap(),
             }
         }
 
-        let exact = compile_ranges(&[(b'a', b'a')]);
+        let exact = compile_three_way_bytes();
         let limits = aggregate_limits(&exact);
         let endpoint = exact
             .try_checkout_pooled_workspace(limits, true, false)
@@ -3811,7 +4655,7 @@ mod tests {
                 },
             ),
         ] {
-            let refused = compile_ranges(&[(b'a', b'a')]);
+            let refused = compile_three_way_bytes();
             let endpoint = refused
                 .try_checkout_pooled_workspace(limits, true, false)
                 .expect("one-below aggregate envelope still admits endpoint owner");
@@ -3838,17 +4682,45 @@ mod tests {
     #[test]
     fn pooled_workspace_owner_failure_fallback_poison_and_plan_mutation_are_bounded() {
         let allocation_failed = compile_ranges(&[(b'a', b'a')]);
-        assert!(
-            allocation_failed
-                .try_checkout_pooled_workspace_with(
-                    WorkspaceLimits::unlimited(),
-                    true,
-                    true,
-                    |owner| Err((fre_exact_alloc::CopyError::AllocationFailed, owner)),
-                )
-                .expect("workspace construction remains executable")
-                .is_some()
+        let payload_limits = Automaton::pooled_workspace_payload_limits(
+            WorkspaceLimits::unlimited(),
+        )
+        .unwrap();
+        let expected_setup = K0Workspace::new_adaptive_selected(
+            &allocation_failed,
+            payload_limits,
+            true,
+            true,
+        )
+        .unwrap()
+        .construction_accounting();
+        let fallback = allocation_failed
+            .try_checkout_pooled_workspace_with(
+                WorkspaceLimits::unlimited(),
+                u64::MAX,
+                true,
+                true,
+                |owner| Err((fre_exact_alloc::CopyError::AllocationFailed, owner)),
+            )
+            .expect("workspace construction remains executable")
+            .expect("failed owner allocation executes uncached");
+        let setup = fallback
+            .cold_setup
+            .expect("failed publication attempt remains accounted");
+        assert_eq!(
+            setup.work(),
+            expected_setup
+                .work()
+                .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                .unwrap(),
         );
+        assert_eq!(setup.allocated_bytes(), expected_setup.allocated_bytes());
+        assert_eq!(
+            setup.initialized_bytes(),
+            expected_setup.initialized_bytes(),
+        );
+        assert_eq!(setup.retained_bytes(), expected_setup.retained_bytes());
+        fallback.commit();
         assert!(allocation_failed.pooled_workspace.get().is_none());
 
         let poisoned = compile_ranges(&[(b'a', b'a')]);

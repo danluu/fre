@@ -864,13 +864,13 @@ pub use text_set::{
 
 use fre_automata::{
     Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
-    K0PositiveEndStartOutcome, K0SpanSourceCursor, MandatoryCutAnalysisLimits,
-    MandatoryCutCandidate, MandatoryCutContinuation, MandatoryCutContinuationAnalysis,
-    MandatoryCutDeclineReason, MandatoryCutResource, MandatoryLiteralFrontierAnalysis,
-    MandatoryLiteralFrontierAnalysisLimits, MandatoryLiteralFrontierDeclineReason,
-    MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits, MandatorySuffixCandidate,
-    MandatorySuffixDeclineReason, MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd,
-    Span,
+    K0PositiveEndStartOutcome, K0SpanSourceCursor, K0StartFilterPreparationReceipt,
+    MandatoryCutAnalysisLimits, MandatoryCutCandidate, MandatoryCutContinuation,
+    MandatoryCutContinuationAnalysis, MandatoryCutDeclineReason, MandatoryCutResource,
+    MandatoryLiteralFrontierAnalysis, MandatoryLiteralFrontierAnalysisLimits,
+    MandatoryLiteralFrontierDeclineReason, MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits,
+    MandatorySuffixCandidate, MandatorySuffixDeclineReason, MandatorySuffixResource,
+    MaximumConsumedDistance, SelectedEnd, Span,
 };
 use fre_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
@@ -906,9 +906,10 @@ pub use guarded_literal_set::{
     SearchUpperBounds as GuardedLiteralSetSearchUpperBounds,
 };
 pub use fre_automata::{
-    DirectReduceLimits, ForcedExecution, PreparationAccounting, PriorityExecutionKernel,
-    PriorityTarget, ReduceError, SearchError as K0SearchError, SearchLimits, SearchWindow,
-    SetupAccounting as SearchSessionSetupAccounting, WorkspaceLimits as SearchSessionLimits,
+    CacheGrowthAccounting, DirectReduceLimits, ForcedExecution, PreparationAccounting,
+    PriorityExecutionKernel, PriorityTarget, ReduceError, SearchError as K0SearchError,
+    SearchLimits, SearchWindow, SetupAccounting as SearchSessionSetupAccounting,
+    WorkspaceLimits as SearchSessionLimits,
 };
 pub use unicode_word_run::{
     AGGREGATE_COUNT_OPERATION_ID as WORD_RUN_COUNT_OPERATION_ID,
@@ -4601,6 +4602,20 @@ impl SearchAccounting {
         }
     }
 
+    /// Demand-grown K0 cache resources observed by this search.
+    ///
+    /// Native plan families return `None` because they do not own the K0
+    /// cache governed by [`CacheGrowthAccounting`]. A K0 search that reused
+    /// existing storage returns `Some` with every growth counter equal to
+    /// zero.
+    #[must_use]
+    pub const fn cache_growth(&self) -> Option<CacheGrowthAccounting> {
+        match self {
+            Self::K0(accounting) => Some(accounting.cache_growth()),
+            _ => None,
+        }
+    }
+
     /// Actual charged K0 work or checked literal linear-bound terms.
     #[must_use]
     pub fn work_or_linear_terms(&self) -> u64 {
@@ -4929,11 +4944,13 @@ impl Default for PortableFindIterLimits {
 ///
 /// Unlike [`PortableFindIterLimits`], this has no session-construction
 /// allowance: [`PortableSearchSession::find_iter`] and
-/// [`PortableSearchSession::find_iter_value`] reuse the session's already
-/// allocated K0 workspace. Each new iterator starts with fresh progression and
-/// search-call-cap state. Accountingful iterators additionally start fresh
-/// whole-iterator accounting, while value-only iterators expose no such
-/// aggregate. One-time setup facts remain available from
+/// [`PortableSearchSession::find_iter_value`] reuse an already constructed
+/// session. An adaptive K0 session may grow retained cache capacity during a
+/// contextual search under that search's [`SearchLimits`]; a fixed session
+/// does not grow retained capacity. Each new iterator starts with fresh
+/// progression and search-call-cap state. Accountingful iterators additionally
+/// start fresh whole-iterator accounting, while value-only iterators expose no
+/// such aggregate. One-time setup facts remain available from
 /// [`PortableSearchSession::workspace_setup_accounting`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableFindIterRunLimits {
@@ -4982,6 +4999,17 @@ pub struct PortableFindIterAccounting {
     /// monotone continuations may prepay one complete linear source envelope
     /// and then contribute zero for covered non-overlapping restarts.
     pub work_or_linear_terms: u64,
+    /// Logical demand-growth transactions across contextual K0 searches.
+    pub cache_growth_events: usize,
+    /// Cumulative heap payload allocated by contextual K0 cache growth.
+    pub cache_growth_allocated_bytes: usize,
+    /// Cumulative payload initialized by contextual K0 cache growth.
+    pub cache_growth_initialized_bytes: usize,
+    /// Cache payload newly retained across contextual K0 searches.
+    pub cache_growth_retained_delta: usize,
+    /// Largest total K0 scratch payload live during an iterator search's
+    /// cache-growth event.
+    pub cache_growth_peak_scratch_bytes: usize,
     /// Exact byte classifications performed while advancing a text iterator
     /// to the next UTF-8 scalar boundary after a repeated empty match.
     pub utf8_progress_byte_probes: u64,
@@ -4989,6 +5017,48 @@ pub struct PortableFindIterAccounting {
     /// increment, one term per byte classification, and one term per
     /// continuation-byte increment.
     pub utf8_progress_work: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PortableFindIterStepAccounting {
+    work_or_linear_terms: u64,
+    cache_growth_events: usize,
+    cache_growth_allocated_bytes: usize,
+    cache_growth_initialized_bytes: usize,
+    cache_growth_retained_delta: usize,
+    cache_growth_peak_scratch_bytes: usize,
+}
+
+impl PortableFindIterStepAccounting {
+    const fn work(work_or_linear_terms: u64) -> Self {
+        Self {
+            work_or_linear_terms,
+            cache_growth_events: 0,
+            cache_growth_allocated_bytes: 0,
+            cache_growth_initialized_bytes: 0,
+            cache_growth_retained_delta: 0,
+            cache_growth_peak_scratch_bytes: 0,
+        }
+    }
+
+    const fn k0(accounting: fre_automata::SearchAccounting) -> Self {
+        let growth = accounting.cache_growth();
+        Self {
+            work_or_linear_terms: accounting.work(),
+            cache_growth_events: growth.events(),
+            cache_growth_allocated_bytes: growth.allocated_bytes(),
+            cache_growth_initialized_bytes: growth.initialized_bytes(),
+            cache_growth_retained_delta: growth.retained_delta(),
+            cache_growth_peak_scratch_bytes: growth.peak_scratch_bytes(),
+        }
+    }
+
+    fn checked_add_work(self, additional: u64) -> Option<Self> {
+        Some(Self {
+            work_or_linear_terms: self.work_or_linear_terms.checked_add(additional)?,
+            ..self
+        })
+    }
 }
 
 /// Checked terminal failure from complete portable match iteration.
@@ -10110,12 +10180,15 @@ impl PortableRegex {
         }
     }
 
-    /// Prepare allocation-free repeated searches over this immutable matcher.
+    /// Prepare a demand-grown reusable search session over this immutable
+    /// matcher.
     ///
-    /// K0 allocates and fully initializes its primary fixed-capacity workspace
-    /// here. One admitted capture-free Exists proof may also retain a second,
-    /// reverse-capable prefix workspace from the residual aggregate setup and
-    /// scratch limits. No source-dependent cursor is retained in either owner.
+    /// K0 admits a finite source-independent workspace layout here, but may
+    /// allocate and initialize cache storage transactionally during later
+    /// searches as the requested operation demands it. One admitted
+    /// capture-free Exists proof may also retain a second, reverse-capable
+    /// prefix workspace from the residual aggregate setup and scratch limits.
+    /// No source-dependent cursor is retained in either owner.
     /// Eligible byte graphs with a statically known positive minimum length
     /// retain a bounded forward endpoint cache plus a separate reverse cache
     /// for exact full-span recovery. Assertion-free nullable graphs retain a
@@ -10124,24 +10197,54 @@ impl PortableRegex {
     /// Assertion-free graphs use direct byte rows; assertion-bearing graphs key
     /// transitions by the exact enabled-assertion mask at each boundary.
     /// Contextual nullable, statically empty, or resource-refused graphs keep
-    /// the ordinary Pike workspace. Cache selection is source-free and occurs
-    /// before allocation; every subsequent call reuses the selected storage
-    /// without growing. Native plans retain their existing operation-specific
-    /// dispatch and need no allocated session storage. Exact literals and
-    /// fixed-predicate words bind their selected immutable plans directly in
-    /// the inline session owner.
+    /// the ordinary Pike workspace. Capability admission remains source-free.
+    /// Native plans retain their existing operation-specific dispatch and need
+    /// no allocated session storage. Exact literals and fixed-predicate words
+    /// bind their selected immutable plans directly in the inline session
+    /// owner.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] if K0 workspace construction exceeds the
-    /// supplied setup-work or scratch limit, or if allocation fails. Native
-    /// specialized plans ignore these limits because they construct no K0
-    /// workspace.
+    /// Returns [`SearchError`] if primary K0 workspace construction exceeds
+    /// the supplied setup-work or scratch limit, or if its allocation fails.
+    /// An optional reverse-inner sidecar may decline on allocation or scratch
+    /// refusal and publish the primary-only session; its discarded attempt is
+    /// not included in that successful setup receipt. Native specialized plans
+    /// ignore these limits because they construct no K0 workspace.
     pub fn search_session(
         &self,
         limits: SearchSessionLimits,
     ) -> Result<PortableSearchSession<'_>, SearchError> {
-        self.search_session_mode(limits, true)
+        self.search_session_mode(limits, true, PortableSearchSessionStorage::Adaptive)
+    }
+
+    /// Prepare a fixed-capacity session whose searches do not grow K0 cache
+    /// storage.
+    ///
+    /// This preserves the preallocated session contract for callers that put
+    /// all workspace construction outside an allocation-free operation
+    /// boundary. K0 selects and reserves its complete admitted workspace
+    /// during this call. Direct rows publish sentinel-initialized cells during
+    /// execution without allocating or increasing cache capacity. A cold
+    /// immutable start-filter proof is separate from workspace capacity and
+    /// may still allocate on its first search; callers that require an
+    /// end-to-end allocation-free measured region must call
+    /// [`PortableSearchSession::prepare_k0_start_filter`] or warm that plan
+    /// proof before entering it. Native specialized plans behave exactly as
+    /// in [`Self::search_session`] because they own no K0 workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if primary fixed K0 workspace construction
+    /// exceeds the supplied setup-work or scratch limit, or if its allocation
+    /// fails. An optional reverse-inner sidecar may decline to the primary-only
+    /// session under the same policy as [`Self::search_session`]. Native
+    /// specialized plans ignore these limits.
+    pub fn fixed_search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableSearchSession<'_>, SearchError> {
+        self.search_session_mode(limits, true, PortableSearchSessionStorage::Fixed)
     }
 
     /// Prepare a smaller reusable session for existence and endpoint
@@ -10153,6 +10256,11 @@ impl PortableRegex {
     /// use Pike. Callers that need nonnullable `find`/iteration acceleration
     /// should use [`Self::search_session`].
     ///
+    /// Like [`Self::search_session`], this endpoint session is adaptive: K0
+    /// allocates a compact cache seed during construction while admitting its
+    /// finite workspace ceiling, then may allocate and initialize more cache
+    /// storage transactionally under a later search's limits.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError`] under the same conditions as
@@ -10161,13 +10269,23 @@ impl PortableRegex {
         &self,
         limits: SearchSessionLimits,
     ) -> Result<PortableSearchSession<'_>, SearchError> {
-        self.search_session_mode(limits, false)
+        self.search_session_mode(limits, false, PortableSearchSessionStorage::Adaptive)
+    }
+
+    /// Prepare a fixed-capacity endpoint session for an aggregate owner whose
+    /// construction receipt must cover every byte the constituent can retain.
+    pub(crate) fn fixed_endpoint_search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableSearchSession<'_>, SearchError> {
+        self.search_session_mode(limits, false, PortableSearchSessionStorage::Fixed)
     }
 
     fn search_session_mode(
         &self,
         limits: SearchSessionLimits,
         bidirectional: bool,
+        storage: PortableSearchSessionStorage,
     ) -> Result<PortableSearchSession<'_>, SearchError> {
         let plan = match &self.plan {
             PortablePlan::K0(k0) => {
@@ -10180,17 +10298,33 @@ impl PortableRegex {
                 let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
                     && !k0.automaton.stats().has_assertions();
                 let endpoint_eligible = positive || assertion_free_nullable;
-                // Select the optional cache from its source-free layout before
-                // allocating. Once accelerated construction begins, propagate
+                // Select the primary cache from its source-free layout before
+                // allocating. Once primary construction begins, propagate
                 // every failure so a partial attempt cannot disappear from
-                // successful setup accounting.
-                let session = K0SearchSession::new_selected(
-                    &k0.automaton,
-                    workspace_limits,
-                    endpoint_eligible,
-                    bidirectional && positive,
-                )?;
+                // successful setup accounting. The reverse-inner owner below
+                // is an optional independent sidecar: its physical or scratch
+                // refusal deliberately publishes this primary alone, and the
+                // successful receipt excludes that discarded optional attempt.
+                let session = match storage {
+                    PortableSearchSessionStorage::Adaptive => {
+                        K0SearchSession::new_adaptive_selected(
+                            &k0.automaton,
+                            workspace_limits,
+                            endpoint_eligible,
+                            bidirectional && positive,
+                        )
+                    }
+                    PortableSearchSessionStorage::Fixed => K0SearchSession::new_selected(
+                        &k0.automaton,
+                        workspace_limits,
+                        endpoint_eligible,
+                        bidirectional && positive,
+                    ),
+                }?;
                 let primary_setup = session.construction_accounting();
+                let primary_scratch_ceiling = primary_setup
+                    .retained_bytes()
+                    .max(session.admitted_scratch_bytes());
                 let reverse_inner = if bidirectional
                     && let Some(plan) = k0.reverse_inner.as_deref()
                 {
@@ -10203,7 +10337,7 @@ impl PortableRegex {
                             })?,
                         max_scratch_bytes: limits
                             .max_scratch_bytes
-                            .checked_sub(primary_setup.retained_bytes())
+                            .checked_sub(primary_scratch_ceiling)
                             .ok_or(K0SearchError::InternalInvariant {
                                 detail: "primary K0 setup exceeded its admitted scratch limit",
                             })?,
@@ -10269,9 +10403,9 @@ impl PortableRegex {
     ///
     /// This is the Rust-compatible convenience API. Search work has no
     /// caller-visible quota, and generic K0 plans automatically retain a
-    /// source-free workspace in this immutable matcher. That workspace has a
-    /// fixed layout derived from the construction-bounded automaton; it never
-    /// grows with the haystack or during a search.
+    /// source-free workspace in this immutable matcher. Its admitted ceiling
+    /// is derived from the construction-bounded automaton, while retained
+    /// cache capacity may grow transactionally as operations demand it.
     ///
     /// Use [`Self::is_match_with_limits`] when a recoverable work or scratch
     /// refusal is required, and [`Self::is_match_accounted`] when the exact
@@ -11639,9 +11773,9 @@ impl PortableRegex {
     /// Return the profile-selected leftmost-first match.
     ///
     /// This is the Rust-compatible convenience API. Search work has no
-    /// caller-visible quota. Generic K0 scratch and optional direct caches are
-    /// fixed by the construction-bounded automaton, retained automatically,
-    /// and never grow with the haystack or during a search.
+    /// caller-visible quota. Generic K0 scratch is admitted from the
+    /// construction-bounded automaton and retained automatically; cache
+    /// capacity may grow transactionally as later operations demand it.
     ///
     /// Use [`Self::find_with_limits`] when a recoverable work or scratch
     /// refusal is required, and [`Self::find_accounted`] when the exact
@@ -11778,10 +11912,10 @@ impl PortableRegex {
     /// Iterate over every non-overlapping match with Rust bytes empty-match
     /// progress and original-haystack assertion context.
     ///
-    /// K0 prepares one reusable workspace before iteration. Every subsequent
-    /// search is allocation-free for K0, while native plans retain their
-    /// selected dispatch. Iterator items are errors so a resource refusal is
-    /// never silently treated as exhaustion.
+    /// K0 prepares one reusable adaptive workspace before iteration and may
+    /// grow its cache transactionally during contextual searches. Native plans
+    /// retain their selected dispatch. Iterator items are errors so a resource
+    /// refusal is never silently treated as exhaustion.
     ///
     /// # Errors
     ///
@@ -11802,8 +11936,11 @@ impl PortableRegex {
     /// This retains the search-call cap and Rust bytes empty-match progress of
     /// [`Self::find_iter`], but deliberately does not aggregate or expose
     /// unified per-iterator search accounting. That permits value-only K0
-    /// accelerators to participate without requiring facade receipts. Use
-    /// [`Self::find_iter`] when reported iterator accounting is required.
+    /// accelerators to participate without requiring facade receipts. The
+    /// fresh adaptive K0 session may grow retained cache capacity during
+    /// iteration under `limits.search`, but this value-only API deliberately
+    /// does not expose an aggregate growth receipt. Use [`Self::find_iter`]
+    /// when reported iterator accounting is required.
     ///
     /// # Errors
     ///
@@ -13153,19 +13290,94 @@ impl PortableRegex {
     }
 }
 
+/// Exact source-free setup accounting for the optional immutable K0
+/// start-filter proof.
+///
+/// The proof owner belongs to the regex and may outlive the session that
+/// prepared it. `newly_retained_owner_bytes` therefore reports allocation by
+/// this call, while `retained_owner_bytes` reports the regex's complete live
+/// proof payload after preparation. The aggregate retained value includes the
+/// caller-owned session workspaces and is checked against the same explicit
+/// setup scratch envelope before this receipt is published.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableK0StartFilterSetupAccounting {
+    work_completed: u64,
+    total_setup_work: u64,
+    newly_retained_owner_bytes: usize,
+    retained_owner_bytes: usize,
+    aggregate_retained_bytes: usize,
+    cap_declined: bool,
+}
+
+impl PortableK0StartFilterSetupAccounting {
+    /// Complete immutable owner payload that callers must reserve before
+    /// permitting one previously unsettled proof publication.
+    #[doc(hidden)]
+    pub const MAX_RETAINED_OWNER_BYTES: usize =
+        K0StartFilterPreparationReceipt::MAX_RETAINED_OWNER_BYTES;
+
+    /// Exact graph derivation and owner-publication work completed by this
+    /// call.
+    #[must_use]
+    pub const fn work_completed(self) -> u64 {
+        self.work_completed
+    }
+
+    /// Session construction plus proof-preparation work under the caller's
+    /// total setup-work cap.
+    #[must_use]
+    pub const fn total_setup_work(self) -> u64 {
+        self.total_setup_work
+    }
+
+    /// Exact proof payload newly allocated, initialized and retained by this
+    /// call.
+    #[must_use]
+    pub const fn newly_retained_owner_bytes(self) -> usize {
+        self.newly_retained_owner_bytes
+    }
+
+    /// Complete immutable proof payload currently retained by the regex.
+    #[must_use]
+    pub const fn retained_owner_bytes(self) -> usize {
+        self.retained_owner_bytes
+    }
+
+    /// Complete session workspace plus regex proof payload after preparation.
+    #[must_use]
+    pub const fn aggregate_retained_bytes(self) -> usize {
+        self.aggregate_retained_bytes
+    }
+
+    /// Whether the residual setup work or retained-byte envelope selected
+    /// permanent ordinary K0 before graph traversal.
+    #[must_use]
+    pub const fn cap_declined(self) -> bool {
+        self.cap_declined
+    }
+}
+
 /// Operation-local reusable search state for one immutable portable matcher.
 ///
 /// This keeps construction-selected specialized plans unchanged. Exact
 /// literals and fixed-predicate words bind their immutable selected plan once
 /// so steady calls do not redispatch through the complete portable-plan enum.
-/// Only K0 owns mutable
-/// state, consisting of its primary fixed-capacity workspace, one optional
-/// immutable-plan-bound prefix workspace, and bounded performance-only
-/// histories whose sizes are determined entirely by the validated plan.
+/// Only K0 owns mutable state, consisting of its primary admitted workspace,
+/// one optional immutable-plan-bound prefix workspace, and bounded
+/// performance-only histories whose sizes are determined entirely by the
+/// validated plan. The primary workspace is either demand-grown or fully
+/// allocated at construction according to the API that created the session.
 /// Neither workspace retains source positions or results.
 #[derive(Debug)]
 pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortableSearchSessionStorage {
+    Adaptive,
+    Fixed,
 }
 
 /// Source-independent admission for repeated value-only existence searches.
@@ -13546,6 +13758,130 @@ fn k0_reused_exists_maximum_input_bytes(
         }
     }
     Some(low)
+}
+
+/// One explicit-session K0 invocation after reserving facade-retained
+/// sidecars from the caller's aggregate scratch cap.
+#[derive(Clone, Copy, Debug)]
+struct K0AggregateInvocation {
+    primary_limits: SearchLimits,
+    external_scratch_bytes: usize,
+    aggregate_scratch_limit: usize,
+}
+
+impl K0AggregateInvocation {
+    fn admit(
+        session: &K0SearchSession<'_>,
+        aggregate_setup: SearchSessionSetupAccounting,
+        limits: SearchLimits,
+    ) -> Result<Self, SearchError> {
+        let primary_setup_bytes = session.construction_accounting().retained_bytes();
+        let external_scratch_bytes = aggregate_setup
+            .retained_bytes()
+            .checked_sub(primary_setup_bytes)
+            .ok_or(K0SearchError::InternalInvariant {
+                detail: "aggregate K0 setup retained fewer bytes than its primary session",
+            })?;
+        let aggregate_retained_bytes = session
+            .retained_scratch_bytes()
+            .checked_add(external_scratch_bytes)
+            .ok_or(K0SearchError::ArithmeticOverflow {
+                computation: "aggregate K0 retained scratch",
+            })?;
+        let primary_scratch_limit = if limits.max_scratch_bytes == usize::MAX {
+            // Preserve the exact unlimited sentinel used by optional K0 route
+            // selection. There is no finite aggregate ceiling to residualize.
+            usize::MAX
+        } else if let Some(limit) = limits
+            .max_scratch_bytes
+            .checked_sub(external_scratch_bytes)
+        {
+            limit
+        } else {
+            return Err(K0SearchError::ResourceLimit {
+                resource: fre_automata::ResourceKind::ScratchBytes,
+                needed: aggregate_retained_bytes,
+                limit: limits.max_scratch_bytes,
+            }
+            .into());
+        };
+        if aggregate_retained_bytes > limits.max_scratch_bytes {
+            return Err(K0SearchError::ResourceLimit {
+                resource: fre_automata::ResourceKind::ScratchBytes,
+                needed: aggregate_retained_bytes,
+                limit: limits.max_scratch_bytes,
+            }
+            .into());
+        }
+        Ok(Self {
+            primary_limits: SearchLimits {
+                max_work: limits.max_work,
+                max_scratch_bytes: primary_scratch_limit,
+            },
+            external_scratch_bytes,
+            aggregate_scratch_limit: limits.max_scratch_bytes,
+        })
+    }
+
+    const fn primary_limits(self) -> SearchLimits {
+        self.primary_limits
+    }
+
+    fn map_k0_error(self, error: K0SearchError) -> SearchError {
+        match error {
+            K0SearchError::ResourceLimit {
+                resource: fre_automata::ResourceKind::ScratchBytes,
+                needed,
+                ..
+            } => match needed.checked_add(self.external_scratch_bytes) {
+                Some(needed) => K0SearchError::ResourceLimit {
+                    resource: fre_automata::ResourceKind::ScratchBytes,
+                    needed,
+                    limit: self.aggregate_scratch_limit,
+                }
+                .into(),
+                None => K0SearchError::ArithmeticOverflow {
+                    computation: "aggregate K0 scratch refusal",
+                }
+                .into(),
+            },
+            error => error.into(),
+        }
+    }
+
+    fn map_error(self, error: SearchError) -> SearchError {
+        match error {
+            SearchError::K0(error) => self.map_k0_error(error),
+            error => error,
+        }
+    }
+
+    fn accounting(
+        self,
+        accounting: fre_automata::SearchAccounting,
+    ) -> Result<fre_automata::SearchAccounting, SearchError> {
+        accounting
+            .with_external_scratch_bytes(self.external_scratch_bytes)
+            .map_err(SearchError::from)
+    }
+}
+
+/// Run the primary report-free K0 lane under one aggregate invocation.
+fn try_k0_warm_exists_value_with_aggregate_limits(
+    session: &mut K0SearchSession<'_>,
+    aggregate_setup: SearchSessionSetupAccounting,
+    haystack: &[u8],
+    limits: SearchLimits,
+) -> Result<Option<bool>, SearchError> {
+    let invocation = K0AggregateInvocation::admit(session, aggregate_setup, limits)?;
+    match session.try_search_warm_exists_value_with_limits(
+        haystack,
+        SearchWindow::full(haystack),
+        invocation.primary_limits(),
+    ) {
+        Ok(output) => Ok(output),
+        Err(error) => Err(invocation.map_k0_error(error)),
+    }
 }
 
 #[repr(u8)]
@@ -18412,6 +18748,11 @@ impl<'r> PortableSearchSession<'r> {
     /// Native specialized plans return `None` because the session allocates no
     /// storage for them. Eligible general reverse-inner sessions include both
     /// the primary and residual-admitted prefix workspaces in this receipt.
+    /// An immutable regex-owned start-filter proof is deliberately excluded;
+    /// its separate exact setup receipt is returned by
+    /// [`Self::prepare_k0_start_filter`].
+    /// Demand growth performed by later searches is excluded and is reported
+    /// by their [`SearchAccounting::cache_growth`] receipts instead.
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         match &self.plan {
@@ -18424,6 +18765,107 @@ impl<'r> PortableSearchSession<'r> {
         }
     }
 
+    /// Settle the optional immutable K0 start-filter proof before a measured
+    /// source-bearing operation.
+    ///
+    /// `limits` covers both the session's already-completed workspace
+    /// construction and this graph-only preparation. Before allocation, the
+    /// byte envelope reserves the complete maximum proof payload in addition
+    /// to every retained session workspace. If either residual cap cannot
+    /// admit that transaction, preparation permanently selects ordinary K0
+    /// without inspecting source. Either K0 outcome means that the next search
+    /// cannot derive or allocate this proof for the first time. Native
+    /// sessions return `Ok(None)`.
+    ///
+    /// The returned owner bytes belong to the immutable regex, not to this
+    /// session, and are therefore deliberately separate from
+    /// [`Self::workspace_setup_accounting`]. Composite owners must charge any
+    /// nonzero retained payload until the regex itself is released. The
+    /// returned aggregate retained value has already been checked against
+    /// `limits.max_scratch_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when either limit is below already-completed
+    /// session setup, a proof retained by an earlier preparation does not fit
+    /// the supplied aggregate scratch cap, or the authenticated source-free
+    /// preparation encounters an invariant failure.
+    #[doc(hidden)]
+    pub fn prepare_k0_start_filter(
+        &mut self,
+        limits: SearchSessionLimits,
+    ) -> Result<Option<PortableK0StartFilterSetupAccounting>, SearchError> {
+        let PortableSearchSessionPlan::K0 {
+            session,
+            aggregate_setup,
+            k0_plan,
+            ..
+        } = &mut self.plan
+        else {
+            return Ok(None);
+        };
+        let residual_work = limits
+            .max_setup_work
+            .checked_sub(aggregate_setup.work())
+            .ok_or(K0SearchError::WorkLimitExceeded {
+                limit: limits.max_setup_work,
+                consumed: 0,
+                requested: aggregate_setup.work(),
+                position: 0,
+            })?;
+        if aggregate_setup.retained_bytes() > limits.max_scratch_bytes {
+            return Err(K0SearchError::ResourceLimit {
+                resource: fre_automata::ResourceKind::ScratchBytes,
+                needed: aggregate_setup.retained_bytes(),
+                limit: limits.max_scratch_bytes,
+            }
+            .into());
+        }
+        let proof_ceiling_fits = aggregate_setup
+            .retained_bytes()
+            .checked_add(K0StartFilterPreparationReceipt::MAX_RETAINED_OWNER_BYTES)
+            .is_some_and(|needed| needed <= limits.max_scratch_bytes);
+        let proof_work_limit = if proof_ceiling_fits { residual_work } else { 0 };
+        let receipt = session.prepare_start_filter_with_setup_work_limit(proof_work_limit)?;
+        let total_work = aggregate_setup
+            .work()
+            .checked_add(receipt.work_completed())
+            .ok_or(K0SearchError::ArithmeticOverflow {
+                computation: "aggregate K0 session and start-filter setup work",
+            })?;
+        if total_work > limits.max_setup_work {
+            return Err(K0SearchError::InternalInvariant {
+                detail: "K0 start-filter preparation exceeded its residual setup-work admission",
+            }
+            .into());
+        }
+        let retained_owner_bytes = k0_plan
+            .automaton
+            .compiler_private_start_filter_proof_retained_bytes();
+        let aggregate_retained_bytes = aggregate_setup
+            .retained_bytes()
+            .checked_add(retained_owner_bytes)
+            .ok_or(K0SearchError::ArithmeticOverflow {
+                computation: "aggregate K0 session and start-filter retained bytes",
+            })?;
+        if aggregate_retained_bytes > limits.max_scratch_bytes {
+            return Err(K0SearchError::ResourceLimit {
+                resource: fre_automata::ResourceKind::ScratchBytes,
+                needed: aggregate_retained_bytes,
+                limit: limits.max_scratch_bytes,
+            }
+            .into());
+        }
+        Ok(Some(PortableK0StartFilterSetupAccounting {
+            work_completed: receipt.work_completed(),
+            total_setup_work: total_work,
+            newly_retained_owner_bytes: receipt.retained_owner_bytes(),
+            retained_owner_bytes,
+            aggregate_retained_bytes,
+            cap_declined: receipt.cap_declined(),
+        }))
+    }
+
     /// Prepare a source-independent token for repeated value-only existence
     /// searches under one fixed finite limit pair.
     ///
@@ -18433,10 +18875,12 @@ impl<'r> PortableSearchSession<'r> {
     /// input prefix whose conservative reused-work certificate fits `limits`.
     /// Construction-proved whole-line, byte-class delimiter, and class-guarded
     /// literal matchers instead retain their exact direct identities and
-    /// source-free linear envelopes. The retained workspace must also fit the
-    /// per-invocation scratch cap. Every other plan receives an incumbent
-    /// token. Preparation reads no source, allocates nothing, and does not
-    /// initialize lazy search state.
+    /// source-free linear envelopes. The construction-time aggregate retained
+    /// workspace must also fit the per-invocation scratch cap. Execution
+    /// rechecks the adaptive primary's live retained floor, reserves any fixed
+    /// sidecar, and charges cache growth under the same finite limits. Every
+    /// other plan receives an incumbent token. Preparation reads no source,
+    /// allocates nothing, and does not initialize lazy search state.
     #[must_use]
     pub fn prepare_is_match_value_token(
         &self,
@@ -18597,7 +19041,9 @@ impl<'r> PortableSearchSession<'r> {
     /// a caller permits the ordinary retained K0 executor but declines a
     /// narrower direct predicate. Preparation is source-independent, reads no
     /// haystack bytes, allocates nothing, and preserves the original finite
-    /// limits for the ordinary fallback path.
+    /// limits for both the authenticated warm executor and the ordinary
+    /// fallback path. Execution rechecks live retained scratch and meters any
+    /// adaptive first-hole growth under those limits.
     #[must_use]
     pub fn prepare_k0_warm_is_match_value_token(
         &self,
@@ -18798,6 +19244,46 @@ impl<'r> PortableSearchSession<'r> {
         {
             return Ok(true);
         }
+        let k0_owner_identity = match token.route {
+            PortableIsMatchValueTokenRoute::LineTotal {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::K0Warm {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::LiteralPrefixClass {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::ByteClassDelimiter {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::BoundedDelimited {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::UriLike {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::FusedUriLikeComposite {
+                automaton_identity, ..
+            }
+            | PortableIsMatchValueTokenRoute::AnchoredScalarCorridor {
+                automaton_identity, ..
+            } => Some(automaton_identity),
+            PortableIsMatchValueTokenRoute::Incumbent
+            | PortableIsMatchValueTokenRoute::EmptyLiteral { .. }
+            | PortableIsMatchValueTokenRoute::UnicodeWordRun { .. } => None,
+        };
+        if let Some(automaton_identity) = k0_owner_identity
+            && let PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                k0_plan,
+                ..
+            } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+        {
+            K0AggregateInvocation::admit(session, *aggregate_setup, token.limits)?;
+        }
         if let PortableIsMatchValueTokenRoute::LineTotal {
             automaton_identity,
             plan_identity,
@@ -18821,13 +19307,19 @@ impl<'r> PortableSearchSession<'r> {
         } = token.route
             && haystack.len() <= maximum_input_bytes
             && let PortableSearchSessionPlan::K0 {
-                session, k0_plan, ..
+                session,
+                aggregate_setup,
+                k0_plan,
+                ..
             } = &mut self.plan
             && k0_plan.automaton.identity() == automaton_identity
             && !k0_plan.automaton.stats().has_assertions()
-            && let Some(matched) = session
-                .try_search_warm_exists_value(haystack, SearchWindow::full(haystack))
-                .map_err(SearchError::from)?
+            && let Some(matched) = try_k0_warm_exists_value_with_aggregate_limits(
+                session,
+                *aggregate_setup,
+                haystack,
+                token.limits,
+            )?
         {
             return Ok(matched);
         }
@@ -18933,9 +19425,10 @@ impl<'r> PortableSearchSession<'r> {
     /// repeated-call handle.
     ///
     /// Every admitted call executes the same complete report-free warm K0
-    /// search as [`Self::is_match_value_prepared`]. A source longer than the
-    /// handle's immutable envelope replays [`Self::is_match_value`] under the
-    /// original finite limits.
+    /// search as [`Self::is_match_value_prepared`] under the handle's original
+    /// finite limits, including the live retained-scratch floor and any
+    /// adaptive first-hole growth. A source longer than the handle's immutable
+    /// envelope replays [`Self::is_match_value`] under those limits.
     ///
     /// # Errors
     ///
@@ -18949,12 +19442,18 @@ impl<'r> PortableSearchSession<'r> {
     ) -> Result<bool, SearchError> {
         if haystack.len() <= bound.maximum_input_bytes
             && let PortableSearchSessionPlan::K0 {
-                session, k0_plan, ..
+                session,
+                aggregate_setup,
+                k0_plan,
+                ..
             } = &mut self.plan
             && k0_plan.automaton.identity() == bound.automaton_identity
-            && let Some(matched) = session
-                .try_search_warm_exists_value(haystack, SearchWindow::full(haystack))
-                .map_err(SearchError::from)?
+            && let Some(matched) = try_k0_warm_exists_value_with_aggregate_limits(
+                session,
+                *aggregate_setup,
+                haystack,
+                bound.limits,
+            )?
         {
             return Ok(matched);
         }
@@ -19032,9 +19531,17 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session, .. } => {
-                let report = session.search_window::<Exists>(haystack, window, limits)?;
-                let accounting = report.accounting();
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                ..
+            } => {
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let report = session
+                    .search_window::<Exists>(haystack, window, invocation.primary_limits())
+                    .map_err(|error| invocation.map_k0_error(error))?;
+                let accounting = invocation.accounting(report.accounting())?;
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
         }
@@ -19075,6 +19582,7 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
+                aggregate_setup,
                 k0_plan,
                 reverse_inner,
                 mandatory_suffix,
@@ -19085,9 +19593,13 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_exists_state,
                 ..
             } => {
-                let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal();
-                if k0_finite_minimum_window_is_proven_empty(
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let absolute_end_proof = k0_plan.absolute_end_proof;
+                    let correlated_terminal = k0_plan.correlated_terminal();
+                    if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
@@ -19263,20 +19775,22 @@ impl<'r> PortableSearchSession<'r> {
                         }
                     }
                 }
-                execute_k0_exists_incumbent(
-                    session,
-                    reverse_inner,
-                    *mandatory_suffix,
-                    *mandatory_cut,
-                    *negative_prefilter,
-                    mandatory_suffix_exists_state,
-                    negative_prefilter_exists_state,
-                    absolute_end_proof,
-                    haystack,
-                    window,
-                    limits,
-                    None,
-                )
+                    execute_k0_exists_incumbent(
+                        session,
+                        reverse_inner,
+                        *mandatory_suffix,
+                        *mandatory_cut,
+                        *negative_prefilter,
+                        mandatory_suffix_exists_state,
+                        negative_prefilter_exists_state,
+                        absolute_end_proof,
+                        haystack,
+                        window,
+                        limits,
+                        None,
+                    )
+                })();
+                result.map_err(|error| invocation.map_error(error))
             }
         }
     }
@@ -19377,14 +19891,19 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
+                aggregate_setup,
                 k0_plan,
                 mandatory_suffix,
                 exclusive_route_state,
                 ..
             } => {
-                let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal();
-                if k0_finite_minimum_window_is_proven_empty(
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let absolute_end_proof = k0_plan.absolute_end_proof;
+                    let correlated_terminal = k0_plan.correlated_terminal();
+                    if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
@@ -19512,10 +20031,12 @@ impl<'r> PortableSearchSession<'r> {
                 )? {
                     return Ok(matched.then_some(window.end()));
                 }
-                session
-                    .search_window::<EarliestEnd>(haystack, window, limits)
-                    .map(fre_automata::SearchReport::into_output)
-                    .map_err(SearchError::from)
+                    session
+                        .search_window::<EarliestEnd>(haystack, window, limits)
+                        .map(fre_automata::SearchReport::into_output)
+                        .map_err(SearchError::from)
+                })();
+                result.map_err(|error| invocation.map_error(error))
             }
         }
     }
@@ -19549,9 +20070,17 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.shortest_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session, .. } => {
-                let report = session.search_window::<EarliestEnd>(haystack, window, limits)?;
-                let accounting = report.accounting();
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                ..
+            } => {
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let report = session
+                    .search_window::<EarliestEnd>(haystack, window, invocation.primary_limits())
+                    .map_err(|error| invocation.map_k0_error(error))?;
+                let accounting = invocation.accounting(report.accounting())?;
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
         }
@@ -19582,9 +20111,17 @@ impl<'r> PortableSearchSession<'r> {
                 Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
             }
             PortableSearchSessionPlan::Native(regex) => regex.selected_end(haystack, limits),
-            PortableSearchSessionPlan::K0 { session, .. } => {
-                let report = session.search::<SelectedEnd>(haystack, limits)?;
-                let accounting = report.accounting();
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                ..
+            } => {
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let report = session
+                    .search::<SelectedEnd>(haystack, invocation.primary_limits())
+                    .map_err(|error| invocation.map_k0_error(error))?;
+                let accounting = invocation.accounting(report.accounting())?;
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
         }
@@ -19777,13 +20314,27 @@ impl<'r> PortableSearchSession<'r> {
                 ))
             }
             PortableSearchSessionPlan::Native(regex) => regex.find_window(haystack, window, limits),
-            PortableSearchSessionPlan::K0 { session, .. } => {
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                ..
+            } => {
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
                 let report = if window.end() == haystack.len() {
-                    session.search_span_at_cursor(haystack, window.start(), limits)?
+                    session
+                        .search_span_at_cursor(
+                            haystack,
+                            window.start(),
+                            invocation.primary_limits(),
+                        )
+                        .map_err(|error| invocation.map_k0_error(error))?
                 } else {
-                    session.search_window::<Span>(haystack, window, limits)?
+                    session
+                        .search_window::<Span>(haystack, window, invocation.primary_limits())
+                        .map_err(|error| invocation.map_k0_error(error))?
                 };
-                let accounting = report.accounting();
+                let accounting = invocation.accounting(report.accounting())?;
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
                     end: span.end(),
@@ -19828,6 +20379,7 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
+                aggregate_setup,
                 k0_plan,
                 mandatory_suffix,
                 mandatory_cut,
@@ -19837,9 +20389,13 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_span_state,
                 ..
             } => {
-                let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal();
-                if k0_finite_minimum_window_is_proven_empty(
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    let absolute_end_proof = k0_plan.absolute_end_proof;
+                    let correlated_terminal = k0_plan.correlated_terminal();
+                    if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
                     window,
@@ -20750,7 +21306,9 @@ impl<'r> PortableSearchSession<'r> {
                     *mandatory_suffix_span_state = suffix_state_after_success;
                     *negative_prefilter_span_state = attempt.state_after_success;
                 }
-                result
+                    result
+                })();
+                result.map_err(|error| invocation.map_error(error))
             }
         }
     }
@@ -20760,7 +21318,11 @@ impl<'r> PortableSearchSession<'r> {
     ///
     /// Session construction and its one-time accounting happened before this
     /// call. Constructing this iterator allocates nothing, and its
-    /// [`PortableFindIterAccounting`] starts at zero for this haystack.
+    /// [`PortableFindIterAccounting`] starts at zero for this haystack. A
+    /// session created by [`PortableRegex::search_session`] may still grow K0
+    /// cache storage during iteration; one created by
+    /// [`PortableRegex::fixed_search_session`] does not grow retained cache
+    /// capacity.
     /// Dropping the iterator early, or dropping it after a yielded error,
     /// releases the mutable borrow so the session can be used again.
     ///
@@ -20783,7 +21345,11 @@ impl<'r> PortableSearchSession<'r> {
     /// Empty-match progress and the whole-iterator search-call cap are
     /// identical to [`Self::find_iter`]. The iterator intentionally omits a
     /// unified per-iterator search-accounting aggregate so value-only
-    /// accelerators can be used without manufacturing facade receipts.
+    /// accelerators can be used without manufacturing facade receipts. If this
+    /// is an adaptive K0 session, contextual searches may grow retained cache
+    /// capacity under `limits.search`; that growth is deliberately unavailable
+    /// as a unified receipt here. A session created by
+    /// [`PortableRegex::fixed_search_session`] does not grow retained capacity.
     #[must_use]
     pub fn find_iter_value<'s, 'h>(
         &'s mut self,
@@ -21060,6 +21626,7 @@ impl<'r> PortableSearchSession<'r> {
         let window = SearchWindow::new(start, haystack.len());
         let PortableSearchSessionPlan::K0 {
             session,
+            aggregate_setup,
             k0_plan,
             mandatory_suffix,
             mandatory_suffix_span_state,
@@ -21074,6 +21641,11 @@ impl<'r> PortableSearchSession<'r> {
         if suffix.universal_finite_match_byte_bounds().is_none() {
             return None;
         }
+        let invocation = match K0AggregateInvocation::admit(session, *aggregate_setup, limits) {
+            Ok(invocation) => invocation,
+            Err(error) => return Some(Err(error)),
+        };
+        let limits = invocation.primary_limits();
         if k0_finite_minimum_window_is_proven_empty(Some(suffix), haystack.len(), window)
             || k0_absolute_end_window_is_proven_empty(
                 k0_plan.absolute_end_proof,
@@ -21149,7 +21721,7 @@ impl<'r> PortableSearchSession<'r> {
         if result.is_ok() {
             *mandatory_suffix_span_state = suffix_state_after_success;
         }
-        Some(result)
+        Some(result.map_err(|error| invocation.map_error(error)))
     }
 
     fn find_iter_value_source_bound_at(
@@ -21158,10 +21730,18 @@ impl<'r> PortableSearchSession<'r> {
         start: usize,
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
-        let PortableSearchSessionPlan::K0 { session, .. } = &mut self.plan else {
+        let PortableSearchSessionPlan::K0 {
+            session,
+            aggregate_setup,
+            ..
+        } = &mut self.plan
+        else {
             unreachable!("source-bound K0 iterator route was checked before construction");
         };
-        let found = session.search_span_value_at_source_cursor(source, start, limits)?;
+        let invocation = K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+        let found = session
+            .search_span_value_at_source_cursor(source, start, invocation.primary_limits())
+            .map_err(|error| invocation.map_k0_error(error))?;
         Ok(found.map(|span| Match {
             start: span.start(),
             end: span.end(),
@@ -21192,10 +21772,18 @@ impl<'r> PortableSearchSession<'r> {
             | PortableSearchSessionPlan::K0 { .. } => false,
         };
         if retained_root_run {
-            let PortableSearchSessionPlan::K0 { session, .. } = &mut self.plan else {
+            let PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                ..
+            } = &mut self.plan
+            else {
                 unreachable!("retained K0 root-run cursor was checked above");
             };
-            let report = session.search_span_at_source_cursor(source, start, limits)?;
+            let invocation = K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+            let report = session
+                .search_span_at_source_cursor(source, start, invocation.primary_limits())
+                .map_err(|error| invocation.map_k0_error(error))?;
             return Ok(report.into_output().map(|span| Match {
                 start: span.start(),
                 end: span.end(),
@@ -21222,7 +21810,7 @@ impl<'r> PortableSearchSession<'r> {
         source: &mut K0SpanSourceCursor<'_>,
         start: usize,
         limits: SearchLimits,
-    ) -> Result<(Option<Match>, u64), SearchError> {
+    ) -> Result<(Option<Match>, PortableFindIterStepAccounting), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
                 let (matched, accounting) = plan.find_window(
@@ -21232,7 +21820,9 @@ impl<'r> PortableSearchSession<'r> {
                 )?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
-                    u64::try_from(accounting.linear_terms).unwrap_or(u64::MAX),
+                    PortableFindIterStepAccounting::work(
+                        u64::try_from(accounting.linear_terms).unwrap_or(u64::MAX),
+                    ),
                 ))
             }
             PortableSearchSessionPlan::FixedPredicateWord64 { plan, .. } => {
@@ -21243,14 +21833,15 @@ impl<'r> PortableSearchSession<'r> {
                 )?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
-                    accounting.actual.work,
+                    PortableFindIterStepAccounting::work(accounting.actual.work),
                 ))
             }
-            PortableSearchSessionPlan::Native(regex) => {
-                regex.find_iter_at(source.haystack(), start, limits)
-            }
+            PortableSearchSessionPlan::Native(regex) => regex
+                .find_iter_at(source.haystack(), start, limits)
+                .map(|(matched, work)| (matched, PortableFindIterStepAccounting::work(work))),
             PortableSearchSessionPlan::K0 {
                 session,
+                aggregate_setup,
                 k0_plan,
                 reverse_inner,
                 mandatory_suffix,
@@ -21258,30 +21849,40 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter,
                 ..
             } => {
-                if k0_plan.correlated_terminal().is_some() {
-                    let sidecars_absent = reverse_inner.is_none()
-                        && mandatory_suffix.is_none()
-                        && mandatory_cut.is_none()
-                        && negative_prefilter.is_none()
-                        && k0_plan.absolute_end_proof.is_none();
-                    if let Some(prepared) = prepare_k0_correlated_iter_at(
-                        session,
-                        k0_plan,
-                        sidecars_absent,
-                        source,
-                        start,
-                        limits,
-                    ) {
-                        return prepared.map(|prepared| prepared.commit(source));
+                let invocation =
+                    K0AggregateInvocation::admit(session, *aggregate_setup, limits)?;
+                let limits = invocation.primary_limits();
+                let result = (|| {
+                    if k0_plan.correlated_terminal().is_some() {
+                        let sidecars_absent = reverse_inner.is_none()
+                            && mandatory_suffix.is_none()
+                            && mandatory_cut.is_none()
+                            && negative_prefilter.is_none()
+                            && k0_plan.absolute_end_proof.is_none();
+                        if let Some(prepared) = prepare_k0_correlated_iter_at(
+                            session,
+                            k0_plan,
+                            sidecars_absent,
+                            source,
+                            start,
+                            limits,
+                        ) {
+                            return prepared.map(|prepared| prepared.commit(source));
+                        }
                     }
-                }
-                let report = session.search_span_at_source_cursor(source, start, limits)?;
-                let work = report.accounting().work();
-                let matched = report.into_output().map(|span| Match {
-                    start: span.start(),
-                    end: span.end(),
-                });
-                Ok((matched, work))
+                    let report = session
+                        .search_span_at_source_cursor(source, start, limits)
+                        .map_err(SearchError::from)?;
+                    let accounting = PortableFindIterStepAccounting::k0(
+                        invocation.accounting(report.accounting())?,
+                    );
+                    let matched = report.into_output().map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    });
+                    Ok((matched, accounting))
+                })();
+                result.map_err(|error| invocation.map_error(error))
             }
         }
     }
@@ -21454,7 +22055,7 @@ fn k0_correlated_iter_linear_work(window_bytes: usize) -> Option<u64> {
 #[derive(Clone, Copy, Debug)]
 struct K0CorrelatedIterPrepared {
     matched: Option<Match>,
-    work: u64,
+    accounting: PortableFindIterStepAccounting,
     #[cfg(test)]
     fallback_work: u64,
     automaton_identity: u64,
@@ -21466,13 +22067,13 @@ impl K0CorrelatedIterPrepared {
     fn commit(
         self,
         source: &mut K0SpanSourceCursor<'_>,
-    ) -> (Option<Match>, u64) {
+    ) -> (Option<Match>, PortableFindIterStepAccounting) {
         source.publish_facade_continuation(
             self.automaton_identity,
             self.window_end,
             self.next_start,
         );
-        (self.matched, self.work)
+        (self.matched, self.accounting)
     }
 }
 
@@ -21515,10 +22116,14 @@ fn prepare_k0_correlated_iter_at(
         window.end(),
     ) {
         correlated_bounded_alternation::ExactDelimitedProbe::Match { start, end } => {
-            Ok((Some(Match { start, end }), prepaid_work, 0))
+            Ok((
+                Some(Match { start, end }),
+                PortableFindIterStepAccounting::work(prepaid_work),
+                0,
+            ))
         }
         correlated_bounded_alternation::ExactDelimitedProbe::Exhausted => {
-            Ok((None, prepaid_work, 0))
+            Ok((None, PortableFindIterStepAccounting::work(prepaid_work), 0))
         }
         correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
             first_unproved_start,
@@ -21528,24 +22133,26 @@ fn prepare_k0_correlated_iter_at(
                 .search_span_at_source_cursor(source, fallback_start, limits)
                 .map_err(SearchError::from)
                 .and_then(|report| {
-                    let fallback_work = report.accounting().work();
+                    let fallback_accounting =
+                        PortableFindIterStepAccounting::k0(report.accounting());
+                    let fallback_work = fallback_accounting.work_or_linear_terms;
                     let matched = report.into_output().map(|span| Match {
                         start: span.start(),
                         end: span.end(),
                     });
-                    let work = prepaid_work.checked_add(fallback_work).ok_or(
+                    let accounting = fallback_accounting.checked_add_work(prepaid_work).ok_or(
                         SearchError::K0(K0SearchError::ArithmeticOverflow {
                             computation: "correlated iterator prepaid plus fallback work",
                         }),
                     )?;
-                    Ok((matched, work, fallback_work))
+                    Ok((matched, accounting, fallback_work))
                 })
         }
     };
-    Some(searched.map(|(matched, work, _fallback_work)| {
+    Some(searched.map(|(matched, accounting, _fallback_work)| {
         K0CorrelatedIterPrepared {
             matched,
-            work,
+            accounting,
             #[cfg(test)]
             fallback_work: _fallback_work,
             automaton_identity,
@@ -21771,6 +22378,11 @@ impl<'h> PortableMatchIterCore<'h> {
                 matches: 0,
                 suppressed_empty: 0,
                 work_or_linear_terms: 0,
+                cache_growth_events: 0,
+                cache_growth_allocated_bytes: 0,
+                cache_growth_initialized_bytes: 0,
+                cache_growth_retained_delta: 0,
+                cache_growth_peak_scratch_bytes: 0,
                 utf8_progress_byte_probes: 0,
                 utf8_progress_work: 0,
             },
@@ -21803,12 +22415,62 @@ impl<'h> PortableMatchIterCore<'h> {
         Ok(())
     }
 
-    fn record_search_work(&mut self, work: u64) -> Result<(), PortableFindIterError> {
-        self.accounting.work_or_linear_terms = self
+    fn record_search_accounting(
+        &mut self,
+        search: PortableFindIterStepAccounting,
+    ) -> Result<(), PortableFindIterError> {
+        let Some(work_or_linear_terms) = self
             .accounting
             .work_or_linear_terms
-            .checked_add(work)
-            .ok_or(PortableFindIterError::AccountingOverflow { counter: "work" })?;
+            .checked_add(search.work_or_linear_terms)
+        else {
+            return Err(PortableFindIterError::AccountingOverflow { counter: "work" });
+        };
+        let Some(cache_growth_events) = self
+            .accounting
+            .cache_growth_events
+            .checked_add(search.cache_growth_events)
+        else {
+            return Err(PortableFindIterError::AccountingOverflow {
+                counter: "cache-growth-event",
+            });
+        };
+        let Some(cache_growth_allocated_bytes) = self
+            .accounting
+            .cache_growth_allocated_bytes
+            .checked_add(search.cache_growth_allocated_bytes)
+        else {
+            return Err(PortableFindIterError::AccountingOverflow {
+                counter: "cache-growth-allocated-byte",
+            });
+        };
+        let Some(cache_growth_initialized_bytes) = self
+            .accounting
+            .cache_growth_initialized_bytes
+            .checked_add(search.cache_growth_initialized_bytes)
+        else {
+            return Err(PortableFindIterError::AccountingOverflow {
+                counter: "cache-growth-initialized-byte",
+            });
+        };
+        let Some(cache_growth_retained_delta) = self
+            .accounting
+            .cache_growth_retained_delta
+            .checked_add(search.cache_growth_retained_delta)
+        else {
+            return Err(PortableFindIterError::AccountingOverflow {
+                counter: "cache-growth-retained-byte",
+            });
+        };
+        self.accounting.work_or_linear_terms = work_or_linear_terms;
+        self.accounting.cache_growth_events = cache_growth_events;
+        self.accounting.cache_growth_allocated_bytes = cache_growth_allocated_bytes;
+        self.accounting.cache_growth_initialized_bytes = cache_growth_initialized_bytes;
+        self.accounting.cache_growth_retained_delta = cache_growth_retained_delta;
+        self.accounting.cache_growth_peak_scratch_bytes = self
+            .accounting
+            .cache_growth_peak_scratch_bytes
+            .max(search.cache_growth_peak_scratch_bytes);
         Ok(())
     }
 
@@ -21909,7 +22571,8 @@ impl<'h> PortableMatchIterCore<'h> {
             &mut K0SpanSourceCursor<'h>,
             usize,
             SearchLimits,
-        ) -> Result<(Option<Match>, u64), SearchError>,
+        )
+            -> Result<(Option<Match>, PortableFindIterStepAccounting), SearchError>,
     ) -> Option<Result<Match, PortableFindIterError>> {
         while !self.finished {
             match self.advance_pending_empty() {
@@ -21921,11 +22584,11 @@ impl<'h> PortableMatchIterCore<'h> {
                 return Some(self.fail(error));
             }
             let searched = search(&mut self.k0_source, self.start, self.limits.search);
-            let (matched, search_work) = match searched {
+            let (matched, search_accounting) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
             };
-            if let Err(error) = self.record_search_work(search_work) {
+            if let Err(error) = self.record_search_accounting(search_accounting) {
                 return Some(self.fail(error));
             }
             let Some(matched) = matched else {
@@ -22010,9 +22673,11 @@ impl<'r, 'h> PortableMatchIterState<'r, 'h> {
             Self::General(core) => core.next_match_with(|source, start, limits| {
                 session.find_iter_at(source, start, limits)
             }),
-            Self::Native { core, cursor } => {
-                core.next_match_with(|_source, start, limits| cursor.find_at(start, limits))
-            }
+            Self::Native { core, cursor } => core.next_match_with(|_source, start, limits| {
+                cursor
+                    .find_at(start, limits)
+                    .map(|(matched, work)| (matched, PortableFindIterStepAccounting::work(work)))
+            }),
         }
     }
 }
@@ -22311,9 +22976,9 @@ mod tests {
         OperationSemantics, PlanKind, PlanSelection,
         PackedLiteralSetError,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-        PortableFindIterRunLimits, PortablePlan, PortableRegex, PortableSearchSession,
-        PortableSearchSessionPlan, PortableSpanVisitLimits, SearchAccounting, SearchError,
-        SearchLimits,
+        PortableFindIterRunLimits, PortableFindIterStepAccounting, PortablePlan, PortableRegex,
+        PortableSearchSession, PortableSearchSessionPlan, PortableSpanVisitLimits,
+        SearchAccounting, SearchError, SearchLimits,
         SearchSessionLimits, SearchWindow,
         PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
         SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
@@ -26865,6 +27530,525 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn adaptive_k0_reverse_inner_reserves_primary_growth_ceiling_before_sidecar() {
+        let regex = PortableBuilder::new(r"(?-u:.[abcd](?:efi|ghj|klk|qrl)[mnop]*)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("reverse-inner aggregate fixture builds");
+        let probe = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("unlimited adaptive aggregate constructs");
+        let (primary_setup, primary_scratch_ceiling, aggregate_setup) = match &probe.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                reverse_inner: Some(_),
+                ..
+            } => (
+                session.construction_accounting(),
+                session.admitted_scratch_bytes(),
+                *aggregate_setup,
+            ),
+            _ => panic!("focused fixture lost its K0 reverse-inner sidecar"),
+        };
+        assert!(
+            primary_scratch_ceiling > primary_setup.retained_bytes(),
+            "the regression requires demand-grown primary capacity",
+        );
+        let sidecar_retained = aggregate_setup
+            .retained_bytes()
+            .checked_sub(primary_setup.retained_bytes())
+            .expect("aggregate setup contains the primary setup");
+        assert!(sidecar_retained > 0);
+        let exact_scratch = primary_scratch_ceiling
+            .checked_add(sidecar_retained)
+            .expect("focused aggregate ceiling fits usize");
+        drop(probe);
+
+        let exact = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: SearchSessionLimits::unlimited().max_setup_work,
+                max_scratch_bytes: exact_scratch,
+            })
+            .expect("the exact primary-growth plus sidecar ceiling is admitted");
+        let PortableSearchSessionPlan::K0 {
+            session,
+            aggregate_setup,
+            reverse_inner: Some(_),
+            ..
+        } = &exact.plan
+        else {
+            panic!("exact-limit session lost its K0 reverse-inner sidecar");
+        };
+        let exact_sidecar_retained = aggregate_setup
+            .retained_bytes()
+            .checked_sub(session.construction_accounting().retained_bytes())
+            .expect("exact aggregate setup contains the primary setup");
+        assert_eq!(
+            session
+                .admitted_scratch_bytes()
+                .checked_add(exact_sidecar_retained),
+            Some(exact_scratch),
+        );
+        drop(exact);
+
+        let one_below = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: SearchSessionLimits::unlimited().max_setup_work,
+                max_scratch_bytes: exact_scratch - 1,
+            })
+            .expect("one byte below the aggregate ceiling may keep the primary alone");
+        let PortableSearchSessionPlan::K0 {
+            session,
+            aggregate_setup,
+            reverse_inner,
+            ..
+        } = &one_below.plan
+        else {
+            panic!("one-below aggregate session lost K0");
+        };
+        assert!(
+            reverse_inner.is_none(),
+            "one byte below the aggregate ceiling must decline the optional sidecar",
+        );
+        assert_eq!(
+            *aggregate_setup,
+            session.construction_accounting(),
+            "a declined sidecar contributes no hidden setup receipt",
+        );
+        assert!(session.admitted_scratch_bytes() <= exact_scratch - 1);
+    }
+
+    #[test]
+    fn immediate_cold_k0_warm_token_completes_under_its_finite_limits() {
+        const HAYSTACK: &[u8] = b"abcdefghijkl";
+        let regex = PortableBuilder::new(r"(?-u:abcdefghijkl)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("cold warm-token fixture builds through K0");
+
+        for bound in [false, true] {
+            let mut search = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("cold adaptive session constructs");
+            let retained = search
+                .workspace_setup_accounting()
+                .expect("forced K0 exposes setup")
+                .retained_bytes();
+            let limits = SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: retained,
+            };
+            let token = search.prepare_k0_warm_is_match_value_token(HAYSTACK.len(), limits);
+            assert!(token.uses_k0_warm_route());
+            let matched = if bound {
+                let bound = search
+                    .bind_k0_warm_is_match_value_token(token)
+                    .expect("cold token authenticates its owner");
+                search.is_match_value_bound_k0_warm(HAYSTACK, bound)
+            } else {
+                search.is_match_value_prepared(HAYSTACK, token)
+            };
+            assert_eq!(matched, Ok(true));
+            let live = match &search.plan {
+                PortableSearchSessionPlan::K0 { session, .. } => {
+                    session.retained_scratch_bytes()
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                live, retained,
+                "the exact cold finite cap completes without publishing growth",
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_direct_k0_token_rechecks_growth_after_token_creation() {
+        const HAYSTACK: &[u8] = b"prefix AKIA01234567ABCDEFGH suffix";
+        let regex = PortableBuilder::new(r"(?-u:(?:ASIA|AKIA|AROA|AIDA)[A-Z0-7]{16})")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("direct-token growth fixture builds through K0");
+        let mut calibration = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("direct-token calibration session constructs");
+        let seed = calibration
+            .workspace_setup_accounting()
+            .expect("forced K0 exposes setup")
+            .retained_bytes();
+        assert!(calibration
+            .find(HAYSTACK, SearchLimits::unlimited())
+            .expect("calibration span search grows")
+            .0
+            .is_some());
+        let live = match &calibration.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.retained_scratch_bytes()
+            }
+            _ => unreachable!(),
+        };
+        assert!(live > seed, "fixture must grow after token minting");
+
+        for (scratch, succeeds) in [(live, true), (live - 1, false)] {
+            let mut search = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("direct-token target session constructs");
+            let limits = SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: scratch,
+            };
+            let token = search.prepare_is_match_value_token(HAYSTACK.len(), limits);
+            assert!(token.uses_literal_prefix_class_route());
+            assert!(search
+                .find(HAYSTACK, SearchLimits::unlimited())
+                .expect("target span search grows after token minting")
+                .0
+                .is_some());
+            if succeeds {
+                assert_eq!(search.is_match_value_prepared(HAYSTACK, token), Ok(true));
+            } else {
+                assert_eq!(
+                    search.is_match_value_prepared(HAYSTACK, token),
+                    Err(SearchError::K0(super::K0SearchError::ResourceLimit {
+                        resource: fre_automata::ResourceKind::ScratchBytes,
+                        needed: live,
+                        limit: live - 1,
+                    })),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_k0_warm_token_applies_limits_to_growth_after_token_creation() {
+        const WARM: &[u8] = b"abcdef";
+        const GROW: &[u8] = b"abcdefghijkl";
+
+        let regex = PortableBuilder::new(r"(?-u:abcdefghijkl)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("adaptive warm-token fixture builds through K0");
+        let mut calibration = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("adaptive calibration session constructs");
+        calibration
+            .is_match(WARM, SearchLimits::unlimited())
+            .expect("short prefix warms the direct K0 cache");
+        let seed_retained = match &calibration.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.retained_scratch_bytes()
+            }
+            _ => panic!("forced K0 fixture lost its K0 session"),
+        };
+        let (matched, accounting) = calibration
+            .is_match(GROW, SearchLimits::unlimited())
+            .expect("longer literal grows the adaptive direct cache");
+        assert!(matched);
+        let growth = accounting
+            .cache_growth()
+            .expect("forced K0 reports cache growth");
+        assert!(growth.events() > 0, "fixture must grow after its warm prefix");
+        assert!(growth.peak_scratch_bytes() > seed_retained);
+        let exact_growth_peak = growth.peak_scratch_bytes();
+
+        let mut exact = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("exact-growth session constructs");
+        exact
+            .is_match(WARM, SearchLimits::unlimited())
+            .expect("exact-growth session warms the same prefix");
+        let exact_token = exact.prepare_k0_warm_is_match_value_token(
+            GROW.len(),
+            SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: exact_growth_peak,
+            },
+        );
+        assert!(exact_token.uses_k0_warm_route());
+        assert!(exact.is_match_value_prepared(GROW, exact_token).unwrap());
+        let exact_retained = match &exact.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.retained_scratch_bytes()
+            }
+            _ => unreachable!(),
+        };
+        assert!(exact_retained > seed_retained);
+        assert!(exact_retained <= exact_growth_peak);
+
+        let mut one_below = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below-growth session constructs");
+        one_below
+            .is_match(WARM, SearchLimits::unlimited())
+            .expect("one-below-growth session warms the same prefix");
+        let one_below_seed = match &one_below.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.retained_scratch_bytes()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(one_below_seed, seed_retained);
+        let one_below_token = one_below.prepare_k0_warm_is_match_value_token(
+            GROW.len(),
+            SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: exact_growth_peak - 1,
+            },
+        );
+        assert!(one_below_token.uses_k0_warm_route());
+        let one_below_bound = one_below
+            .bind_k0_warm_is_match_value_token(one_below_token)
+            .expect("one-below token binds before its first growth attempt");
+        assert!(one_below
+            .is_match_value_bound_k0_warm(GROW, one_below_bound)
+            .unwrap());
+        let one_below_retained = match &one_below.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.retained_scratch_bytes()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            one_below_retained, one_below_seed,
+            "one byte below the staged peak must complete without publishing growth",
+        );
+    }
+
+    #[test]
+    fn prepared_and_bound_k0_warm_tokens_preflight_grown_aggregate_scratch() {
+        let regex = PortableBuilder::new(r"(?-u:.a?a?a?a?aaaaaaaaaa)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("reverse-inner warm-token fixture builds");
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[3_000..3_015].copy_from_slice(b"!aaaaaaaaaaaaaa");
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("adaptive aggregate session constructs");
+        let (warmed, warm_accounting) = search
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("aggregate session warms and grows its span caches");
+        assert!(warmed.is_some());
+        let (aggregate_setup, live_primary, sidecar_retained) = match &search.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                aggregate_setup,
+                reverse_inner: Some(_),
+                ..
+            } => {
+                let primary_setup = session.construction_accounting().retained_bytes();
+                let sidecar_retained = aggregate_setup
+                    .retained_bytes()
+                    .checked_sub(primary_setup)
+                    .expect("aggregate setup contains its primary session");
+                (*aggregate_setup, session.retained_scratch_bytes(), sidecar_retained)
+            }
+            _ => panic!("focused fixture lost its K0 reverse-inner sidecar"),
+        };
+        assert!(sidecar_retained > 0);
+        let live_aggregate = live_primary
+            .checked_add(sidecar_retained)
+            .expect("focused live aggregate fits usize");
+        assert!(
+            live_aggregate > aggregate_setup.retained_bytes(),
+            "fixture must grow the primary before minting its finite token",
+        );
+        let warm_growth = warm_accounting
+            .cache_growth()
+            .expect("K0 span warmup reports cache growth");
+        assert!(warm_growth.events() > 0);
+        assert!(
+            warm_growth.peak_scratch_bytes() >= live_aggregate,
+            "accounted growth peak includes the fixed sidecar",
+        );
+
+        let exact_limits = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: live_aggregate,
+        };
+        let (ordinary_match, ordinary_accounting) = search
+            .is_match(&haystack, exact_limits)
+            .expect("ordinary accounted Exists admits the exact aggregate floor");
+        assert!(ordinary_match);
+        let SearchAccounting::K0(ordinary_k0) = ordinary_accounting else {
+            unreachable!("focused session remains K0");
+        };
+        assert_eq!(ordinary_k0.scratch_bytes(), live_aggregate);
+        assert_eq!(ordinary_k0.cache_growth().peak_scratch_bytes(), 0);
+        assert!(search
+            .is_match_value(&haystack, exact_limits)
+            .expect("ordinary value Exists admits the exact aggregate floor"));
+        let (ordinary_span, span_accounting) = search
+            .find(&haystack, exact_limits)
+            .expect("ordinary accounted Span admits the exact aggregate floor");
+        assert!(ordinary_span.is_some());
+        let SearchAccounting::K0(span_k0) = span_accounting else {
+            unreachable!("focused session remains K0");
+        };
+        assert_eq!(span_k0.scratch_bytes(), live_aggregate);
+        assert_eq!(span_k0.cache_growth().peak_scratch_bytes(), 0);
+        assert!(search
+            .find_value(&haystack, exact_limits)
+            .expect("ordinary value Span admits the exact aggregate floor")
+            .is_some());
+        {
+            let mut iter = search.find_iter(
+                &haystack,
+                PortableFindIterRunLimits {
+                    search: exact_limits,
+                    max_search_calls: usize::MAX,
+                },
+            );
+            assert!(iter.next().expect("exact iterator emits").is_ok());
+            assert!(
+                iter.next().is_none(),
+                "exact iterator continuation reaches its terminal miss",
+            );
+            assert_eq!(iter.accounting().cache_growth_peak_scratch_bytes, 0);
+        }
+        let absent = vec![b'!'; haystack.len()];
+        {
+            let mut terminal_miss = search.find_iter(
+                &absent,
+                PortableFindIterRunLimits {
+                    search: exact_limits,
+                    max_search_calls: usize::MAX,
+                },
+            );
+            assert!(terminal_miss.next().is_none());
+            assert_eq!(terminal_miss.accounting().search_calls, 1);
+            assert_eq!(
+                terminal_miss.accounting().cache_growth_peak_scratch_bytes,
+                0,
+            );
+        }
+        let exact = search.prepare_k0_warm_is_match_value_token(haystack.len(), exact_limits);
+        assert!(exact.uses_k0_warm_route());
+        let exact_bound = search
+            .bind_k0_warm_is_match_value_token(exact)
+            .expect("exact live-aggregate token binds");
+        assert!(search.is_match_value_prepared(&haystack, exact).unwrap());
+        assert!(search
+            .is_match_value_bound_k0_warm(&haystack, exact_bound)
+            .unwrap());
+
+        let below_limits = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: live_aggregate - 1,
+        };
+        let below = search.prepare_k0_warm_is_match_value_token(haystack.len(), below_limits);
+        assert!(
+            below.uses_k0_warm_route(),
+            "setup-only admission must not hide the execution-time live-floor check",
+        );
+        let below_bound = search
+            .bind_k0_warm_is_match_value_token(below)
+            .expect("one-below live-aggregate token still authenticates its owner");
+        let expected = SearchError::K0(super::K0SearchError::ResourceLimit {
+            resource: fre_automata::ResourceKind::ScratchBytes,
+            needed: live_aggregate,
+            limit: live_aggregate - 1,
+        });
+        assert_eq!(
+            search.is_match(&haystack, below_limits),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            search.is_match_value(&haystack, below_limits),
+            Err(expected.clone()),
+        );
+        assert_eq!(search.find(&haystack, below_limits), Err(expected.clone()));
+        assert_eq!(
+            search.find_value(&haystack, below_limits),
+            Err(expected.clone()),
+        );
+        {
+            let mut iter = search.find_iter(
+                &haystack,
+                PortableFindIterRunLimits {
+                    search: below_limits,
+                    max_search_calls: usize::MAX,
+                },
+            );
+            assert_eq!(
+                iter.next(),
+                Some(Err(PortableFindIterError::Search(expected.clone()))),
+            );
+        }
+        {
+            let mut terminal_miss = search.find_iter_value(
+                &absent,
+                PortableFindIterRunLimits {
+                    search: below_limits,
+                    max_search_calls: usize::MAX,
+                },
+            );
+            assert_eq!(
+                terminal_miss.next(),
+                Some(Err(PortableFindIterError::Search(expected.clone()))),
+            );
+        }
+        assert_eq!(
+            search.is_match_value_prepared(&haystack, below),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            search.is_match_value_bound_k0_warm(&haystack, below_bound),
+            Err(expected),
+        );
+    }
+
+    #[test]
+    fn universal_finite_suffix_iterator_early_miss_preflights_live_scratch() {
+        let regex = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
+        let haystack = vec![b'!'; 64];
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("universal finite-suffix session constructs");
+        let retained = match &search.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } => {
+                assert!(suffix.universal_finite_match_byte_bounds().is_some());
+                session.retained_scratch_bytes()
+            }
+            _ => panic!("universal finite-suffix fixture lost its K0 owner"),
+        };
+        let exact = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: retained,
+        };
+        assert_eq!(
+            search.find_iter_universal_finite_suffix_at(&haystack, haystack.len(), exact),
+            Some(Ok(None)),
+            "the exact live floor admits the minimum-window terminal theorem",
+        );
+        let one_below = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: retained - 1,
+        };
+        assert_eq!(
+            search.find_iter_universal_finite_suffix_at(&haystack, haystack.len(), one_below),
+            Some(Err(SearchError::K0(
+                super::K0SearchError::ResourceLimit {
+                    resource: fre_automata::ResourceKind::ScratchBytes,
+                    needed: retained,
+                    limit: retained - 1,
+                },
+            ))),
+            "the early terminal theorem must not bypass the live scratch floor",
+        );
     }
 
     #[test]
@@ -34970,11 +36154,15 @@ mod tests {
                 for start in 0..=haystack.len() {
                     let mut source = K0SpanSourceCursor::new(haystack);
                     assert_eq!(
-                        session.find_iter_at(
-                            &mut source,
-                            start,
-                            SearchLimits::unlimited(),
-                        ),
+                        session
+                            .find_iter_at(
+                                &mut source,
+                                start,
+                                SearchLimits::unlimited(),
+                            )
+                            .map(|(matched, accounting)| {
+                                (matched, accounting.work_or_linear_terms)
+                            }),
                         regex.find_iter_at(haystack, start, SearchLimits::unlimited()),
                         "iterator pattern={pattern:?}, haystack={haystack:?}, start={start}",
                     );
@@ -35242,11 +36430,15 @@ mod tests {
             for start in 0..=haystack.len() {
                 let mut source = K0SpanSourceCursor::new(haystack);
                 assert_eq!(
-                    session.find_iter_at(
-                        &mut source,
-                        start,
-                        SearchLimits::unlimited(),
-                    ),
+                    session
+                        .find_iter_at(
+                            &mut source,
+                            start,
+                            SearchLimits::unlimited(),
+                        )
+                        .map(|(matched, accounting)| {
+                            (matched, accounting.work_or_linear_terms)
+                        }),
                     regex.find_iter_at(haystack, start, SearchLimits::unlimited()),
                     "iterator haystack={haystack:?}, start={start}",
                 );
@@ -37688,7 +38880,9 @@ mod tests {
         assert_eq!(first, Some(Match { start: 0, end: 6 }));
         assert_eq!(
             first_work,
-            super::k0_correlated_iter_linear_work(haystack.len()).unwrap(),
+            PortableFindIterStepAccounting::work(
+                super::k0_correlated_iter_linear_work(haystack.len()).unwrap(),
+            ),
         );
         let prepared = prepare_correlated_iter_for_test(
             &mut session,
@@ -37702,7 +38896,9 @@ mod tests {
         assert_eq!(noncontiguous, Some(Match { start: 6, end: 11 }));
         assert_eq!(
             reset_work,
-            super::k0_correlated_iter_linear_work(haystack.len() - 1).unwrap(),
+            PortableFindIterStepAccounting::work(
+                super::k0_correlated_iter_linear_work(haystack.len() - 1).unwrap(),
+            ),
         );
     }
 
@@ -37756,7 +38952,7 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.matched, expected);
         assert_eq!(
-            prepared.work,
+            prepared.accounting.work_or_linear_terms,
             super::k0_correlated_iter_linear_work(haystack.len())
                 .unwrap()
                 .checked_add(prepared.fallback_work)
@@ -37813,7 +39009,7 @@ mod tests {
             .unwrap();
         let (exhausted, continuation_work) = prepared.commit(&mut source);
         assert_eq!(exhausted, None);
-        assert_eq!(continuation_work, 0);
+        assert_eq!(continuation_work, PortableFindIterStepAccounting::default());
     }
 
     #[test]

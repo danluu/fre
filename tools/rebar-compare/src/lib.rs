@@ -234,7 +234,7 @@ pub const CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN: &str =
 pub const CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN: &str =
     fre::ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID;
 /// Stable plan label for the pinned Rebar `regexredux::generic` control flow.
-pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-session-v2";
+pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-session-v3";
 
 /// Fixed-size evidence produced by one complete pinned Rebar regex-redux run.
 ///
@@ -307,11 +307,15 @@ const FRE_ADAPTER_V151: &str =
     "fre-current-aggregate-capture-v151-formal-v150-reusable-bounded-backtrack-capture-iteration-and-v150-arbitrary-nonnullable-first-byte-root-mask-route-composition-v1";
 const FRE_ADAPTER_V152: &str =
     "fre-current-aggregate-capture-v152-rust-compatible-ordinary-portable-grep-v1-v151-formal-route-composition-v1";
+const FRE_ADAPTER_V153: &str =
+    "fre-current-aggregate-capture-v153-adaptive-portable-session-fixed-rebar-boundaries-v1-v152-route-composition-v1";
+const FRE_ADAPTER_V154: &str =
+    "fre-current-aggregate-capture-v154-source-free-k0-start-proof-preparation-v1-v153-route-composition-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V152
+    FRE_ADAPTER_V154
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -630,7 +634,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V152
+        FRE_ADAPTER_V154
     }
 
     #[allow(
@@ -648,12 +652,12 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V152.to_string(),
+            adapter: FRE_ADAPTER_V154.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux uses the fixed pinned pattern suite, Unicode-off case-sensitive PortableRegex construction, one finite source-free reusable session and source-bound exact nonempty match iterator per component execution, five simultaneously retained substitution matchers, checked session/search/allocation/output envelopes, and exact nine-count/three-length report verification; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact-HIR allocation-free Ruff line-stream configurations and one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, bounded input-load certificates, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux uses the fixed pinned pattern suite, Unicode-off case-sensitive PortableRegex construction, one finite source-free fixed-capacity reusable session and source-bound exact nonempty match iterator per component execution, five simultaneously retained substitution matchers, checked session/search/allocation/output envelopes, and exact nine-count/three-length report verification; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact-HIR allocation-free Ruff line-stream configurations and one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, bounded input-load certificates, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         };
@@ -1318,6 +1322,26 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity.availability.push_str(FRE_ADAPTER_V151);
         identity.availability.push_str(
             "; superseding every earlier plain-grep availability statement, formal Rust-comparable plain grep reports rebar-lines-ordinary-is-match-v1 and never uses a prepared token, explicit search session, or finite per-search work meter; CurrentFreGrepSession and current_fre_rebar_grep_session_with_limits remain available only as the separately labeled rebar-lines-finite-is-match-v3 robustness lane, while count, count-spans, capture, and regex-redux lifecycles retain their existing specialized boundaries",
+        );
+        identity.identity.push_str(
+            "; adaptive-portable-session-v1 makes the ordinary PortableRegex search session demand-grown within its source-free admitted ceiling; formal portable complete-spans, finite-grep robustness and regex-redux lifecycles explicitly retain fixed-capacity sessions",
+        );
+        identity
+            .availability
+            .push_str("; this v153 adapter extends ");
+        identity.availability.push_str(FRE_ADAPTER_V152);
+        identity.availability.push_str(
+            "; portable complete-spans, rebar-lines-finite-is-match-v3 and regex-redux-rebar-generic-session-v2 use fixed_search_session so their prepared allocation-free, first-then-steady and composite-allocation contracts remain unchanged",
+        );
+        identity.identity.push_str(
+            "; source-free-k0-start-proof-preparation-v1 explicitly settles the optional immutable K0 start filter at each fixed Rebar preparation boundary before source-bearing execution",
+        );
+        identity
+            .availability
+            .push_str("; this v154 adapter extends ");
+        identity.availability.push_str(FRE_ADAPTER_V153);
+        identity.availability.push_str(
+            "; complete-spans settles the proof before first/steady timing, finite grep settles it inside documented first-operation initialization, and regex-redux-rebar-generic-session-v3 charges exact newly retained proof-owner bytes to allocation, capacity and live-owned peak until the matcher is released",
         );
         identity
     }
@@ -2708,9 +2732,10 @@ fn portable_plan_kind_label(plan: PlanKind) -> &'static str {
 /// One immutable, single-pattern matcher for Rebar's complete-span reducer.
 ///
 /// This owner is deliberately separate from [`CurrentFreCompleteSpansSession`]
-/// so the latter can borrow the matcher and retain its K0 workspace without a
-/// self-referential allocation. Construction and session preparation both
-/// happen before either first or steady public-operation timing begins.
+/// so the latter can borrow the matcher and retain its fixed-capacity K0
+/// workspace without a self-referential allocation. Construction and session
+/// preparation both happen before either first or steady public-operation
+/// timing begins.
 pub struct CurrentFreCompleteSpansRegex {
     inner: CurrentFreCompleteSpansRegexInner,
     plan: String,
@@ -2847,6 +2872,7 @@ impl CurrentFreCompleteSpansRegex {
                 };
                 Ok(CurrentFreCompleteSpansSession {
                     search: None,
+                    start_filter_preparation: None,
                     aggregate: Some(regex),
                     aggregate_limits: Some(aggregate_limits),
                     aggregate_span_visit_workspace,
@@ -2864,14 +2890,22 @@ impl CurrentFreCompleteSpansRegex {
             }
             CurrentFreCompleteSpansRegexInner::Portable(regex) => {
                 let retained_runtime_implementation_id = regex.runtime_implementation_id();
-                let search = regex
-                    .search_session(SearchSessionLimits {
-                        max_setup_work: search_limits.max_work,
-                        max_scratch_bytes: search_limits.max_scratch_bytes,
-                    })
+                let session_limits = SearchSessionLimits {
+                    max_setup_work: search_limits.max_work,
+                    max_scratch_bytes: search_limits.max_scratch_bytes,
+                };
+                let mut search = regex
+                    .fixed_search_session(session_limits)
                     .map_err(|error| {
                         CompareError::new(format!(
                             "FRE portable complete-spans search-session build failed: {error}"
+                        ))
+                    })?;
+                let start_filter_preparation = search
+                    .prepare_k0_start_filter(session_limits)
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE portable complete-spans start-filter preparation failed: {error}"
                         ))
                     })?;
                 if search.runtime_implementation_id() != retained_runtime_implementation_id {
@@ -2881,6 +2915,7 @@ impl CurrentFreCompleteSpansRegex {
                 }
                 Ok(CurrentFreCompleteSpansSession {
                     search: Some(search),
+                    start_filter_preparation,
                     aggregate: None,
                     aggregate_limits: None,
                     aggregate_span_visit_workspace: None,
@@ -2909,6 +2944,7 @@ impl CurrentFreCompleteSpansRegex {
 #[derive(Debug)]
 pub struct CurrentFreCompleteSpansSession<'r> {
     search: Option<PortableSearchSession<'r>>,
+    start_filter_preparation: Option<fre::PortableK0StartFilterSetupAccounting>,
     aggregate: Option<&'r AggregateSpanVisitorRegex>,
     aggregate_limits: Option<AggregateRunLimits>,
     aggregate_span_visit_workspace: Option<AggregateSpanVisitWorkspace>,
@@ -3077,6 +3113,15 @@ impl CurrentFreCompleteSpansSession<'_> {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.runtime_implementation_id
+    }
+
+    /// Exact source-free K0 plan-proof setup performed before the first or
+    /// steady complete-span operation, or `None` for a native route.
+    #[must_use]
+    pub const fn start_filter_preparation_accounting(
+        &self,
+    ) -> Option<fre::PortableK0StartFilterSetupAccounting> {
+        self.start_filter_preparation
     }
 
     /// Validate the fixed haystack property bound during session preparation.
@@ -5671,11 +5716,12 @@ const CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES: usize = 16;
 )]
 enum CurrentFreGrepRoute<'r> {
     /// Explicitly finite per-line route used by robustness checks. The search
-    /// workspace is deliberately created by the first operation and retains
-    /// caller-selected work/scratch limits.
+    /// workspace is deliberately created at fixed capacity by the first
+    /// operation and retains caller-selected work/scratch limits.
     RebarLines {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
+        start_filter_preparation: Option<fre::PortableK0StartFilterSetupAccounting>,
         is_match_token: Option<PortableIsMatchValueToken>,
         bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
         bound_line_total: Option<PortableBoundLineTotalMatcher>,
@@ -5771,6 +5817,21 @@ impl CurrentFreGrepSession<'_> {
                 search.workspace_setup_accounting().is_some()
             }
             CurrentFreGrepRoute::Stream(_) => false,
+        }
+    }
+
+    /// Exact source-free K0 plan-proof setup performed by the first finite
+    /// operation, or `None` before initialization and for native routes.
+    #[must_use]
+    pub const fn start_filter_preparation_accounting(
+        &self,
+    ) -> Option<fre::PortableK0StartFilterSetupAccounting> {
+        match &self.route {
+            CurrentFreGrepRoute::RebarLines {
+                start_filter_preparation,
+                ..
+            } => *start_filter_preparation,
+            CurrentFreGrepRoute::Stream(_) | CurrentFreGrepRoute::Search { .. } => None,
         }
     }
 
@@ -5946,20 +6007,29 @@ impl CurrentFreGrepSession<'_> {
             CurrentFreGrepRoute::RebarLines {
                 regex,
                 search,
+                start_filter_preparation,
                 is_match_token,
                 bound_k0_warm,
                 bound_line_total,
                 bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
-                    let prepared = regex
-                        .search_session(SearchSessionLimits {
-                            max_setup_work: self.limits.search.max_work,
-                            max_scratch_bytes: self.limits.search.max_scratch_bytes,
-                        })
+                    let session_limits = SearchSessionLimits {
+                        max_setup_work: self.limits.search.max_work,
+                        max_scratch_bytes: self.limits.search.max_scratch_bytes,
+                    };
+                    let mut prepared = regex
+                        .fixed_search_session(session_limits)
                         .map_err(|error| {
                             ExecutionError::unsupported(format!(
                                 "FRE strict Rebar grep search-session build failed: {error}"
+                            ))
+                        })?;
+                    let proof = prepared
+                        .prepare_k0_start_filter(session_limits)
+                        .map_err(|error| {
+                            ExecutionError::unsupported(format!(
+                                "FRE strict Rebar grep start-filter preparation failed: {error}"
                             ))
                         })?;
                     if prepared.runtime_implementation_id() != self.runtime_implementation_id {
@@ -5988,6 +6058,7 @@ impl CurrentFreGrepSession<'_> {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
                     });
                     *is_match_token = token;
+                    *start_filter_preparation = proof;
                     *search = Some(prepared);
                 }
                 let search = search.as_mut().ok_or_else(|| {
@@ -6095,6 +6166,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
     let route = CurrentFreGrepRoute::RebarLines {
         regex,
         search: None,
+        start_filter_preparation: None,
         is_match_token: None,
         bound_k0_warm: None,
         bound_line_total: None,
@@ -9176,7 +9248,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V152
+        if receipt.adapter == FRE_ADAPTER_V154
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -11285,6 +11357,17 @@ struct RegexReduxMatcher {
     search_limits: Option<SearchLimits>,
     find: Option<RegexReduxFind>,
     persistent_bytes: usize,
+    start_filter_owner_bytes: usize,
+}
+
+impl RegexReduxMatcher {
+    fn retained_bytes(&self) -> Result<usize, ExecutionError> {
+        composite_usize_add(
+            self.persistent_bytes,
+            self.start_filter_owner_bytes,
+            "retained matcher bytes",
+        )
+    }
 }
 
 struct RegexReduxBudget {
@@ -11354,21 +11437,80 @@ impl RegexReduxBudget {
     }
 
     fn retain_matcher(&mut self, matcher: &RegexReduxMatcher) -> Result<(), ExecutionError> {
-        self.charge_allocation(matcher.persistent_bytes)?;
+        let retained = matcher.retained_bytes()?;
+        self.charge_allocation(retained)?;
         self.live_regex_bytes = composite_usize_add(
             self.live_regex_bytes,
-            matcher.persistent_bytes,
+            retained,
             "live regex bytes",
         )?;
         self.observe_owned_peak(0, 0)
     }
 
     fn release_matcher(&mut self, matcher: &RegexReduxMatcher) -> Result<(), ExecutionError> {
+        let retained = matcher.retained_bytes()?;
         self.live_regex_bytes = self
             .live_regex_bytes
-            .checked_sub(matcher.persistent_bytes)
+            .checked_sub(retained)
             .ok_or_else(|| ExecutionError::fault("regex-redux live regex accounting underflow"))?;
         Ok(())
+    }
+
+    fn retain_start_filter_owner(
+        &mut self,
+        retained_owner_bytes: &mut usize,
+        newly_retained_bytes: usize,
+        sequence_capacity: usize,
+        output_capacity: usize,
+    ) -> Result<(), ExecutionError> {
+        if newly_retained_bytes == 0 {
+            return Ok(());
+        }
+        if *retained_owner_bytes != 0 {
+            return Err(ExecutionError::fault(
+                "regex-redux matcher published its start-filter owner more than once",
+            ));
+        }
+        self.charge_allocation(newly_retained_bytes)?;
+        self.live_regex_bytes = composite_usize_add(
+            self.live_regex_bytes,
+            newly_retained_bytes,
+            "live regex-redux start-filter owner bytes",
+        )?;
+        *retained_owner_bytes = newly_retained_bytes;
+        self.observe_owned_peak(sequence_capacity, output_capacity)
+    }
+
+    /// Whether one previously unsettled K0 proof can publish without any
+    /// composite allocation, capacity, or simultaneously-owned limit being
+    /// crossed. This is deliberately checked after the search session is
+    /// retained, so the optional immutable owner cannot consume capacity that
+    /// the mandatory session already needs.
+    fn admits_start_filter_owner_publication(
+        &self,
+        sequence_capacity: usize,
+        output_capacity: usize,
+    ) -> bool {
+        let owner_bytes = fre::PortableK0StartFilterSetupAccounting::MAX_RETAINED_OWNER_BYTES;
+        let Ok(owner_bytes_u64) = u64::try_from(owner_bytes) else {
+            return false;
+        };
+        let allocation_fits = self
+            .allocation_bytes
+            .checked_add(owner_bytes_u64)
+            .is_some_and(|needed| needed <= self.limits.allocation_bytes);
+        let capacity_fits = self
+            .capacity_bytes
+            .checked_add(owner_bytes_u64)
+            .is_some_and(|needed| needed <= self.limits.capacity_bytes);
+        let owned_peak_fits = self
+            .live_regex_bytes
+            .checked_add(owner_bytes)
+            .and_then(|live| live.checked_add(sequence_capacity))
+            .and_then(|live| live.checked_add(output_capacity))
+            .map(|live| self.owned_peak_bytes.max(live))
+            .is_some_and(|needed| needed <= self.limits.owned_peak_bytes);
+        allocation_fits && capacity_fits && owned_peak_fits
     }
 
     fn retain_search_session(
@@ -11483,6 +11625,7 @@ fn compile_regex_redux_matcher(
         search_limits: Some(search_limits),
         find: None,
         persistent_bytes,
+        start_filter_owner_bytes: 0,
     })
 }
 
@@ -11494,33 +11637,73 @@ fn regex_redux_for_each_match(
     output_capacity: usize,
     mut visit: impl FnMut(usize, usize, &mut RegexReduxBudget) -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
-    if let Some(regex) = matcher.portable.as_ref() {
-        // Reuse one construction-selected session for this component's whole
-        // non-overlapping scan. The session remains inside the timed Rebar
-        // component boundary and retains no source or result state afterward.
-        let search_limits = matcher.search_limits.ok_or_else(|| {
+    let RegexReduxMatcher {
+        portable,
+        search_limits,
+        find,
+        start_filter_owner_bytes,
+        ..
+    } = matcher;
+    if let Some(regex) = portable.as_ref() {
+        // Reuse one fixed-capacity construction-selected session for this
+        // component's whole non-overlapping scan. The session remains inside
+        // the timed Rebar component boundary and retains no source or result
+        // state afterward. Its source-free start proof, when newly published,
+        // belongs to the regex and remains charged after the session is
+        // released until that matcher itself leaves the composite.
+        let search_limits = (*search_limits).ok_or_else(|| {
             ExecutionError::fault("regex-redux prepared matcher has no finite search limits")
         })?;
+        let session_limits = SearchSessionLimits {
+            max_setup_work: search_limits.max_work,
+            max_scratch_bytes: search_limits.max_scratch_bytes,
+        };
         let mut session = regex
-            .search_session(SearchSessionLimits {
-                max_setup_work: search_limits.max_work,
-                max_scratch_bytes: search_limits.max_scratch_bytes,
-            })
+            .fixed_search_session(session_limits)
             .map_err(|error| {
                 ExecutionError::unsupported(format!(
                     "FRE regex-redux search-session construction refused: {error}"
                 ))
             })?;
+        let session_setup = session.workspace_setup_accounting();
         let session_bytes = budget.retain_search_session(
-            session.workspace_setup_accounting(),
+            session_setup,
             retained_capacity,
             output_capacity,
         )?;
+        let proof_limits = if *start_filter_owner_bytes != 0
+            || budget.admits_start_filter_owner_publication(retained_capacity, output_capacity)
+        {
+            session_limits
+        } else {
+            // The proof is optional. An exact workspace-only setup-work cap
+            // tells the facade to settle ordinary K0 before graph traversal,
+            // so a composite cap refusal cannot occur after owner allocation.
+            SearchSessionLimits {
+                max_setup_work: session_setup.map_or(0, |setup| setup.work()),
+                max_scratch_bytes: session_limits.max_scratch_bytes,
+            }
+        };
         let max_search_calls = haystack
             .len()
             .checked_add(1)
             .ok_or_else(|| ExecutionError::fault("regex-redux search-call bound overflow"))?;
         let result = (|| {
+            let start_filter_preparation = session
+                .prepare_k0_start_filter(proof_limits)
+                .map_err(|error| {
+                    ExecutionError::unsupported(format!(
+                        "FRE regex-redux start-filter preparation refused: {error}"
+                    ))
+                })?;
+            if let Some(preparation) = start_filter_preparation {
+                budget.retain_start_filter_owner(
+                    start_filter_owner_bytes,
+                    preparation.newly_retained_owner_bytes(),
+                    retained_capacity,
+                    output_capacity,
+                )?;
+            }
             let mut matches = session.find_iter_value(
                 haystack.as_bytes(),
                 PortableFindIterRunLimits {
@@ -11558,13 +11741,13 @@ fn regex_redux_for_each_match(
         return result;
     }
 
-    if matcher.search_limits.is_some() {
+    if search_limits.is_some() {
         return Err(ExecutionError::fault(
             "regex-redux scalar matcher unexpectedly retains prepared search limits",
         ));
     }
 
-    let find = matcher.find.as_mut().ok_or_else(|| {
+    let find = find.as_mut().ok_or_else(|| {
         ExecutionError::fault("regex-redux matcher has no authenticated execution owner")
     })?;
     let mut remaining = haystack;
@@ -27127,6 +27310,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                                 .map(|matched| (matched.start(), matched.end())))
                         })),
                         persistent_bytes: 0,
+                        start_filter_owner_bytes: 0,
                     })
                 }
             },
@@ -27174,6 +27358,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "agggtaaaTTTACCCTacgggtaaaBYaNSt",
             "<tag>abc|def|xyz</tag>|q|tHaNtHaN",
         ];
+        let mut saw_start_filter_owner = false;
 
         for pattern in patterns {
             let oracle = rust_compile_options(&[pattern.to_string()], false, false)
@@ -27184,7 +27369,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 && let Some(retained) = regex.retained_find_iter_build_accounting()
             {
                 let session = regex
-                    .search_session(SearchSessionLimits::unlimited())
+                    .fixed_search_session(SearchSessionLimits::unlimited())
                     .expect("retained regex-redux session");
                 assert_eq!(
                     session.runtime_implementation_id(),
@@ -27226,7 +27411,12 @@ agggtaa[cgt]|[acg]ttaccct 0
                     actual, expected,
                     "pattern {pattern:?}, haystack {haystack:?}"
                 );
-                assert_eq!(budget.live_regex_bytes, matcher_bytes);
+                let retained_matcher_bytes = matcher
+                    .retained_bytes()
+                    .expect("complete matcher retained bytes");
+                assert_eq!(budget.live_regex_bytes, retained_matcher_bytes);
+                assert!(budget.live_regex_bytes >= matcher_bytes);
+                saw_start_filter_owner |= matcher.start_filter_owner_bytes > 0;
                 assert_eq!(
                     budget.search_calls,
                     u64::try_from(actual.len() + 1).unwrap()
@@ -27235,6 +27425,136 @@ agggtaa[cgt]|[acg]ttaccct 0
                 budget
                     .release_matcher(&matcher)
                     .expect("release regex-redux component");
+                assert_eq!(budget.live_regex_bytes, 0);
+            }
+        }
+        assert!(
+            saw_start_filter_owner,
+            "the pinned suite must exercise regex-owned start-filter accounting"
+        );
+    }
+
+    #[test]
+    fn current_fre_regex_redux_start_filter_caps_are_prepublication_exact() {
+        let limits = RunLimits::default();
+        let owner_ceiling =
+            fre::PortableK0StartFilterSetupAccounting::MAX_RETAINED_OWNER_BYTES;
+        assert!(owner_ceiling > 0);
+        let pattern = std::iter::once(REGEX_REDUX_FLATTEN_PATTERN)
+            .chain(REGEX_REDUX_VARIANTS)
+            .chain(REGEX_REDUX_SUBSTITUTIONS.map(|(pattern, _)| pattern))
+            .find(|pattern| {
+                let Ok(matcher) = compile_regex_redux_matcher(pattern, &limits) else {
+                    return false;
+                };
+                let Some(regex) = matcher.portable.as_ref() else {
+                    return false;
+                };
+                let Ok(mut session) =
+                    regex.fixed_search_session(SearchSessionLimits::unlimited())
+                else {
+                    return false;
+                };
+                session
+                    .prepare_k0_start_filter(SearchSessionLimits::unlimited())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|receipt| {
+                        receipt.newly_retained_owner_bytes() == owner_ceiling
+                    })
+            })
+            .expect("the pinned suite publishes one exact K0 start-filter owner");
+
+        for dimension in ["allocation", "capacity", "owned peak"] {
+            for admit_exact in [false, true] {
+                let mut matcher = compile_regex_redux_matcher(pattern, &limits)
+                    .expect("fresh regex-redux proof-cap matcher");
+                let setup = {
+                    let regex = matcher.portable.as_ref().expect("portable matcher");
+                    let session = regex
+                        .fixed_search_session(SearchSessionLimits::unlimited())
+                        .expect("proof-cap setup probe");
+                    session
+                        .workspace_setup_accounting()
+                        .expect("proof-cap fixture uses K0")
+                };
+                let mut budget = RegexReduxBudget::new(0, &limits)
+                    .expect("regex-redux proof-cap budget");
+                budget
+                    .retain_matcher(&matcher)
+                    .expect("retain proof-cap matcher");
+                let exact_allocation = budget
+                    .allocation_bytes
+                    .checked_add(u64::try_from(setup.allocated_bytes()).unwrap())
+                    .and_then(|bytes| bytes.checked_add(u64::try_from(owner_ceiling).unwrap()))
+                    .expect("exact proof allocation cap");
+                let exact_capacity = budget
+                    .capacity_bytes
+                    .checked_add(u64::try_from(setup.allocated_bytes()).unwrap())
+                    .and_then(|bytes| bytes.checked_add(u64::try_from(owner_ceiling).unwrap()))
+                    .expect("exact proof capacity cap");
+                let exact_peak = budget
+                    .live_regex_bytes
+                    .checked_add(setup.retained_bytes())
+                    .and_then(|bytes| bytes.checked_add(owner_ceiling))
+                    .expect("exact proof owned-peak cap")
+                    .max(budget.owned_peak_bytes);
+                budget.limits.allocation_bytes = u64::MAX;
+                budget.limits.capacity_bytes = u64::MAX;
+                budget.limits.owned_peak_bytes = usize::MAX;
+                let selected_exact = match dimension {
+                    "allocation" => exact_allocation,
+                    "capacity" => exact_capacity,
+                    "owned peak" => u64::try_from(exact_peak).unwrap(),
+                    _ => unreachable!(),
+                };
+                let selected_limit = if admit_exact {
+                    selected_exact
+                } else {
+                    selected_exact.checked_sub(1).expect("one-below cap")
+                };
+                match dimension {
+                    "allocation" => budget.limits.allocation_bytes = selected_limit,
+                    "capacity" => budget.limits.capacity_bytes = selected_limit,
+                    "owned peak" => {
+                        budget.limits.owned_peak_bytes = usize::try_from(selected_limit).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+
+                regex_redux_for_each_match(
+                    "",
+                    &mut matcher,
+                    &mut budget,
+                    0,
+                    0,
+                    |_, _, _| unreachable!("empty input cannot produce a nonempty match"),
+                )
+                .expect("proof-cap refusal remains a complete ordinary-K0 execution");
+                assert_eq!(
+                    matcher.start_filter_owner_bytes,
+                    if admit_exact { owner_ceiling } else { 0 },
+                    "dimension={dimension}, admit_exact={admit_exact}",
+                );
+                let observed = match dimension {
+                    "allocation" => budget.allocation_bytes,
+                    "capacity" => budget.capacity_bytes,
+                    "owned peak" => u64::try_from(budget.owned_peak_bytes).unwrap(),
+                    _ => unreachable!(),
+                };
+                if admit_exact {
+                    assert_eq!(observed, selected_limit, "dimension={dimension}");
+                } else {
+                    assert!(observed <= selected_limit, "dimension={dimension}");
+                }
+                assert_eq!(
+                    budget.live_regex_bytes,
+                    matcher.retained_bytes().unwrap(),
+                );
+                budget
+                    .release_matcher(&matcher)
+                    .expect("release proof-cap matcher");
+                assert_eq!(budget.live_regex_bytes, 0);
             }
         }
     }
@@ -27250,7 +27570,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 let session = probe
                     .portable
                     .as_ref()?
-                    .search_session(SearchSessionLimits::unlimited())
+                    .fixed_search_session(SearchSessionLimits::unlimited())
                     .ok()?;
                 session
                     .workspace_setup_accounting()
@@ -36189,11 +36509,13 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V152);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V154);
         assert_eq!(
             current_identity.adapter,
-            "fre-current-aggregate-capture-v152-rust-compatible-ordinary-portable-grep-v1-v151-formal-route-composition-v1"
+            "fre-current-aggregate-capture-v154-source-free-k0-start-proof-preparation-v1-v153-route-composition-v1"
         );
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V153));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V152));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V151));
         assert!(current_identity.availability.contains(FRE_ADAPTER));
         assert!(
@@ -38949,7 +39271,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut finite = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
         assert_eq!(finite.plan(), CURRENT_FRE_REBAR_FINITE_GREP_PLAN);
         assert_ne!(finite.plan(), CURRENT_FRE_REBAR_GREP_PLAN);
+        assert_eq!(finite.start_filter_preparation_accounting(), None);
         assert_eq!(finite.execute(haystack).unwrap(), expected);
+        if finite.has_reusable_k0_workspace() {
+            assert!(finite.start_filter_preparation_accounting().is_some());
+        }
     }
 
     #[test]
@@ -43386,6 +43712,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             .session(haystack.len())
             .expect("retained complete-spans session");
         assert_eq!(session.runtime_implementation_id(), runtime);
+        assert!(
+            session.start_filter_preparation_accounting().is_some(),
+            "portable K0 session must settle its plan proof before timing"
+        );
         session
             .validate_haystack(haystack)
             .expect("fixed input validation");

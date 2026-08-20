@@ -17,7 +17,7 @@ import controller  # noqa: E402
 
 def fake_catalog() -> dict:
     return {
-        "schema": "fre.steady-state-generalization.v1",
+        "schema": "fre.steady-state-generalization.v2",
         "plan_id": "test-plan",
         "plan_checksum": "0123456789abcdef",
         "generator_id": "test-generator",

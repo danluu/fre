@@ -96,11 +96,162 @@ impl<T> K0OrderedResumeValue<T> {
     }
 }
 
+/// Demand-grown cache resources observed during one successful invocation.
+///
+/// This ledger is separate from [`SetupAccounting`]: it covers cache storage
+/// obtained or initialized after source-free setup, while the automaton is
+/// executing. Its event boundary is logical rather than allocator-specific.
+/// One event is one executor-reported demand-growth transaction that
+/// successfully allocates or initializes payload. A transaction may allocate
+/// several buffers, and a request rejected before obtaining or initializing
+/// payload is not an event. Staged payload that is subsequently discarded is
+/// still counted by `allocated_bytes` and `initialized_bytes`.
+///
+/// `peak_scratch_bytes` is an observed high-water mark: it counts all scratch
+/// payload simultaneously live during an accounted growth event, including
+/// payload retained before the call and staged replacement storage. This can
+/// exceed [`SearchAccounting::scratch_bytes`], which reports only payload
+/// retained when the successful call completes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheGrowthAccounting {
+    events: usize,
+    allocated_bytes: usize,
+    initialized_bytes: usize,
+    retained_delta: usize,
+    peak_scratch_bytes: usize,
+}
+
+#[allow(
+    dead_code,
+    reason = "cache construction and accumulation precede demand-grown executor integration"
+)]
+impl CacheGrowthAccounting {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            events: 0,
+            allocated_bytes: 0,
+            initialized_bytes: 0,
+            retained_delta: 0,
+            peak_scratch_bytes: 0,
+        }
+    }
+
+    pub(crate) const fn new(
+        events: usize,
+        allocated_bytes: usize,
+        initialized_bytes: usize,
+        retained_delta: usize,
+        peak_scratch_bytes: usize,
+    ) -> Self {
+        Self {
+            events,
+            allocated_bytes,
+            initialized_bytes,
+            retained_delta,
+            peak_scratch_bytes,
+        }
+    }
+
+    pub(crate) const fn event(
+        allocated_bytes: usize,
+        initialized_bytes: usize,
+        retained_delta: usize,
+        peak_scratch_bytes: usize,
+    ) -> Self {
+        Self::new(
+            1,
+            allocated_bytes,
+            initialized_bytes,
+            retained_delta,
+            peak_scratch_bytes,
+        )
+    }
+
+    /// Add another aggregate without partially updating on overflow.
+    pub(crate) fn checked_accumulate(&mut self, additional: Self) -> bool {
+        let Some(events) = self.events.checked_add(additional.events) else {
+            return false;
+        };
+        let Some(allocated_bytes) = self.allocated_bytes.checked_add(additional.allocated_bytes)
+        else {
+            return false;
+        };
+        let Some(initialized_bytes) = self
+            .initialized_bytes
+            .checked_add(additional.initialized_bytes)
+        else {
+            return false;
+        };
+        let Some(retained_delta) = self.retained_delta.checked_add(additional.retained_delta)
+        else {
+            return false;
+        };
+        *self = Self {
+            events,
+            allocated_bytes,
+            initialized_bytes,
+            retained_delta,
+            peak_scratch_bytes: self.peak_scratch_bytes.max(additional.peak_scratch_bytes),
+        };
+        true
+    }
+
+    /// Logical demand-growth transactions observed during this call.
+    ///
+    /// This is not an allocator-call or allocation count. One event may own
+    /// multiple allocations, and all byte fields remain authoritative.
+    #[must_use]
+    pub const fn events(self) -> usize {
+        self.events
+    }
+
+    /// Heap payload bytes successfully allocated by cache growth.
+    ///
+    /// This is cumulative traffic, so it includes staged or replaced payload
+    /// released before the successful call returns. Failed allocation
+    /// requests that obtain no payload are excluded, as are setup allocations.
+    #[must_use]
+    pub const fn allocated_bytes(self) -> usize {
+        self.allocated_bytes
+    }
+
+    /// Payload bytes logically written while growing cache storage.
+    ///
+    /// Repeated initialization is counted repeatedly. This excludes setup
+    /// writes and ordinary updates to cache cells whose storage was already
+    /// admitted.
+    #[must_use]
+    pub const fn initialized_bytes(self) -> usize {
+        self.initialized_bytes
+    }
+
+    /// Newly retained cache payload attributable to this call.
+    ///
+    /// This is a non-negative addition relative to call entry. It can be less
+    /// than `allocated_bytes` when growth used transient replacement storage
+    /// or discarded a staged candidate.
+    #[must_use]
+    pub const fn retained_delta(self) -> usize {
+        self.retained_delta
+    }
+
+    /// Largest total scratch payload live during a cache-growth event.
+    ///
+    /// This observed peak includes pre-existing retained scratch and staged
+    /// storage. It is zero when no growth event was observed and is not the
+    /// invocation's admitted ceiling; see [`SearchAccounting::scratch_bytes`].
+    #[must_use]
+    pub const fn peak_scratch_bytes(self) -> usize {
+        self.peak_scratch_bytes
+    }
+}
+
 /// Exact counters returned with every successful search invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchAccounting {
     work: u64,
     setup: SetupAccounting,
+    cache_growth: CacheGrowthAccounting,
     transition_work: u64,
     scratch_bytes: usize,
     boundaries: usize,
@@ -117,13 +268,64 @@ impl SearchAccounting {
         Self {
             work,
             setup,
+            cache_growth: CacheGrowthAccounting::empty(),
             transition_work,
             scratch_bytes,
             boundaries,
         }
     }
 
-    /// Total charged work: setup plus automaton transition work.
+    #[allow(
+        dead_code,
+        reason = "demand-grown executors will attach their ledger after legacy construction"
+    )]
+    pub(crate) const fn with_cache_growth(mut self, cache_growth: CacheGrowthAccounting) -> Self {
+        self.cache_growth = cache_growth;
+        self
+    }
+
+    /// Add scratch retained outside this executor to its successful receipt.
+    ///
+    /// Facades use this after running a primary K0 workspace while a fixed
+    /// sidecar remains live. A nonzero growth peak describes the same active
+    /// invocation and therefore includes the external payload; an empty growth
+    /// ledger keeps its sentinel zero peak.
+    #[doc(hidden)]
+    pub fn with_external_scratch_bytes(mut self, bytes: usize) -> Result<Self, SearchError> {
+        let retained_bytes = self.setup.retained_bytes.checked_add(bytes).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "external K0 scratch accounting",
+            },
+        )?;
+        let scratch_bytes = self.scratch_bytes.checked_add(bytes).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "external K0 scratch accounting",
+            },
+        )?;
+        let cache_growth = if self.cache_growth.events == 0 {
+            self.cache_growth
+        } else {
+            CacheGrowthAccounting {
+                peak_scratch_bytes: self
+                    .cache_growth
+                    .peak_scratch_bytes
+                    .checked_add(bytes)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "external K0 scratch accounting",
+                    })?,
+                ..self.cache_growth
+            }
+        };
+        self.setup.retained_bytes = retained_bytes;
+        self.scratch_bytes = scratch_bytes;
+        self.cache_growth = cache_growth;
+        Ok(self)
+    }
+
+    /// Total charged work: setup plus automaton execution work.
+    ///
+    /// Execution work includes any cache-growth initialization reported by
+    /// [`Self::cache_growth`].
     #[must_use]
     pub const fn work(self) -> u64 {
         self.work
@@ -138,7 +340,8 @@ impl SearchAccounting {
         self.setup.work()
     }
 
-    /// Work charged while examining boundaries, states, and edges.
+    /// Work charged while examining boundaries, states, and edges or growing
+    /// cache payload during execution.
     #[must_use]
     pub const fn transition_work(self) -> u64 {
         self.transition_work
@@ -150,7 +353,21 @@ impl SearchAccounting {
         self.setup
     }
 
-    /// Heap payload bytes preflighted for this invocation.
+    /// Demand-grown cache resources observed during this call.
+    #[must_use]
+    pub const fn cache_growth(self) -> CacheGrowthAccounting {
+        self.cache_growth
+    }
+
+    /// Heap scratch payload retained when this invocation completes.
+    ///
+    /// Fixed workspaces report the payload preflighted before execution.
+    /// Aggregate routes also include any concurrently retained owner payload
+    /// that their invocation keeps live, such as an automaton-owned pool box.
+    /// Demand-grown workspaces include payload published during this call,
+    /// but exclude replaced staging allocations that have already been
+    /// released. The corresponding active-call high-water mark is reported by
+    /// [`CacheGrowthAccounting::peak_scratch_bytes`].
     #[must_use]
     pub const fn scratch_bytes(self) -> usize {
         self.scratch_bytes
@@ -217,10 +434,12 @@ impl SetupAccounting {
         self.initialized_bytes
     }
 
-    /// Total heap payload bytes retained by the workspace used for this call.
+    /// Total heap payload bytes retained by the workspace and any aggregate
+    /// owner needed to keep it available for this call.
     ///
-    /// This excludes an immutable plan-side proof even when this invocation
-    /// allocated it; that delta is visible through [`Self::allocated_bytes`].
+    /// A cold pooled call includes its newly retained pool owner. This excludes
+    /// an immutable plan-side proof even when this invocation allocated it;
+    /// that delta is visible through [`Self::allocated_bytes`].
     #[must_use]
     pub const fn retained_bytes(self) -> usize {
         self.retained_bytes
@@ -230,6 +449,76 @@ impl SetupAccounting {
     #[must_use]
     pub const fn reused(self) -> bool {
         self.reused
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::{CacheGrowthAccounting, SearchAccounting, SetupAccounting};
+
+    #[test]
+    fn cache_growth_accumulates_traffic_delta_and_peak_transactionally() {
+        let mut growth = CacheGrowthAccounting::event(32, 24, 16, 80);
+        assert!(growth.checked_accumulate(CacheGrowthAccounting::new(2, 40, 48, 20, 72,)));
+        assert_eq!(growth.events(), 3);
+        assert_eq!(growth.allocated_bytes(), 72);
+        assert_eq!(growth.initialized_bytes(), 72);
+        assert_eq!(growth.retained_delta(), 36);
+        assert_eq!(growth.peak_scratch_bytes(), 80);
+
+        let before = growth;
+        assert!(!growth.checked_accumulate(CacheGrowthAccounting::new(
+            usize::MAX,
+            0,
+            0,
+            0,
+            usize::MAX,
+        )));
+        assert_eq!(growth, before);
+    }
+
+    #[test]
+    fn search_accounting_defaults_empty_and_attaches_growth_without_changing_admission() {
+        let setup = SetupAccounting::empty(96, true);
+        let base = SearchAccounting::new(11, setup, 9, 128, 4);
+        assert_eq!(base.cache_growth(), CacheGrowthAccounting::empty());
+
+        let growth = CacheGrowthAccounting::event(24, 16, 24, 120);
+        let accounting = base.with_cache_growth(growth);
+        assert_eq!(accounting.cache_growth(), growth);
+        assert_eq!(accounting.scratch_bytes(), 128);
+        assert_eq!(accounting.work(), 11);
+        assert_eq!(accounting.transition_work(), 9);
+        assert_eq!(accounting.boundaries(), 4);
+
+        let aggregate = accounting
+            .with_external_scratch_bytes(32)
+            .expect("external sidecar scratch fits");
+        assert_eq!(aggregate.setup().retained_bytes(), 128);
+        assert_eq!(aggregate.scratch_bytes(), 160);
+        assert_eq!(aggregate.cache_growth().peak_scratch_bytes(), 152);
+        let no_growth = base
+            .with_external_scratch_bytes(32)
+            .expect("external scratch preserves an empty growth sentinel");
+        assert_eq!(no_growth.setup().retained_bytes(), 128);
+        assert_eq!(no_growth.scratch_bytes(), 160);
+        assert_eq!(no_growth.cache_growth().peak_scratch_bytes(), 0);
+        assert!(
+            SearchAccounting::new(0, SetupAccounting::empty(0, true), 0, usize::MAX, 0)
+                .with_external_scratch_bytes(1)
+                .is_err(),
+        );
+        assert!(
+            SearchAccounting::new(
+                0,
+                SetupAccounting::empty(usize::MAX, true),
+                0,
+                0,
+                0,
+            )
+            .with_external_scratch_bytes(1)
+            .is_err(),
+        );
     }
 }
 
@@ -389,8 +678,14 @@ impl<O: Operation> TypedPlan<'_, O> {
         ))
     }
 
-    /// Search the full haystack using caller-owned, reusable fixed-capacity
-    /// workspace. This method never allocates or grows the workspace.
+    /// Search the full haystack using caller-owned, reusable workspace.
+    ///
+    /// Workspace vectors built by the public fixed-capacity constructors never
+    /// allocate or grow here. A cold automaton may independently allocate and
+    /// publish its immutable start-filter proof on the first search. The
+    /// doc-hidden adaptive constructor used by the portable facade may also
+    /// grow its direct caches transactionally; that traffic is reported by
+    /// [`SearchAccounting::cache_growth`].
     ///
     /// # Errors
     ///
@@ -407,13 +702,16 @@ impl<O: Operation> TypedPlan<'_, O> {
         self.search_window_with_workspace(haystack, SearchWindow::full(haystack), workspace, limits)
     }
 
-    /// Search a byte range using caller-owned, reusable fixed-capacity
-    /// workspace. Assertions still inspect the original haystack.
+    /// Search a byte range using caller-owned, reusable workspace. Assertions
+    /// still inspect the original haystack. Public fixed-capacity workspace
+    /// vectors never grow during this call, though a cold automaton may publish
+    /// its separate immutable start-filter proof. A doc-hidden adaptive
+    /// workspace may additionally report transactional direct-cache growth.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid range, incompatible workspace,
-    /// insufficient hard limit, or execution failure. No allocation occurs.
+    /// insufficient hard limit, or execution failure.
     pub fn search_window_with_workspace(
         &self,
         haystack: &[u8],
@@ -643,9 +941,11 @@ impl<O: Operation> TypedPlan<'_, O> {
 }
 
 impl Automaton {
-    /// Check out an optional automaton-owned session for a facade-composed
-    /// value operation. The returned owner is bound to this exact immutable
-    /// automaton and contains no source position or result.
+    /// Check out an optional automaton-owned session for the facade's
+    /// outer-unlimited reverse-suffix operation. Finite workspace envelopes
+    /// decline before inspecting or mutating the pool. The returned owner is
+    /// bound to this exact immutable automaton and contains no source position
+    /// or result.
     #[doc(hidden)]
     pub fn try_checkout_pooled_search_session(
         &self,
@@ -653,6 +953,9 @@ impl Automaton {
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Option<K0SearchSession<'_>>, SearchError> {
+        if workspace_limits != WorkspaceLimits::unlimited() {
+            return Ok(None);
+        }
         let Some(workspace) =
             self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
         else {
@@ -677,10 +980,11 @@ impl Automaton {
         Ok(())
     }
 
-    /// Replace a successfully checked-out facade session with genuinely fresh
-    /// selected scratch. Refusal or construction failure restores the old
-    /// session through its original return route and remains an optional
-    /// decline.
+    /// Replace a successfully checked-out outer-unlimited facade session with
+    /// genuinely fresh selected scratch. A finite workspace envelope restores
+    /// the old session without constructing a candidate. Unlimited optional
+    /// refusal or construction failure likewise restores the old session as a
+    /// deliberate performance decline.
     #[doc(hidden)]
     pub fn refresh_pooled_search_session(
         &self,
@@ -693,6 +997,10 @@ impl Automaton {
             return Err(SearchError::InvalidResumeState {
                 detail: "pooled K0 session belongs to another automaton",
             });
+        }
+        if workspace_limits != WorkspaceLimits::unlimited() {
+            session.commit_pooled_workspace();
+            return Ok(());
         }
         match self.try_new_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional) {
             Ok(Some(fresh)) => {
@@ -710,16 +1018,17 @@ impl Automaton {
     /// workspace. The workspace is checked out only from this exact immutable
     /// automaton and is returned only after a successful execution.
     ///
-    /// `Ok(None)` means the optional owner or selected workspace could not be
-    /// allocated; the facade must use its canonical one-shot entry. An actual
-    /// search result is wrapped in `Some`.
+    /// `Ok(None)` means the optional route declined before finite execution,
+    /// or that an unlimited optional construction was unavailable; the facade
+    /// must use its canonical one-shot entry. An actual search result is
+    /// wrapped in `Some`.
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] if execution with a successfully checked-out
-    /// workspace fails. Invalid windows and custom finite limits decline
-    /// before pooled execution, while the exact default finite envelope
-    /// charges cold workspace construction on its first successful attempt.
+    /// Returns [`SearchError`] if pooled execution fails, or if cold workspace
+    /// construction fails under the exact default finite envelope. Invalid
+    /// windows and custom finite limits decline before pooled execution;
+    /// unlimited optional construction failures remain `Ok(None)`.
     #[doc(hidden)]
     pub fn search_window_with_optional_pooled_exists_value(
         &self,
@@ -736,13 +1045,20 @@ impl Automaton {
         {
             return Ok(None);
         }
+        let workspace_limits =
+            Self::pooled_workspace_limits_for_search(workspace_limits, limits);
         let warm = self.try_with_warm_owner_workspace(
             workspace_limits,
             endpoint_eligible,
             bidirectional,
             |workspace| {
-                crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
-                    self, haystack, window, workspace, limits,
+                crate::k0::search_prevalidated_exists_value_with_authenticated_workspace_and_external_scratch(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    limits,
+                    Self::pooled_workspace_owner_bytes(),
                 )
             },
         );
@@ -771,6 +1087,7 @@ impl Automaton {
     ) -> Result<Option<bool>, SearchError> {
         let checkout = self.try_checkout_pooled_workspace_with_setup(
             workspace_limits,
+            limits.max_work,
             endpoint_eligible,
             bidirectional,
         );
@@ -782,6 +1099,7 @@ impl Automaton {
         else {
             return Ok(None);
         };
+        let external_scratch_bytes = checkout.external_retained_scratch_bytes();
         let result = match (limits == SearchLimits::default(), checkout.cold_setup) {
             (true, Some(setup)) => {
                 crate::k0::search_prevalidated_exists_value_with_authenticated_workspace_and_setup(
@@ -791,14 +1109,16 @@ impl Automaton {
                     &mut checkout,
                     limits,
                     setup,
+                    external_scratch_bytes,
                 )
             }
-            _ => crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+            _ => crate::k0::search_prevalidated_exists_value_with_authenticated_workspace_and_external_scratch(
                 self,
                 haystack,
                 window,
                 &mut checkout,
                 limits,
+                external_scratch_bytes,
             ),
         };
         if result.is_ok() {
@@ -817,7 +1137,10 @@ impl Automaton {
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] only after pooled execution has begun.
+    /// Returns [`SearchError`] if pooled execution fails, or if cold workspace
+    /// construction fails under the exact default finite envelope. Invalid
+    /// windows and custom finite limits decline before pooled execution;
+    /// unlimited optional construction failures remain `Ok(None)`.
     #[doc(hidden)]
     pub fn search_window_with_optional_pooled_span_value(
         &self,
@@ -834,13 +1157,20 @@ impl Automaton {
         {
             return Ok(None);
         }
+        let workspace_limits =
+            Self::pooled_workspace_limits_for_search(workspace_limits, limits);
         let warm = self.try_with_warm_owner_workspace(
             workspace_limits,
             endpoint_eligible,
             bidirectional,
             |workspace| {
-                crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
-                    self, haystack, window, workspace, limits,
+                crate::k0::search_prevalidated_span_value_with_authenticated_workspace_and_external_scratch(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    limits,
+                    Self::pooled_workspace_owner_bytes(),
                 )
             },
         );
@@ -869,6 +1199,7 @@ impl Automaton {
     ) -> Result<Option<Option<MatchSpan>>, SearchError> {
         let checkout = self.try_checkout_pooled_workspace_with_setup(
             workspace_limits,
+            limits.max_work,
             endpoint_eligible,
             bidirectional,
         );
@@ -880,6 +1211,7 @@ impl Automaton {
         else {
             return Ok(None);
         };
+        let external_scratch_bytes = checkout.external_retained_scratch_bytes();
         let result = match (limits == SearchLimits::default(), checkout.cold_setup) {
             (true, Some(setup)) => {
                 crate::k0::search_prevalidated_span_value_with_authenticated_workspace_and_setup(
@@ -889,14 +1221,16 @@ impl Automaton {
                     &mut checkout,
                     limits,
                     setup,
+                    external_scratch_bytes,
                 )
             }
-            _ => crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+            _ => crate::k0::search_prevalidated_span_value_with_authenticated_workspace_and_external_scratch(
                 self,
                 haystack,
                 window,
                 &mut checkout,
                 limits,
+                external_scratch_bytes,
             ),
         };
         if result.is_ok() {
@@ -1612,7 +1946,9 @@ impl TypedPlan<'_, Span> {
     ///
     /// This facade-only bridge exists for exact partial-DFA producers. It
     /// retains the ordinary hard work, scratch, reset, and accounting
-    /// contracts and performs no allocation during the prepared call.
+    /// contracts. A fixed workspace performs no allocation during the call;
+    /// an adaptive workspace may demand-grow its reverse cache within those
+    /// limits and reports that traffic through search accounting.
     ///
     /// # Errors
     ///
@@ -1746,7 +2082,13 @@ impl K0SearchSession<'_> {
     ///
     /// The session is permanently bound to the immutable automaton that
     /// constructed its workspace. Per-call range, work, scratch, reset, and
-    /// accounting checks remain identical to the caller-owned workspace API.
+    /// accounting checks remain identical to the caller-owned workspace API
+    /// for explicitly constructed sessions. Sessions returned by
+    /// [`Automaton::try_checkout_pooled_search_session`] are reserved for an
+    /// outer-unlimited facade route: their generic search methods reject
+    /// finite [`SearchLimits`] before ordinary range or resource validation.
+    /// Their private positive-end verifier methods retain their separate
+    /// [`K0PositiveEndLimits`] contract.
     ///
     /// # Errors
     ///
@@ -1761,9 +2103,11 @@ impl K0SearchSession<'_> {
 
     /// Search a byte range under one typed output contract.
     ///
-    /// Assertions inspect the complete original haystack. The range is
-    /// validated on every call even though graph and workspace compatibility
-    /// were authenticated during construction.
+    /// Assertions inspect the complete original haystack. Caller-owned
+    /// sessions, and pooled sessions admitted with unlimited limits, validate
+    /// the range on every call even though graph and workspace compatibility
+    /// were authenticated during construction. A finite pooled call rejects
+    /// at its provenance boundary before range validation.
     ///
     /// # Errors
     ///
@@ -1822,6 +2166,30 @@ impl K0SearchSession<'_> {
         window: SearchWindow,
     ) -> Result<Option<bool>, SearchError> {
         self.try_search_warm_exists_value_untyped(haystack, window)
+    }
+
+    /// Try only the authenticated report-free warm existence route under
+    /// finite invocation limits.
+    ///
+    /// Current retained scratch and the logical reset are checked before warm
+    /// admission. A finite call is authoritative: if the report-free cache is
+    /// structurally cold, ordinary K0 completes under these same limits and
+    /// returns `Some`. Immutable-prefix work and any exact mutable continuation
+    /// likewise remain under `limits`; resource exhaustion is returned as an
+    /// error and never converted into wider facade replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// a warm-cache invariant failure.
+    #[doc(hidden)]
+    pub fn try_search_warm_exists_value_with_limits(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<bool>, SearchError> {
+        self.try_search_warm_exists_value_with_limits_untyped(haystack, window, limits)
     }
 
     /// Return only the selected endpoint, allowing an authenticated warm

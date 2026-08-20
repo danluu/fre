@@ -540,8 +540,9 @@ impl PortableTextRegexSet {
     /// Construct one reusable Exists-only session for every proved text
     /// constituent.
     ///
-    /// The session vector and all endpoint-capable K0 payloads are charged as
-    /// one transaction before publication. A failure drops every already-made
+    /// The session vector and all fixed-capacity endpoint-capable K0 payloads
+    /// are charged as one transaction before publication. Their cache capacity
+    /// cannot grow during later searches. A failure drops every already-made
     /// private constituent session. No source positions or results are
     /// retained between calls.
     ///
@@ -557,7 +558,9 @@ impl PortableTextRegexSet {
             self.regexes.len(),
             limits,
             "text-set session vector",
-            |index, residual| self.regexes[index].endpoint_search_session(residual),
+            |index, residual| {
+                self.regexes[index].fixed_endpoint_search_session(residual)
+            },
             PortableTextSearchSession::workspace_setup_accounting,
         )?;
         Ok(PortableTextRegexSetSearchSession {

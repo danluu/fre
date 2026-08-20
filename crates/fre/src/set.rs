@@ -594,10 +594,11 @@ impl PortableRegexSet {
 
     /// Construct one reusable Exists-only session for every constituent.
     ///
-    /// The complete descriptor vector and all K0 workspace payloads are
-    /// charged before the session is published. Native constituents retain a
-    /// direct immutable binding and no workspace. A construction failure drops
-    /// every already-created private constituent session.
+    /// The complete descriptor vector and all fixed-capacity K0 endpoint
+    /// workspace payloads are charged before the session is published. Their
+    /// cache capacity cannot grow during later searches. Native constituents
+    /// retain a direct immutable binding and no workspace. A construction
+    /// failure drops every already-created private constituent session.
     ///
     /// # Errors
     ///
@@ -611,7 +612,9 @@ impl PortableRegexSet {
             self.regexes.len(),
             limits,
             "byte-set session vector",
-            |index, residual| self.regexes[index].endpoint_search_session(residual),
+            |index, residual| {
+                self.regexes[index].fixed_endpoint_search_session(residual)
+            },
             PortableSearchSession::workspace_setup_accounting,
         )?;
         Ok(PortableRegexSetSearchSession {

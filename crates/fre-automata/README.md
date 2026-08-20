@@ -16,17 +16,25 @@ Key invariants:
 - accept states have no outgoing edges;
 - every index, table dimension, storage charge, scratch charge, and work charge
   is checked;
-- `K0Workspace` exposes a fixed, auditable layout for repeated calls: direct
-  transition rows reserve their final capacity up front and initialize only
-  as states become live, no backing vector allocates or grows retained capacity
-  during search, and allocator-visible retained capacity remains reported;
-- one-shot calls remain available and report cold allocation/initialization,
-  while reusable calls split their constant logical reset work from transition
-  work and report zero per-call allocation;
+- public `K0Workspace` constructors retain a fixed, auditable, address-stable
+  layout: direct transition rows reserve their final capacity up front and
+  initialize only as states become live; these workspace vectors never grow,
+  while the automaton's separate immutable start-filter proof may still be
+  allocated on its first use unless the caller prepares or warms it first;
+- automaton-owned pools and adaptive search sessions admit the same finite
+  layout as a hard ceiling but initially allocate only small direct forward and
+  reverse cache seeds; reached state/item/row storage grows transactionally,
+  and a refused growth attempt leaves the authoritative cache unchanged before
+  execution continues through its canonical fallback;
+- one-shot calls remain available and report cold allocation/initialization;
+  reusable fixed calls report no cache-growth traffic, while adaptive calls
+  separately report growth allocations, initialized bytes, retained deltas,
+  and the transient old-plus-new scratch peak;
 - setup `initialized_bytes` covers setup-phase writes, while demand-initialized
   transition rows and cache cells are charged to execution work;
-- workspace shape mismatches and per-call scratch limits are errors rather than
-  implicit resizing;
+- workspace shape mismatches remain errors; adaptive growth is permitted only
+  within both the construction-admitted layout and the active call's scratch
+  limit, while fixed workspaces never resize;
 - logical thread lengths are reset before every invocation, including after an
   earlier resource error, and the generation table is cleared with an explicit
   setup charge before its counter could wrap;

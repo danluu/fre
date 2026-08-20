@@ -3040,7 +3040,7 @@ mod tests {
             schema: FRE_EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
             mode: FreExecutorMode::PerformanceRaw,
             model: "regex-redux".to_string(),
-            candidate_plan: "regex-redux-rebar-generic-session-v2".to_string(),
+            candidate_plan: "regex-redux-rebar-generic-session-v3".to_string(),
             candidate_runtime: None,
             priming_operations: 0,
         };

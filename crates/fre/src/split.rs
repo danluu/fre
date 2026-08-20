@@ -54,7 +54,13 @@ impl PortableRegex {
     }
 }
 
-/// Fallible, allocation-free split fields over contextual portable searches.
+/// Fallible borrowed split fields over contextual portable searches.
+///
+/// Each field is a slice of the original haystack and is not materialized in
+/// a per-item allocation. A default K0 match session is adaptive, however, so
+/// [`Iterator::next`] may allocate while demand-growing its cache. Callers
+/// that require an allocation-free search boundary must use a fixed-capacity
+/// session API directly.
 #[derive(Debug)]
 pub struct PortableSplit<'r, 'h> {
     haystack: &'h [u8],
