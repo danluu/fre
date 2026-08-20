@@ -45850,7 +45850,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut bounded = limits;
         bounded.reducer_steps = 1;
         let bounded_patterns = ["(a+)".to_string(), "(a)".to_string()];
-        let capture_limit = fre_aggregate_many_capture_count(
+        let selector_limit = fre_aggregate_many_capture_count(
             CandidateRequest {
                 model: "count-captures",
                 patterns: &bounded_patterns,
@@ -45861,10 +45861,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             &bounded,
         );
         assert!(
-            matches!(capture_limit, Err(ref error)
+            matches!(selector_limit, Err(ref error)
                 if error.status == Status::Unsupported
-                    && error.message.contains("CaptureEventsLimit")),
-            "capture reducer limit must remain typed unsupported: {capture_limit:?}"
+                    && error.message.contains("MatchEvents")),
+            "value selector limit must remain typed unsupported: {selector_limit:?}"
         );
 
         let formal = current_fre(

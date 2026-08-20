@@ -799,7 +799,7 @@ fn complete_spans_preserve_unicode_literal_boundaries_and_schema_identity() {
         .unicode(true)
         .build_spans()
         .unwrap();
-    assert_eq!(4, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
+    assert_eq!(5, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
     assert_eq!(
         AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
         regex.build_report().schema_version
