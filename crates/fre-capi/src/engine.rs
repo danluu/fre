@@ -22,6 +22,7 @@ use crate::{
 pub(crate) struct CompiledRegex {
     regex: PortableRegex,
     search_limits: SearchLimits,
+    selected_end_value_route: bool,
 }
 
 impl CompiledRegex {
@@ -64,12 +65,16 @@ impl CompiledRegex {
                     error.to_string(),
                 )
             })?;
+        let search_limits = SearchLimits {
+            max_work: config.search_work,
+            max_scratch_bytes: scratch,
+        };
+        let selected_end_value_route = search_limits == SearchLimits::unlimited()
+            && regex.build_report().plan == PlanKind::FixedPredicateWord64;
         Ok(Self {
             regex,
-            search_limits: SearchLimits {
-                max_work: config.search_work,
-                max_scratch_bytes: scratch,
-            },
+            search_limits,
+            selected_end_value_route,
         })
     }
 
@@ -107,16 +112,30 @@ impl CompiledRegex {
     }
 
     pub(crate) fn selected_end(&self, haystack: &[u8]) -> Result<FreV1SelectedEndResult, Outcome> {
+        let end = self
+            .selected_end_raw(haystack)
+            .map_err(|error| search_error(&error))?;
+        Ok(FreV1SelectedEndResult {
+            abi_version: crate::FRE_V1_ABI_VERSION,
+            struct_size: size_u32::<FreV1SelectedEndResult>(),
+            found: u32::from(end.is_some()),
+            reserved: 0,
+            end: end.unwrap_or(0),
+        })
+    }
+
+    #[inline(never)]
+    fn selected_end_raw(&self, haystack: &[u8]) -> Result<Option<usize>, fre::SearchError> {
+        if self.selected_end_value_route {
+            return self
+                .regex
+                .find_value(haystack, self.search_limits)
+                .map(|matched| matched.map(fre::Match::end));
+        }
+
         self.regex
             .selected_end_accounted(haystack, self.search_limits)
-            .map(|(end, _)| FreV1SelectedEndResult {
-                abi_version: crate::FRE_V1_ABI_VERSION,
-                struct_size: size_u32::<FreV1SelectedEndResult>(),
-                found: u32::from(end.is_some()),
-                reserved: 0,
-                end: end.unwrap_or(0),
-            })
-            .map_err(|error| search_error(&error))
+            .map(|(end, _)| end)
     }
 
     pub(crate) fn span(&self, haystack: &[u8]) -> Result<FreV1MatchResult, Outcome> {
@@ -166,4 +185,90 @@ pub(crate) const fn plan_tag(plan: PlanKind) -> u32 {
 
 fn size_u32<T>() -> u32 {
     u32::try_from(core::mem::size_of::<T>()).expect("ABI record fits u32")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FreV1Config;
+
+    const FIXED_PATTERN: &[u8] = br"[A-D][\x00-\x7F]Q";
+
+    fn byte_config(limits: SearchLimits) -> FreV1Config {
+        let mut config = FreV1Config::checked_default();
+        config.unicode = 0;
+        config.search_work = limits.max_work;
+        config.search_scratch_bytes =
+            u64::try_from(limits.max_scratch_bytes).expect("test scratch fits u64");
+        config
+    }
+
+    #[test]
+    fn selected_end_value_route_is_fixed_predicate_and_unlimited_only() {
+        let unlimited = SearchLimits::unlimited();
+        let fixed = CompiledRegex::compile(byte_config(unlimited), FIXED_PATTERN)
+            .expect("unlimited fixed-predicate regex");
+        assert_eq!(
+            fixed.regex.build_report().plan,
+            PlanKind::FixedPredicateWord64
+        );
+        assert!(fixed.selected_end_value_route);
+
+        for finite in [
+            SearchLimits::default(),
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+            SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: usize::MAX - 1,
+            },
+        ] {
+            let fixed = CompiledRegex::compile(byte_config(finite), FIXED_PATTERN)
+                .expect("finite fixed-predicate regex");
+            assert!(!fixed.selected_end_value_route);
+        }
+
+        let noneligible = CompiledRegex::compile(byte_config(unlimited), br"a{2,4}")
+            .expect("unlimited noneligible regex");
+        assert_ne!(
+            noneligible.regex.build_report().plan,
+            PlanKind::FixedPredicateWord64
+        );
+        assert!(!noneligible.selected_end_value_route);
+    }
+
+    #[test]
+    fn selected_end_value_route_matches_accounted_selection_and_errors() {
+        let fixed = CompiledRegex::compile(byte_config(SearchLimits::unlimited()), FIXED_PATTERN)
+            .expect("unlimited fixed-predicate regex");
+        for haystack in [
+            b"zzA!Q".as_slice(),
+            b"zzzz".as_slice(),
+            b"A\xffQ A!Q".as_slice(),
+        ] {
+            let expected = fixed
+                .regex
+                .selected_end_accounted(haystack, fixed.search_limits)
+                .expect("unlimited accounted selection")
+                .0;
+            let actual = fixed.selected_end(haystack).expect("facade selection");
+            assert_eq!(actual.found, u32::from(expected.is_some()));
+            assert_eq!(actual.end, expected.unwrap_or(0));
+        }
+
+        let refused_limits = SearchLimits {
+            max_work: 0,
+            ..SearchLimits::default()
+        };
+        let refused = CompiledRegex::compile(byte_config(refused_limits), FIXED_PATTERN)
+            .expect("finite fixed-predicate regex");
+        assert!(!refused.selected_end_value_route);
+        let expected = refused
+            .regex
+            .selected_end_accounted(b"zzA!Q", refused.search_limits)
+            .expect_err("accounted refusal");
+        assert_eq!(refused.selected_end(b"zzA!Q"), Err(search_error(&expected)));
+    }
 }
