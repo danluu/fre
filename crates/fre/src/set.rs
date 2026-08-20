@@ -645,6 +645,20 @@ impl PortableRegexSet {
         self.is_match_at(haystack, 0, limits)
     }
 
+    /// Whether any pattern matches the full haystack without constructing set
+    /// or constituent execution reports.
+    ///
+    /// This operation deliberately has unlimited execution resources. Use
+    /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
+    /// must be enforced.
+    #[inline(always)]
+    pub fn is_match_value_unlimited(
+        &self,
+        haystack: &[u8],
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at_unlimited(haystack, 0)
+    }
+
     /// Whether any pattern matches at or after `start`, retaining the complete
     /// original-haystack context for assertions.
     ///
@@ -689,6 +703,46 @@ impl PortableRegexSet {
                 output_capacity_bytes: 0,
             },
         ))
+    }
+
+    /// Whether any pattern matches at or after `start` without constructing set
+    /// or constituent execution reports.
+    ///
+    /// This preserves original-haystack assertion context and source-order
+    /// short circuiting. This operation deliberately has unlimited execution
+    /// resources. Use [`Self::is_match_at`] when finite work, scratch, or
+    /// pattern-count limits must be enforced.
+    #[inline(always)]
+    pub fn is_match_value_at_unlimited(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at_unlimited_inner(haystack, start)
+    }
+
+    #[inline(never)]
+    fn is_match_value_at_unlimited_inner(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        validate_start(start, haystack.len())?;
+        let window = SearchWindow::new(start, haystack.len());
+        for (index, regex) in self.regexes.iter().enumerate() {
+            let matched = regex
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Return every matching pattern ID in ascending source order.
