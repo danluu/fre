@@ -188,6 +188,11 @@ pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) start_prefix_first_set: Option<[u64; 4]>,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchView<'a>>,
     pub(crate) start_closure_dispatch: Option<NativeEpsilonClosureProgramView<'a>>,
+    /// Exact compiler-only bitmap for a fragmented final-byte suffix column.
+    /// Reverse depth is fixed at zero by this field's contract. The four
+    /// canonical ascending-byte-index words never enter the frozen object
+    /// image.
+    pub(crate) terminal_exact_set: Option<[u64; 4]>,
     pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
     pub(crate) line_terminator: u8,
     pub(crate) artifact_identity: [u8; 32],
@@ -208,6 +213,9 @@ pub(crate) struct NativeOrderedNfaTerminalRangeV1 {
 /// Below this structural size, an extra full-window range scan is more likely
 /// to duplicate cheap Pike work than amortize it.
 pub(crate) const MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES: usize = 64;
+/// Exact fragmented sets broader than this are insufficiently selective to
+/// justify an exhaustive reverse trim on match-dense aggregate routes.
+pub(crate) const MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY: u16 = 64;
 
 /// A start-only text specialization remains deliberately smaller than the
 /// universal retained sidecar. These fixed ceilings cover the two motivating
@@ -427,10 +435,25 @@ impl NativeOrderedNfaStartPrefixPlan {
     }
 }
 
+/// Validated compiler-only receipt for an aggregate terminal-set trim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaTerminalExactSetPlan {
+    words: [u64; 4],
+}
+
+impl NativeOrderedNfaTerminalExactSetPlan {
+    pub(crate) const fn words(self) -> [u64; 4] {
+        self.words
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeOrderedNfaObjectImage<'a> {
     pub(crate) bytes: Vec<u8>,
     pub(crate) layout: NativeOrderedNfaObjectLayout,
+    /// Compiler-only fragmented final-byte bitmap retained through target
+    /// lowering. This never enters the frozen object image.
+    pub(crate) terminal_exact_set_words: Option<[u64; 4]>,
     /// Borrowed compiler IR consumed only while target text is emitted.
     pub(crate) start_closure_program: Option<NativeEpsilonClosureProgramView<'a>>,
 }
@@ -467,6 +490,56 @@ fn validate_native_ordered_nfa_terminal_range(
         ));
     }
     Ok(range)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a u8 byte indexes one of four complete u64 bitmap words"
+)]
+fn native_ordered_nfa_terminal_exact_set_contains(exact: [u64; 4], byte: u8) -> bool {
+    let index = usize::from(byte);
+    exact[index / 64] & (1_u64 << (index % 64)) != 0
+}
+
+/// Validate the compiler-only exact terminal bitmap. Empty, universal, and
+/// contiguous columns are not members of this plan: the latter remain owned
+/// by the V3 range path.
+fn validate_native_ordered_nfa_terminal_exact_set(
+    exact: [u64; 4],
+    edge_count: usize,
+) -> Result<NativeOrderedNfaTerminalExactSetPlan, ObjectError> {
+    let cardinality = exact.iter().map(|word| word.count_ones()).sum::<u32>();
+    if edge_count < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES
+        || cardinality == 0
+        || cardinality > u32::from(MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY)
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA terminal exact-set proof",
+        ));
+    }
+    let start = (u8::MIN..=u8::MAX)
+        .find(|&byte| native_ordered_nfa_terminal_exact_set_contains(exact, byte))
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA terminal exact-set first byte",
+        ))?;
+    let end = (u8::MIN..=u8::MAX)
+        .rev()
+        .find(|&byte| native_ordered_nfa_terminal_exact_set_contains(exact, byte))
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA terminal exact-set last byte",
+        ))?;
+    let inclusive_width = u32::from(end)
+        .checked_sub(u32::from(start))
+        .and_then(|width| width.checked_add(1))
+        .ok_or(ObjectError::InvalidModule(
+            "ordered-NFA terminal exact-set width",
+        ))?;
+    if inclusive_width == cardinality {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA terminal exact set is contiguous",
+        ));
+    }
+    Ok(NativeOrderedNfaTerminalExactSetPlan { words: exact })
 }
 
 fn native_ordered_nfa_start_prefix_contains(
@@ -1080,6 +1153,24 @@ fn validate_native_ordered_edge_dispatch(
 }
 
 impl<'a> NativeOrderedNfaObjectImage<'a> {
+    /// Revalidate the separately retained compiler-only terminal bitmap during
+    /// backend lowering. The ordinary entry deliberately ignores valid words,
+    /// while the module receipt may later supply them to aggregate wrappers;
+    /// malformed words and a forged overlap with V3 still fail closed.
+    pub(crate) fn terminal_exact_set_plan(
+        &self,
+    ) -> Result<Option<NativeOrderedNfaTerminalExactSetPlan>, ObjectError> {
+        let Some(exact) = self.terminal_exact_set_words else {
+            return Ok(None);
+        };
+        if self.layout.terminal_range.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set overlaps terminal range",
+            ));
+        }
+        validate_native_ordered_nfa_terminal_exact_set(exact, self.layout.edge_count).map(Some)
+    }
+
     /// Borrow one state's already-encoded canonical edge-kind row from the
     /// object image. This is a compiler-only convenience for guarded start
     /// specialization and does not expose source storage to target code.
@@ -1174,10 +1265,22 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             assertion_edges,
             assertion_kinds,
         ) || start_closure_dispatch.is_some_and(|layout| layout.guarded);
+        let terminal_exact_set_words = match view.terminal_exact_set {
+            Some(exact) => {
+                validate_native_ordered_nfa_terminal_exact_set(exact, edges)?;
+                Some(exact)
+            }
+            None => None,
+        };
         let terminal_range = view
             .terminal_range
             .map(|range| validate_native_ordered_nfa_terminal_range(range, edges))
             .transpose()?;
+        if terminal_exact_set_words.is_some() && terminal_range.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set overlaps terminal range",
+            ));
+        }
         let has_unicode = assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0;
         let align4 =
             |value: usize| {
@@ -1623,6 +1726,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
         Ok(Some(Self {
             bytes,
             layout,
+            terminal_exact_set_words,
             start_closure_program,
         }))
     }
@@ -3059,6 +3163,7 @@ fn assertion_bit(kind: EdgeKind) -> Option<u32> {
 }
 
 const _: () = {
+    assert!(core::mem::size_of::<NativeOrderedNfaObjectLayout>() <= 256);
     assert!(FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL_OFFSET == 0);
     assert!(FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL_OFFSET == 0);
     assert!(FROZEN_ORDERED_NFA_THREAD_V1_STATE_OFFSET == 0);
@@ -3278,12 +3383,172 @@ mod tests {
         let restored = crate::CompiledProgram::deserialize(&serialized).unwrap();
         let restored_view = restored.native_ordered_nfa_view().unwrap();
         assert_eq!(restored_view.whole_window_width_bounds, Some(expected));
-        let restored_image =
-            NativeOrderedNfaObjectImage::try_build(restored_view, usize::MAX)
-                .unwrap()
-                .unwrap();
+        let restored_image = NativeOrderedNfaObjectImage::try_build(restored_view, usize::MAX)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored_image.bytes, first.bytes);
-        assert_eq!(restored_image.layout.whole_window_width_bounds, Some(expected));
+        assert_eq!(
+            restored_image.layout.whole_window_width_bounds,
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn terminal_exact_set_selection_is_deterministic_and_object_byte_inert() {
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let program = span_program_with_mode(
+            &format!(r"{repeated}[0-24-6]"),
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let exact = view
+            .terminal_exact_set
+            .expect("fragmented depth-zero suffix selects exact terminal bitmap");
+        assert!(view.terminal_range.is_none());
+
+        let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let second = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        let plan = first
+            .terminal_exact_set_plan()
+            .unwrap()
+            .expect("validated fragmented bitmap is selected");
+        assert_eq!(first.terminal_exact_set_words, Some(exact));
+        assert_eq!(plan.words(), exact);
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            NativeOrderedNfaProgramView {
+                terminal_exact_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.bytes, without.bytes);
+        assert_eq!(first.layout.object_bytes, without.layout.object_bytes);
+        assert_eq!(
+            first.layout.ordered_edge_dispatch,
+            without.layout.ordered_edge_dispatch
+        );
+        assert!(without.terminal_exact_set_words.is_none());
+        assert!(without.terminal_exact_set_plan().unwrap().is_none());
+
+        let serialized = program.serialize().unwrap();
+        let restored = crate::CompiledProgram::deserialize(&serialized).unwrap();
+        let restored_view = restored.native_ordered_nfa_view().unwrap();
+        assert_eq!(restored_view.terminal_exact_set, Some(exact));
+        let restored_image = NativeOrderedNfaObjectImage::try_build(restored_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_image.bytes, first.bytes);
+        assert_eq!(restored_image.terminal_exact_set_words, Some(exact));
+        assert_eq!(
+            restored_image.terminal_exact_set_plan().unwrap(),
+            Some(plan)
+        );
+    }
+
+    #[test]
+    fn terminal_exact_set_validation_rejects_noncanonical_or_overlapping_plans() {
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let fragmented = span_program_with_mode(
+            &format!(r"{repeated}[0-24-6]"),
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let fragmented_view = fragmented.native_ordered_nfa_view().unwrap();
+        for invalid in [[0_u64; 4], [u64::MAX; 4], membership_words(b'a'..=b'z')] {
+            assert!(matches!(
+                NativeOrderedNfaObjectImage::try_build(
+                    NativeOrderedNfaProgramView {
+                        terminal_exact_set: Some(invalid),
+                        ..fragmented_view
+                    },
+                    usize::MAX,
+                ),
+                Err(ObjectError::InvalidModule(_))
+            ));
+        }
+        let broad_fragmented = membership_words((0_u8..64).chain([65_u8]));
+        assert_eq!(
+            broad_fragmented
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>(),
+            u32::from(MAX_NATIVE_ORDERED_NFA_TERMINAL_EXACT_SET_CARDINALITY)
+                .checked_add(1)
+                .expect("terminal exact-set cardinality cap has a successor"),
+        );
+        assert!(matches!(
+            NativeOrderedNfaObjectImage::try_build(
+                NativeOrderedNfaProgramView {
+                    terminal_exact_set: Some(broad_fragmented),
+                    ..fragmented_view
+                },
+                usize::MAX,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let tiny = span_program_with_mode(
+            r"[0-24-6]",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let tiny_view = tiny.native_ordered_nfa_view().unwrap();
+        assert!(tiny_view.raw.edge_kinds.len() < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert!(matches!(
+            NativeOrderedNfaObjectImage::try_build(
+                NativeOrderedNfaProgramView {
+                    terminal_exact_set: Some(membership_words([
+                        b'0', b'1', b'2', b'4', b'5', b'6',
+                    ])),
+                    ..tiny_view
+                },
+                usize::MAX,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let contiguous = span_program_with_mode(
+            &format!(r"{repeated}[a-z]"),
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let contiguous_view = contiguous.native_ordered_nfa_view().unwrap();
+        assert!(contiguous_view.terminal_range.is_some());
+        assert!(matches!(
+            NativeOrderedNfaObjectImage::try_build(
+                NativeOrderedNfaProgramView {
+                    terminal_exact_set: fragmented_view.terminal_exact_set,
+                    ..contiguous_view
+                },
+                usize::MAX,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
     }
 
     #[test]

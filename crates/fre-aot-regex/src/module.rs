@@ -1442,8 +1442,13 @@ pub struct CompiledModule {
     /// Whether this exact Ordered-NFA text uses the anchored-prefix first-byte
     /// proof. This compiler-only bit drives its monotone final-object retry.
     ordered_nfa_start_prefix_lowered: bool,
+    /// Exact graph-proved fragmented final-byte membership retained for
+    /// exhaustive Count/SpanSum wrappers. The ordinary Ordered-NFA entry is
+    /// byte-inert to these compiler-only words; they drive the first monotone
+    /// aggregate final-object retry and never enter frozen data.
+    ordered_nfa_terminal_exact_set_lowered: Option<[u64; 4]>,
     /// Whether this exact Ordered-NFA text rejects impossible absolute
-    /// whole-window widths. This compiler-only bit drives the first
+    /// whole-window widths. This compiler-only bit drives the second
     /// final-object retry and never changes frozen object bytes.
     ordered_nfa_whole_window_width_gate_lowered: bool,
 }
@@ -2234,8 +2239,13 @@ enum PreparedEntryKind {
 /// layout: the object starts at symbol slot 5 and contains its identity at a
 /// fixed descriptor-relative offset, while private entries remain text-local.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent compiler-text receipts preserve the exact final-object retry ladder"
+)]
 struct PreparedOrderedNfaEntryLayout {
     object_abi_version: u32,
+    terminal_exact_set_lowered: Option<[u64; 4]>,
     whole_window_width_gate_lowered: bool,
     start_closure_dispatch_lowered: bool,
     start_prefix_lowered: bool,
@@ -2573,6 +2583,44 @@ impl CompiledModule {
         allow_ordered_nfa_whole_window_width_gate: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+            program,
+            target,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    /// Rebuild the ordinary portfolio while independently retaining the
+    /// compiler-only fragmented terminal-set proof for aggregate wrappers.
+    /// Final-object retries remove that additive aggregate text first while
+    /// preserving every older accelerator, route permission, and the caller's
+    /// exact native-data ceiling.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "the retry preserves two route permissions, six independent accelerator permissions, and one exact data ceiling"
+    )]
+    pub(crate) fn lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
         Self::lower_without_slow_optimization(
             program,
             target,
@@ -2584,6 +2632,7 @@ impl CompiledModule {
             allow_ordered_nfa_start_closure_dispatch,
             allow_ordered_nfa_start_prefix,
             allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
         )
     }
@@ -3575,6 +3624,7 @@ impl CompiledModule {
             true,
             true,
             true,
+            true,
             max_native_data_bytes,
         )
     }
@@ -3595,6 +3645,7 @@ impl CompiledModule {
         allow_ordered_nfa_start_closure_dispatch: bool,
         allow_ordered_nfa_start_prefix: bool,
         allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -3651,6 +3702,9 @@ impl CompiledModule {
                     }
                     if !allow_ordered_nfa_whole_window_width_gate {
                         view.whole_window_width_bounds = None;
+                    }
+                    if !allow_ordered_nfa_terminal_exact_set {
+                        view.terminal_exact_set = None;
                     }
                     view
                 })
@@ -5026,6 +5080,11 @@ impl CompiledModule {
                     ..
                 }))
             ),
+            ordered_nfa_terminal_exact_set_lowered: match prepared_layout.map(|layout| layout.kind)
+            {
+                Some(PreparedEntryKind::OrderedNfa(ordered)) => ordered.terminal_exact_set_lowered,
+                _ => None,
+            },
             ordered_nfa_whole_window_width_gate_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -5271,7 +5330,7 @@ impl CompiledModule {
         self.required_prepare_capabilities
     }
 
-    fn ordered_nfa_object_abi_and_flags(&self) -> Option<(u32, u32)> {
+    pub(crate) fn ordered_nfa_object_abi_and_flags(&self) -> Option<(u32, u32)> {
         const FLAGS_OFFSET: usize = 28;
         const FLAGS_END: usize = FLAGS_OFFSET + 4;
 
@@ -5345,6 +5404,15 @@ impl CompiledModule {
     #[must_use]
     pub(crate) const fn has_ordered_nfa_start_prefix(&self) -> bool {
         self.ordered_nfa_start_prefix_lowered
+    }
+
+    /// Whether the module retains the compiler-only fragmented terminal proof
+    /// for exhaustive aggregate wrappers. The shared one-Span entry remains
+    /// byte-identical without it; this receipt participates in monotone
+    /// aggregate final-object retries.
+    #[must_use]
+    pub(crate) const fn has_ordered_nfa_terminal_exact_set(&self) -> bool {
+        self.ordered_nfa_terminal_exact_set_lowered.is_some()
     }
 
     /// Whether generated Ordered-NFA text uses the compiler-only absolute
@@ -5596,6 +5664,16 @@ impl CompiledModule {
         let ordered_nfa_reducers = native_span_reducers
             && self.prepared_bulk_strategy
                 == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+        // Only exhaustive scalar reducers may spend unbounded work finding a
+        // final candidate. A selected absolute-width gate already owns the
+        // whole-window rejection path, so do not duplicate its work here.
+        // SpanFill and every generic/direct wrapper remain byte-for-byte
+        // unchanged because they never receive these compiler-only words.
+        let ordered_nfa_terminal_exact_set = ordered_nfa_aggregate_terminal_trim(
+            ordered_nfa_reducers,
+            self.ordered_nfa_whole_window_width_gate_lowered,
+            self.ordered_nfa_terminal_exact_set_lowered,
+        );
         let aggregate_strategy = match (
             ordered_nfa_reducers,
             native_span_reducers,
@@ -5636,11 +5714,13 @@ impl CompiledModule {
                         (Architecture::X86_64, true) => {
                             lower_x86_64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::Count,
+                                ordered_nfa_terminal_exact_set,
                             )?
                         }
                         (Architecture::Aarch64, true) => {
                             lower_aarch64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::Count,
+                                ordered_nfa_terminal_exact_set,
                             )?
                         }
                         (Architecture::X86_64, false) => {
@@ -5677,11 +5757,13 @@ impl CompiledModule {
                         (Architecture::X86_64, true) => {
                             lower_x86_64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::SpanSum,
+                                ordered_nfa_terminal_exact_set,
                             )?
                         }
                         (Architecture::Aarch64, true) => {
                             lower_aarch64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::SpanSum,
+                                ordered_nfa_terminal_exact_set,
                             )?
                         }
                         (Architecture::X86_64, false) => {
@@ -6890,6 +6972,20 @@ fn native_span_reducer_wrappers_fit(
     Ok(true)
 }
 
+/// Select the exhaustive aggregate-only form of the compiler terminal proof.
+/// Ordinary search and `SpanFill` deliberately never consult this selector.
+const fn ordered_nfa_aggregate_terminal_trim(
+    ordered_nfa_reducers: bool,
+    whole_window_width_gate: bool,
+    terminal_exact_set: Option<[u64; 4]>,
+) -> Option<[u64; 4]> {
+    if ordered_nfa_reducers && !whole_window_width_gate {
+        terminal_exact_set
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePreparedIdentityRelocation {
     X86PcRelative32(usize),
@@ -7347,6 +7443,9 @@ fn lower_native_ordered_nfa_prepared(
                 )
             }
         };
+    let terminal_exact_set_lowered = image
+        .terminal_exact_set_plan()?
+        .map(crate::ordered_nfa_native::NativeOrderedNfaTerminalExactSetPlan::words);
     let public_entry_size = entry_code.len();
     let private_entry_offset = public_entry_offset
         .checked_add(private_relative)
@@ -7407,6 +7506,7 @@ fn lower_native_ordered_nfa_prepared(
                 } else {
                     ORDERED_NFA_OBJECT_V1_ABI_VERSION
                 },
+                terminal_exact_set_lowered,
                 whole_window_width_gate_lowered: image
                     .layout
                     .whole_window_width_bounds
@@ -31720,9 +31820,41 @@ fn lower_x86_64_prepared_span_reduce(
     call_kind: NativeSpanReducerCallKind,
     ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
+        sink,
+        call_kind,
+        ordered_nfa_gate,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticated one-shot terminal trim and exact nullable iteration form one generated leaf"
+)]
+fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
+    sink: PreparedSpanSink,
+    call_kind: NativeSpanReducerCallKind,
+    ordered_nfa_gate: bool,
+    terminal_exact_set: Option<[u64; 4]>,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 64;
+    const OUTPUT_OFFSET: u8 = 16;
+    const ACCUMULATOR_OFFSET: u8 = 24;
+    const FLAGS_OFFSET: u8 = 32;
+    const TERMINAL_END_OFFSET: u8 = 40;
+    const SESSION_OFFSET: u8 = 48;
+
     if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA reducer has no private prepared target",
+        ));
+    }
+    if terminal_exact_set.is_some()
+        && (!ordered_nfa_gate || call_kind != NativeSpanReducerCallKind::PreparedPrivate)
+    {
+        return Err(ObjectError::InvalidModule(
+            "terminal exact-set aggregate trim has no Ordered-NFA private target",
         ));
     }
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
@@ -31730,12 +31862,6 @@ fn lower_x86_64_prepared_span_reduce(
             "x86 prepared scalar reducer received the Fill sink",
         ));
     }
-    const FRAME_BYTES: u8 = 64;
-    const OUTPUT_OFFSET: u8 = 16;
-    const ACCUMULATOR_OFFSET: u8 = 24;
-    const FLAGS_OFFSET: u8 = 32;
-    const SESSION_OFFSET: u8 = 48;
-
     let mut assembler = X86Assembler::new();
     let loop_head = assembler.label()?;
     let search = assembler.label()?;
@@ -31750,6 +31876,12 @@ fn lower_x86_64_prepared_span_reduce(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let terminal_scan = assembler.label()?;
+    let terminal_word0 = assembler.label()?;
+    let terminal_word1 = assembler.label()?;
+    let terminal_word2 = assembler.label()?;
+    let terminal_word3 = assembler.label()?;
+    let terminal_member = assembler.label()?;
 
     // Validate the complete public boundary before entering generated code
     // that can authenticate and then access source bytes.
@@ -31864,13 +31996,57 @@ fn lower_x86_64_prepared_span_reduce(
         ])?;
     }
 
+    if let Some(bitmap_words) = terminal_exact_set {
+        // The exhaustive reducer pays for one full reverse scan, once. The
+        // ordinary/private search keeps the original full length in R13 for
+        // assertion context while every iterator window ends at this E.
+        assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, TERMINAL_END_OFFSET])?; // E = H
+        assembler.instruction(&[0x4c, 0x89, 0xe9])?; // scan cursor = H
+        assembler.bind(terminal_scan)?;
+        assembler.instruction(&[0x48, 0x85, 0xc9])?;
+        assembler.branch(&[0x0f, 0x84], finished)?;
+        assembler.instruction(&[0x48, 0x83, 0xe9, 0x01])?;
+        assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x0c])?; // haystack[cursor]
+        assembler.instruction(&[0x83, 0xf8, 0x40])?;
+        assembler.branch(&[0x0f, 0x82], terminal_word0)?;
+        assembler.instruction(&[0x3d, 0x80, 0, 0, 0])?;
+        assembler.branch(&[0x0f, 0x82], terminal_word1)?;
+        assembler.instruction(&[0x3d, 0xc0, 0, 0, 0])?;
+        assembler.branch(&[0x0f, 0x82], terminal_word2)?;
+        assembler.branch(&[0xe9], terminal_word3)?;
+        for (label, word) in [
+            terminal_word0,
+            terminal_word1,
+            terminal_word2,
+            terminal_word3,
+        ]
+        .into_iter()
+        .zip(bitmap_words)
+        {
+            assembler.bind(label)?;
+            let mut load_word = vec![0x49, 0xba]; // movabs word, r10
+            load_word.extend_from_slice(&word.to_le_bytes());
+            assembler.instruction(&load_word)?;
+            assembler.branch(&[0xe9], terminal_member)?;
+        }
+        assembler.bind(terminal_member)?;
+        assembler.instruction(&[0x49, 0x0f, 0xa3, 0xc2])?; // bt rax, r10
+        assembler.branch(&[0x0f, 0x83], terminal_scan)?; // member bit clear
+        assembler.instruction(&[0x48, 0x83, 0xc1, 0x01])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, TERMINAL_END_OFFSET])?; // E = last member + 1
+    }
+
     assembler.bind(loop_head)?;
     assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
     assembler.instruction(&[0xa8, 0x02])?; // pending empty progress
     assembler.branch(&[0x0f, 0x84], search)?;
     assembler.instruction(&[0x83, 0xe0, 0xfd])?;
     assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
-    assembler.instruction(&[0x4d, 0x39, 0xee])?; // next_start == length
+    if terminal_exact_set.is_some() {
+        assembler.instruction(&[0x4c, 0x3b, 0x74, 0x24, TERMINAL_END_OFFSET])?; // next_start == E
+    } else {
+        assembler.instruction(&[0x4d, 0x39, 0xee])?; // next_start == length
+    }
     assembler.branch(&[0x0f, 0x84], finished)?;
     assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
 
@@ -31881,7 +32057,11 @@ fn lower_x86_64_prepared_span_reduce(
             assembler.instruction(&[0x4c, 0x89, 0xe6])?;
             assembler.instruction(&[0x4c, 0x89, 0xea])?;
             assembler.instruction(&[0x4c, 0x89, 0xf1])?;
-            assembler.instruction(&[0x4d, 0x89, 0xe8])?;
+            if terminal_exact_set.is_some() {
+                assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, TERMINAL_END_OFFSET])?; // window end = E
+            } else {
+                assembler.instruction(&[0x4d, 0x89, 0xe8])?;
+            }
             assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
             assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
         }
@@ -31910,7 +32090,12 @@ fn lower_x86_64_prepared_span_reduce(
     assembler.branch(&[0x0f, 0x82], invalid_result)?;
     assembler.instruction(&[0x4d, 0x39, 0xc1])?; // end >= start
     assembler.branch(&[0x0f, 0x82], invalid_result)?;
-    assembler.instruction(&[0x4d, 0x39, 0xe9])?; // end <= length
+    if terminal_exact_set.is_some() {
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, TERMINAL_END_OFFSET])?;
+        assembler.instruction(&[0x4d, 0x39, 0xd1])?; // end <= E
+    } else {
+        assembler.instruction(&[0x4d, 0x39, 0xe9])?; // end <= length
+    }
     assembler.branch(&[0x0f, 0x87], invalid_result)?;
     assembler.instruction(&[0x4d, 0x39, 0xc8])?;
     assembler.branch(&[0x0f, 0x85], nonempty)?;
@@ -31919,7 +32104,11 @@ fn lower_x86_64_prepared_span_reduce(
     assembler.branch(&[0x0f, 0x84], accepted)?;
     assembler.instruction(&[0x4d, 0x39, 0xcf])?; // last end != end
     assembler.branch(&[0x0f, 0x85], accepted)?;
-    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    if terminal_exact_set.is_some() {
+        assembler.instruction(&[0x4c, 0x3b, 0x74, 0x24, TERMINAL_END_OFFSET])?;
+    } else {
+        assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    }
     assembler.branch(&[0x0f, 0x84], finished)?;
     assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
     assembler.branch(&[0xe9], search)?;
@@ -32013,11 +32202,13 @@ fn lower_x86_64_prepared_span_reduce(
 
 fn lower_x86_64_ordered_nfa_span_reduce(
     sink: PreparedSpanSink,
+    terminal_exact_set: Option<[u64; 4]>,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
-    lower_x86_64_prepared_span_reduce(
+    lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
         sink,
         NativeSpanReducerCallKind::PreparedPrivate,
         true,
+        terminal_exact_set,
     )
 }
 
@@ -32493,9 +32684,41 @@ fn lower_aarch64_prepared_span_reduce(
     call_kind: NativeSpanReducerCallKind,
     ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
+        sink,
+        call_kind,
+        ordered_nfa_gate,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticated one-shot terminal trim and exact nullable iteration form one generated leaf"
+)]
+fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
+    sink: PreparedSpanSink,
+    call_kind: NativeSpanReducerCallKind,
+    ordered_nfa_gate: bool,
+    terminal_exact_set: Option<[u64; 4]>,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const LEGACY_FRAME_BYTES: u16 = 112;
+    const TERMINAL_FRAME_BYTES: u16 = 128;
+    const SAVED_REGISTERS_OFFSET: i16 = 16;
+    const SESSION_OFFSET: u16 = 96;
+    const SESSION_PAIR_OFFSET: i16 = 96;
+    const TERMINAL_END_OFFSET: u16 = 112;
+
     if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA reducer has no private prepared target",
+        ));
+    }
+    if terminal_exact_set.is_some()
+        && (!ordered_nfa_gate || call_kind != NativeSpanReducerCallKind::PreparedPrivate)
+    {
+        return Err(ObjectError::InvalidModule(
+            "terminal exact-set aggregate trim has no Ordered-NFA private target",
         ));
     }
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
@@ -32503,10 +32726,11 @@ fn lower_aarch64_prepared_span_reduce(
             "AArch64 prepared scalar reducer received the Fill sink",
         ));
     }
-    const FRAME_BYTES: u16 = 112;
-    const SAVED_REGISTERS_OFFSET: i16 = 16;
-    const SESSION_OFFSET: u16 = 96;
-    const SESSION_PAIR_OFFSET: i16 = 96;
+    let frame_bytes = if terminal_exact_set.is_some() {
+        TERMINAL_FRAME_BYTES
+    } else {
+        LEGACY_FRAME_BYTES
+    };
 
     let mut assembler = Aarch64Assembler::new();
     let loop_head = assembler.label()?;
@@ -32522,6 +32746,12 @@ fn lower_aarch64_prepared_span_reduce(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let terminal_scan = assembler.label()?;
+    let terminal_word0 = assembler.label()?;
+    let terminal_word1 = assembler.label()?;
+    let terminal_word2 = assembler.label()?;
+    let terminal_word3 = assembler.label()?;
+    let terminal_member = assembler.label()?;
 
     assembler.branch_zero_x(0, invalid_handle)?;
     assembler.branch_zero_x(1, invalid)?;
@@ -32572,7 +32802,7 @@ fn lower_aarch64_prepared_span_reduce(
         assembler.branch_cond(AARCH64_NE, wrong_identity)?;
     }
 
-    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_pair_x(
         19,
         20,
@@ -32600,10 +32830,52 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_movz_x(25, 0, 0)?)?; // accumulator
     assembler.instruction(aarch64_movz_w(26, 0)?)?; // iterator flags
 
+    if let Some(bitmap_words) = terminal_exact_set {
+        // Keep H in X21 for assertions. This one exhaustive aggregate scan
+        // computes a smaller semantic E in its own slot, disjoint from the
+        // two-word private prepared session at +96.
+        assembler.instruction(aarch64_store_x(21, 31, TERMINAL_END_OFFSET)?)?;
+        assembler.instruction(aarch64_mov_x(8, 21)?)?; // scan cursor = H
+        assembler.bind(terminal_scan)?;
+        assembler.branch_zero_x(8, finished)?;
+        assembler.instruction(aarch64_sub_x_imm(8, 8, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(9, 20, 8)?)?;
+        assembler.instruction(aarch64_cmp_w_imm(9, 64)?)?;
+        assembler.branch_cond(AARCH64_LO, terminal_word0)?;
+        assembler.instruction(aarch64_cmp_w_imm(9, 128)?)?;
+        assembler.branch_cond(AARCH64_LO, terminal_word1)?;
+        assembler.instruction(aarch64_cmp_w_imm(9, 192)?)?;
+        assembler.branch_cond(AARCH64_LO, terminal_word2)?;
+        assembler.branch(terminal_word3)?;
+        for (label, word) in [
+            terminal_word0,
+            terminal_word1,
+            terminal_word2,
+            terminal_word3,
+        ]
+        .into_iter()
+        .zip(bitmap_words)
+        {
+            assembler.bind(label)?;
+            aarch64_load_u64_constant(&mut assembler, 10, word)?;
+            assembler.branch(terminal_member)?;
+        }
+        assembler.bind(terminal_member)?;
+        assembler.instruction(aarch64_lsrv_x(10, 10, 9)?)?;
+        assembler.branch_bit_clear_w(10, 0, terminal_scan)?;
+        assembler.instruction(aarch64_add_x_imm(8, 8, 1)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, TERMINAL_END_OFFSET)?)?;
+    }
+
     assembler.bind(loop_head)?;
     assembler.branch_bit_clear_w(26, 1, search)?;
     assembler.instruction(aarch64_and_low_w(26, 26, 1)?)?;
-    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    if terminal_exact_set.is_some() {
+        assembler.instruction(aarch64_load_x_imm(8, 31, TERMINAL_END_OFFSET)?)?;
+        assembler.instruction(aarch64_cmp_x(23, 8)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    }
     assembler.branch_cond(AARCH64_EQ, finished)?;
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
 
@@ -32614,7 +32886,11 @@ fn lower_aarch64_prepared_span_reduce(
             assembler.instruction(aarch64_mov_x(1, 20)?)?;
             assembler.instruction(aarch64_mov_x(2, 21)?)?;
             assembler.instruction(aarch64_mov_x(3, 23)?)?;
-            assembler.instruction(aarch64_mov_x(4, 21)?)?;
+            if terminal_exact_set.is_some() {
+                assembler.instruction(aarch64_load_x_imm(4, 31, TERMINAL_END_OFFSET)?)?;
+            } else {
+                assembler.instruction(aarch64_mov_x(4, 21)?)?;
+            }
             // ADD (immediate) names SP for register 31, unlike MOV's XZR alias.
             assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
             assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
@@ -32640,14 +32916,24 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.branch_cond(AARCH64_LO, invalid_result)?;
     assembler.instruction(aarch64_cmp_x(9, 8)?)?;
     assembler.branch_cond(AARCH64_LO, invalid_result)?;
-    assembler.instruction(aarch64_cmp_x(9, 21)?)?;
+    if terminal_exact_set.is_some() {
+        assembler.instruction(aarch64_load_x_imm(10, 31, TERMINAL_END_OFFSET)?)?;
+        assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(9, 21)?)?;
+    }
     assembler.branch_cond(AARCH64_HI, invalid_result)?;
     assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, nonempty)?;
     assembler.branch_bit_clear_w(26, 0, accepted)?;
     assembler.instruction(aarch64_cmp_x(24, 9)?)?;
     assembler.branch_cond(AARCH64_NE, accepted)?;
-    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    if terminal_exact_set.is_some() {
+        assembler.instruction(aarch64_load_x_imm(10, 31, TERMINAL_END_OFFSET)?)?;
+        assembler.instruction(aarch64_cmp_x(23, 10)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    }
     assembler.branch_cond(AARCH64_EQ, finished)?;
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
     assembler.branch(search)?;
@@ -32686,7 +32972,7 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
     assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(invalid_handle)?;
     assembler.instruction(aarch64_movz_w(0, 5)?)?;
@@ -32740,11 +33026,13 @@ fn lower_aarch64_prepared_span_reduce(
 
 fn lower_aarch64_ordered_nfa_span_reduce(
     sink: PreparedSpanSink,
+    terminal_exact_set: Option<[u64; 4]>,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
-    lower_aarch64_prepared_span_reduce(
+    lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
         sink,
         NativeSpanReducerCallKind::PreparedPrivate,
         true,
+        terminal_exact_set,
     )
 }
 
@@ -59444,6 +59732,275 @@ mod tests {
             )
             .expect("far AArch64 direct SpanSum-only call"),
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one cross-ISA audit keeps the exhaustive trim model, full-context ABI, frame partition, and byte-inert absence proof together"
+    )]
+    fn ordered_nfa_aggregate_terminal_trim_is_one_shot_and_context_preserving() {
+        let exact = [0x8000_0000_0000_0001; 4];
+        let contains = |byte: u8| {
+            let index = usize::from(byte);
+            exact[index / 64] & (1_u64 << (index % 64)) != 0
+        };
+        let trim_end = |haystack: &[u8]| {
+            haystack
+                .iter()
+                .rposition(|&byte| contains(byte))
+                .map(|position| position + 1)
+        };
+
+        let no_member = vec![b'!'; 8 * 1_024];
+        assert_eq!(trim_end(&no_member), None);
+        let mut early_member = no_member.clone();
+        early_member[3] = 0x40;
+        assert_eq!(trim_end(&early_member), Some(4));
+        assert_eq!(early_member.len(), 8 * 1_024);
+        for boundary in [0x00, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff] {
+            assert!(contains(boundary));
+            assert_eq!(trim_end(&[b'!', boundary, b'!']), Some(2));
+        }
+
+        assert_eq!(
+            ordered_nfa_aggregate_terminal_trim(true, false, Some(exact)),
+            Some(exact),
+        );
+        assert_eq!(
+            ordered_nfa_aggregate_terminal_trim(true, true, Some(exact)),
+            None,
+            "an absolute-width owner must suppress the aggregate trim",
+        );
+        assert_eq!(
+            ordered_nfa_aggregate_terminal_trim(false, false, Some(exact)),
+            None,
+        );
+        assert_eq!(ordered_nfa_aggregate_terminal_trim(true, false, None), None,);
+
+        for sink in [PreparedSpanSink::Count, PreparedSpanSink::SpanSum] {
+            let x86_legacy = lower_x86_64_prepared_span_reduce(
+                sink,
+                NativeSpanReducerCallKind::PreparedPrivate,
+                true,
+            )
+            .expect("x86 legacy Ordered-NFA reducer");
+            let x86_absent = lower_x86_64_ordered_nfa_span_reduce(sink, None)
+                .expect("x86 absent-plan Ordered-NFA reducer");
+            assert_eq!(
+                x86_absent.code, x86_legacy.code,
+                "absent x86 plan changed legacy reducer bytes",
+            );
+            let x86 = lower_x86_64_ordered_nfa_span_reduce(sink, Some(exact))
+                .expect("x86 exact-terminal Ordered-NFA reducer");
+            assert!(x86.code.len() > x86_absent.code.len());
+            let x86_source_load = [0x41, 0x0f, 0xb6, 0x04, 0x0c];
+            assert_eq!(
+                x86.code
+                    .windows(x86_source_load.len())
+                    .filter(|window| *window == x86_source_load)
+                    .count(),
+                1,
+            );
+            let source_offset = x86
+                .code
+                .windows(x86_source_load.len())
+                .position(|window| window == x86_source_load)
+                .expect("x86 exhaustive source load");
+            let Some(NativePreparedIdentityRelocation::X86PcRelative32(identity_offset)) =
+                x86.identity_relocation
+            else {
+                panic!("x86 exact reducer identity relocation");
+            };
+            assert!(source_offset > identity_offset + 4);
+            assert!(source_offset < x86.prepared_call_offset);
+            assert!(
+                source_offset
+                    > x86
+                        .ordered_nfa_gate_call_offset
+                        .expect("x86 Ordered-NFA operation gate"),
+            );
+            for instruction in [
+                [0x4c, 0x89, 0x6c, 0x24, 0x28].as_slice(), // E = H at +40
+                [0x4c, 0x8d, 0x54, 0x24, 0x30].as_slice(), // session stays +48
+                [0x4c, 0x3b, 0x74, 0x24, 0x28].as_slice(), // empty progress vs E
+                [0x4c, 0x8b, 0x54, 0x24, 0x28, 0x4d, 0x39, 0xd1].as_slice(), // end <= E
+            ] {
+                assert!(
+                    x86.code
+                        .windows(instruction.len())
+                        .any(|window| window == instruction),
+                    "x86 exact reducer omitted {instruction:02x?}",
+                );
+            }
+            let x86_call_arguments = [
+                0x48, 0x89, 0xdf, // handle
+                0x4c, 0x89, 0xe6, // haystack
+                0x4c, 0x89, 0xea, // full H remains assertion length
+                0x4c, 0x89, 0xf1, // moving start
+                0x4c, 0x8b, 0x44, 0x24, 0x28, // trimmed E is only the window end
+            ];
+            assert!(
+                x86.code
+                    .windows(x86_call_arguments.len())
+                    .any(|window| window == x86_call_arguments),
+                "x86 private call conflated full H with trimmed E",
+            );
+
+            let aarch64_legacy = lower_aarch64_prepared_span_reduce(
+                sink,
+                NativeSpanReducerCallKind::PreparedPrivate,
+                true,
+            )
+            .expect("AArch64 legacy Ordered-NFA reducer");
+            let aarch64_absent = lower_aarch64_ordered_nfa_span_reduce(sink, None)
+                .expect("AArch64 absent-plan Ordered-NFA reducer");
+            assert_eq!(
+                aarch64_absent.code, aarch64_legacy.code,
+                "absent AArch64 plan changed legacy reducer bytes",
+            );
+            let aarch64 = lower_aarch64_ordered_nfa_span_reduce(sink, Some(exact))
+                .expect("AArch64 exact-terminal Ordered-NFA reducer");
+            assert!(aarch64.code.len() > aarch64_absent.code.len());
+            let words = aarch64
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let source_load = aarch64_load_byte_reg(9, 20, 8).unwrap();
+            assert_eq!(words.iter().filter(|&&word| word == source_load).count(), 1,);
+            let source_offset = words
+                .iter()
+                .position(|&word| word == source_load)
+                .expect("AArch64 exhaustive source load")
+                * 4;
+            let Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                page_offset: identity_offset,
+                ..
+            }) = aarch64.identity_relocation
+            else {
+                panic!("AArch64 exact reducer identity relocation");
+            };
+            assert!(source_offset > identity_offset + 4);
+            assert!(source_offset < aarch64.prepared_call_offset);
+            assert!(
+                source_offset
+                    > aarch64
+                        .ordered_nfa_gate_call_offset
+                        .expect("AArch64 Ordered-NFA operation gate"),
+            );
+            for instruction in [
+                aarch64_sub_x_imm(31, 31, 128).unwrap(),
+                aarch64_store_x(21, 31, 112).unwrap(),
+                aarch64_add_x_imm(6, 31, 96).unwrap(),
+                aarch64_add_x_imm(31, 31, 128).unwrap(),
+            ] {
+                assert!(words.contains(&instruction));
+            }
+            let aarch64_call_arguments = [
+                aarch64_mov_x(0, 19).unwrap(),
+                aarch64_mov_x(1, 20).unwrap(),
+                aarch64_mov_x(2, 21).unwrap(), // full H remains assertion length
+                aarch64_mov_x(3, 23).unwrap(),
+                aarch64_load_x_imm(4, 31, 112).unwrap(), // E is only window end
+            ];
+            assert!(
+                words
+                    .windows(aarch64_call_arguments.len())
+                    .any(|window| window == aarch64_call_arguments),
+                "AArch64 private call conflated full H with trimmed E",
+            );
+            for validation in [
+                [
+                    aarch64_load_x_imm(8, 31, 112).unwrap(),
+                    aarch64_cmp_x(23, 8).unwrap(),
+                ],
+                [
+                    aarch64_load_x_imm(10, 31, 112).unwrap(),
+                    aarch64_cmp_x(9, 10).unwrap(),
+                ],
+                [
+                    aarch64_load_x_imm(10, 31, 112).unwrap(),
+                    aarch64_cmp_x(23, 10).unwrap(),
+                ],
+            ] {
+                assert!(
+                    words
+                        .windows(validation.len())
+                        .any(|window| window == validation),
+                    "AArch64 exact reducer omitted E validation {validation:08x?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_nfa_width_gate_suppresses_terminal_trim_in_appended_reducers() {
+        const PATTERN: &str = concat!(
+            r"^[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,120}",
+            r"[0-24-6]$",
+        );
+        let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let mut slow_limits = SlowAotLimits::default();
+            slow_limits.determinize.max_states = 0;
+            slow_limits.determinize.max_transitions = 0;
+            slow_limits.determinize.max_work = 0;
+            let compiled = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(PATTERN, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(CompileLimitsV1 {
+                        determinize: DeterminizeLimits {
+                            max_states: 0,
+                            ..DeterminizeLimits::default()
+                        },
+                        ..CompileLimitsV1::default()
+                    }),
+                exports,
+                slow_limits,
+            )
+            .expect("compile width/exact-set aggregate fixture");
+            let module = compiled.module();
+            assert!(module.has_ordered_nfa_terminal_exact_set());
+            assert!(module.has_ordered_nfa_whole_window_width_gate());
+            let exact = module
+                .ordered_nfa_terminal_exact_set_lowered
+                .expect("retained validated exact-set words");
+            assert_eq!(
+                ordered_nfa_aggregate_terminal_trim(true, true, Some(exact)),
+                None,
+            );
+            for (sink, symbol_name) in [
+                (
+                    PreparedSpanSink::Count,
+                    module.prepared_count_symbol().expect("width-gated Count"),
+                ),
+                (
+                    PreparedSpanSink::SpanSum,
+                    module
+                        .prepared_span_sum_symbol()
+                        .expect("width-gated SpanSum"),
+                ),
+            ] {
+                let expected = match target.architecture {
+                    Architecture::X86_64 => lower_x86_64_ordered_nfa_span_reduce(sink, None),
+                    Architecture::Aarch64 => lower_aarch64_ordered_nfa_span_reduce(sink, None),
+                }
+                .expect("rebuild width-gated reducer without duplicate trim");
+                let symbol = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == symbol_name)
+                    .expect("width-gated aggregate symbol");
+                assert_eq!(
+                    usize::try_from(symbol.size).unwrap(),
+                    expected.code.len(),
+                    "width/exact coexistence emitted a duplicate trim on {target:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -99555,6 +100112,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 bit_parallel_exact_endpoint_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
+                ordered_nfa_terminal_exact_set_lowered: None,
                 ordered_nfa_whole_window_width_gate_lowered: false,
             };
 
@@ -99878,6 +100436,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             bit_parallel_exact_endpoint_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
+            ordered_nfa_terminal_exact_set_lowered: None,
             ordered_nfa_whole_window_width_gate_lowered: false,
         };
 

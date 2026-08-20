@@ -2810,6 +2810,10 @@ fn emit_semantic_body(
 pub(super) fn lower_x86_64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<OrderedNfaNativeEntry, ObjectError> {
+    // The fragmented terminal proof is aggregate-only. Revalidate it here so
+    // a forged compiler-only receipt still fails closed, but do not let it
+    // change the shared/public/private one-Span entry.
+    let _ = image.terminal_exact_set_plan()?;
     let layout = image.layout;
     let expected_scratch_bytes = scratch_bytes(layout)?;
     let mut asm = X86Assembler::new();
@@ -3174,6 +3178,7 @@ mod tests {
                 ordered_edge_dispatch: None,
                 terminal_range: None,
             },
+            terminal_exact_set_words: None,
             start_closure_program: None,
         }
     }
@@ -3483,6 +3488,69 @@ mod tests {
                 .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ordered_nfa_x86_terminal_exact_set_is_shared_entry_inert_but_validated() {
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let pattern = format!(r"{repeated}[0-24-6]");
+        let program = optimizing_ordered_nfa(&pattern);
+        let view = program.native_ordered_nfa_view().unwrap();
+        let selected = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            selected.terminal_exact_set_plan().unwrap().is_some(),
+            "fragmented final column must retain its validated aggregate receipt",
+        );
+        assert!(selected.layout.terminal_range.is_none());
+
+        let without = NativeOrderedNfaObjectImage::try_build(
+            crate::ordered_nfa_native::NativeOrderedNfaProgramView {
+                terminal_exact_set: None,
+                ..view
+            },
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.bytes, without.bytes);
+
+        let selected_entry = lower_x86_64(&selected).unwrap();
+        let without_entry = lower_x86_64(&without).unwrap();
+        assert_eq!(selected_entry.code, without_entry.code);
+        assert_eq!(selected_entry.relocations, without_entry.relocations);
+        assert_eq!(
+            selected_entry.private_entry_offset,
+            without_entry.private_entry_offset,
+        );
+        assert_eq!(
+            selected_entry.bulk_gate_entry_offset,
+            without_entry.bulk_gate_entry_offset,
+        );
+
+        let mut overlap = selected.clone();
+        overlap.layout.terminal_range =
+            Some(crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                start: b'a',
+                end: b'z',
+                reverse_depth: 0,
+            });
+        assert!(matches!(
+            lower_x86_64(&overlap),
+            Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set overlaps terminal range"
+            ))
+        ));
+
+        let mut invalid = selected;
+        invalid.terminal_exact_set_words = Some([0; 4]);
+        assert!(matches!(
+            lower_x86_64(&invalid),
+            Err(ObjectError::InvalidModule(
+                "ordered-NFA terminal exact-set proof"
+            ))
+        ));
     }
 
     #[test]

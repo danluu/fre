@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v22() {
+fn receipt_records_selected_workspace_optimizer_identity_v23() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 22);
+    assert_eq!(OPTIMIZER_VERSION, 23);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -1122,6 +1122,196 @@ fn ordered_nfa_compiler_text_final_object_retries_preserve_exact_v3() {
         retried_aggregate_without_start.object(),
         without_start_aggregate_object,
     );
+}
+
+const TERMINAL_EXACT_SET_PATTERN: &str = concat!(
+    r"^[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,120}",
+    r"[0-24-6]$",
+);
+const TERMINAL_EXACT_SET_AGGREGATE_PATTERN: &str = concat!(
+    r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}",
+    r"[0-24-6](?-u:\b)",
+);
+
+fn terminal_exact_set_slow_limits() -> SlowAotLimits {
+    let mut limits = SlowAotLimits::default();
+    limits.determinize.max_states = 0;
+    limits.determinize.max_transitions = 0;
+    limits.determinize.max_work = 0;
+    limits
+}
+
+#[test]
+fn ordered_nfa_terminal_exact_set_is_shared_entry_data_abi_and_relocation_inert_on_both_isas() {
+    let mut compile_limits = CompileLimitsV1::default();
+    compile_limits.determinize.max_states = 0;
+    let compiled = compile_with_slow_aot_limits(
+        CompileRequest::new(TERMINAL_EXACT_SET_PATTERN, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(compile_limits),
+        terminal_exact_set_slow_limits(),
+    )
+    .expect("build fragmented terminal-set Ordered-NFA program");
+    assert!(
+        compiled
+            .program()
+            .native_ordered_nfa_view()
+            .and_then(|view| view.terminal_exact_set)
+            .is_some(),
+    );
+
+    let relocation_shapes = |module: &crate::CompiledModule| {
+        module
+            .relocations()
+            .iter()
+            .map(|relocation| {
+                (
+                    relocation.section,
+                    relocation.kind,
+                    relocation.symbol,
+                    relocation.addend,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let enabled = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width(
+            compiled.program(), target, false, true, true, true, true, true, true, usize::MAX,
+        )
+        .expect("lower exact terminal-set module");
+        let disabled = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+            compiled.program(), target, false, true, true, true, true, true, true, false,
+            usize::MAX,
+        )
+        .expect("lower module without the exact terminal-set receipt");
+        assert!(enabled.has_ordered_nfa_terminal_exact_set(), "{target:?}");
+        assert!(!disabled.has_ordered_nfa_terminal_exact_set(), "{target:?}");
+        assert_eq!(
+            enabled.required_prepare_capabilities(),
+            disabled.required_prepare_capabilities(),
+            "capability drift for {target:?}",
+        );
+        assert_eq!(
+            enabled.ordered_nfa_object_abi_and_flags(),
+            disabled.ordered_nfa_object_abi_and_flags(),
+            "object ABI/flag drift for {target:?}",
+        );
+        assert_eq!(
+            enabled.sections()[1].bytes(),
+            disabled.sections()[1].bytes(),
+            "program/object data drift for {target:?}",
+        );
+        assert_eq!(
+            relocation_shapes(&enabled),
+            relocation_shapes(&disabled),
+            "relocation dependency drift for {target:?}",
+        );
+        assert_eq!(
+            enabled.sections()[0].bytes(),
+            disabled.sections()[0].bytes(),
+            "shared one-Span text drift for {target:?}",
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordinary inertness and the aggregate-only object-cap retry share one exact fixture"
+)]
+fn ordered_nfa_terminal_exact_set_is_ordinary_inert_and_retries_aggregate_text_first() {
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(TERMINAL_EXACT_SET_AGGREGATE_PATTERN, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: crate::DeterminizeLimits {
+                    max_states: 0,
+                    ..crate::DeterminizeLimits::default()
+                },
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let slow_limits = terminal_exact_set_slow_limits();
+    let selected = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded exact terminal-set fixture");
+    assert!(selected.module().has_ordered_nfa_terminal_exact_set());
+    assert!(!selected.module().has_ordered_nfa_whole_window_width_gate());
+    assert!(!selected.module().has_ordered_nfa_terminal_range_object());
+
+    let without_exact = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+        selected.program(), target, false, true, true, true, true, true, true, false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route lowering without the terminal exact-set receipt")
+    .with_optimizing_fallbacks_may_continue(
+        selected.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!without_exact.has_ordered_nfa_terminal_exact_set());
+    assert!(!without_exact.has_ordered_nfa_whole_window_width_gate());
+    assert_eq!(
+        selected.module().sections()[0].bytes(),
+        without_exact.sections()[0].bytes(),
+        "ordinary one-Span text must ignore the aggregate-only receipt",
+    );
+    assert_eq!(
+        selected.module().sections()[1].bytes(),
+        without_exact.sections()[1].bytes(),
+        "the compiler-only receipt must not enter data",
+    );
+
+    let format = crate::ObjectFormat::for_target(target);
+    let without_exact_object =
+        emit_object(&without_exact, format, usize::MAX).expect("emit exact-set-disabled object");
+    assert_eq!(
+        selected.object(),
+        without_exact_object,
+        "ordinary objects must be byte-identical",
+    );
+
+    let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+    let selected_aggregate = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        request(usize::MAX),
+        exports,
+        slow_limits,
+    )
+    .expect("unbounded exact terminal-set aggregate");
+    assert!(
+        selected_aggregate
+            .module()
+            .has_ordered_nfa_terminal_exact_set(),
+    );
+    let serialized = selected
+        .program()
+        .serialize()
+        .expect("serialize exact terminal-set fixture");
+    let without_exact_aggregate = without_exact
+        .append_prepared_aggregate_exports(
+            exports,
+            selected.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append aggregate exports without terminal exact-set text");
+    let without_exact_aggregate_object = emit_object(&without_exact_aggregate, format, usize::MAX)
+        .expect("emit exact-set-disabled aggregate object");
+    assert!(
+        without_exact_aggregate_object.len() < selected_aggregate.object().len(),
+        "only Count/SpanSum wrappers should carry exact-set text",
+    );
+
+    let aggregate_one_below = selected_aggregate.object().len() - 1;
+    assert!(without_exact_aggregate_object.len() <= aggregate_one_below);
+    let retried_aggregate = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        request(aggregate_one_below),
+        exports,
+        slow_limits,
+    )
+    .expect("aggregate exact-set object one-below retries without its text");
+    assert_eq!(retried_aggregate.module(), &without_exact_aggregate);
+    assert_eq!(retried_aggregate.object(), without_exact_aggregate_object);
 }
 
 #[test]
@@ -3362,6 +3552,16 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     const ORDERED_TERMINAL_LOW_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
+    const ORDERED_TERMINAL_EXACT_PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}[0-24-6](?-u:\b)";
+    const ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN: &str = concat!(
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}",
+        r"(?-u:[\x00\x3F\x40\x7F\x80\xBF\xC0\xFF])(?-u:\b)",
+    );
+    const ORDERED_TERMINAL_EXACT_WIDTH_PATTERN: &str = concat!(
+        r"^[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,120}",
+        r"[0-24-6]$",
+    );
     const ASSERTION_CACHE_PATTERN: &str =
         r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))";
     const PLAIN_START_CLOSURE_PATTERN: &str =
@@ -3379,6 +3579,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         Target::aarch64_linux()
     } else {
         Target::aarch64_macos()
+    };
+    let terminal_boundary_haystack = |byte| {
+        let mut haystack = vec![b'A'; 100];
+        haystack.push(byte);
+        haystack.push(b'A');
+        haystack
     };
     let fixtures = [
         (
@@ -3607,6 +3813,102 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 },
             ],
         ),
+        (
+            ORDERED_TERMINAL_EXACT_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                vec![b'3'; 64],
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.push(b'0');
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.push(b'0');
+                    haystack.extend(std::iter::repeat_n(b'3', 63));
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.push(b'0');
+                    haystack.extend(std::iter::repeat_n(b'3', 64));
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'!'];
+                    haystack.extend(std::iter::repeat_n(b'A', 100));
+                    haystack.extend_from_slice(b"0!");
+                    haystack
+                },
+                vec![b'3'; 257],
+                {
+                    let mut haystack = vec![b'!'];
+                    haystack.extend(std::iter::repeat_n(b'A', 100));
+                    haystack.extend_from_slice(b"0!");
+                    haystack.extend(std::iter::repeat_n(b'3', 257));
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'!'];
+                    haystack.extend(std::iter::repeat_n(b'A', 100));
+                    haystack.push(b'0');
+                    haystack.extend(std::iter::repeat_n(b'3', 63));
+                    haystack.push(b'!');
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'!'];
+                    haystack.extend(std::iter::repeat_n(b'A', 100));
+                    haystack.push(b'0');
+                    haystack.extend(std::iter::repeat_n(b'3', 64));
+                    haystack.push(b'!');
+                    haystack
+                },
+            ],
+        ),
+        (
+            ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                terminal_boundary_haystack(0x00),
+                terminal_boundary_haystack(0x3f),
+                terminal_boundary_haystack(0x40),
+                terminal_boundary_haystack(0x7f),
+                terminal_boundary_haystack(0x80),
+                terminal_boundary_haystack(0xbf),
+                terminal_boundary_haystack(0xc0),
+                terminal_boundary_haystack(0xff),
+                terminal_boundary_haystack(0x3e),
+                vec![b'A'; 4_096],
+                {
+                    let mut haystack = vec![b'A'; 101];
+                    haystack.push(0x00);
+                    haystack.extend(std::iter::repeat_n(b'A', 4_096));
+                    haystack
+                },
+            ],
+        ),
+        (
+            ORDERED_TERMINAL_EXACT_WIDTH_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![vec![b'A'; 99], {
+                let mut haystack = vec![b'A'; 100];
+                haystack.push(b'0');
+                haystack
+            }],
+        ),
     ];
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
@@ -3622,7 +3924,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     let mut objects = Vec::new();
     let mut compiled = Vec::new();
     let mut source = String::from(
-        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+        "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\
          typedef void *handle_t;\n\
          typedef struct {size_t next_start;size_t last_match_end;uint32_t flags;uint32_t reserved;} iter_state_t;\n\
          typedef struct {size_t start;size_t end;} span_t;\n\
@@ -3641,7 +3943,13 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .output(OutputContract::Span);
         let terminal_prefilter_fixture = *pattern == ORDERED_EDGE_DISPATCH_PATTERN
             || *pattern == ORDERED_TERMINAL_LOW_PATTERN;
+        let terminal_exact_set_trim_fixture = *pattern == ORDERED_TERMINAL_EXACT_PATTERN
+            || *pattern == ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN;
+        let terminal_exact_set_width_fixture = *pattern == ORDERED_TERMINAL_EXACT_WIDTH_PATTERN;
+        let terminal_exact_set_fixture =
+            terminal_exact_set_trim_fixture || terminal_exact_set_width_fixture;
         let forced_ordered_graph_fixture = terminal_prefilter_fixture
+            || terminal_exact_set_fixture
             || *pattern == ASSERTION_CACHE_PATTERN
             || *pattern == PLAIN_START_CLOSURE_PATTERN
             || *pattern == PREFIX_FLOW_PATTERN
@@ -3743,6 +4051,27 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                         .any(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v3"),
                     "wide-row fixture did not publish its composed V3 object",
                 );
+            }
+            if terminal_exact_set_fixture {
+                let view = artifact
+                    .program()
+                    .native_ordered_nfa_view()
+                    .expect("fragmented terminal fixture retains its Ordered-NFA view");
+                assert!(view.terminal_exact_set.is_some());
+                assert!(view.terminal_range.is_none());
+                assert!(artifact.module().has_ordered_nfa_terminal_exact_set());
+                if terminal_exact_set_width_fixture {
+                    assert!(view.whole_window_width_bounds.is_some());
+                    assert!(artifact.module().has_ordered_nfa_whole_window_width_gate());
+                } else {
+                    assert!(view.whole_window_width_bounds.is_none());
+                    assert!(
+                        !artifact.module().has_ordered_nfa_whole_window_width_gate(),
+                        "fragmented terminal linked fixture must exercise the aggregate trim",
+                    );
+                }
+                assert!(!artifact.module().has_ordered_nfa_terminal_range_object());
+                assert!(artifact.module().has_ordered_edge_dispatch_object());
             }
             if *pattern == ASSERTION_CACHE_PATTERN {
                 let ordered_view = artifact
@@ -3916,7 +4245,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 || *pattern == ABSOLUTE_WORD_WIDTH_PATTERN
             {
                 None
-            } else if *pattern == PREFIX_FLOW_PATTERN {
+            } else if *pattern == PREFIX_FLOW_PATTERN || terminal_exact_set_fixture {
                 fixed_width_window_oracle(&oracle, haystack, window_start, window_end)
             } else {
                 oracle
@@ -4062,6 +4391,20 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     != first.program().artifact_identity()
         })
         .expect("foreign Ordered-NFA authentication fixture");
+    let exact = compiled
+        .iter()
+        .find(|artifact| {
+            artifact.module().has_ordered_nfa_terminal_exact_set()
+                && !artifact.module().has_ordered_nfa_whole_window_width_gate()
+        })
+        .expect("terminal exact-set authentication fixture");
+    let exact_width = compiled
+        .iter()
+        .find(|artifact| {
+            artifact.module().has_ordered_nfa_terminal_exact_set()
+                && artifact.module().has_ordered_nfa_whole_window_width_gate()
+        })
+        .expect("terminal exact-set plus width authentication fixture");
     let (first_program, first_program_len) = first
         .module()
         .required_runtime_program()
@@ -4070,6 +4413,10 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         .module()
         .required_runtime_program()
         .expect("second authentication program");
+    let (exact_width_program, exact_width_program_len) = exact_width
+        .module()
+        .required_runtime_program()
+        .expect("terminal exact-set plus width authentication program");
     let first_count = first
         .module()
         .prepared_count_symbol()
@@ -4078,22 +4425,51 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         .module()
         .prepared_span_sum_symbol()
         .expect("first authentication SpanSum");
+    let exact_count = exact
+        .module()
+        .prepared_count_symbol()
+        .expect("terminal exact-set authentication Count");
+    let exact_span_sum = exact
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("terminal exact-set authentication SpanSum");
+    let exact_width_count = exact_width
+        .module()
+        .prepared_count_symbol()
+        .expect("terminal exact-set plus width authentication Count");
+    let exact_width_span_sum = exact_width
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("terminal exact-set plus width authentication SpanSum");
     writeln!(
         source,
         concat!(
             "static int authenticate_before_source(void){{",
-            "handle_t right=0,wrong=0;",
+            "handle_t right=0,wrong=0,width=0;",
             "const prepare_v3_t v3={{112U,3U,UINT64_C(6),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};",
             "uint64_t out=UINT64_C(0x1122334455667788);",
             "static const unsigned char readable[8]={{0}};",
             "unsigned char bytes[17];uint32_t q;int authentication_failed=0;memset(bytes,0xa5,sizeof(bytes));",
             "if(fre_aot_regex_runtime_prepare_exclusive_v3({first_program},{first_program_len}U,&v3,&right)!=0U)return 1;",
             "if(fre_aot_regex_runtime_prepare_exclusive_v3({second_program},{second_program_len}U,&v3,&wrong)!=0U)return 2;",
+            "if(fre_aot_regex_runtime_prepare_exclusive_v3({exact_width_program},{exact_width_program_len}U,&v3,&width)!=0U)return 3;",
             "q={first_count}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
             "out=UINT64_C(0x1122334455667788);",
             "q={first_span_sum}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={exact_count}(right,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={exact_span_sum}(right,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={exact_width_count}(width,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=0U||out!=0U)authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={exact_width_span_sum}(width,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=0U||out!=0U)authentication_failed=1;",
             "out=UINT64_C(0x1122334455667788);",
             "q={first_count}(wrong,readable,sizeof(readable),&out);",
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
@@ -4110,15 +4486,21 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             "if({first_count}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 18;",
             "out=UINT64_C(0x1122334455667788);",
             "if({first_span_sum}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 19;",
-            "if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 20;",
+            "if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(width)!=0U)return 20;",
             "return 0;}}",
         ),
         first_program = first_program,
         first_program_len = first_program_len,
         second_program = second_program,
         second_program_len = second_program_len,
+        exact_width_program = exact_width_program,
+        exact_width_program_len = exact_width_program_len,
         first_count = first_count,
         first_span_sum = first_span_sum,
+        exact_count = exact_count,
+        exact_span_sum = exact_span_sum,
+        exact_width_count = exact_width_count,
+        exact_width_span_sum = exact_width_span_sum,
     )
     .expect("write authentication-before-source checks");
     source.push_str("int main(void){int status;\n");
@@ -4126,13 +4508,19 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         for case_index in 0..haystacks.len() {
             writeln!(
                 source,
-                "status=run{fixture_index}_{case_index}();if(status)return {}+status;",
-                20 + fixture_index * 20 + case_index * 4,
+                concat!(
+                    "status=run{fixture_index}_{case_index}();",
+                    "if(status){{fprintf(stderr,\"fixture {fixture_index} case {case_index}: status=%d\\n\",status);return 1;}}",
+                ),
+                fixture_index = fixture_index,
+                case_index = case_index,
             )
             .expect("invoke aggregate differential case");
         }
     }
-    source.push_str("status=authenticate_before_source();if(status)return 200+status;return 0;}\n");
+    source.push_str(
+        "status=authenticate_before_source();if(status){fprintf(stderr,\"authentication: status=%d\\n\",status);return 1;}return 0;}\n",
+    );
 
     let current_exe = std::env::current_exe().expect("current test executable");
     let profile_dir = current_exe
