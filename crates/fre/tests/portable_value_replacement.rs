@@ -3,9 +3,9 @@
 use std::borrow::Cow;
 
 use fre::{
-    NoExpand, PlanSelection, PortableBuilder, PortableFindIterError, PortableFindIterLimits,
-    PortableFindIterRunLimits, PortableValueReplacementError, RustProfile, SearchLimits,
-    SearchSessionLimits, ValueReplacementOutputLimits,
+    NoExpand, PlanKind, PlanSelection, PortableBuilder, PortableFindIterError,
+    PortableFindIterLimits, PortableFindIterRunLimits, PortableValueReplacementError, RustProfile,
+    SearchLimits, SearchSessionLimits, ValueReplacementOutputLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -243,6 +243,76 @@ fn value_replacement_preserves_setup_search_and_call_cap_refusals() {
         )
         .expect("session must remain reusable after refusal");
     assert_eq!(recovered.as_ref(), b"_x");
+}
+
+#[test]
+fn exact_literal_value_replacement_matches_the_first_value_iterator_item() {
+    let regex = PortableBuilder::new("needle")
+        .unicode(false)
+        .build()
+        .expect("exact literal value replacement regex");
+    assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+
+    let limits = [
+        PortableFindIterLimits::unlimited(),
+        PortableFindIterLimits {
+            session: SearchSessionLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            search: SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            max_search_calls: 0,
+            ..PortableFindIterLimits::unlimited()
+        },
+    ];
+    let output_limits = ValueReplacementOutputLimits {
+        max_output_bytes: usize::MAX,
+        max_output_capacity_bytes: usize::MAX,
+    };
+
+    for haystack in [
+        b"needle first".as_slice(),
+        b"prefix needle suffix".as_slice(),
+        b"absent".as_slice(),
+        b"".as_slice(),
+    ] {
+        for iterator_limits in limits {
+            let first = regex
+                .find_iter_value(haystack, iterator_limits)
+                .expect("an exact literal needs no session resources")
+                .next();
+            let actual =
+                regex.replace_literal_value(haystack, b"X", iterator_limits, output_limits);
+
+            match first {
+                Some(Ok(matched)) => {
+                    let mut expected = Vec::new();
+                    expected.extend_from_slice(&haystack[..matched.start()]);
+                    expected.extend_from_slice(b"X");
+                    expected.extend_from_slice(&haystack[matched.end()..]);
+                    assert_eq!(actual.expect("matching replacement").as_ref(), expected);
+                }
+                Some(Err(error)) => assert_eq!(
+                    actual.expect_err("the direct search must preserve iterator refusal"),
+                    PortableValueReplacementError::Iteration(error),
+                ),
+                None => {
+                    let actual = actual.expect("absent replacement");
+                    assert!(matches!(actual, Cow::Borrowed(_)));
+                    assert_eq!(actual.as_ref(), haystack);
+                }
+            }
+        }
+    }
 }
 
 #[test]

@@ -662,8 +662,8 @@ impl std::error::Error for FunctionalReplacementErrorSource {
 }
 
 impl PortableRegex {
-    /// Replace the first selected byte match with literal bytes through the
-    /// value-only iterator route.
+    /// Replace the first selected byte match with literal bytes through a
+    /// value-only selected-span route.
     ///
     /// `$` has no special meaning: this is the bounded counterpart of pinned
     /// Rust bytes replacement with [`NoExpand`]. A no-match result borrows the
@@ -676,9 +676,12 @@ impl PortableRegex {
     ///
     /// # Errors
     ///
+    /// Exact literals execute their first selected-span search directly;
+    /// other plans retain the value iterator and its reusable-session setup.
     /// Returns a typed setup, first-search, output-bound, allocation or
     /// invariant refusal. The iterator call cap is consumed only for the first
     /// hit or miss; a successful hit never probes for a later match.
+    #[inline]
     pub fn replace_literal_value<'h, R: LiteralReplacer>(
         &self,
         haystack: &'h [u8],
@@ -687,6 +690,16 @@ impl PortableRegex {
         output_limits: ValueReplacementOutputLimits,
     ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
         let replacement = replacement.literal_bytes();
+        if self.build_report().plan == crate::PlanKind::ExactLiteral {
+            return replace_exact_literal_value(
+                self,
+                haystack,
+                replacement,
+                iterator_limits,
+                output_limits,
+            );
+        }
+
         let mut matches = self
             .find_iter_value(haystack, iterator_limits)
             .map_err(PortableValueReplacementError::Setup)?;
@@ -764,6 +777,33 @@ impl PortableRegex {
     }
 }
 
+#[inline(always)]
+fn replace_exact_literal_value<'h>(
+    regex: &PortableRegex,
+    haystack: &'h [u8],
+    replacement: &[u8],
+    iterator_limits: PortableFindIterLimits,
+    output_limits: ValueReplacementOutputLimits,
+) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
+    if iterator_limits.max_search_calls == 0 {
+        return Err(PortableValueReplacementError::Iteration(
+            PortableFindIterError::SearchCallLimit {
+                needed: 1,
+                limit: 0,
+            },
+        ));
+    }
+    let first = match regex.find_value(haystack, iterator_limits.search) {
+        Ok(first) => first,
+        Err(error) => {
+            return Err(PortableValueReplacementError::Iteration(
+                PortableFindIterError::Search(error),
+            ));
+        }
+    };
+    replace_selected_literal_value(haystack, replacement, first, output_limits)
+}
+
 impl PortableSearchSession<'_> {
     /// Replace the first selected byte match with literal bytes while reusing
     /// this session's already allocated search workspace.
@@ -800,10 +840,20 @@ fn replace_first_literal_value<'h>(
     first: Option<Result<Match, PortableFindIterError>>,
     limits: ValueReplacementOutputLimits,
 ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
-    let Some(matched) = first
+    let matched = first
         .transpose()
-        .map_err(PortableValueReplacementError::Iteration)?
-    else {
+        .map_err(PortableValueReplacementError::Iteration)?;
+    replace_selected_literal_value(haystack, replacement, matched, limits)
+}
+
+#[inline(always)]
+fn replace_selected_literal_value<'h>(
+    haystack: &'h [u8],
+    replacement: &[u8],
+    matched: Option<Match>,
+    limits: ValueReplacementOutputLimits,
+) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
+    let Some(matched) = matched else {
         enforce_value_replacement_output_bytes(haystack.len(), limits.max_output_bytes)?;
         return Ok(Cow::Borrowed(haystack));
     };
