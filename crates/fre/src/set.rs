@@ -897,6 +897,23 @@ impl PortableRegexSetSearchSession<'_> {
         self.is_match_at(haystack, 0, limits)
     }
 
+    /// Whether any pattern matches the full haystack without constructing a
+    /// set or constituent execution report on the unlimited-work success
+    /// path.
+    ///
+    /// Finite aggregate work, constituent work, or constituent scratch limits
+    /// retain the accounted constituent route so their exact cumulative work
+    /// and refusal semantics remain unchanged. Pattern-search limits are
+    /// enforced directly in both routes.
+    #[inline(always)]
+    pub fn is_match_value(
+        &mut self,
+        haystack: &[u8],
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.is_match_value_at(haystack, 0, limits)
+    }
+
     /// Whether any pattern matches at or after `start` while reusing all
     /// constituent workspaces.
     pub fn is_match_at(
@@ -938,6 +955,67 @@ impl PortableRegexSetSearchSession<'_> {
                 output_capacity_bytes: 0,
             },
         ))
+    }
+
+    /// Whether any pattern matches at or after `start` without constructing a
+    /// set or constituent execution report on the unlimited-work success
+    /// path.
+    ///
+    /// This preserves original-haystack assertion context and source-order
+    /// short circuiting. Calls with any finite work or scratch limit retain
+    /// the exact cumulative-work loop from [`Self::is_match_at`], while
+    /// omitting only its final report; only calls whose constituent and
+    /// aggregate resource ceilings are all unlimited also bypass constituent
+    /// accounting.
+    #[inline(always)]
+    pub fn is_match_value_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        if !set_value_route_is_unlimited(limits) {
+            return self.is_match_value_at_accounted(haystack, start, limits);
+        }
+
+        validate_start(start, haystack.len())?;
+        let window = SearchWindow::new(start, haystack.len());
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+            let matched = session
+                .is_match_window_value(haystack, window, limits.pattern)
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_match_value_at_accounted(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        validate_start(start, haystack.len())?;
+        let window = SearchWindow::new(start, haystack.len());
+        let mut total_work = 0_u64;
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+            let (matched, work) =
+                search_one_session(session, index, haystack, window, limits, total_work)?;
+            total_work = work;
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Return every matching pattern ID while reusing all constituent
@@ -1890,6 +1968,12 @@ fn enforce_output_bytes(needed: usize, limit: usize) -> Result<(), PortableRegex
         return Err(PortableRegexSetExecutionError::OutputBytesLimit { needed, limit });
     }
     Ok(())
+}
+
+const fn set_value_route_is_unlimited(limits: PortableRegexSetRunLimits) -> bool {
+    limits.max_total_work == u64::MAX
+        && limits.pattern.max_work == u64::MAX
+        && limits.pattern.max_scratch_bytes == usize::MAX
 }
 
 fn enforce<E>(needed: usize, limit: usize, error: impl FnOnce(usize, usize) -> E) -> Result<(), E> {
