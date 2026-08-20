@@ -70,7 +70,10 @@ impl CompiledRegex {
             max_scratch_bytes: scratch,
         };
         let selected_end_value_route = search_limits == SearchLimits::unlimited()
-            && regex.build_report().plan == PlanKind::FixedPredicateWord64;
+            && matches!(
+                regex.build_report().plan,
+                PlanKind::FixedPredicateWord64 | PlanKind::LiteralClassRunLiteral
+            );
         Ok(Self {
             regex,
             search_limits,
@@ -193,6 +196,7 @@ mod tests {
     use crate::FreV1Config;
 
     const FIXED_PATTERN: &[u8] = br"[A-D][\x00-\x7F]Q";
+    const LITERAL_CLASS_RUN_PATTERN: &[u8] = br"a[ab]+c";
 
     fn byte_config(limits: SearchLimits) -> FreV1Config {
         let mut config = FreV1Config::checked_default();
@@ -204,15 +208,17 @@ mod tests {
     }
 
     #[test]
-    fn selected_end_value_route_is_fixed_predicate_and_unlimited_only() {
+    fn selected_end_value_route_is_eligible_plans_and_unlimited_only() {
         let unlimited = SearchLimits::unlimited();
-        let fixed = CompiledRegex::compile(byte_config(unlimited), FIXED_PATTERN)
-            .expect("unlimited fixed-predicate regex");
-        assert_eq!(
-            fixed.regex.build_report().plan,
-            PlanKind::FixedPredicateWord64
-        );
-        assert!(fixed.selected_end_value_route);
+        for (pattern, expected_plan) in [
+            (FIXED_PATTERN, PlanKind::FixedPredicateWord64),
+            (LITERAL_CLASS_RUN_PATTERN, PlanKind::LiteralClassRunLiteral),
+        ] {
+            let compiled = CompiledRegex::compile(byte_config(unlimited), pattern)
+                .expect("unlimited eligible regex");
+            assert_eq!(compiled.regex.build_report().plan, expected_plan);
+            assert!(compiled.selected_end_value_route);
+        }
 
         for finite in [
             SearchLimits::default(),
@@ -225,9 +231,11 @@ mod tests {
                 max_scratch_bytes: usize::MAX - 1,
             },
         ] {
-            let fixed = CompiledRegex::compile(byte_config(finite), FIXED_PATTERN)
-                .expect("finite fixed-predicate regex");
-            assert!(!fixed.selected_end_value_route);
+            for pattern in [FIXED_PATTERN, LITERAL_CLASS_RUN_PATTERN] {
+                let compiled = CompiledRegex::compile(byte_config(finite), pattern)
+                    .expect("finite eligible-plan regex");
+                assert!(!compiled.selected_end_value_route);
+            }
         }
 
         let noneligible = CompiledRegex::compile(byte_config(unlimited), br"a{2,4}")
@@ -270,5 +278,45 @@ mod tests {
             .selected_end_accounted(b"zzA!Q", refused.search_limits)
             .expect_err("accounted refusal");
         assert_eq!(refused.selected_end(b"zzA!Q"), Err(search_error(&expected)));
+
+        let literal_class_run = CompiledRegex::compile(
+            byte_config(SearchLimits::unlimited()),
+            LITERAL_CLASS_RUN_PATTERN,
+        )
+        .expect("unlimited literal-class-run regex");
+        assert_eq!(
+            literal_class_run.regex.build_report().plan,
+            PlanKind::LiteralClassRunLiteral
+        );
+        assert!(literal_class_run.selected_end_value_route);
+        for haystack in [
+            b"!!aabbc!!".as_slice(),
+            b"!!bbbb!!".as_slice(),
+            b"!aabc!abbc!".as_slice(),
+        ] {
+            let expected = literal_class_run
+                .regex
+                .selected_end_accounted(haystack, literal_class_run.search_limits)
+                .expect("unlimited accounted literal-class-run selection")
+                .0;
+            let actual = literal_class_run
+                .selected_end(haystack)
+                .expect("literal-class-run facade selection");
+            assert_eq!(actual.found, u32::from(expected.is_some()));
+            assert_eq!(actual.end, expected.unwrap_or(0));
+        }
+
+        let refused_literal_class_run =
+            CompiledRegex::compile(byte_config(refused_limits), LITERAL_CLASS_RUN_PATTERN)
+                .expect("finite literal-class-run regex");
+        assert!(!refused_literal_class_run.selected_end_value_route);
+        let expected = refused_literal_class_run
+            .regex
+            .selected_end_accounted(b"!!aabbc!!", refused_literal_class_run.search_limits)
+            .expect_err("accounted literal-class-run refusal");
+        assert_eq!(
+            refused_literal_class_run.selected_end(b"!!aabbc!!"),
+            Err(search_error(&expected))
+        );
     }
 }
