@@ -2,7 +2,8 @@
 
 use fre::{
     CaptureExpansionLimits, CaptureSearchLimits, PortableBuilder, PortableFindIterLimits,
-    PortableTextBuilder, PortableTextCaptureBuilder, RustProfile, SearchLimits, SearchWindow,
+    PortableTextBuildError, PortableTextBuilder, PortableTextCaptureBuilder, RustProfile,
+    SearchLimits, SearchWindow,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +26,8 @@ enum Probe {
     CaptureExpand,
     Shortest { text: bool, contextual: bool },
 }
+
+const UPSTREAM_SIZE_THRESHOLD_REASON: &str = "doctest.upstream-size-threshold-not-promised";
 
 /// Execute one source-line-bound core example handled by this adapter.
 pub(crate) fn execute_remaining_core_doctest(id: &str) -> Option<RemainingCoreExecution> {
@@ -70,10 +73,7 @@ fn run_probe(probe: Probe) -> RemainingCoreExecution {
             b"0-0,4-4|0-0,1-1,2-2,3-3,4-4".to_vec(),
             empty_iteration()?.into_bytes(),
         ),
-        Probe::ConstructorErrors { text } => (
-            b"true,true,true".to_vec(),
-            constructor_errors(text).into_bytes(),
-        ),
+        Probe::ConstructorErrors { text } => constructor_errors(text)?,
         Probe::NamedCapture => (b"J".to_vec(), named_capture()?.into_bytes()),
         Probe::ContextCapture => (b"chew|false".to_vec(), context_capture()?.into_bytes()),
         Probe::AlternativeCapture => (b"foo,bar".to_vec(), alternative_capture()?.into_bytes()),
@@ -159,21 +159,71 @@ fn empty_iteration() -> Result<String, RemainingCoreRefusal> {
     ))
 }
 
-fn constructor_errors(text: bool) -> String {
-    let (invalid, unicode_large, ascii_large) = if text {
-        (
-            PortableTextBuilder::new(r"foo(bar").build().is_err(),
-            PortableTextBuilder::new(r"\w{1000}").build().is_err(),
-            PortableTextBuilder::new(r"(?-u:\w){1000}").build().is_ok(),
-        )
+fn constructor_errors(text: bool) -> RemainingCoreExecution {
+    // Preserve the syntax-error and ASCII-success assertions from the compound
+    // upstream example. Only its implementation-specific Unicode size outcome
+    // is outside FRE's native-size contract.
+    let (invalid_syntax, ascii_large) = if text {
+        let invalid_syntax = matches!(
+            PortableTextBuilder::new(r"foo(bar").build(),
+            Err(PortableTextBuildError::TextSyntax(error))
+                if matches!(error.category, fre_syntax::ErrorCategory::UpstreamRustSyntax)
+        );
+        let ascii_large = PortableTextBuilder::new(r"(?-u:\w){1000}").build().is_ok();
+        authenticate_text_native_size_outcome(r"\w{1000}")?;
+        (invalid_syntax, ascii_large)
     } else {
-        (
-            PortableBuilder::new(r"foo(bar").build().is_err(),
-            PortableBuilder::new(r"\w{1000}").build().is_err(),
-            PortableBuilder::new(r"(?-u:\w){1000}").build().is_ok(),
-        )
+        let invalid_syntax = matches!(
+            PortableBuilder::new(r"foo(bar").build(),
+            Err(fre::BuildError::Syntax(error))
+                if matches!(error.category, fre_syntax::ErrorCategory::UpstreamRustSyntax)
+        );
+        let ascii_large = PortableBuilder::new(r"(?-u:\w){1000}").build().is_ok();
+        authenticate_bytes_native_size_outcome(r"\w{1000}")?;
+        (invalid_syntax, ascii_large)
     };
-    format!("{invalid},{unicode_large},{ascii_large}")
+    if invalid_syntax && ascii_large {
+        return Err(RemainingCoreRefusal::Unsupported(
+            UPSTREAM_SIZE_THRESHOLD_REASON,
+        ));
+    }
+    Ok((
+        b"true,true,true".to_vec(),
+        format!("{invalid_syntax},true,{ascii_large}").into_bytes(),
+    ))
+}
+
+fn authenticate_text_native_size_outcome(pattern: &str) -> Result<(), RemainingCoreRefusal> {
+    match PortableTextBuilder::new(pattern).build() {
+        Ok(_) => Ok(()),
+        Err(PortableTextBuildError::TextSyntax(error))
+            if matches!(
+                error.category,
+                fre_syntax::ErrorCategory::FreResourceLimit { .. }
+                    | fre_syntax::ErrorCategory::StrictQualificationFailure { .. }
+            ) =>
+        {
+            Ok(())
+        }
+        Err(
+            PortableTextBuildError::FiniteProof(error)
+            | PortableTextBuildError::EquivalenceProof(error)
+            | PortableTextBuildError::Portable(error),
+        ) if error.failure_class() == fre::BuildFailureClass::ResourceLimit => Ok(()),
+        Err(_) => Err(RemainingCoreRefusal::Fault(
+            "doctest.native-size-text-probe-fault",
+        )),
+    }
+}
+
+fn authenticate_bytes_native_size_outcome(pattern: &str) -> Result<(), RemainingCoreRefusal> {
+    match PortableBuilder::new(pattern).build() {
+        Ok(_) => Ok(()),
+        Err(error) if error.failure_class() == fre::BuildFailureClass::ResourceLimit => Ok(()),
+        Err(_) => Err(RemainingCoreRefusal::Fault(
+            "doctest.native-size-bytes-probe-fault",
+        )),
+    }
 }
 
 fn named_capture() -> Result<String, RemainingCoreRefusal> {
@@ -338,10 +388,8 @@ mod tests {
             "src/lib.rs:253",
             "src/lib.rs:481",
             "src/lib.rs:746",
-            "src/regex/bytes.rs:166",
             "src/regex/bytes.rs:1003",
             "src/regex/bytes.rs:1035",
-            "src/regex/string.rs:168",
             "src/regex/string.rs:990",
             "src/regex/string.rs:1022",
             "src/regex/string.rs:1133",
@@ -353,6 +401,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing probe for {id}"))
                 .unwrap_or_else(|error| panic!("probe refused for {id}: {error:?}"));
             assert_eq!(expected, observed, "probe mismatch for {id}");
+        }
+        for id in ["src/regex/bytes.rs:166", "src/regex/string.rs:168"] {
+            assert!(matches!(
+                execute_remaining_core_doctest(id),
+                Some(Err(RemainingCoreRefusal::Unsupported(
+                    UPSTREAM_SIZE_THRESHOLD_REASON
+                )))
+            ));
         }
     }
 }

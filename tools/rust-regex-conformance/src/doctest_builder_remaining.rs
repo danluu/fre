@@ -18,10 +18,12 @@ pub(crate) type BuilderExecution = Result<(Vec<u8>, Vec<u8>), BuilderRefusal>;
 enum BuilderProbe {
     TextLineTerminator { set: bool },
     IgnoreWhitespace { text: bool, set: bool },
-    SizeLimit { text: bool, set: bool },
+    UpstreamSizeThreshold,
     ByteUnicodeDot { set: bool },
     ByteLineTerminator { set: bool },
 }
+
+const UPSTREAM_SIZE_THRESHOLD_REASON: &str = "doctest.upstream-size-threshold-not-promised";
 
 const PERSON_PATTERN: &str = r"
     \b
@@ -56,22 +58,10 @@ pub(crate) fn execute_remaining_builder_doctest(line: usize) -> Option<BuilderEx
             text: false,
             set: true,
         },
-        681 => BuilderProbe::SizeLimit {
-            text: true,
-            set: false,
-        },
-        1249 => BuilderProbe::SizeLimit {
-            text: true,
-            set: true,
-        },
-        1860 => BuilderProbe::SizeLimit {
-            text: false,
-            set: false,
-        },
-        2433 => BuilderProbe::SizeLimit {
-            text: false,
-            set: true,
-        },
+        // These examples assert the upstream 45,000-byte compiled-size boundary.
+        // Their authenticated expected value remains upstream-owned; FRE's native
+        // representation has no equivalent threshold to compare.
+        681 | 1249 | 1860 | 2433 => BuilderProbe::UpstreamSizeThreshold,
         1452 => BuilderProbe::ByteUnicodeDot { set: false },
         2052 => BuilderProbe::ByteUnicodeDot { set: true },
         1683 => BuilderProbe::ByteLineTerminator { set: false },
@@ -98,8 +88,8 @@ fn run_probe(probe: BuilderProbe) -> BuilderExecution {
                 ignore_whitespace(text, set)?.into_bytes(),
             )
         }
-        BuilderProbe::SizeLimit { text, set } => {
-            (b"true".to_vec(), size_limit(text, set).into_bytes())
+        BuilderProbe::UpstreamSizeThreshold => {
+            return Err(BuilderRefusal::Unsupported(UPSTREAM_SIZE_THRESHOLD_REASON));
         }
         BuilderProbe::ByteUnicodeDot { set } => {
             (b"true".to_vec(), byte_unicode_dot(set)?.into_bytes())
@@ -278,34 +268,6 @@ fn ignore_whitespace_byte_captures(profile: RustProfile) -> Result<String, Build
     .map(|values| values.join(","))
 }
 
-fn size_limit(text: bool, set: bool) -> String {
-    let refused = match (text, set) {
-        (true, false) => PortableTextBuilder::new(r"\w")
-            .size_limit(45_000)
-            .build()
-            .is_err(),
-        (true, true) => {
-            let patterns = vec![r"\w".to_owned()];
-            PortableTextRegexSetBuilder::new(&patterns)
-                .size_limit(45_000)
-                .build()
-                .is_err()
-        }
-        (false, false) => PortableBuilder::new(r"\w")
-            .size_limit(45_000)
-            .build()
-            .is_err(),
-        (false, true) => {
-            let patterns = vec![r"\w".to_owned()];
-            PortableRegexSetBuilder::new(&patterns)
-                .size_limit(45_000)
-                .build()
-                .is_err()
-        }
-    };
-    refused.to_string()
-}
-
 fn byte_unicode_dot(set: bool) -> Result<String, BuilderRefusal> {
     let matched = if set {
         let patterns = vec![".".to_owned()];
@@ -349,14 +311,21 @@ mod tests {
 
     #[test]
     fn every_remaining_builder_probe_matches() {
-        const LINES: [usize; 14] = [
-            511, 577, 681, 1088, 1158, 1249, 1452, 1683, 1750, 1860, 2052, 2281, 2342, 2433,
-        ];
-        for line in LINES {
+        const SUPPORTED_LINES: [usize; 10] =
+            [511, 577, 1088, 1158, 1452, 1683, 1750, 2052, 2281, 2342];
+        for line in SUPPORTED_LINES {
             let (expected, observed) = execute_remaining_builder_doctest(line)
                 .unwrap_or_else(|| panic!("missing builder probe {line}"))
                 .unwrap_or_else(|error| panic!("builder probe {line} refused: {error:?}"));
             assert_eq!(expected, observed, "builder probe {line}");
+        }
+        for line in [681, 1249, 1860, 2433] {
+            assert!(matches!(
+                execute_remaining_builder_doctest(line),
+                Some(Err(BuilderRefusal::Unsupported(
+                    UPSTREAM_SIZE_THRESHOLD_REASON
+                )))
+            ));
         }
         assert!(execute_remaining_builder_doctest(1).is_none());
     }

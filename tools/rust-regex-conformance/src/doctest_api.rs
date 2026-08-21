@@ -2558,9 +2558,9 @@ mod tests {
         eprintln!("doctest counts={:?}", report.payload.counts);
         assert_eq!(
             DoctestCounts {
-                pass: 242,
+                pass: 236,
                 mismatch: 0,
-                unsupported: 0,
+                unsupported: 6,
                 fault: 0,
                 total: DOCTEST_API_CASES,
             },

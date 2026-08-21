@@ -166,6 +166,7 @@ enum CaseKind {
     },
     ValidConstructor(&'static str),
     InvalidConstructors(&'static [&'static str]),
+    UpstreamSizeThreshold(&'static str),
     FindRanges {
         pattern: &'static str,
         haystack: &'static [u8],
@@ -391,7 +392,7 @@ const CASES: [MiscRegressionCase; MISC_REGRESSION_API_CASES] = [
         "big_regex_fails_to_compile",
         2,
         Constructor,
-        CaseKind::InvalidConstructors(&["[\u{0}\u{e}\u{2}\\w~~>[l\t\u{0}]p?<]{971158}"]),
+        CaseKind::UpstreamSizeThreshold("[\u{0}\u{e}\u{2}\\w~~>[l\t\u{0}]p?<]{971158}"),
         b"invalid"
     ),
     case!(
@@ -627,6 +628,7 @@ fn execute_case(case: MiscRegressionCase) -> Result<Vec<u8>, ExecutionRefusal> {
         CaseKind::CaptureRecord { pattern, haystack } => execute_capture_record(pattern, haystack),
         CaseKind::ValidConstructor(pattern) => execute_valid_constructor(pattern),
         CaseKind::InvalidConstructors(patterns) => execute_invalid_constructors(patterns),
+        CaseKind::UpstreamSizeThreshold(pattern) => execute_upstream_size_threshold(pattern),
         CaseKind::FindRanges { pattern, haystack } => execute_find_ranges(pattern, haystack),
         CaseKind::IsMatch { pattern, haystack } => execute_is_match(pattern, haystack),
         CaseKind::TextMatches {
@@ -777,6 +779,34 @@ fn execute_invalid_constructors(patterns: &[&str]) -> Result<Vec<u8>, ExecutionR
         }
     }
     Ok(b"invalid".to_vec())
+}
+
+fn execute_upstream_size_threshold(pattern: &str) -> Result<Vec<u8>, ExecutionRefusal> {
+    // Execute the authenticated source so a syntax or internal regression is
+    // still visible. Only agreement with upstream's representation threshold is
+    // deliberately left unsupported.
+    match PortableBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .build()
+    {
+        Ok(_) => Err(unsupported(
+            "misc-regression.upstream-size-threshold-not-promised",
+        )),
+        Err(error) => match error.failure_class() {
+            BuildFailureClass::ResourceLimit => Err(unsupported(
+                "misc-regression.upstream-size-threshold-not-promised",
+            )),
+            BuildFailureClass::ExpectedInvalid => Err(fault(
+                "misc-regression.native-valid-size-probe-syntax-rejected",
+            )),
+            BuildFailureClass::Unsupported => {
+                Err(unsupported("misc-regression.native-size-probe-unavailable"))
+            }
+            BuildFailureClass::InvalidConfiguration | BuildFailureClass::InternalFailure => {
+                Err(fault("misc-regression.native-size-probe-fault"))
+            }
+        },
+    }
 }
 
 fn execute_find_ranges(pattern: &str, haystack: &[u8]) -> Result<Vec<u8>, ExecutionRefusal> {
@@ -1080,11 +1110,26 @@ mod tests {
             });
         }
         let counts = MiscRegressionCounts::from_receipts(&receipts).unwrap();
-        assert_eq!(counts.pass, 25);
+        assert_eq!(counts.pass, 24);
         assert_eq!(counts.total, MISC_REGRESSION_API_CASES);
         assert_eq!(counts.mismatch, 0);
-        assert_eq!(counts.unsupported, 0);
+        assert_eq!(counts.unsupported, 1);
         assert_eq!(counts.fault, 0);
+        let unsupported_receipt = receipts
+            .iter()
+            .find(|receipt| {
+                matches!(
+                    receipt.disposition,
+                    MiscRegressionDisposition::Unsupported { .. }
+                )
+            })
+            .expect("one upstream resource-threshold receipt");
+        assert_eq!(unsupported_receipt.case_id, "big_regex_fails_to_compile");
+        assert!(matches!(
+            &unsupported_receipt.disposition,
+            MiscRegressionDisposition::Unsupported { reason_code, .. }
+                if reason_code == "misc-regression.upstream-size-threshold-not-promised"
+        ));
         let payload = MiscRegressionReportPayload {
             source,
             candidate: candidate(),
