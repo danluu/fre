@@ -127,6 +127,7 @@ pub struct AotSelectedEndV2RouteEvidence {
     pub source_bytes: usize,
     pub minimum_width: u32,
     pub maximum_width: u32,
+    pub batch_vectors: u8,
     pub runtime_verification_budget: u16,
 }
 
@@ -817,6 +818,7 @@ fn v2_supplemental_evidence(
                 source_bytes: report.lowering.source_bytes,
                 minimum_width: report.lowering.minimum_width,
                 maximum_width: report.lowering.maximum_width,
+                batch_vectors: report.lowering.batch_vectors,
                 runtime_verification_budget: report.lowering.runtime_verification_budget,
             })
         })

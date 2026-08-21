@@ -501,6 +501,9 @@ pub struct ExactFiniteSelectedEndTeddyAotReport {
     pub plan_scan_instruction_units: u16,
     pub emitted_scan_instruction_units: u16,
     pub guaranteed_vector_bytes: u16,
+    /// Consecutive complete vectors scanned by the hot miss loop. This is four
+    /// only for the retained-predicate SVE/SVE2 leaf and one on other ISAs.
+    pub batch_vectors: u8,
     pub gate_table_bytes: usize,
     pub selected_target_tier: ExactFiniteSelectedEndTeddyAotTargetTier,
     pub emitted_isa: ExactFiniteSelectedEndTeddyAotIsa,
@@ -47920,18 +47923,21 @@ fn aarch64_emit_mandatory_teddy_asimd_candidates(
     aarch64_emit_candidate_any(assembler, 24)
 }
 
-/// Produce one exact scalable correlated candidate predicate in P1. Base SVE
-/// TBL is used for both SVE and SVE2 targets; MATCH cannot retain bucket IDs.
-fn aarch64_emit_mandatory_teddy_sve_candidates(
+/// Produce one exact scalable correlated candidate predicate for one runtime
+/// vector. Base SVE TBL is used for both SVE and SVE2 targets; MATCH cannot
+/// retain bucket IDs.
+fn aarch64_emit_mandatory_teddy_sve_candidates_at(
     assembler: &mut Aarch64Assembler,
     teddy: NativeMandatoryTeddyLayout,
+    vector_offset: u8,
+    candidates: u8,
 ) -> Result<(), ObjectError> {
     for column in 0..usize::from(teddy.plan.columns()) {
         let scan_offset = u8::try_from(column).map_err(|_| {
             ObjectError::ArithmeticOverflow("AArch64 SVE Teddy scan offset")
         })?;
         aarch64_emit_start_filter_address(assembler, scan_offset)?;
-        assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
+        assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
         assembler.instruction(aarch64_sve_lsr_b_by_4(4, 0)?)?;
         assembler.instruction(aarch64_sve_and_z(5, 0, 26)?)?;
         let low = 16_u8
@@ -47953,8 +47959,16 @@ fn aarch64_emit_mandatory_teddy_sve_candidates(
             assembler.instruction(aarch64_sve_and_z(6, 6, 7)?)?;
         }
     }
-    assembler.instruction(aarch64_sve_cmpne_zero_b(1, 6)?)?;
+    assembler.instruction(aarch64_sve_cmpne_zero_b(candidates, 6)?)?;
     Ok(())
+}
+
+/// Produce one exact scalable correlated candidate predicate in P1.
+fn aarch64_emit_mandatory_teddy_sve_candidates(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    aarch64_emit_mandatory_teddy_sve_candidates_at(assembler, teddy, 0, 1)
 }
 
 fn aarch64_emit_mandatory_teddy_scalar_candidate(
