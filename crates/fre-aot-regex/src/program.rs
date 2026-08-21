@@ -47,6 +47,7 @@ use crate::{
     finite_language::{
         NativeFiniteExistsChoiceView, NativeFiniteLanguageCandidate,
         NativeFiniteLanguageProgram, NativeFiniteLanguageView,
+        NativeFiniteSelectedEndTeddyView,
     },
     mandatory_teddy::{self, MandatoryTeddyPlan},
     ordered_nfa_native::{
@@ -11166,6 +11167,15 @@ impl CompiledProgram {
     ) -> Option<NativeFiniteExistsChoiceView<'_>> {
         self.native_finite_language_program()?
             .native_exists_choice_view(self.identity.artifact, self.output)
+    }
+
+    /// Return the authenticated exact finite `SelectedEnd` Teddy candidate.
+    /// Target lowering still owns ISA selection and direct-leaf admission.
+    pub(crate) fn native_finite_selected_end_teddy_view(
+        &self,
+    ) -> Option<NativeFiniteSelectedEndTeddyView<'_>> {
+        self.native_finite_language_program()?
+            .native_selected_end_teddy_view(self.identity.artifact, self.output)
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.

@@ -33,7 +33,10 @@ use crate::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
     dfa_loop_skip,
-    finite_language::{NativeFiniteExistsChoiceView, NativeFiniteLanguageView},
+    finite_language::{
+        NativeFiniteExistsChoiceView, NativeFiniteLanguageView,
+        NativeFiniteSelectedEndTeddyView,
+    },
     mandatory_teddy::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
         MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
@@ -427,6 +430,113 @@ pub struct ExactSingleLiteralAotReport {
     pub native_data_bytes: usize,
 }
 
+/// Actual instruction family emitted by the direct exact-finite
+/// `SelectedEnd` Teddy leaf. Stronger targets may reuse an audited narrower
+/// sequence, so this is distinct from the authorizing target tier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactFiniteSelectedEndTeddyAotIsa {
+    X86Avx2,
+    Aarch64Asimd,
+    Aarch64Sve,
+}
+
+/// Target capability tier authorizing the direct exact-finite
+/// `SelectedEnd` Teddy leaf.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactFiniteSelectedEndTeddyAotTargetTier {
+    X86Avx2,
+    X86Avx512Bw,
+    Aarch64Asimd,
+    Aarch64Sve,
+    Aarch64Sve2,
+}
+
+/// Transient provenance for a direct exact-finite `SelectedEnd` Teddy leaf.
+/// Long valid windows start in the emitted scanner and source-order verifier.
+/// A deterministic exact-verification budget tail-enters the retained
+/// incumbent at the still-unresolved candidate; short or invalid calls enter
+/// that same incumbent directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteSelectedEndDfaBaselineReport {
+    /// Digest of the authenticated semantic DFA geometry and transition
+    /// contents from which the retained native incumbent was lowered.
+    pub semantic_dfa_sha256: [u8; 32],
+    pub forward_states: usize,
+    pub alphabet_classes: usize,
+    pub transition_cells: usize,
+    /// Favorable lower bound used for the baseline's target-native table.
+    pub minimum_native_data_bytes: usize,
+    pub native_data_bytes: usize,
+    pub hot_loads_per_byte: usize,
+    pub hot_branches_per_byte: usize,
+    pub has_accelerator: bool,
+    /// Scanner actually emitted by the retained complete-DFA lowering.
+    pub scanner: StartAccelerator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteSelectedEndTeddyAotReport {
+    pub artifact_identity: [u8; 32],
+    pub output: OutputContract,
+    pub literal_sha256: [u8; 32],
+    pub prefix_plan_sha256: [u8; 32],
+    pub native_code_sha256: [u8; 32],
+    pub native_data_sha256: [u8; 32],
+    pub relocations_sha256: [u8; 32],
+    pub incumbent_code_sha256: [u8; 32],
+    pub incumbent_data_sha256: [u8; 32],
+    pub incumbent_relocations_sha256: [u8; 32],
+    pub incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
+    pub source_count: u32,
+    pub source_bytes: usize,
+    pub minimum_width: u32,
+    pub maximum_width: u32,
+    pub root_members: [u64; 4],
+    pub columns: u8,
+    pub bucket_count: u8,
+    pub literal_count: u16,
+    pub candidate_fingerprint_upper_bound: u64,
+    pub candidate_frequency_upper_bound: u64,
+    pub fingerprint_space: u64,
+    pub plan_scan_instruction_units: u16,
+    pub emitted_scan_instruction_units: u16,
+    pub guaranteed_vector_bytes: u16,
+    pub gate_table_bytes: usize,
+    pub selected_target_tier: ExactFiniteSelectedEndTeddyAotTargetTier,
+    pub emitted_isa: ExactFiniteSelectedEndTeddyAotIsa,
+    pub target: Target,
+    pub scanner: StartAccelerator,
+    pub input_floor_bytes: usize,
+    pub selection_horizon_bytes: usize,
+    pub selection_gate_cost_units: u128,
+    /// Candidate-weighted exact-verifier work charged across the fixed
+    /// selection horizon.
+    pub selection_expected_verification_cost_units: u128,
+    /// Conservative scanner plus verifier work compared with the incumbent.
+    pub selection_full_cost_units: u128,
+    /// Retained complete semantic-DFA work across the same horizon.
+    pub selection_incumbent_cost_units: u128,
+    pub selection_root_frequency_units: u16,
+    pub selection_no_candidate_numerator: u128,
+    pub selection_probability_denominator: u128,
+    /// Maximum exact literal comparisons before the wrapper resumes the
+    /// retained complete semantic DFA at the unresolved candidate base.
+    pub runtime_verification_budget: u16,
+    pub table_base: u32,
+    pub table_end: u32,
+    /// Eight little-endian source-ordinal masks indexed by Teddy bucket.
+    pub bucket_ordinal_masks_offset: u32,
+    /// Source-order `(absolute literal offset, byte length)` u32 pairs.
+    pub literal_descriptors_offset: u32,
+    pub literal_bytes_offset: u32,
+    pub literal_bytes_end: u32,
+    pub native_data_bytes: usize,
+    pub incumbent_code_offset: usize,
+    pub incumbent_code_bytes: usize,
+    pub incumbent_data_bytes: usize,
+    pub incumbent_relocation_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactFiniteExistsLeafReport {
     ByteSet(ExactFiniteExistsByteSetAotReport),
@@ -517,6 +627,8 @@ mod module_bit_parallel_exists;
 mod module_single_literal_two_way;
 #[path = "module_dfa_loop_skip.rs"]
 mod module_dfa_loop_skip;
+#[path = "module_exact_finite_selected_end_teddy.rs"]
+mod module_exact_finite_selected_end_teddy;
 #[path = "module_seeded_reverse_aarch64.rs"]
 mod module_seeded_reverse_aarch64;
 #[path = "module_suffix_retry.rs"]
@@ -1430,6 +1542,8 @@ pub struct CompiledModule {
     slow_context_aot_report: Option<SlowContextAotReport>,
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
     exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
+    exact_finite_selected_end_teddy_aot_report:
+        Option<ExactFiniteSelectedEndTeddyAotReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -1821,10 +1935,8 @@ struct NativeFiniteLanguageCost {
 /// The comparison deliberately gives the DFA its cheapest possible dense
 /// transition loop: one haystack load and one direct-byte transition load per
 /// step. A variable-width `Span` machine must also enter a reverse transition
-/// loop to recover the selected start. The ordered finite-language machine
-/// retains that start during its forward walk. Any graph-derived moving scanner
-/// or interior loop keeps ownership with the DFA because the current finite
-/// leaf is scalar on every target.
+/// loop to recover the selected start; `SelectedEnd` is the genuine one-pass
+/// baseline retained by the exact-finite Teddy composite.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeCompleteDfaCost {
     transition_cells: usize,
@@ -1836,43 +1948,57 @@ struct NativeCompleteDfaCost {
 
 impl NativeCompleteDfaCost {
     fn estimate(view: &NativeProgramView<'_>) -> Result<Option<Self>, ObjectError> {
+        if view.output != OutputContract::Span {
+            return Ok(None);
+        }
+        Self::estimate_span_or_selected_end(view)
+    }
+
+    fn estimate_selected_end(
+        view: &NativeProgramView<'_>,
+    ) -> Result<Option<Self>, ObjectError> {
+        if view.output != OutputContract::SelectedEnd {
+            return Ok(None);
+        }
+        Self::estimate_span_or_selected_end(view)
+    }
+
+    fn estimate_span_or_selected_end(
+        view: &NativeProgramView<'_>,
+    ) -> Result<Option<Self>, ObjectError> {
         let dfa = view.dfa;
-        // `Exists` and `SelectedEnd` are already one-pass complete-DFA
-        // searches. The current finite-language leaf is an unminimized
-        // `Aho-Corasick` machine with an additional class-map and per-state
-        // output load, so
-        // it cannot honestly dominate those contracts without its own scanner
-        // or a separately authenticated minimization. `Span` is different:
-        // its complete DFA must recover a variable start with a reverse
-        // machine, while the finite leaf carries the selected start in one
-        // pass.
+        let selected_end = view.output == OutputContract::SelectedEnd;
+        let span = view.output == OutputContract::Span;
         if view.partial_discovered_states.is_some()
             || view.collapse_partial_holes
             || view.exact_product_width.is_some()
-            || view.output != OutputContract::Span
+            || (!selected_end && !span)
             || dfa.initial_pending
             || view.exact_match_width.is_some()
             || dfa.class_count == 0
             || dfa.class_count > 256
             || dfa.forward_cells.is_empty()
             || !dfa.forward_cells.len().is_multiple_of(dfa.class_count)
-            || dfa.reverse_initial.is_none()
-            || dfa.reverse_cells.is_empty()
-            || !dfa.reverse_cells.len().is_multiple_of(dfa.class_count)
+            || (span
+                && (dfa.reverse_initial.is_none()
+                    || dfa.reverse_cells.is_empty()
+                    || !dfa.reverse_cells.len().is_multiple_of(dfa.class_count)))
+            || (selected_end && (dfa.reverse_initial.is_some() || !dfa.reverse_cells.is_empty()))
         {
             return Ok(None);
         }
+        let retained_reverse_cells = if span { dfa.reverse_cells.len() } else { 0 };
         let transition_cells = dfa
             .forward_cells
             .len()
-            .checked_add(dfa.reverse_cells.len())
+            .checked_add(retained_reverse_cells)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "complete DFA structural transition cells",
             ))?;
         let forward_states = dfa.forward_cells.len().checked_div(dfa.class_count).ok_or(
             ObjectError::ArithmeticOverflow("complete DFA forward state count"),
         )?;
-        let reverse_states = dfa.reverse_cells.len().checked_div(dfa.class_count).ok_or(
+        let reverse_states = retained_reverse_cells.checked_div(dfa.class_count).ok_or(
             ObjectError::ArithmeticOverflow("complete DFA reverse state count"),
         )?;
         // Price both dense representations independently for both supported
@@ -1918,14 +2044,11 @@ impl NativeCompleteDfaCost {
         Ok(Some(Self {
             transition_cells,
             minimum_data_bytes,
-            // The best possible direct-byte loop has one input and one table
-            // load. Price one forward and one reverse state step; the separate
-            // finite-width gate below proves that every selected match performs
-            // a nontrivial reverse walk instead of merely paying setup.
-            hot_loads_per_byte: 4,
-            // Window, transition/output, and termination branches are the
-            // common target-neutral control-flow lower bound for each pass.
-            hot_branches_per_byte: 6,
+            // One input and one direct-byte transition load per state step.
+            hot_loads_per_byte: if span { 4 } else { 2 },
+            // Window, transition/output, and termination branches are a
+            // favorable target-neutral lower bound for each pass.
+            hot_branches_per_byte: if span { 6 } else { 1 },
             has_accelerator: has_start_accelerator
                 || has_mandatory_accelerator
                 || has_loop_accelerator,
@@ -1937,6 +2060,141 @@ impl NativeCompleteDfaCost {
             .checked_mul(4)?
             .checked_add(self.hot_branches_per_byte.checked_mul(3)?)
     }
+
+    fn selected_end_report(
+        self,
+        view: &NativeProgramView<'_>,
+        lowering: &NativeLowering,
+    ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        if view.output != OutputContract::SelectedEnd
+            || self.has_accelerator
+            || lowering.start_accelerator != StartAccelerator::None
+            || lowering.needs_runtime
+            || lowering.slow_partial_table.is_some()
+            || lowering.code.is_empty()
+            || lowering.data.len() < self.minimum_data_bytes
+        {
+            return Ok(None);
+        }
+        let forward_states = view
+            .dfa
+            .forward_cells
+            .len()
+            .checked_div(view.dfa.class_count)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SelectedEnd complete DFA forward states",
+            ))?;
+        Ok(Some(ExactFiniteSelectedEndDfaBaselineReport {
+            semantic_dfa_sha256: native_selected_end_dfa_semantic_digest(view)?,
+            forward_states,
+            alphabet_classes: view.dfa.class_count,
+            transition_cells: self.transition_cells,
+            minimum_native_data_bytes: self.minimum_data_bytes,
+            native_data_bytes: lowering.data.len(),
+            hot_loads_per_byte: self.hot_loads_per_byte,
+            hot_branches_per_byte: self.hot_branches_per_byte,
+            has_accelerator: self.has_accelerator,
+            scanner: lowering.start_accelerator,
+        }))
+    }
+}
+
+fn native_selected_end_dfa_semantic_digest(
+    view: &NativeProgramView<'_>,
+) -> Result<[u8; 32], ObjectError> {
+    if view.output != OutputContract::SelectedEnd
+        || view.dfa.class_count == 0
+        || view.dfa.forward_cells.is_empty()
+        || !view
+            .dfa
+            .forward_cells
+            .len()
+            .is_multiple_of(view.dfa.class_count)
+        || view.dfa.reverse_initial.is_some()
+        || !view.dfa.reverse_cells.is_empty()
+    {
+        return Err(ObjectError::InvalidModule(
+            "SelectedEnd complete DFA semantic digest geometry",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fre-selected-end-complete-dfa-v1");
+    digest.update(view.dfa.initial_state.to_le_bytes());
+    digest.update([u8::from(view.dfa.initial_pending)]);
+    digest.update([u8::from(view.dfa.initial_terminal)]);
+    digest.update(
+        u64::try_from(view.dfa.class_count)
+            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA class count"))?
+            .to_le_bytes(),
+    );
+    digest.update(view.dfa.byte_classes);
+    digest.update(
+        u64::try_from(view.dfa.class_representatives.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA representatives"))?
+            .to_le_bytes(),
+    );
+    digest.update(view.dfa.class_representatives);
+    digest.update(
+        u64::try_from(view.dfa.forward_cells.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA transition cells"))?
+            .to_le_bytes(),
+    );
+    for cell in view.dfa.forward_cells {
+        digest.update(cell.next().to_le_bytes());
+        digest.update([u8::from(cell.accepted())]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn exact_finite_selected_end_dfa_baseline_authenticates(
+    view: &NativeProgramView<'_>,
+    report: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Result<bool, ObjectError> {
+    let Some(cost) = NativeCompleteDfaCost::estimate_selected_end(view)? else {
+        return Ok(false);
+    };
+    let Some(forward_states) = view
+        .dfa
+        .forward_cells
+        .len()
+        .checked_div(view.dfa.class_count)
+    else {
+        return Ok(false);
+    };
+    Ok(view.output == OutputContract::SelectedEnd
+        && report.semantic_dfa_sha256 == native_selected_end_dfa_semantic_digest(view)?
+        && report.forward_states == forward_states
+        && report.alphabet_classes == view.dfa.class_count
+        && report.transition_cells == cost.transition_cells
+        && report.minimum_native_data_bytes == cost.minimum_data_bytes
+        && report.native_data_bytes >= report.minimum_native_data_bytes
+        && report.hot_loads_per_byte == cost.hot_loads_per_byte
+        && report.hot_branches_per_byte == cost.hot_branches_per_byte
+        && report.has_accelerator == cost.has_accelerator
+        && !report.has_accelerator
+        && report.scanner == StartAccelerator::None)
+}
+
+fn exact_finite_selected_end_dfa_lowering_authenticates(
+    view: &NativeProgramView<'_>,
+    target: Target,
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+) -> Result<bool, ObjectError> {
+    let Some(lowering) = lower_native_dfa_with_data_limit(
+        *view,
+        target,
+        report.incumbent_data_bytes,
+    )? else {
+        return Ok(false);
+    };
+    Ok(!lowering.needs_runtime
+        && lowering.slow_partial_table.is_none()
+        && lowering.start_accelerator == StartAccelerator::None
+        && lowering.data.len() == report.incumbent_data_bytes
+        && Sha256::digest(&lowering.code).as_slice() == report.incumbent_code_sha256
+        && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
+        && module_exact_finite_selected_end_teddy::relocation_digest(&lowering.relocations)
+            .is_some_and(|digest| digest == report.incumbent_relocations_sha256))
 }
 
 impl NativeFiniteLanguageCost {
@@ -2829,18 +3087,21 @@ impl CompiledModule {
             // ordinary complete DFA before target lowering, but only under a
             // conservative target-neutral comparison. Exact-product and
             // contextual machines keep their established portfolios.
-            if program.engine_kind() == crate::EngineKind::OrderedDfa
+            let finite_candidate = if program.engine_kind() == crate::EngineKind::OrderedDfa
                 && let Some(finite_view) = program.native_finite_language_view()
                 && let Some(complete_cost) =
                     NativeCompleteDfaCost::estimate(&semantic_native)?
-                && let Some((lowering, report)) =
-                    lower_optional_native_finite_language_with_data_limit_and_competitor(
+            {
+                lower_optional_native_finite_language_with_data_limit_and_competitor(
                         finite_view,
                         target,
                         effective_native_data_limit_bytes,
                         Some(complete_cost),
                     )?
-            {
+            } else {
+                None
+            };
+            if let Some((lowering, report)) = finite_candidate {
                 return Self::lower_serialized_with_prelowered(
                     program_bytes,
                     Some(lowering),
@@ -2860,6 +3121,79 @@ impl CompiledModule {
                     target,
                 )
                 .map_err(CompileError::from);
+            }
+
+            // The exact finite SelectedEnd leaf starts every long valid
+            // window and tail-enters the exact complete semantic DFA that the
+            // established portfolio would otherwise publish. Selection or a
+            // declared-cap miss therefore returns that byte-identical
+            // incumbent, never a newly introduced fallback route.
+            if program.engine_kind() == crate::EngineKind::OrderedDfa
+                && let Some(teddy_view) =
+                    program.native_finite_selected_end_teddy_view()
+                && let Some(baseline_cost) =
+                    NativeCompleteDfaCost::estimate_selected_end(&semantic_native)?
+                && !baseline_cost.has_accelerator
+                && let Some(incumbent) = lower_native_dfa(semantic_native, target)?
+                && let Some(baseline_report) =
+                    baseline_cost.selected_end_report(&semantic_native, &incumbent)?
+            {
+                let (lowering, teddy_report) = if let Some(selection) =
+                    module_exact_finite_selected_end_teddy::
+                        select_exact_finite_selected_end_teddy(
+                            teddy_view,
+                            target,
+                            baseline_report,
+                        )
+                {
+                    match module_exact_finite_selected_end_teddy::
+                        wrap_exact_finite_selected_end_teddy(
+                            selection,
+                            incumbent,
+                            baseline_report,
+                            target,
+                            effective_native_data_limit_bytes,
+                        )?
+                    {
+                        module_exact_finite_selected_end_teddy::
+                            ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
+                                lowering,
+                                report,
+                            } => (lowering, Some(report)),
+                        module_exact_finite_selected_end_teddy::
+                            ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(
+                                lowering,
+                            ) => (lowering, None),
+                    }
+                } else {
+                    (incumbent, None)
+                };
+                let mut module = Self::lower_serialized_with_prelowered(
+                    program_bytes,
+                    Some(lowering),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    None,
+                    target,
+                )?;
+                if let Some(report) = teddy_report {
+                    module.install_exact_finite_selected_end_teddy_aot_report(
+                        report,
+                        program.artifact_identity(),
+                        &semantic_native,
+                    )?;
+                }
+                return Ok(module);
             }
             return Self::lower_serialized(
                 program_bytes,
@@ -5061,6 +5395,7 @@ impl CompiledModule {
             slow_context_aot_report,
             compiler_k0_aot_report,
             exact_finite_exists_leaf_report,
+            exact_finite_selected_end_teddy_aot_report: None,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -5149,6 +5484,80 @@ impl CompiledModule {
             Some(report) => report.single_literal(),
             None => None,
         }
+    }
+
+    fn install_exact_finite_selected_end_teddy_aot_report(
+        &mut self,
+        report: ExactFiniteSelectedEndTeddyAotReport,
+        artifact_identity: [u8; 32],
+        semantic_native: &NativeProgramView<'_>,
+    ) -> Result<(), ObjectError> {
+        if self.exact_finite_selected_end_teddy_aot_report.is_some()
+            || self.exact_finite_exists_leaf_report.is_some()
+            || self.ordered_finite_language_aot_report.is_some()
+            || self.slow_aot_report.is_some()
+            || self.slow_context_aot_report.is_some()
+            || self.compiler_k0_aot_report.is_some()
+            || report.artifact_identity != artifact_identity
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy provenance is not exclusive",
+            ));
+        }
+        if !exact_finite_selected_end_dfa_baseline_authenticates(
+            semantic_native,
+            report.incumbent_complete_dfa,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy baseline disagrees with its semantic DFA",
+            ));
+        }
+        if !exact_finite_selected_end_dfa_lowering_authenticates(
+            semantic_native,
+            self.target,
+            &report,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy incumbent disagrees with its semantic DFA lowering",
+            ));
+        }
+        let code = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy module has no text",
+            ))?;
+        let data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy module has no data",
+            ))?;
+        if !module_exact_finite_selected_end_teddy::report_matches_parts(
+            &report,
+            code.bytes(),
+            data.bytes(),
+            &self.relocations,
+            self.runtime_symbol_index.is_some(),
+            false,
+            self.start_accelerator,
+            self.anchored_prefix_filter_bytes,
+            self.target,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy module disagrees with its receipt",
+            ));
+        }
+        self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        Ok(())
+    }
+
+    /// Return provenance for a direct exact-finite `SelectedEnd` Teddy leaf.
+    #[must_use]
+    pub const fn exact_finite_selected_end_teddy_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndTeddyAotReport> {
+        self.exact_finite_selected_end_teddy_aot_report.as_ref()
     }
 
     /// Return exact geometry for a selected ordered finite-language native
@@ -6547,6 +6956,20 @@ impl CompiledModule {
         self.prepared_aggregate_exports = exports;
         self.prepared_aggregate_strategy = Some(aggregate_strategy);
         self.runtime_program_symbol_index = runtime_program_symbol_index;
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        }
         Ok(self)
     }
 
@@ -100105,6 +100528,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 slow_context_aot_report: None,
                 compiler_k0_aot_report: None,
                 exact_finite_exists_leaf_report: None,
+                exact_finite_selected_end_teddy_aot_report: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -100429,6 +100853,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             slow_context_aot_report: None,
             compiler_k0_aot_report: None,
             exact_finite_exists_leaf_report: None,
+            exact_finite_selected_end_teddy_aot_report: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,

@@ -82,10 +82,11 @@ pub use grep_count::{
 };
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
-    ExactFiniteExistsByteSetAotReport, ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport,
-    ExactSingleLiteralPairPrefilterReport, ExactSingleLiteralTwoWayShift, FeatureSet,
-    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
-    OrderedFiniteLanguageAotReport, PreparedAggregateExports,
+    ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndTeddyAotIsa,
+    ExactFiniteSelectedEndTeddyAotReport, ExactFiniteSelectedEndTeddyAotTargetTier,
+    ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
+    ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
+    OperatingSystem, OrderedFiniteLanguageAotReport, PreparedAggregateExports,
     PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
     SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
     PREPARED_CAPABILITY_ORDERED_NFA_V15,
@@ -279,7 +280,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 23;
+pub const OPTIMIZER_VERSION: u32 = 24;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +292,7 @@ pub enum OptimizationPass {
     OrderedDeterminization,
     CompilerK0Closure,
     OrderedFiniteLanguageLowering,
+    ExactFiniteSelectedEndTeddyLowering,
     ExactFiniteExistsByteSetLowering,
     ExactFiniteExistsSingleLiteralLowering,
     ContextOrderedDeterminization,
@@ -502,6 +504,8 @@ pub struct CompileReceipt {
     /// Authenticated direct exact wide single-literal `Exists` lowering, when
     /// selected.
     pub exact_single_literal_aot: Option<ExactSingleLiteralAotReport>,
+    /// Direct exact finite-language Teddy `SelectedEnd` leaf, when selected.
+    pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
     /// ordered finite-language leaf. This is never stable program data.
     pub ordered_finite_language_aot: Option<OrderedFiniteLanguageAotReport>,
@@ -868,6 +872,9 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     receipt.exact_single_literal_aot = module.exact_single_literal_aot_report().copied();
     receipt.ordered_finite_language_aot = module
         .ordered_finite_language_aot_report()
+        .copied();
+    receipt.exact_finite_selected_end_teddy_aot = module
+        .exact_finite_selected_end_teddy_aot_report()
         .copied();
     receipt.slow_context_aot = module.slow_context_aot_report().cloned();
     receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
@@ -1643,6 +1650,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             .exact_finite_exists_byte_set_aot_report()
             .copied(),
         exact_single_literal_aot: module.exact_single_literal_aot_report().copied(),
+        exact_finite_selected_end_teddy_aot: module
+            .exact_finite_selected_end_teddy_aot_report()
+            .copied(),
         ordered_finite_language_aot: module
             .ordered_finite_language_aot_report()
             .copied(),
@@ -1825,6 +1835,14 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 OptimizationPass::OutputContractSpecialization,
                 OptimizationPass::ConstantFold,
                 OptimizationPass::StrengthReduceRowAddressing,
+            ]);
+            if module
+                .exact_finite_selected_end_teddy_aot_report()
+                .is_some()
+            {
+                passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
+            }
+            passes.extend_from_slice(&[
                 OptimizationPass::TargetInstructionSelection,
                 OptimizationPass::FixedRegisterAssignment,
                 OptimizationPass::CheckedBranchFixup,
@@ -1952,6 +1970,12 @@ fn append_native_dfa_passes(
         OptimizationPass::ConstantFold,
         OptimizationPass::StrengthReduceRowAddressing,
     ]);
+    if module
+        .exact_finite_selected_end_teddy_aot_report()
+        .is_some()
+    {
+        passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
+    }
     if module.start_accelerator() != StartAccelerator::None {
         passes.push(OptimizationPass::StartStateScanAcceleration);
     }

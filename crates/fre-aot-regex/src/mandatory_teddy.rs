@@ -615,6 +615,38 @@ pub(crate) fn derive_exact_prefixes<B: AsRef<[u8]>>(
     })
 }
 
+/// Rebuild the deterministic literal-to-bucket assignment for one selected
+/// exact-prefix plan. The emitted exact verifier uses this authenticated map
+/// to turn a scalar bucket fingerprint into a source-ordinal mask.
+#[must_use]
+pub(crate) fn exact_plan_assignments<B: AsRef<[u8]>>(
+    literals: &[B],
+    plan: MandatoryTeddyPlan,
+) -> Option<Box<[u8]>> {
+    let literal_count = literals.len();
+    let columns = usize::from(plan.columns());
+    let bucket_count = usize::from(plan.bucket_count());
+    if literal_count != usize::from(plan.literal_count())
+        || literal_count > MAX_MANDATORY_TEDDY_LITERALS
+        || plan.bank_count() != 1
+        || bucket_count > MANDATORY_TEDDY_BUCKETS_PER_BANK
+    {
+        return None;
+    }
+    let mut budget = BuildBudget::new();
+    let build = derive_geometry(
+        literal_count,
+        columns,
+        bucket_count,
+        &|index| literals.get(index)?.as_ref().get(..columns),
+        &mut budget,
+    )?;
+    if build.plan != plan {
+        return None;
+    }
+    Some(build.assignments[..literal_count].to_vec().into_boxed_slice())
+}
+
 #[derive(Clone, Copy)]
 struct BucketNibbles {
     low: [u16; MAX_MANDATORY_TEDDY_COLUMNS],
