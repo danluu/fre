@@ -96,6 +96,9 @@ class TrueNativeCensusTests(unittest.TestCase):
     def test_exact_adapter_includes_ordered_many_but_not_multi_grep(self) -> None:
         self.assertTrue(CENSUS.has_exact_adapter("count", 1))
         self.assertTrue(CENSUS.has_exact_adapter("count", 3))
+        self.assertFalse(
+            CENSUS.has_exact_adapter("count", CENSUS.MAX_NATIVE_ROW_COMPONENTS + 1)
+        )
         self.assertTrue(CENSUS.has_exact_adapter("count-spans", 2))
         self.assertTrue(CENSUS.has_exact_adapter("grep", 1))
         self.assertFalse(CENSUS.has_exact_adapter("grep", 2))
@@ -189,6 +192,7 @@ class TrueNativeCensusTests(unittest.TestCase):
         }
         for index in range(2):
             fields[f"component_{index}_native"] = "true"
+            fields[f"component_{index}_source_ordinal"] = str(index)
             fields[f"component_{index}_entry_symbol"] = f"fre_row_{index}_entry"
             fields[f"component_{index}_runtime_symbols"] = ""
             fields[f"component_{index}_program_sha256"] = f"{index + 1:064x}"
@@ -197,6 +201,50 @@ class TrueNativeCensusTests(unittest.TestCase):
             CENSUS.selected_operation_entries(fields),
             (["fre_row_0_entry", "fre_row_1_entry"], "linked-native-row-adapter-loop"),
         )
+
+    def test_native_row_v3_provenance_closes_and_seals_source_topology(self) -> None:
+        fields = {
+            "schema": "fre.aot.rebar-runner.v3",
+            "disposition": "executed",
+            "configured": "true",
+            "adapter": "general-aot-native-row-bridge-count-v1",
+            "model": "count",
+            "benchmark": "synthetic/native-row",
+            "source_commit": "1" * 40,
+            "source_tree": "2" * 40,
+            "target": "x86_64-linux",
+            "feature_bits": "0000000000000000",
+            "compiler_version": "1",
+            "optimizer_version": "1",
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedNfa)",
+            "aggregate_strategy": "native-independent-span-row-selector-v1",
+            "native_row_bridge": "true",
+            "source_pattern_count": "3",
+            "row_total_object_bytes": "4096",
+            "source_to_artifact": "0,1,0",
+            "component_count": "2",
+            "boundary": "complete-native-row-bridge",
+            "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+        }
+        for index, source_ordinal in enumerate((0, 1)):
+            fields[f"component_{index}_native"] = "true"
+            fields[f"component_{index}_source_ordinal"] = str(source_ordinal)
+            fields[f"component_{index}_entry_symbol"] = f"fre_row_{index}_entry"
+            fields[f"component_{index}_runtime_symbols"] = ""
+            fields[f"component_{index}_program_sha256"] = f"{index + 1:064x}"
+            fields[f"component_{index}_object_sha256"] = f"{index + 3:064x}"
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        receipt = CENSUS.provenance_receipt(parsed)
+        self.assertEqual(receipt["composite_kind"], "native-row-bridge-v1")
+        self.assertEqual(receipt["source_pattern_count"], 3)
+        self.assertEqual(receipt["source_to_artifact"], [0, 1, 0])
+        self.assertEqual(
+            [component["source_ordinal"] for component in receipt["components"]],
+            [0, 1],
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
+            CENSUS.parse_provenance(encoded + b" unsealed_field=1")
 
     def test_empty_semantic_helper_inventory_is_a_valid_proof_surface(self) -> None:
         phase = {

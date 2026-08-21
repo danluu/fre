@@ -99,7 +99,10 @@ python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
 
 Repeat `--primary-object` and `--replica-object` in component ordinal order for
 a composite v3 runner. Its normalized provenance must match every supplied
-object digest in both builds.
+object digest in both builds. Native-row v3 additionally seals the complete
+source-to-artifact map, each retained artifact's first source ordinal, source
+cardinality, total object bytes, and the exact composite boundary; unrecognized
+raw v3 fields are rejected rather than silently discarded.
 
 The controller requires identical runner/object hashes and normalized
 provenance from both builds. It inventories all defined text symbols in the

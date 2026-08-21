@@ -282,11 +282,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "ordinal", "entry_symbol", "required_runtime_symbols",
+        "ordinal", "native", "source_ordinal", "entry_symbol", "required_runtime_symbols",
         "program_sha256", "object_sha256"
       ],
       "properties": {
         "ordinal": { "type": "integer", "minimum": 0 },
+        "native": { "const": true },
+        "source_ordinal": { "type": ["integer", "null"], "minimum": 0 },
         "entry_symbol": { "type": "string", "minLength": 1 },
         "required_runtime_symbols": {
           "type": "array", "items": { "type": "string" }, "uniqueItems": true
@@ -300,7 +302,9 @@
       "additionalProperties": false,
       "required": [
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
-        "target", "feature_bits", "kind", "engine", "aggregate_strategy",
+        "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
+        "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
+        "aggregate_strategy",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
@@ -315,6 +319,15 @@
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
         "kind": { "enum": ["scalar-v2", "composite-v3"] },
+        "composite_kind": {
+          "enum": [null, "native-row-bridge-v1", "regex-redux-fixed-v1"]
+        },
+        "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
+        "source_to_artifact": {
+          "type": "array", "items": { "type": "integer", "minimum": 0 }
+        },
+        "row_total_object_bytes": { "type": ["integer", "null"], "minimum": 1 },
+        "boundary": { "type": ["string", "null"] },
         "engine": { "type": ["string", "null"] },
         "aggregate_strategy": { "type": ["string", "null"] },
         "prepared_bulk_strategy": { "type": ["string", "null"] },

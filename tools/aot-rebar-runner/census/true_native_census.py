@@ -30,6 +30,8 @@ SCHEDULE_SCHEMA = "fre.full-rebar.campaign.v1"
 EXPECTED_PUBLIC_JOBS = 344
 EXPECTED_RUNTIME_JOBS = 311
 EXPECTED_COMPILE_JOBS = 33
+MAX_NATIVE_ROW_COMPONENTS = 4_096
+MAX_NATIVE_ROW_OBJECT_BYTES = 256 * 1024 * 1024
 TRAP_EXIT = 197
 SCALAR_ADAPTER_MODELS = {"count", "count-spans", "grep"}
 COMPOSITE_ADAPTER_MODELS = {"regex-redux"}
@@ -57,7 +59,8 @@ class CensusError(RuntimeError):
 def has_exact_adapter(model: str, pattern_count: int) -> bool:
     """Return whether the integrated runner has a typed adapter for this shape."""
     return (
-        model in {"count", "count-spans"} and pattern_count >= 1
+        model in {"count", "count-spans"}
+        and 1 <= pattern_count <= MAX_NATIVE_ROW_COMPONENTS
     ) or (
         model == "grep" and pattern_count == 1
     ) or (
@@ -556,7 +559,11 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "span_fill_symbol", "required_runtime_symbols",
         }
     elif fields.get("schema") == "fre.aot.rebar-runner.v3":
-        required = common | {"component_count"}
+        required = common | {
+            "disposition", "compiler_version", "optimizer_version", "engine",
+            "aggregate_strategy", "component_count", "boundary",
+            "required_comparators",
+        }
     else:
         raise CensusError("runner provenance is neither scalar v2 nor composite v3")
     missing = required - set(fields)
@@ -568,7 +575,8 @@ def parse_provenance(output: bytes) -> dict[str, str]:
         require_hex64(fields["program_sha256"], "provenance program digest")
         require_hex64(fields["object_sha256"], "provenance object digest")
     else:
-        components_from_provenance(fields)
+        components = components_from_provenance(fields)
+        validate_v3_provenance(fields, components)
     return fields
 
 
@@ -594,8 +602,9 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
         raise CensusError("composite provenance has invalid component_count") from error
     if fields.get("model") == "regex-redux" and count != 15:
         raise CensusError(f"regex-redux must publish exactly 15 components, got {count}")
-    if count <= 0 or count > 256:
+    if count <= 0 or count > MAX_NATIVE_ROW_COMPONENTS:
         raise CensusError(f"composite component count is out of range: {count}")
+    native_row = fields.get("native_row_bridge") == "true"
     components = []
     for index in range(count):
         native = component_field(fields, index, ("native",))
@@ -616,15 +625,109 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
             SYMBOL.fullmatch(symbol) for symbol in runtime_symbols
         ):
             raise CensusError(f"component {index} runtime symbol list is malformed")
+        source_ordinal = None
+        if native_row:
+            source_ordinal_text = component_field(fields, index, ("source_ordinal",))
+            try:
+                source_ordinal = int(source_ordinal_text, 10)
+            except ValueError as error:
+                raise CensusError(
+                    f"composite component {index} has invalid source ordinal"
+                ) from error
+            if source_ordinal < 0:
+                raise CensusError(
+                    f"composite component {index} has negative source ordinal"
+                )
         components.append({
             "ordinal": index,
             "native": True,
+            "source_ordinal": source_ordinal,
             "entry_symbol": entry,
             "required_runtime_symbols": runtime_symbols,
             "program_sha256": program_sha256,
             "object_sha256": object_sha256,
         })
     return components
+
+
+def validate_v3_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> None:
+    """Validate the exact raw v3 field set and composite topology."""
+    if fields.get("disposition") != "executed":
+        raise CensusError("composite provenance disposition is not executed")
+    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
+        raise CensusError("composite provenance comparator set differs")
+    for name in ("compiler_version", "optimizer_version"):
+        try:
+            value = int(fields[name], 10)
+        except ValueError as error:
+            raise CensusError(f"composite provenance has invalid {name}") from error
+        if value <= 0:
+            raise CensusError(f"composite provenance has nonpositive {name}")
+    base = {
+        "schema", "disposition", "configured", "adapter", "model", "benchmark",
+        "source_commit", "source_tree", "target", "feature_bits",
+        "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
+        "component_count", "boundary", "required_comparators",
+    }
+    component_fields = {
+        f"component_{index}_{suffix}"
+        for index in range(len(components))
+        for suffix in (
+            "native", "entry_symbol", "runtime_symbols", "program_sha256",
+            "object_sha256",
+        )
+    }
+    if fields["model"] == "regex-redux":
+        if fields.get("boundary") != "complete-regex-redux-aot-precompiled":
+            raise CensusError("regex-redux provenance has the wrong operation boundary")
+        expected = base | component_fields
+    elif (
+        fields.get("native_row_bridge") == "true"
+        and fields["model"] in {"count", "count-spans"}
+    ):
+        if fields.get("boundary") != "complete-native-row-bridge":
+            raise CensusError("native-row provenance has the wrong operation boundary")
+        component_fields |= {
+            f"component_{index}_source_ordinal" for index in range(len(components))
+        }
+        expected = base | component_fields | {
+            "native_row_bridge", "source_pattern_count", "row_total_object_bytes",
+            "source_to_artifact",
+        }
+        try:
+            source_count = int(fields["source_pattern_count"], 10)
+            object_bytes = int(fields["row_total_object_bytes"], 10)
+            source_to_artifact = [
+                int(value, 10) for value in fields["source_to_artifact"].split(",")
+            ]
+        except (KeyError, ValueError) as error:
+            raise CensusError("native-row provenance topology is malformed") from error
+        if not 2 <= source_count <= MAX_NATIVE_ROW_COMPONENTS:
+            raise CensusError("native-row source pattern count is out of range")
+        if not 0 < object_bytes <= MAX_NATIVE_ROW_OBJECT_BYTES:
+            raise CensusError("native-row object-byte total is out of range")
+        if len(source_to_artifact) != source_count or any(
+            artifact < 0 or artifact >= len(components)
+            for artifact in source_to_artifact
+        ):
+            raise CensusError("native-row source-to-artifact map is out of range")
+        if set(source_to_artifact) != set(range(len(components))):
+            raise CensusError("native-row source-to-artifact map is not surjective")
+        first_sources = [source_to_artifact.index(index) for index in range(len(components))]
+        if first_sources != sorted(first_sources):
+            raise CensusError("native-row component priority is not source ordered")
+        if [component["source_ordinal"] for component in components] != first_sources:
+            raise CensusError("native-row component source ordinals differ from its map")
+    else:
+        raise CensusError("runner v3 provenance has an unknown composite route")
+    if set(fields) != expected:
+        raise CensusError(
+            "runner v3 provenance field closure differs: "
+            f"missing={sorted(expected - set(fields))!r} "
+            f"extra={sorted(set(fields) - expected)!r}"
+        )
 
 
 def nm_text_symbols(nm_output: str) -> set[str]:
@@ -815,6 +918,11 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         return {
             **common,
             "kind": "scalar-v2",
+            "composite_kind": None,
+            "source_pattern_count": None,
+            "source_to_artifact": [],
+            "row_total_object_bytes": None,
+            "boundary": fields.get("boundary"),
             "engine": fields["engine"],
             "aggregate_strategy": fields["aggregate_strategy"],
             "prepared_bulk_strategy": fields["prepared_bulk_strategy"],
@@ -832,11 +940,26 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "components": [],
         }
     components = components_from_provenance(fields)
+    native_row = fields.get("native_row_bridge") == "true"
     return {
         **common,
         "kind": "composite-v3",
-        "engine": None,
-        "aggregate_strategy": None,
+        "composite_kind": (
+            "native-row-bridge-v1" if native_row else "regex-redux-fixed-v1"
+        ),
+        "source_pattern_count": (
+            int(fields["source_pattern_count"], 10) if native_row else 0
+        ),
+        "source_to_artifact": (
+            [int(value, 10) for value in fields["source_to_artifact"].split(",")]
+            if native_row else []
+        ),
+        "row_total_object_bytes": (
+            int(fields["row_total_object_bytes"], 10) if native_row else None
+        ),
+        "boundary": fields["boundary"],
+        "engine": fields["engine"],
+        "aggregate_strategy": fields["aggregate_strategy"],
         "prepared_bulk_strategy": None,
         "span_iteration_strategy": None,
         "grep_iteration_strategy": None,
@@ -914,6 +1037,18 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         ],
     }
     normalized_provenance = provenance_receipt(primary_fields)
+    if normalized_provenance["kind"] == "composite-v3" and (
+        normalized_provenance["source_pattern_count"]
+        != len(job["input"]["pattern_sha256"])
+    ):
+        raise CensusError("composite provenance source count differs from sealed job")
+    if normalized_provenance["composite_kind"] == "native-row-bridge-v1":
+        source_map = normalized_provenance["source_to_artifact"]
+        pattern_hashes = job["input"]["pattern_sha256"]
+        for source, pattern_hash in enumerate(pattern_hashes):
+            for prior in range(source):
+                if pattern_hash == pattern_hashes[prior] and source_map[source] != source_map[prior]:
+                    raise CensusError("duplicate source patterns map to different artifacts")
     expected_object_hashes = (
         [normalized_provenance["object_sha256"]]
         if normalized_provenance["kind"] == "scalar-v2"
@@ -923,6 +1058,13 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         raise CensusError("primary object files differ from provenance object identities")
     if [row["sha256"] for row in replica_hashes["objects"]] != expected_object_hashes:
         raise CensusError("replica object files differ from provenance object identities")
+    if normalized_provenance["composite_kind"] == "native-row-bridge-v1":
+        expected_total_bytes = normalized_provenance["row_total_object_bytes"]
+        if any(
+            sum(row["bytes"] for row in artifact["objects"]) != expected_total_bytes
+            for artifact in (primary_hashes, replica_hashes)
+        ):
+            raise CensusError("native-row object files differ from its total-byte receipt")
     reproducible = primary_hashes == replica_hashes
     primary_symbols, primary_nm_sha = run_nm(args.nm, primary_runner)
     replica_symbols, replica_nm_sha = run_nm(args.nm, replica_runner)
@@ -1127,14 +1269,17 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         raise CensusError(f"{context} is not an object")
     require_exact_keys(provenance, {
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
-        "target", "feature_bits", "kind", "engine", "aggregate_strategy",
+        "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
+        "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
+        "aggregate_strategy",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
     }, context)
     for index, component in enumerate(provenance["components"]):
         require_exact_keys(component, {
-            "ordinal", "native", "entry_symbol", "required_runtime_symbols",
+            "ordinal", "native", "source_ordinal", "entry_symbol",
+            "required_runtime_symbols",
             "program_sha256", "object_sha256",
         }, f"{context} component {index}")
 
