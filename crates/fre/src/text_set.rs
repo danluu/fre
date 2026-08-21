@@ -1100,6 +1100,92 @@ impl PortableTextRegexSetSearchSession<'_> {
         };
         Ok(PortableSetMatches::from_flags_and_report(flags, report))
     }
+
+    /// Set every matching pattern's caller-owned flag while reusing all
+    /// constituent workspaces and omitting execution reports.
+    ///
+    /// Successful searches only change matching slots from `false` to `true`;
+    /// existing flags and any tail beyond [`Self::len`] remain untouched. The
+    /// returned boolean describes this execution rather than flags retained
+    /// from an earlier call. This operation deliberately has unlimited
+    /// execution resources. Use [`Self::matches`] when finite limits must be
+    /// enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an undersized caller buffer or indexed matcher refusal.
+    #[inline(always)]
+    pub fn matches_read_value_unlimited(
+        &mut self,
+        match_flags: &mut [bool],
+        haystack: &str,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        self.matches_read_at_value_unlimited(match_flags, haystack, 0)
+    }
+
+    /// Set every matching pattern's caller-owned flag at or after byte offset
+    /// `start` while reusing all constituent workspaces and omitting execution
+    /// reports.
+    ///
+    /// An offset inside a UTF-8 scalar advances once to the next possible text
+    /// match boundary, while assertions retain complete original-haystack
+    /// context. Mutation is incremental in source order: a later indexed
+    /// matcher refusal retains flags set by preceding successful constituents.
+    /// This operation deliberately has unlimited execution resources. Use
+    /// [`Self::matches_at`] when finite limits must be enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid start, an undersized caller buffer, or indexed
+    /// matcher refusal. Range and capacity errors are checked before mutation.
+    #[inline(always)]
+    pub fn matches_read_at_value_unlimited(
+        &mut self,
+        match_flags: &mut [bool],
+        haystack: &str,
+        start: usize,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        let search_start = validate_text_start(haystack, start)?;
+        if match_flags.len() < self.len() {
+            return Err(PortableRegexSetExecutionError::MatchBufferTooSmall {
+                needed: self.len(),
+                available: match_flags.len(),
+            });
+        }
+        if self.is_empty() {
+            return Ok(false);
+        }
+        let mut any = false;
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let regex = &self.owner.regexes[index];
+            let matched = if text_set_constituent_value_route_is_direct(regex) {
+                session.is_match_value_at_normalized(
+                    haystack,
+                    search_start,
+                    SearchLimits::unlimited(),
+                )
+            } else {
+                session
+                    .is_match_accounted_at_normalized(
+                        haystack,
+                        search_start,
+                        SearchLimits::unlimited(),
+                    )
+                    .map(|(matched, _report)| matched)
+            }
+            .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                index,
+                total_work_before: 0,
+                remaining_total_work: u64::MAX,
+                source,
+            })?;
+            if matched {
+                match_flags[index] = true;
+                any = true;
+            }
+        }
+        Ok(any)
+    }
 }
 
 fn search_one(
