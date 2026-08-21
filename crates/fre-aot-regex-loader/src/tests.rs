@@ -1,6 +1,9 @@
 use std::{io, ptr, sync::Mutex};
 
-use fre_aot_regex::{CompileMode, CompileRequest, MatchResult, OutputContract, compile};
+use fre_aot_regex::{
+    CompileMode, CompileRequest, CompileRequestV2, ExactFiniteSelectedEndTeddyPolicyV2,
+    MatchResult, OutputContract, StartAccelerator, compile, compile_v2,
+};
 
 use super::*;
 
@@ -167,6 +170,68 @@ fn direct_selected_end_matches_portable_for_full_and_subwindows() {
                     "{pattern:?} {haystack:?} {window:?}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn forced_v2_accelerated_incumbent_executes_in_source_order_across_windows() {
+    let _lock = PUBLICATION_TEST_LOCK.lock().unwrap();
+    let target = host_target().expect("supported test host");
+    let teddy_capable = target
+        .features
+        .contains(FeatureSet::of(CpuFeature::X86Avx2))
+        || target
+            .features
+            .contains(FeatureSet::of(CpuFeature::Aarch64Asimd));
+    if !teddy_capable {
+        return;
+    }
+    for pattern in ["samwise|samw|frodo|pippin", "samw|samwise|frodo|pippin"] {
+        let compiled = compile_v2(
+            CompileRequestV2::new(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(
+                ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ),
+        )
+        .unwrap_or_else(|error| panic!("compile forced V2 {pattern:?}: {error}"));
+        let report = compiled
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .unwrap_or_else(|| panic!("host target did not select forced V2 for {pattern:?}"));
+        assert!(report.lowering.incumbent_complete_dfa.has_accelerator);
+        assert_ne!(report.incumbent_start_accelerator, StartAccelerator::None);
+
+        let mut haystack = vec![b'x'; 9_000];
+        haystack[211..218].copy_from_slice(b"samwise");
+        haystack[5_013..5_020].copy_from_slice(b"samwise");
+        haystack[8_990..8_996].copy_from_slice(b"pippin");
+        let windows = [
+            SearchWindow::full(&haystack),
+            SearchWindow::new(200, 215),
+            SearchWindow::new(212, haystack.len()),
+            SearchWindow::new(180, 260),
+            SearchWindow::new(300, 5_013),
+            SearchWindow::new(5_013, 5_017),
+            SearchWindow::new(8_980, haystack.len()),
+        ];
+        let expected = windows
+            .iter()
+            .map(|&window| portable_selected_end(compiled.compiled(), &haystack, window))
+            .collect::<Vec<_>>();
+        let published =
+            publish_selected_end(compiled.into_compiled(), PublicationLimits::default())
+                .unwrap_or_else(|error| panic!("publish forced V2 {pattern:?}: {error}"));
+        for (&window, expected) in windows.iter().zip(expected) {
+            assert_eq!(
+                published.search(&haystack, window).unwrap(),
+                expected,
+                "forced native/portable source-order parity for {pattern:?} in {window:?}",
+            );
         }
     }
 }

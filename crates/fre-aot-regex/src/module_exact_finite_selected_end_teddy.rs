@@ -77,8 +77,9 @@ fn candidate_probability_cmp(left: MandatoryTeddyPlan, right: MandatoryTeddyPlan
 fn complete_dfa_incumbent_cost_units(
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
     horizon: u128,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Option<u128> {
-    if !complete_dfa_baseline_report_has_valid_geometry(incumbent) {
+    if !complete_dfa_baseline_report_has_valid_geometry(incumbent, selection_basis) {
         return None;
     }
     let per_byte = u128::try_from(incumbent.hot_loads_per_byte)
@@ -94,7 +95,16 @@ fn complete_dfa_incumbent_cost_units(
 
 fn complete_dfa_baseline_report_has_valid_geometry(
     report: ExactFiniteSelectedEndDfaBaselineReport,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> bool {
+    let accelerator_is_valid = match selection_basis {
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+            !report.has_accelerator && report.scanner == StartAccelerator::None
+        }
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+            report.has_accelerator == (report.scanner != StartAccelerator::None)
+        }
+    };
     report.semantic_dfa_sha256 != [0; 32]
         && report.forward_states != 0
         && (1..=256).contains(&report.alphabet_classes)
@@ -107,8 +117,7 @@ fn complete_dfa_baseline_report_has_valid_geometry(
         && report.native_data_bytes >= report.minimum_native_data_bytes
         && report.hot_loads_per_byte != 0
         && report.hot_branches_per_byte != 0
-        && !report.has_accelerator
-        && report.scanner == StartAccelerator::None
+        && accelerator_is_valid
 }
 
 fn worst_case_exact_verification_units<B: AsRef<[u8]>>(literals: &[B]) -> Option<u128> {
@@ -145,6 +154,7 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
     isa: MandatoryTeddyIsa,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
     selection_horizon_bytes: usize,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Option<ExactFiniteSelectedEndTeddyCosts> {
     let (root_frequency_units, root_cardinality) = root_frequency_and_cardinality(root_members)?;
     let horizon = u128::try_from(selection_horizon_bytes).ok()?;
@@ -182,7 +192,9 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
         root_cardinality,
         per_byte_scan_units,
     )?;
-    if !dynamic_profitable {
+    if !dynamic_profitable
+        && selection_basis == ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
+    {
         return None;
     }
 
@@ -196,9 +208,11 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
     let full_cost_units = gate_cost_units
         .checked_mul(EXACT_FINITE_TEDDY_GATE_COST_MULTIPLIER)?
         .checked_add(expected_verification_cost_units)?;
-    let incumbent_cost_units = complete_dfa_incumbent_cost_units(incumbent, horizon)?;
+    let incumbent_cost_units =
+        complete_dfa_incumbent_cost_units(incumbent, horizon, selection_basis)?;
     if full_cost_units.checked_mul(EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR)?
         > incumbent_cost_units.checked_mul(EXACT_FINITE_TEDDY_MATERIAL_GAIN_NUMERATOR)?
+        && selection_basis == ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
     {
         return None;
     }
@@ -225,6 +239,7 @@ fn recompute_exact_finite_selected_end_teddy_selection<B: AsRef<[u8]>>(
     target: Target,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
     selection_horizon_bytes: usize,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Option<RecomputedExactFiniteSelectedEndTeddySelection> {
     let isa = native_mandatory_teddy_isa(target)?;
     let literal_count = u16::try_from(literals.len()).ok()?;
@@ -244,6 +259,7 @@ fn recompute_exact_finite_selected_end_teddy_selection<B: AsRef<[u8]>>(
             isa,
             incumbent,
             selection_horizon_bytes,
+            selection_basis,
         ) else {
             continue;
         };
@@ -279,7 +295,10 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
 ) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
     let selection_horizon_bytes =
         PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
-    if !complete_dfa_baseline_report_has_valid_geometry(incumbent) {
+    if !complete_dfa_baseline_report_has_valid_geometry(
+        incumbent,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    ) {
         return None;
     }
     let selected = recompute_exact_finite_selected_end_teddy_selection(
@@ -290,6 +309,49 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
         target,
         incumbent,
         selection_horizon_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )?;
+    Some(ExactFiniteSelectedEndTeddySelection {
+        view,
+        plan: selected.plan,
+        isa: selected.isa,
+        target,
+        selection_horizon_bytes,
+        gate_cost_units: selected.costs.gate_cost_units,
+        expected_verification_cost_units: selected.costs.expected_verification_cost_units,
+        full_cost_units: selected.costs.full_cost_units,
+        incumbent_cost_units: selected.costs.incumbent_cost_units,
+        root_frequency_units: selected.costs.root_frequency_units,
+        no_candidate_numerator: selected.costs.no_candidate_numerator,
+        probability_denominator: selected.costs.probability_denominator,
+    })
+}
+
+/// Select a structurally valid V2 experiment while retaining every proof,
+/// target, plan-geometry and arithmetic check from the stable selector.
+/// Only the two result-blind performance predicates are bypassed.
+pub(super) fn select_exact_finite_selected_end_teddy_forced_v2<'a>(
+    view: NativeFiniteSelectedEndTeddyView<'a>,
+    target: Target,
+    incumbent: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
+    let selection_horizon_bytes =
+        PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
+    if !complete_dfa_baseline_report_has_valid_geometry(
+        incumbent,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+    ) {
+        return None;
+    }
+    let selected = recompute_exact_finite_selected_end_teddy_selection(
+        view.literals(),
+        view.portfolio(),
+        view.minimum_width(),
+        view.root_members(),
+        target,
+        incumbent,
+        selection_horizon_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
     )?;
     Some(ExactFiniteSelectedEndTeddySelection {
         view,
@@ -428,6 +490,105 @@ fn report_plan_digest(
     );
     digest.update(table);
     Some(digest.finalize().into())
+}
+
+fn v2_route_binding_digest(report: &ExactFiniteSelectedEndTeddyAotReportV2) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-exact-finite-selected-end-teddy-route-v2");
+    digest.update(report.schema_version.to_le_bytes());
+    digest.update([match report.requested_policy {
+        crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled => 0,
+        crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => 1,
+        crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => 2,
+    }]);
+    digest.update([match report.selection_basis {
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => 0,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => 1,
+    }]);
+    digest.update([match report.incumbent_source {
+        ExactFiniteSelectedEndTeddyIncumbentSourceV2::OrdinaryPublicCompleteDfa => 0,
+    }]);
+    digest.update([start_accelerator_tag(report.incumbent_start_accelerator)]);
+    digest.update([report.incumbent_anchored_prefix_filter_bytes]);
+    digest.update([
+        u8::from(report.performance_admission_bypassed),
+        u8::from(report.tail_enters_exact_incumbent),
+    ]);
+    digest.update(report.lowering.artifact_identity);
+    digest.update(report.lowering.prefix_plan_sha256);
+    digest.update(report.lowering.native_code_sha256);
+    digest.update(report.lowering.native_data_sha256);
+    digest.update(report.lowering.relocations_sha256);
+    digest.update(report.lowering.incumbent_code_sha256);
+    digest.update(report.lowering.incumbent_data_sha256);
+    digest.update(report.lowering.incumbent_relocations_sha256);
+    digest.update(report.lowering.incumbent_complete_dfa.semantic_dfa_sha256);
+    digest.finalize().into()
+}
+
+pub(crate) fn exact_finite_selected_end_teddy_report_v2(
+    lowering: ExactFiniteSelectedEndTeddyAotReport,
+    requested_policy: crate::ExactFiniteSelectedEndTeddyPolicyV2,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    incumbent_anchored_prefix_filter_bytes: u8,
+) -> Result<ExactFiniteSelectedEndTeddyAotReportV2, ObjectError> {
+    let valid_policy = matches!(
+        (requested_policy, selection_basis),
+        (
+            crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ) | (
+            crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        )
+    );
+    if !valid_policy
+        || !complete_dfa_baseline_report_has_valid_geometry(
+            lowering.incumbent_complete_dfa,
+            selection_basis,
+        )
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact finite SelectedEnd Teddy V2 policy or incumbent",
+        ));
+    }
+    let mut report = ExactFiniteSelectedEndTeddyAotReportV2 {
+        schema_version: crate::COMPILE_REQUEST_V2_SCHEMA_VERSION,
+        requested_policy,
+        selection_basis,
+        incumbent_source: ExactFiniteSelectedEndTeddyIncumbentSourceV2::OrdinaryPublicCompleteDfa,
+        incumbent_start_accelerator: lowering.incumbent_complete_dfa.scanner,
+        incumbent_anchored_prefix_filter_bytes,
+        performance_admission_bypassed: selection_basis
+            == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        tail_enters_exact_incumbent: true,
+        route_binding_sha256: [0; 32],
+        lowering,
+    };
+    report.route_binding_sha256 = v2_route_binding_digest(&report);
+    Ok(report)
+}
+
+fn report_v2_metadata_authenticates(report: &ExactFiniteSelectedEndTeddyAotReportV2) -> bool {
+    report.schema_version == crate::COMPILE_REQUEST_V2_SCHEMA_VERSION
+        && report.incumbent_source
+            == ExactFiniteSelectedEndTeddyIncumbentSourceV2::OrdinaryPublicCompleteDfa
+        && report.incumbent_start_accelerator == report.lowering.incumbent_complete_dfa.scanner
+        && report.performance_admission_bypassed
+            == (report.selection_basis
+                == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility)
+        && report.tail_enters_exact_incumbent
+        && matches!(
+            (report.requested_policy, report.selection_basis),
+            (
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+                ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+            ) | (
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+                ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+            )
+        )
+        && report.route_binding_sha256 == v2_route_binding_digest(report)
 }
 
 pub(super) fn relocation_digest(relocations: &[ModuleRelocation]) -> Option<[u8; 32]> {
@@ -1533,14 +1694,49 @@ fn report_for(
 /// allocation policy.
 pub(super) fn wrap_exact_finite_selected_end_teddy(
     selection: ExactFiniteSelectedEndTeddySelection<'_>,
-    mut incumbent: NativeLowering,
+    incumbent: NativeLowering,
     incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
     target: Target,
     maximum_native_data_bytes: usize,
 ) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
+    wrap_exact_finite_selected_end_teddy_with_basis(
+        selection,
+        incumbent,
+        incumbent_complete_dfa,
+        target,
+        maximum_native_data_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+pub(super) fn wrap_exact_finite_selected_end_teddy_forced_v2(
+    selection: ExactFiniteSelectedEndTeddySelection<'_>,
+    incumbent: NativeLowering,
+    incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
+    target: Target,
+    maximum_native_data_bytes: usize,
+) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
+    wrap_exact_finite_selected_end_teddy_with_basis(
+        selection,
+        incumbent,
+        incumbent_complete_dfa,
+        target,
+        maximum_native_data_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+    )
+}
+
+fn wrap_exact_finite_selected_end_teddy_with_basis(
+    selection: ExactFiniteSelectedEndTeddySelection<'_>,
+    mut incumbent: NativeLowering,
+    incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
+    target: Target,
+    maximum_native_data_bytes: usize,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
     if target != selection.target
         || native_mandatory_teddy_isa(target) != Some(selection.isa)
-        || !complete_dfa_baseline_report_has_valid_geometry(incumbent_complete_dfa)
+        || !complete_dfa_baseline_report_has_valid_geometry(incumbent_complete_dfa, selection_basis)
         || incumbent_complete_dfa.native_data_bytes != incumbent.data.len()
         || incumbent_complete_dfa.scanner != incumbent.start_accelerator
         || incumbent.needs_runtime
@@ -1674,7 +1870,15 @@ pub(super) fn wrap_exact_finite_selected_end_teddy(
         incumbent_relocation_count,
         incumbent_complete_dfa,
     )?;
-    if !report_matches_lowering(&report, &incumbent, target)? {
+    let report_matches = match selection_basis {
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+            report_matches_lowering(&report, &incumbent, target)?
+        }
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+            report_matches_lowering_with_basis(&report, &incumbent, target, selection_basis)?
+        }
+    };
+    if !report_matches {
         return Err(ObjectError::InvalidModule(
             "exact finite SelectedEnd Teddy wrapper disagrees with its receipt",
         ));
@@ -1690,7 +1894,21 @@ pub(super) fn report_matches_lowering(
     lowering: &NativeLowering,
     target: Target,
 ) -> Result<bool, ObjectError> {
-    report_matches_parts(
+    report_matches_lowering_with_basis(
+        report,
+        lowering,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+fn report_matches_lowering_with_basis(
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    lowering: &NativeLowering,
+    target: Target,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<bool, ObjectError> {
+    report_matches_parts_with_basis(
         report,
         &lowering.code,
         &lowering.data,
@@ -1700,6 +1918,7 @@ pub(super) fn report_matches_lowering(
         lowering.start_accelerator,
         lowering.anchored_prefix_filter_bytes,
         target,
+        selection_basis,
     )
 }
 
@@ -1718,6 +1937,66 @@ pub(super) fn report_matches_parts(
     anchored_prefix_filter_bytes: u8,
     target: Target,
 ) -> Result<bool, ObjectError> {
+    report_matches_parts_with_basis(
+        report,
+        code,
+        data,
+        relocations,
+        needs_runtime,
+        has_slow_partial_table,
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "V2 module attachment re-authenticates every independently stored lowering component"
+)]
+pub(super) fn report_v2_matches_parts(
+    report: &ExactFiniteSelectedEndTeddyAotReportV2,
+    code: &[u8],
+    data: &[u8],
+    relocations: &[ModuleRelocation],
+    needs_runtime: bool,
+    has_slow_partial_table: bool,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    target: Target,
+) -> Result<bool, ObjectError> {
+    Ok(report_v2_metadata_authenticates(report)
+        && report_matches_parts_with_basis(
+            &report.lowering,
+            code,
+            data,
+            relocations,
+            needs_runtime,
+            has_slow_partial_table,
+            start_accelerator,
+            anchored_prefix_filter_bytes,
+            target,
+            report.selection_basis,
+        )?)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "module attachment re-authenticates every independently stored lowering component"
+)]
+fn report_matches_parts_with_basis(
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    code: &[u8],
+    data: &[u8],
+    relocations: &[ModuleRelocation],
+    needs_runtime: bool,
+    has_slow_partial_table: bool,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    target: Target,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<bool, ObjectError> {
     let code_end = report
         .incumbent_code_offset
         .checked_add(report.incumbent_code_bytes);
@@ -1725,52 +2004,67 @@ pub(super) fn report_matches_parts(
         .filter(|&end| end <= code.len())
         .and_then(|end| code.get(report.incumbent_code_offset..end));
     let incumbent_data = data.get(..report.incumbent_data_bytes);
-    let incumbent_route_matches =
-        complete_dfa_baseline_report_has_valid_geometry(report.incumbent_complete_dfa)
-            && report.incumbent_complete_dfa.native_data_bytes == report.incumbent_data_bytes
-            && incumbent_relocation_digest(
-                relocations,
-                report.incumbent_relocation_count,
-                report.incumbent_code_offset,
-                report.incumbent_code_bytes,
-            )
-            .is_some_and(|digest| digest == report.incumbent_relocations_sha256);
-    Ok(report_costs_authenticate(report, data, target)?
-        && verifier_data_authenticates(report, data)?
-        && report.artifact_identity != [0; 32]
-        && report.output == OutputContract::SelectedEnd
-        && report.source_count >= 4
-        && report.source_count <= 64
-        && usize::try_from(report.minimum_width)
-            .ok()
-            .and_then(|width| width.checked_mul(usize::try_from(report.source_count).ok()?))
-            .is_some_and(|minimum_source_bytes| report.source_bytes >= minimum_source_bytes)
-        && report.minimum_width >= u32::from(report.columns)
-        && report.minimum_width <= report.maximum_width
-        && report.literal_sha256 != [0; 32]
-        && matches!(report.columns, 3 | 4)
-        && report.literal_count == u16::try_from(report.source_count).unwrap_or(0)
-        && report.bucket_count == u8::try_from(report.literal_count.min(8)).unwrap_or(0)
-        && report.candidate_fingerprint_upper_bound != 0
-        && report.candidate_frequency_upper_bound != 0
-        && report.fingerprint_space != 0
-        && report.candidate_fingerprint_upper_bound <= report.fingerprint_space
-        && report.candidate_frequency_upper_bound <= report.fingerprint_space
-        && report.table_base < report.table_end
-        && report.incumbent_data_bytes <= usize::try_from(report.table_base).unwrap_or(0)
-        && report.native_data_bytes == data.len()
-        && incumbent_route_matches
-        && report.scanner == start_accelerator
-        && anchored_prefix_filter_bytes == report.columns
-        && !needs_runtime
-        && !has_slow_partial_table
-        && Sha256::digest(code).as_slice() == report.native_code_sha256
-        && Sha256::digest(data).as_slice() == report.native_data_sha256
-        && relocation_digest(relocations).is_some_and(|digest| digest == report.relocations_sha256)
-        && incumbent
-            .is_some_and(|code| Sha256::digest(code).as_slice() == report.incumbent_code_sha256)
-        && incumbent_data
-            .is_some_and(|data| Sha256::digest(data).as_slice() == report.incumbent_data_sha256))
+    let incumbent_route_matches = complete_dfa_baseline_report_has_valid_geometry(
+        report.incumbent_complete_dfa,
+        selection_basis,
+    ) && report.incumbent_complete_dfa.native_data_bytes
+        == report.incumbent_data_bytes
+        && incumbent_relocation_digest(
+            relocations,
+            report.incumbent_relocation_count,
+            report.incumbent_code_offset,
+            report.incumbent_code_bytes,
+        )
+        .is_some_and(|digest| digest == report.incumbent_relocations_sha256);
+    let costs_authenticate = match selection_basis {
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+            report_costs_authenticate(report, data, target)?
+        }
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+            report_costs_authenticate_with_basis(report, data, target, selection_basis)?
+        }
+    };
+    Ok(
+        costs_authenticate
+            && verifier_data_authenticates(report, data)?
+            && report.artifact_identity != [0; 32]
+            && report.output == OutputContract::SelectedEnd
+            && report.source_count >= 4
+            && report.source_count <= 64
+            && usize::try_from(report.minimum_width)
+                .ok()
+                .and_then(|width| width.checked_mul(usize::try_from(report.source_count).ok()?))
+                .is_some_and(|minimum_source_bytes| report.source_bytes >= minimum_source_bytes)
+            && report.minimum_width >= u32::from(report.columns)
+            && report.minimum_width <= report.maximum_width
+            && report.literal_sha256 != [0; 32]
+            && matches!(report.columns, 3 | 4)
+            && report.literal_count == u16::try_from(report.source_count).unwrap_or(0)
+            && report.bucket_count == u8::try_from(report.literal_count.min(8)).unwrap_or(0)
+            && report.candidate_fingerprint_upper_bound != 0
+            && report.candidate_frequency_upper_bound != 0
+            && report.fingerprint_space != 0
+            && report.candidate_fingerprint_upper_bound <= report.fingerprint_space
+            && report.candidate_frequency_upper_bound <= report.fingerprint_space
+            && report.table_base < report.table_end
+            && report.incumbent_data_bytes <= usize::try_from(report.table_base).unwrap_or(0)
+            && report.native_data_bytes == data.len()
+            && incumbent_route_matches
+            && report.scanner == start_accelerator
+            && anchored_prefix_filter_bytes == report.columns
+            && !needs_runtime
+            && !has_slow_partial_table
+            && Sha256::digest(code).as_slice() == report.native_code_sha256
+            && Sha256::digest(data).as_slice() == report.native_data_sha256
+            && relocation_digest(relocations)
+                .is_some_and(|digest| digest == report.relocations_sha256)
+            && incumbent.is_some_and(|code| {
+                Sha256::digest(code).as_slice() == report.incumbent_code_sha256
+            })
+            && incumbent_data.is_some_and(|data| {
+                Sha256::digest(data).as_slice() == report.incumbent_data_sha256
+            }),
+    )
 }
 
 fn incumbent_relocation_digest(
@@ -2022,6 +2316,20 @@ fn report_costs_authenticate(
     data: &[u8],
     target: Target,
 ) -> Result<bool, ObjectError> {
+    report_costs_authenticate_with_basis(
+        report,
+        data,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+fn report_costs_authenticate_with_basis(
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    data: &[u8],
+    target: Target,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<bool, ObjectError> {
     let selected_isa = mandatory_isa_for_target_tier(report.selected_target_tier);
     if report.target != target
         || target.validate().is_err()
@@ -2046,7 +2354,7 @@ fn report_costs_authenticate(
             root_members[byte / 64] |= 1_u64 << (byte % 64);
         }
         let incumbent = report.incumbent_complete_dfa;
-        if !complete_dfa_baseline_report_has_valid_geometry(incumbent)
+        if !complete_dfa_baseline_report_has_valid_geometry(incumbent, selection_basis)
             || incumbent.native_data_bytes != report.incumbent_data_bytes
             || source_bytes != report.source_bytes
             || root_members != report.root_members
@@ -2065,6 +2373,7 @@ fn report_costs_authenticate(
             target,
             incumbent,
             EXACT_FINITE_PREFIX_MIN_INPUT_BYTES,
+            selection_basis,
         )?;
         if selected.isa != selected_isa {
             return Some(false);
@@ -2147,13 +2456,90 @@ pub(super) fn refresh_report_parts(
     anchored_prefix_filter_bytes: u8,
     target: Target,
 ) -> Result<(), ObjectError> {
+    refresh_report_parts_with_basis(
+        report,
+        code,
+        data,
+        relocations,
+        needs_runtime,
+        has_slow_partial_table,
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "aggregate composition refreshes the full-module hashes and then replays exact attachment validation"
+)]
+fn refresh_report_parts_with_basis(
+    report: &mut ExactFiniteSelectedEndTeddyAotReport,
+    code: &[u8],
+    data: &[u8],
+    relocations: &[ModuleRelocation],
+    needs_runtime: bool,
+    has_slow_partial_table: bool,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    target: Target,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<(), ObjectError> {
     report.native_code_sha256 = Sha256::digest(code).into();
     report.native_data_sha256 = Sha256::digest(data).into();
     report.relocations_sha256 = relocation_digest(relocations).ok_or(
         ObjectError::InvalidModule("exact finite SelectedEnd Teddy aggregate relocation digest"),
     )?;
     report.native_data_bytes = data.len();
-    if !report_matches_parts(
+    if !report_matches_parts_with_basis(
+        report,
+        code,
+        data,
+        relocations,
+        needs_runtime,
+        has_slow_partial_table,
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        target,
+        selection_basis,
+    )? {
+        return Err(ObjectError::InvalidModule(
+            "exact finite SelectedEnd Teddy aggregate composition changed its ordinary entry",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "V2 aggregate composition refreshes both lowering and route bindings"
+)]
+pub(super) fn refresh_report_v2_parts(
+    report: &mut ExactFiniteSelectedEndTeddyAotReportV2,
+    code: &[u8],
+    data: &[u8],
+    relocations: &[ModuleRelocation],
+    needs_runtime: bool,
+    has_slow_partial_table: bool,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    target: Target,
+) -> Result<(), ObjectError> {
+    refresh_report_parts_with_basis(
+        &mut report.lowering,
+        code,
+        data,
+        relocations,
+        needs_runtime,
+        has_slow_partial_table,
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        target,
+        report.selection_basis,
+    )?;
+    report.route_binding_sha256 = v2_route_binding_digest(report);
+    if !report_v2_matches_parts(
         report,
         code,
         data,
@@ -2165,7 +2551,7 @@ pub(super) fn refresh_report_parts(
         target,
     )? {
         return Err(ObjectError::InvalidModule(
-            "exact finite SelectedEnd Teddy aggregate composition changed its ordinary entry",
+            "exact finite SelectedEnd Teddy V2 aggregate composition changed its ordinary entry",
         ));
     }
     Ok(())
@@ -2591,6 +2977,347 @@ mod tests {
             assert!(compiled.receipt().ordered_finite_language_aot.is_none());
             let unchanged = unchanged_selected_end_module(&compiled, target);
             assert_byte_identical_module(compiled.module(), &unchanged);
+        }
+    }
+
+    fn accelerated_exact_finite_pattern() -> &'static str {
+        "samwise|samw|frodo|pippin"
+    }
+
+    fn force_v2(pattern: &str, target: Target) -> crate::CompiledRegexV2 {
+        crate::compile_v2(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ),
+        )
+        .expect("compile forced structurally eligible Teddy V2")
+    }
+
+    #[test]
+    fn v2_automatic_is_stable_v1_byte_for_byte() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let request = || {
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+        };
+        let stable = compile(request()).unwrap();
+        let v2 = crate::compile_v2(crate::CompileRequestV2::new(request())).unwrap();
+        assert_eq!(v2.object(), stable.object());
+        assert_eq!(v2.module(), stable.module());
+        assert_eq!(v2.receipt(), stable.receipt());
+        let stable_report = stable
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("stable fixture selects V1 Teddy");
+        let supplement = v2
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("V2 Automatic describes the same selection");
+        assert_eq!(
+            supplement.selection_basis,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        );
+        assert!(!supplement.performance_admission_bypassed);
+        assert_eq!(supplement.lowering, stable_report);
+
+        let accelerated_request = || {
+            CompileRequest::new(accelerated_exact_finite_pattern(), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+        };
+        let stable = compile(accelerated_request()).unwrap();
+        let v2 = crate::compile_v2(crate::CompileRequestV2::new(accelerated_request())).unwrap();
+        assert_eq!(v2.object(), stable.object());
+        assert_eq!(v2.module(), stable.module());
+        assert_eq!(v2.receipt(), stable.receipt());
+        assert_eq!(
+            v2.receipt_v2().exact_finite_selected_end_teddy_policy,
+            crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        );
+        assert!(
+            v2.receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+            "Automatic must not enable the accelerated-incumbent experiment",
+        );
+    }
+
+    #[test]
+    fn v2_disabled_is_byte_identical_to_the_established_ordinary_module() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let stable = compile_selected(&pattern, target);
+        let ordinary = unchanged_selected_end_module(&stable, target);
+        let ordinary_object = crate::emit_object(
+            &ordinary,
+            crate::ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+        let disabled = crate::compile_v2(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled),
+        )
+        .unwrap();
+        assert_byte_identical_module(disabled.module(), &ordinary);
+        assert_eq!(disabled.object(), ordinary_object);
+        assert!(
+            disabled
+                .receipt()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+        assert!(
+            disabled
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn v2_force_wraps_the_actual_accelerated_incumbent_on_every_target_tier() {
+        let targets = [
+            avx2_target(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx2)
+                        .with(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+        ];
+        for target in targets {
+            let forced = force_v2(accelerated_exact_finite_pattern(), target);
+            let ordinary = crate::compile_v2(
+                crate::CompileRequestV2::new(
+                    CompileRequest::new(accelerated_exact_finite_pattern(), target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd),
+                )
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                ),
+            )
+            .expect("compile the ordinary accelerated incumbent");
+            assert!(
+                forced
+                    .receipt()
+                    .exact_finite_selected_end_teddy_aot
+                    .is_none(),
+                "forced evidence must not enter V1: {target:?}",
+            );
+            let report = forced
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .unwrap_or_else(|| panic!("forced target did not select: {target:?}"));
+            assert_eq!(
+                report.selection_basis,
+                ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+            );
+            assert!(report.performance_admission_bypassed);
+            assert!(report.tail_enters_exact_incumbent);
+            assert!(report.lowering.incumbent_complete_dfa.has_accelerator);
+            assert_ne!(report.incumbent_start_accelerator, StartAccelerator::None,);
+            assert_eq!(
+                report.incumbent_start_accelerator,
+                report.lowering.incumbent_complete_dfa.scanner,
+            );
+            assert_eq!(
+                report.incumbent_start_accelerator,
+                ordinary.module().start_accelerator(),
+            );
+            assert_eq!(
+                report.incumbent_anchored_prefix_filter_bytes,
+                ordinary.module().anchored_prefix_filter_bytes(),
+            );
+            let ordinary_code_sha256: [u8; 32] =
+                Sha256::digest(ordinary.module().sections()[TEXT_SECTION].bytes()).into();
+            let ordinary_data_sha256: [u8; 32] =
+                Sha256::digest(ordinary.module().sections()[PROGRAM_SECTION].bytes()).into();
+            assert_eq!(
+                report.lowering.incumbent_code_sha256,
+                ordinary_code_sha256,
+            );
+            assert_eq!(
+                report.lowering.incumbent_data_sha256,
+                ordinary_data_sha256,
+            );
+            assert_eq!(
+                Some(report.lowering.incumbent_relocations_sha256),
+                relocation_digest(ordinary.module().relocations()),
+            );
+            assert_eq!(
+                forced
+                    .module()
+                    .exact_finite_selected_end_teddy_aot_report_v2(),
+                Some(&report),
+            );
+        }
+    }
+
+    #[test]
+    fn v2_route_binding_rejects_policy_and_incumbent_fact_tampering() {
+        let authentic = force_v2(accelerated_exact_finite_pattern(), avx2_target())
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("forced V2 selection");
+        assert!(report_v2_metadata_authenticates(&authentic));
+
+        let mut tampered = authentic;
+        tampered.requested_policy = crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic;
+        assert!(!report_v2_metadata_authenticates(&tampered));
+
+        let mut tampered = authentic;
+        tampered.incumbent_start_accelerator = StartAccelerator::None;
+        assert!(!report_v2_metadata_authenticates(&tampered));
+
+        let mut tampered = authentic;
+        tampered.incumbent_anchored_prefix_filter_bytes ^= 1;
+        assert!(!report_v2_metadata_authenticates(&tampered));
+
+        let mut tampered = authentic;
+        tampered.route_binding_sha256[0] ^= 1;
+        assert!(!report_v2_metadata_authenticates(&tampered));
+    }
+
+    #[test]
+    fn v2_force_data_cap_decline_restores_the_accelerated_incumbent_exactly() {
+        let target = avx2_target();
+        let pattern = accelerated_exact_finite_pattern();
+        let forced = force_v2(pattern, target);
+        let report = forced
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("uncapped forced selection");
+        let disabled = crate::compile_v2(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled),
+        )
+        .unwrap();
+        let capped = crate::compile_v2_with_slow_aot_limits(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ),
+            crate::SlowAotLimits {
+                max_native_data_bytes: report.lowering.native_data_bytes - 1,
+                ..crate::SlowAotLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.module(), disabled.module());
+        assert_eq!(capped.object(), disabled.object());
+        assert_eq!(capped.receipt(), disabled.receipt());
+        assert!(
+            capped
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn v2_force_object_cap_restores_the_accelerated_incumbent_exactly() {
+        let target = avx2_target();
+        let pattern = accelerated_exact_finite_pattern();
+        let request = |max_object_bytes| {
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(crate::CompileLimitsV1 {
+                    max_object_bytes,
+                    ..crate::CompileLimitsV1::default()
+                })
+        };
+        let ordinary = crate::compile_v2(
+            crate::CompileRequestV2::new(request(usize::MAX))
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                ),
+        )
+        .expect("compile the ordinary accelerated incumbent");
+        let forced = crate::compile_v2(
+            crate::CompileRequestV2::new(request(usize::MAX)).exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ),
+        )
+        .expect("compile the forced wrapper");
+        assert!(ordinary.object().len() < forced.object().len());
+
+        let capped = crate::compile_v2(
+            crate::CompileRequestV2::new(request(ordinary.object().len()))
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+                ),
+        )
+        .expect("the exact ordinary object boundary must fit");
+        assert_eq!(capped.module(), ordinary.module());
+        assert_eq!(capped.object(), ordinary.object());
+        assert_eq!(capped.receipt(), ordinary.receipt());
+        assert!(
+            capped
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn v2_force_never_bypasses_structural_or_output_gates() {
+        let target = avx2_target();
+        for (pattern, output) in [
+            ("alpha|bravo|cider", OutputContract::SelectedEnd),
+            ("aa|bb|cc|dd", OutputContract::SelectedEnd),
+            (accelerated_exact_finite_pattern(), OutputContract::Exists),
+            (accelerated_exact_finite_pattern(), OutputContract::Span),
+        ] {
+            let compiled = crate::compile_v2(
+                crate::CompileRequestV2::new(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+                ),
+            )
+            .unwrap();
+            assert!(
+                compiled
+                    .receipt_v2()
+                    .exact_finite_selected_end_teddy_aot
+                    .is_none(),
+                "force bypassed a correctness gate for {pattern:?}/{output:?}",
+            );
         }
     }
 

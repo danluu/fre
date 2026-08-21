@@ -84,8 +84,9 @@ pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
     ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport,
-    ExactFiniteSelectedEndTeddyAotTargetTier, ExactSingleLiteralAotIsa,
-    ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
+    ExactFiniteSelectedEndTeddyAotReportV2, ExactFiniteSelectedEndTeddyAotTargetTier,
+    ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
+    ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
     ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
     OperatingSystem, OrderedFiniteLanguageAotReport, PreparedAggregateExports,
     PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
@@ -282,6 +283,13 @@ pub use regex_set::{
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
 pub const OPTIMIZER_VERSION: u32 = 24;
+/// Schema identity for the opt-in experimental compile request and receipt.
+pub const COMPILE_REQUEST_V2_SCHEMA_VERSION: u32 = 2;
+/// Optimizer identity for the opt-in accelerated-incumbent Teddy experiment.
+///
+/// The stable V1 receipt deliberately retains [`OPTIMIZER_VERSION`], including
+/// when a V2 request uses `Automatic`, so existing evidence is not relabeled.
+pub const EXPERIMENTAL_OPTIMIZER_VERSION_V2: u32 = 25;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -327,6 +335,22 @@ pub enum CompileMode {
     Fast,
     /// Run complete ordered determinization and target optimization.
     Optimizing,
+}
+
+/// Opt-in policy for the V2 exact-finite `SelectedEnd` Teddy experiment.
+///
+/// `ForceStructurallyEligible` bypasses only result-blind performance
+/// admission. It does not bypass finite-language proof, output/ABI, target,
+/// plan geometry, resource, or receipt-authentication checks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExactFiniteSelectedEndTeddyPolicyV2 {
+    /// Do not consider the Teddy wrapper.
+    Disabled,
+    /// Preserve the stable V1 selector exactly.
+    #[default]
+    Automatic,
+    /// Admit every otherwise-valid structural candidate for measurement.
+    ForceStructurallyEligible,
 }
 
 /// Exact C entry-point ABI emitted for one capture-free output contract.
@@ -446,6 +470,35 @@ impl CompileRequest {
     }
 }
 
+/// Versioned opt-in request for experimental compiler policies.
+///
+/// Keeping this wrapper separate leaves [`CompileRequest`] and [`compile`]
+/// source-compatible and preserves their stable V1 receipts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileRequestV2 {
+    pub request: CompileRequest,
+    pub exact_finite_selected_end_teddy: ExactFiniteSelectedEndTeddyPolicyV2,
+}
+
+impl CompileRequestV2 {
+    #[must_use]
+    pub const fn new(request: CompileRequest) -> Self {
+        Self {
+            request,
+            exact_finite_selected_end_teddy: ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        }
+    }
+
+    #[must_use]
+    pub const fn exact_finite_selected_end_teddy(
+        mut self,
+        policy: ExactFiniteSelectedEndTeddyPolicyV2,
+    ) -> Self {
+        self.exact_finite_selected_end_teddy = policy;
+        self
+    }
+}
+
 pub(crate) fn rust_profile_compiled_size_limit(profile: &RustProfile) -> Option<usize> {
     match &profile.constructor {
         RustConstructor::RegexBuilder { size_limit, .. }
@@ -557,6 +610,52 @@ pub struct CompiledRegex {
     module: CompiledModule,
     object: Box<[u8]>,
     receipt: CompileReceipt,
+}
+
+/// Supplemental receipt for one V2 experimental request.
+///
+/// The stable V1 receipt remains available from [`CompiledRegex::receipt`]
+/// and is not rewritten. In particular, a forced V2 route never appears in
+/// the V1 Teddy field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompileReceiptV2 {
+    pub schema_version: u32,
+    pub optimizer_version: u32,
+    pub exact_finite_selected_end_teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
+    pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReportV2>,
+}
+
+/// Compiler result carrying both the unchanged stable receipt and the V2
+/// experimental supplement.
+#[derive(Clone, Debug)]
+pub struct CompiledRegexV2 {
+    compiled: CompiledRegex,
+    receipt_v2: CompileReceiptV2,
+}
+
+impl CompiledRegexV2 {
+    #[must_use]
+    pub const fn compiled(&self) -> &CompiledRegex {
+        &self.compiled
+    }
+
+    #[must_use]
+    pub const fn receipt_v2(&self) -> &CompileReceiptV2 {
+        &self.receipt_v2
+    }
+
+    #[must_use]
+    pub fn into_compiled(self) -> CompiledRegex {
+        self.compiled
+    }
+}
+
+impl core::ops::Deref for CompiledRegexV2 {
+    type Target = CompiledRegex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.compiled
+    }
 }
 
 /// Reusable execution storage prepared by an AOT compiler result.
@@ -674,6 +773,77 @@ impl CompiledModule {
 /// object-production failure.
 pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
     compile_with_slow_aot_limits(request, SlowAotLimits::default())
+}
+
+/// Compile with an explicit V2 experimental-selection policy.
+///
+/// The returned result retains the stable [`CompileReceipt`] unchanged and
+/// carries policy/selection provenance in [`CompileReceiptV2`].
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`compile`].
+pub fn compile_v2(request: CompileRequestV2) -> Result<CompiledRegexV2, CompileError> {
+    compile_v2_with_slow_aot_limits(request, SlowAotLimits::default())
+}
+
+/// Compile a V2 request with an explicit optional-native resource envelope.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`compile_with_slow_aot_limits`].
+pub fn compile_v2_with_slow_aot_limits(
+    request: CompileRequestV2,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegexV2, CompileError> {
+    let policy = request.exact_finite_selected_end_teddy;
+    let compiled =
+        compile_with_slow_aot_limits_and_teddy_policy_v2(request.request, slow_aot_limits, policy)?;
+    let exact_finite_selected_end_teddy_aot = match policy {
+        ExactFiniteSelectedEndTeddyPolicyV2::Disabled => None,
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic => compiled
+            .module()
+            .exact_finite_selected_end_teddy_aot_report()
+            .copied()
+            .map(|report| {
+                let incumbent_prefix =
+                    module::exact_finite_selected_end_teddy_incumbent_prefix_bytes(
+                        compiled.program(),
+                        compiled.receipt().target,
+                        &report,
+                    )?;
+                module::exact_finite_selected_end_teddy_report_v2(
+                    report,
+                    policy,
+                    ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+                    incumbent_prefix,
+                )
+            })
+            .transpose()?,
+        ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => compiled
+            .module()
+            .exact_finite_selected_end_teddy_aot_report_v2()
+            .copied(),
+    };
+    if policy == ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible
+        && compiled
+            .module()
+            .exact_finite_selected_end_teddy_aot_report()
+            .is_some()
+    {
+        return Err(CompileError::InternalInvariant(
+            "forced Teddy V2 route leaked into the stable V1 receipt",
+        ));
+    }
+    Ok(CompiledRegexV2 {
+        compiled,
+        receipt_v2: CompileReceiptV2 {
+            schema_version: COMPILE_REQUEST_V2_SCHEMA_VERSION,
+            optimizer_version: EXPERIMENTAL_OPTIMIZER_VERSION_V2,
+            exact_finite_selected_end_teddy_policy: policy,
+            exact_finite_selected_end_teddy_aot,
+        },
+    })
 }
 
 /// Compile a program and append explicitly requested prepared reducer
@@ -975,6 +1145,18 @@ pub fn compile_with_slow_aot_limits(
     request: CompileRequest,
     slow_aot_limits: SlowAotLimits,
 ) -> Result<CompiledRegex, CompileError> {
+    compile_with_slow_aot_limits_and_teddy_policy_v2(
+        request,
+        slow_aot_limits,
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+    )
+}
+
+fn compile_with_slow_aot_limits_and_teddy_policy_v2(
+    request: CompileRequest,
+    slow_aot_limits: SlowAotLimits,
+    teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
+) -> Result<CompiledRegex, CompileError> {
     let CompileRequest {
         pattern,
         profile,
@@ -1010,6 +1192,7 @@ pub fn compile_with_slow_aot_limits(
         mode,
         limits,
         slow_aot_limits,
+        teddy_policy,
     )
 }
 
@@ -1040,6 +1223,7 @@ pub fn compile_raw(
         mode,
         limits,
         SlowAotLimits::default(),
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
     )
 }
 
@@ -1073,6 +1257,7 @@ pub fn compile_raw_with_line_terminator(
         mode,
         limits,
         SlowAotLimits::default(),
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
     )
 }
 
@@ -1495,6 +1680,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     mode: CompileMode,
     limits: CompileLimitsV1,
     slow_aot_limits: SlowAotLimits,
+    teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
 ) -> Result<CompiledRegex, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
@@ -1527,11 +1713,13 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             let effective_native_data_limit_bytes = slow_aot_limits
                 .max_native_data_bytes
                 .min(limits.max_object_bytes);
-            let optimized = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            let optimized = CompiledModule::lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa_and_teddy_policy_v2(
                 &program,
                 target,
                 slow_aot_limits,
                 effective_native_data_limit_bytes,
+                true,
+                teddy_policy,
             )?;
             match emit_with_ordered_nfa_accelerator_retries(
                 optimized,
@@ -1900,6 +2088,9 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             if module
                 .exact_finite_selected_end_teddy_aot_report()
                 .is_some()
+                || module
+                    .exact_finite_selected_end_teddy_aot_report_v2()
+                    .is_some()
             {
                 passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
             }
@@ -2034,6 +2225,9 @@ fn append_native_dfa_passes(
     if module
         .exact_finite_selected_end_teddy_aot_report()
         .is_some()
+        || module
+            .exact_finite_selected_end_teddy_aot_report_v2()
+            .is_some()
     {
         passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
     }

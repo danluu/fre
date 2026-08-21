@@ -537,6 +537,42 @@ pub struct ExactFiniteSelectedEndTeddyAotReport {
     pub incumbent_relocation_count: usize,
 }
 
+/// Why a V2 exact-finite Teddy wrapper was selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExactFiniteSelectedEndTeddySelectionBasisV2 {
+    /// The unchanged V1 cost model admitted a scanner-free incumbent.
+    AutomaticV1,
+    /// The opt-in experiment bypassed only performance admission gates.
+    ForcedStructuralEligibility,
+}
+
+/// Authenticated source of the native lowering retained behind a V2 wrapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExactFiniteSelectedEndTeddyIncumbentSourceV2 {
+    /// The ordinary public complete-DFA scheduler was run first and its exact
+    /// output was retained as the wrapper tail.
+    OrdinaryPublicCompleteDfa,
+}
+
+/// Unambiguous V2 provenance for an experimental exact-finite Teddy wrapper.
+///
+/// `lowering` reuses the complete byte/data/relocation authentication record,
+/// but is V1 evidence only when `selection_basis == AutomaticV1` and the
+/// stable [`crate::CompileReceipt`] independently contains the same report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteSelectedEndTeddyAotReportV2 {
+    pub schema_version: u32,
+    pub requested_policy: crate::ExactFiniteSelectedEndTeddyPolicyV2,
+    pub selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    pub incumbent_source: ExactFiniteSelectedEndTeddyIncumbentSourceV2,
+    pub incumbent_start_accelerator: StartAccelerator,
+    pub incumbent_anchored_prefix_filter_bytes: u8,
+    pub performance_admission_bypassed: bool,
+    pub tail_enters_exact_incumbent: bool,
+    pub route_binding_sha256: [u8; 32],
+    pub lowering: ExactFiniteSelectedEndTeddyAotReport,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactFiniteExistsLeafReport {
     ByteSet(ExactFiniteExistsByteSetAotReport),
@@ -634,6 +670,40 @@ pub(crate) fn exact_finite_selected_end_relocation_digest(
     relocations: &[ModuleRelocation],
 ) -> Option<[u8; 32]> {
     module_exact_finite_selected_end_teddy::relocation_digest(relocations)
+}
+
+pub(crate) fn exact_finite_selected_end_teddy_report_v2(
+    lowering: ExactFiniteSelectedEndTeddyAotReport,
+    requested_policy: crate::ExactFiniteSelectedEndTeddyPolicyV2,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    incumbent_anchored_prefix_filter_bytes: u8,
+) -> Result<ExactFiniteSelectedEndTeddyAotReportV2, ObjectError> {
+    module_exact_finite_selected_end_teddy::exact_finite_selected_end_teddy_report_v2(
+        lowering,
+        requested_policy,
+        selection_basis,
+        incumbent_anchored_prefix_filter_bytes,
+    )
+}
+
+pub(crate) fn exact_finite_selected_end_teddy_incumbent_prefix_bytes(
+    program: &CompiledProgram,
+    target: Target,
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+) -> Result<u8, ObjectError> {
+    let view = program.native_dfa_view().ok_or(ObjectError::InvalidModule(
+        "exact finite SelectedEnd Teddy V1 program has no semantic DFA",
+    ))?;
+    if !exact_finite_selected_end_dfa_lowering_authenticates(&view, target, report)? {
+        return Err(ObjectError::InvalidModule(
+            "exact finite SelectedEnd Teddy V1 incumbent cannot be reconstructed",
+        ));
+    }
+    let lowering = lower_native_dfa_with_data_limit(view, target, report.incumbent_data_bytes)?
+        .ok_or(ObjectError::InvalidModule(
+            "exact finite SelectedEnd Teddy V1 incumbent no longer lowers",
+        ))?;
+    Ok(lowering.anchored_prefix_filter_bytes)
 }
 
 #[path = "module_seeded_reverse_aarch64.rs"]
@@ -1549,8 +1619,8 @@ pub struct CompiledModule {
     slow_context_aot_report: Option<SlowContextAotReport>,
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
     exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
-    exact_finite_selected_end_teddy_aot_report:
-        Option<ExactFiniteSelectedEndTeddyAotReport>,
+    exact_finite_selected_end_teddy_aot_report: Option<ExactFiniteSelectedEndTeddyAotReport>,
+    exact_finite_selected_end_teddy_aot_report_v2: Option<ExactFiniteSelectedEndTeddyAotReportV2>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -2073,9 +2143,30 @@ impl NativeCompleteDfaCost {
         view: &NativeProgramView<'_>,
         lowering: &NativeLowering,
     ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        self.selected_end_report_with_basis(
+            view,
+            lowering,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        )
+    }
+
+    fn selected_end_report_with_basis(
+        self,
+        view: &NativeProgramView<'_>,
+        lowering: &NativeLowering,
+        selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        let actual_has_accelerator = lowering.start_accelerator != StartAccelerator::None;
+        let admitted_accelerator = match selection_basis {
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+                !self.has_accelerator && !actual_has_accelerator
+            }
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                self.has_accelerator == actual_has_accelerator
+            }
+        };
         if view.output != OutputContract::SelectedEnd
-            || self.has_accelerator
-            || lowering.start_accelerator != StartAccelerator::None
+            || !admitted_accelerator
             || lowering.needs_runtime
             || lowering.slow_partial_table.is_some()
             || lowering.code.is_empty()
@@ -2100,7 +2191,7 @@ impl NativeCompleteDfaCost {
             native_data_bytes: lowering.data.len(),
             hot_loads_per_byte: self.hot_loads_per_byte,
             hot_branches_per_byte: self.hot_branches_per_byte,
-            has_accelerator: self.has_accelerator,
+            has_accelerator: actual_has_accelerator,
             scanner: lowering.start_accelerator,
         }))
     }
@@ -2157,6 +2248,18 @@ fn exact_finite_selected_end_dfa_baseline_authenticates(
     view: &NativeProgramView<'_>,
     report: ExactFiniteSelectedEndDfaBaselineReport,
 ) -> Result<bool, ObjectError> {
+    exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
+        view,
+        report,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+fn exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
+    view: &NativeProgramView<'_>,
+    report: ExactFiniteSelectedEndDfaBaselineReport,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> Result<bool, ObjectError> {
     let Some(cost) = NativeCompleteDfaCost::estimate_selected_end(view)? else {
         return Ok(false);
     };
@@ -2168,6 +2271,14 @@ fn exact_finite_selected_end_dfa_baseline_authenticates(
     else {
         return Ok(false);
     };
+    let accelerator_is_valid = match selection_basis {
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+            !report.has_accelerator && report.scanner == StartAccelerator::None
+        }
+        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+            report.has_accelerator == (report.scanner != StartAccelerator::None)
+        }
+    };
     Ok(view.output == OutputContract::SelectedEnd
         && report.semantic_dfa_sha256 == native_selected_end_dfa_semantic_digest(view)?
         && report.forward_states == forward_states
@@ -2178,8 +2289,7 @@ fn exact_finite_selected_end_dfa_baseline_authenticates(
         && report.hot_loads_per_byte == cost.hot_loads_per_byte
         && report.hot_branches_per_byte == cost.hot_branches_per_byte
         && report.has_accelerator == cost.has_accelerator
-        && !report.has_accelerator
-        && report.scanner == StartAccelerator::None)
+        && accelerator_is_valid)
 }
 
 fn exact_finite_selected_end_dfa_lowering_authenticates(
@@ -2187,16 +2297,39 @@ fn exact_finite_selected_end_dfa_lowering_authenticates(
     target: Target,
     report: &ExactFiniteSelectedEndTeddyAotReport,
 ) -> Result<bool, ObjectError> {
-    let Some(lowering) = lower_native_dfa_with_data_limit(
-        *view,
+    exact_finite_selected_end_dfa_lowering_authenticates_with_basis(
+        view,
         target,
-        report.incumbent_data_bytes,
-    )? else {
+        report,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        None,
+    )
+}
+
+fn exact_finite_selected_end_dfa_lowering_authenticates_with_basis(
+    view: &NativeProgramView<'_>,
+    target: Target,
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    incumbent_anchored_prefix_filter_bytes: Option<u8>,
+) -> Result<bool, ObjectError> {
+    if !exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
+        view,
+        report.incumbent_complete_dfa,
+        selection_basis,
+    )? {
+        return Ok(false);
+    }
+    let Some(lowering) =
+        lower_native_dfa_with_data_limit(*view, target, report.incumbent_data_bytes)?
+    else {
         return Ok(false);
     };
     Ok(!lowering.needs_runtime
         && lowering.slow_partial_table.is_none()
-        && lowering.start_accelerator == StartAccelerator::None
+        && lowering.start_accelerator == report.incumbent_complete_dfa.scanner
+        && incumbent_anchored_prefix_filter_bytes
+            .is_none_or(|bytes| bytes == lowering.anchored_prefix_filter_bytes)
         && lowering.data.len() == report.incumbent_data_bytes
         && Sha256::digest(&lowering.code).as_slice() == report.incumbent_code_sha256
         && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
@@ -3005,6 +3138,24 @@ impl CompiledModule {
         effective_native_data_limit_bytes: usize,
         allow_ordered_nfa: bool,
     ) -> Result<Self, CompileError> {
+        Self::lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa_and_teddy_policy_v2(
+            program,
+            target,
+            requested_limits,
+            effective_native_data_limit_bytes,
+            allow_ordered_nfa,
+            crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        )
+    }
+
+    pub(crate) fn lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa_and_teddy_policy_v2(
+        program: &CompiledProgram,
+        target: Target,
+        requested_limits: SlowAotLimits,
+        effective_native_data_limit_bytes: usize,
+        allow_ordered_nfa: bool,
+        teddy_policy: crate::ExactFiniteSelectedEndTeddyPolicyV2,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let effective_native_data_limit_bytes = effective_native_data_limit_bytes
             .min(requested_limits.max_native_data_bytes);
@@ -3135,72 +3286,153 @@ impl CompiledModule {
             // established portfolio would otherwise publish. Selection or a
             // declared-cap miss therefore returns that byte-identical
             // incumbent, never a newly introduced fallback route.
-            if program.engine_kind() == crate::EngineKind::OrderedDfa
-                && let Some(teddy_view) =
-                    program.native_finite_selected_end_teddy_view()
+            if teddy_policy != crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
+                && program.engine_kind() == crate::EngineKind::OrderedDfa
+                && let Some(teddy_view) = program.native_finite_selected_end_teddy_view()
                 && let Some(baseline_cost) =
                     NativeCompleteDfaCost::estimate_selected_end(&semantic_native)?
-                && !baseline_cost.has_accelerator
-                && let Some(incumbent) = lower_native_dfa(semantic_native, target)?
-                && let Some(baseline_report) =
-                    baseline_cost.selected_end_report(&semantic_native, &incumbent)?
             {
-                let (lowering, teddy_report) = if let Some(selection) =
-                    module_exact_finite_selected_end_teddy::
-                        select_exact_finite_selected_end_teddy(
-                            teddy_view,
-                            target,
-                            baseline_report,
-                        )
-                {
-                    match module_exact_finite_selected_end_teddy::
-                        wrap_exact_finite_selected_end_teddy(
-                            selection,
-                            incumbent,
-                            baseline_report,
-                            target,
-                            effective_native_data_limit_bytes,
-                        )?
+                let incumbent = match teddy_policy {
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic
+                        if !baseline_cost.has_accelerator =>
                     {
-                        module_exact_finite_selected_end_teddy::
-                            ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
-                                lowering,
-                                report,
-                            } => (lowering, Some(report)),
-                        module_exact_finite_selected_end_teddy::
-                            ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(
-                                lowering,
-                            ) => (lowering, None),
+                        lower_native_dfa(semantic_native, target)?
                     }
-                } else {
-                    (incumbent, None)
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => {
+                        lower_native_dfa(semantic_native, target)?
+                    }
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
+                    | crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => None,
                 };
-                let mut module = Self::lower_serialized_with_prelowered(
-                    program_bytes,
-                    Some(lowering),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    program.native_context_program_view(),
-                    program.native_bit_parallel_exists_view(),
-                    program.native_bit_parallel_endpoint_oracle_view(),
-                    program.native_partial_dfa_view(),
-                    program.native_dynamic_rows_view(),
-                    None,
-                    target,
-                )?;
-                if let Some(report) = teddy_report {
-                    module.install_exact_finite_selected_end_teddy_aot_report(
-                        report,
-                        program.artifact_identity(),
-                        &semantic_native,
-                    )?;
+                if let Some(incumbent) = incumbent {
+                    let selection_basis = match teddy_policy {
+                        crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => {
+                            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
+                        }
+                        crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => {
+                            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
+                        }
+                        crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled => unreachable!(),
+                    };
+                    let baseline_report = match selection_basis {
+                        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+                            baseline_cost.selected_end_report(&semantic_native, &incumbent)?
+                        }
+                        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                            baseline_cost.selected_end_report_with_basis(
+                                &semantic_native,
+                                &incumbent,
+                                selection_basis,
+                            )?
+                        }
+                    };
+                    if let Some(baseline_report) = baseline_report {
+                        let incumbent_prefix = incumbent.anchored_prefix_filter_bytes;
+                        let selection = match selection_basis {
+                            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+                                module_exact_finite_selected_end_teddy::
+                                    select_exact_finite_selected_end_teddy(
+                                        teddy_view,
+                                        target,
+                                        baseline_report,
+                                    )
+                            }
+                            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                                module_exact_finite_selected_end_teddy::
+                                    select_exact_finite_selected_end_teddy_forced_v2(
+                                        teddy_view,
+                                        target,
+                                        baseline_report,
+                                    )
+                            }
+                        };
+                        let (lowering, teddy_report, teddy_report_v2) = if let Some(selection) =
+                            selection
+                        {
+                            let outcome = match selection_basis {
+                                    ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+                                        module_exact_finite_selected_end_teddy::
+                                            wrap_exact_finite_selected_end_teddy(
+                                                selection,
+                                                incumbent,
+                                                baseline_report,
+                                                target,
+                                                effective_native_data_limit_bytes,
+                                            )?
+                                    }
+                                    ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                                        module_exact_finite_selected_end_teddy::
+                                            wrap_exact_finite_selected_end_teddy_forced_v2(
+                                                selection,
+                                                incumbent,
+                                                baseline_report,
+                                                target,
+                                                effective_native_data_limit_bytes,
+                                            )?
+                                    }
+                                };
+                            match outcome {
+                                    module_exact_finite_selected_end_teddy::
+                                        ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
+                                            lowering,
+                                            report,
+                                        } => match selection_basis {
+                                            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
+                                                (lowering, Some(report), None)
+                                            }
+                                            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                                                let report_v2 = module_exact_finite_selected_end_teddy::exact_finite_selected_end_teddy_report_v2(
+                                                    report,
+                                                    teddy_policy,
+                                                    selection_basis,
+                                                    incumbent_prefix,
+                                                )?;
+                                                (lowering, None, Some(report_v2))
+                                            }
+                                        },
+                                    module_exact_finite_selected_end_teddy::
+                                        ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(
+                                            lowering,
+                                        ) => (lowering, None, None),
+                                }
+                        } else {
+                            (incumbent, None, None)
+                        };
+                        let mut module = Self::lower_serialized_with_prelowered(
+                            program_bytes,
+                            Some(lowering),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                            program.native_context_program_view(),
+                            program.native_bit_parallel_exists_view(),
+                            program.native_bit_parallel_endpoint_oracle_view(),
+                            program.native_partial_dfa_view(),
+                            program.native_dynamic_rows_view(),
+                            None,
+                            target,
+                        )?;
+                        if let Some(report) = teddy_report {
+                            module.install_exact_finite_selected_end_teddy_aot_report(
+                                report,
+                                program.artifact_identity(),
+                                &semantic_native,
+                            )?;
+                        }
+                        if let Some(report) = teddy_report_v2 {
+                            module.install_exact_finite_selected_end_teddy_aot_report_v2(
+                                report,
+                                program.artifact_identity(),
+                                &semantic_native,
+                            )?;
+                        }
+                        return Ok(module);
+                    }
                 }
-                return Ok(module);
             }
             return Self::lower_serialized(
                 program_bytes,
@@ -5403,6 +5635,7 @@ impl CompiledModule {
             compiler_k0_aot_report,
             exact_finite_exists_leaf_report,
             exact_finite_selected_end_teddy_aot_report: None,
+            exact_finite_selected_end_teddy_aot_report_v2: None,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -5500,6 +5733,7 @@ impl CompiledModule {
         semantic_native: &NativeProgramView<'_>,
     ) -> Result<(), ObjectError> {
         if self.exact_finite_selected_end_teddy_aot_report.is_some()
+            || self.exact_finite_selected_end_teddy_aot_report_v2.is_some()
             || self.exact_finite_exists_leaf_report.is_some()
             || self.ordered_finite_language_aot_report.is_some()
             || self.slow_aot_report.is_some()
@@ -5559,12 +5793,90 @@ impl CompiledModule {
         Ok(())
     }
 
+    fn install_exact_finite_selected_end_teddy_aot_report_v2(
+        &mut self,
+        report: ExactFiniteSelectedEndTeddyAotReportV2,
+        artifact_identity: [u8; 32],
+        semantic_native: &NativeProgramView<'_>,
+    ) -> Result<(), ObjectError> {
+        if self.exact_finite_selected_end_teddy_aot_report.is_some()
+            || self.exact_finite_selected_end_teddy_aot_report_v2.is_some()
+            || self.exact_finite_exists_leaf_report.is_some()
+            || self.ordered_finite_language_aot_report.is_some()
+            || self.slow_aot_report.is_some()
+            || self.slow_context_aot_report.is_some()
+            || self.compiler_k0_aot_report.is_some()
+            || report.lowering.artifact_identity != artifact_identity
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 provenance is not exclusive",
+            ));
+        }
+        if !exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
+            semantic_native,
+            report.lowering.incumbent_complete_dfa,
+            report.selection_basis,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 baseline disagrees with its semantic DFA",
+            ));
+        }
+        if !exact_finite_selected_end_dfa_lowering_authenticates_with_basis(
+            semantic_native,
+            self.target,
+            &report.lowering,
+            report.selection_basis,
+            Some(report.incumbent_anchored_prefix_filter_bytes),
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 incumbent disagrees with its semantic DFA lowering",
+            ));
+        }
+        let code = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 module has no text",
+            ))?;
+        let data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 module has no data",
+            ))?;
+        if !module_exact_finite_selected_end_teddy::report_v2_matches_parts(
+            &report,
+            code.bytes(),
+            data.bytes(),
+            &self.relocations,
+            self.runtime_symbol_index.is_some(),
+            false,
+            self.start_accelerator,
+            self.anchored_prefix_filter_bytes,
+            self.target,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite SelectedEnd Teddy V2 module disagrees with its receipt",
+            ));
+        }
+        self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
+        Ok(())
+    }
+
     /// Return provenance for a direct exact-finite `SelectedEnd` Teddy leaf.
     #[must_use]
     pub const fn exact_finite_selected_end_teddy_aot_report(
         &self,
     ) -> Option<&ExactFiniteSelectedEndTeddyAotReport> {
         self.exact_finite_selected_end_teddy_aot_report.as_ref()
+    }
+
+    /// Return unambiguous provenance for a selected V2 experimental wrapper.
+    #[must_use]
+    pub const fn exact_finite_selected_end_teddy_aot_report_v2(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndTeddyAotReportV2> {
+        self.exact_finite_selected_end_teddy_aot_report_v2.as_ref()
     }
 
     /// Return exact geometry for a selected ordered finite-language native
@@ -6976,6 +7288,20 @@ impl CompiledModule {
                 self.target,
             )?;
             self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        }
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report_v2.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_v2_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
         }
         Ok(self)
     }
@@ -100536,6 +100862,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 compiler_k0_aot_report: None,
                 exact_finite_exists_leaf_report: None,
                 exact_finite_selected_end_teddy_aot_report: None,
+                exact_finite_selected_end_teddy_aot_report_v2: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -100861,6 +101188,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             compiler_k0_aot_report: None,
             exact_finite_exists_leaf_report: None,
             exact_finite_selected_end_teddy_aot_report: None,
+            exact_finite_selected_end_teddy_aot_report_v2: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,

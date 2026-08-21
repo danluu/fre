@@ -628,6 +628,7 @@ pub fn compile_captures(
         mode,
         limits.selector,
         limits.selector_slow_aot,
+        crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
     )
     .map_err(CaptureCompileError::Selector)?;
     let identity = CaptureArtifactIdentity {
