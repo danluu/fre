@@ -6,7 +6,7 @@ use fre_syntax::{CanonicalPattern, ParseError, ParseRequest, ParseSummary};
 use regex_syntax::hir::{Hir, HirKind, Look, LookSet};
 
 use crate::{
-    BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
+    BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanKind, PlanSelection,
     PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
     PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
     PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
@@ -1041,6 +1041,7 @@ impl PortableTextRegex {
     ) -> Result<PortableTextSearchSession<'_>, SearchError> {
         Ok(PortableTextSearchSession {
             inner: self.inner.search_session(limits)?,
+            shortest_value_eligible: self.report.portable.plan == PlanKind::K0,
         })
     }
 
@@ -1065,6 +1066,7 @@ impl PortableTextRegex {
     ) -> Result<PortableTextSearchSession<'_>, SearchError> {
         Ok(PortableTextSearchSession {
             inner: self.inner.fixed_search_session(limits)?,
+            shortest_value_eligible: self.report.portable.plan == PlanKind::K0,
         })
     }
 
@@ -1074,6 +1076,7 @@ impl PortableTextRegex {
     ) -> Result<PortableTextSearchSession<'_>, SearchError> {
         Ok(PortableTextSearchSession {
             inner: self.inner.fixed_endpoint_search_session(limits)?,
+            shortest_value_eligible: self.report.portable.plan == PlanKind::K0,
         })
     }
 
@@ -1311,6 +1314,7 @@ impl PortableTextRegex {
 #[derive(Debug)]
 pub struct PortableTextSearchSession<'r> {
     inner: PortableSearchSession<'r>,
+    shortest_value_eligible: bool,
 }
 
 impl<'r> PortableTextSearchSession<'r> {
@@ -1468,6 +1472,59 @@ impl<'r> PortableTextSearchSession<'r> {
         self.inner
             .find_window_value(haystack.as_bytes(), window, limits)
             .map_err(PortableTextSearchError::Search)
+    }
+
+    /// Return only the first detected match end while reusing this
+    /// session's workspace.
+    ///
+    /// Exact-unlimited K0 sessions use their report-free earliest-end route.
+    /// Finite calls and other plan families retain the accountingful executor
+    /// so their resource and error behavior remains identical to the selected
+    /// incumbent path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-search contract as
+    /// [`PortableTextRegex::shortest_match_value`].
+    pub fn shortest_match_value(
+        &mut self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        if self.shortest_value_eligible && limits == SearchLimits::unlimited() {
+            self.inner.shortest_match_value(haystack.as_bytes(), limits)
+        } else {
+            self.inner
+                .shortest_match(haystack.as_bytes(), limits)
+                .map(|(end, _accounting)| end)
+        }
+    }
+
+    /// Return only the first detected match end at or after `start` while
+    /// reusing this session's workspace.
+    ///
+    /// An interior UTF-8 byte offset advances to the next scalar boundary,
+    /// while assertions continue to inspect the complete original haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableTextRegex::shortest_match_at_value`].
+    pub fn shortest_match_at_value(
+        &mut self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        if self.shortest_value_eligible && limits == SearchLimits::unlimited() {
+            self.inner
+                .shortest_match_at_value(haystack.as_bytes(), start, limits)
+        } else {
+            self.inner
+                .shortest_match_at(haystack.as_bytes(), start, limits)
+                .map(|(end, _accounting)| end)
+        }
     }
 
     /// Iterate over non-overlapping matches in one UTF-8 haystack while
