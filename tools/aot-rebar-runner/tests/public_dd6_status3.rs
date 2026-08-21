@@ -334,19 +334,36 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
             }
             let provenance = std::str::from_utf8(&provenance.stdout)?;
             for expected_field in [
+                "schema=fre.aot.rebar-runner.v3",
                 "native_row_bridge=true",
                 "source_pattern_count=5",
-                "row_artifact_count=4",
+                "source_to_artifact=0,1,2,1,3",
+                "component_count=4",
                 "aggregate_strategy=native-independent-span-row-selector-v1",
-                "prepare_scope=none",
-                "required_prepare_capabilities=0000000000000000",
-                "required_runtime_symbols= boundary=",
+                "boundary=complete-native-row-bridge",
             ] {
                 if !provenance.contains(expected_field) {
                     return Err(format!(
                         "native-row provenance omitted {expected_field:?}: {provenance}"
                     )
                     .into());
+                }
+            }
+            for component in 0..4 {
+                for expected_field in [
+                    format!("component_{component}_native=true"),
+                    format!("component_{component}_source_ordinal="),
+                    format!("component_{component}_entry_symbol="),
+                    format!("component_{component}_runtime_symbols="),
+                    format!("component_{component}_program_sha256="),
+                    format!("component_{component}_object_sha256="),
+                ] {
+                    if !provenance.contains(&expected_field) {
+                        return Err(format!(
+                            "native-row provenance omitted {expected_field:?}: {provenance}"
+                        )
+                        .into());
+                    }
                 }
             }
         }

@@ -112,17 +112,23 @@ Three fresh processes authenticate each job:
 
 1. The unmodified `--quiet` runner must exit zero after its independent Rust
    oracle comparison.
-2. A copy with every semantic helper armed must still exit zero. The marker
-   records every image-relative patch offset and before/after instruction
-   bytes.
+2. When semantic helpers exist, a copy with every helper armed must still exit
+   zero. The marker records every image-relative patch offset and before/after
+   instruction bytes. An independently empty final-binary helper inventory is
+   itself the closed proof surface and does not manufacture a trap phase.
 3. A fresh copy for each selected operation entry must exit with the dedicated
    trap status and name that exact entry. For `count` this is the reducer; for
    bulk `count-spans` it is Span-fill; for direct `count-spans` and `grep` it is
    the ordinary entry. Composite v3 provenance is normalized into a closed
-   component list. `regex-redux` must publish exactly 15 component entries,
+   component list whose every `component_N_native` claim is true.
+   `regex-redux` must publish exactly 15 component entries,
    per-component runtime-symbol lists, and program/object hashes; the
    controller runs 15 independent negative controls so a trap in the first
    stage cannot stand in for proof that the other 14 entries execute.
+   The variable-width native-row bridge receives the same independent negative
+   control for every retained row artifact. Both composite routes are reported
+   as native search cores with an adapter outer loop; they do not inflate the
+   stricter wholly fused-operation numerator.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:

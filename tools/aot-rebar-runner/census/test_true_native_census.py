@@ -93,6 +93,16 @@ def synthetic_plan() -> dict[str, object]:
 
 
 class TrueNativeCensusTests(unittest.TestCase):
+    def test_exact_adapter_includes_ordered_many_but_not_multi_grep(self) -> None:
+        self.assertTrue(CENSUS.has_exact_adapter("count", 1))
+        self.assertTrue(CENSUS.has_exact_adapter("count", 3))
+        self.assertTrue(CENSUS.has_exact_adapter("count-spans", 2))
+        self.assertTrue(CENSUS.has_exact_adapter("grep", 1))
+        self.assertFalse(CENSUS.has_exact_adapter("grep", 2))
+        self.assertTrue(CENSUS.has_exact_adapter("regex-redux", 0))
+        self.assertFalse(CENSUS.has_exact_adapter("regex-redux", 1))
+        self.assertFalse(CENSUS.has_exact_adapter("compile", 1))
+
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
         receipt = CENSUS.id_set(["b", "a"])
         self.assertEqual(receipt["count"], 2)
@@ -157,6 +167,7 @@ class TrueNativeCensusTests(unittest.TestCase):
             "component_count": "15",
         }
         for index in range(15):
+            fields[f"component_{index}_native"] = "true"
             fields[f"component_{index}_entry_symbol"] = f"fre_component_{index}_entry"
             fields[f"component_{index}_runtime_symbols"] = (
                 "fre_aot_regex_runtime_search_exclusive_v1"
@@ -164,10 +175,48 @@ class TrueNativeCensusTests(unittest.TestCase):
             fields[f"component_{index}_program_sha256"] = f"{index:064x}"
             fields[f"component_{index}_object_sha256"] = f"{index + 1:064x}"
         entries, route = CENSUS.selected_operation_entries(fields)
-        self.assertEqual(route, "linked-composite-fixed-stages")
+        self.assertEqual(route, "linked-fixed-composite-adapter-loop")
         self.assertEqual(len(entries), 15)
         self.assertEqual(entries[0], "fre_component_0_entry")
         self.assertEqual(entries[-1], "fre_component_14_entry")
+
+    def test_native_row_components_are_search_core_with_an_adapter_loop(self) -> None:
+        fields = {
+            "schema": "fre.aot.rebar-runner.v3",
+            "model": "count-spans",
+            "native_row_bridge": "true",
+            "component_count": "2",
+        }
+        for index in range(2):
+            fields[f"component_{index}_native"] = "true"
+            fields[f"component_{index}_entry_symbol"] = f"fre_row_{index}_entry"
+            fields[f"component_{index}_runtime_symbols"] = ""
+            fields[f"component_{index}_program_sha256"] = f"{index + 1:064x}"
+            fields[f"component_{index}_object_sha256"] = f"{index + 3:064x}"
+        self.assertEqual(
+            CENSUS.selected_operation_entries(fields),
+            (["fre_row_0_entry", "fre_row_1_entry"], "linked-native-row-adapter-loop"),
+        )
+
+    def test_empty_semantic_helper_inventory_is_a_valid_proof_surface(self) -> None:
+        phase = {
+            "outcome": "not-run",
+            "returncode": None,
+            "stdout_bytes": 0,
+            "stdout_sha256": CENSUS.sha_bytes(b""),
+            "stderr_bytes": 0,
+            "stderr_sha256": CENSUS.sha_bytes(b""),
+        }
+        marker = {
+            "status": "missing",
+            "sha256": None,
+            "armed": [],
+            "triggered": None,
+        }
+        self.assertTrue(CENSUS.semantic_helper_control_pass([], phase, marker))
+        self.assertFalse(
+            CENSUS.semantic_helper_control_pass([], phase, {**marker, "armed": [1]})
+        )
 
     def test_plan_is_closed_and_requires_canonical_311_jobs(self) -> None:
         plan = synthetic_plan()

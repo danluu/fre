@@ -677,8 +677,15 @@ fn print_provenance() {
         return;
     }
     if linked::NATIVE_ROW_BRIDGE {
-        println!(
-            "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true source_pattern_count={} row_artifact_count={} row_total_object_bytes={} row_first_source_ordinals={:?} row_entry_symbols={:?} row_program_sha256={} row_object_sha256={} prepared_bulk_strategy=None span_iteration_strategy={} grep_iteration_strategy=not-applicable prepare_scope=none required_prepare_capabilities=0000000000000000 required_runtime_symbols= boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        let source_to_artifact = linked::SOURCE_TO_ARTIFACT
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut provenance = String::new();
+        write!(
+            &mut provenance,
+            "schema=fre.aot.rebar-runner.v3 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true source_pattern_count={} row_total_object_bytes={} source_to_artifact={} component_count={}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -693,13 +700,24 @@ fn print_provenance() {
             linked::ENGINE,
             linked::AGGREGATE_STRATEGY,
             linked::SOURCE_PATTERN_COUNT,
-            linked::ROW_ARTIFACT_COUNT,
             linked::ROW_TOTAL_OBJECT_BYTES,
-            linked::ROW_FIRST_SOURCE_ORDINALS,
-            linked::ROW_ENTRY_SYMBOLS,
-            hex_rows(linked::ROW_PROGRAM_SHA256),
-            hex_rows(linked::ROW_OBJECT_SHA256),
-            linked::SPAN_ITERATION_STRATEGY,
+            source_to_artifact,
+            linked::ROW_ARTIFACT_COUNT,
+        )
+        .expect("format native-row provenance header");
+        for component in 0..linked::ROW_ARTIFACT_COUNT {
+            write!(
+                &mut provenance,
+                " component_{component}_native=true component_{component}_source_ordinal={} component_{component}_entry_symbol={} component_{component}_runtime_symbols= component_{component}_program_sha256={} component_{component}_object_sha256={}",
+                linked::ROW_FIRST_SOURCE_ORDINALS[component],
+                linked::ROW_ENTRY_SYMBOLS[component],
+                hex(&linked::ROW_PROGRAM_SHA256[component]),
+                hex(&linked::ROW_OBJECT_SHA256[component]),
+            )
+            .expect("format native-row component provenance");
+        }
+        println!(
+            "{provenance} boundary=complete-native-row-bridge required_comparators=rust-regex-1.12.4,fre-current-runtime"
         );
         return;
     }
@@ -948,6 +966,12 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_ENTRY_SYMBOLS.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_PROGRAM_SHA256.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_OBJECT_SHA256.len()
+        || linked::ROW_PROGRAM_SHA256
+            .iter()
+            .any(|digest| *digest == [0; 32])
+        || linked::ROW_OBJECT_SHA256
+            .iter()
+            .any(|digest| *digest == [0; 32])
     {
         return Err("linked native-row table has inconsistent cardinalities".to_owned());
     }
@@ -1528,13 +1552,6 @@ fn hex(bytes: &[u8]) -> String {
         output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     output
-}
-
-fn hex_rows(rows: &[[u8; 32]]) -> String {
-    rows.iter()
-        .map(|row| hex(row))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 #[cfg(test)]

@@ -127,7 +127,7 @@ required runtime surface, and program/object SHA-256 identities.
 
 ## Qualification before using results
 
-1. Run every statically eligible public single-pattern row against the pinned
+1. Run every statically eligible public exact-adapter job against the pinned
    Rust 1.12.4 Rebar runner and require exact values for both first-call
    (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules.
 2. Retain explicit nullable/empty-match, empty-haystack, invalid-byte, CRLF,
@@ -195,9 +195,11 @@ coverage additionally requires an independent final-binary audit, complete
 operation success after all semantic helpers are trap-patched, and a trap when
 each claimed component entry is patched on a fixture that reaches it.
 The v3 provenance record publishes a separate native flag, entry symbol,
-runtime-symbol surface, and program/object hash for every numbered component.
-Merely linking all 15 objects does not count helper-backed components as
-native.
+runtime-symbol surface, and program/object hash for every numbered regex-redux
+component or retained native row. Merely linking a component does not count a
+helper-backed entry as native.
+The census reports these componentized routes as native search cores with a
+Rust adapter loop, not as wholly fused native operations.
 
 ## HEAD campaign reporting
 

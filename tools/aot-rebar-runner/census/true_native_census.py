@@ -54,6 +54,17 @@ class CensusError(RuntimeError):
     """A fail-closed census validation error."""
 
 
+def has_exact_adapter(model: str, pattern_count: int) -> bool:
+    """Return whether the integrated runner has a typed adapter for this shape."""
+    return (
+        model in {"count", "count-spans"} and pattern_count >= 1
+    ) or (
+        model == "grep" and pattern_count == 1
+    ) or (
+        model in COMPOSITE_ADAPTER_MODELS and pattern_count == 0
+    )
+
+
 def canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -335,9 +346,8 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
             prior_point = raw_points.setdefault(point_id, point_record)
             if prior_point != point_record:
                 raise CensusError(f"conflicting duplicate public point {point_id}")
-            exact_adapter = (
-                model in SCALAR_ADAPTER_MODELS and len(identity["pattern_sha256"]) == 1
-            ) or model in COMPOSITE_ADAPTER_MODELS
+            pattern_count = len(identity["pattern_sha256"])
+            exact_adapter = has_exact_adapter(model, pattern_count)
             job_basis = {
                 "job_id": job_id,
                 "benchmark": benchmark,
@@ -347,7 +357,11 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
                 "is_runtime": model != "compile",
                 "exact_adapter": exact_adapter,
                 "adapter_reason": (
-                    "exact-single-pattern-scalar-adapter"
+                    "exact-native-row-composite-adapter"
+                    if exact_adapter and model in {"count", "count-spans"} and pattern_count > 1
+                    else "exact-single-pattern-scalar-adapter"
+                    if exact_adapter and model in SCALAR_ADAPTER_MODELS
+                    else "exact-fixed-composite-adapter"
                     if exact_adapter
                     else "compile-job-outside-runtime-denominator"
                     if model == "compile"
@@ -584,12 +598,15 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
         raise CensusError(f"composite component count is out of range: {count}")
     components = []
     for index in range(count):
+        native = component_field(fields, index, ("native",))
         entry = component_field(fields, index, ("entry_symbol",))
         runtime_text = component_field(
             fields, index, ("required_runtime_symbols", "runtime_symbols")
         )
         program_sha256 = component_field(fields, index, ("program_sha256",))
         object_sha256 = component_field(fields, index, ("object_sha256",))
+        if native != "true":
+            raise CensusError(f"composite component {index} is not claimed native")
         if SYMBOL.fullmatch(entry) is None:
             raise CensusError(f"composite component {index} has invalid entry symbol")
         require_hex64(program_sha256, f"component {index} program digest")
@@ -601,6 +618,7 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
             raise CensusError(f"component {index} runtime symbol list is malformed")
         components.append({
             "ordinal": index,
+            "native": True,
             "entry_symbol": entry,
             "required_runtime_symbols": runtime_symbols,
             "program_sha256": program_sha256,
@@ -655,7 +673,13 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         entries = [str(component["entry_symbol"]) for component in components]
         if len(entries) != len(set(entries)):
             raise CensusError("composite provenance repeats an entry symbol")
-        return entries, "linked-composite-fixed-stages"
+        if model == "regex-redux":
+            return entries, "linked-fixed-composite-adapter-loop"
+        if provenance.get("native_row_bridge") == "true" and model in {
+            "count", "count-spans",
+        }:
+            return entries, "linked-native-row-adapter-loop"
+        raise CensusError(f"unknown composite operation route for model {model!r}")
     if model == "count":
         return [provenance["reducer_symbol"]], "linked-reducer"
     if model == "count-spans" and provenance["span_fill_symbol"]:
@@ -703,6 +727,36 @@ def trap_environment(library: pathlib.Path, marker: pathlib.Path, symbols: list[
     environment["FRE_AOT_CENSUS_TRAP_SYMBOLS"] = ",".join(symbols)
     environment["FRE_AOT_CENSUS_TRAP_KIND"] = kind
     return environment
+
+
+def semantic_helper_control_pass(
+    helpers: list[str], phase: dict[str, object], marker: dict[str, object]
+) -> bool:
+    """Authenticate either a complete helper trap or a proven-empty helper surface."""
+    if not helpers:
+        return phase == {
+            "outcome": "not-run",
+            "returncode": None,
+            "stdout_bytes": 0,
+            "stdout_sha256": sha_bytes(b""),
+            "stderr_bytes": 0,
+            "stderr_sha256": sha_bytes(b""),
+        } and marker == {
+            "status": "missing",
+            "sha256": None,
+            "armed": [],
+            "triggered": None,
+        }
+    armed = [row.get("symbol") for row in marker.get("armed", [])]
+    return (
+        phase["returncode"] == 0
+        and marker.get("status") == "valid"
+        and marker.get("installed") == len(helpers)
+        and marker.get("expected") == len(helpers)
+        and armed == helpers
+        and marker.get("triggered") is None
+        and marker.get("completed") == "normal"
+    )
 
 
 def parse_trap_marker(path: pathlib.Path) -> dict[str, object]:
@@ -914,17 +968,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
                 "process": negative_phase,
                 "marker": parse_trap_marker(negative_path),
             })
-    helper_armed = [row.get("symbol") for row in helper_marker.get("armed", [])]
-    helper_pass = (
-        bool(helpers)
-        and helper_phase["returncode"] == 0
-        and helper_marker.get("status") == "valid"
-        and helper_marker.get("installed") == len(helpers)
-        and helper_marker.get("expected") == len(helpers)
-        and helper_armed == helpers
-        and helper_marker.get("triggered") is None
-        and helper_marker.get("completed") == "normal"
-    )
+    helper_pass = semantic_helper_control_pass(helpers, helper_phase, helper_marker)
     negative_pass = len(negative_controls) == len(entries) and all(
         control["process"]["returncode"] == TRAP_EXIT
         and control["marker"].get("status") == "valid"
@@ -935,7 +979,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     )
     executed = unmodified["returncode"] == 0
     core_native = reproducible and executed and helper_pass and negative_pass
-    adapter_outer_loop = adapter_route == "linked-direct-entry-adapter-loop"
+    adapter_outer_loop = adapter_route.endswith("-adapter-loop")
     whole_native = core_native and not adapter_outer_loop
     if not reproducible:
         reason = "non-reproducible-build"
@@ -1090,7 +1134,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     }, context)
     for index, component in enumerate(provenance["components"]):
         require_exact_keys(component, {
-            "ordinal", "entry_symbol", "required_runtime_symbols",
+            "ordinal", "native", "entry_symbol", "required_runtime_symbols",
             "program_sha256", "object_sha256",
         }, f"{context} component {index}")
 
