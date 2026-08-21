@@ -19931,6 +19931,7 @@ impl AggregatePlan {
         limits: &AggregateRunLimits,
         dense_finite: &mut OrderedLiteralCountWorkspace,
         continuation: &mut ContinuationSweepWorkspace,
+        guarded_ascii_word: &mut guarded_ascii_word::CountWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::FiniteCount(engine) => {
@@ -19974,6 +19975,25 @@ impl AggregatePlan {
                     Err(source) => Err(self
                         .execution_error(limits, AggregateExecutionSource::Continuation(source))),
                 }
+            }
+            AggregateEngine::GuardedAsciiWord(engine) => {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
+                    return Ok(value);
+                }
+                engine
+                    .count_with_workspace(
+                        haystack,
+                        guarded_ascii_word_reduce_limits(limits.finite_literal),
+                        guarded_ascii_word,
+                    )
+                    .map(|result| result.count)
+                    .map_err(|source| {
+                        self.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                        )
+                    })
             }
             _ => self.execute_count_value(haystack, limits),
         }
@@ -24834,14 +24854,16 @@ impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 ///
 /// Dense finite-literal plans retain their DP allocation here. Eligible
 /// byte/scalar continuation plans retain observed ordered transitions in a
-/// fixed arena. A saturated cache completes the current operation inline and
-/// becomes a compact disabled marker; fixed-resource-ineligible calls select
-/// the incumbent before source access. Other selected plans ignore the
-/// workspace.
+/// fixed arena. Guarded ASCII-word plans retain a binding to the process-wide
+/// immutable host-selected run scanner. A saturated continuation cache
+/// completes the current operation inline and becomes a compact disabled
+/// marker; fixed-resource-ineligible calls select the incumbent before source
+/// access. Other selected plans ignore the workspace.
 #[derive(Debug, Default)]
 pub struct AggregateCountWorkspace {
     dense_finite: OrderedLiteralCountWorkspace,
     continuation: ContinuationSweepWorkspace,
+    guarded_ascii_word: guarded_ascii_word::CountWorkspace,
 }
 
 /// Source-free admission retained for repeated width-one fixed-predicate
@@ -24877,6 +24899,7 @@ impl AggregateCountWorkspace {
         Self {
             dense_finite: OrderedLiteralCountWorkspace::new(),
             continuation: ContinuationSweepWorkspace::new(),
+            guarded_ascii_word: guarded_ascii_word::CountWorkspace::new(),
         }
     }
 
@@ -25183,7 +25206,8 @@ impl AggregateCountRegex {
     }
 
     /// Count through the selected value-only plan while retaining eligible
-    /// dense finite-literal scratch in a caller-owned workspace.
+    /// dense finite-literal scratch or immutable guarded-word dispatch in a
+    /// caller-owned workspace.
     ///
     /// The first dense call performs the same allocation and initialization
     /// as [`Self::count_value`]. Eligible byte/scalar continuation plans may
@@ -25204,6 +25228,7 @@ impl AggregateCountRegex {
             limits,
             &mut workspace.dense_finite,
             &mut workspace.continuation,
+            &mut workspace.guarded_ascii_word,
         )
     }
 

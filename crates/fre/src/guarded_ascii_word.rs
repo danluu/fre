@@ -14,6 +14,7 @@
 )]
 
 use core::{cmp::Ordering, fmt, mem::size_of};
+use std::sync::OnceLock;
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::{
@@ -522,6 +523,43 @@ pub struct DispatchedDictionary<'a> {
     word_run_scanner: Option<AsciiByteSetRunScanner>,
 }
 
+#[derive(Debug, Default)]
+enum CountDispatch {
+    #[default]
+    Uninitialized,
+    Scalar,
+    Scanner(&'static AsciiByteSetRunScanner),
+}
+
+/// Caller-owned binding to immutable host dispatch across repeated aggregate
+/// counts.
+#[derive(Debug, Default)]
+pub(crate) struct CountWorkspace {
+    dispatch: CountDispatch,
+}
+
+impl CountWorkspace {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            dispatch: CountDispatch::Uninitialized,
+        }
+    }
+
+    fn word_run_scanner(&mut self) -> Option<&AsciiByteSetRunScanner> {
+        if matches!(self.dispatch, CountDispatch::Uninitialized) {
+            self.dispatch = match process_word_run_scanner() {
+                Some(scanner) => CountDispatch::Scanner(scanner),
+                None => CountDispatch::Scalar,
+            };
+        }
+        match self.dispatch {
+            CountDispatch::Scanner(scanner) => Some(scanner),
+            CountDispatch::Uninitialized | CountDispatch::Scalar => None,
+        }
+    }
+}
+
 struct BuildState {
     packed: ExactVec<u8>,
     entries: ExactVec<EntryIdentity>,
@@ -652,20 +690,32 @@ impl Dictionary {
     /// SVE retains the incumbent scalar segmentation path.
     #[must_use]
     pub fn with_dispatch(&self, dispatch: SimdDispatchContext) -> DispatchedDictionary<'_> {
-        let usable = dispatch.capabilities().usable();
-        let word_run_scanner = if usable.contains(Feature::ArmSve) {
-            Some(
-                dispatch
-                    .ascii_byte_set_run_scanner(ASCII_WORD_SET, DispatchPolicy::Auto)
-                    .expect("automatic dispatch always retains a scalar fallback"),
-            )
-        } else {
-            None
-        };
+        let word_run_scanner = automatic_word_run_scanner(dispatch);
         DispatchedDictionary {
             dictionary: self,
             word_run_scanner,
         }
+    }
+
+    /// Count while retaining the immutable host-selected run scanner in
+    /// caller-owned aggregate workspace.
+    pub(crate) fn count_with_workspace(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &mut CountWorkspace,
+    ) -> Result<CountResult, ReduceError> {
+        let scanner = workspace.word_run_scanner();
+        let reduction = self.reduce_with_run_scanner(
+            haystack,
+            ReduceOperation::Count,
+            limits,
+            scanner,
+        )?;
+        Ok(CountResult {
+            count: reduction.accounting.actual.matches,
+            accounting: reduction.accounting,
+        })
     }
 
     /// Look up one complete maximal ASCII-word candidate.
@@ -2110,6 +2160,27 @@ impl DispatchedDictionary<'_> {
             accounting: reduction.accounting,
         })
     }
+}
+
+fn automatic_word_run_scanner(
+    dispatch: SimdDispatchContext,
+) -> Option<AsciiByteSetRunScanner> {
+    dispatch
+        .capabilities()
+        .usable()
+        .contains(Feature::ArmSve)
+        .then(|| {
+            dispatch
+                .ascii_byte_set_run_scanner(ASCII_WORD_SET, DispatchPolicy::Auto)
+                .expect("automatic dispatch always retains a scalar fallback")
+        })
+}
+
+fn process_word_run_scanner() -> Option<&'static AsciiByteSetRunScanner> {
+    static SCANNER: OnceLock<Option<AsciiByteSetRunScanner>> = OnceLock::new();
+    SCANNER
+        .get_or_init(|| automatic_word_run_scanner(SimdDispatchContext::capture()))
+        .as_ref()
 }
 
 impl Dictionary {
