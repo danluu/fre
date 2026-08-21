@@ -135,7 +135,7 @@ impl fmt::Display for PublicationError {
 
 impl std::error::Error for PublicationError {}
 
-/// Failure returned by a call through a published direct `Span` entry.
+/// Failure returned by a call through a published direct search entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CallError {

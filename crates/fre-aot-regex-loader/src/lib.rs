@@ -6,7 +6,8 @@
 //! module parts directly: it rejects every undefined symbol, applies the same
 //! local relocations in private memory, verifies the complete copy, changes
 //! text from RW to RX and read-only data from RW to R, synchronizes the
-//! instruction cache, and only then exposes a typed [`PublishedSpan`].
+//! instruction cache, and only then exposes a typed [`PublishedSpan`] or
+//! [`PublishedSelectedEnd`].
 //!
 //! No portable executor or runtime helper is selected on refusal. A grep
 //! integration can compile and publish on a background thread, atomically
@@ -41,7 +42,7 @@ const DEFAULT_MAX_CODE_BYTES: usize = 536_870_912;
 const DEFAULT_MAX_READ_ONLY_DATA_BYTES: usize = 536_870_912;
 const DEFAULT_MAX_SCRATCH_BYTES: usize = 536_870_912;
 const DEFAULT_MAX_MAPPED_BYTES: usize = 1_073_741_824;
-const SPAN_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
+const SEARCH_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
 
 /// Explicit ceilings for one direct-native publication transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,6 +355,97 @@ impl PublishedSpan {
     }
 }
 
+/// Immutable, reentrant, direct-native `SelectedEnd` matcher.
+///
+/// This endpoint deliberately does not recover a match start. It is suitable
+/// for callers such as grep's matching-line discovery and shortest-match
+/// interface that need only the leftmost-first selected endpoint.
+#[derive(Clone, Debug)]
+pub struct PublishedSelectedEnd {
+    inner: Arc<PublishedInner>,
+}
+
+impl PublishedSelectedEnd {
+    /// Search one checked half-open window with the compiler-produced native
+    /// entry and return its selected exclusive end.
+    #[inline]
+    #[allow(
+        unsafe_code,
+        reason = "one hidden call boundary invokes the authenticated compiler-produced SelectedEnd entry and reads its status-initialized result"
+    )]
+    pub fn search(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<usize>, CallError> {
+        let start = window.start();
+        let end = window.end();
+        if start > end || end > haystack.len() {
+            return Err(CallError::InvalidWindow {
+                start,
+                end,
+                haystack_len: haystack.len(),
+            });
+        }
+        let mut slot = RawSpan {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        // SAFETY: publication decoded this exact five-argument SelectedEnd
+        // entry only after all module bytes became immutable and executable.
+        // This borrow keeps the Arc-owned mapping live; the checked
+        // haystack/window and aligned disjoint result slot remain valid for
+        // the complete call.
+        let status = unsafe {
+            (self.inner.entry)(haystack.as_ptr(), haystack.len(), start, end, &raw mut slot)
+        };
+        match status {
+            0 => Ok(None),
+            1 => {
+                if start <= slot.end && slot.end <= end && slot.start == slot.end {
+                    Ok(Some(slot.end))
+                } else {
+                    Err(CallError::InvalidSpan {
+                        start: slot.start,
+                        end: slot.end,
+                        window_start: start,
+                        window_end: end,
+                        haystack_len: haystack.len(),
+                    })
+                }
+            }
+            status => Err(CallError::NativeStatus { status }),
+        }
+    }
+
+    /// Search from `at` through the end of `haystack`.
+    #[inline]
+    pub fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<usize>, CallError> {
+        self.search(haystack, SearchWindow::new(at, haystack.len()))
+    }
+
+    /// Search the complete haystack.
+    #[inline]
+    pub fn find(&self, haystack: &[u8]) -> Result<Option<usize>, CallError> {
+        self.search(haystack, SearchWindow::full(haystack))
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> PublicationIdentity {
+        self.inner.identity
+    }
+
+    #[must_use]
+    pub fn accounting(&self) -> PublicationAccounting {
+        self.inner.accounting
+    }
+
+    #[must_use]
+    pub fn target(&self) -> Target {
+        self.inner.target
+    }
+}
+
 /// Borrowing iterator returned by [`PublishedSpan::find_iter`].
 #[derive(Debug)]
 pub struct SpanMatches<'matcher, 'haystack> {
@@ -486,7 +578,14 @@ pub fn publish_span(
     compiled: CompiledRegex,
     limits: PublicationLimits,
 ) -> Result<PublishedSpan, PublicationError> {
-    publish_span_impl(&compiled, limits)
+    Ok(PublishedSpan {
+        inner: publish_search_impl(
+            &compiled,
+            limits,
+            OutputContract::Span,
+            EntryAbi::SpanSearchV1,
+        )?,
+    })
 }
 
 /// Compile and publish one direct-native `Span` matcher in the calling thread.
@@ -500,6 +599,36 @@ pub fn compile_and_publish_span(
 ) -> Result<PublishedSpan, BuildError> {
     let compiled = compile(request)?;
     Ok(publish_span(compiled, limits)?)
+}
+
+/// Publish one compiler-owned `SelectedEnd` result without accepting external
+/// symbols or invoking FRE's portable runtime.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consumption releases the portable program, module, and emitted object after native publication"
+)]
+pub fn publish_selected_end(
+    compiled: CompiledRegex,
+    limits: PublicationLimits,
+) -> Result<PublishedSelectedEnd, PublicationError> {
+    Ok(PublishedSelectedEnd {
+        inner: publish_search_impl(
+            &compiled,
+            limits,
+            OutputContract::SelectedEnd,
+            EntryAbi::SelectedEndSearchV1,
+        )?,
+    })
+}
+
+/// Compile and publish one direct-native `SelectedEnd` matcher in the calling
+/// thread.
+pub fn compile_and_publish_selected_end(
+    request: CompileRequest,
+    limits: PublicationLimits,
+) -> Result<PublishedSelectedEnd, BuildError> {
+    let compiled = compile(request)?;
+    Ok(publish_selected_end(compiled, limits)?)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,20 +649,22 @@ struct LoadPlan {
     unsafe_code,
     reason = "publication performs checked copies, target cache synchronization, and one post-RX function-pointer decode"
 )]
-fn publish_span_impl(
+fn publish_search_impl(
     compiled: &CompiledRegex,
     limits: PublicationLimits,
-) -> Result<PublishedSpan, PublicationError> {
+    expected_output: OutputContract,
+    expected_abi: EntryAbi,
+) -> Result<Arc<PublishedInner>, PublicationError> {
     let receipt = compiled.receipt();
-    if receipt.output != OutputContract::Span {
+    if receipt.output != expected_output {
         return Err(PublicationError::OutputMismatch {
-            expected: OutputContract::Span,
+            expected: expected_output,
             actual: receipt.output,
         });
     }
-    if receipt.entry_abi != EntryAbi::SpanSearchV1 {
+    if receipt.entry_abi != expected_abi {
         return Err(PublicationError::EntryAbiMismatch {
-            expected: EntryAbi::SpanSearchV1,
+            expected: expected_abi,
             actual: receipt.entry_abi,
         });
     }
@@ -632,9 +763,7 @@ fn publish_span_impl(
         accounting: plan.accounting,
         target: receipt.target,
     };
-    Ok(PublishedSpan {
-        inner: Arc::new(inner),
-    })
+    Ok(Arc::new(inner))
 }
 
 #[allow(
@@ -983,7 +1112,7 @@ fn resolve_entry(
     let symbol = matches
         .next()
         .ok_or(PublicationError::InvalidModule { at: "entry symbol" })?;
-    if !symbol.name.starts_with(SPAN_ENTRY_SYMBOL_PREFIX)
+    if !symbol.name.starts_with(SEARCH_ENTRY_SYMBOL_PREFIX)
         || matches.next().is_some()
         || symbol.binding != SymbolBinding::Global
         || symbol.kind != SymbolKind::Function

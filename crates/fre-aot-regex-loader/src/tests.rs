@@ -24,6 +24,24 @@ fn compile_span(pattern: &str) -> CompiledRegex {
     compiled
 }
 
+fn compile_selected_end(pattern: &str) -> CompiledRegex {
+    let compiled = compile(
+        CompileRequest::new(pattern, host_target().expect("supported test host"))
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .unwrap_or_else(|error| panic!("compile direct SelectedEnd {pattern:?}: {error}"));
+    let unresolved = compiled
+        .module()
+        .required_runtime_symbols()
+        .collect::<Vec<_>>();
+    assert!(
+        unresolved.is_empty(),
+        "fixture {pattern:?} unexpectedly requires {unresolved:?}"
+    );
+    compiled
+}
+
 fn portable_span(
     compiled: &CompiledRegex,
     haystack: &[u8],
@@ -32,6 +50,17 @@ fn portable_span(
     match compiled.search(haystack, window).expect("portable oracle") {
         MatchResult::Span(found) => found.map(|(start, end)| SpanMatch { start, end }),
         other => panic!("Span compiler returned {other:?}"),
+    }
+}
+
+fn portable_selected_end(
+    compiled: &CompiledRegex,
+    haystack: &[u8],
+    window: SearchWindow,
+) -> Option<usize> {
+    match compiled.search(haystack, window).expect("portable oracle") {
+        MatchResult::SelectedEnd(found) => found,
+        other => panic!("SelectedEnd compiler returned {other:?}"),
     }
 }
 
@@ -77,11 +106,50 @@ fn child_write_is_blocked(pointer: NonNull<c_void>) -> bool {
 fn public_types_are_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PublishedSpan>();
+    assert_send_sync::<PublishedSelectedEnd>();
     assert_send_sync::<SpanMatches<'_, '_>>();
 }
 
 #[test]
-fn convenience_compile_and_publish_uses_the_detected_host_target() {
+fn direct_selected_end_matches_portable_for_full_and_subwindows() {
+    let _lock = PUBLICATION_TEST_LOCK.lock().unwrap();
+    for (pattern, haystacks) in [
+        (
+            "a{0,100}b",
+            [b"zzzaaabzz".as_slice(), b"aaaaaaaaac".as_slice()],
+        ),
+        ("(?:ab|a)", [b"zzabaz".as_slice(), b"nothing".as_slice()]),
+        (
+            r"(?-u:\b(?:foo|bar)\b)",
+            [b"!foo bar!".as_slice(), b"foobar".as_slice()],
+        ),
+    ] {
+        let compiled = compile_selected_end(pattern);
+        let portable = compiled.clone();
+        let receipt = compiled.receipt().clone();
+        let published = publish_selected_end(compiled, PublicationLimits::default())
+            .unwrap_or_else(|error| panic!("publish {pattern:?}: {error}"));
+        assert_eq!(published.identity().as_bytes(), &receipt.object_sha256);
+        assert_eq!(published.target(), receipt.target);
+        assert_eq!(published.accounting().code_bytes(), receipt.code_bytes);
+        for haystack in haystacks {
+            for window in [
+                SearchWindow::full(haystack),
+                SearchWindow::new(0, haystack.len().saturating_sub(1)),
+                SearchWindow::new(haystack.len().min(2), haystack.len()),
+            ] {
+                assert_eq!(
+                    published.search(haystack, window).unwrap(),
+                    portable_selected_end(&portable, haystack, window),
+                    "{pattern:?} {haystack:?} {window:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn convenience_compile_and_publish_wrappers_use_the_detected_host_target() {
     let _lock = PUBLICATION_TEST_LOCK.lock().unwrap();
     let request = CompileRequest::new("needle", host_target().unwrap())
         .mode(CompileMode::Optimizing)
@@ -91,6 +159,13 @@ fn convenience_compile_and_publish_uses_the_detected_host_target() {
         published.find(b"hay needle stack").unwrap(),
         Some(SpanMatch { start: 4, end: 10 })
     );
+
+    let request = CompileRequest::new("needle", host_target().unwrap())
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::SelectedEnd);
+    let published =
+        compile_and_publish_selected_end(request, PublicationLimits::default()).unwrap();
+    assert_eq!(published.find(b"hay needle stack").unwrap(), Some(10));
 }
 
 #[test]
@@ -283,6 +358,15 @@ fn helper_backed_and_wrong_output_artifacts_fail_closed_before_mapping() {
         Err(PublicationError::OutputMismatch {
             expected: OutputContract::Span,
             actual: OutputContract::Exists,
+        })
+    ));
+
+    let span = compile_span("needle");
+    assert!(matches!(
+        publish_selected_end(span, PublicationLimits::default()),
+        Err(PublicationError::OutputMismatch {
+            expected: OutputContract::SelectedEnd,
+            actual: OutputContract::Span,
         })
     ));
     assert_eq!(platform::live_mappings(), before);
