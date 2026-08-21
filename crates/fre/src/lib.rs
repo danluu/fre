@@ -11181,6 +11181,14 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
         match &self.plan {
+            PortablePlan::ExactLiteral(literal) => literal
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _accounting)| matched.map(|(_start, end)| end))
+                .map_err(SearchError::from),
             PortablePlan::UnicodeScalarRun(plan) => plan
                 .shortest_match_window_value(
                     haystack,

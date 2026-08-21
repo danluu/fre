@@ -1201,6 +1201,84 @@ impl PortableTextRegex {
             .map_err(PortableTextSearchError::Search)
     }
 
+    /// Return the first byte boundary where a match is detected, with exact
+    /// accounting.
+    ///
+    /// Like [`PortableRegex::shortest_match`], this may be shorter than the
+    /// end of the leftmost-first match returned by [`Self::find`]. The byte
+    /// offset is nevertheless a UTF-8 scalar boundary because construction
+    /// proved the text and byte languages equivalent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if checked search limits refuse execution.
+    pub fn shortest_match(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.inner.shortest_match(haystack.as_bytes(), limits)
+    }
+
+    /// Return only the first byte boundary where a match is detected.
+    ///
+    /// This preserves [`Self::shortest_match`] semantics without constructing
+    /// facade diagnostic accounting on value-only native and K0 routes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as
+    /// [`Self::shortest_match`].
+    pub fn shortest_match_value(
+        &self,
+        haystack: &str,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.inner.shortest_match_value(haystack.as_bytes(), limits)
+    }
+
+    /// Return the first detected match end at or after byte offset `start`,
+    /// with exact accounting.
+    ///
+    /// Interior UTF-8 offsets advance to the next scalar boundary without
+    /// slicing the haystack, so assertions retain their original context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an out-of-bounds start or when checked
+    /// search limits refuse execution.
+    pub fn shortest_match_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner
+            .shortest_match_at(haystack.as_bytes(), start, limits)
+    }
+
+    /// Return only the first detected match end at or after byte offset
+    /// `start`.
+    ///
+    /// Interior UTF-8 offsets retain the normalization and assertion context
+    /// of [`Self::shortest_match_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as
+    /// [`Self::shortest_match_at`].
+    pub fn shortest_match_at_value(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner
+            .shortest_match_at_value(haystack.as_bytes(), start, limits)
+    }
+
     /// Return the selected match end in bytes without exposing its start.
     ///
     /// # Errors
