@@ -69,10 +69,14 @@ a separately named compiler-stage benchmark.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
   and all five ordered substitutions through their separately linked ordinary
   Span entries. Rust owns only checked stage sequencing, replacement copies,
-  and scalar accounting. Every stage must return an in-window nonempty Span;
-  invalid, backward, empty, or non-success results fail the complete sample.
-  This is an AOT runtime-execution boundary, not a claim that precompiled
-  object construction is timing-equivalent to Rebar's per-call compilation.
+  scalar accounting, and the canonical nine-line plus terminal report
+  formatting. Every stage must return an in-window nonempty Span; invalid,
+  backward, empty, or non-success results fail the complete sample. An untimed
+  independent Rust translation must reproduce the input/clean/final lengths,
+  all nine counts, all five substitution lengths, and the complete report
+  bytes exactly.
+  This is a complete runtime composite with precompiled entries, not a claim
+  that omitted per-call regex construction is timing-equivalent to Rebar.
 
 For a multi-pattern scalar job, exact duplicate source rows are compiled once;
 distinct source spellings that produce the same complete entry/object are also
@@ -94,8 +98,9 @@ more than 256 MiB of distinct row objects before linking. These are explicit
 fail-closed resource limits; the bridge never mixes native rows with a portable
 semantic fallback.
 
-One exclusive handle is prepared from the exact linked program before every
-warmup/timed loop and destroyed after all samples. Handle preparation,
+Except for the fixed regex-redux composite and native-row bridge, one exclusive
+handle is prepared from the exact linked program before every warmup/timed loop
+and destroyed after all samples. Handle preparation,
 result comparison, and destruction are outside every measured duration. The
 compiler receipt selects the preparation ABI without consulting a benchmark
 name. Incumbent objects use the unchanged 64-byte V2 config. An object whose
@@ -184,13 +189,15 @@ all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
 admitted only by its typed zero-pattern model and exact fixed public stage
 table; it is not recognized by benchmark name.
 
-For native-coverage evidence, a linked regex-redux component is native only
-when an independent binary audit finds no semantic runtime-helper edge, the
-complete operation still succeeds after all semantic helpers are trap-patched,
-and patching that component's claimed entry traps a fixture that reaches it.
-The v3 provenance record publishes component-indexed entry symbols, runtime
-symbol surfaces and program/object hashes. Merely linking all 15 objects does
-not count helper-backed components as native.
+The build fails closed unless every linked regex-redux component has no
+prepared program/entry and no semantic runtime-helper relocation. Native
+coverage additionally requires an independent final-binary audit, complete
+operation success after all semantic helpers are trap-patched, and a trap when
+each claimed component entry is patched on a fixture that reaches it.
+The v3 provenance record publishes a separate native flag, entry symbol,
+runtime-symbol surface, and program/object hash for every numbered component.
+Merely linking all 15 objects does not count helper-backed components as
+native.
 
 ## HEAD campaign reporting
 

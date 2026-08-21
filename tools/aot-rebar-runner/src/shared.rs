@@ -148,19 +148,44 @@ pub const REGEX_REDUX_SUBSTITUTIONS: [(&str, &str); 5] = [
     (r"\|[^|][^|]*\|", "-"),
 ];
 
+pub const REGEX_REDUX_VARIANT_BASE: usize = 1;
+pub const REGEX_REDUX_SUBSTITUTION_BASE: usize =
+    REGEX_REDUX_VARIANT_BASE.saturating_add(REGEX_REDUX_VARIANTS.len());
 pub const REGEX_REDUX_COMPONENTS: usize =
-    1 + REGEX_REDUX_VARIANTS.len() + REGEX_REDUX_SUBSTITUTIONS.len();
+    REGEX_REDUX_SUBSTITUTION_BASE.saturating_add(REGEX_REDUX_SUBSTITUTIONS.len());
+
+#[must_use]
+pub const fn regex_redux_variant_component(variant: usize) -> Option<usize> {
+    if variant < REGEX_REDUX_VARIANTS.len() {
+        REGEX_REDUX_VARIANT_BASE.checked_add(variant)
+    } else {
+        None
+    }
+}
+
+#[must_use]
+pub const fn regex_redux_substitution_component(substitution: usize) -> Option<usize> {
+    if substitution < REGEX_REDUX_SUBSTITUTIONS.len() {
+        REGEX_REDUX_SUBSTITUTION_BASE.checked_add(substitution)
+    } else {
+        None
+    }
+}
 
 #[must_use]
 pub const fn regex_redux_pattern(component: usize) -> Option<&'static str> {
     if component == 0 {
         return Some(REGEX_REDUX_FLATTEN_PATTERN);
     }
-    let variant = component - 1;
+    let Some(variant) = component.checked_sub(REGEX_REDUX_VARIANT_BASE) else {
+        return None;
+    };
     if variant < REGEX_REDUX_VARIANTS.len() {
         return Some(REGEX_REDUX_VARIANTS[variant]);
     }
-    let substitution = variant - REGEX_REDUX_VARIANTS.len();
+    let Some(substitution) = component.checked_sub(REGEX_REDUX_SUBSTITUTION_BASE) else {
+        return None;
+    };
     if substitution < REGEX_REDUX_SUBSTITUTIONS.len() {
         return Some(REGEX_REDUX_SUBSTITUTIONS[substitution].0);
     }
@@ -643,7 +668,8 @@ mod tests {
             .windows(field.len())
             .position(|window| window == field)
             .expect("pattern field");
-        output.drain(offset..offset + field.len());
+        let end = offset.checked_add(field.len()).expect("pattern field end");
+        output.drain(offset..end);
         output
     }
 
@@ -779,7 +805,11 @@ mod tests {
         assert_eq!(REGEX_REDUX_COMPONENTS, 15);
         assert_eq!(regex_redux_pattern(0), Some(REGEX_REDUX_FLATTEN_PATTERN));
         assert_eq!(
-            regex_redux_pattern(REGEX_REDUX_COMPONENTS - 1),
+            regex_redux_pattern(
+                REGEX_REDUX_COMPONENTS
+                    .checked_sub(1)
+                    .expect("fixed regex-redux suite is nonempty"),
+            ),
             Some(REGEX_REDUX_SUBSTITUTIONS[4].0)
         );
         assert_eq!(regex_redux_pattern(REGEX_REDUX_COMPONENTS), None);

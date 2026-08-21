@@ -391,6 +391,146 @@ fn configured_native_rows_klv(model: Model) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "recursive Cargo smoke for all fixed regex-redux AOT objects and entries"]
+fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(), DynError> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "fre-aot-rebar-regex-redux-smoke-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+    let result = (|| {
+        let klv_bytes = regex_redux_smoke_klv();
+        let benchmark = Benchmark::parse(&klv_bytes)?;
+        if benchmark.model != Model::RegexRedux || !benchmark.patterns.is_empty() {
+            return Err("regex-redux smoke did not retain its typed zero-pattern shape".into());
+        }
+        let klv = root.join("regex-redux-smoke.klv");
+        let target = root.join("target");
+        fs::write(&klv, &klv_bytes)?;
+
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let built = Command::new(cargo)
+            .current_dir(workspace_root())
+            .args([
+                "build",
+                "--offline",
+                "--jobs=2",
+                "-p",
+                "fre-aot-rebar-runner",
+                "--bin",
+                "fre-aot-rebar-runner",
+            ])
+            .env("CARGO_TARGET_DIR", &target)
+            .env("FRE_AOT_REBAR_KLV", &klv)
+            .env("FRE_AOT_REBAR_FEATURES", "none")
+            .env("FRE_AOT_REBAR_SOURCE_COMMIT", "regex-redux-smoke")
+            .env("FRE_AOT_REBAR_SOURCE_TREE", "regex-redux-smoke")
+            .output()?;
+        if !built.status.success() {
+            return Err(format!(
+                "regex-redux runner build/link failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr),
+            )
+            .into());
+        }
+
+        let runner = target.join("debug").join(format!(
+            "fre-aot-rebar-runner{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let executed = Command::new(&runner)
+            .stdin(Stdio::from(fs::File::open(&klv)?))
+            .output()?;
+        if !executed.status.success()
+            || executed.stdout.lines().count() != 1
+            || !executed.stdout.ends_with(b",8\n")
+        {
+            return Err(format!(
+                "regex-redux runner failed or returned the wrong final length: status={:?} stdout={} stderr={}",
+                executed.status.code(),
+                String::from_utf8_lossy(&executed.stdout),
+                String::from_utf8_lossy(&executed.stderr),
+            )
+            .into());
+        }
+        let provenance = Command::new(&runner).arg("--provenance").output()?;
+        if !provenance.status.success() {
+            return Err(format!(
+                "regex-redux provenance failed: {}",
+                String::from_utf8_lossy(&provenance.stderr)
+            )
+            .into());
+        }
+        let provenance = std::str::from_utf8(&provenance.stdout)?;
+        for expected_field in [
+            "schema=fre.aot.rebar-runner.v3",
+            "model=regex-redux",
+            "benchmark=\"synthetic/aot-runner/regex-redux-smoke\"",
+            "component_count=15",
+            "boundary=complete-regex-redux-aot-precompiled",
+        ] {
+            if !provenance.contains(expected_field) {
+                return Err(format!(
+                    "regex-redux provenance omitted {expected_field:?}: {provenance}"
+                )
+                .into());
+            }
+        }
+        for component in 0..15 {
+            for expected_field in [
+                format!("component_{component}_native=true"),
+                format!("component_{component}_entry_symbol="),
+                format!("component_{component}_runtime_symbols="),
+                format!("component_{component}_program_sha256="),
+                format!("component_{component}_object_sha256="),
+            ] {
+                if !provenance.contains(&expected_field) {
+                    return Err(format!(
+                        "regex-redux provenance omitted {expected_field:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("preserving failed regex-redux smoke at {}", root.display());
+            Err(error)
+        }
+    }
+}
+
+fn regex_redux_smoke_klv() -> Vec<u8> {
+    let mut output = Vec::new();
+    for (key, value) in [
+        ("name", b"synthetic/aot-runner/regex-redux-smoke".as_slice()),
+        ("model", b"regex-redux".as_slice()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"false".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("haystack", b">test\nagggtaaa\n".as_slice()),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+#[test]
 #[ignore = "recursive Cargo smoke for linked prepared Span-fill refills and nullable progress"]
 fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), DynError> {
     const KEYWORD_PATTERN: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";

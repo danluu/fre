@@ -443,6 +443,7 @@ fn configured_source(
     source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
     source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
     source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     writeln!(
@@ -516,7 +517,9 @@ fn configured_regex_redux_source(
     assert_eq!(components.len(), shared::REGEX_REDUX_COMPONENTS);
     assert_eq!(object_paths.len(), components.len());
 
-    let first = components.first().expect("regex-redux has fixed components");
+    let first = components
+        .first()
+        .expect("regex-redux has fixed components");
     let compiler_version = first.receipt().compiler_version;
     let optimizer_version = first.receipt().optimizer_version;
     let mut entry_symbols = Vec::with_capacity(components.len());
@@ -529,29 +532,67 @@ fn configured_regex_redux_source(
         assert_eq!(receipt.compiler_version, compiler_version);
         assert_eq!(receipt.optimizer_version, optimizer_version);
         assert_eq!(receipt.required_prepare_capabilities, 0);
-        assert_eq!(compiled.module().prepared_aggregate_exports(), fre_aot_regex::PreparedAggregateExports::NONE);
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            fre_aot_regex::PreparedAggregateExports::NONE
+        );
         assert!(compiled.module().prepared_count_symbol().is_none());
         assert!(compiled.module().prepared_span_sum_symbol().is_none());
         assert!(compiled.module().prepared_grep_count_symbol().is_none());
         assert!(compiled.module().prepared_span_fill_symbol().is_none());
-        let entry = compiled.module().entry_symbol();
-        assert!(unique_entries.insert(entry.to_owned()), "regex-redux components {component} and an earlier component share one entry symbol");
-        entry_symbols.push(entry.to_owned());
-        runtime_symbols.push(
-            compiled
+        assert!(compiled.module().prepared_entry_symbol().is_none());
+        assert!(compiled.module().prepared_exists_batch_symbol().is_none());
+        assert!(compiled.module().required_runtime_program().is_none());
+        assert!(
+            !compiled
                 .module()
-                .required_runtime_symbols()
-                .collect::<Vec<_>>()
-                .join(","),
+                .symbols()
+                .iter()
+                .enumerate()
+                .any(|(symbol_index, symbol)| {
+                    symbol.section.is_none()
+                        && compiled
+                            .module()
+                            .relocations()
+                            .iter()
+                            .any(|relocation| relocation.symbol == symbol_index)
+                }),
+            "regex-redux component {component} retains an unresolved relocation target"
         );
+        let entry = compiled.module().entry_symbol();
+        assert!(
+            unique_entries.insert(entry.to_owned()),
+            "regex-redux components {component} and an earlier component share one entry symbol"
+        );
+        entry_symbols.push(entry.to_owned());
+        let component_runtime_symbols = compiled
+            .module()
+            .required_runtime_symbols()
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            component_runtime_symbols.is_empty(),
+            "regex-redux component {component} retains semantic runtime helpers: {component_runtime_symbols}"
+        );
+        runtime_symbols.push(component_runtime_symbols);
         program_hashes.push(receipt.program_sha256);
         object_hashes.push(receipt.object_sha256);
     }
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
-    writeln!(source, "pub const ADAPTER: &str = {:?};", benchmark.model.adapter()).unwrap();
-    writeln!(source, "pub const EXPECTED_NAME: &str = {:?};", benchmark.name).unwrap();
+    writeln!(
+        source,
+        "pub const ADAPTER: &str = {:?};",
+        benchmark.model.adapter()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_NAME: &str = {:?};",
+        benchmark.name
+    )
+    .unwrap();
     source.push_str("pub const EXPECTED_MODEL: &str = \"regex-redux\";\n");
     source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
     source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 2;\n");
@@ -571,21 +612,60 @@ fn configured_regex_redux_source(
     source.push_str("pub const ENTRY_SYMBOL: &str = \"\";\n");
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
     source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
-    source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"fixed-component-direct-entry-loop\";\n");
+    source.push_str(
+        "pub const SPAN_ITERATION_STRATEGY: &str = \"fixed-component-direct-entry-loop\";\n",
+    );
     source.push_str("pub const GREP_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
     source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
     source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"component-indexed\";\n");
     source.push_str("pub const ENGINE: &str = \"FixedRegexReduxComponents\";\n");
-    source.push_str("pub const AGGREGATE_STRATEGY: &str = \"linked-fixed-regex-redux-span-entries\";\n");
-    writeln!(source, "pub const COMPILER_VERSION: u32 = {compiler_version};").unwrap();
-    writeln!(source, "pub const OPTIMIZER_VERSION: u32 = {optimizer_version};").unwrap();
+    source.push_str(
+        "pub const AGGREGATE_STRATEGY: &str = \"linked-fixed-regex-redux-span-entries\";\n",
+    );
+    writeln!(
+        source,
+        "pub const COMPILER_VERSION: u32 = {compiler_version};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OPTIMIZER_VERSION: u32 = {optimizer_version};"
+    )
+    .unwrap();
     source.push_str("pub const PROGRAM_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const OBJECT_SHA256: [u8; 32] = [0; 32];\n");
-    writeln!(source, "pub const REGEX_REDUX_COMPONENT_COUNT: usize = {};", components.len()).unwrap();
-    writeln!(source, "pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &{entry_symbols:?};").unwrap();
-    writeln!(source, "pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &{runtime_symbols:?};").unwrap();
-    writeln!(source, "pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &{program_hashes:?};").unwrap();
-    writeln!(source, "pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &{object_hashes:?};").unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_COMPONENT_COUNT: usize = {};",
+        components.len()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &{runtime_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_NATIVE: &[bool] = &{:?};",
+        vec![true; components.len()]
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &{program_hashes:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &{object_hashes:?};"
+    )
+    .unwrap();
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
 
     source.push_str("unsafe extern \"C\" {\n");
@@ -927,6 +1007,7 @@ pub const OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;
 pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];
 pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];
+pub const REGEX_REDUX_NATIVE: &[bool] = &[];
 pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];
 pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];
 pub static OBJECT_BYTES: &[u8] = &[];
