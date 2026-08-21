@@ -82,9 +82,10 @@ pub use grep_count::{
 };
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
-    ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndTeddyAotIsa,
-    ExactFiniteSelectedEndTeddyAotReport, ExactFiniteSelectedEndTeddyAotTargetTier,
-    ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
+    ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
+    ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport,
+    ExactFiniteSelectedEndTeddyAotTargetTier, ExactSingleLiteralAotIsa,
+    ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
     ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
     OperatingSystem, OrderedFiniteLanguageAotReport, PreparedAggregateExports,
     PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
@@ -736,6 +737,9 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     drop(object);
     let artifact_identity = program.artifact_identity();
     let serialized_program = program.serialize()?;
+    let exact_teddy_incumbent = module
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
     let module =
         module.append_prepared_aggregate_exports(exports, artifact_identity, &serialized_program)?;
     let ordered_nfa_selected = module.required_prepare_capabilities()
@@ -817,21 +821,78 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         FinalObjectAttempt::ObjectBytes {
             first_error: first,
             ..
-        } if ordered_nfa_selected => {
+        } if ordered_nfa_selected || exact_teddy_incumbent.is_some() => {
             // The aggregate additions are part of the same object-size
             // transaction as the base module. If the additive Ordered-TNFA
             // V3 object fit by itself but the complete object does not, the
             // shared retry above preserves V2 dispatch and then scalar V1.
             // Only after V1 also exceeds the ceiling do we rebuild the
             // incumbent adapter and its whole-operation helpers exactly once.
+            //
+            // The direct exact-finite Teddy wrapper has the same transaction:
+            // its report authenticates the byte-identical complete-DFA
+            // incumbent and its exact data extent. The ordinary (non-slow)
+            // fallback scheduler excludes the Teddy wrapper and publishes the
+            // established semantic DFA. Reusing the authenticated incumbent
+            // extent as its ceiling prevents a larger optional route from
+            // replacing that fallback. The postcondition below authenticates
+            // the exact incumbent before aggregation.
+            let fallback_native_data_limit_bytes = exact_teddy_incumbent
+                .map_or(effective_native_data_limit_bytes, |report| {
+                    effective_native_data_limit_bytes.min(report.incumbent_data_bytes)
+                });
             let fallback = CompiledModule::lower_with_native_data_limit_and_optional_routes(
                 &program,
                 target,
                 false,
                 false,
-                effective_native_data_limit_bytes,
-            )?
-            .append_prepared_aggregate_exports(
+                fallback_native_data_limit_bytes,
+            )?;
+            if let Some(report) = exact_teddy_incumbent {
+                let code = fallback
+                    .sections()
+                    .iter()
+                    .find(|section| section.kind == SectionKind::Text)
+                    .ok_or(CompileError::InternalInvariant(
+                        "exact finite SelectedEnd Teddy aggregate fallback has no text",
+                    ))?;
+                let data = fallback
+                    .sections()
+                    .iter()
+                    .find(|section| section.kind == SectionKind::ReadOnlyData)
+                    .ok_or(CompileError::InternalInvariant(
+                        "exact finite SelectedEnd Teddy aggregate fallback has no data",
+                    ))?;
+                let code_sha256: [u8; 32] = Sha256::digest(code.bytes()).into();
+                let data_sha256: [u8; 32] = Sha256::digest(data.bytes()).into();
+                if fallback
+                    .exact_finite_selected_end_teddy_aot_report()
+                    .is_some()
+                    || fallback.exact_finite_exists_byte_set_aot_report().is_some()
+                    || fallback.exact_single_literal_aot_report().is_some()
+                    || fallback.ordered_finite_language_aot_report().is_some()
+                    || fallback.slow_aot_report().is_some()
+                    || fallback.slow_context_aot_report().is_some()
+                    || fallback.compiler_k0_aot_report().is_some()
+                    || fallback.required_runtime_symbols().next().is_some()
+                    || fallback.start_accelerator()
+                        != report.incumbent_complete_dfa.scanner
+                    || code.bytes().len() != report.incumbent_code_bytes
+                    || data.bytes().len() != report.incumbent_data_bytes
+                    || code_sha256 != report.incumbent_code_sha256
+                    || data_sha256 != report.incumbent_data_sha256
+                    || fallback.relocations().len()
+                        != report.incumbent_relocation_count
+                    || crate::module::exact_finite_selected_end_relocation_digest(
+                        fallback.relocations(),
+                    ) != Some(report.incumbent_relocations_sha256)
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "exact finite SelectedEnd Teddy aggregate fallback did not restore the authenticated semantic DFA incumbent",
+                    ));
+                }
+            }
+            let fallback = fallback.append_prepared_aggregate_exports(
                 exports,
                 artifact_identity,
                 &serialized_program,

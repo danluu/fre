@@ -47,6 +47,8 @@ const MAX_MANDATORY_TEDDY_BUILD_WORK: u64 = 2_000_000;
 /// distinct bit. A modest minimum also keeps pair-like sets on the established
 /// relation scanner instead of paying table setup for too little parallelism.
 const MIN_MANDATORY_TEDDY_LITERALS: usize = 4;
+/// A `u64` source-ordinal mask bounds the exact finite verifier to 64 arms.
+const MAX_EXACT_PLAN_LITERALS: usize = 64;
 
 const EMPTY_MASK_BANK: MandatoryTeddyMaskBank = MandatoryTeddyMaskBank {
     low: [[0; 16]; MAX_MANDATORY_TEDDY_COLUMNS],
@@ -615,6 +617,23 @@ pub(crate) fn derive_exact_prefixes<B: AsRef<[u8]>>(
     })
 }
 
+/// Fixed-capacity source-ordinal bucket receipt for one exact plan.
+///
+/// The plan's own authenticated literal count bounds the live prefix. Keeping
+/// the backing storage inline makes rebuilding this compiler-only map
+/// allocation-free during materialization and receipt authentication.
+pub(crate) struct ExactPlanAssignments {
+    assignments: [u8; MAX_EXACT_PLAN_LITERALS],
+    literal_count: u8,
+}
+
+impl ExactPlanAssignments {
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.assignments[..usize::from(self.literal_count)]
+    }
+}
+
 /// Rebuild the deterministic literal-to-bucket assignment for one selected
 /// exact-prefix plan. The emitted exact verifier uses this authenticated map
 /// to turn a scalar bucket fingerprint into a source-ordinal mask.
@@ -622,12 +641,12 @@ pub(crate) fn derive_exact_prefixes<B: AsRef<[u8]>>(
 pub(crate) fn exact_plan_assignments<B: AsRef<[u8]>>(
     literals: &[B],
     plan: MandatoryTeddyPlan,
-) -> Option<Box<[u8]>> {
+) -> Option<ExactPlanAssignments> {
     let literal_count = literals.len();
     let columns = usize::from(plan.columns());
     let bucket_count = usize::from(plan.bucket_count());
     if literal_count != usize::from(plan.literal_count())
-        || literal_count > MAX_MANDATORY_TEDDY_LITERALS
+        || literal_count > MAX_EXACT_PLAN_LITERALS
         || plan.bank_count() != 1
         || bucket_count > MANDATORY_TEDDY_BUCKETS_PER_BANK
     {
@@ -644,7 +663,12 @@ pub(crate) fn exact_plan_assignments<B: AsRef<[u8]>>(
     if build.plan != plan {
         return None;
     }
-    Some(build.assignments[..literal_count].to_vec().into_boxed_slice())
+    let mut assignments = [0_u8; MAX_EXACT_PLAN_LITERALS];
+    assignments[..literal_count].copy_from_slice(&build.assignments[..literal_count]);
+    Some(ExactPlanAssignments {
+        assignments,
+        literal_count: u8::try_from(literal_count).ok()?,
+    })
 }
 
 #[derive(Clone, Copy)]

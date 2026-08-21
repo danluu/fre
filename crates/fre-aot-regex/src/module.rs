@@ -629,6 +629,13 @@ mod module_single_literal_two_way;
 mod module_dfa_loop_skip;
 #[path = "module_exact_finite_selected_end_teddy.rs"]
 mod module_exact_finite_selected_end_teddy;
+
+pub(crate) fn exact_finite_selected_end_relocation_digest(
+    relocations: &[ModuleRelocation],
+) -> Option<[u8; 32]> {
+    module_exact_finite_selected_end_teddy::relocation_digest(relocations)
+}
+
 #[path = "module_seeded_reverse_aarch64.rs"]
 mod module_seeded_reverse_aarch64;
 #[path = "module_suffix_retry.rs"]
@@ -3088,9 +3095,9 @@ impl CompiledModule {
             // conservative target-neutral comparison. Exact-product and
             // contextual machines keep their established portfolios.
             let finite_candidate = if program.engine_kind() == crate::EngineKind::OrderedDfa
-                && let Some(finite_view) = program.native_finite_language_view()
                 && let Some(complete_cost) =
                     NativeCompleteDfaCost::estimate(&semantic_native)?
+                && let Some(finite_view) = program.native_finite_language_view()
             {
                 lower_optional_native_finite_language_with_data_limit_and_competitor(
                         finite_view,

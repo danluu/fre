@@ -640,7 +640,7 @@ fn append_exact_verifier_data(
         ),
     )?;
     if !(4..=64).contains(&literals.len())
-        || assignments.len() != literals.len()
+        || assignments.as_slice().len() != literals.len()
         || teddy.plan.bank_count() != 1
         || teddy.plan.bucket_count() > 8
     {
@@ -689,7 +689,7 @@ fn append_exact_verifier_data(
         .map_err(|_| ObjectError::Allocation("exact finite SelectedEnd Teddy verifier data"))?;
 
     let mut bucket_ordinal_masks = [0_u64; 8];
-    for (ordinal, &bucket) in assignments.iter().enumerate() {
+    for (ordinal, &bucket) in assignments.as_slice().iter().enumerate() {
         let bucket = usize::from(bucket);
         if bucket >= usize::from(teddy.plan.bucket_count()) {
             return Err(ObjectError::InvalidModule(
@@ -1917,7 +1917,7 @@ fn exact_bucket_masks_authenticate<B: AsRef<[u8]>>(
 ) -> Option<bool> {
     let assignments = mandatory_teddy::exact_plan_assignments(literals, plan)?;
     let mut expected = [0_u64; 8];
-    for (ordinal, &bucket) in assignments.iter().enumerate() {
+    for (ordinal, &bucket) in assignments.as_slice().iter().enumerate() {
         let bucket = usize::from(bucket);
         if bucket >= usize::from(plan.bucket_count()) {
             return Some(false);
@@ -2840,6 +2840,121 @@ mod tests {
                 .passes
                 .contains(&OptimizationPass::ExactFiniteSelectedEndTeddyLowering),
         );
+    }
+
+    #[test]
+    fn prepared_aggregate_object_cap_restores_exact_complete_dfa_incumbent() {
+        let pattern = scanner_free_exact_finite_pattern();
+        let target = avx2_target();
+        let exports = crate::PreparedAggregateExports::GREP_COUNT;
+        let request = |max_object_bytes| {
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(crate::CompileLimitsV1 {
+                    max_object_bytes,
+                    ..crate::CompileLimitsV1::default()
+                })
+        };
+
+        let base = compile(request(usize::MAX)).expect("unbounded Teddy base object");
+        let selected = crate::compile_with_prepared_aggregate_exports(
+            request(usize::MAX),
+            exports,
+        )
+        .expect("unbounded Teddy aggregate object");
+        let report = selected
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("fixture selects the exact Teddy aggregate route");
+
+        let serialized = selected.program().serialize().unwrap();
+        let incumbent_base =
+            CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                selected.program(),
+                target,
+                false,
+                false,
+                report.incumbent_data_bytes,
+            )
+            .expect("rebuild exact ordinary complete-DFA incumbent");
+        assert!(
+            incumbent_base
+                .exact_finite_selected_end_teddy_aot_report()
+                .is_none(),
+        );
+        assert!(incumbent_base.ordered_finite_language_aot_report().is_none());
+        assert!(incumbent_base.slow_aot_report().is_none());
+        assert!(incumbent_base.slow_context_aot_report().is_none());
+        assert!(incumbent_base.compiler_k0_aot_report().is_none());
+        assert_eq!(incumbent_base.start_accelerator(), report.incumbent_complete_dfa.scanner);
+        assert_eq!(incumbent_base.sections()[1].bytes().len(), report.incumbent_data_bytes);
+        assert_eq!(
+            Sha256::digest(incumbent_base.sections()[0].bytes()).as_slice(),
+            report.incumbent_code_sha256,
+        );
+        assert_eq!(
+            Sha256::digest(incumbent_base.sections()[1].bytes()).as_slice(),
+            report.incumbent_data_sha256,
+        );
+        assert_eq!(
+            relocation_digest(incumbent_base.relocations()),
+            Some(report.incumbent_relocations_sha256),
+        );
+        let incumbent = incumbent_base
+            .append_prepared_aggregate_exports(
+                exports,
+                selected.program().artifact_identity(),
+                &serialized,
+            )
+            .expect("append aggregate export to exact incumbent");
+        let incumbent_object = crate::emit_object(
+            &incumbent,
+            crate::ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit exact incumbent aggregate object");
+
+        assert!(incumbent_object.len() < selected.object().len());
+        assert!(base.object().len() < incumbent_object.len());
+        let exact_incumbent = crate::compile_with_prepared_aggregate_exports(
+            request(incumbent_object.len()),
+            exports,
+        )
+        .expect("exact complete-DFA aggregate boundary succeeds");
+        assert_eq!(exact_incumbent.module(), &incumbent);
+        assert_eq!(exact_incumbent.object(), incumbent_object);
+        assert!(
+            exact_incumbent
+                .receipt()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+        assert!(
+            !exact_incumbent
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::ExactFiniteSelectedEndTeddyLowering),
+        );
+
+        let one_below = incumbent_object
+            .len()
+            .checked_sub(1)
+            .expect("nonempty incumbent aggregate object");
+        assert!(base.object().len() <= one_below);
+        let error = crate::compile_with_prepared_aggregate_exports(
+            request(one_below),
+            exports,
+        )
+        .expect_err("Teddy and complete-DFA aggregate objects both exceed the lower cap");
+        assert!(matches!(
+            error,
+            crate::CompileError::Object(ObjectError::Resource {
+                resource: crate::CompileResource::ObjectBytes,
+                limit,
+                required,
+            }) if limit == one_below && required == selected.object().len()
+        ));
     }
 
     #[test]
