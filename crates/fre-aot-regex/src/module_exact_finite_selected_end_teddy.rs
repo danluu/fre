@@ -2740,6 +2740,82 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_verification_budget_tail_restores_public_abi_on_every_tier() {
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = compile_selected(&scanner_free_exact_finite_pattern(), target);
+            let report = compiled
+                .receipt()
+                .exact_finite_selected_end_teddy_aot
+                .expect("exact finite SelectedEnd Teddy receipt");
+            let words = compiled.module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let restore = [
+                aarch64_mov_x(1, 19).unwrap(),
+                aarch64_load_pair_x(19, 20, 31, 0).unwrap(),
+                aarch64_add_x_imm(31, 31, 16).unwrap(),
+            ];
+            let restore_target = words
+                .windows(restore.len())
+                .position(|window| window == restore)
+                .expect("public length, callee-saved registers, and stack restore sequence");
+            let budget_branches = words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word & 0xff00_001f == (0xb400_0000 | 20))
+                .filter(|(branch, word)| {
+                    let immediate = ((((**word >> 5) & 0x7_ffff) as i32) << 13) >> 13;
+                    isize::try_from(*branch)
+                        .ok()
+                        .and_then(|origin| origin.checked_add(immediate as isize))
+                        .and_then(|destination| usize::try_from(destination).ok())
+                        == Some(restore_target)
+                })
+                .count();
+            assert_eq!(
+                budget_branches, 1,
+                "verification-budget CBZ must target the complete ABI restore: {target:?}",
+            );
+            let tail = *words
+                .get(restore_target + restore.len())
+                .expect("restore sequence has an incumbent tail branch");
+            assert_eq!(tail & 0xfc00_0000, 0x1400_0000, "target={target:?}");
+            let immediate = (((tail & 0x03ff_ffff) as i32) << 6) >> 6;
+            let tail_entry = isize::try_from(restore_target + restore.len())
+                .unwrap()
+                .checked_add(immediate as isize)
+                .and_then(|destination| usize::try_from(destination).ok())
+                .expect("in-section restored tail target");
+            let incumbent_branch = *words
+                .get(tail_entry)
+                .expect("restored tail has an incumbent branch");
+            assert_eq!(
+                incumbent_branch & 0xfc00_0000,
+                0x1400_0000,
+                "target={target:?}",
+            );
+            let immediate = (((incumbent_branch & 0x03ff_ffff) as i32) << 6) >> 6;
+            let incumbent = isize::try_from(tail_entry)
+                .unwrap()
+                .checked_add(immediate as isize)
+                .and_then(|destination| usize::try_from(destination).ok())
+                .expect("in-section incumbent target");
+            assert_eq!(
+                incumbent.checked_mul(4),
+                Some(report.incumbent_code_offset),
+                "restored tail must enter the authenticated incumbent: {target:?}",
+            );
+        }
+    }
+
+    #[test]
     fn declared_native_data_cap_declines_unchanged_and_exact_boundary_selects() {
         let target = avx2_target();
         let pattern = scanner_free_exact_finite_pattern();

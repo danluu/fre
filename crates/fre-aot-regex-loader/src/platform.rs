@@ -181,6 +181,46 @@ mod implementation {
         usize::try_from(raw).map_err(|_| libc::EOVERFLOW)
     }
 
+    #[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+    pub(crate) fn with_guarded_haystack<T>(
+        bytes: &[u8],
+        at_right_boundary: bool,
+        callback: impl for<'a> FnOnce(&'a [u8]) -> T,
+    ) -> Result<T, i32> {
+        let page = page_size()?;
+        if !page.is_power_of_two() {
+            return Err(libc::EPROTO);
+        }
+        let payload_bytes = bytes
+            .len()
+            .max(1)
+            .checked_add(page.checked_sub(1).ok_or(libc::EOVERFLOW)?)
+            .map(|rounded| rounded & !(page - 1))
+            .ok_or(libc::EOVERFLOW)?;
+        let total = payload_bytes
+            .checked_add(page.checked_mul(2).ok_or(libc::EOVERFLOW)?)
+            .ok_or(libc::EOVERFLOW)?;
+        let mapping = Mapping::reserve(total)?;
+        mapping.make_writable(page, payload_bytes)?;
+        let placement = if at_right_boundary {
+            page.checked_add(payload_bytes)
+                .and_then(|end| end.checked_sub(bytes.len()))
+                .ok_or(libc::EOVERFLOW)?
+        } else {
+            page
+        };
+        // SAFETY: the payload is the exact writable middle-page range, and
+        // `placement` keeps the disjoint source wholly within that range.
+        unsafe { mapping.copy_from(placement, bytes) };
+        mapping.make_read_only(page, payload_bytes)?;
+        // SAFETY: the copied bytes are initialized and readable, while the
+        // owned mapping outlives the higher-ranked callback.
+        let guarded = unsafe { mapping.bytes(placement, bytes.len()) };
+        let result = callback(guarded);
+        drop(mapping);
+        Ok(result)
+    }
+
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub(crate) fn current_thread_sve_vector_length_bytes() -> Result<Option<u16>, i32> {
         const PR_SVE_GET_VL: libc::c_int = 51;
@@ -485,6 +525,15 @@ mod implementation {
         Ok(None)
     }
 
+    #[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+    pub(crate) fn with_guarded_haystack<T>(
+        _bytes: &[u8],
+        _at_right_boundary: bool,
+        _callback: impl for<'a> FnOnce(&'a [u8]) -> T,
+    ) -> Result<T, i32> {
+        Err(0)
+    }
+
     pub(crate) unsafe fn synchronize_instruction_cache(_start: *mut c_void, _bytes: usize) {}
 
     #[cfg(test)]
@@ -499,6 +548,9 @@ pub(crate) use implementation::{
 
 #[cfg(test)]
 pub(crate) use implementation::live_mappings;
+
+#[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+pub(crate) use implementation::with_guarded_haystack;
 
 pub(crate) const fn supported() -> bool {
     cfg!(all(
