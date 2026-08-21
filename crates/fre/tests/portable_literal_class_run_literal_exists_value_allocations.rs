@@ -69,6 +69,11 @@ fn literal_class_run_existence_values_allocate_nothing() {
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
+        assert!(regex.is_match(haystack));
+        assert!(suffix.is_match(suffix_haystack));
+        assert!(!regex.is_match(absent));
+        assert!(inside.is_match(inside_haystack));
+        assert!(guarded.is_match(guarded_haystack));
         assert!(
             regex
                 .is_match_window_value(haystack, window, SearchLimits::unlimited())

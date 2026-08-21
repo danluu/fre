@@ -10572,6 +10572,9 @@ impl PortableRegex {
                     .map(|report| report.into_output())
                     .map_err(SearchError::from),
             },
+            PortablePlan::LiteralClassRunLiteral(plan) => plan
+                .is_match_full_ordinary_value(haystack)
+                .map_err(SearchError::from),
             _ => self.is_match_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }

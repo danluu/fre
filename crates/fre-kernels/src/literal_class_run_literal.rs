@@ -798,6 +798,38 @@ enum Anchor {
     CompleteAsciiWordSuffix,
 }
 
+/// Construction-resolved geometry for the direct literal/class-run owner.
+///
+/// `SuffixInsideClass` is semantically distinct from an ordinary suffix
+/// anchor: greedy selection must inspect overlapping suffix occurrences from
+/// the end of the class run. Keeping that proof in the retained plan avoids
+/// rediscovering it at every operation boundary.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedSearchGeometry {
+    GeneralPrefix,
+    GeneralSuffix,
+    SuffixInsideClass,
+    CompleteAsciiWordSuffix,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SEARCH_PREFLIGHT_CALLS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_test_search_preflight_calls() {
+    TEST_SEARCH_PREFLIGHT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn test_search_preflight_calls() -> usize {
+    TEST_SEARCH_PREFLIGHT_CALLS.with(core::cell::Cell::get)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundedNativeAdmission {
     Unconditional,
@@ -827,7 +859,7 @@ struct BoundedRepetitionPreference {
 pub struct LiteralClassRunLiteralPlan {
     anchor: Finder<'static>,
     opposite_literal: Box<[u8]>,
-    anchor_kind: Anchor,
+    geometry: ResolvedSearchGeometry,
     class: ByteClass,
     ascii_scanner: Option<AsciiClassScanner>,
     build: BuildAccounting,
@@ -1098,11 +1130,6 @@ impl LiteralClassRunLiteralPlan {
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal byte total",
                     })?;
-            let anchor_kind = match boundary_semantics {
-                BoundarySemantics::Unguarded if prefix.len() >= suffix.len() => Anchor::Prefix,
-                BoundarySemantics::Unguarded => Anchor::Suffix,
-                BoundarySemantics::CompleteAsciiWordRun => Anchor::CompleteAsciiWordSuffix,
-            };
             let anchor_bytes = prefix.len().max(suffix.len());
             enforce_build(
                 literal_bytes,
@@ -1143,7 +1170,7 @@ impl LiteralClassRunLiteralPlan {
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
             let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
-            match boundary_semantics {
+            let geometry = match boundary_semantics {
                 BoundarySemantics::Unguarded => {
                     work.charge(2)?;
                     if prefix
@@ -1152,10 +1179,10 @@ impl LiteralClassRunLiteralPlan {
                     {
                         return Err(BuildError::PrefixBoundaryInClass);
                     }
-                    if suffix
+                    let suffix_is_inside_class = suffix
                         .first()
-                        .is_some_and(|&boundary| class.contains(boundary))
-                    {
+                        .is_some_and(|&boundary| class.contains(boundary));
+                    if suffix_is_inside_class {
                         if !prefix.is_empty() {
                             return Err(BuildError::SuffixBoundaryInClass);
                         }
@@ -1163,6 +1190,13 @@ impl LiteralClassRunLiteralPlan {
                         if !suffix.iter().all(|&byte| class.contains(byte)) {
                             return Err(BuildError::SuffixBoundaryInClass);
                         }
+                    }
+                    if suffix_is_inside_class {
+                        ResolvedSearchGeometry::SuffixInsideClass
+                    } else if prefix.len() >= suffix.len() {
+                        ResolvedSearchGeometry::GeneralPrefix
+                    } else {
+                        ResolvedSearchGeometry::GeneralSuffix
                     }
                 }
                 BoundarySemantics::CompleteAsciiWordRun => {
@@ -1176,8 +1210,9 @@ impl LiteralClassRunLiteralPlan {
                             return Err(BuildError::SuffixByteOutsideAsciiWordClass);
                         }
                     }
+                    ResolvedSearchGeometry::CompleteAsciiWordSuffix
                 }
-            }
+            };
             let ascii_scanner = build_ascii_scanner(
                 dispatch.filter(|_| class.is_ascii()),
                 class,
@@ -1196,9 +1231,13 @@ impl LiteralClassRunLiteralPlan {
             }
             let prefix_bytes = prefix.len();
             let suffix_bytes = suffix.len();
-            let (anchor, opposite_literal) = match anchor_kind {
-                Anchor::Prefix => (FinderBuilder::new().build_forward_owned(prefix), suffix),
-                Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => {
+            let (anchor, opposite_literal) = match geometry {
+                ResolvedSearchGeometry::GeneralPrefix => {
+                    (FinderBuilder::new().build_forward_owned(prefix), suffix)
+                }
+                ResolvedSearchGeometry::GeneralSuffix
+                | ResolvedSearchGeometry::SuffixInsideClass
+                | ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
                     (FinderBuilder::new().build_forward_owned(suffix), prefix)
                 }
             };
@@ -1219,7 +1258,7 @@ impl LiteralClassRunLiteralPlan {
             Ok(Self {
                 anchor,
                 opposite_literal,
-                anchor_kind,
+                geometry,
                 class,
                 ascii_scanner,
                 build: BuildAccounting {
@@ -1298,33 +1337,33 @@ impl LiteralClassRunLiteralPlan {
     }
 
     fn prefix(&self) -> &[u8] {
-        match self.anchor_kind {
-            Anchor::Prefix => self.anchor.needle(),
-            Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => &self.opposite_literal,
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix => self.anchor.needle(),
+            ResolvedSearchGeometry::GeneralSuffix
+            | ResolvedSearchGeometry::SuffixInsideClass
+            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => &self.opposite_literal,
         }
     }
 
     fn suffix(&self) -> &[u8] {
-        match self.anchor_kind {
-            Anchor::Prefix => &self.opposite_literal,
-            Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => self.anchor.needle(),
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix => &self.opposite_literal,
+            ResolvedSearchGeometry::GeneralSuffix
+            | ResolvedSearchGeometry::SuffixInsideClass
+            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => self.anchor.needle(),
         }
     }
 
     #[must_use]
     pub const fn boundary_semantics(&self) -> BoundarySemantics {
-        match self.anchor_kind {
-            Anchor::Prefix | Anchor::Suffix => BoundarySemantics::Unguarded,
-            Anchor::CompleteAsciiWordSuffix => BoundarySemantics::CompleteAsciiWordRun,
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix
+            | ResolvedSearchGeometry::GeneralSuffix
+            | ResolvedSearchGeometry::SuffixInsideClass => BoundarySemantics::Unguarded,
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                BoundarySemantics::CompleteAsciiWordRun
+            }
         }
-    }
-
-    fn suffix_is_inside_class(&self) -> bool {
-        self.prefix().is_empty()
-            && self
-                .suffix()
-                .first()
-                .is_some_and(|&byte| self.class.contains(byte))
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
@@ -1439,24 +1478,53 @@ impl LiteralClassRunLiteralPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        if self.boundary_semantics() != BoundarySemantics::Unguarded
-            || self.suffix_is_inside_class()
-            || limits != SearchLimits::unlimited()
+        if !matches!(
+            self.geometry,
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix
+        ) || limits != SearchLimits::unlimited()
         {
-            return self
-                .shortest_window(haystack, window, limits)
-                .map(|(matched, _)| matched.is_some());
+            return self.is_match_window_incumbent(haystack, window, limits);
         }
         let (upper, _, _, meter) = self.search_preflight(haystack.len(), window, limits)?;
-        if !meter.work_envelope_admitted
-            || upper.anchor_candidates > limits.max_candidate_visits
-        {
-            return self
-                .shortest_window(haystack, window, limits)
-                .map(|(matched, _)| matched.is_some());
+        if !meter.work_envelope_admitted || upper.anchor_candidates > limits.max_candidate_visits {
+            return self.is_match_window_incumbent(haystack, window, limits);
         }
         let slice = &haystack[window.start()..window.end()];
         Ok(self.search_general_exists_value(slice))
+    }
+
+    /// Whether the ordinary immutable full-haystack operation has a match.
+    ///
+    /// Construction resolves the only static specialist decision. General
+    /// prefix/suffix geometry enters the report-free existence loop directly;
+    /// contained-suffix and guarded geometry enter the incumbent checked
+    /// implementation directly. Ranged, finite, accounted, and session APIs
+    /// deliberately continue to use [`Self::is_match_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn is_match_full_ordinary_value(&self, haystack: &[u8]) -> Result<bool, SearchError> {
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
+                Ok(self.search_general_exists_value(haystack))
+            }
+            ResolvedSearchGeometry::SuffixInsideClass
+            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => self.is_match_window_incumbent(
+                haystack,
+                Window::full(haystack),
+                SearchLimits::unlimited(),
+            ),
+        }
+    }
+
+    #[inline]
+    fn is_match_window_incumbent(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.shortest_window(haystack, window, limits)
+            .map(|(matched, _)| matched.is_some())
     }
 
     #[allow(
@@ -1470,8 +1538,8 @@ impl LiteralClassRunLiteralPlan {
                 return false;
             };
             let anchor_start = cursor + relative;
-            match self.anchor_kind {
-                Anchor::Prefix => {
+            match self.geometry {
+                ResolvedSearchGeometry::GeneralPrefix => {
                     let anchor_end = anchor_start + self.prefix().len();
                     if let Some(run_end) = scan_class_run_forward_value(
                         haystack,
@@ -1487,7 +1555,7 @@ impl LiteralClassRunLiteralPlan {
                         }
                     }
                 }
-                Anchor::Suffix => {
+                ResolvedSearchGeometry::GeneralSuffix => {
                     if let Some(run_start) = scan_class_run_backward_value(
                         haystack,
                         self.class,
@@ -1504,8 +1572,9 @@ impl LiteralClassRunLiteralPlan {
                         }
                     }
                 }
-                Anchor::CompleteAsciiWordSuffix => {
-                    debug_assert!(false, "guarded value route must use incumbent search");
+                ResolvedSearchGeometry::SuffixInsideClass
+                | ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                    debug_assert!(false, "non-general geometry must use incumbent search");
                     return false;
                 }
             }
@@ -1530,14 +1599,17 @@ impl LiteralClassRunLiteralPlan {
                     end: window.end(),
                     haystack_len: haystack.len(),
                 })?;
-        let (matched, actual) =
-            if self.boundary_semantics() == BoundarySemantics::CompleteAsciiWordRun {
+        let (matched, actual) = match self.geometry {
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
                 self.search_complete_ascii_word_run(haystack, slice, window.start(), upper, meter)?
-            } else if self.suffix_is_inside_class() {
+            }
+            ResolvedSearchGeometry::SuffixInsideClass => {
                 self.search_suffix_inside_class(slice, projection, upper, meter)?
-            } else {
+            }
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
                 self.search_general(slice, projection, upper, meter)?
-            };
+            }
+        };
         let matched =
             matched
                 .map(|(start, end)| {
@@ -1586,6 +1658,8 @@ impl LiteralClassRunLiteralPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(ReduceUpperBounds, usize, usize, SearchMeter), SearchError> {
+        #[cfg(test)]
+        TEST_SEARCH_PREFLIGHT_CALLS.with(|calls| calls.set(calls.get() + 1));
         if window.start() > window.end() || window.end() > haystack_len {
             return Err(SearchError::InvalidWindow {
                 start: window.start(),
@@ -1641,8 +1715,8 @@ impl LiteralClassRunLiteralPlan {
             else {
                 return finish_search(None, actual, upper);
             };
-            let candidate = match self.anchor_kind {
-                Anchor::Prefix
+            let candidate = match self.geometry {
+                ResolvedSearchGeometry::GeneralPrefix
                     if projection == SearchProjection::EarliestEnd && self.suffix().is_empty() =>
                 {
                     self.search_prefix_anchor_shortest_candidate(
@@ -1653,7 +1727,7 @@ impl LiteralClassRunLiteralPlan {
                         meter,
                     )?
                 }
-                Anchor::Prefix => self.search_prefix_anchor_candidate(
+                ResolvedSearchGeometry::GeneralPrefix => self.search_prefix_anchor_candidate(
                     haystack,
                     anchor_start,
                     anchor_end,
@@ -1661,7 +1735,7 @@ impl LiteralClassRunLiteralPlan {
                     &mut actual,
                     meter,
                 )?,
-                Anchor::Suffix => self.search_suffix_anchor_candidate(
+                ResolvedSearchGeometry::GeneralSuffix => self.search_suffix_anchor_candidate(
                     haystack,
                     anchor_start,
                     anchor_end,
@@ -1669,7 +1743,8 @@ impl LiteralClassRunLiteralPlan {
                     &mut actual,
                     meter,
                 )?,
-                Anchor::CompleteAsciiWordSuffix => {
+                ResolvedSearchGeometry::SuffixInsideClass
+                | ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
                     debug_assert!(
                         false,
                         "guarded suffix route must retain original-haystack assertions"
@@ -1700,7 +1775,7 @@ impl LiteralClassRunLiteralPlan {
         upper: ReduceUpperBounds,
         meter: SearchMeter,
     ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
-        debug_assert_eq!(self.anchor_kind, Anchor::Suffix);
+        debug_assert_eq!(self.geometry, ResolvedSearchGeometry::SuffixInsideClass);
         debug_assert!(self.prefix().is_empty());
         let suffix_bytes = self.anchor.needle().len();
         let mut actual = new_search_actual();
@@ -1780,7 +1855,10 @@ impl LiteralClassRunLiteralPlan {
         upper: ReduceUpperBounds,
         meter: SearchMeter,
     ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
-        debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
+        debug_assert_eq!(
+            self.geometry,
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix
+        );
         let mut actual = new_search_actual();
         let mut cursor = 0_usize;
         loop {
@@ -1991,20 +2069,21 @@ impl LiteralClassRunLiteralPlan {
             },
             None => ClassScanKind::Scalar,
         };
-        match self.boundary_semantics() {
-            BoundarySemantics::Unguarded => derive_reduce_upper_bounds(
-                self.build,
-                class_scan,
-                self.suffix_is_inside_class(),
-                input_bytes,
-                operation,
-            ),
-            BoundarySemantics::CompleteAsciiWordRun => derive_complete_ascii_word_run_upper_bounds(
-                self.build,
-                class_scan,
-                input_bytes,
-                operation,
-            ),
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
+                derive_reduce_upper_bounds(self.build, class_scan, false, input_bytes, operation)
+            }
+            ResolvedSearchGeometry::SuffixInsideClass => {
+                derive_reduce_upper_bounds(self.build, class_scan, true, input_bytes, operation)
+            }
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                derive_complete_ascii_word_run_upper_bounds(
+                    self.build,
+                    class_scan,
+                    input_bytes,
+                    operation,
+                )
+            }
         }
     }
 
@@ -2046,11 +2125,14 @@ impl LiteralClassRunLiteralPlan {
     where
         F: FnMut(CompleteSpan),
     {
-        if self.boundary_semantics() == BoundarySemantics::CompleteAsciiWordRun {
-            return self.scan_complete_ascii_word_run(haystack, operation, upper, visitor);
-        }
-        if self.suffix_is_inside_class() {
-            return self.scan_suffix_inside_class(haystack, operation, upper, visitor);
+        match self.geometry {
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                return self.scan_complete_ascii_word_run(haystack, operation, upper, visitor);
+            }
+            ResolvedSearchGeometry::SuffixInsideClass => {
+                return self.scan_suffix_inside_class(haystack, operation, upper, visitor);
+            }
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {}
         }
         let mut actual = ReduceActualCounters {
             source_reads: 0,
@@ -2118,21 +2200,29 @@ impl LiteralClassRunLiteralPlan {
             actual.anchor_candidates =
                 checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
             actual.work = checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
-            let candidate = match self.anchor_kind {
-                Anchor::Prefix => self.prefix_anchor_candidate(
+            let candidate = match self.geometry {
+                ResolvedSearchGeometry::GeneralPrefix => self.prefix_anchor_candidate(
                     haystack,
                     anchor_start,
                     anchor_end,
                     restart,
                     &mut actual,
                 )?,
-                Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => self.suffix_anchor_candidate(
+                ResolvedSearchGeometry::GeneralSuffix => self.suffix_anchor_candidate(
                     haystack,
                     anchor_start,
                     anchor_end,
                     restart,
                     &mut actual,
                 )?,
+                ResolvedSearchGeometry::SuffixInsideClass
+                | ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                    return Err(ReduceError::AccountingInvariant {
+                        resource: "resolved reduction dispatch",
+                        actual: 1,
+                        upper: 0,
+                    });
+                }
             };
             if let Some((start, end)) = candidate {
                 record_reduce_match(&mut actual, operation, start, end, visitor)?;
@@ -2195,7 +2285,7 @@ impl LiteralClassRunLiteralPlan {
             scratch_bytes: 0,
         };
         let suffix_bytes = self.anchor.needle().len();
-        debug_assert_eq!(self.anchor_kind, Anchor::Suffix);
+        debug_assert_eq!(self.geometry, ResolvedSearchGeometry::SuffixInsideClass);
         debug_assert!(self.prefix().is_empty());
         debug_assert!(suffix_bytes != 0);
         let mut cursor = 0_usize;
@@ -2390,7 +2480,10 @@ impl LiteralClassRunLiteralPlan {
     where
         F: FnMut(CompleteSpan),
     {
-        debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
+        debug_assert_eq!(
+            self.geometry,
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix
+        );
         debug_assert!(self.opposite_literal.is_empty());
         let mut actual = ReduceActualCounters {
             source_reads: 0,
@@ -10151,6 +10244,11 @@ mod tests {
         let guarded = complete_ascii_word_run_plan(b"n");
         let unguarded = plan();
         assert_eq!(
+            guarded.geometry,
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix
+        );
+        assert_eq!(unguarded.geometry, ResolvedSearchGeometry::GeneralPrefix);
+        assert_eq!(
             guarded.boundary_semantics(),
             BoundarySemantics::CompleteAsciiWordRun
         );
@@ -10167,6 +10265,49 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_exists_uses_the_construction_resolved_route() {
+        let direct = plan();
+        reset_test_search_preflight_calls();
+        assert!(direct
+            .is_match_full_ordinary_value(b"!ab \tcd!")
+            .unwrap());
+        assert_eq!(test_search_preflight_calls(), 0);
+
+        let direct_suffix = LiteralClassRunLiteralPlan::build(
+            b"a",
+            [(b'x', b'x')].into_iter(),
+            b"zz",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        reset_test_search_preflight_calls();
+        assert!(direct_suffix
+            .is_match_full_ordinary_value(b"!axxxzz!")
+            .unwrap());
+        assert_eq!(test_search_preflight_calls(), 0);
+
+        let contained = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'b')].into_iter(),
+            b"aba",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        reset_test_search_preflight_calls();
+        assert!(contained
+            .is_match_full_ordinary_value(b"!aababa!")
+            .unwrap());
+        assert_eq!(test_search_preflight_calls(), 1);
+
+        let guarded = complete_ascii_word_run_plan(b"ing");
+        reset_test_search_preflight_calls();
+        assert!(guarded
+            .is_match_full_ordinary_value(b"!testing!")
+            .unwrap());
+        assert_eq!(test_search_preflight_calls(), 1);
+    }
+
+    #[test]
     fn overlapping_prefix_anchor_candidates_are_not_skipped() {
         let plan = LiteralClassRunLiteralPlan::build(
             b"aaa",
@@ -10175,7 +10316,7 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(plan.anchor_kind, Anchor::Prefix);
+        assert_eq!(plan.geometry, ResolvedSearchGeometry::GeneralPrefix);
         assert_eq!(plan.anchor.needle(), b"aaa");
         let haystack = b"aaaaxxb--aaaxxb";
         let (_, _, spans) = reference(r"aaax+b", haystack);
@@ -10192,7 +10333,7 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(plan.anchor_kind, Anchor::Suffix);
+        assert_eq!(plan.geometry, ResolvedSearchGeometry::GeneralSuffix);
         assert_eq!(plan.anchor.needle(), b"aaaa");
         for haystack in [
             b"axaaaaa".as_slice(),
@@ -10229,7 +10370,10 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(suffix_anchored.anchor_kind, Anchor::Suffix);
+        assert_eq!(
+            suffix_anchored.geometry,
+            ResolvedSearchGeometry::SuffixInsideClass
+        );
         assert_exhaustive_matches(&suffix_anchored, r"[a-z]+ing", b"aginx-", 6);
 
         let bordered_suffix = LiteralClassRunLiteralPlan::build(
@@ -10270,7 +10414,10 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(prefix_anchored.anchor_kind, Anchor::Prefix);
+        assert_eq!(
+            prefix_anchored.geometry,
+            ResolvedSearchGeometry::GeneralPrefix
+        );
         assert_exhaustive_matches(&prefix_anchored, r"item[0-9]+", b"item012x", 6);
 
         let mixed_suffix = LiteralClassRunLiteralPlan::build(
@@ -10345,8 +10492,11 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(scalar.anchor_kind, Anchor::Prefix);
-        assert_eq!(dispatched.anchor_kind, Anchor::Prefix);
+        assert_eq!(scalar.geometry, ResolvedSearchGeometry::GeneralPrefix);
+        assert_eq!(
+            dispatched.geometry,
+            ResolvedSearchGeometry::GeneralPrefix
+        );
         assert!(scalar.count_identity().class_scan.is_none());
         assert!(dispatched.count_identity().class_scan.is_some());
         let dispatched_scan = dispatched
@@ -10402,8 +10552,11 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(scalar.anchor_kind, Anchor::Suffix);
-        assert_eq!(dispatched.anchor_kind, Anchor::Suffix);
+        assert_eq!(scalar.geometry, ResolvedSearchGeometry::GeneralSuffix);
+        assert_eq!(
+            dispatched.geometry,
+            ResolvedSearchGeometry::GeneralSuffix
+        );
         let dispatched_scan = dispatched
             .span_sum_identity()
             .class_scan
@@ -10955,6 +11108,11 @@ mod tests {
 
     #[test]
     fn build_accounting_and_every_nonzero_limit_are_exact() {
+        assert_eq!(
+            size_of::<ResolvedSearchGeometry>(),
+            size_of::<Anchor>(),
+            "cached route must replace, not enlarge, the retained discriminant"
+        );
         let baseline = plan().build_accounting();
         let exact = BuildLimits {
             max_literal_bytes: baseline.literal_bytes,

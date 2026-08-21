@@ -4,8 +4,8 @@
 )]
 
 use fre::{
-    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, PlanKind, PortableBuilder, SearchAccounting, SearchLimits,
-    SearchSessionLimits, SearchWindow,
+    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, PlanKind, PortableBuilder, PortableTextRegex,
+    SearchAccounting, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
 fn portable(pattern: &str) -> fre::PortableRegex {
@@ -56,6 +56,16 @@ fn literal_class_run_existence_values_match_every_window_and_session() {
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
         for haystack in byte_strings(maximum_length, alphabet) {
+            let full = SearchWindow::full(&haystack);
+            let expected_full = regex
+                .is_match_window(&haystack, full, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(
+                regex.is_match(&haystack),
+                expected_full,
+                "ordinary pattern={pattern:?} haystack={haystack:?}"
+            );
             for start in 0..=haystack.len() {
                 for end in start..=haystack.len() {
                     let window = SearchWindow::new(start, end);
@@ -171,6 +181,15 @@ fn literal_class_run_existence_values_preserve_resources_errors_and_fallbacks() 
         (portable(r"[ab]+aba"), b"!aababa!".as_slice()),
         (portable(r"\b\w+ing\b"), b"!testing!".as_slice()),
     ] {
+        let expected = fallback
+            .is_match_window(
+                source,
+                SearchWindow::full(source),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(fallback.is_match(source), expected);
         assert_eq!(
             fallback
                 .is_match_window_value(
@@ -179,14 +198,23 @@ fn literal_class_run_existence_values_preserve_resources_errors_and_fallbacks() 
                     SearchLimits::unlimited(),
                 )
                 .unwrap(),
-            fallback
-                .is_match_window(
-                    source,
-                    SearchWindow::full(source),
-                    SearchLimits::unlimited(),
-                )
-                .unwrap()
-                .0
+            expected
         );
+    }
+}
+
+#[test]
+fn text_ordinary_exists_delegates_to_the_resolved_byte_route() {
+    let regex = PortableTextRegex::new(r"(?-u:[ab]+aba)").expect("ASCII text corridor");
+    assert_eq!(
+        regex.build_report().portable.plan,
+        PlanKind::LiteralClassRunLiteral
+    );
+    for haystack in ["", "!", "!aababa!", "éaababa", "abab!"] {
+        let expected = regex
+            .is_match_accounted(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert_eq!(regex.is_match(haystack), expected, "haystack={haystack:?}");
     }
 }
