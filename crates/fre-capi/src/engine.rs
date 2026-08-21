@@ -69,11 +69,8 @@ impl CompiledRegex {
             max_work: config.search_work,
             max_scratch_bytes: scratch,
         };
-        let selected_end_value_route = search_limits == SearchLimits::unlimited()
-            && matches!(
-                regex.build_report().plan,
-                PlanKind::FixedPredicateWord64 | PlanKind::LiteralClassRunLiteral
-            );
+        let selected_end_value_route =
+            selected_end_value_route(regex.build_report().plan, search_limits);
         Ok(Self {
             regex,
             search_limits,
@@ -157,6 +154,19 @@ impl CompiledRegex {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn selected_end_value_route(plan: PlanKind, search_limits: SearchLimits) -> bool {
+    search_limits == SearchLimits::unlimited()
+        && matches!(
+            plan,
+            PlanKind::FixedPredicateWord64
+                | PlanKind::LiteralClassRunLiteral
+                | PlanKind::PureByteClassRepeat
+                | PlanKind::BoundedByteClassSequence
+        )
+}
+
 fn search_error(error: &fre::SearchError) -> Outcome {
     Outcome::failure(
         FRE_V1_STATUS_SEARCH_ERROR,
@@ -197,6 +207,9 @@ mod tests {
 
     const FIXED_PATTERN: &[u8] = br"[A-D][\x00-\x7F]Q";
     const LITERAL_CLASS_RUN_PATTERN: &[u8] = br"a[ab]+c";
+    const PURE_BYTE_CLASS_PATTERN: &[u8] = br"(?-u:[A-Z_a-z]+)";
+    const BOUNDED_BYTE_CLASS_REPEAT_PATTERN: &[u8] = br"(?-u:[A-Z_a-z]){1,3}";
+    const BOUNDED_BYTE_CLASS_SEQUENCE_PATTERN: &[u8] = br"(?-u:[ab]){1,3}(?-u:[CD]){1,3}";
 
     fn byte_config(limits: SearchLimits) -> FreV1Config {
         let mut config = FreV1Config::checked_default();
@@ -213,6 +226,15 @@ mod tests {
         for (pattern, expected_plan) in [
             (FIXED_PATTERN, PlanKind::FixedPredicateWord64),
             (LITERAL_CLASS_RUN_PATTERN, PlanKind::LiteralClassRunLiteral),
+            (PURE_BYTE_CLASS_PATTERN, PlanKind::PureByteClassRepeat),
+            (
+                BOUNDED_BYTE_CLASS_REPEAT_PATTERN,
+                PlanKind::PureByteClassRepeat,
+            ),
+            (
+                BOUNDED_BYTE_CLASS_SEQUENCE_PATTERN,
+                PlanKind::BoundedByteClassSequence,
+            ),
         ] {
             let compiled = CompiledRegex::compile(byte_config(unlimited), pattern)
                 .expect("unlimited eligible regex");
@@ -231,18 +253,24 @@ mod tests {
                 max_scratch_bytes: usize::MAX - 1,
             },
         ] {
-            for pattern in [FIXED_PATTERN, LITERAL_CLASS_RUN_PATTERN] {
+            for pattern in [
+                FIXED_PATTERN,
+                LITERAL_CLASS_RUN_PATTERN,
+                PURE_BYTE_CLASS_PATTERN,
+                BOUNDED_BYTE_CLASS_REPEAT_PATTERN,
+                BOUNDED_BYTE_CLASS_SEQUENCE_PATTERN,
+            ] {
                 let compiled = CompiledRegex::compile(byte_config(finite), pattern)
                     .expect("finite eligible-plan regex");
                 assert!(!compiled.selected_end_value_route);
             }
         }
 
-        let noneligible = CompiledRegex::compile(byte_config(unlimited), br"a{2,4}")
+        let noneligible = CompiledRegex::compile(byte_config(unlimited), br"needle")
             .expect("unlimited noneligible regex");
-        assert_ne!(
+        assert_eq!(
             noneligible.regex.build_report().plan,
-            PlanKind::FixedPredicateWord64
+            PlanKind::ExactLiteral
         );
         assert!(!noneligible.selected_end_value_route);
     }
@@ -318,5 +346,91 @@ mod tests {
             refused_literal_class_run.selected_end(b"!!aabbc!!"),
             Err(search_error(&expected))
         );
+    }
+
+    fn assert_selected_end_parity(
+        pattern: &[u8],
+        expected_plan: PlanKind,
+        limits: SearchLimits,
+        haystacks: &[&[u8]],
+        expected_value_route: bool,
+    ) {
+        let compiled =
+            CompiledRegex::compile(byte_config(limits), pattern).expect("route regex compiles");
+        assert_eq!(compiled.regex.build_report().plan, expected_plan);
+        assert_eq!(compiled.selected_end_value_route, expected_value_route);
+        for &haystack in haystacks {
+            match compiled
+                .regex
+                .selected_end_accounted(haystack, compiled.search_limits)
+            {
+                Ok((expected, _)) => {
+                    let actual = compiled.selected_end(haystack).expect("facade selection");
+                    assert_eq!(actual.found, u32::from(expected.is_some()));
+                    assert_eq!(actual.end, expected.unwrap_or(0));
+                }
+                Err(expected) => {
+                    assert_eq!(
+                        compiled.selected_end(haystack),
+                        Err(search_error(&expected))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_end_value_route_matches_new_native_plan_selection_and_errors() {
+        let unlimited = SearchLimits::unlimited();
+        assert_selected_end_parity(
+            PURE_BYTE_CLASS_PATTERN,
+            PlanKind::PureByteClassRepeat,
+            unlimited,
+            &[b"a", b"123", b"1a2b"],
+            true,
+        );
+        assert_selected_end_parity(
+            BOUNDED_BYTE_CLASS_REPEAT_PATTERN,
+            PlanKind::PureByteClassRepeat,
+            unlimited,
+            &[b"a", b"123", b"1abc2"],
+            true,
+        );
+        assert_selected_end_parity(
+            BOUNDED_BYTE_CLASS_SEQUENCE_PATTERN,
+            PlanKind::BoundedByteClassSequence,
+            unlimited,
+            &[b"aXaXaXaXaXaXaXaXaXaXaXaXaXaXaXaC", b"aaabbb", b"aCDaabCCD"],
+            true,
+        );
+
+        let finite_success = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let finite_refusal = SearchLimits {
+            max_work: 0,
+            ..SearchLimits::default()
+        };
+        for (pattern, expected_plan, haystack) in [
+            (
+                PURE_BYTE_CLASS_PATTERN,
+                PlanKind::PureByteClassRepeat,
+                b"a".as_slice(),
+            ),
+            (
+                BOUNDED_BYTE_CLASS_REPEAT_PATTERN,
+                PlanKind::PureByteClassRepeat,
+                b"a".as_slice(),
+            ),
+            (
+                BOUNDED_BYTE_CLASS_SEQUENCE_PATTERN,
+                PlanKind::BoundedByteClassSequence,
+                b"aC".as_slice(),
+            ),
+        ] {
+            assert_selected_end_parity(pattern, expected_plan, finite_success, &[haystack], false);
+            assert_selected_end_parity(pattern, expected_plan, finite_refusal, &[haystack], false);
+        }
     }
 }
