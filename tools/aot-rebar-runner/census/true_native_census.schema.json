@@ -1,0 +1,534 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fre.example/schemas/aot-rebar-true-native-census-v1.json",
+  "title": "FRE public-Rebar true-native census records",
+  "oneOf": [
+    { "$ref": "#/$defs/plan" },
+    { "$ref": "#/$defs/receipt" },
+    { "$ref": "#/$defs/summary" }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "idSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "ids", "ids_sha256"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "ids_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree", "cargo_lock_sha256"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/gitHash" },
+        "tree": { "$ref": "#/$defs/gitHash" },
+        "cargo_lock_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pattern_sha256", "haystack_sha256", "haystack_bytes",
+        "case_insensitive", "unicode"
+      ],
+      "properties": {
+        "pattern_sha256": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sha256" }
+        },
+        "haystack_sha256": { "$ref": "#/$defs/sha256" },
+        "haystack_bytes": { "type": "integer", "minimum": 0 },
+        "case_insensitive": { "type": "boolean" },
+        "unicode": { "type": "boolean" }
+      }
+    },
+    "klv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_sha256", "internal_sha256", "canonical_commit", "canonical_tree",
+        "rebar_revision", "point_count"
+      ],
+      "properties": {
+        "file_sha256": { "$ref": "#/$defs/sha256" },
+        "internal_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "canonical_commit": { "type": ["string", "null"] },
+        "canonical_tree": { "type": ["string", "null"] },
+        "rebar_revision": { "type": ["string", "null"] },
+        "point_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "planJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id", "benchmark", "model", "input", "candidate_klv", "is_runtime",
+        "exact_adapter", "adapter_reason", "point_ids"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "benchmark": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "input": { "$ref": "#/$defs/input" },
+        "candidate_klv": { "$ref": "#/$defs/klv" },
+        "is_runtime": { "type": "boolean" },
+        "exact_adapter": { "type": "boolean" },
+        "adapter_reason": { "type": "string", "minLength": 1 },
+        "point_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "planPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point_id", "job_id", "benchmark", "model", "boundary", "comparator",
+        "expected", "input", "candidate_klv", "reference_klv",
+        "source_schedule_sha256", "source_ordinal"
+      ],
+      "properties": {
+        "point_id": { "type": "string", "minLength": 1 },
+        "job_id": { "type": "string", "minLength": 1 },
+        "benchmark": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "boundary": { "type": "string", "minLength": 1 },
+        "comparator": { "type": "string", "minLength": 1 },
+        "expected": {},
+        "input": { "$ref": "#/$defs/input" },
+        "candidate_klv": { "$ref": "#/$defs/klv" },
+        "reference_klv": { "$ref": "#/$defs/klv" },
+        "source_schedule_sha256": { "$ref": "#/$defs/sha256" },
+        "source_ordinal": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "candidate_source", "public_corpus", "target", "policy",
+        "denominators", "jobs", "points", "plan_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "fre.aot-rebar.true-native-plan.v1" },
+        "candidate_source": { "$ref": "#/$defs/source" },
+        "public_corpus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label", "klv_root_recorded", "privacy_policy", "rebar_revisions", "schedules"
+          ],
+          "properties": {
+            "label": { "type": "string", "minLength": 1 },
+            "klv_root_recorded": { "type": "string", "minLength": 1 },
+            "privacy_policy": { "const": "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes" },
+            "rebar_revisions": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "schedules": { "type": "array", "items": { "$ref": "#/$defs/schedule" }, "minItems": 1 }
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["triple", "features"],
+          "properties": {
+            "triple": { "type": "string", "minLength": 1 },
+            "features": { "type": "string" }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "compiler_mode", "timing", "public_klv_bytes_hashed",
+            "reproducible_builds_required", "native_proof",
+            "compiled_artifact_is_runtime_execution",
+            "unsupported_failure_timeout_are_nonnative", "canonical_denominator"
+          ],
+          "properties": {
+            "compiler_mode": { "const": "Optimizing" },
+            "timing": { "const": false },
+            "public_klv_bytes_hashed": { "type": "boolean" },
+            "reproducible_builds_required": { "const": 2 },
+            "native_proof": { "type": "string" },
+            "compiled_artifact_is_runtime_execution": { "const": false },
+            "unsupported_failure_timeout_are_nonnative": { "const": true },
+            "canonical_denominator": { "const": "deduplicated-public-rust-rebar-runtime-job" }
+          }
+        },
+        "denominators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all_public_jobs", "compile_jobs", "runtime_jobs", "exact_adapter_runtime_jobs",
+            "all_raw_schedule_points", "raw_runtime_schedule_points"
+          ],
+          "properties": {
+            "all_public_jobs": { "$ref": "#/$defs/idSet" },
+            "compile_jobs": { "$ref": "#/$defs/idSet" },
+            "runtime_jobs": { "$ref": "#/$defs/idSet" },
+            "exact_adapter_runtime_jobs": { "$ref": "#/$defs/idSet" },
+            "all_raw_schedule_points": { "$ref": "#/$defs/idSet" },
+            "raw_runtime_schedule_points": { "$ref": "#/$defs/idSet" }
+          }
+        },
+        "jobs": { "type": "array", "items": { "$ref": "#/$defs/planJob" } },
+        "points": { "type": "array", "items": { "$ref": "#/$defs/planPoint" } },
+        "plan_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifactHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner_sha256", "objects"],
+      "properties": {
+        "runner_sha256": { "$ref": "#/$defs/sha256" },
+        "objects": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ordinal", "sha256", "bytes"],
+            "properties": {
+              "ordinal": { "type": "integer", "minimum": 0 },
+              "sha256": { "$ref": "#/$defs/sha256" },
+              "bytes": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome", "returncode", "stdout_bytes", "stdout_sha256",
+        "stderr_bytes", "stderr_sha256"
+      ],
+      "properties": {
+        "outcome": { "enum": ["exit", "signal", "timeout", "not-run"] },
+        "returncode": { "type": ["integer", "null"] },
+        "stdout_bytes": { "type": "integer", "minimum": 0 },
+        "stdout_sha256": { "$ref": "#/$defs/sha256" },
+        "stderr_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sha256", "armed", "triggered"],
+      "properties": {
+        "status": { "enum": ["missing", "invalid", "valid"] },
+        "sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "kind": { "type": ["string", "null"] },
+        "architecture": { "type": ["string", "null"] },
+        "installed": { "type": ["integer", "null"] },
+        "expected": { "type": ["integer", "null"] },
+        "armed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["symbol", "offset", "before", "after"],
+            "properties": {
+              "symbol": { "type": ["string", "null"] },
+              "offset": { "type": ["string", "null"] },
+              "before": { "type": ["string", "null"] },
+              "after": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "triggered": { "type": ["string", "null"] },
+        "completed": { "type": ["string", "null"] }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "built_reproducibly", "executed_oracle_correct",
+        "native_search_core_authenticated", "adapter_outer_loop",
+        "whole_operation_native_authenticated", "reason"
+      ],
+      "properties": {
+        "built_reproducibly": { "type": "boolean" },
+        "executed_oracle_correct": { "type": "boolean" },
+        "native_search_core_authenticated": { "type": "boolean" },
+        "adapter_outer_loop": { "type": "boolean" },
+        "whole_operation_native_authenticated": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "componentProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal", "entry_symbol", "required_runtime_symbols",
+        "program_sha256", "object_sha256"
+      ],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "entry_symbol": { "type": "string", "minLength": 1 },
+        "required_runtime_symbols": {
+          "type": "array", "items": { "type": "string" }, "uniqueItems": true
+        },
+        "program_sha256": { "$ref": "#/$defs/sha256" },
+        "object_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
+        "target", "feature_bits", "kind", "engine", "aggregate_strategy",
+        "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
+        "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
+        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
+      ],
+      "properties": {
+        "schema": { "enum": ["fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3"] },
+        "adapter": { "type": "string" },
+        "model": { "type": "string" },
+        "benchmark": { "type": "string" },
+        "source_commit": { "type": "string" },
+        "source_tree": { "type": "string" },
+        "target": { "type": "string" },
+        "feature_bits": { "type": "string" },
+        "kind": { "enum": ["scalar-v2", "composite-v3"] },
+        "engine": { "type": ["string", "null"] },
+        "aggregate_strategy": { "type": ["string", "null"] },
+        "prepared_bulk_strategy": { "type": ["string", "null"] },
+        "span_iteration_strategy": { "type": ["string", "null"] },
+        "grep_iteration_strategy": { "type": ["string", "null"] },
+        "program_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "object_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "program_symbol": { "type": ["string", "null"] },
+        "entry_symbol": { "type": ["string", "null"] },
+        "reducer_symbol": { "type": ["string", "null"] },
+        "span_fill_symbol": { "type": ["string", "null"] },
+        "required_runtime_symbols": {
+          "type": "array", "items": { "type": "string" }, "uniqueItems": true
+        },
+        "components": {
+          "type": "array", "items": { "$ref": "#/$defs/componentProvenance" }
+        }
+      }
+    },
+    "qualificationPhases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unmodified_oracle", "semantic_helper_trap", "claimed_entry_negative_traps"
+      ],
+      "properties": {
+        "unmodified_oracle": { "$ref": "#/$defs/process" },
+        "semantic_helper_trap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["process", "marker"],
+          "properties": {
+            "process": { "$ref": "#/$defs/process" },
+            "marker": { "$ref": "#/$defs/marker" }
+          }
+        },
+        "claimed_entry_negative_traps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ordinal", "symbol", "process", "marker"],
+            "properties": {
+              "ordinal": { "type": "integer", "minimum": 0 },
+              "symbol": { "type": "string" },
+              "process": { "$ref": "#/$defs/process" },
+              "marker": { "$ref": "#/$defs/marker" }
+            }
+          }
+        }
+      }
+    },
+    "failurePhases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pre_execution_failure"],
+      "properties": {
+        "pre_execution_failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stage", "outcome", "evidence"],
+          "properties": {
+            "stage": { "enum": ["build", "link", "provenance", "qualification"] },
+            "outcome": { "enum": ["failure", "timeout"] },
+            "evidence": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["sha256", "bytes"],
+                  "properties": {
+                    "sha256": { "$ref": "#/$defs/sha256" },
+                    "bytes": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "plan_sha256", "candidate_source", "job", "artifacts", "route",
+        "phases", "classification", "receipt_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "fre.aot-rebar.true-native-job-receipt.v1" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_source": { "$ref": "#/$defs/source" },
+        "job": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["job_id", "point_ids", "model", "input", "candidate_klv"],
+          "properties": {
+            "job_id": { "type": "string" },
+            "point_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "model": { "type": "string" },
+            "input": { "$ref": "#/$defs/input" },
+            "candidate_klv": { "$ref": "#/$defs/klv" }
+          }
+        },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary", "replica", "reproducible", "compiled_artifact_present",
+            "runtime_execution_authenticated_separately", "provenance"
+          ],
+          "properties": {
+            "primary": { "anyOf": [{ "$ref": "#/$defs/artifactHashes" }, { "type": "null" }] },
+            "replica": { "anyOf": [{ "$ref": "#/$defs/artifactHashes" }, { "type": "null" }] },
+            "reproducible": { "type": "boolean" },
+            "compiled_artifact_present": { "type": "boolean" },
+            "runtime_execution_authenticated_separately": { "const": true },
+            "provenance": { "anyOf": [{ "$ref": "#/$defs/provenance" }, { "type": "null" }] }
+          }
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operation_entry_symbols", "operation_entry_symbols_sha256", "adapter_route", "semantic_helper_symbols",
+            "semantic_helper_symbols_sha256", "provenance_declared_runtime_symbols",
+            "primary_nm_sha256", "replica_nm_sha256"
+          ],
+          "properties": {
+            "operation_entry_symbols": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "operation_entry_symbols_sha256": { "$ref": "#/$defs/sha256" },
+            "adapter_route": { "type": ["string", "null"] },
+            "semantic_helper_symbols": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "semantic_helper_symbols_sha256": { "$ref": "#/$defs/sha256" },
+            "provenance_declared_runtime_symbols": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "primary_nm_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+            "replica_nm_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] }
+          }
+        },
+        "phases": {
+          "oneOf": [
+            { "$ref": "#/$defs/qualificationPhases" },
+            { "$ref": "#/$defs/failurePhases" }
+          ]
+        },
+        "classification": { "$ref": "#/$defs/classification" },
+        "receipt_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["numerator", "denominator"],
+      "properties": {
+        "numerator": { "type": "integer", "minimum": 0 },
+        "denominator": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "plan_sha256", "candidate_source", "canonical_runtime_denominator",
+        "raw_runtime_schedule_denominator", "numerators", "fractions",
+        "disposition_counts", "job_dispositions", "receipt_manifest", "summary_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "fre.aot-rebar.true-native-summary.v1" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_source": { "$ref": "#/$defs/source" },
+        "canonical_runtime_denominator": { "$ref": "#/$defs/idSet" },
+        "raw_runtime_schedule_denominator": { "$ref": "#/$defs/idSet" },
+        "numerators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "built_reproducibly", "executed_oracle_correct",
+            "native_search_core_authenticated", "whole_operation_native_authenticated"
+          ],
+          "properties": {
+            "built_reproducibly": { "$ref": "#/$defs/idSet" },
+            "executed_oracle_correct": { "$ref": "#/$defs/idSet" },
+            "native_search_core_authenticated": { "$ref": "#/$defs/idSet" },
+            "whole_operation_native_authenticated": { "$ref": "#/$defs/idSet" }
+          }
+        },
+        "fractions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "native_search_core_over_all_runtime_jobs",
+            "whole_operation_native_over_all_runtime_jobs",
+            "native_search_core_over_executed_jobs"
+          ],
+          "properties": {
+            "native_search_core_over_all_runtime_jobs": { "$ref": "#/$defs/fraction" },
+            "whole_operation_native_over_all_runtime_jobs": { "$ref": "#/$defs/fraction" },
+            "native_search_core_over_executed_jobs": { "$ref": "#/$defs/fraction" }
+          }
+        },
+        "disposition_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "job_dispositions": { "type": "object", "additionalProperties": { "type": "string" } },
+        "receipt_manifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "files_sha256"],
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "files_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "summary_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

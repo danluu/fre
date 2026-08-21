@@ -150,6 +150,11 @@ benchmark-name recognition or silently folded into these scalar contracts.
 
 ## HEAD campaign reporting
 
+The source-only [public true-native census control](census/README.md) keeps the
+canonical 311-job runtime denominator distinct from raw comparator/boundary
+schedule points and authenticates runtime routing with comprehensive helper
+traps plus claimed-entry negative controls. It performs no timing.
+
 A complete rerun treats the runner's successful sample output and nonzero
 process/build outcomes as raw observations; it does not prefilter the report to
 wins. The published table must retain every scheduled point as exactly one of
