@@ -26,7 +26,7 @@ fre-kernels = { path = "../../crates/fre-kernels" }
 libc = "=0.2.186"
 rebar-expand = { path = "../rebar-expand" }
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
-regex-automata = "=0.4.14"
+regex-automata = "=0.4.15"
 regex-lite = "=0.1.9"
 regex-syntax = "=0.8.11"
 serde = { version = "=1.0.228", features = ["derive"] }

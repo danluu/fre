@@ -12,7 +12,7 @@ bstr = { version = "=1.12.1", default-features = false, features = ["std"] }
 fre = { path = "../../crates/fre" }
 fre-kernels = { path = "../../crates/fre-kernels" }
 fre-syntax = { path = "../../crates/fre-syntax" }
-regex-automata = "=0.4.14"
+regex-automata = "=0.4.15"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"

@@ -17,7 +17,7 @@ bstr = { version = "=1.12.1", default-features = false, features = ["std"] }
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
 fre-aot-regex-runtime = { path = "../../crates/fre-aot-regex-runtime" }
 fre-syntax = { path = "../../crates/fre-syntax" }
-regex-automata = "=0.4.14"
+regex-automata = "=0.4.15"
 
 [build-dependencies]
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
