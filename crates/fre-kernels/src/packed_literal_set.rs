@@ -445,6 +445,13 @@ enum SharedColumnsFilterResult {
     ResumeAt(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LongSharedFragmentFilterResult {
+    Exhausted,
+    Match { start: usize, end: usize },
+    ResumeAt(usize),
+}
+
 impl SparseAnchor {
     fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
         let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
@@ -1351,6 +1358,9 @@ fn find_native_shared_fragment(
     fragment: &SharedFragment,
     haystack: &[u8],
 ) -> Option<(usize, usize)> {
+    if fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES {
+        return find_native_long_shared_fragment(searcher, fragment, haystack);
+    }
     let native_start_budget = fragment.native_start_budget;
     let native_prefix_bytes = fragment.native_prefix_bytes;
     if haystack.len() <= native_prefix_bytes {
@@ -1405,6 +1415,81 @@ fn find_native_shared_fragment(
                 fallback_start.checked_add(matched.end())?,
             ))
         })
+}
+
+#[inline]
+fn find_native_long_shared_fragment(
+    searcher: &Searcher,
+    fragment: &SharedFragment,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
+    // Preserve the frozen native service for every input in its existing
+    // prefix envelope. The fragment-first route removes a repeated prefix scan
+    // only for long buffers on an already-selected shared-fragment plan.
+    if haystack.len() <= fragment.native_prefix_bytes {
+        return searcher
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+    }
+    let minimum_start = match find_bounded_long_shared_fragment(fragment, haystack)? {
+        LongSharedFragmentFilterResult::Exhausted => return None,
+        LongSharedFragmentFilterResult::Match { start, end } => return Some((start, end)),
+        LongSharedFragmentFilterResult::ResumeAt(start) => start,
+    };
+    searcher
+        .find(&haystack[minimum_start..])
+        .and_then(|matched| {
+            Some((
+                minimum_start.checked_add(matched.start())?,
+                minimum_start.checked_add(matched.end())?,
+            ))
+        })
+}
+
+fn find_bounded_long_shared_fragment(
+    fragment: &SharedFragment,
+    haystack: &[u8],
+) -> Option<LongSharedFragmentFilterResult> {
+    let Some(first) = fragment.earliest_possible_start_from(haystack, 0) else {
+        return Some(LongSharedFragmentFilterResult::Exhausted);
+    };
+    let after_first = first.checked_add(1)?;
+    if let Some(end) = fragment.verify_at(haystack, first) {
+        return Some(LongSharedFragmentFilterResult::Match { start: first, end });
+    }
+    let Some(second) = fragment.earliest_possible_start_from(haystack, after_first) else {
+        return Some(LongSharedFragmentFilterResult::Exhausted);
+    };
+    if second < first.saturating_add(fragment.width) {
+        // Overlapping occurrences are a saturated stream. Native
+        // resumes after the one exactly disproved start instead of buying four
+        // exact probes that advance only a handful of bytes.
+        return Some(LongSharedFragmentFilterResult::ResumeAt(after_first));
+    }
+
+    let mut pending_candidate = Some(second);
+    let mut minimum_start = after_first;
+    for _ in 1..NATIVE_FILTER_CANDIDATE_BUDGET {
+        let candidate = if let Some(candidate) = pending_candidate.take() {
+            candidate
+        } else {
+            let Some(candidate) =
+                fragment.earliest_possible_start_from(haystack, minimum_start)
+            else {
+                return Some(LongSharedFragmentFilterResult::Exhausted);
+            };
+            candidate
+        };
+        let after_candidate = candidate.checked_add(1)?;
+        if let Some(end) = fragment.verify_at(haystack, candidate) {
+            return Some(LongSharedFragmentFilterResult::Match {
+                start: candidate,
+                end,
+            });
+        }
+        minimum_start = after_candidate;
+    }
+    Some(LongSharedFragmentFilterResult::ResumeAt(minimum_start))
 }
 
 fn shared_fragment_native_start_budget(
@@ -2023,10 +2108,11 @@ mod tests {
     use super::{
         BUILD_FACTOR, LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
         LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES, NATIVE_FILTER_CANDIDATE_BUDGET,
-        PackedLiteralEngine,
+        LongSharedFragmentFilterResult, PackedLiteralEngine,
         PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
         PackedLiteralSetLongSharedFragmentBuildReceipt, PackedLiteralSetPlan,
         PackedLiteralSetSearchLimits, RUNTIME_IMPLEMENTATION_ID,
+        find_bounded_long_shared_fragment,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
     };
@@ -2592,6 +2678,191 @@ mod tests {
                 native_prefix_bytes: shared_fragment.native_prefix_bytes,
             })
         );
+    }
+
+    #[test]
+    fn frozen_planner_keeps_rare_anchor_over_common_long_fragment() {
+        let patterns = [
+            b"longpref\x1ctail".as_slice(),
+            b"longpref\x1dtail".as_slice(),
+            b"longpref\x1etail".as_slice(),
+        ];
+        assert!(select_sparse_anchor(&patterns).is_some());
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        assert!(matches!(
+            &plan.engine,
+            PackedLiteralEngine::NativeSparse { .. }
+        ));
+        assert_eq!(plan.long_shared_fragment_build_receipt(), None);
+        assert_native_anchor_matches_unfiltered(&plan, b"longprefxlongpref\x1dtail");
+    }
+
+    #[test]
+    fn selected_long_fragment_handles_sparse_late_dense_and_saturated_streams() {
+        let patterns = [
+            b"longpref0".as_slice(),
+            b"longpref11".as_slice(),
+            b"longpref222".as_slice(),
+            b"longpref3333".as_slice(),
+        ];
+        let Some(selected_plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &selected_plan.engine
+        else {
+            panic!("long common fragment did not select its shared-fragment engine")
+        };
+
+        let sparse = vec![b'.'; 64 * 1024];
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &sparse),
+            Some(LongSharedFragmentFilterResult::Exhausted),
+        );
+        assert_eq!(
+            selected_plan.find(&sparse, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None,
+        );
+
+        let late_start = sparse.len() - patterns[2].len();
+        let late_end = late_start + patterns[2].len();
+        let mut late = sparse;
+        late[late_start..late_end].copy_from_slice(patterns[2]);
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &late),
+            Some(LongSharedFragmentFilterResult::Match {
+                start: late_start,
+                end: late_end,
+            }),
+        );
+
+        let decoy = b"longprefx";
+        let match_start = shared_fragment.native_prefix_bytes + 73;
+        let match_end = match_start + patterns[3].len();
+        let mut dense = vec![b'.'; match_end + 17];
+        for start in [0, decoy.len(), decoy.len() * 2, decoy.len() * 3] {
+            dense[start..start + decoy.len()].copy_from_slice(decoy);
+        }
+        dense[match_start..match_end].copy_from_slice(patterns[3]);
+        let expected = searcher
+            .find(&dense)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((match_start, match_end)));
+        assert_eq!(
+            selected_plan.find(&dense, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+
+        let saturated_patterns = [
+            b"aaaaaaaa0".as_slice(),
+            b"aaaaaaaa11".as_slice(),
+            b"aaaaaaaa222".as_slice(),
+            b"aaaaaaaa3333".as_slice(),
+        ];
+        let Some(saturated_plan) = plan(&saturated_patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &saturated_plan.engine
+        else {
+            panic!("saturated language did not select its shared-fragment engine")
+        };
+        let saturated = vec![b'a'; shared_fragment.native_prefix_bytes + 97];
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &saturated),
+            Some(LongSharedFragmentFilterResult::ResumeAt(1)),
+        );
+        let expected = searcher
+            .find(&saturated)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            saturated_plan
+                .find(&saturated, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+    }
+
+    #[test]
+    fn long_fragment_prefix_boundary_and_interior_offset_match_native() {
+        let patterns = [
+            b"a_sharedfrag0".as_slice(),
+            b"b_sharedfrag11".as_slice(),
+            b"c_sharedfrag222".as_slice(),
+            b"d_sharedfrag3333".as_slice(),
+        ];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("interior long fragment did not select its sidecar")
+        };
+        assert_eq!(shared_fragment.offset, 1);
+        assert!(shared_fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES);
+        assert!(plan.long_shared_fragment_build_receipt().is_some());
+
+        let boundary = shared_fragment.native_prefix_bytes;
+        for length in [boundary - 1, boundary, boundary + 1] {
+            let mut haystack = vec![b'.'; length];
+            if length >= patterns[0].len() {
+                let start = length - patterns[0].len();
+                haystack[start..].copy_from_slice(patterns[0]);
+            }
+            let expected = searcher
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected,
+                "native-prefix boundary length {length}",
+            );
+        }
+    }
+
+    #[test]
+    fn long_fragment_receipt_equals_runtime_dispatch() {
+        let selected = [
+            b"longpref0".as_slice(),
+            b"longpref11".as_slice(),
+            b"longpref222".as_slice(),
+            b"longpref3333".as_slice(),
+        ];
+        let rare_anchor = [
+            b"longpref\x1ctail".as_slice(),
+            b"longpref\x1dtail".as_slice(),
+            b"longpref\x1etail".as_slice(),
+        ];
+        for patterns in [selected.as_slice(), rare_anchor.as_slice()] {
+            let Some(plan) = plan(patterns) else {
+                return;
+            };
+            let dispatched = matches!(
+                &plan.engine,
+                PackedLiteralEngine::NativeSharedFragment {
+                    shared_fragment,
+                    ..
+                } if shared_fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES
+            );
+            assert_eq!(plan.long_shared_fragment_build_receipt().is_some(), dispatched);
+            assert_native_anchor_matches_unfiltered(&plan, b"..longprefx..longpref3333..");
+        }
     }
 
     #[test]
