@@ -506,13 +506,14 @@ pub use ordered_literal_aggregate::{
 };
 pub use packed_literal_set::{
     CERTIFIED_MAX_PATTERNS as PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS,
+    LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID as PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
     RETAINED_ITER_BUILD_CAPABILITY_ID as PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
     RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID,
     RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_RUNTIME_IMPLEMENTATION_ID,
     UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
     PackedLiteralSetAccounting, PackedLiteralSetBuildAccounting, PackedLiteralSetBuildLimits,
-    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting,
-    PackedLiteralSetSearchLimits,
+    PackedLiteralSetError, PackedLiteralSetLongSharedFragmentBuildReceipt, PackedLiteralSetPlan,
+    PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
     packed_literal_anchor_frequency_rank,
     packed_literal_set_build_work_upper_bound_from_dimensions,
 };

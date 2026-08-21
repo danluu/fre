@@ -158,6 +158,10 @@ pub use fre_kernels::{
     LiteralSpanVisitError, LiteralSpanVisitIdentity, LiteralSpanVisitLimits,
     LiteralSpanVisitUpperBounds,
 };
+pub use fre_kernels::{
+    PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+    PackedLiteralSetLongSharedFragmentBuildReceipt,
+};
 pub use bounded_byte_class_sequence::{
     Accounting as BoundedByteClassSequenceAccounting,
     Error as BoundedByteClassSequenceSearchError,
@@ -10246,6 +10250,25 @@ impl PortableRegex {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.plan.runtime_implementation_id()
+    }
+
+    /// Exact immutable receipt for a selected long shared-fragment packed
+    /// subengine.
+    ///
+    /// This returns `None` for every other portable plan and packed subengine.
+    /// A present receipt authenticates that whole-buffer packed search uses an
+    /// exact common fragment of at least eight bytes; callers do not need to
+    /// infer that private planner decision from pattern syntax.
+    #[must_use]
+    pub const fn packed_literal_set_long_shared_fragment_build_receipt(
+        &self,
+    ) -> Option<PackedLiteralSetLongSharedFragmentBuildReceipt> {
+        match &self.plan {
+            PortablePlan::PackedLiteralSet(plan) => {
+                plan.long_shared_fragment_build_receipt()
+            }
+            _ => None,
+        }
     }
 
     /// Separately versioned resources retained for session-backed iteration.
@@ -23190,8 +23213,9 @@ mod tests {
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
         K0PackedFrontierPlan, K0PooledValue, K0PooledValueOperation, K0ReverseSuffixSpanAttempt,
         K0SpanSourceCursor, LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, Match,
-        OperationSemantics, PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
-        PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
+        OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID, PackedLiteralSetError, PlanKind,
+        PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
         PortablePlan, PortableRegex, PortableSearchSession, PortableSearchSessionPlan,
@@ -37032,6 +37056,39 @@ mod tests {
                 assert_eq!(end, expected.map(|(_, end)| end));
             }
         }
+    }
+
+    #[test]
+    fn portable_receipt_authenticates_only_selected_long_shared_fragments() {
+        let selected = PortableBuilder::new(
+            "longpref0|longpref11|longpref222|longpref3333",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(selected.build_report().plan, PlanKind::PackedLiteralSet);
+        let receipt = selected
+            .packed_literal_set_long_shared_fragment_build_receipt()
+            .unwrap();
+        assert_eq!(
+            receipt.capability_id,
+            PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID
+        );
+        assert!(receipt.fragment_bytes >= 8);
+        assert!(receipt.minimum_pattern_bytes >= receipt.fragment_bytes);
+        assert!(receipt.native_prefix_bytes >= receipt.minimum_pattern_bytes);
+
+        let public_candidate = PortableBuilder::new(
+            "__rg_aot_absent_alpha_8fd3|__rg_aot_absent_beta_7ca1|\
+             __rg_aot_absent_gamma_019a|__rg_aot_absent_delta_edd2",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            public_candidate
+                .packed_literal_set_long_shared_fragment_build_receipt(),
+            None,
+            "the pre-optimization planner must not claim the unselected route"
+        );
     }
 
     #[test]

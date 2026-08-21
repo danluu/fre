@@ -45,6 +45,9 @@ const NATIVE_FILTER_MAX_RETAINED_PATTERN_BYTES: usize = 4 * 1024;
 // 16-byte blocks. Exact shared-column continuation requires every adjacent
 // candidate gap to amortize its own verification.
 const NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
+// Public long-fragment receipts deliberately describe only subengines whose
+// exact common substring is wide enough to justify whole-buffer routing.
+const LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES: usize = 8;
 // A one-byte common fragment is already represented by `SparseAnchor`. Two
 // bytes are the smallest exact fragment whose occurrence stream can prove
 // strictly more impossible starts than that byte-set route.
@@ -60,6 +63,9 @@ pub const RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID: &str =
 /// Stable identity of the opt-in dual-engine retained build capability.
 pub const RETAINED_ITER_BUILD_CAPABILITY_ID: &str =
     "packed-literal-set.retained-adaptive-build.v1";
+/// Stable identity of the selected long shared-fragment build capability.
+pub const LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID: &str =
+    "packed-literal-set.long-shared-fragment-build.v1";
 #[cfg(not(feature = "static-dispatch"))]
 const UNIFORM_WORD64_STATE_BITS: usize = u64::BITS as usize;
 #[cfg(not(feature = "static-dispatch"))]
@@ -167,6 +173,29 @@ pub struct PackedLiteralSetRetainedIterBuildAccounting {
     pub additional_build_bytes: usize,
     /// Additional persistent bytes beyond the ordinary plan.
     pub additional_persistent_bytes: usize,
+}
+
+/// Immutable receipt for a selected long shared-fragment subengine.
+///
+/// This receipt is present only when construction retained an exact common
+/// fragment of at least eight bytes and the packed runtime will use that
+/// fragment for long-haystack candidate discovery. Callers can therefore gate
+/// whole-buffer searches on an authenticated stored-plan fact instead of
+/// re-parsing the pattern or inferring a private planner decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedLiteralSetLongSharedFragmentBuildReceipt {
+    /// Versioned identity of this optional build capability.
+    pub capability_id: &'static str,
+    /// Fixed byte offset of the common fragment in every retained literal.
+    pub fragment_offset: usize,
+    /// Exact common-fragment width.
+    pub fragment_bytes: usize,
+    /// Shortest retained literal width.
+    pub minimum_pattern_bytes: usize,
+    /// Maximum exact verification work for one fragment candidate.
+    pub maximum_candidate_verification_work: usize,
+    /// Complete short-input/native-prefix extent retained by the subengine.
+    pub native_prefix_bytes: usize,
 }
 
 /// Per-search bound for a packed finite-literal invocation.
@@ -1009,6 +1038,31 @@ impl PackedLiteralSetPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> PackedLiteralSetBuildAccounting {
         self.build
+    }
+
+    /// Exact immutable receipt for the selected long shared-fragment engine.
+    #[must_use]
+    pub const fn long_shared_fragment_build_receipt(
+        &self,
+    ) -> Option<PackedLiteralSetLongSharedFragmentBuildReceipt> {
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment, ..
+        } = &self.engine
+        else {
+            return None;
+        };
+        if shared_fragment.width < LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES {
+            return None;
+        }
+        Some(PackedLiteralSetLongSharedFragmentBuildReceipt {
+            capability_id: LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+            fragment_offset: shared_fragment.offset,
+            fragment_bytes: shared_fragment.width,
+            minimum_pattern_bytes: shared_fragment.minimum_pattern_width,
+            maximum_candidate_verification_work: shared_fragment
+                .maximum_candidate_verification_work,
+            native_prefix_bytes: shared_fragment.native_prefix_bytes,
+        })
     }
 
     /// Stable identity of the construction-selected runtime implementation.
@@ -1967,9 +2021,12 @@ mod retained_iter_owner_allocation_probe {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_FACTOR, NATIVE_FILTER_CANDIDATE_BUDGET, PackedLiteralEngine,
+        BUILD_FACTOR, LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+        LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES, NATIVE_FILTER_CANDIDATE_BUDGET,
+        PackedLiteralEngine,
         PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
-        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, RUNTIME_IMPLEMENTATION_ID,
+        PackedLiteralSetLongSharedFragmentBuildReceipt, PackedLiteralSetPlan,
+        PackedLiteralSetSearchLimits, RUNTIME_IMPLEMENTATION_ID,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
     };
@@ -2501,6 +2558,39 @@ mod tests {
         assert!(select_shared_fragment(&expensive, 1).is_none());
         assert!(
             select_shared_fragment(&[b"ab".as_slice(), b"ac".as_slice()], 1).is_none()
+        );
+    }
+
+    #[test]
+    fn long_shared_fragment_selection_has_an_exact_public_receipt() {
+        let patterns = [
+            b"longpref0".as_slice(),
+            b"longpref11".as_slice(),
+            b"longpref222".as_slice(),
+            b"longpref3333".as_slice(),
+        ];
+        assert!(select_sparse_anchor(&patterns).is_none());
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment, ..
+        } = &plan.engine
+        else {
+            panic!("long common fragment did not select its shared-fragment engine")
+        };
+        assert!(shared_fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES);
+        assert_eq!(
+            plan.long_shared_fragment_build_receipt(),
+            Some(PackedLiteralSetLongSharedFragmentBuildReceipt {
+                capability_id: LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+                fragment_offset: shared_fragment.offset,
+                fragment_bytes: shared_fragment.width,
+                minimum_pattern_bytes: shared_fragment.minimum_pattern_width,
+                maximum_candidate_verification_work: shared_fragment
+                    .maximum_candidate_verification_work,
+                native_prefix_bytes: shared_fragment.native_prefix_bytes,
+            })
         );
     }
 
