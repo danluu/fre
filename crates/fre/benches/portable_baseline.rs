@@ -14,6 +14,7 @@ fn main() {
     println!("engine,phase,case,iterations,elapsed_ns,ns_per_iteration,checksum");
     for case in cases() {
         compare_search(&case);
+        compare_exists(&case);
         compare_compile(&case);
         if case.name == "alternation-late-52k" {
             compare_literal_set_kernel(&case);
@@ -80,6 +81,12 @@ fn cases() -> Vec<Case> {
     let mut alternation = b"foo-no-match/".repeat(4_000);
     alternation.extend_from_slice(b"foobaz");
 
+    let mut contained_suffix = b"abcdef".repeat(8_000);
+    contained_suffix.extend_from_slice(b"face");
+
+    let mut guarded_suffix = b"word-no-match/".repeat(4_000);
+    guarded_suffix.extend_from_slice(b"payloadtag");
+
     vec![
         Case {
             name: "literal-late-64k",
@@ -95,6 +102,16 @@ fn cases() -> Vec<Case> {
             name: "alternation-late-52k",
             pattern: "foobar|foobaz|fooquux",
             haystack: alternation,
+        },
+        Case {
+            name: "class-contained-suffix-late-48k",
+            pattern: "[a-f]+face",
+            haystack: contained_suffix,
+        },
+        Case {
+            name: "guarded-word-suffix-late-56k",
+            pattern: r"\b\w+tag\b",
+            haystack: guarded_suffix,
         },
     ]
 }
@@ -116,24 +133,7 @@ fn compare_search(case: &Case) {
         .find(&case.haystack)
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(actual, expected);
-    let fre_engine = match fre.build_report().plan {
-        PlanKind::ExactLiteral => "fre-exact-literal",
-        PlanKind::PackedLiteralSet => "fre-packed-literal-set",
-        PlanKind::LiteralSetDfa => "fre-literal-set-dfa",
-        PlanKind::RequiredLiteral => "fre-required-literal",
-        PlanKind::LiteralClassRunLiteral => "fre-literal-class-run-literal",
-        PlanKind::ReverseInner => "fre-reverse-inner",
-        PlanKind::PrefixClassAlternation => "fre-prefix-class-alternation",
-        PlanKind::PureByteClassRepeat => "fre-pure-byte-class-repeat",
-        PlanKind::BoundedByteClassSequence => "fre-bounded-byte-class-sequence",
-        PlanKind::ForwardAnchored => "fre-forward-anchored",
-        PlanKind::K0 => "fre-k0",
-        PlanKind::UnicodeFoldedLiteral => "fre-unicode-folded-literal",
-        PlanKind::UnicodeWordRun => "fre-unicode-word-run",
-        PlanKind::FixedPredicateWord64 => "fre-fixed-predicate-word64",
-        PlanKind::UnicodeScalarRun => "fre-unicode-scalar-run",
-        PlanKind::LineDomainByteAtoms => "fre-line-domain-byte-atoms",
-    };
+    let fre_engine = fre_engine_name(&fre);
 
     warm(|| {
         fre.find(black_box(&case.haystack))
@@ -170,6 +170,67 @@ fn compare_search(case: &Case) {
         elapsed,
         checksum,
     );
+}
+
+fn compare_exists(case: &Case) {
+    let fre = PortableBuilder::new(case.pattern)
+        .unicode(false)
+        .build()
+        .expect("smoke pattern belongs to portable subset");
+    let upstream = regex::bytes::RegexBuilder::new(case.pattern)
+        .unicode(false)
+        .build()
+        .expect("upstream accepts smoke pattern");
+    let expected = upstream.is_match(&case.haystack);
+    assert_eq!(fre.is_match(&case.haystack), expected);
+    let fre_engine = fre_engine_name(&fre);
+
+    warm(|| usize::from(fre.is_match(black_box(&case.haystack))));
+    let (elapsed, checksum) = measure(SEARCH_ITERS, || {
+        usize::from(fre.is_match(black_box(&case.haystack)))
+    });
+    print_row(
+        fre_engine,
+        "is-match",
+        case.name,
+        SEARCH_ITERS,
+        elapsed,
+        checksum,
+    );
+
+    warm(|| usize::from(upstream.is_match(black_box(&case.haystack))));
+    let (elapsed, checksum) = measure(SEARCH_ITERS, || {
+        usize::from(upstream.is_match(black_box(&case.haystack)))
+    });
+    print_row(
+        "rust-regex-1.12.4",
+        "is-match",
+        case.name,
+        SEARCH_ITERS,
+        elapsed,
+        checksum,
+    );
+}
+
+fn fre_engine_name(regex: &fre::PortableRegex) -> &'static str {
+    match regex.build_report().plan {
+        PlanKind::ExactLiteral => "fre-exact-literal",
+        PlanKind::PackedLiteralSet => "fre-packed-literal-set",
+        PlanKind::LiteralSetDfa => "fre-literal-set-dfa",
+        PlanKind::RequiredLiteral => "fre-required-literal",
+        PlanKind::LiteralClassRunLiteral => "fre-literal-class-run-literal",
+        PlanKind::ReverseInner => "fre-reverse-inner",
+        PlanKind::PrefixClassAlternation => "fre-prefix-class-alternation",
+        PlanKind::PureByteClassRepeat => "fre-pure-byte-class-repeat",
+        PlanKind::BoundedByteClassSequence => "fre-bounded-byte-class-sequence",
+        PlanKind::ForwardAnchored => "fre-forward-anchored",
+        PlanKind::K0 => "fre-k0",
+        PlanKind::UnicodeFoldedLiteral => "fre-unicode-folded-literal",
+        PlanKind::UnicodeWordRun => "fre-unicode-word-run",
+        PlanKind::FixedPredicateWord64 => "fre-fixed-predicate-word64",
+        PlanKind::UnicodeScalarRun => "fre-unicode-scalar-run",
+        PlanKind::LineDomainByteAtoms => "fre-line-domain-byte-atoms",
+    }
 }
 
 fn compare_compile(case: &Case) {
