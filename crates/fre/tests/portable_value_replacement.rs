@@ -386,6 +386,103 @@ fn fixed_predicate_value_replacement_matches_the_first_value_iterator_item() {
 }
 
 #[test]
+fn byte_class_value_replacements_match_the_first_value_iterator_item() {
+    let cases: &[(&str, PlanKind, &str, &[&[u8]])] = &[
+        (
+            r"(?-u:[aceg]+)",
+            PlanKind::PureByteClassRepeat,
+            fre::PURE_BYTE_CLASS_REPEAT_PLAN_ID,
+            &[b"aceg first", b"prefix acegg suffix", b"absent", b""],
+        ),
+        (
+            r"(?-u:[aceg]){2,5}",
+            PlanKind::PureByteClassRepeat,
+            "pure-byte-class-repeat-bounded-v1",
+            &[b"aceg first", b"prefix acegg suffix", b"absent", b""],
+        ),
+        (
+            r"(?-u:[A-Z]){1,3}(?-u:[a-z]){2,5}(?-u:[0-9]){1,2}",
+            PlanKind::BoundedByteClassSequence,
+            fre::BOUNDED_BYTE_CLASS_SEQUENCE_PLAN_ID,
+            &[b"ABCabc12 first", b"prefix Qab7 suffix", b"absent", b""],
+        ),
+    ];
+    let limits = [
+        PortableFindIterLimits::unlimited(),
+        PortableFindIterLimits {
+            session: SearchSessionLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            search: SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            max_search_calls: 0,
+            ..PortableFindIterLimits::unlimited()
+        },
+    ];
+    let output_limits = ValueReplacementOutputLimits {
+        max_output_bytes: usize::MAX,
+        max_output_capacity_bytes: usize::MAX,
+    };
+
+    for &(pattern, expected_plan, expected_runtime, haystacks) in cases {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("byte-class value replacement {pattern:?}: {error}"));
+        assert_eq!(regex.build_report().plan, expected_plan, "{pattern:?}");
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            expected_runtime,
+            "{pattern:?}",
+        );
+
+        for &haystack in haystacks {
+            for iterator_limits in limits {
+                let first = regex
+                    .find_iter_value(haystack, iterator_limits)
+                    .expect("a native byte-class plan needs no session resources")
+                    .next();
+                let actual =
+                    regex.replace_literal_value(haystack, b"X", iterator_limits, output_limits);
+
+                match first {
+                    Some(Ok(matched)) => {
+                        let mut expected = Vec::new();
+                        expected.extend_from_slice(&haystack[..matched.start()]);
+                        expected.extend_from_slice(b"X");
+                        expected.extend_from_slice(&haystack[matched.end()..]);
+                        assert_eq!(
+                            actual.expect("matching replacement").as_ref(),
+                            expected,
+                            "{pattern:?} {haystack:?}",
+                        );
+                    }
+                    Some(Err(error)) => assert_eq!(
+                        actual.expect_err("the direct search must preserve iterator refusal"),
+                        PortableValueReplacementError::Iteration(error),
+                        "{pattern:?} {haystack:?}",
+                    ),
+                    None => {
+                        let actual = actual.expect("absent replacement");
+                        assert!(matches!(actual, Cow::Borrowed(_)));
+                        assert_eq!(actual.as_ref(), haystack, "{pattern:?} {haystack:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn value_replacement_enforces_exact_output_and_observed_capacity_limits() {
     let regex = PortableBuilder::new(r"[0-9]")
         .unicode(false)

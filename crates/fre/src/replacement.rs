@@ -676,9 +676,10 @@ impl PortableRegex {
     ///
     /// # Errors
     ///
-    /// Exact literals and fixed-predicate words execute their first
-    /// selected-span search directly; other plans retain the value iterator
-    /// and its reusable-session setup.
+    /// Exact literals, fixed-predicate words, pure byte-class repetitions and
+    /// bounded byte-class sequences execute their first selected-span search
+    /// directly; other plans retain the value iterator and its reusable-session
+    /// setup.
     /// Returns a typed setup, first-search, output-bound, allocation or
     /// invariant refusal. The iterator call cap is consumed only for the first
     /// hit or miss; a successful hit never probes for a later match.
@@ -691,8 +692,21 @@ impl PortableRegex {
         output_limits: ValueReplacementOutputLimits,
     ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
         let replacement = replacement.literal_bytes();
+        let plan = self.build_report().plan;
         if matches!(
-            self.build_report().plan,
+            plan,
+            crate::PlanKind::PureByteClassRepeat | crate::PlanKind::BoundedByteClassSequence
+        ) {
+            return replace_direct_literal_value(
+                self,
+                haystack,
+                replacement,
+                iterator_limits,
+                output_limits,
+            );
+        }
+        if matches!(
+            plan,
             crate::PlanKind::ExactLiteral | crate::PlanKind::FixedPredicateWord64
         ) {
             return replace_direct_literal_value(

@@ -99,4 +99,69 @@ fn warm_literal_value_replacement_allocates_only_its_matched_output() {
         fixed_match_change.deallocations, 0,
         "{fixed_match_change:?}"
     );
+
+    for (pattern, expected_plan, matched_haystack, expected) in [
+        (
+            r"(?-u:[aceg]+)",
+            PlanKind::PureByteClassRepeat,
+            b"!!!!acegg!!!!".as_slice(),
+            b"!!!!_!!!!".as_slice(),
+        ),
+        (
+            r"(?-u:[aceg]){2,5}",
+            PlanKind::PureByteClassRepeat,
+            b"!!!!acegg!!!!".as_slice(),
+            b"!!!!_!!!!".as_slice(),
+        ),
+        (
+            r"(?-u:[A-Z]){1,3}(?-u:[a-z]){2,5}(?-u:[0-9]){1,2}",
+            PlanKind::BoundedByteClassSequence,
+            b"!!!!ABCabc12!!!!".as_slice(),
+            b"!!!!_!!!!".as_slice(),
+        ),
+    ] {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("byte-class allocation regex {pattern:?}: {error}"));
+        assert_eq!(regex.build_report().plan, expected_plan, "{pattern:?}");
+
+        let absent_region = Region::new(GLOBAL);
+        let absent = regex
+            .replace_literal_value(
+                b"!!!!!!!!!!!!!!!!",
+                b"_",
+                PortableFindIterLimits::unlimited(),
+                ValueReplacementOutputLimits::default(),
+            )
+            .expect("byte-class no-match replacement");
+        let absent_change = absent_region.change();
+        assert!(matches!(absent, Cow::Borrowed(_)));
+        assert_eq!(absent_change, Stats::default(), "{pattern:?}");
+
+        let matched_region = Region::new(GLOBAL);
+        let matched = regex
+            .replace_literal_value(
+                matched_haystack,
+                b"_",
+                PortableFindIterLimits::unlimited(),
+                ValueReplacementOutputLimits::default(),
+            )
+            .expect("byte-class matched replacement");
+        let matched_change = matched_region.change();
+        assert!(matches!(matched, Cow::Owned(_)));
+        assert_eq!(matched.as_ref(), expected, "{pattern:?}");
+        assert_eq!(
+            matched_change.allocations, 1,
+            "{pattern:?} {matched_change:?}"
+        );
+        assert_eq!(
+            matched_change.reallocations, 0,
+            "{pattern:?} {matched_change:?}"
+        );
+        assert_eq!(
+            matched_change.deallocations, 0,
+            "{pattern:?} {matched_change:?}"
+        );
+    }
 }
