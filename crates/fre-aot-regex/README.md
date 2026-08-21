@@ -5,6 +5,14 @@ capture-free regular expressions. It lowers the validated automaton rather
 than recognizing a list of pattern spellings, and emits relocatable object
 files without invoking LLVM, a C compiler, an assembler, or a linker.
 
+For latency-sensitive same-process use, the companion
+[`fre-aot-regex-loader`](../fre-aot-regex-loader/README.md) consumes a
+self-contained optimizing `Span` result and publishes its retained typed
+module under strict W^X. Compilation still emits the real relocatable object;
+the loader removes only temporary-file, external-linker, and dynamic-loader
+work. Runtime-helper-backed artifacts are rejected rather than routed through
+the portable executor.
+
 ## Targets and CPU features
 
 The target operating system, architecture, and CPU features are explicit

@@ -30,6 +30,30 @@ let compiled = compile(
 std::fs::write("item.o", compiled.object())?;
 ```
 
+For a same-process grep integration, `fre-aot-regex-loader` can instead
+consume a self-contained optimizing `Span` artifact, relocate its retained
+typed module directly, and return a cloneable strict-W^X matcher:
+
+```rust
+use fre_aot_regex_loader::{PublicationLimits, host_target, publish_span};
+
+let compiled = compile(
+    CompileRequest::new(r"(?:[A-Za-z_][A-Za-z0-9_]*::)+item", host_target()?)
+        .output(OutputContract::Span)
+        .mode(CompileMode::Optimizing),
+)?;
+let native = publish_span(compiled, PublicationLimits::default())?;
+let found = native.find_at(b"prefix::item", 0)?;
+```
+
+This path still emits and hashes the normal ELF or Mach-O object during
+compilation. It avoids filesystem, external-linker, and dynamic-loader work;
+it is not an object-emission shortcut. Publication accepts no unresolved
+symbol and has no portable fallback, so a caller can keep its stock matcher
+when a pattern needs a runtime helper. See the
+[`fre-aot-regex-loader` README](../crates/fre-aot-regex-loader/README.md) for a
+background compilation and file-boundary cutover sketch.
+
 `CompileMode::Fast` performs syntax lowering, validation, canonicalization, and
 ordered-TNFA freezing. `CompileMode::Optimizing` may spend substantially more
 time on complete ordered determinization, reverse-machine construction,

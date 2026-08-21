@@ -326,6 +326,27 @@ pub enum CompileMode {
     Optimizing,
 }
 
+/// Exact C entry-point ABI emitted for one capture-free output contract.
+///
+/// Consumers that turn a symbol address into a typed function pointer must
+/// check this receipt field in addition to the semantic output contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryAbi {
+    ExistsSearchV1,
+    SelectedEndSearchV1,
+    SpanSearchV1,
+}
+
+impl EntryAbi {
+    const fn for_output(output: OutputContract) -> Self {
+        match output {
+            OutputContract::Exists => Self::ExistsSearchV1,
+            OutputContract::SelectedEnd => Self::SelectedEndSearchV1,
+            OutputContract::Span => Self::SpanSearchV1,
+        }
+    }
+}
+
 /// Checked limits for one complete compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompileLimitsV1 {
@@ -454,6 +475,8 @@ pub struct CompileReceipt {
     pub optimizer_version: u32,
     pub mode: CompileMode,
     pub output: OutputContract,
+    /// Versioned callable contract for the exported ordinary entry symbol.
+    pub entry_abi: EntryAbi,
     pub target: Target,
     /// Byte configured as the line terminator for this semantic program.
     pub line_terminator: u8,
@@ -1605,6 +1628,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         optimizer_version: OPTIMIZER_VERSION,
         mode,
         output,
+        entry_abi: EntryAbi::for_output(output),
         target,
         line_terminator,
         automaton_sha256: digest,

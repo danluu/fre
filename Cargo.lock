@@ -246,6 +246,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-aot-regex-loader"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-regex",
+ "fre-target-features",
+ "libc",
+ "regex 1.12.4",
+]
+
+[[package]]
 name = "fre-aot-regex-runtime"
 version = "0.1.0"
 dependencies = [

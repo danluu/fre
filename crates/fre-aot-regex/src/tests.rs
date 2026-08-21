@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
-    EngineSelectionReason, FeatureSet, PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    EngineSelectionReason, EntryAbi, FeatureSet, PreparedAggregateExports,
+    PreparedAggregateStrategy, PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
@@ -29,6 +29,7 @@ fn receipt_records_selected_workspace_optimizer_identity_v23() {
     .expect("compile optimizer-identity fixture");
     assert_eq!(compiled.receipt().compiler_version, COMPILER_VERSION);
     assert_eq!(compiled.receipt().optimizer_version, OPTIMIZER_VERSION);
+    assert_eq!(compiled.receipt().entry_abi, EntryAbi::SpanSearchV1);
 }
 
 fn streaming_resume_test_automaton() -> Automaton {
