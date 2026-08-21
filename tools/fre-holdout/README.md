@@ -116,3 +116,54 @@ cargo run --release -p fre-holdout -- run-aot-selected-end \
 ```
 
 Neither this report nor its engine labels describe portable FRE timing.
+
+## Default-off V2 policy comparison
+
+`run-aot-selected-end-v2-experiment` is a separate opt-in command. It does not
+change `run-aot-selected-end`, `run`, or any production compiler default. For
+every one of the 19 frozen cases it independently issues explicit
+`CompileRequestV2` requests for `Automatic` and
+`ForceStructurallyEligible`, publishes each successful artifact, and retains
+compile/publication declines, faults, and forced requests that returned only
+their incumbent fallback.
+
+The clock-free report has two policy receipts for each of the 338 authenticated
+full/bounded windows. Each ready artifact must agree with its own portable
+`CompiledRegex::search` result and the independent full or bounded oracle. The
+supplemental schema and optimizer version, requested policy, selection basis,
+route-binding digest, semantic-program artifact identity, module/object
+identity, and published identity are all bound into the case and report
+digests. Forced evidence is rejected if it appears in the stable V1 receipt.
+
+A case enters the frozen eligible list only when the forced supplemental
+receipt contains an authenticated `ForcedStructuralEligibility` report.
+Automatic selection, compile or publication duration, publication success,
+and search results do not participate in eligibility. A successful forced
+request without that report is explicitly `structurally-ineligible`; it is not
+renamed as the forced route. The eligibility digest covers all eligible,
+ineligible, declined, and faulted cases before any timing clock is read.
+
+Run only the clock-free comparison:
+
+```sh
+cargo run --release -p fre-holdout -- \
+  run-aot-selected-end-v2-experiment \
+  research/holdout/suite.json \
+  research/holdout/schema.json \
+  research/holdout/digests.json \
+  /tmp/fre-holdout-aot-selected-end-v2-correctness.json
+```
+
+The optional `--performance OUTPUT` path validates the correctness report,
+strict gate, frozen eligibility digest, target/SVE evidence, source and
+executable provenance, two-policy readiness, and a checked 65,536-observation
+cap before its first clock. It constructs one matcher per policy and eligible
+case, records compile and publish durations only as separate setup fields, and
+then runs deterministic paired hot sweeps over the eligible full/bounded
+windows. Adjacent sweeps use a permutation and its reverse, and first-policy
+order alternates for every input. Timing remains non-normative and cannot
+change correctness or eligibility.
+
+An empty frozen eligible set makes `--performance` inadmissible: the command
+returns an error before constructing any timing clock and writes no performance
+report. Incumbent fallbacks therefore cannot silently enter a timing cohort.

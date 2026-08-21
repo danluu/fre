@@ -19,6 +19,7 @@ pub use aot_selected_end::{
     run_aot_selected_end_performance, validate_aot_selected_end_correctness,
     validate_aot_selected_end_performance,
 };
+pub use aot_selected_end::v2::*;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

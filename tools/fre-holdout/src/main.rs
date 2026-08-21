@@ -1,9 +1,11 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use fre_holdout::{
-    AotSelectedEndComparisonStatus, AotSelectedEndDisposition, AotSelectedEndRunConfig, RunConfig,
-    authenticate_paths, derive_digest_manifest, enforce_aot_selected_end_strict_gate,
-    enforce_strict_gate, run, run_aot_selected_end,
+    AotSelectedEndComparisonStatus, AotSelectedEndDisposition, AotSelectedEndRunConfig,
+    AotSelectedEndV2Eligibility, AotSelectedEndV2RunConfig, RunConfig, authenticate_paths,
+    derive_digest_manifest, enforce_aot_selected_end_strict_gate,
+    enforce_aot_selected_end_v2_strict_gate, enforce_strict_gate, run, run_aot_selected_end,
+    run_aot_selected_end_v2_experiment,
 };
 
 fn main() -> ExitCode {
@@ -20,7 +22,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args_os().skip(1);
     let command = arguments
         .next()
-        .ok_or("usage: fre-holdout derive SUITE SCHEMA | fre-holdout authenticate SUITE SCHEMA DIGESTS | fre-holdout run SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT] | fre-holdout run-aot-selected-end SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT]")?;
+        .ok_or("usage: fre-holdout derive SUITE SCHEMA | fre-holdout authenticate SUITE SCHEMA DIGESTS | fre-holdout run SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT] | fre-holdout run-aot-selected-end SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT] | fre-holdout run-aot-selected-end-v2-experiment SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT]")?;
     match command.to_string_lossy().as_ref() {
         "derive" => {
             let suite = next_path(&mut arguments, "suite")?;
@@ -108,8 +110,82 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             enforce_strict_gate(&report)?;
         }
         "run-aot-selected-end" => run_aot_selected_end_command(&mut arguments)?,
+        "run-aot-selected-end-v2-experiment" => {
+            run_aot_selected_end_v2_experiment_command(&mut arguments)?;
+        }
         other => return Err(format!("unknown command {other:?}").into()),
     }
+    Ok(())
+}
+
+fn run_aot_selected_end_v2_experiment_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suite = next_path(arguments, "suite")?;
+    let schema = next_path(arguments, "schema")?;
+    let digests = next_path(arguments, "digests")?;
+    let correctness_output = next_path(arguments, "correctness output")?;
+    let performance_output = match arguments.next() {
+        None => None,
+        Some(flag) if flag == "--performance" => Some(next_path(arguments, "performance output")?),
+        Some(other) => {
+            return Err(format!("unexpected argument {}", PathBuf::from(other).display()).into());
+        }
+    };
+    if arguments.next().is_some() {
+        return Err("unexpected argument after output paths".into());
+    }
+    let report = run_aot_selected_end_v2_experiment(&AotSelectedEndV2RunConfig {
+        suite,
+        schema,
+        digests,
+        correctness_output,
+        performance_output,
+    })?;
+    let ineligible = report
+        .coverage
+        .by_eligibility
+        .get(&AotSelectedEndV2Eligibility::StructurallyIneligible)
+        .copied()
+        .unwrap_or(0);
+    let declined = report
+        .coverage
+        .by_eligibility
+        .get(&AotSelectedEndV2Eligibility::CompileDeclined)
+        .copied()
+        .unwrap_or(0);
+    let faults = report
+        .coverage
+        .by_eligibility
+        .get(&AotSelectedEndV2Eligibility::Fault)
+        .copied()
+        .unwrap_or(0);
+    let failures = report
+        .coverage
+        .by_policy_input_status
+        .values()
+        .map(|statuses| {
+            statuses
+                .get(&AotSelectedEndComparisonStatus::Fail)
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
+    println!(
+        "suite={} v2_cases={} eligible={} ineligible={} declined={} fault={} eligible_windows={} policy_comparisons={} fail={} eligibility_sha256={} receipts_sha256={}",
+        report.suite_id,
+        report.coverage.case_patterns,
+        report.coverage.frozen_eligible_cases,
+        ineligible,
+        declined,
+        faults,
+        report.coverage.frozen_eligible_search_windows,
+        report.coverage.policy_comparisons,
+        failures,
+        report.eligibility_sha256,
+        report.receipts_sha256,
+    );
+    enforce_aot_selected_end_v2_strict_gate(&report)?;
     Ok(())
 }
 

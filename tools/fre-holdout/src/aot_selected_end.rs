@@ -4185,6 +4185,10 @@ fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Explicit, default-off comparison of the V2 automatic and structurally
+/// forced exact-finite `SelectedEnd` Teddy policies.
+pub mod v2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
