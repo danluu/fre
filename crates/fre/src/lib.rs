@@ -12163,11 +12163,40 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: PortableFindIterLimits,
     ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
+        self.find_iter_value_at(haystack, 0, limits)
+    }
+
+    /// Iterate over every non-overlapping byte match at or after `start`
+    /// through the value-only selected-span route.
+    ///
+    /// Assertions inspect the complete original haystack and returned offsets
+    /// remain relative to it. Empty-match progress and resource behavior are
+    /// identical to [`Self::find_iter_value`]. An invalid `start` is yielded
+    /// as a [`PortableFindIterError`] item after the iterator-level search-call
+    /// cap admits that search, matching the zero-origin iterator's resource
+    /// precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if reusable session construction exceeds
+    /// `limits.session`. Per-search failures and the whole-iterator call cap
+    /// are yielded as [`PortableFindIterError`] items.
+    pub fn find_iter_value_at<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+        start: usize,
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
         let native_cursor = self.native_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableValueMatches {
             session,
-            state: PortableValueMatchIterState::new(haystack, limits.run(), native_cursor),
+            state: PortableValueMatchIterState::new_at(
+                haystack,
+                start,
+                limits.run(),
+                native_cursor,
+            ),
         })
     }
 
@@ -21576,10 +21605,26 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
     ) -> PortableSessionValueMatches<'s, 'r, 'h> {
+        self.find_iter_value_at(haystack, 0, limits)
+    }
+
+    /// Iterate over every non-overlapping byte match at or after `start`
+    /// through this session's value-only selected-span route.
+    ///
+    /// Assertions retain complete original-haystack context and offsets remain
+    /// absolute. An invalid `start` is yielded as an iterator error after the
+    /// iterator-level search-call cap admits that search.
+    #[must_use]
+    pub fn find_iter_value_at<'s, 'h>(
+        &'s mut self,
+        haystack: &'h [u8],
+        start: usize,
+        limits: PortableFindIterRunLimits,
+    ) -> PortableSessionValueMatches<'s, 'r, 'h> {
         let native_cursor = self.value_native_search_cursor(haystack);
         PortableSessionValueMatches {
             session: self,
-            state: PortableValueMatchIterState::new(haystack, limits, native_cursor),
+            state: PortableValueMatchIterState::new_at(haystack, start, limits, native_cursor),
         }
     }
 
@@ -21975,7 +22020,7 @@ impl<'r> PortableSearchSession<'r> {
         }))
     }
 
-    fn find_iter_value_at(
+    fn find_iter_value_source_at(
         &mut self,
         source: &mut K0SpanSourceCursor<'_>,
         start: usize,
@@ -22445,11 +22490,15 @@ struct PortableValueMatchIterCore<'h> {
 }
 
 impl<'h> PortableValueMatchIterCore<'h> {
-    const fn new(haystack: &'h [u8], limits: PortableFindIterRunLimits) -> Self {
+    const fn new_at(
+        haystack: &'h [u8],
+        start: usize,
+        limits: PortableFindIterRunLimits,
+    ) -> Self {
         Self {
             k0_source: K0SpanSourceCursor::new(haystack),
             limits,
-            start: 0,
+            start,
             last_match_end: None,
             pending_empty_progress: false,
             search_calls: 0,
@@ -22541,12 +22590,13 @@ impl<'h> PortableValueMatchIterCore<'h> {
 }
 
 impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
-    const fn new(
+    const fn new_at(
         haystack: &'h [u8],
+        start: usize,
         limits: PortableFindIterRunLimits,
         native_cursor: Option<PortableNativeSearchCursor<'r, 'h>>,
     ) -> Self {
-        let core = PortableValueMatchIterCore::new(haystack, limits);
+        let core = PortableValueMatchIterCore::new_at(haystack, start, limits);
         match native_cursor {
             Some(cursor) => Self::Native { core, cursor },
             None => Self::General(core),
@@ -22570,7 +22620,7 @@ impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
     ) -> Option<Result<Match, PortableFindIterError>> {
         match self {
             Self::General(core) => core.next_match_with(|source, start, limits| {
-                session.find_iter_value_at(source, start, limits)
+                session.find_iter_value_source_at(source, start, limits)
             }),
             Self::Native { core, cursor } => {
                 if matches!(cursor, PortableNativeSearchCursor::K0SourceBound) {
