@@ -1,7 +1,7 @@
 # `fre-aot-regex-loader`
 
 `fre-aot-regex-loader` is FRE's strict-W^X in-process linker and publisher for
-self-contained general-AOT `Span` artifacts. It removes temporary object
+self-contained general-AOT `Span` and `SelectedEnd` artifacts. It removes temporary object
 files, an external linker, and `dlopen`/`dlsym` from latency-sensitive grep
 integrations while preserving the normal compiler transaction: compilation
 still emits and hashes the real ELF or Mach-O object.
@@ -37,9 +37,10 @@ thread::Builder::new()
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })?;
 
-// At a file boundary, a worker may clone the published handle. If it is not
-// present, keep using the stock matcher. Never switch engines midway through
-// a file: that keeps capture/metadata and iteration state coherent.
+// At a caller-defined safe boundary, a worker may clone the published handle.
+// If it is not present, keep using the stock matcher. An in-file boundary is
+// safe only when the caller can preserve iteration/metadata state and has
+// ruled out query semantics that cannot be split at that boundary.
 if let Some(native) = NATIVE.get().cloned() {
     if let Some(found) = native.find_at(b"prefix foo suffix", 0)? {
         assert_eq!(found.range(), 7..10);
@@ -59,6 +60,14 @@ Use `search` for an exact `SearchWindow`, `find_at` for a suffix, and
 nullable-pattern progress. Native status and span outputs are checked before
 they become safe Rust results.
 
-The current safe publisher accepts only compiler-owned `CompiledRegex`
-values with the versioned five-argument `Span` ABI. It does not accept object
-bytes or caller-built modules and does not expose a raw entry pointer.
+`SearchWindow` does not create a new logical haystack. Native calls retain the
+complete haystack as assertion context, matching the same compiled artifact's
+portable search: an interior `window.end()` is not `\z`, and a nonzero start is
+not `\A`. A grep integration may cut over at a caller-validated in-file
+boundary for splittable queries, but must retain its stock matcher for
+haystack-anchor or other stateful queries whose semantics cannot be preserved
+across that boundary.
+
+The current safe publisher accepts only compiler-owned `CompiledRegex` values
+with a versioned five-argument `Span` or `SelectedEnd` ABI. It does not accept
+object bytes or caller-built modules and does not expose a raw entry pointer.

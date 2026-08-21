@@ -47,6 +47,40 @@ Correctness output contains no clocks. Its receipt ordering, values, classificat
 
 Optional performance output has a separate `fre.holdout.performance.v4` schema. It times equivalent ordinary APIs: FRE and Rust-regex both use `find` and `is_match` without a per-search work quota, and the selected-end diagnostic invokes `find` once and projects the match end on both sides. Both engines automatically retain implementation-owned, construction-bounded search scratch across hot calls; the caller does not construct an explicit session. The deterministic correctness report continues to use FRE's finite accounting APIs so plan and work receipts remain available outside the timing boundary, and it checks those finite results against the ordinary API before any timing.
 
+That portable-facade report is not AOT evidence. The separate
+`run-aot-selected-end` adapter emits
+`fre.holdout.aot-selected-end.correctness.v1` after compiling optimizing
+`OutputContract::SelectedEnd`, publishing the self-contained object directly
+in memory, and calling only the published native entry. It retains every
+compile/publication decline and every window behind that decline instead of
+silently shrinking the corpus or falling back. Each of the 169 authenticated
+inputs is checked twice: its full window and a deterministic bounded
+nonzero-start interior midscan window in
+`MIDSCAN_PREFIX || input || MIDSCAN_SUFFIX`, for 338 receipts total. The oracle
+is mandatorily the same compiled artifact's portable `SelectedEnd` search over
+the full haystack and identical `SearchWindow`; native and portable must match
+for every applicable bounded case. Pinned regex::bytes remains the independent
+full-window baseline. The independent bounded baseline is regex-automata
+`Input::span` over the full haystack, which preserves absolute `\A` and `\z`
+context; all 169 bounded windows are independently checked. This covers a
+caller-validated in-file cutover. Its optional
+`fre.holdout.aot-selected-end.performance.v1` output reports fresh
+compile/publish/first-scan transactions separately from calls on an already
+published matcher and pairs each observation with a regex-automata meta
+full-haystack `Input::span` call on the identical window; nonzero-span `\A`
+observations are checked and timed like every other bounded case. Correctness
+gates and a readiness floor run before any timing. The report carries the exact
+correctness target, feature bits, SVE vector length where applicable,
+source/build/host provenance including exact build-vs-runtime
+status/tracked-diff/untracked-content digests; external diff/text conversion is
+disabled and any Git snapshot-command failure aborts,
+explicit compiler/publication limit policy, a checked 65,536-observation timing
+ceiling, and a fully recorded authenticated seeded/reversal-counterbalanced
+schedule for every warmup and measurement sweep. The frozen 3/9 timing policy
+plans 16,262 observations. Closure validators recompute exact matrices,
+coverage, resource policy, terminal tuples, and digests. These schemas never
+label the portable facade as AOT or the native entry as portable FRE.
+
 The 2026-08-19 C9g diagnostic for automatic portable K0 scratch is summarized in [`docs/performance/automatic-portable-k0-scratch-c9g32-2026-08-19.md`](../../docs/performance/automatic-portable-k0-scratch-c9g32-2026-08-19.md). Raw timing samples remain external; the committed report contains only labeled diagnostic aggregates and reproduction hashes.
 
 The follow-up C9g diagnostic for the general thread-owner workspace pool is summarized in [`docs/performance/owner-fast-pooled-k0-workspaces-c9g32-2026-08-19.md`](../../docs/performance/owner-fast-pooled-k0-workspaces-c9g32-2026-08-19.md). It compares the owner-fast pool with the preceding automatic mutex-backed pool and records the exact tested source separately from the feature commit.
@@ -109,6 +143,12 @@ cargo run --release -p fre-holdout -- run \
   research/holdout/digests.json \
   /tmp/fre-holdout-correctness.json \
   --performance /tmp/fre-holdout-performance.json
+
+cargo run --release -p fre-holdout -- run-aot-selected-end \
+  research/holdout/suite.json \
+  research/holdout/schema.json \
+  research/holdout/digests.json \
+  /tmp/fre-holdout-aot-selected-end-correctness.json
 ```
 
 The second command writes correctness first, optionally writes separate timing diagnostics, prints exact status counts and the receipt digest, and exits nonzero if the strict mismatch/fault gate fails. CI should archive the correctness JSON even on nonzero exit. Run without `--performance` for the normative semantic gate.

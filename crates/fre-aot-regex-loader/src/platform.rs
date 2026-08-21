@@ -181,6 +181,32 @@ mod implementation {
         usize::try_from(raw).map_err(|_| libc::EOVERFLOW)
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub(crate) fn current_thread_sve_vector_length_bytes() -> Result<Option<u16>, i32> {
+        const PR_SVE_GET_VL: libc::c_int = 51;
+        const PR_SVE_VL_LEN_MASK: libc::c_int = 0xffff;
+        // SAFETY: PR_SVE_GET_VL ignores its four unsigned-long arguments and
+        // reads only the calling thread's architectural SVE state.
+        let raw = unsafe { libc::prctl(PR_SVE_GET_VL, 0, 0, 0, 0) };
+        if raw < 0 {
+            return Err(errno());
+        }
+        let bytes = u16::try_from(raw & PR_SVE_VL_LEN_MASK).map_err(|_| libc::EOVERFLOW)?;
+        if !(16..=256).contains(&bytes) || !bytes.is_multiple_of(16) {
+            return Err(libc::EPROTO);
+        }
+        Ok(Some(bytes))
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "all cfg variants share the Linux prctl failure-capable signature"
+    )]
+    pub(crate) const fn current_thread_sve_vector_length_bytes() -> Result<Option<u16>, i32> {
+        Ok(None)
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub(crate) unsafe fn synchronize_instruction_cache(_start: *mut c_void, _bytes: usize) {}
 
@@ -451,6 +477,14 @@ mod implementation {
         Err(0)
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "all cfg variants share the Linux prctl failure-capable signature"
+    )]
+    pub(crate) const fn current_thread_sve_vector_length_bytes() -> Result<Option<u16>, i32> {
+        Ok(None)
+    }
+
     pub(crate) unsafe fn synchronize_instruction_cache(_start: *mut c_void, _bytes: usize) {}
 
     #[cfg(test)]
@@ -459,7 +493,9 @@ mod implementation {
     }
 }
 
-pub(crate) use implementation::{Mapping, page_size, synchronize_instruction_cache};
+pub(crate) use implementation::{
+    Mapping, current_thread_sve_vector_length_bytes, page_size, synchronize_instruction_cache,
+};
 
 #[cfg(test)]
 pub(crate) use implementation::live_mappings;

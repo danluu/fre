@@ -1,10 +1,13 @@
 use std::{fs, path::PathBuf};
 
 use fre_holdout::{
-    AuthenticatedSuite, CaseSpec, DigestManifest, DimensionDeclaration, ExecutionMode,
-    ExplicitInput, GeneratorSpec, OracleDeclaration, PERFORMANCE_SCHEMA, Status, SuiteManifest,
-    TimingEngine, TimingPolicy, authenticate_bytes, authenticate_paths, derive_digest_manifest,
-    enforce_strict_gate, expand_manifest, run_correctness, run_performance,
+    AOT_SELECTED_END_CORRECTNESS_SCHEMA, AotSelectedEndComparisonStatus, AotSelectedEndDisposition,
+    AotSelectedEndWindowKind, AuthenticatedSuite, CaseSpec, DigestManifest, DimensionDeclaration,
+    ExecutionMode, ExplicitInput, GeneratorSpec, OracleDeclaration, PERFORMANCE_SCHEMA, Status,
+    SuiteManifest, TimingEngine, TimingPolicy, authenticate_bytes, authenticate_paths,
+    derive_digest_manifest, enforce_aot_selected_end_strict_gate, enforce_strict_gate,
+    expand_manifest, run_aot_selected_end_correctness, run_correctness, run_performance,
+    validate_aot_selected_end_correctness,
 };
 
 const RECEIPTS_SHA256: &str = "d461acc096b999d14c03ce23593411f6e3093c126a27f8885db3142746633abe";
@@ -93,6 +96,142 @@ fn correctness_receipts_are_deterministic_and_strict_gate_is_clean() {
     let mut failing = first;
     failing.coverage.by_status.insert(Status::Fail, 1);
     assert!(enforce_strict_gate(&failing).is_err());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the frozen AOT test keeps exact case, window, terminal, and validator closure assertions together"
+)]
+fn frozen_suite_native_aot_selected_end_covers_every_applicable_input() {
+    let authenticated = authenticate_paths(
+        &research_path("suite.json"),
+        &research_path("schema.json"),
+        &research_path("digests.json"),
+    )
+    .expect("authenticate frozen suite");
+    let report = run_aot_selected_end_correctness(&authenticated)
+        .expect("run native AOT SelectedEnd correctness");
+    assert_eq!(report.schema, AOT_SELECTED_END_CORRECTNESS_SCHEMA);
+    assert_eq!(report.coverage.case_patterns, 19);
+    assert_eq!(report.coverage.expanded_inputs, 169);
+    assert_eq!(report.coverage.search_windows, 338);
+    assert_eq!(
+        report
+            .coverage
+            .by_case_disposition
+            .values()
+            .copied()
+            .sum::<usize>(),
+        19
+    );
+    assert_eq!(
+        report
+            .coverage
+            .by_input_status
+            .values()
+            .copied()
+            .sum::<usize>(),
+        338
+    );
+    assert_eq!(
+        report
+            .comparisons
+            .iter()
+            .filter(|receipt| receipt.window_kind == AotSelectedEndWindowKind::Full)
+            .count(),
+        169
+    );
+    let bounded = report
+        .comparisons
+        .iter()
+        .filter(|receipt| receipt.window_kind == AotSelectedEndWindowKind::MidscanNonzeroBounded)
+        .collect::<Vec<_>>();
+    assert_eq!(bounded.len(), 169);
+    assert!(bounded.iter().all(|receipt| {
+        receipt.independent_oracle_kind == "regex-automata-0.4.15-meta-input-span"
+            && receipt.portable_call_attempted
+            && receipt.native_call_attempted
+            && receipt.expected_end == receipt.independent_end
+            && receipt.actual_end == receipt.expected_end
+    }));
+    assert!(report.comparisons.iter().all(|receipt| {
+        receipt.window_kind != AotSelectedEndWindowKind::MidscanNonzeroBounded
+            || (receipt.window_start > 0 && receipt.window_end < receipt.haystack_bytes)
+    }));
+    let ready_windows = report
+        .cases
+        .iter()
+        .filter(|case| case.disposition == AotSelectedEndDisposition::Ready)
+        .map(|case| case.search_window_count)
+        .sum::<usize>();
+    assert_eq!(report.coverage.applicable_search_windows, ready_windows);
+    for case in report
+        .cases
+        .iter()
+        .filter(|case| case.disposition == AotSelectedEndDisposition::Ready)
+    {
+        let compiler = case.compiler.as_ref().expect("successful compiler receipt");
+        let publication = case
+            .publication
+            .as_ref()
+            .expect("successful publication receipt");
+        assert_eq!(compiler.output_contract, "SelectedEnd");
+        assert_eq!(compiler.entry_abi, "SelectedEndSearchV1");
+        assert!(!compiler.machine.reverse_start_recovery);
+        assert_eq!(compiler.object_sha256, publication.identity_sha256);
+    }
+    for case in &report.cases {
+        for receipt in report
+            .comparisons
+            .iter()
+            .filter(|receipt| receipt.case_id == case.case_id)
+        {
+            match case.disposition {
+                AotSelectedEndDisposition::Ready => {
+                    assert!(receipt.native_call_attempted);
+                    assert_ne!(receipt.status, AotSelectedEndComparisonStatus::Declined);
+                }
+                AotSelectedEndDisposition::Declined => {
+                    assert!(!receipt.native_call_attempted);
+                    assert_eq!(receipt.status, AotSelectedEndComparisonStatus::Declined);
+                    assert_eq!(receipt.reason_code, case.reason_code);
+                }
+                AotSelectedEndDisposition::Fault => {
+                    assert!(!receipt.native_call_attempted);
+                    assert_eq!(receipt.status, AotSelectedEndComparisonStatus::Fault);
+                    assert_eq!(receipt.reason_code, case.reason_code);
+                }
+            }
+        }
+    }
+    validate_aot_selected_end_correctness(&authenticated, &report)
+        .expect("frozen AOT correctness closure");
+    let has_failure_or_fault = report
+        .coverage
+        .by_input_status
+        .get(&AotSelectedEndComparisonStatus::Fail)
+        .copied()
+        .unwrap_or(0)
+        > 0
+        || report
+            .coverage
+            .by_input_status
+            .get(&AotSelectedEndComparisonStatus::Fault)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        || report
+            .coverage
+            .by_case_disposition
+            .get(&AotSelectedEndDisposition::Fault)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+    assert_eq!(
+        enforce_aot_selected_end_strict_gate(&report).is_err(),
+        has_failure_or_fault
+    );
 }
 
 fn timing_fixture() -> AuthenticatedSuite {

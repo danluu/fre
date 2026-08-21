@@ -6,6 +6,27 @@ use super::*;
 
 static PUBLICATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn current_thread_sve_vector_length_receipt_is_structurally_valid_when_applicable() {
+    let target = host_target().expect("supported test host");
+    if target
+        .features
+        .contains(FeatureSet::of(CpuFeature::Aarch64Sve))
+    {
+        let bytes = current_thread_sve_vector_length_bytes()
+            .expect("query current-thread SVE vector length")
+            .expect("SVE target has an applicable vector-length receipt");
+        assert!((16..=256).contains(&bytes));
+        assert_eq!(bytes % 16, 0);
+    } else if !cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        assert_eq!(
+            current_thread_sve_vector_length_bytes()
+                .expect("non-Linux/AArch64 SVE query is inapplicable"),
+            None
+        );
+    }
+}
+
 fn compile_span(pattern: &str) -> CompiledRegex {
     let compiled = compile(
         CompileRequest::new(pattern, host_target().expect("supported test host"))
@@ -148,6 +169,47 @@ fn direct_selected_end_matches_portable_for_full_and_subwindows() {
             }
         }
     }
+}
+
+#[test]
+fn direct_subwindows_preserve_full_haystack_anchor_context() {
+    let _lock = PUBLICATION_TEST_LOCK.lock().unwrap();
+    let haystack = b"prefix-tail-suffix";
+    let window = SearchWindow::new(7, 11);
+    for (pattern, window, expected) in [
+        (r"tail\z", window, None),
+        (r"\Atail", window, None),
+        (r"(?:)", window, Some(7)),
+        (r"\Aprefix", SearchWindow::new(0, 6), Some(6)),
+        (r"suffix\z", SearchWindow::new(12, haystack.len()), Some(18)),
+        (
+            r"\z",
+            SearchWindow::new(haystack.len(), haystack.len()),
+            Some(haystack.len()),
+        ),
+    ] {
+        let compiled = compile_selected_end(pattern);
+        let portable = compiled.clone();
+        let published = publish_selected_end(compiled, PublicationLimits::default())
+            .unwrap_or_else(|error| panic!("publish {pattern:?}: {error}"));
+        let portable_end = portable_selected_end(&portable, haystack, window);
+        assert_eq!(
+            published.search(haystack, window).unwrap(),
+            portable_end,
+            "native/portable parity for {pattern:?} in {window:?}"
+        );
+        assert_eq!(portable_end, expected, "{pattern:?} in {window:?}");
+    }
+
+    let compiled = compile_span(r"tail\z");
+    let portable = compiled.clone();
+    let span = publish_span(compiled, PublicationLimits::default())
+        .expect("publish full-context bounded Span matcher");
+    assert_eq!(
+        span.search(haystack, window).unwrap(),
+        portable_span(&portable, haystack, window)
+    );
+    assert_eq!(span.search(haystack, window).unwrap(), None);
 }
 
 #[test]

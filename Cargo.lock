@@ -354,11 +354,14 @@ name = "fre-holdout"
 version = "0.1.0"
 dependencies = [
  "fre",
+ "fre-aot-regex",
+ "fre-aot-regex-loader",
  "fre-automata",
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
  "regex 1.12.4",
+ "regex-automata 0.4.15",
  "serde",
  "serde_json",
  "sha2",

@@ -8,6 +8,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aot_selected_end;
+
+pub use aot_selected_end::{
+    AOT_SELECTED_END_CORRECTNESS_SCHEMA, AOT_SELECTED_END_PERFORMANCE_SCHEMA,
+    AotSelectedEndComparisonStatus, AotSelectedEndCorrectnessReport, AotSelectedEndDisposition,
+    AotSelectedEndPerformanceCoverage, AotSelectedEndPerformanceReport, AotSelectedEndRunConfig,
+    AotSelectedEndWindowKind, enforce_aot_selected_end_readiness_floor,
+    enforce_aot_selected_end_strict_gate, run_aot_selected_end, run_aot_selected_end_correctness,
+    run_aot_selected_end_performance, validate_aot_selected_end_correctness,
+    validate_aot_selected_end_performance,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,

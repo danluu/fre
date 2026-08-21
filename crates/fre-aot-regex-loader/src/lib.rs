@@ -11,8 +11,11 @@
 //!
 //! No portable executor or runtime helper is selected on refusal. A grep
 //! integration can compile and publish on a background thread, atomically
-//! share the returned cloneable handle at a file boundary, and retain its
-//! stock matcher for every [`PublicationError`].
+//! share the returned cloneable handle at any caller-defined checked
+//! [`SearchWindow`] boundary (including a nonzero start inside one file), and
+//! retain its stock matcher for every [`PublicationError`]. The full haystack
+//! remains the assertion domain; callers must decline a mid-file cutover when
+//! their query cannot be split without changing haystack-anchor semantics.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unsafe_code)]
@@ -227,7 +230,8 @@ pub struct PublishedSpan {
 
 impl PublishedSpan {
     /// Search one checked half-open window with the compiler-produced native
-    /// entry.
+    /// entry. The complete haystack remains available as assertion context;
+    /// the window only bounds admissible match starts and ends.
     #[inline]
     #[allow(
         unsafe_code,
@@ -255,6 +259,10 @@ impl PublishedSpan {
         // after all module bytes became immutable and executable. This borrow
         // keeps the Arc-owned mapping live; the checked haystack/window and
         // aligned disjoint result slot remain valid for the complete call.
+        // The native text length is always the complete haystack length. This
+        // is the same-artifact portable SearchWindow contract: `start..end`
+        // bounds admissible matches without redefining `\A` or `\z` at an
+        // interior cutover boundary.
         let status = unsafe {
             (self.inner.entry)(haystack.as_ptr(), haystack.len(), start, end, &raw mut slot)
         };
@@ -367,7 +375,9 @@ pub struct PublishedSelectedEnd {
 
 impl PublishedSelectedEnd {
     /// Search one checked half-open window with the compiler-produced native
-    /// entry and return its selected exclusive end.
+    /// entry and return its selected exclusive end. The complete haystack
+    /// remains available as assertion context; the window only bounds
+    /// admissible match starts and ends.
     #[inline]
     #[allow(
         unsafe_code,
@@ -395,7 +405,9 @@ impl PublishedSelectedEnd {
         // entry only after all module bytes became immutable and executable.
         // This borrow keeps the Arc-owned mapping live; the checked
         // haystack/window and aligned disjoint result slot remain valid for
-        // the complete call.
+        // the complete call. Passing the full haystack length preserves the
+        // exact portable artifact's absolute-anchor context; the separate
+        // checked `end` still bounds accepted match endpoints.
         let status = unsafe {
             (self.inner.entry)(haystack.as_ptr(), haystack.len(), start, end, &raw mut slot)
         };
@@ -541,6 +553,17 @@ pub fn host_target() -> Result<Target, PublicationError> {
         reason = "unsupported targets retain the typed error tail after cfg-selected host returns"
     )]
     Err(PublicationError::UnsupportedHost)
+}
+
+/// Observe the calling thread's current Linux/AArch64 SVE vector length.
+///
+/// `Ok(None)` means the current platform has no applicable SVE thread-state
+/// query. Callers should require `Some` only when their authenticated target
+/// includes [`CpuFeature::Aarch64Sve`]. The observation is intentionally
+/// separate from [`host_target`]: Linux permits SVE vector length to vary by
+/// thread even though ISA usability is process-wide capability evidence.
+pub fn current_thread_sve_vector_length_bytes() -> Result<Option<u16>, i32> {
+    platform::current_thread_sve_vector_length_bytes()
 }
 
 fn detected_host_features() -> FeatureSet {

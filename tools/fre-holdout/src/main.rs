@@ -1,7 +1,9 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use fre_holdout::{
-    RunConfig, authenticate_paths, derive_digest_manifest, enforce_strict_gate, run,
+    AotSelectedEndComparisonStatus, AotSelectedEndDisposition, AotSelectedEndRunConfig, RunConfig,
+    authenticate_paths, derive_digest_manifest, enforce_aot_selected_end_strict_gate,
+    enforce_strict_gate, run, run_aot_selected_end,
 };
 
 fn main() -> ExitCode {
@@ -18,7 +20,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args_os().skip(1);
     let command = arguments
         .next()
-        .ok_or("usage: fre-holdout derive SUITE SCHEMA | fre-holdout authenticate SUITE SCHEMA DIGESTS | fre-holdout run SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT]")?;
+        .ok_or("usage: fre-holdout derive SUITE SCHEMA | fre-holdout authenticate SUITE SCHEMA DIGESTS | fre-holdout run SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT] | fre-holdout run-aot-selected-end SUITE SCHEMA DIGESTS CORRECTNESS [--performance OUTPUT]")?;
     match command.to_string_lossy().as_ref() {
         "derive" => {
             let suite = next_path(&mut arguments, "suite")?;
@@ -105,8 +107,88 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             enforce_strict_gate(&report)?;
         }
+        "run-aot-selected-end" => run_aot_selected_end_command(&mut arguments)?,
         other => return Err(format!("unknown command {other:?}").into()),
     }
+    Ok(())
+}
+
+fn run_aot_selected_end_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suite = next_path(arguments, "suite")?;
+    let schema = next_path(arguments, "schema")?;
+    let digests = next_path(arguments, "digests")?;
+    let correctness_output = next_path(arguments, "correctness output")?;
+    let performance_output = match arguments.next() {
+        None => None,
+        Some(flag) if flag == "--performance" => Some(next_path(arguments, "performance output")?),
+        Some(other) => {
+            return Err(format!("unexpected argument {}", PathBuf::from(other).display()).into());
+        }
+    };
+    if arguments.next().is_some() {
+        return Err("unexpected argument after output paths".into());
+    }
+    let report = run_aot_selected_end(&AotSelectedEndRunConfig {
+        suite,
+        schema,
+        digests,
+        correctness_output,
+        performance_output,
+    })?;
+    println!(
+        "suite={} aot_selected_end_cases={} ready={} declined={} fault={} source_inputs={} search_windows={} applicable_windows={} pass={} window_declined={} fail={} window_fault={} receipts_sha256={}",
+        report.suite_id,
+        report.coverage.case_patterns,
+        report
+            .coverage
+            .by_case_disposition
+            .get(&AotSelectedEndDisposition::Ready)
+            .copied()
+            .unwrap_or(0),
+        report
+            .coverage
+            .by_case_disposition
+            .get(&AotSelectedEndDisposition::Declined)
+            .copied()
+            .unwrap_or(0),
+        report
+            .coverage
+            .by_case_disposition
+            .get(&AotSelectedEndDisposition::Fault)
+            .copied()
+            .unwrap_or(0),
+        report.coverage.expanded_inputs,
+        report.coverage.search_windows,
+        report.coverage.applicable_search_windows,
+        report
+            .coverage
+            .by_input_status
+            .get(&AotSelectedEndComparisonStatus::Pass)
+            .copied()
+            .unwrap_or(0),
+        report
+            .coverage
+            .by_input_status
+            .get(&AotSelectedEndComparisonStatus::Declined)
+            .copied()
+            .unwrap_or(0),
+        report
+            .coverage
+            .by_input_status
+            .get(&AotSelectedEndComparisonStatus::Fail)
+            .copied()
+            .unwrap_or(0),
+        report
+            .coverage
+            .by_input_status
+            .get(&AotSelectedEndComparisonStatus::Fault)
+            .copied()
+            .unwrap_or(0),
+        report.receipts_sha256
+    );
+    enforce_aot_selected_end_strict_gate(&report)?;
     Ok(())
 }
 
