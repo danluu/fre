@@ -3,8 +3,8 @@
 use std::{alloc::System, borrow::Cow};
 
 use fre::{
-    PlanSelection, PortableBuilder, PortableFindIterRunLimits, SearchLimits, SearchSessionLimits,
-    ValueReplacementOutputLimits,
+    PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits, PortableFindIterRunLimits,
+    SearchLimits, SearchSessionLimits, ValueReplacementOutputLimits,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -58,4 +58,45 @@ fn warm_literal_value_replacement_allocates_only_its_matched_output() {
     assert_eq!(matched_change.allocations, 1, "{matched_change:?}");
     assert_eq!(matched_change.reallocations, 0, "{matched_change:?}");
     assert_eq!(matched_change.deallocations, 0, "{matched_change:?}");
+
+    let fixed = PortableBuilder::new(r"[A-D][\x00-\x7F]Q")
+        .unicode(false)
+        .build()
+        .expect("fixed-predicate allocation regex");
+    assert_eq!(fixed.build_report().plan, PlanKind::FixedPredicateWord64);
+
+    let fixed_absent_region = Region::new(GLOBAL);
+    let fixed_absent = fixed
+        .replace_literal_value(
+            b"xxxxxxxx",
+            b"_",
+            PortableFindIterLimits::unlimited(),
+            ValueReplacementOutputLimits::default(),
+        )
+        .expect("fixed-predicate no-match replacement");
+    let fixed_absent_change = fixed_absent_region.change();
+    assert!(matches!(fixed_absent, Cow::Borrowed(_)));
+    assert_eq!(fixed_absent_change, Stats::default());
+
+    let fixed_match_region = Region::new(GLOBAL);
+    let fixed_match = fixed
+        .replace_literal_value(
+            b"xxxxA!Qxxxx",
+            b"_",
+            PortableFindIterLimits::unlimited(),
+            ValueReplacementOutputLimits::default(),
+        )
+        .expect("fixed-predicate matched replacement");
+    let fixed_match_change = fixed_match_region.change();
+    assert!(matches!(fixed_match, Cow::Owned(_)));
+    assert_eq!(fixed_match.as_ref(), b"xxxx_xxxx");
+    assert_eq!(fixed_match_change.allocations, 1, "{fixed_match_change:?}");
+    assert_eq!(
+        fixed_match_change.reallocations, 0,
+        "{fixed_match_change:?}"
+    );
+    assert_eq!(
+        fixed_match_change.deallocations, 0,
+        "{fixed_match_change:?}"
+    );
 }

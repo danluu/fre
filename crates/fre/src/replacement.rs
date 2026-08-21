@@ -676,8 +676,9 @@ impl PortableRegex {
     ///
     /// # Errors
     ///
-    /// Exact literals execute their first selected-span search directly;
-    /// other plans retain the value iterator and its reusable-session setup.
+    /// Exact literals and fixed-predicate words execute their first
+    /// selected-span search directly; other plans retain the value iterator
+    /// and its reusable-session setup.
     /// Returns a typed setup, first-search, output-bound, allocation or
     /// invariant refusal. The iterator call cap is consumed only for the first
     /// hit or miss; a successful hit never probes for a later match.
@@ -690,8 +691,11 @@ impl PortableRegex {
         output_limits: ValueReplacementOutputLimits,
     ) -> Result<Cow<'h, [u8]>, PortableValueReplacementError> {
         let replacement = replacement.literal_bytes();
-        if self.build_report().plan == crate::PlanKind::ExactLiteral {
-            return replace_exact_literal_value(
+        if matches!(
+            self.build_report().plan,
+            crate::PlanKind::ExactLiteral | crate::PlanKind::FixedPredicateWord64
+        ) {
+            return replace_direct_literal_value(
                 self,
                 haystack,
                 replacement,
@@ -778,7 +782,7 @@ impl PortableRegex {
 }
 
 #[inline(always)]
-fn replace_exact_literal_value<'h>(
+fn replace_direct_literal_value<'h>(
     regex: &PortableRegex,
     haystack: &'h [u8],
     replacement: &[u8],

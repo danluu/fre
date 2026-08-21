@@ -316,6 +316,76 @@ fn exact_literal_value_replacement_matches_the_first_value_iterator_item() {
 }
 
 #[test]
+fn fixed_predicate_value_replacement_matches_the_first_value_iterator_item() {
+    let regex = PortableBuilder::new(r"[A-D][\x00-\x7F]Q")
+        .unicode(false)
+        .build()
+        .expect("fixed-predicate value replacement regex");
+    assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+
+    let limits = [
+        PortableFindIterLimits::unlimited(),
+        PortableFindIterLimits {
+            session: SearchSessionLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            search: SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            },
+            ..PortableFindIterLimits::unlimited()
+        },
+        PortableFindIterLimits {
+            max_search_calls: 0,
+            ..PortableFindIterLimits::unlimited()
+        },
+    ];
+    let output_limits = ValueReplacementOutputLimits {
+        max_output_bytes: usize::MAX,
+        max_output_capacity_bytes: usize::MAX,
+    };
+
+    for haystack in [
+        b"A!Q first".as_slice(),
+        b"prefix D0Q suffix".as_slice(),
+        b"absent".as_slice(),
+        b"".as_slice(),
+    ] {
+        for iterator_limits in limits {
+            let first = regex
+                .find_iter_value(haystack, iterator_limits)
+                .expect("a fixed predicate needs no session resources")
+                .next();
+            let actual =
+                regex.replace_literal_value(haystack, b"X", iterator_limits, output_limits);
+
+            match first {
+                Some(Ok(matched)) => {
+                    let mut expected = Vec::new();
+                    expected.extend_from_slice(&haystack[..matched.start()]);
+                    expected.extend_from_slice(b"X");
+                    expected.extend_from_slice(&haystack[matched.end()..]);
+                    assert_eq!(actual.expect("matching replacement").as_ref(), expected);
+                }
+                Some(Err(error)) => assert_eq!(
+                    actual.expect_err("the direct search must preserve iterator refusal"),
+                    PortableValueReplacementError::Iteration(error),
+                ),
+                None => {
+                    let actual = actual.expect("absent replacement");
+                    assert!(matches!(actual, Cow::Borrowed(_)));
+                    assert_eq!(actual.as_ref(), haystack);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn value_replacement_enforces_exact_output_and_observed_capacity_limits() {
     let regex = PortableBuilder::new(r"[0-9]")
         .unicode(false)
