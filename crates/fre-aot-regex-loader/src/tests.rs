@@ -123,6 +123,8 @@ fn direct_selected_end_matches_portable_for_full_and_subwindows() {
             r"(?-u:\b(?:foo|bar)\b)",
             [b"!foo bar!".as_slice(), b"foobar".as_slice()],
         ),
+        (r"\Afoo", [b"foo bar".as_slice(), b"xfoo".as_slice()]),
+        (r"foo\z", [b"xfoo".as_slice(), b"foo x".as_slice()]),
     ] {
         let compiled = compile_selected_end(pattern);
         let portable = compiled.clone();
