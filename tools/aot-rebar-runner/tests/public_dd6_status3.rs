@@ -248,6 +248,149 @@ fn configured_smoke_klv() -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "recursive Cargo smoke for the helper-free linked native-row bridge"]
+fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
+-> Result<(), DynError> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "fre-aot-rebar-native-rows-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+
+    let result = (|| {
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        for (index, model) in [Model::Count, Model::SpanSum].into_iter().enumerate() {
+            let klv_bytes = configured_native_rows_klv(model);
+            let benchmark = Benchmark::parse(&klv_bytes)?;
+            let expected = oracle(&benchmark)?;
+            let klv = root.join(format!("native-rows-{index}.klv"));
+            let target = root.join(format!("target-{index}"));
+            fs::write(&klv, &klv_bytes)?;
+
+            let built = Command::new(&cargo)
+                .current_dir(workspace_root())
+                .args([
+                    "build",
+                    "--offline",
+                    "--jobs=2",
+                    "-p",
+                    "fre-aot-rebar-runner",
+                    "--bin",
+                    "fre-aot-rebar-runner",
+                ])
+                .env("CARGO_TARGET_DIR", &target)
+                .env("FRE_AOT_REBAR_KLV", &klv)
+                .env("FRE_AOT_REBAR_FEATURES", "none")
+                .env("FRE_AOT_REBAR_SOURCE_COMMIT", "native-row-smoke")
+                .env("FRE_AOT_REBAR_SOURCE_TREE", "native-row-smoke")
+                .output()?;
+            if !built.status.success() {
+                return Err(format!(
+                    "configured native-row build failed for {model:?}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&built.stdout),
+                    String::from_utf8_lossy(&built.stderr),
+                )
+                .into());
+            }
+
+            let runner = target.join("debug").join(format!(
+                "fre-aot-rebar-runner{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let executed = Command::new(&runner)
+                .stdin(Stdio::from(fs::File::open(&klv)?))
+                .output()?;
+            if !executed.status.success() {
+                return Err(format!(
+                    "configured native-row runner failed for {model:?}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&executed.stdout),
+                    String::from_utf8_lossy(&executed.stderr),
+                )
+                .into());
+            }
+            let stdout = std::str::from_utf8(&executed.stdout)?;
+            let (_, actual) = stdout
+                .trim()
+                .split_once(',')
+                .ok_or("native-row output is not nanoseconds,value")?;
+            let actual = actual.parse::<u64>()?;
+            if actual != expected {
+                return Err(format!(
+                    "native-row {model:?} returned {actual}, build-many oracle returned {expected}"
+                )
+                .into());
+            }
+
+            let provenance = Command::new(&runner).arg("--provenance").output()?;
+            if !provenance.status.success() {
+                return Err(format!(
+                    "native-row provenance failed for {model:?}: {}",
+                    String::from_utf8_lossy(&provenance.stderr)
+                )
+                .into());
+            }
+            let provenance = std::str::from_utf8(&provenance.stdout)?;
+            for expected_field in [
+                "native_row_bridge=true",
+                "source_pattern_count=5",
+                "row_artifact_count=4",
+                "aggregate_strategy=native-independent-span-row-selector-v1",
+                "prepare_scope=none",
+                "required_prepare_capabilities=0000000000000000",
+                "required_runtime_symbols= boundary=",
+            ] {
+                if !provenance.contains(expected_field) {
+                    return Err(format!(
+                        "native-row provenance omitted {expected_field:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("preserving failed native-row smoke at {}", root.display());
+            Err(error)
+        }
+    }
+}
+
+fn configured_native_rows_klv(model: Model) -> Vec<u8> {
+    let mut output = Vec::new();
+    let model = model.name().as_bytes();
+    for (key, value) in [
+        ("name", b"synthetic/aot-runner/native-row-bridge".as_slice()),
+        ("model", model),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"false".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("pattern", b"z+".as_slice()),
+        ("pattern", b"ab".as_slice()),
+        ("pattern", b"a".as_slice()),
+        ("pattern", b"ab".as_slice()),
+        ("pattern", b"".as_slice()),
+        ("haystack", b"abx".as_slice()),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+#[test]
 #[ignore = "recursive Cargo smoke for linked prepared Span-fill refills and nullable progress"]
 fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), DynError> {
     const KEYWORD_PATTERN: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";

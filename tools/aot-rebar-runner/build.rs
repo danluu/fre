@@ -57,6 +57,40 @@ fn main() {
         env::var(SOURCE_COMMIT_ENV).unwrap_or_else(|_| "unbound-development".to_owned());
     let source_tree =
         env::var(SOURCE_TREE_ENV).unwrap_or_else(|_| "unbound-development".to_owned());
+    if benchmark.uses_native_row_bridge() {
+        let bridge = shared::compile_native_row_bridge(&benchmark, target)
+            .expect("compile helper-free public Rebar native-row bridge");
+        let mut object_paths = Vec::new();
+        object_paths
+            .try_reserve_exact(bridge.artifacts.len())
+            .expect("reserve native-row object paths");
+        for (index, artifact) in bridge.artifacts.iter().enumerate() {
+            let row_path = output.join(format!("aot-rebar-row-{index}.o"));
+            fs::write(&row_path, artifact.compiled.object())
+                .expect("write linked general AOT native-row object");
+            object_paths.push(row_path);
+        }
+        fs::write(
+            &generated_path,
+            configured_native_row_source(
+                &benchmark,
+                &bridge,
+                &architecture,
+                &operating_system,
+                feature_bits,
+                &source_commit,
+                &source_tree,
+            ),
+        )
+        .expect("write linked general AOT native-row bindings");
+        for row_path in object_paths {
+            println!(
+                "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                row_path.display()
+            );
+        }
+        return;
+    }
     let compiled =
         shared::compile_benchmark(&benchmark, target).expect("compile public Rebar build artifact");
     let (program_symbol, program_len) = compiled
@@ -155,7 +189,10 @@ fn configured_source(
     let required_prepare_capabilities = receipt.required_prepare_capabilities;
     assert!(
         required_prepare_capabilities == 0
-            || matches!(benchmark.model, shared::Model::Compile | shared::Model::Count | shared::Model::SpanSum),
+            || matches!(
+                benchmark.model,
+                shared::Model::Compile | shared::Model::Count | shared::Model::SpanSum
+            ),
         "required Ordered-NFA capability is not legal for this operation model"
     );
     let prepare_config_version = if required_prepare_capabilities == 0 {
@@ -188,6 +225,7 @@ fn configured_source(
         .join(",");
     let mut source = String::new();
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
+    writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = false;").unwrap();
     writeln!(
         source,
         "pub const ADAPTER: &str = {:?};",
@@ -228,6 +266,43 @@ fn configured_source(
         source,
         "pub const EXPECTED_PATTERN: &str = {:?};",
         benchmark.pattern()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_PATTERNS: &[&str] = &[{:?}];",
+        benchmark.pattern()
+    )
+    .unwrap();
+    writeln!(source, "pub const SOURCE_PATTERN_COUNT: usize = 1;").unwrap();
+    writeln!(source, "pub const ROW_ARTIFACT_COUNT: usize = 1;").unwrap();
+    writeln!(
+        source,
+        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
+        compiled.object().len()
+    )
+    .unwrap();
+    writeln!(source, "pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];").unwrap();
+    writeln!(
+        source,
+        "pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &[{entry_symbol:?}];"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.program_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.object_sha256
     )
     .unwrap();
     writeln!(
@@ -362,6 +437,9 @@ fn configured_source(
     source.push_str(
         "pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
     );
+    source.push_str(
+        "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    if row != 0 { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; }\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+    );
     if span_fill_symbol.is_some() {
         source.push_str(
             "pub unsafe fn fill_spans(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, capacity: usize, written_out: *mut usize) -> u32 {\n    unsafe { LINKED_SPAN_FILL(handle, haystack, haystack_len, state, results, capacity, written_out) }\n}\n",
@@ -374,8 +452,285 @@ fn configured_source(
     source
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generated bridge binds every row and source identity component explicitly"
+)]
+fn configured_native_row_source(
+    benchmark: &shared::Benchmark,
+    bridge: &shared::NativeRowBridge,
+    architecture: &str,
+    operating_system: &str,
+    feature_bits: u64,
+    source_commit: &str,
+    source_tree: &str,
+) -> String {
+    assert!(benchmark.uses_native_row_bridge());
+    assert!(!bridge.artifacts.is_empty());
+    assert_eq!(bridge.source_to_artifact.len(), benchmark.patterns.len());
+    assert_eq!(
+        bridge.total_object_bytes,
+        bridge
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.compiled.object().len())
+            .sum::<usize>()
+    );
+
+    let first = &bridge.artifacts[0].compiled;
+    let compiler_version = first.receipt().compiler_version;
+    let optimizer_version = first.receipt().optimizer_version;
+    let first_program_sha256 = first.receipt().program_sha256;
+    let first_object_sha256 = first.receipt().object_sha256;
+    for artifact in &bridge.artifacts {
+        let compiled = &artifact.compiled;
+        assert_eq!(compiled.receipt().compiler_version, compiler_version);
+        assert_eq!(compiled.receipt().optimizer_version, optimizer_version);
+        assert_eq!(compiled.receipt().target, first.receipt().target);
+        assert_eq!(
+            compiled.receipt().output,
+            fre_aot_regex::OutputContract::Span
+        );
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            !compiled
+                .module()
+                .symbols()
+                .iter()
+                .enumerate()
+                .any(|(index, symbol)| {
+                    symbol.section.is_none()
+                        && compiled
+                            .module()
+                            .relocations()
+                            .iter()
+                            .any(|relocation| relocation.symbol == index)
+                })
+        );
+        assert!(compiled.module().prepared_entry_symbol().is_none());
+        assert!(compiled.module().required_runtime_program().is_none());
+    }
+
+    let adapter = match benchmark.model {
+        shared::Model::Count => "general-aot-native-row-bridge-count-v1",
+        shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
+        shared::Model::Compile | shared::Model::GrepCount => {
+            unreachable!("parser excludes this multi-pattern model")
+        }
+    };
+    let aggregate_strategy = "native-independent-span-row-selector-v1";
+    let span_iteration_strategy = if benchmark.model == shared::Model::SpanSum {
+        aggregate_strategy
+    } else {
+        "not-applicable"
+    };
+    let first_source_ordinals = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.first_source_ordinal)
+        .collect::<Vec<_>>();
+    let entry_symbols = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.compiled.module().entry_symbol())
+        .collect::<Vec<_>>();
+    let engines = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| format!("{:?}", artifact.compiled.receipt().engine))
+        .collect::<Vec<_>>();
+    let row_program_hashes = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.compiled.receipt().program_sha256)
+        .collect::<Vec<_>>();
+    let row_object_hashes = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.compiled.receipt().object_sha256)
+        .collect::<Vec<_>>();
+
+    let mut source = String::new();
+    writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
+    writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
+    writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_NAME: &str = {:?};",
+        benchmark.name
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_MODEL: &str = {:?};",
+        benchmark.model.name()
+    )
+    .unwrap();
+    writeln!(source, "pub const PREPARE_OPERATION_FLAGS: u64 = 0;").unwrap();
+    writeln!(source, "pub const PREPARE_CONFIG_VERSION: u32 = 0;").unwrap();
+    writeln!(source, "pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;").unwrap();
+    writeln!(source, "pub const EXPECTED_PATTERN: &str = \"\";").unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_PATTERNS: &[&str] = &{:?};",
+        benchmark.patterns
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SOURCE_PATTERN_COUNT: usize = {};",
+        benchmark.patterns.len()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_ARTIFACT_COUNT: usize = {};",
+        bridge.artifacts.len()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
+        bridge.total_object_bytes
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SOURCE_TO_ARTIFACT: &[usize] = &{:?};",
+        bridge.source_to_artifact
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &{first_source_ordinals:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &{row_program_hashes:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &{row_object_hashes:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_UNICODE: bool = {};",
+        benchmark.unicode
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_CASE_INSENSITIVE: bool = {};",
+        benchmark.case_insensitive
+    )
+    .unwrap();
+    writeln!(source, "pub const TARGET_ARCH: &str = {architecture:?};").unwrap();
+    writeln!(source, "pub const TARGET_OS: &str = {operating_system:?};").unwrap();
+    writeln!(source, "pub const FEATURE_BITS: u64 = {feature_bits};").unwrap();
+    writeln!(source, "pub const SOURCE_COMMIT: &str = {source_commit:?};").unwrap();
+    writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
+    writeln!(source, "pub const PROGRAM_LEN: usize = 0;").unwrap();
+    writeln!(source, "pub const PROGRAM_SYMBOL: &str = \"\";").unwrap();
+    writeln!(source, "pub const REDUCER_SYMBOL: &str = \"\";").unwrap();
+    writeln!(
+        source,
+        "pub const ENTRY_SYMBOL: &str = \"native-row-table\";"
+    )
+    .unwrap();
+    writeln!(source, "pub const SPAN_FILL_SYMBOL: &str = \"\";").unwrap();
+    writeln!(source, "pub const HAS_SPAN_FILL: bool = false;").unwrap();
+    writeln!(
+        source,
+        "pub const SPAN_ITERATION_STRATEGY: &str = {span_iteration_strategy:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const GREP_ITERATION_STRATEGY: &str = \"not-applicable\";"
+    )
+    .unwrap();
+    writeln!(source, "pub const PREPARED_BULK_STRATEGY: &str = \"None\";").unwrap();
+    writeln!(source, "pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";").unwrap();
+    writeln!(
+        source,
+        "pub const ENGINE: &str = {:?};",
+        format!("IndependentNativeSpanRows({})", engines.join(","))
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const AGGREGATE_STRATEGY: &str = {aggregate_strategy:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const COMPILER_VERSION: u32 = {compiler_version};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OPTIMIZER_VERSION: u32 = {optimizer_version};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PROGRAM_SHA256: [u8; 32] = {first_program_sha256:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {first_object_sha256:?};"
+    )
+    .unwrap();
+    writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
+    source.push_str(
+        "pub type LinkedRowSearch = unsafe extern \"C\" fn(*const u8, usize, usize, usize, *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
+    );
+    source.push_str("unsafe extern \"C\" {\n");
+    for (index, entry_symbol) in entry_symbols.iter().enumerate() {
+        writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
+        writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
+    }
+    source.push_str("}\n");
+    source.push_str("pub static LINKED_ROW_SEARCHES: &[LinkedRowSearch] = &[\n");
+    for index in 0..entry_symbols.len() {
+        writeln!(source, "    LINKED_ROW_ENTRY_{index},").unwrap();
+    }
+    source.push_str("];\n");
+    source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
+    source.push_str(
+        "pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+    );
+    source.push_str(
+        "pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+    );
+    source.push_str(
+        "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    let Some(search) = LINKED_ROW_SEARCHES.get(row) else { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; };\n    unsafe { search(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+    );
+    source.push_str(
+        "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+    );
+    source
+}
+
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
+pub const NATIVE_ROW_BRIDGE: bool = false;
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
@@ -383,6 +738,15 @@ pub const PREPARE_OPERATION_FLAGS: u64 = 0;
 pub const PREPARE_CONFIG_VERSION: u32 = 2;
 pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;
 pub const EXPECTED_PATTERN: &str = "";
+pub const EXPECTED_PATTERNS: &[&str] = &[];
+pub const SOURCE_PATTERN_COUNT: usize = 0;
+pub const ROW_ARTIFACT_COUNT: usize = 0;
+pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;
+pub const SOURCE_TO_ARTIFACT: &[usize] = &[];
+pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];
+pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];
+pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[];
+pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[];
 pub const EXPECTED_UNICODE: bool = false;
 pub const EXPECTED_CASE_INSENSITIVE: bool = false;
 pub const TARGET_ARCH: &str = "";
@@ -415,6 +779,14 @@ pub unsafe fn reduce(
     _value_out: *mut u64,
 ) -> u32 { 2 }
 pub unsafe fn search(
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _window_start: usize,
+    _window_end: usize,
+    _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
+) -> u32 { 2 }
+pub unsafe fn search_row(
+    _row: usize,
     _haystack: *const u8,
     _haystack_len: usize,
     _window_start: usize,

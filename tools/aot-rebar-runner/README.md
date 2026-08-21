@@ -5,10 +5,13 @@ This is a distinct, job-specialized Rebar engine for the general
 `tools/rebar-compare/examples/fre_rebar_runner.rs`, which measures the public
 portable FRE facade.
 
-The checked-in build script consumes one public Rebar KLV file, compiles one
-single-pattern general-AOT artifact, writes its relocatable object into
-`OUT_DIR`, and statically links that exact object into the runner. A build with
-no KLV remains a harmless unconfigured workspace binary.
+The checked-in build script consumes one public Rebar KLV file. The incumbent
+single-pattern route compiles one general-AOT artifact, writes its relocatable
+object into `OUT_DIR`, and statically links that exact object into the runner.
+The additive multi-pattern `count`/`count-spans` route compiles an ordinary
+Optimizing+Span object for each distinct source row and links the deduplicated
+helper-free native objects. A build with no KLV remains a harmless
+unconfigured workspace binary.
 
 ```sh
 rebar klv --max-iters 9 --max-warmup-iters 1 \
@@ -37,11 +40,11 @@ not admissible evidence.
 ## Operation contract
 
 The adapter supports the public `count`, `count-spans`, and `grep` models for
-exactly one pattern. Dispatch depends only on the typed model, not on a
-benchmark name. It deliberately rejects `compile`: emitting a relocatable
-object is not the Rebar operation of constructing a regex that is ready to
-search. Object-emission timing belongs to a separately named compiler-stage
-benchmark.
+one pattern, plus ordered multi-pattern `count` and `count-spans`. Dispatch
+depends only on the typed model and pattern cardinality, not on a benchmark
+name. It deliberately rejects `compile`: emitting a relocatable object is not
+the Rebar operation of constructing a regex that is ready to search.
+Object-emission timing belongs to a separately named compiler-stage benchmark.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
@@ -61,6 +64,26 @@ benchmark.
   call reports a match. The prepared whole-haystack `GrepCount` export may be
   linked to provision the shared program/handle, but is never called by the
   timed Rebar grep operation.
+
+For a multi-pattern scalar job, exact duplicate source rows are compiled once;
+distinct source spellings that produce the same complete entry/object are also
+linked once. The retained artifacts remain ordered by their first source
+ordinal. On every iterator window the runner calls every row's ordinary native
+Span entry, validates every result (including losing rows), selects the lowest
+match start, and uses the lowest source ordinal to break a start tie. The
+winning row's own leftmost-first endpoint is authoritative. The outer iterator
+then applies the same byte-wise empty progress and adjacent-empty suppression
+as pinned `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in
+local checked state and are published only after the complete traversal.
+
+This bridge has no prepared handle, serialized runtime program, scalar helper,
+or input-dependent deoptimization edge. Build-time admission rejects the
+entire job when any row has an unresolved runtime function, a helper-backed
+receipt, a prepared entry/program, a missing/zero-sized public native entry, or
+any prepared aggregate state. It also rejects more than 4,096 source rows or
+more than 256 MiB of distinct row objects before linking. These are explicit
+fail-closed resource limits; the bridge never mixes native rows with a portable
+semantic fallback.
 
 One exclusive handle is prepared from the exact linked program before every
 warmup/timed loop and destroyed after all samples. Handle preparation,
@@ -144,9 +167,12 @@ host tier with `FRE_AOT_REBAR_BENCHMARK_FILTER=<exact-name>` and
 mandatory default remains the complete four-row, base-plus-SIMD correctness
 matrix.
 
-Capture replay, ordered-many, RegexSet, literal replacement/regex-redux and
-future `MatchStats` are separate typed extensions. They must not be emulated by
-benchmark-name recognition or silently folded into these scalar contracts.
+Capture replay, RegexSet all-ID publication, literal replacement/regex-redux
+and future `MatchStats` are separate typed extensions. They must not be
+emulated by benchmark-name recognition or silently folded into these scalar
+contracts. The native-row bridge implements Rebar's ordered `build_many`
+single-match stream; it is not an all-matching RegexSet and does not claim a
+shared-scan automaton.
 
 ## HEAD campaign reporting
 

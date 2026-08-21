@@ -1,12 +1,21 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, CompiledRegex, FeatureSet, OperatingSystem,
-    OutputContract, PreparedAggregateExports, Target, compile_with_prepared_aggregate_exports,
+    OutputContract, PreparedAggregateExports, SymbolBinding, SymbolKind, Target, compile,
+    compile_with_prepared_aggregate_exports,
 };
 use fre_syntax::RustProfile;
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
+/// Maximum source rows accepted by the additive independent-native-row bridge.
+///
+/// This matches the ordinary multi-pattern facade's default construction
+/// envelope. It is checked before any row compilation or build-script output.
+pub const MAX_NATIVE_ROW_BRIDGE_PATTERNS: usize = 4_096;
+/// Maximum combined bytes of distinct relocatable row objects linked into one
+/// job-specialized bridge binary.
+pub const MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES: usize = 256 * 1_048_576;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Model {
@@ -199,10 +208,24 @@ impl Benchmark {
             max_time: required(max_time, "max-time")?,
             max_warmup_time: required(max_warmup_time, "max-warmup-time")?,
         };
-        if benchmark.patterns.len() != 1 {
+        if benchmark.patterns.is_empty() {
+            return Err(
+                "current linked general-AOT operation requires at least one pattern".to_owned(),
+            );
+        }
+        if benchmark.patterns.len() > 1 && !matches!(benchmark.model, Model::Count | Model::SpanSum)
+        {
             return Err(format!(
-                "current linked general-AOT operation requires exactly one pattern, got {}",
+                "current linked general-AOT multi-pattern bridge supports only count and count-spans, got model {:?} with {} patterns",
+                benchmark.model,
                 benchmark.patterns.len()
+            ));
+        }
+        if benchmark.patterns.len() > MAX_NATIVE_ROW_BRIDGE_PATTERNS {
+            return Err(format!(
+                "general-AOT native-row bridge pattern count {} exceeds limit {}",
+                benchmark.patterns.len(),
+                MAX_NATIVE_ROW_BRIDGE_PATTERNS
             ));
         }
         if benchmark.max_iters == 0 {
@@ -212,7 +235,17 @@ impl Benchmark {
     }
 
     pub fn pattern(&self) -> &str {
+        debug_assert_eq!(
+            self.patterns.len(),
+            1,
+            "single-pattern accessor used for a native-row bridge"
+        );
         &self.patterns[0]
+    }
+
+    #[must_use]
+    pub fn uses_native_row_bridge(&self) -> bool {
+        self.patterns.len() > 1
     }
 
     pub fn same_compilation_identity(&self, other: &Self) -> bool {
@@ -246,6 +279,12 @@ pub fn target_from_parts(
 }
 
 pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<CompiledRegex, String> {
+    if benchmark.uses_native_row_bridge() {
+        return Err(
+            "single-artifact compilation cannot compile a multi-pattern native-row bridge"
+                .to_owned(),
+        );
+    }
     let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = benchmark.unicode;
     profile.options.case_insensitive = benchmark.case_insensitive;
@@ -255,6 +294,199 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         .mode(CompileMode::Optimizing);
     compile_with_prepared_aggregate_exports(request, benchmark.model.exports())
         .map_err(|error| format!("general AOT compilation failed: {error}"))
+}
+
+/// One distinct helper-free native `Span` object in source-priority order.
+#[derive(Clone, Debug)]
+pub struct NativeRowArtifact {
+    pub compiled: CompiledRegex,
+    pub first_source_ordinal: usize,
+}
+
+/// Build-time result for the independent native-row bridge.
+#[derive(Clone, Debug)]
+pub struct NativeRowBridge {
+    pub artifacts: Vec<NativeRowArtifact>,
+    pub source_to_artifact: Vec<usize>,
+    pub total_object_bytes: usize,
+}
+
+/// Compile and authenticate one ordinary native `Span` object per distinct row.
+///
+/// Exact duplicate source rows are compiled once. If distinct source strings
+/// nevertheless produce the same complete link artifact, that artifact is
+/// retained once at its lowest source ordinal. Any row that exposes a
+/// prepared/runtime route rejects the entire bridge; the timed Rust selector
+/// can therefore reach only generated native ordinary entries.
+pub fn compile_native_row_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<NativeRowBridge, String> {
+    if !benchmark.uses_native_row_bridge()
+        || !matches!(benchmark.model, Model::Count | Model::SpanSum)
+    {
+        return Err(
+            "native-row bridge compilation requires a multi-pattern count or count-spans job"
+                .to_owned(),
+        );
+    }
+    if benchmark.patterns.len() > MAX_NATIVE_ROW_BRIDGE_PATTERNS {
+        return Err(format!(
+            "general-AOT native-row bridge pattern count {} exceeds limit {}",
+            benchmark.patterns.len(),
+            MAX_NATIVE_ROW_BRIDGE_PATTERNS
+        ));
+    }
+
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let mut source_artifacts = BTreeMap::<&str, usize>::new();
+    let mut link_artifacts = BTreeMap::<String, usize>::new();
+    let mut defined_link_symbols = BTreeMap::<String, usize>::new();
+    let mut artifacts = Vec::<NativeRowArtifact>::new();
+    let mut source_to_artifact = Vec::new();
+    source_to_artifact
+        .try_reserve_exact(benchmark.patterns.len())
+        .map_err(|_| "native-row bridge source map allocation failed".to_owned())?;
+    let mut total_object_bytes = 0_usize;
+
+    for (source_ordinal, pattern) in benchmark.patterns.iter().enumerate() {
+        if let Some(&artifact_index) = source_artifacts.get(pattern.as_str()) {
+            source_to_artifact.push(artifact_index);
+            continue;
+        }
+
+        let request = CompileRequest::new(pattern, target)
+            .profile(profile.clone())
+            .output(OutputContract::Span)
+            .mode(CompileMode::Optimizing);
+        let compiled = compile(request).map_err(|error| {
+            format!(
+                "general AOT native-row compilation failed at source ordinal {source_ordinal}: {error}"
+            )
+        })?;
+        authenticate_native_row(&compiled, source_ordinal)?;
+
+        let entry = compiled.module().entry_symbol().to_owned();
+        let artifact_index = if let Some(&existing) = link_artifacts.get(&entry) {
+            let prior = &artifacts[existing].compiled;
+            if prior.object() != compiled.object()
+                || prior.receipt().object_sha256 != compiled.receipt().object_sha256
+            {
+                return Err(format!(
+                    "native-row entry symbol collision at source ordinal {source_ordinal}: {entry:?}"
+                ));
+            }
+            existing
+        } else {
+            let prospective = total_object_bytes
+                .checked_add(compiled.object().len())
+                .ok_or_else(|| "native-row bridge object-byte total overflowed".to_owned())?;
+            if prospective > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES {
+                return Err(format!(
+                    "general-AOT native-row bridge objects require {prospective} bytes, limit is {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES}"
+                ));
+            }
+            let index = artifacts.len();
+            for symbol in compiled.module().symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global && symbol.section.is_some()
+            }) {
+                if let Some(&prior) = defined_link_symbols.get(&symbol.name) {
+                    return Err(format!(
+                        "native-row source ordinal {source_ordinal} defines link symbol {:?} already owned by artifact {prior}",
+                        symbol.name
+                    ));
+                }
+            }
+            artifacts
+                .try_reserve(1)
+                .map_err(|_| "native-row bridge artifact allocation failed".to_owned())?;
+            artifacts.push(NativeRowArtifact {
+                compiled,
+                first_source_ordinal: source_ordinal,
+            });
+            for symbol in artifacts[index]
+                .compiled
+                .module()
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.binding == SymbolBinding::Global && symbol.section.is_some()
+                })
+            {
+                defined_link_symbols.insert(symbol.name.clone(), index);
+            }
+            link_artifacts.insert(entry, index);
+            total_object_bytes = prospective;
+            index
+        };
+        source_artifacts.insert(pattern.as_str(), artifact_index);
+        source_to_artifact.push(artifact_index);
+    }
+
+    Ok(NativeRowBridge {
+        artifacts,
+        source_to_artifact,
+        total_object_bytes,
+    })
+}
+
+fn authenticate_native_row(compiled: &CompiledRegex, source_ordinal: usize) -> Result<(), String> {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let entry_name = module.entry_symbol();
+    let entry = module
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == entry_name)
+        .ok_or_else(|| {
+            format!(
+                "native-row source ordinal {source_ordinal} has no public entry record {entry_name:?}"
+            )
+        })?;
+    let runtime_symbols = module.required_runtime_symbols().collect::<Vec<_>>();
+    let unresolved_symbols = module
+        .symbols()
+        .iter()
+        .enumerate()
+        .filter(|(index, symbol)| {
+            symbol.section.is_none()
+                && module
+                    .relocations()
+                    .iter()
+                    .any(|relocation| relocation.symbol == *index)
+        })
+        .map(|(_, symbol)| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    if receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Span
+        || receipt.runtime_helper_required
+        || !runtime_symbols.is_empty()
+        || !unresolved_symbols.is_empty()
+        || module.prepared_entry_symbol().is_some()
+        || module.required_runtime_program().is_some()
+        || !module.prepared_aggregate_exports().is_empty()
+        || module.prepared_count_symbol().is_some()
+        || module.prepared_span_sum_symbol().is_some()
+        || module.prepared_grep_count_symbol().is_some()
+        || module.required_prepare_capabilities() != 0
+        || entry.binding != SymbolBinding::Global
+        || entry.kind != SymbolKind::Function
+        || entry.section.is_none()
+        || entry.size == 0
+    {
+        return Err(format!(
+            "native-row source ordinal {source_ordinal} is not a helper-free ordinary Span entry: engine={:?} runtime_helper={} runtime_symbols={runtime_symbols:?} unresolved_symbols={unresolved_symbols:?} prepared_entry={} runtime_program={} entry_defined={} entry_size={}",
+            receipt.engine,
+            receipt.runtime_helper_required,
+            module.prepared_entry_symbol().is_some(),
+            module.required_runtime_program().is_some(),
+            entry.section.is_some(),
+            entry.size,
+        ));
+    }
+    Ok(())
 }
 
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, String> {
@@ -326,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_and_multi_pattern_models() {
+    fn admits_multi_pattern_reducers_and_rejects_other_multi_models() {
         assert!(Benchmark::parse(&fixture("count-captures", b"(a)", b"a")).is_err());
         assert!(Benchmark::parse(&fixture("compile", b"a", b"a")).is_err());
         let mut multi = fixture("count", b"a", b"a");
@@ -336,7 +568,102 @@ mod tests {
             .position(|window| window == b"haystack")
             .expect("haystack field");
         multi.splice(offset..offset, insertion.iter().copied());
-        assert!(Benchmark::parse(&multi).is_err());
+        let parsed = Benchmark::parse(&multi).expect("multi-pattern Count");
+        assert_eq!(parsed.patterns, ["a", "b"]);
+        assert!(parsed.uses_native_row_bridge());
+
+        let mut multi_grep = fixture("grep", b"a", b"a");
+        let offset = multi_grep
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi_grep.splice(offset..offset, insertion.iter().copied());
+        assert!(Benchmark::parse(&multi_grep).is_err());
+    }
+
+    #[test]
+    fn native_row_bridge_deduplicates_source_rows_and_has_no_helper_surface() {
+        let mut multi = fixture("count-spans", b"a+", b"abba");
+        let insertion = b"pattern:2:a+\npattern:2:b+\n";
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, insertion.iter().copied());
+        let benchmark = Benchmark::parse(&multi).expect("native-row fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let bridge = compile_native_row_bridge(&benchmark, target).expect("native-row bridge");
+        assert_eq!(bridge.source_to_artifact, [0, 0, 1]);
+        assert_eq!(bridge.artifacts.len(), 2);
+        assert_eq!(bridge.artifacts[0].first_source_ordinal, 0);
+        assert_eq!(bridge.artifacts[1].first_source_ordinal, 2);
+        assert_eq!(
+            bridge.total_object_bytes,
+            bridge
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.compiled.object().len())
+                .sum::<usize>()
+        );
+        for artifact in bridge.artifacts {
+            assert!(!artifact.compiled.receipt().runtime_helper_required);
+            assert!(
+                artifact
+                    .compiled
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
+            assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
+        }
+    }
+
+    #[test]
+    fn native_row_bridge_rejects_one_helper_backed_row_transactionally() {
+        let mut multi = fixture("count", b"a+", b"foo");
+        let insertion = b"pattern:7:\\bfoo\\b\n";
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, insertion.iter().copied());
+        let mut benchmark = Benchmark::parse(&multi).expect("helper trap fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let error = compile_native_row_bridge(&benchmark, target)
+            .expect_err("one semantic helper must reject the complete bridge");
+        assert!(error.contains("source ordinal 1"), "{error}");
+        assert!(
+            error.contains("not a helper-free ordinary Span entry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_row_bridge_pattern_cap_fails_before_compilation() {
+        let mut too_many = fixture("count", b"a", b"a");
+        let insertion = b"pattern:1:a\n".repeat(MAX_NATIVE_ROW_BRIDGE_PATTERNS);
+        let offset = too_many
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        too_many.splice(offset..offset, insertion);
+        let error = Benchmark::parse(&too_many).expect_err("pattern cap");
+        assert!(
+            error.contains("pattern count 4097 exceeds limit 4096"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -380,15 +707,11 @@ mod tests {
             assert_eq!(model.prepare_operation_flags(), operation_flags);
         }
         assert_eq!(
-            Model::Count.adapter_for_required_capabilities(
-                PREPARE_CAPABILITY_ORDERED_NFA_V15,
-            ),
+            Model::Count.adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             "general-aot-identity-suffixed-exclusive-count-prepared-v3-required-ordered-nfa-v15",
         );
         assert_eq!(
-            Model::SpanSum.adapter_for_required_capabilities(
-                PREPARE_CAPABILITY_ORDERED_NFA_V15,
-            ),
+            Model::SpanSum.adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
         );
     }
