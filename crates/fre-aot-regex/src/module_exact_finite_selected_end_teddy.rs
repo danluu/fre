@@ -1,9 +1,10 @@
 //! Authenticated direct exact-finite `SelectedEnd` Teddy leaf.
 //!
 //! Teddy finds candidate bases and buckets. A bucket-to-source-ordinal mask
-//! then drives byte-exact verification in original alternation order. False
-//! fingerprints resume scanning at `base + 1`; exhausted long windows return
-//! no match directly. A bounded number of failed exact verifications keeps a
+//! then drives byte-exact verification in original alternation order. After a
+//! false fingerprint, the wrapper consumes the remaining candidate lanes in
+//! the current vector block before advancing; exhausted long windows return no
+//! match directly. A bounded number of failed exact verifications keeps a
 //! collision-heavy window from monopolizing the verifier: the wrapper then
 //! tail-enters the byte-for-byte incumbent at the still-unresolved candidate.
 //! Invalid calls and windows below the fixed setup floor enter it directly.
@@ -977,9 +978,10 @@ fn lower_x86_wrapper(
     let vector = assembler.label()?;
     let scalar = assembler.label()?;
     let vector_candidate = assembler.label()?;
+    let scalar_candidate = assembler.label()?;
     let candidate = assembler.label()?;
     let false_candidate = assembler.label()?;
-    let retry_base = assembler.label()?;
+    let retry_retained = assembler.label()?;
     let next_ordinal = assembler.label()?;
     let exact_loop = assembler.label()?;
     let runtime_fallback = assembler.label()?;
@@ -1003,13 +1005,17 @@ fn lower_x86_wrapper(
     assembler.branch(&[0x0f, 0x82], tail)?;
 
     // Preserve public arguments needed by the bounded-verification fallback,
-    // plus the callee-saved counter and end/result registers used by the leaf.
+    // plus the callee-saved counter and result register used by the leaf. R12
+    // and R13 retain one vector block's base and candidate mask, so public
+    // length/end move to RBP/R15 for the lifetime of the wrapper.
     assembler.instruction(&[0x41, 0x54])?; // push r12
     assembler.instruction(&[0x53])?; // push rbx
     assembler.instruction(&[0x41, 0x55])?; // push r13
     assembler.instruction(&[0x41, 0x56])?; // push r14
-    assembler.instruction(&[0x49, 0x89, 0xf4])?; // r12 = public length
-    assembler.instruction(&[0x49, 0x89, 0xcd])?; // r13 = end
+    assembler.instruction(&[0x41, 0x57])?; // push r15
+    assembler.instruction(&[0x55])?; // push rbp
+    assembler.instruction(&[0x48, 0x89, 0xf5])?; // rbp = public length
+    assembler.instruction(&[0x49, 0x89, 0xcf])?; // r15 = public end
     assembler.instruction(&[0x4d, 0x89, 0xc6])?; // r14 = result
     let mut verification_budget = vec![0xbb]; // mov imm32, ebx
     verification_budget.extend_from_slice(
@@ -1055,18 +1061,24 @@ fn lower_x86_wrapper(
         ))?;
     x86_emit_start_filter_scalar_bound(&mut assembler, maximum_offset, exhausted)?;
     x86_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
-    assembler.branch(&[0x0f, 0x85], candidate)?;
+    assembler.branch(&[0x0f, 0x85], scalar_candidate)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     assembler.branch(&[0xe9], scalar)?;
 
     assembler.bind(vector_candidate)?;
-    x86_emit_first_candidate_lane(&mut assembler, X86CandidateMask::MovemaskEax)?;
-    assembler.instruction(&[0x48, 0x01, 0xc2])?;
+    x86_emit_retain_candidate_mask(&mut assembler, X86CandidateMask::MovemaskEax)?;
+    x86_emit_first_retained_candidate(&mut assembler)?;
     // Vector lanes retained only candidate truth, so recompute the exact
     // bucket identity at the selected base.
     x86_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
     assembler.branch(&[0x0f, 0x85], candidate)?;
-    assembler.branch(&[0xe9], retry_base)?;
+    assembler.branch(&[0xe9], retry_retained)?;
+
+    assembler.bind(scalar_candidate)?;
+    // Give a scalar-tail candidate the same retained-mask contract. Encoding
+    // it as lane 31 makes an exhausted synthetic block advance to base + 1.
+    assembler.instruction(&[0x4c, 0x8d, 0x62, 0xe1])?; // r12 = candidate - 31
+    assembler.instruction(&[0x41, 0xbd, 0, 0, 0, 0x80])?; // r13d = 1 << 31
 
     assembler.bind(candidate)?;
     assembler.instruction(&[0x31, 0xc0])?; // source-ordinal mask = 0
@@ -1124,7 +1136,7 @@ fn lower_x86_wrapper(
     load_width.extend_from_slice(&width_displacement.to_le_bytes());
     assembler.instruction(&load_width)?; // ecx = literal width
     assembler.instruction(&[0x4d, 0x01, 0xcb])?; // r11 += program base
-    assembler.instruction(&[0x4c, 0x89, 0xee])?; // rsi = end
+    assembler.instruction(&[0x4c, 0x89, 0xfe])?; // rsi = end
     assembler.instruction(&[0x48, 0x29, 0xd6])?; // remaining -= candidate
     assembler.instruction(&[0x48, 0x39, 0xce])?; // remaining < width?
     assembler.branch(&[0x0f, 0x82], false_candidate)?;
@@ -1143,18 +1155,29 @@ fn lower_x86_wrapper(
     assembler.bind(false_candidate)?;
     assembler.instruction(&[0x48, 0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x85], next_ordinal)?;
-    assembler.bind(retry_base)?;
-    assembler.instruction(&[0x48, 0xff, 0xc2])?; // retry from base+1
-    assembler.instruction(&[0x4c, 0x89, 0xe9])?; // restore public end
+    assembler.bind(retry_retained)?;
+    x86_emit_clear_first_retained_candidate(&mut assembler)?;
+    let retained_candidate = assembler.label()?;
+    assembler.branch(&[0x0f, 0x85], retained_candidate)?;
+    x86_emit_advance_retained_block(&mut assembler, teddy.vector_bytes)?;
+    assembler.instruction(&[0x4c, 0x89, 0xf9])?; // restore public end
     assembler.branch(&[0xe9], vector)?;
+
+    assembler.bind(retained_candidate)?;
+    x86_emit_first_retained_candidate(&mut assembler)?;
+    x86_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
+    assembler.branch(&[0x0f, 0x85], candidate)?;
+    assembler.branch(&[0xe9], retry_retained)?;
 
     assembler.bind(runtime_fallback)?;
     // RDX still names the first candidate whose exact source-order result is
     // unresolved. Restore the other public arguments and tail-enter the
     // complete incumbent from that base.
-    assembler.instruction(&[0x4c, 0x89, 0xe6])?; // rsi = public length
-    assembler.instruction(&[0x4c, 0x89, 0xe9])?; // rcx = public end
+    assembler.instruction(&[0x48, 0x89, 0xee])?; // rsi = public length
+    assembler.instruction(&[0x4c, 0x89, 0xf9])?; // rcx = public end
     assembler.instruction(&[0x4d, 0x89, 0xf0])?; // r8 = public result
+    assembler.instruction(&[0x5d])?; // pop rbp
+    assembler.instruction(&[0x41, 0x5f])?; // pop r15
     assembler.instruction(&[0x41, 0x5e])?; // pop r14
     assembler.instruction(&[0x41, 0x5d])?; // pop r13
     assembler.instruction(&[0x5b])?; // pop rbx
@@ -1172,6 +1195,8 @@ fn lower_x86_wrapper(
     assembler.bind(exhausted)?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.bind(returned)?;
+    assembler.instruction(&[0x5d])?; // pop rbp
+    assembler.instruction(&[0x41, 0x5f])?; // pop r15
     assembler.instruction(&[0x41, 0x5e])?; // pop r14
     assembler.instruction(&[0x41, 0x5d])?; // pop r13
     assembler.instruction(&[0x5b])?; // pop rbx
@@ -1292,10 +1317,11 @@ fn lower_aarch64_wrapper(
     let vector = assembler.label()?;
     let scalar = assembler.label()?;
     let vector_candidate = assembler.label()?;
+    let scalar_candidate = assembler.label()?;
     let candidate = assembler.label()?;
     let bucket_ready = assembler.label()?;
     let retry_scan = assembler.label()?;
-    let retry_base = assembler.label()?;
+    let retry_retained = assembler.label()?;
     let ordinal_failed = assembler.label()?;
     let next_ordinal = assembler.label()?;
     let exact_loop = assembler.label()?;
@@ -1315,8 +1341,9 @@ fn lower_aarch64_wrapper(
     )?;
     assembler.instruction(aarch64_cmp_x(12, 11)?)?;
     assembler.branch_cond(AARCH64_LO, tail)?;
-    assembler.instruction(aarch64_sub_x_imm(31, 31, 16)?)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
     assembler.instruction(aarch64_store_pair_x(19, 20, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(21, 31, 16)?)?;
     assembler.instruction(aarch64_mov_x(19, 1)?)?; // preserve public length
     assembler.instruction(aarch64_movz_w(
         20,
@@ -1364,13 +1391,21 @@ fn lower_aarch64_wrapper(
                     ))?;
             aarch64_emit_start_filter_scalar_bound(&mut assembler, maximum_offset, exhausted)?;
             aarch64_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
-            assembler.branch_cond(AARCH64_NE, bucket_ready)?;
+            assembler.branch_cond(AARCH64_NE, scalar_candidate)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
             assembler.branch(scalar)?;
 
             assembler.bind(vector_candidate)?;
-            aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
+            assembler.instruction(aarch64_mov_x(21, 2)?)?; // retained block base
+            aarch64_emit_first_retained_candidate_lane(&mut assembler, 24, 21)?;
             assembler.branch(candidate)?;
+
+            assembler.bind(scalar_candidate)?;
+            // Encode one scalar-tail candidate as retained lane 15, so an
+            // exhausted synthetic block advances to candidate + 1.
+            assembler.instruction(aarch64_sub_x_imm(21, 2, 15)?)?;
+            assembler.instruction(aarch64_cmeq_16b(24, 29, 26)?)?;
+            assembler.branch(bucket_ready)?;
         }
         MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
             let partial = assembler.label()?;
@@ -1412,6 +1447,7 @@ fn lower_aarch64_wrapper(
             assembler.branch_cond(AARCH64_EQ, exhausted)?;
 
             assembler.bind(vector_candidate)?;
+            assembler.instruction(aarch64_mov_x(21, 2)?)?; // retained block base
             aarch64_emit_sve_first_candidate(&mut assembler, 1, candidate)?;
             assembler.bind(scalar)?;
             assembler.branch(exhausted)?;
@@ -1427,7 +1463,7 @@ fn lower_aarch64_wrapper(
     // The SVE first-lane helper branches here directly; recover the exact
     // bucket identity that predicates intentionally discard.
     aarch64_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
-    assembler.branch_cond(AARCH64_EQ, retry_base)?;
+    assembler.branch_cond(AARCH64_EQ, retry_retained)?;
     assembler.bind(bucket_ready)?;
     assembler.instruction(aarch64_movz_w(11, 0)?)?; // source-ordinal mask
     aarch64_set_table_address(&mut assembler, 12, layout.bucket_ordinal_masks_offset)?;
@@ -1452,7 +1488,7 @@ fn lower_aarch64_wrapper(
         assembler.instruction(aarch64_exact_orr_x(11, 11, 8)?)?;
         assembler.bind(absent)?;
     }
-    assembler.branch_zero_x(11, retry_base)?;
+    assembler.branch_zero_x(11, retry_retained)?;
 
     assembler.bind(next_ordinal)?;
     assembler.branch_zero_x(20, runtime_fallback)?;
@@ -1483,13 +1519,50 @@ fn lower_aarch64_wrapper(
 
     assembler.bind(ordinal_failed)?;
     assembler.branch_nonzero_x(11, next_ordinal)?;
-    assembler.bind(retry_base)?;
-    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.bind(retry_retained)?;
     match teddy.isa {
         MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
+            // Consume every candidate lane through the rejected base while
+            // retaining the active full/partial predicate. P1 and P0 survive
+            // scalar exact verification; P2 is caller-saved scratch.
+            assembler.instruction(aarch64_add_x_imm(12, 2, 1)?)?;
+            assembler.instruction(aarch64_sve_whilelo_b(2, 21, 12)?)?;
+            assembler.instruction(aarch64_sve_not_b(2, 2)?)?;
+            assembler.instruction(aarch64_sve_and_b(1, 1, 2)?)?;
+            assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+            let retained_candidate = assembler.label()?;
+            assembler.branch_cond(AARCH64_NE, retained_candidate)?;
+            // A final partial P0 has no later candidate block. Advancing it
+            // by a full VL could move X2 beyond the public end and make the
+            // retry loop's unsigned remaining calculation underflow.
+            assembler.instruction(aarch64_sve_cntp_b(12, 0, 0)?)?;
+            assembler.instruction(aarch64_sve_cntb(10)?)?;
+            assembler.instruction(aarch64_cmp_x(12, 10)?)?;
+            assembler.branch_cond(AARCH64_LO, exhausted)?;
+            assembler.instruction(aarch64_sve_addvl(2, 21, 1)?)?;
             assembler.branch(retry_scan)?;
+            assembler.bind(retained_candidate)?;
+            assembler.instruction(aarch64_mov_x(2, 21)?)?;
+            aarch64_emit_sve_first_candidate(&mut assembler, 1, candidate)?;
         }
-        MandatoryTeddyIsa::Aarch64Asimd => assembler.branch(vector)?,
+        MandatoryTeddyIsa::Aarch64Asimd => {
+            // Keep V24 intact. Form an exact `lane >= rejected + 1` mask in
+            // V28, intersect it with the retained candidates, and select the
+            // next lane relative to callee-saved X21.
+            assembler.instruction(aarch64_add_x_imm(12, 2, 1)?)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 12, 21)?)?;
+            assembler.instruction(aarch64_dup_16b_from_w(28, 12)?)?;
+            assembler.instruction(aarch64_cmhs_16b(28, 29, 28)?)?;
+            assembler.instruction(aarch64_and_16b(28, 28, 24)?)?;
+            aarch64_emit_candidate_any(&mut assembler, 28)?;
+            let retained_candidate = assembler.label()?;
+            assembler.branch_cond(AARCH64_NE, retained_candidate)?;
+            assembler.instruction(aarch64_add_x_imm(2, 21, 16)?)?;
+            assembler.branch(vector)?;
+            assembler.bind(retained_candidate)?;
+            aarch64_emit_first_retained_candidate_lane(&mut assembler, 28, 21)?;
+            assembler.branch(candidate)?;
+        }
         MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => {
             return Err(ObjectError::InvalidModule(
                 "x86 Teddy reached AArch64 exact finite SelectedEnd Teddy retry",
@@ -1501,8 +1574,9 @@ fn lower_aarch64_wrapper(
     // X2 still names the first unresolved candidate. Restore public length
     // and the callee-saved registers before tail-entering the incumbent.
     assembler.instruction(aarch64_mov_x(1, 19)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.branch(tail)?;
 
     assembler.bind(matched)?;
@@ -1510,13 +1584,15 @@ fn lower_aarch64_wrapper(
     assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
     assembler.instruction(aarch64_store_x(6, 4, 8)?)?;
     assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(exhausted)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(tail)?;
     let tail_instruction = assembler.instruction(0x1400_0000)?; // patched B core
@@ -3365,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn sve_false_candidate_retry_restores_predicate_nibble_mask_and_vl() {
+    fn sve_retained_mask_exhaustion_restores_predicate_nibble_mask_and_vl() {
         for features in [
             FeatureSet::of(CpuFeature::Aarch64Sve),
             FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
@@ -3386,7 +3462,33 @@ mod tests {
                 .windows(restore.len())
                 .position(|window| window == restore)
                 .expect("SVE retry rematerialization sequence");
-            let retry_advance = aarch64_add_x_imm(2, 2, 1).unwrap();
+            let consume = [
+                aarch64_add_x_imm(12, 2, 1).unwrap(),
+                aarch64_sve_whilelo_b(2, 21, 12).unwrap(),
+                aarch64_sve_not_b(2, 2).unwrap(),
+                aarch64_sve_and_b(1, 1, 2).unwrap(),
+                aarch64_sve_ptest_p0(1).unwrap(),
+            ];
+            assert!(
+                words.windows(consume.len()).any(|window| window == consume),
+                "SVE retry must consume retained P1 lanes under active P0: {target:?}",
+            );
+            let full_block_advance = [
+                aarch64_sve_cntp_b(12, 0, 0).unwrap(),
+                aarch64_sve_cntb(10).unwrap(),
+                aarch64_cmp_x(12, 10).unwrap(),
+            ];
+            assert!(
+                words.windows(full_block_advance.len() + 2).any(|window| {
+                    window[..full_block_advance.len()] == full_block_advance
+                        && window[full_block_advance.len()] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(AARCH64_LO)
+                        && window[full_block_advance.len() + 1]
+                            == aarch64_sve_addvl(2, 21, 1).unwrap()
+                }),
+                "SVE retained exhaustion must distinguish partial P0 before ADDVL: {target:?}",
+            );
+            let retry_advance = aarch64_sve_addvl(2, 21, 1).unwrap();
             let branches_to_restore = words
                 .iter()
                 .enumerate()
@@ -3412,8 +3514,132 @@ mod tests {
                     .filter(|&&word| word == aarch64_sve_ptrue_b())
                     .count()
                     >= 2,
-                "constant load and retry must each establish P0",
+                "constant load and exhausted-block retry must each establish P0",
             );
+            let first_retained = [
+                aarch64_mov_x(2, 21).unwrap(),
+                aarch64_sve_brkb_p0(2, 1).unwrap(),
+                aarch64_sve_incp_b(2, 2).unwrap(),
+            ];
+            assert!(
+                words
+                    .windows(first_retained.len())
+                    .any(|window| window == first_retained),
+                "retained P1 hits must restore the block base before the first-lane helper",
+            );
+        }
+    }
+
+    #[test]
+    fn retained_candidate_masks_have_backend_specific_static_shapes_on_every_tier() {
+        for target in [
+            avx2_target(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx2)
+                        .with(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+        ] {
+            let compiled = compile_selected(&scanner_free_exact_finite_pattern(), target);
+            let code = compiled.module().sections()[TEXT_SECTION].bytes();
+            for (name, sequence) in [
+                (
+                    "retain and select vector candidate",
+                    &[
+                        0x49, 0x89, 0xd4, // r12 = vector block base
+                        0x41, 0x89, 0xc5, // r13d = candidate lanes
+                        0x49, 0x0f, 0xbc, 0xc5, // bsf r13, rax
+                        0x49, 0x8d, 0x14, 0x04, // rdx = r12 + rax
+                    ][..],
+                ),
+                (
+                    "clear retained candidate",
+                    &[
+                        0x49, 0x8d, 0x45, 0xff, // rax = r13 - 1
+                        0x49, 0x21, 0xc5, // r13 &= rax
+                        0x4d, 0x85, 0xed, // test retained mask
+                    ],
+                ),
+                (
+                    "advance exhausted vector block",
+                    &[0x49, 0x8d, 0x54, 0x24, 32], // rdx = r12 + 32
+                ),
+                (
+                    "scalar synthetic retained lane",
+                    &[
+                        0x4c, 0x8d, 0x62, 0xe1, // r12 = rdx - 31
+                        0x41, 0xbd, 0, 0, 0, 0x80, // r13d = 1 << 31
+                    ],
+                ),
+            ] {
+                assert!(
+                    code.windows(sequence.len()).any(|window| window == sequence),
+                    "{name}: {target:?}",
+                );
+            }
+        }
+
+        let asimd = compile_selected(
+            &scanner_free_exact_finite_pattern(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        );
+        let words = asimd.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let retain = [
+            aarch64_mov_x(21, 2).unwrap(),
+            aarch64_orr_16b(28, 24, 24).unwrap(),
+            aarch64_bsl_16b(28, 29, 31).unwrap(),
+            aarch64_uminv_16b(28, 28).unwrap(),
+            aarch64_umov_b0(12, 28).unwrap(),
+            aarch64_add_x_reg(2, 21, 12).unwrap(),
+        ];
+        assert!(words.windows(retain.len()).any(|window| window == retain));
+        let consume = [
+            aarch64_add_x_imm(12, 2, 1).unwrap(),
+            aarch64_sub_x_reg(12, 12, 21).unwrap(),
+            aarch64_dup_16b_from_w(28, 12).unwrap(),
+            aarch64_cmhs_16b(28, 29, 28).unwrap(),
+            aarch64_and_16b(28, 28, 24).unwrap(),
+        ];
+        assert!(words.windows(consume.len()).any(|window| window == consume));
+        let scalar = [
+            aarch64_sub_x_imm(21, 2, 15).unwrap(),
+            aarch64_cmeq_16b(24, 29, 26).unwrap(),
+        ];
+        assert!(words.windows(scalar.len()).any(|window| window == scalar));
+        assert!(words.contains(&aarch64_add_x_imm(2, 21, 16).unwrap()));
+
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = compile_selected(&scanner_free_exact_finite_pattern(), target);
+            let words = compiled.module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let consume = [
+                aarch64_add_x_imm(12, 2, 1).unwrap(),
+                aarch64_sve_whilelo_b(2, 21, 12).unwrap(),
+                aarch64_sve_not_b(2, 2).unwrap(),
+                aarch64_sve_and_b(1, 1, 2).unwrap(),
+                aarch64_sve_ptest_p0(1).unwrap(),
+            ];
+            assert!(
+                words.windows(consume.len()).any(|window| window == consume),
+                "consume active retained predicate: {target:?}",
+            );
+            assert!(words.contains(&aarch64_mov_x(21, 2).unwrap()));
+            assert!(words.contains(&aarch64_sve_addvl(2, 21, 1).unwrap()));
         }
     }
 
@@ -3422,9 +3648,11 @@ mod tests {
         let compiled = compile_selected(&scanner_free_exact_finite_pattern(), avx2_target());
         let code = compiled.module().sections()[TEXT_SECTION].bytes();
         let restore = [
-            0x4c, 0x89, 0xe6, // rsi = public length
-            0x4c, 0x89, 0xe9, // rcx = public end
+            0x48, 0x89, 0xee, // rsi = public length
+            0x4c, 0x89, 0xf9, // rcx = public end
             0x4d, 0x89, 0xf0, // r8 = public result
+            0x5d, // pop rbp
+            0x41, 0x5f, // pop r15
             0x41, 0x5e, // pop r14
             0x41, 0x5d, // pop r13
             0x5b, // pop rbx
@@ -3486,8 +3714,9 @@ mod tests {
                 .collect::<Vec<_>>();
             let restore = [
                 aarch64_mov_x(1, 19).unwrap(),
+                aarch64_load_x_imm(21, 31, 16).unwrap(),
                 aarch64_load_pair_x(19, 20, 31, 0).unwrap(),
-                aarch64_add_x_imm(31, 31, 16).unwrap(),
+                aarch64_add_x_imm(31, 31, 32).unwrap(),
             ];
             let restore_target = words
                 .windows(restore.len())

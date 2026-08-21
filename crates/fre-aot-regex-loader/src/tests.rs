@@ -2,7 +2,8 @@ use std::{io, ptr, sync::Mutex};
 
 use fre_aot_regex::{
     CompileMode, CompileRequest, CompileRequestV2, ExactFiniteSelectedEndTeddyPolicyV2,
-    MatchResult, OutputContract, StartAccelerator, compile, compile_v2,
+    ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport, MatchResult,
+    OutputContract, StartAccelerator, compile, compile_v2,
 };
 
 use super::*;
@@ -234,6 +235,491 @@ fn forced_v2_accelerated_incumbent_executes_in_source_order_across_windows() {
             );
         }
     }
+}
+
+#[test]
+fn exact_teddy_retained_masks_match_portable_in_process_at_guarded_boundaries() {
+    use std::{collections::BTreeMap, fmt::Write as _};
+
+    const BYTES: [u8; 17] = [
+        0x00, 0x12, 0x3f, 0x51, 0x7e, 0x8a, 0x92, 0xa4, 0x0c, 0x18, 0x1e, 0x58, 0x5e, 0x8f,
+        0x98, 0x9e, 0xaa,
+    ];
+    const SEPARATOR: u8 = 0xff;
+    const BLOCK_BYTES: usize = 32;
+    const COLLISION_OFFSET: usize = 8;
+
+    #[derive(Clone, Copy)]
+    struct Bucket {
+        low: [u16; 4],
+        high: [u16; 4],
+    }
+
+    impl Bucket {
+        const EMPTY: Self = Self {
+            low: [0; 4],
+            high: [0; 4],
+        };
+
+        fn insert(&mut self, literal: &[u8], columns: usize) {
+            for (column, &byte) in literal[..columns].iter().enumerate() {
+                self.low[column] |= 1_u16 << u32::from(byte & 0x0f);
+                self.high[column] |= 1_u16 << u32::from(byte >> 4);
+            }
+        }
+
+        fn volume(self, columns: usize) -> u64 {
+            (0..columns).fold(1_u64, |volume, column| {
+                volume
+                    .saturating_mul(u64::from(self.low[column].count_ones()))
+                    .saturating_mul(u64::from(self.high[column].count_ones()))
+            })
+        }
+
+        fn accepts(self, bytes: &[u8], columns: usize) -> bool {
+            bytes[..columns].iter().enumerate().all(|(column, &byte)| {
+                self.low[column] & (1_u16 << u32::from(byte & 0x0f)) != 0
+                    && self.high[column] & (1_u16 << u32::from(byte >> 4)) != 0
+            })
+        }
+    }
+
+    struct Plan {
+        columns: usize,
+        bucket_count: usize,
+        buckets: [Bucket; 8],
+        ordinal_masks: [u64; 8],
+    }
+
+    impl Plan {
+        fn derive(literals: &[Vec<u8>], report: ExactFiniteSelectedEndTeddyAotReport) -> Self {
+            let columns = usize::from(report.columns);
+            let bucket_count = usize::from(report.bucket_count);
+            assert!((3..=4).contains(&columns));
+            assert!((1..=8).contains(&bucket_count));
+            assert_eq!(usize::from(report.literal_count), literals.len());
+            let mut buckets = [Bucket::EMPTY; 8];
+            let mut assignments = Vec::with_capacity(literals.len());
+            for literal in literals {
+                let mut best = None;
+                for (bucket_index, bucket) in buckets[..bucket_count].iter().copied().enumerate() {
+                    let current_volume = bucket.volume(columns);
+                    let mut next = bucket;
+                    next.insert(literal, columns);
+                    let next_volume = next.volume(columns);
+                    let key = (
+                        next_volume.checked_sub(current_volume).unwrap(),
+                        next_volume,
+                        bucket_index,
+                    );
+                    if best.as_ref().is_none_or(
+                        |(best_key, _): &((u64, u64, usize), Bucket)| key < *best_key,
+                    ) {
+                        best = Some((key, next));
+                    }
+                }
+                let ((_, _, bucket_index), next) = best.unwrap();
+                buckets[bucket_index] = next;
+                assignments.push(bucket_index);
+            }
+            let mut ordinal_masks = [0_u64; 8];
+            for (ordinal, bucket) in assignments.into_iter().enumerate() {
+                ordinal_masks[bucket] |= 1_u64 << u32::try_from(ordinal).unwrap();
+            }
+            Self {
+                columns,
+                bucket_count,
+                buckets,
+                ordinal_masks,
+            }
+        }
+
+        fn candidate_buckets(&self, bytes: &[u8]) -> u8 {
+            if bytes.len() < self.columns {
+                return 0;
+            }
+            self.buckets[..self.bucket_count].iter().enumerate().fold(
+                0_u8,
+                |mask, (bucket, nibbles)| {
+                    if nibbles.accepts(bytes, self.columns) {
+                        mask | (1_u8 << u32::try_from(bucket).unwrap())
+                    } else {
+                        mask
+                    }
+                },
+            )
+        }
+
+        fn candidate_ordinals(&self, bytes: &[u8]) -> u64 {
+            let candidates = self.candidate_buckets(bytes);
+            self.ordinal_masks[..self.bucket_count]
+                .iter()
+                .enumerate()
+                .fold(0_u64, |mask, (bucket, ordinals)| {
+                    if candidates & (1_u8 << u32::try_from(bucket).unwrap()) != 0 {
+                        mask | ordinals
+                    } else {
+                        mask
+                    }
+                })
+        }
+
+        fn candidate_positions(&self, bytes: &[u8]) -> Vec<usize> {
+            bytes
+                .windows(self.columns)
+                .enumerate()
+                .filter_map(|(base, window)| {
+                    (self.candidate_buckets(window) != 0).then_some(base)
+                })
+                .collect()
+        }
+    }
+
+    fn pattern(literals: &[Vec<u8>]) -> String {
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in literals.iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                write!(pattern, "\\x{byte:02x}").unwrap();
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn collision_block(prefix: &[u8]) -> Vec<u8> {
+        let mut block = vec![SEPARATOR; BLOCK_BYTES];
+        block[COLLISION_OFFSET..COLLISION_OFFSET + prefix.len()].copy_from_slice(prefix);
+        block
+    }
+
+    fn composition(target: usize, candidates: &BTreeMap<usize, Vec<u8>>) -> Option<Vec<usize>> {
+        let mut compositions = vec![None::<Vec<usize>>; target + 1];
+        compositions[0] = Some(Vec::new());
+        for total in 0..target {
+            let Some(prefix) = compositions[total].clone() else {
+                continue;
+            };
+            for &weight in candidates.keys() {
+                let Some(next) = total.checked_add(weight).filter(|&next| next <= target) else {
+                    continue;
+                };
+                if compositions[next].is_none() {
+                    let mut next_composition = prefix.clone();
+                    next_composition.push(weight);
+                    compositions[next] = Some(next_composition);
+                }
+            }
+        }
+        compositions[target].clone()
+    }
+
+    fn trace(
+        plan: &Plan,
+        literals: &[Vec<u8>],
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> (usize, Vec<usize>, Option<usize>) {
+        let mut failures = 0;
+        let mut bases = Vec::new();
+        let Some(last_base) = window.end().checked_sub(plan.columns) else {
+            return (failures, bases, None);
+        };
+        for base in window.start()..=last_base {
+            let mut ordinals = plan.candidate_ordinals(&haystack[base..]);
+            if ordinals == 0 {
+                continue;
+            }
+            bases.push(base);
+            while ordinals != 0 {
+                let ordinal = usize::try_from(ordinals.trailing_zeros()).unwrap();
+                ordinals &= ordinals - 1;
+                let literal = &literals[ordinal];
+                if base
+                    .checked_add(literal.len())
+                    .filter(|&end| end <= window.end())
+                    .is_some_and(|end| haystack[base..end] == literal[..])
+                {
+                    return (failures, bases, Some(base + literal.len()));
+                }
+                failures += 1;
+            }
+        }
+        (failures, bases, None)
+    }
+
+    let _lock = PUBLICATION_TEST_LOCK.lock().unwrap();
+    let target = host_target().expect("supported test host");
+    if !target
+        .features
+        .contains(FeatureSet::of(CpuFeature::X86Avx2))
+        && !target
+            .features
+            .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+    {
+        return;
+    }
+    let literals = BYTES
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, byte)| vec![byte; 6 + usize::from(ordinal == 16)])
+        .collect::<Vec<_>>();
+    let compiled = compile(
+        CompileRequest::new(pattern(&literals), target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("compile host exact finite SelectedEnd Teddy");
+    let report = compiled
+        .receipt()
+        .exact_finite_selected_end_teddy_aot
+        .expect("host target must select exact finite SelectedEnd Teddy");
+    assert_eq!(report.runtime_verification_budget, 64);
+    let plan = Plan::derive(&literals, report);
+    assert_eq!(plan.candidate_buckets(&[SEPARATOR; 4]), 0);
+
+    let data = compiled
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::ReadOnlyData)
+        .unwrap()
+        .bytes();
+    let masks_offset = usize::try_from(report.bucket_ordinal_masks_offset).unwrap();
+    for (bucket, expected) in plan.ordinal_masks.iter().enumerate() {
+        let offset = masks_offset + bucket * 8;
+        assert_eq!(
+            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()),
+            *expected,
+            "authenticated bucket ordinal mask {bucket}",
+        );
+    }
+
+    let combinations = BYTES.len().pow(u32::try_from(plan.columns).unwrap());
+    let mut candidates = BTreeMap::<usize, Vec<u8>>::new();
+    for mut ordinal in 0..combinations {
+        let mut prefix = vec![0_u8; plan.columns];
+        for byte in &mut prefix {
+            *byte = BYTES[ordinal % BYTES.len()];
+            ordinal /= BYTES.len();
+        }
+        if literals
+            .iter()
+            .any(|literal| literal[..plan.columns] == prefix[..])
+        {
+            continue;
+        }
+        let weight = usize::try_from(plan.candidate_ordinals(&prefix).count_ones()).unwrap();
+        if weight == 0 || candidates.contains_key(&weight) {
+            continue;
+        }
+        let block = collision_block(&prefix);
+        if plan.candidate_positions(&block) != [COLLISION_OFFSET]
+            || trace(
+                &plan,
+                &literals,
+                &block,
+                SearchWindow::full(&block),
+            ) != (weight, vec![COLLISION_OFFSET], None)
+        {
+            continue;
+        }
+        candidates.insert(weight, prefix);
+        if [63, 64, 65]
+            .into_iter()
+            .all(|boundary| composition(boundary, &candidates).is_some())
+        {
+            break;
+        }
+    }
+    let compositions = [63, 64, 65]
+        .into_iter()
+        .map(|boundary| {
+            (
+                boundary,
+                composition(boundary, &candidates).unwrap_or_else(|| {
+                    panic!(
+                        "no certified exact composition for {boundary}: {:?}",
+                        candidates.keys().collect::<Vec<_>>(),
+                    )
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut cases = Vec::<(String, Vec<u8>, SearchWindow)>::new();
+    for boundary in [63, 64, 65] {
+        let composition = &compositions[&boundary];
+        let start = 19;
+        let used = composition.len() * BLOCK_BYTES + literals[0].len();
+        let window_bytes = (report.input_floor_bytes + 257).max(used + 64);
+        let end = start + window_bytes;
+        let mut haystack = vec![SEPARATOR; end];
+        let mut cursor = start;
+        for weight in composition {
+            let block = collision_block(&candidates[weight]);
+            haystack[cursor..cursor + block.len()].copy_from_slice(&block);
+            cursor += block.len();
+        }
+        let match_base = end - literals[0].len();
+        haystack[match_base..end].copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(start, end);
+        assert_eq!(trace(&plan, &literals, &haystack, window).0, boundary);
+        cases.push((format!("verification-budget-{boundary}"), haystack, window));
+    }
+
+    let vector_bytes = match report.emitted_isa {
+        ExactFiniteSelectedEndTeddyAotIsa::X86Avx2 => 32,
+        ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd => 16,
+        ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve => usize::from(
+            current_thread_sve_vector_length_bytes()
+                .expect("query host SVE VL")
+                .expect("SVE receipt requires a runtime VL"),
+        ),
+    };
+    let (&false_weight, false_prefix) = candidates.first_key_value().unwrap();
+    let start = 29;
+    let end = start + report.input_floor_bytes + 257;
+    let mut same_vector = vec![SEPARATOR; end];
+    let retained_block = start + 64;
+    for lane in [0, plan.columns + 1, 2 * (plan.columns + 1)] {
+        same_vector[retained_block + lane..retained_block + lane + plan.columns]
+            .copy_from_slice(false_prefix);
+    }
+    same_vector[end - literals[0].len()..].copy_from_slice(&literals[0]);
+    let window = SearchWindow::new(start, end);
+    let (_, bases, selected_end) = trace(&plan, &literals, &same_vector, window);
+    assert_eq!(selected_end, Some(end));
+    let first_three = bases.get(..3).expect("three false lanes in one vector block");
+    assert!(first_three.iter().all(|&base| {
+        (base - start) / vector_bytes == (first_three[0] - start) / vector_bytes
+    }));
+    cases.push(("multiple-false-lanes-one-vector".to_owned(), same_vector, window));
+
+    let start = 23;
+    let mut window_bytes = report.input_floor_bytes.max(vector_bytes * 3);
+    let desired_remainder = 8_usize.min(vector_bytes - 1).max(plan.columns);
+    while (window_bytes - plan.columns + 1) % vector_bytes != desired_remainder {
+        window_bytes += 1;
+    }
+    let end = start + window_bytes;
+    let mut full_to_partial = vec![SEPARATOR; end];
+    let false_base = start + COLLISION_OFFSET;
+    full_to_partial[false_base..false_base + plan.columns].copy_from_slice(false_prefix);
+    full_to_partial[end - literals[0].len()..].copy_from_slice(&literals[0]);
+    let window = SearchWindow::new(start, end);
+    let (_, bases, selected_end) = trace(&plan, &literals, &full_to_partial, window);
+    assert_eq!(bases.first(), Some(&false_base));
+    assert_eq!(selected_end, Some(end));
+    cases.push(("full-to-partial-binary-eof".to_owned(), full_to_partial, window));
+
+    let start = 41;
+    let partial_lanes = 2 * plan.columns + 1;
+    assert!(partial_lanes < vector_bytes);
+    assert!(false_weight * 2 < 64);
+    let mut window_bytes = report.input_floor_bytes.max(vector_bytes * 3);
+    while (window_bytes - plan.columns + 1) % vector_bytes != partial_lanes {
+        window_bytes += 1;
+    }
+    let end = start + window_bytes;
+    let candidate_count = window_bytes - plan.columns + 1;
+    let partial_base = start + candidate_count - partial_lanes;
+    let mut partial_exhaustion = vec![SEPARATOR; end];
+    for lane in [0, 2 * plan.columns] {
+        partial_exhaustion[partial_base + lane..partial_base + lane + plan.columns]
+            .copy_from_slice(false_prefix);
+    }
+    let window = SearchWindow::new(start, end);
+    let (failures, bases, selected_end) =
+        trace(&plan, &literals, &partial_exhaustion, window);
+    assert_eq!(failures, false_weight * 2);
+    assert_eq!(bases, [partial_base, end - plan.columns]);
+    assert_eq!(selected_end, None);
+    cases.push((
+        "partial-retained-exhaustion-at-guarded-eof".to_owned(),
+        partial_exhaustion,
+        window,
+    ));
+
+    let portable = compiled.clone();
+    let published = publish_selected_end(compiled, PublicationLimits::default())
+        .expect("publish host exact finite SelectedEnd Teddy");
+    for (label, haystack, window) in cases {
+        let expected = portable_selected_end(&portable, &haystack, window);
+        for at_right_boundary in [false, true] {
+            let actual = platform::with_guarded_haystack(
+                &haystack,
+                at_right_boundary,
+                |guarded| published.search(guarded, window),
+            )
+            .unwrap_or_else(|errno| panic!("{label}: guarded mapping errno={errno}"))
+            .unwrap_or_else(|error| panic!("{label}: native call {error}"));
+            assert_eq!(actual, expected, "{label}, right_guard={at_right_boundary}");
+        }
+    }
+
+    for long_first in [false, true] {
+        let mut ordered = literals.clone();
+        let long = ordered.pop().unwrap();
+        let short = vec![0xaa; 6];
+        if long_first {
+            ordered.extend([long, short]);
+        } else {
+            ordered.extend([short, long]);
+        }
+        let compiled = compile(
+            CompileRequest::new(pattern(&ordered), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile overlapping exact Teddy host fixture");
+        let report = compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("overlap fixture selects exact Teddy");
+        let start = 31;
+        let end = start + report.input_floor_bytes + 73;
+        let mut haystack = vec![SEPARATOR; end];
+        haystack[end - 7..].fill(0xaa);
+        let window = SearchWindow::new(start, end);
+        let expected = portable_selected_end(&compiled, &haystack, window);
+        assert_eq!(expected, Some(if long_first { end } else { end - 1 }));
+        let published = publish_selected_end(compiled, PublicationLimits::default()).unwrap();
+        let actual = platform::with_guarded_haystack(&haystack, true, |guarded| {
+            published.search(guarded, window)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, expected, "source order, long_first={long_first}");
+    }
+
+    let mut duplicates = literals.clone();
+    duplicates.push(literals[0].clone());
+    let compiled = compile(
+        CompileRequest::new(pattern(&duplicates), target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("compile duplicate-arm exact Teddy host fixture");
+    let report = compiled
+        .receipt()
+        .exact_finite_selected_end_teddy_aot
+        .expect("duplicate-arm fixture selects exact Teddy");
+    let start = 37;
+    let end = start + report.input_floor_bytes + 71;
+    let mut haystack = vec![SEPARATOR; end];
+    haystack[end - literals[0].len()..].copy_from_slice(&literals[0]);
+    let window = SearchWindow::new(start, end);
+    let expected = portable_selected_end(&compiled, &haystack, window);
+    let published = publish_selected_end(compiled, PublicationLimits::default()).unwrap();
+    let actual = platform::with_guarded_haystack(&haystack, true, |guarded| {
+        published.search(guarded, window)
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(actual, expected, "duplicate source arms at guarded EOF");
 }
 
 #[test]
@@ -1472,6 +1958,74 @@ mod exact_finite_selected_end_teddy_linux_aarch64_qualification {
         let (&false_weight, false_prefix) = candidates
             .first_key_value()
             .expect("at least one certified false fingerprint");
+        let vector_bytes = if report.emitted_isa
+            == ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd
+        {
+            16
+        } else {
+            usize::from(observed_vl)
+        };
+        let start = 31;
+        let end = start + report.input_floor_bytes + 193;
+        let mut same_vector = vec![QUALIFICATION_SEPARATOR; end];
+        let block_base = start + 64;
+        for lane in [0, plan.columns + 1, 2 * (plan.columns + 1)] {
+            same_vector[block_base + lane..block_base + lane + plan.columns]
+                .copy_from_slice(false_prefix);
+        }
+        same_vector[end - literals[0].len()..].copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(start, end);
+        let trace = trace_verifier(&plan, &literals, &same_vector, window);
+        assert_eq!(trace.selected_end, Some(end));
+        let first_three = trace
+            .candidate_bases
+            .get(..3)
+            .expect("three certified false lanes in one vector block");
+        assert!(first_three.iter().all(|&base| {
+            (base - start) / vector_bytes == (first_three[0] - start) / vector_bytes
+        }));
+        assert_native_portable_manual(
+            "multiple-false-lanes-one-retained-vector",
+            &literals,
+            &portable,
+            &published,
+            &same_vector,
+            window,
+        );
+
+        let start = 41;
+        let partial_lanes = 2 * plan.columns + 1;
+        assert!(partial_lanes < vector_bytes);
+        assert!(false_weight * 2 < usize::from(report.runtime_verification_budget));
+        let mut window_bytes = report.input_floor_bytes.max(vector_bytes * 3);
+        while (window_bytes - plan.columns + 1) % vector_bytes != partial_lanes {
+            window_bytes += 1;
+        }
+        let end = start + window_bytes;
+        let candidate_count = window_bytes - plan.columns + 1;
+        let partial_base = start + candidate_count - partial_lanes;
+        let mut partial_exhaustion = vec![QUALIFICATION_SEPARATOR; end];
+        for lane in [0, 2 * plan.columns] {
+            partial_exhaustion[partial_base + lane..partial_base + lane + plan.columns]
+                .copy_from_slice(false_prefix);
+        }
+        let window = SearchWindow::new(start, end);
+        let trace = trace_verifier(&plan, &literals, &partial_exhaustion, window);
+        assert_eq!(trace.failed_ordinals, false_weight * 2);
+        assert_eq!(
+            trace.candidate_bases,
+            [partial_base, end - plan.columns]
+        );
+        assert_eq!(trace.selected_end, None);
+        assert_native_portable_manual(
+            "partial-retained-exhaustion-at-guarded-eof",
+            &literals,
+            &portable,
+            &published,
+            &partial_exhaustion,
+            window,
+        );
+
         let (haystack, window, false_base, match_base) = full_to_partial_haystack(
             &literals,
             report,
@@ -1554,5 +2108,35 @@ mod exact_finite_selected_end_teddy_linux_aarch64_qualification {
                 SearchWindow::new(start, end),
             );
         }
+
+        let mut duplicates = literals.clone();
+        duplicates.push(literals[0].clone());
+        let compiled = compile(
+            CompileRequest::new(selected_end_pattern(&duplicates), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile duplicate source-arm fixture");
+        let duplicate_report = compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("duplicate source-arm fixture selects exact Teddy");
+        assert_eq!(duplicate_report.selected_target_tier, expected_tier);
+        assert_eq!(duplicate_report.emitted_isa, expected_isa);
+        let portable = compiled.clone();
+        let published = publish_selected_end(compiled, PublicationLimits::default())
+            .expect("publish duplicate source-arm fixture");
+        let start = 37;
+        let end = start + duplicate_report.input_floor_bytes + 71;
+        let mut haystack = vec![QUALIFICATION_SEPARATOR; end];
+        haystack[end - literals[0].len()..].copy_from_slice(&literals[0]);
+        assert_native_portable_manual(
+            "duplicate-source-arms-at-guarded-eof",
+            &duplicates,
+            &portable,
+            &published,
+            &haystack,
+            SearchWindow::new(start, end),
+        );
     }
 }

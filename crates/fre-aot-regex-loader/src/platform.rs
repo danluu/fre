@@ -181,7 +181,7 @@ mod implementation {
         usize::try_from(raw).map_err(|_| libc::EOVERFLOW)
     }
 
-    #[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn with_guarded_haystack<T>(
         bytes: &[u8],
         at_right_boundary: bool,
@@ -525,7 +525,7 @@ mod implementation {
         Ok(None)
     }
 
-    #[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn with_guarded_haystack<T>(
         _bytes: &[u8],
         _at_right_boundary: bool,
@@ -549,7 +549,7 @@ pub(crate) use implementation::{
 #[cfg(test)]
 pub(crate) use implementation::live_mappings;
 
-#[cfg(all(test, target_arch = "aarch64", target_os = "linux"))]
+#[cfg(test)]
 pub(crate) use implementation::with_guarded_haystack;
 
 pub(crate) const fn supported() -> bool {

@@ -282,14 +282,14 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 24;
+pub const OPTIMIZER_VERSION: u32 = 25;
 /// Schema identity for the opt-in experimental compile request and receipt.
 pub const COMPILE_REQUEST_V2_SCHEMA_VERSION: u32 = 2;
 /// Optimizer identity for the opt-in accelerated-incumbent Teddy experiment.
 ///
 /// The stable V1 receipt deliberately retains [`OPTIMIZER_VERSION`], including
 /// when a V2 request uses `Automatic`, so existing evidence is not relabeled.
-pub const EXPERIMENTAL_OPTIMIZER_VERSION_V2: u32 = 25;
+pub const EXPERIMENTAL_OPTIMIZER_VERSION_V2: u32 = 26;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

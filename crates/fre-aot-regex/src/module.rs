@@ -45881,8 +45881,8 @@ fn aarch64_emit_first_retained_candidate_lane(
     candidates: u8,
     block_base: u8,
 ) -> Result<(), ObjectError> {
-    // Retained V24 must survive scalar prefix checks. Refine a caller-saved
-    // copy in V28 and address the selected lane from caller-saved X14.
+    // The retained mask must survive scalar checks. Refine a caller-saved
+    // copy in V28 and address the selected lane from the supplied block base.
     assembler.instruction(aarch64_orr_16b(28, candidates, candidates)?)?;
     assembler.instruction(aarch64_bsl_16b(28, 29, 31)?)?;
     assembler.instruction(aarch64_uminv_16b(28, 28)?)?;
