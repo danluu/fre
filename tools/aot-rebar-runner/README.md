@@ -5,10 +5,11 @@ This is a distinct, job-specialized Rebar engine for the general
 `tools/rebar-compare/examples/fre_rebar_runner.rs`, which measures the public
 portable FRE facade.
 
-The checked-in build script consumes one public Rebar KLV file. The incumbent
-single-pattern route compiles one general-AOT artifact, writes its relocatable
-object into `OUT_DIR`, and statically links that exact object into the runner.
-The additive multi-pattern `count`/`count-spans` route compiles an ordinary
+The checked-in build script consumes one public Rebar KLV file. Scalar models
+compile and link one single-pattern general-AOT artifact. The fixed
+`regex-redux` model has no external patterns; it compiles and links the exact
+15 public Rebar stage patterns as independent ordinary Span artifacts. The
+additive multi-pattern `count`/`count-spans` route compiles an ordinary
 Optimizing+Span object for each distinct source row and links the deduplicated
 helper-free native objects. A build with no KLV remains a harmless
 unconfigured workspace binary.
@@ -40,11 +41,12 @@ not admissible evidence.
 ## Operation contract
 
 The adapter supports the public `count`, `count-spans`, and `grep` models for
-one pattern, plus ordered multi-pattern `count` and `count-spans`. Dispatch
-depends only on the typed model and pattern cardinality, not on a benchmark
-name. It deliberately rejects `compile`: emitting a relocatable object is not
-the Rebar operation of constructing a regex that is ready to search.
-Object-emission timing belongs to a separately named compiler-stage benchmark.
+one pattern, ordered multi-pattern `count` and `count-spans`, and the
+zero-external-pattern `regex-redux` model. Dispatch depends only on the typed
+model and pattern cardinality, not on a benchmark name. It deliberately rejects
+`compile`: emitting a relocatable object is not the Rebar operation of
+constructing a regex that is ready to search. Object-emission timing belongs to
+a separately named compiler-stage benchmark.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
@@ -64,6 +66,13 @@ Object-emission timing belongs to a separately named compiler-stage benchmark.
   call reports a match. The prepared whole-haystack `GrepCount` export may be
   linked to provision the shared program/handle, but is never called by the
   timed Rebar grep operation.
+- `regex-redux` runs the pinned flatten expression, all nine variant counts,
+  and all five ordered substitutions through their separately linked ordinary
+  Span entries. Rust owns only checked stage sequencing, replacement copies,
+  and scalar accounting. Every stage must return an in-window nonempty Span;
+  invalid, backward, empty, or non-success results fail the complete sample.
+  This is an AOT runtime-execution boundary, not a claim that precompiled
+  object construction is timing-equivalent to Rebar's per-call compilation.
 
 For a multi-pattern scalar job, exact duplicate source rows are compiled once;
 distinct source spellings that produce the same complete entry/object are also
@@ -167,12 +176,21 @@ host tier with `FRE_AOT_REBAR_BENCHMARK_FILTER=<exact-name>` and
 mandatory default remains the complete four-row, base-plus-SIMD correctness
 matrix.
 
-Capture replay, RegexSet all-ID publication, literal replacement/regex-redux
-and future `MatchStats` are separate typed extensions. They must not be
-emulated by benchmark-name recognition or silently folded into these scalar
-contracts. The native-row bridge implements Rebar's ordered `build_many`
-single-match stream; it is not an all-matching RegexSet and does not claim a
-shared-scan automaton.
+Capture replay, RegexSet all-ID publication and future `MatchStats` remain
+separate typed extensions. They must not be emulated by benchmark-name
+recognition or silently folded into these contracts. The native-row bridge
+implements Rebar's ordered `build_many` single-match stream; it is not an
+all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
+admitted only by its typed zero-pattern model and exact fixed public stage
+table; it is not recognized by benchmark name.
+
+For native-coverage evidence, a linked regex-redux component is native only
+when an independent binary audit finds no semantic runtime-helper edge, the
+complete operation still succeeds after all semantic helpers are trap-patched,
+and patching that component's claimed entry traps a fixture that reaches it.
+The v3 provenance record publishes component-indexed entry symbols, runtime
+symbol surfaces and program/object hashes. Merely linking all 15 objects does
+not count helper-backed components as native.
 
 ## HEAD campaign reporting
 

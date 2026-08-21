@@ -23,6 +23,7 @@ pub enum Model {
     Count,
     SpanSum,
     GrepCount,
+    RegexRedux,
 }
 
 impl Model {
@@ -35,6 +36,7 @@ impl Model {
             "count" => Ok(Self::Count),
             "count-spans" => Ok(Self::SpanSum),
             "grep" => Ok(Self::GrepCount),
+            "regex-redux" => Ok(Self::RegexRedux),
             other => Err(format!(
                 "general AOT Rebar runner does not support model {other:?}"
             )),
@@ -47,6 +49,7 @@ impl Model {
             Self::Count => "count",
             Self::SpanSum => "count-spans",
             Self::GrepCount => "grep",
+            Self::RegexRedux => "regex-redux",
         }
     }
 
@@ -56,6 +59,7 @@ impl Model {
             Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
             Self::SpanSum => "general-aot-linked-complete-spans-prepared-v2",
             Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
     }
 
@@ -80,6 +84,7 @@ impl Model {
                 "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15"
             }
             Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
     }
 
@@ -94,6 +99,7 @@ impl Model {
             Self::Compile | Self::Count => 1 << 1,
             Self::SpanSum => 1 << 2,
             Self::GrepCount => 1 << 3,
+            Self::RegexRedux => 0,
         }
     }
 
@@ -102,15 +108,63 @@ impl Model {
             Self::Compile | Self::Count => PreparedAggregateExports::COUNT,
             Self::SpanSum => PreparedAggregateExports::SPAN_SUM,
             Self::GrepCount => PreparedAggregateExports::GREP_COUNT,
+            Self::RegexRedux => PreparedAggregateExports::NONE,
         }
     }
 
     pub const fn output(self) -> OutputContract {
         match self {
             Self::GrepCount => OutputContract::Exists,
+            Self::RegexRedux => OutputContract::Span,
             Self::Compile | Self::Count | Self::SpanSum => OutputContract::Span,
         }
     }
+}
+
+/// Exact fixed regex suite used by Rebar's public `regex-redux` model.
+///
+/// These declarations are benchmark semantics, not a workload classifier:
+/// the model has no external patterns and every conforming invocation runs
+/// this complete ordered stage list.
+pub const REGEX_REDUX_VARIANTS: [&str; 9] = [
+    r"agggtaaa|tttaccct",
+    r"[cgt]gggtaaa|tttaccc[acg]",
+    r"a[act]ggtaaa|tttacc[agt]t",
+    r"ag[act]gtaaa|tttac[agt]ct",
+    r"agg[act]taaa|ttta[agt]cct",
+    r"aggg[acg]aaa|ttt[cgt]ccct",
+    r"agggt[cgt]aa|tt[acg]accct",
+    r"agggta[cgt]a|t[acg]taccct",
+    r"agggtaa[cgt]|[acg]ttaccct",
+];
+
+pub const REGEX_REDUX_FLATTEN_PATTERN: &str = r">[^\n]*\n|\n";
+
+pub const REGEX_REDUX_SUBSTITUTIONS: [(&str, &str); 5] = [
+    (r"tHa[Nt]", "<4>"),
+    (r"aND|caN|Ha[DS]|WaS", "<3>"),
+    (r"a[NSt]|BY", "<2>"),
+    (r"<[^>]*>", "|"),
+    (r"\|[^|][^|]*\|", "-"),
+];
+
+pub const REGEX_REDUX_COMPONENTS: usize =
+    1 + REGEX_REDUX_VARIANTS.len() + REGEX_REDUX_SUBSTITUTIONS.len();
+
+#[must_use]
+pub const fn regex_redux_pattern(component: usize) -> Option<&'static str> {
+    if component == 0 {
+        return Some(REGEX_REDUX_FLATTEN_PATTERN);
+    }
+    let variant = component - 1;
+    if variant < REGEX_REDUX_VARIANTS.len() {
+        return Some(REGEX_REDUX_VARIANTS[variant]);
+    }
+    let substitution = variant - REGEX_REDUX_VARIANTS.len();
+    if substitution < REGEX_REDUX_SUBSTITUTIONS.len() {
+        return Some(REGEX_REDUX_SUBSTITUTIONS[substitution].0);
+    }
+    None
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -208,18 +262,28 @@ impl Benchmark {
             max_time: required(max_time, "max-time")?,
             max_warmup_time: required(max_warmup_time, "max-warmup-time")?,
         };
-        if benchmark.patterns.is_empty() {
-            return Err(
-                "current linked general-AOT operation requires at least one pattern".to_owned(),
-            );
-        }
-        if benchmark.patterns.len() > 1 && !matches!(benchmark.model, Model::Count | Model::SpanSum)
-        {
-            return Err(format!(
-                "current linked general-AOT multi-pattern bridge supports only count and count-spans, got model {:?} with {} patterns",
-                benchmark.model,
-                benchmark.patterns.len()
-            ));
+        if benchmark.model == Model::RegexRedux {
+            if !benchmark.patterns.is_empty() {
+                return Err(format!(
+                    "linked general-AOT regex-redux operation requires zero patterns, got {}",
+                    benchmark.patterns.len()
+                ));
+            }
+        } else {
+            if benchmark.patterns.is_empty() {
+                return Err(
+                    "current linked general-AOT operation requires at least one pattern".to_owned(),
+                );
+            }
+            if benchmark.patterns.len() > 1
+                && !matches!(benchmark.model, Model::Count | Model::SpanSum)
+            {
+                return Err(format!(
+                    "current linked general-AOT multi-pattern bridge supports only count and count-spans, got model {:?} with {} patterns",
+                    benchmark.model,
+                    benchmark.patterns.len()
+                ));
+            }
         }
         if benchmark.patterns.len() > MAX_NATIVE_ROW_BRIDGE_PATTERNS {
             return Err(format!(
@@ -282,6 +346,12 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
     if benchmark.uses_native_row_bridge() {
         return Err(
             "single-artifact compilation cannot compile a multi-pattern native-row bridge"
+                .to_owned(),
+        );
+    }
+    if benchmark.model == Model::RegexRedux {
+        return Err(
+            "regex-redux is a fixed multi-artifact composite; compile its components explicitly"
                 .to_owned(),
         );
     }
@@ -489,6 +559,29 @@ fn authenticate_native_row(compiled: &CompiledRegex, source_ordinal: usize) -> R
     Ok(())
 }
 
+/// Compile one fixed regex-redux stage as an ordinary Span artifact.
+///
+/// No aggregate or runtime composite is smuggled into this boundary. The
+/// linked runner performs only Rebar's deterministic stage sequencing around
+/// these independently receipted search entries.
+pub fn compile_regex_redux_component(
+    component: usize,
+    target: Target,
+) -> Result<CompiledRegex, String> {
+    let pattern = regex_redux_pattern(component)
+        .ok_or_else(|| format!("regex-redux component {component} is out of range"))?;
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = false;
+    profile.options.case_insensitive = false;
+    compile(
+        CompileRequest::new(pattern, target)
+            .profile(profile)
+            .output(OutputContract::Span)
+            .mode(CompileMode::Optimizing),
+    )
+    .map_err(|error| format!("regex-redux component {component} compilation failed: {error}"))
+}
+
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, String> {
     std::str::from_utf8(value).map_err(|error| format!("{key} is not UTF-8: {error}"))
 }
@@ -540,6 +633,17 @@ mod tests {
         field(&mut output, "max-warmup-time", b"100");
         field(&mut output, "pattern", pattern);
         field(&mut output, "haystack", haystack);
+        output
+    }
+
+    fn zero_pattern_fixture(model: &str, haystack: &[u8]) -> Vec<u8> {
+        let mut output = fixture(model, b"unused", haystack);
+        let field = b"pattern:6:unused\n";
+        let offset = output
+            .windows(field.len())
+            .position(|window| window == field)
+            .expect("pattern field");
+        output.drain(offset..offset + field.len());
         output
     }
 
@@ -667,6 +771,22 @@ mod tests {
     }
 
     #[test]
+    fn regex_redux_accepts_only_its_zero_pattern_fixed_suite() {
+        let parsed = Benchmark::parse(&zero_pattern_fixture("regex-redux", b">x\nACGT\n"))
+            .expect("parse fixed regex-redux model");
+        assert_eq!(parsed.model, Model::RegexRedux);
+        assert!(parsed.patterns.is_empty());
+        assert_eq!(REGEX_REDUX_COMPONENTS, 15);
+        assert_eq!(regex_redux_pattern(0), Some(REGEX_REDUX_FLATTEN_PATTERN));
+        assert_eq!(
+            regex_redux_pattern(REGEX_REDUX_COMPONENTS - 1),
+            Some(REGEX_REDUX_SUBSTITUTIONS[4].0)
+        );
+        assert_eq!(regex_redux_pattern(REGEX_REDUX_COMPONENTS), None);
+        assert!(Benchmark::parse(&fixture("regex-redux", b"a", b"a")).is_err());
+    }
+
+    #[test]
     fn models_bind_exact_prepare_abi_adapters_flags_and_capability_bit() {
         use fre_aot_regex_runtime::{
             PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION,
@@ -701,6 +821,11 @@ mod tests {
                 Model::GrepCount,
                 "general-aot-linked-per-line-is-match-v1",
                 PREPARE_OPERATION_GREP_COUNT,
+            ),
+            (
+                Model::RegexRedux,
+                "general-aot-linked-fixed-regex-redux-span-entries-v1",
+                0,
             ),
         ] {
             assert_eq!(model.adapter(), adapter);
