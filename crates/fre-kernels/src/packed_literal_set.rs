@@ -247,6 +247,13 @@ pub struct PackedLiteralSetAccounting {
     pub simd_eligible_length: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PackedLiteralSetSearchPreflight {
+    searched_bytes: usize,
+    positions_upper_bound: usize,
+    work_upper_bound: usize,
+}
+
 /// Packed literal-set build or search failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1227,6 +1234,92 @@ impl PackedLiteralSetPlan {
         self.find_window_with_native(haystack, window, limits, None)
     }
 
+    /// Return only the selected span inside a byte range.
+    ///
+    /// This compact projection performs the accounted search's identical
+    /// window, arithmetic, and work-limit preflight without retaining its
+    /// diagnostic accounting receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked window, arithmetic, or work-limit error as
+    /// [`Self::find_window`].
+    #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: PackedLiteralSetSearchLimits,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        self.search_preflight(haystack.len(), window, limits)?;
+        let window_bytes = &haystack[window.start()..window.end()];
+        Ok(self
+            .find_relative(window_bytes, None)
+            .map(|(relative_start, relative_end)| {
+                (
+                    window.start() + relative_start,
+                    window.start() + relative_end,
+                )
+            }))
+    }
+
+    /// Return only whether a selected span exists inside a byte range.
+    ///
+    /// This is the boolean projection of [`Self::find_window_value`] and
+    /// therefore preserves its exact validation and resource contract.
+    #[inline]
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: PackedLiteralSetSearchLimits,
+    ) -> Result<bool, PackedLiteralSetError> {
+        self.find_window_value(haystack, window, limits)
+            .map(|matched| matched.is_some())
+    }
+
+    #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a valid byte-slice window proves the subtraction and terminal position"
+    )]
+    fn search_preflight(
+        &self,
+        haystack_len: usize,
+        window: Window,
+        limits: PackedLiteralSetSearchLimits,
+    ) -> Result<PackedLiteralSetSearchPreflight, PackedLiteralSetError> {
+        if window.start() > window.end() || window.end() > haystack_len {
+            return Err(PackedLiteralSetError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len,
+            });
+        }
+        let searched_bytes = window.end() - window.start();
+        let positions_upper_bound = searched_bytes + 1;
+        let work_upper_bound = positions_upper_bound
+            .checked_mul(self.verification_bytes_per_position)
+            .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                computation: "packed literal search work",
+            })?;
+        if work_upper_bound > limits.max_work {
+            return Err(PackedLiteralSetError::WorkLimit {
+                needed: work_upper_bound,
+                limit: limits.max_work,
+            });
+        }
+        Ok(PackedLiteralSetSearchPreflight {
+            searched_bytes,
+            positions_upper_bound,
+            work_upper_bound,
+        })
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the validated slice and packed engine contracts prove these window-relative additions"
@@ -1288,27 +1381,9 @@ impl PackedLiteralSetPlan {
         limits: PackedLiteralSetSearchLimits,
         iterator_native: Option<&Searcher>,
     ) -> Result<(Option<(usize, usize)>, PackedLiteralSetAccounting), PackedLiteralSetError> {
-        if window.start() > window.end() || window.end() > haystack.len() {
-            return Err(PackedLiteralSetError::InvalidWindow {
-                start: window.start(),
-                end: window.end(),
-                haystack_len: haystack.len(),
-            });
-        }
-        let searched_bytes = window.end() - window.start();
-        let positions_upper_bound = searched_bytes + 1;
+        let preflight = self.search_preflight(haystack.len(), window, limits)?;
+        let searched_bytes = preflight.searched_bytes;
         let verification_bytes_per_position = self.verification_bytes_per_position;
-        let work_upper_bound = positions_upper_bound
-            .checked_mul(verification_bytes_per_position)
-            .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-                computation: "packed literal search work",
-            })?;
-        if work_upper_bound > limits.max_work {
-            return Err(PackedLiteralSetError::WorkLimit {
-                needed: work_upper_bound,
-                limit: limits.max_work,
-            });
-        }
         let simd_eligible_length = iterator_native.map_or_else(
             || match &self.engine {
                 #[cfg(not(feature = "static-dispatch"))]
@@ -1318,17 +1393,34 @@ impl PackedLiteralSetPlan {
             },
             |native| searched_bytes >= native.minimum_len(),
         );
-        let mut accounting = PackedLiteralSetAccounting {
+        let accounting = PackedLiteralSetAccounting {
             searched_bytes,
-            positions_upper_bound,
+            positions_upper_bound: preflight.positions_upper_bound,
             verification_bytes_per_position,
-            work_upper_bound,
+            work_upper_bound: preflight.work_upper_bound,
             scratch_bytes: 0,
-            factored_columns: false,
+            factored_columns: iterator_native.is_none()
+                && matches!(&self.engine, PackedLiteralEngine::Factored(_)),
             simd_eligible_length,
         };
         let window_bytes = &haystack[window.start()..window.end()];
-        let matched = if let Some(native) = iterator_native {
+        let matched = self.find_relative(window_bytes, iterator_native);
+        let matched = matched.map(|(relative_start, relative_end)| {
+            (
+                window.start() + relative_start,
+                window.start() + relative_end,
+            )
+        });
+        Ok((matched, accounting))
+    }
+
+    #[inline]
+    fn find_relative(
+        &self,
+        window_bytes: &[u8],
+        iterator_native: Option<&Searcher>,
+    ) -> Option<(usize, usize)> {
+        if let Some(native) = iterator_native {
             native
                 .find(window_bytes)
                 .map(|matched| (matched.start(), matched.end()))
@@ -1355,19 +1447,9 @@ impl PackedLiteralSetPlan {
                     searcher,
                     shared_columns,
                 } => find_native_shared_columns(searcher, shared_columns, window_bytes),
-                PackedLiteralEngine::Factored(factored) => {
-                    accounting.factored_columns = true;
-                    factored.find(window_bytes)
-                }
+                PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
             }
-        };
-        let matched = matched.map(|(relative_start, relative_end)| {
-            (
-                window.start() + relative_start,
-                window.start() + relative_end,
-            )
-        });
-        Ok((matched, accounting))
+        }
     }
 }
 

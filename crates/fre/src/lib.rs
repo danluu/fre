@@ -11792,12 +11792,11 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::PackedLiteralSet(literal_set) => literal_set
-                .find_window(
+                .is_match_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     packed_literal_set_limits(limits),
                 )
-                .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::GuardedLiteralSet(plan) => plan
                 .find_window_value(haystack, window, limits)
@@ -13657,12 +13656,12 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::PackedLiteralSet(literal_set) => literal_set
-                .find_window(
+                .find_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     packed_literal_set_limits(limits),
                 )
-                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::GuardedLiteralSet(plan) => plan
                 .find_window_value(haystack, window, limits)
