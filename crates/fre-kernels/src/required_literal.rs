@@ -725,6 +725,37 @@ impl RequiredLiteralPlan {
         self.exists_window_value_with_run_scanner(haystack, window, limits, None)
     }
 
+    /// Return the first accepting end for an unanchored `CLASS+ SUFFIX`
+    /// match wholly within `window`.
+    ///
+    /// The suffix witness determines the accepting end. Recovering the
+    /// beginning of the preceding greedy class run is therefore unnecessary
+    /// for this value-only projection. The construction proof makes suffix
+    /// occurrences non-overlapping and keeps the suffix's first byte outside
+    /// the class, so the same ordered witness stream used by
+    /// [`Self::find_window`] remains complete. Anchored plans retain the
+    /// established span search.
+    ///
+    /// This preserves the complete incumbent preflight envelope while
+    /// omitting actual-event accounting and greedy-start recovery on the
+    /// admitted unanchored route.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn first_acceptance_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.first_acceptance_window_value_with_run_scanner(
+            haystack, window, limits, None,
+        )
+    }
+
     fn exists_window_with_run_scanner(
         &self,
         haystack: &[u8],
@@ -797,10 +828,27 @@ impl RequiredLiteralPlan {
         limits: SearchLimits,
         backward_scanner: Option<&AsciiByteSetRunScanner>,
     ) -> Result<bool, SearchError> {
+        self.first_acceptance_window_value_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            backward_scanner,
+        )
+        .map(|end| end.is_some())
+    }
+
+    #[inline]
+    fn first_acceptance_window_value_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Option<usize>, SearchError> {
         if self.anchors != Anchors::default() {
             return self
                 .find_window_with_run_scanner(haystack, window, limits, backward_scanner)
-                .map(|(matched, _)| matched.is_some());
+                .map(|(matched, _)| matched.map(|(_, end)| end));
         }
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(SearchError::InvalidWindow {
@@ -811,22 +859,22 @@ impl RequiredLiteralPlan {
         }
         check_search_scratch(0, limits.max_scratch_bytes)?;
         self.preflight(window, limits, backward_scanner)?;
-        self.exists_unanchored_preflighted_value(haystack, window)
+        self.first_acceptance_unanchored_preflighted_value(haystack, window)
     }
 
     #[inline]
-    fn exists_unanchored_preflighted_value(
+    fn first_acceptance_unanchored_preflighted_value(
         &self,
         haystack: &[u8],
         window: Window,
-    ) -> Result<bool, SearchError> {
+    ) -> Result<Option<usize>, SearchError> {
         let suffix_bytes = self.suffix().len();
         debug_assert!(suffix_bytes != 0, "required-literal suffix is non-empty");
         let mut search_start = window.start();
         loop {
             let slice = &haystack[search_start..window.end()];
             let Some(relative) = self.finder.find(slice) else {
-                return Ok(false);
+                return Ok(None);
             };
             let candidate = search_start.checked_add(relative).ok_or(
                 SearchError::ArithmeticOverflow {
@@ -840,7 +888,13 @@ impl RequiredLiteralPlan {
                         computation: "value-only existence candidate predecessor",
                     })?;
                 if self.class.contains(haystack[previous]) {
-                    return Ok(true);
+                    let end = candidate.checked_add(suffix_bytes).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "value-only first acceptance end",
+                        },
+                    )?;
+                    debug_assert!(end <= window.end());
+                    return Ok(Some(end));
                 }
             }
             search_start = candidate.checked_add(suffix_bytes).ok_or(
@@ -1824,6 +1878,29 @@ impl DispatchedRequiredLiteralPlan {
                 self.backward_scanner.as_ref(),
             )
     }
+
+    /// Return the first accepting end for an unanchored `CLASS+ SUFFIX`
+    /// match wholly within `window` while retaining the dispatched preflight
+    /// envelope. Anchored plans retain their established span search.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn first_acceptance_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.plan.first_acceptance_window_value_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            self.backward_scanner.as_ref(),
+        )
+    }
 }
 
 #[allow(
@@ -2656,6 +2733,14 @@ mod tests {
             scalar.exists_window_value(haystack, window, SearchLimits::unlimited()),
             Ok(true)
         );
+        assert_eq!(
+            scalar.first_acceptance_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited()
+            ),
+            Ok(Some(10))
+        );
 
         let exact = SearchLimits {
             max_work_upper_bound: exists.1.work_upper_bound,
@@ -2697,6 +2782,18 @@ mod tests {
             ),
             Err(SearchError::InvalidWindow { .. })
         ));
+        assert!(matches!(
+            scalar.first_acceptance_window_value(
+                haystack,
+                Window::new(2, 1),
+                SearchLimits {
+                    max_work_upper_bound: 0,
+                    max_candidate_visits: 0,
+                    max_scratch_bytes: 0,
+                }
+            ),
+            Err(SearchError::InvalidWindow { .. })
+        ));
 
         let dispatched = RequiredLiteralPlan::build_with_dispatch(
             SimdDispatchContext::capture(),
@@ -2718,6 +2815,14 @@ mod tests {
         assert_eq!(
             dispatched.exists_window_value(haystack, window, SearchLimits::unlimited()),
             Ok(true)
+        );
+        assert_eq!(
+            dispatched.first_acceptance_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited()
+            ),
+            Ok(dispatched_span.0.map(|(_, end)| end))
         );
     }
 
@@ -2762,6 +2867,15 @@ mod tests {
                     Ok(span.0.is_some()),
                     "scalar case={case} suffix_len={suffix_len}"
                 );
+                assert_eq!(
+                    scalar.first_acceptance_window_value(
+                        &body,
+                        window,
+                        SearchLimits::unlimited()
+                    ),
+                    Ok(span.0.map(|(_, end)| end)),
+                    "scalar endpoint case={case} suffix_len={suffix_len}"
+                );
 
                 let dispatched_span = dispatched
                     .find_window(&body, window, SearchLimits::unlimited())
@@ -2784,6 +2898,15 @@ mod tests {
                     ),
                     Ok(dispatched_span.0.is_some()),
                     "dispatched value case={case} suffix_len={suffix_len}"
+                );
+                assert_eq!(
+                    dispatched.first_acceptance_window_value(
+                        &body,
+                        window,
+                        SearchLimits::unlimited()
+                    ),
+                    Ok(dispatched_span.0.map(|(_, end)| end)),
+                    "dispatched endpoint case={case} suffix_len={suffix_len}"
                 );
             }
         }
@@ -2824,11 +2947,20 @@ mod tests {
                 Ok(span.0.is_some()),
                 "anchors={anchors:?}"
             );
+            assert_eq!(
+                anchored.first_acceptance_window_value(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited()
+                ),
+                Ok(span.0.map(|(_, end)| end)),
+                "anchored endpoint anchors={anchors:?}"
+            );
         }
     }
 
     #[test]
-    fn value_exists_repeated_find_resumes_at_the_incumbent_nonoverlapping_boundary() {
+    fn value_projections_resume_at_the_proved_nonoverlapping_boundary() {
         let class = ByteClass::from_bytes(b"a");
         for suffix_len in [1_usize, 2, 3, 8, 17] {
             let suffix = unbordered_suffix(suffix_len);
@@ -2867,6 +2999,20 @@ mod tests {
                     plan.exists_window_value(&haystack, window, SearchLimits::unlimited()),
                     Ok(expected),
                     "case={case} suffix_len={suffix_len}"
+                );
+                let expected_end = incumbent.iter().copied().find_map(|candidate| {
+                    (candidate != start
+                        && class.contains(haystack[candidate.checked_sub(1).unwrap()]))
+                    .then(|| candidate.checked_add(suffix.len()).unwrap())
+                });
+                assert_eq!(
+                    plan.first_acceptance_window_value(
+                        &haystack,
+                        window,
+                        SearchLimits::unlimited()
+                    ),
+                    Ok(expected_end),
+                    "endpoint case={case} suffix_len={suffix_len}"
                 );
             }
         }

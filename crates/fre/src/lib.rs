@@ -10662,10 +10662,12 @@ impl PortableRegex {
     /// Bind reusable worker-owned state for ordinary unlimited searches.
     ///
     /// A K0 matcher authenticates one source-free executor and settles its
-    /// immutable start-filter policy during this call. Other selected plan
-    /// families bind the existing canonical session with unlimited setup
-    /// limits. The returned owner retains no haystack and may be reused across
-    /// unrelated inputs by one mutable worker.
+    /// immutable start-filter policy during this call. Unanchored
+    /// required-literal matchers bind their value-only projection alongside
+    /// the canonical span session. Other selected plan families bind only the
+    /// existing canonical session with unlimited setup limits. The returned
+    /// owner retains no haystack and may be reused across unrelated inputs by
+    /// one mutable worker.
     ///
     /// This is deliberately separate from [`Self::search_session`]: ordinary
     /// methods accept no finite limits and construct no facade accounting.
@@ -10690,6 +10692,26 @@ impl PortableRegex {
                         positive,
                     )?,
                     positive,
+                }
+            }
+            PortablePlan::RequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                PortableOrdinarySessionPlan::RequiredLiteral {
+                    projection: PortableOrdinaryRequiredLiteral::Scalar(required),
+                    canonical: Box::new(
+                        self.search_session(SearchSessionLimits::unlimited())?,
+                    ),
+                }
+            }
+            PortablePlan::DispatchedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                PortableOrdinarySessionPlan::RequiredLiteral {
+                    projection: PortableOrdinaryRequiredLiteral::Dispatched(required),
+                    canonical: Box::new(
+                        self.search_session(SearchSessionLimits::unlimited())?,
+                    ),
                 }
             }
             _ => PortableOrdinarySessionPlan::Canonical(Box::new(
@@ -14007,9 +14029,11 @@ pub struct PortableSearchSession<'a> {
 ///
 /// K0 matchers bind one source-free executor, including its immutable
 /// capabilities and reusable workspace, when this session is constructed.
-/// Other matcher families retain the existing canonical search session. No
-/// method on this type accepts finite limits or publishes accounting; callers
-/// that need either contract should use [`PortableSearchSession`] instead.
+/// Unanchored required-literal matchers bind their value-only projection once
+/// while retaining the existing canonical search session for spans. Other
+/// matcher families retain only that canonical session. No method on this
+/// type accepts finite limits or publishes accounting; callers that need
+/// either contract should use [`PortableSearchSession`] instead.
 ///
 /// A session never retains a haystack. It can therefore be reused across
 /// unrelated sources by one mutable, thread-confined worker.
@@ -14025,6 +14049,50 @@ enum PortableOrdinarySessionPlan<'a> {
         positive: bool,
     },
     Canonical(Box<PortableSearchSession<'a>>),
+    RequiredLiteral {
+        projection: PortableOrdinaryRequiredLiteral<'a>,
+        canonical: Box<PortableSearchSession<'a>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PortableOrdinaryRequiredLiteral<'a> {
+    Scalar(&'a RequiredLiteralPlan),
+    Dispatched(&'a DispatchedRequiredLiteralPlan),
+}
+
+impl PortableOrdinaryRequiredLiteral<'_> {
+    #[inline]
+    fn is_match_at(self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
+        let window = LiteralWindow::new(start, haystack.len());
+        let limits = required_literal_limits(SearchLimits::unlimited());
+        match self {
+            Self::Scalar(plan) => plan
+                .exists_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
+            Self::Dispatched(plan) => plan
+                .exists_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
+        }
+    }
+
+    #[inline]
+    fn first_acceptance_at(
+        self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        let window = LiteralWindow::new(start, haystack.len());
+        let limits = required_literal_limits(SearchLimits::unlimited());
+        match self {
+            Self::Scalar(plan) => plan
+                .first_acceptance_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
+            Self::Dispatched(plan) => plan
+                .first_acceptance_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14033,10 +14101,12 @@ mod required_literal_ordinary_session_probe {
 
     std::thread_local! {
         static CALLS: Cell<usize> = const { Cell::new(0) };
+        static ENDPOINT_CALLS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
         CALLS.set(0);
+        ENDPOINT_CALLS.set(0);
     }
 
     pub(super) fn record() {
@@ -14045,6 +14115,14 @@ mod required_literal_ordinary_session_probe {
 
     pub(super) fn calls() -> usize {
         CALLS.get()
+    }
+
+    pub(super) fn record_endpoint() {
+        ENDPOINT_CALLS.set(ENDPOINT_CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn endpoint_calls() -> usize {
+        ENDPOINT_CALLS.get()
     }
 }
 
@@ -19434,19 +19512,24 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|endpoint| endpoint.is_some())
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => session
-                .is_match_window_ordinary(
-                    haystack,
-                    SearchWindow::new(start, haystack.len()),
-                ),
+                .shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+                .map(|endpoint| endpoint.is_some()),
+            PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
+                #[cfg(test)]
+                required_literal_ordinary_session_probe::record();
+                projection.is_match_at(haystack, start)
+            }
         }
     }
 
     /// Return the first accepting boundary at or after `start`.
     ///
-    /// K0 executes its endpoint-only engine. Canonical fallback plans use the
-    /// existing value-only shortest-match projection with unlimited limits.
-    /// Assertions inspect the complete original haystack and the returned
-    /// boundary is relative to it.
+    /// K0 executes its endpoint-only engine. An unanchored required-literal
+    /// owner selects the first suffix witness without recovering its greedy
+    /// start. Other canonical fallback plans use the existing value-only
+    /// shortest-match projection with unlimited limits. Assertions inspect
+    /// the complete original haystack and the returned boundary is relative
+    /// to it.
     ///
     /// # Errors
     ///
@@ -19462,8 +19545,14 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .first_acceptance_at(haystack, start)
                 .map_err(SearchError::from),
-            PortableOrdinarySessionPlan::Canonical(session) => session
-                .shortest_match_at_value(haystack, start, SearchLimits::unlimited()),
+            PortableOrdinarySessionPlan::Canonical(session) => {
+                session.shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+            }
+            PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
+                #[cfg(test)]
+                required_literal_ordinary_session_probe::record_endpoint();
+                projection.first_acceptance_at(haystack, start)
+            }
         }
     }
 
@@ -19512,7 +19601,10 @@ impl<'r> PortableOrdinarySession<'r> {
                     })
                 })
                 .map_err(SearchError::from),
-            PortableOrdinarySessionPlan::Canonical(session) => {
+            PortableOrdinarySessionPlan::RequiredLiteral {
+                canonical: session, ..
+            }
+            | PortableOrdinarySessionPlan::Canonical(session) => {
                 session.find_at_value(haystack, start, SearchLimits::unlimited())
             }
         }
@@ -19592,7 +19684,10 @@ impl<'r> PortableOrdinarySession<'r> {
                     visitor,
                 )
             }
-            PortableOrdinarySessionPlan::Canonical(session) => {
+            PortableOrdinarySessionPlan::RequiredLiteral {
+                canonical: session, ..
+            }
+            | PortableOrdinarySessionPlan::Canonical(session) => {
                 let matches = session.find_iter_value_at(
                     haystack,
                     start,
@@ -19709,47 +19804,6 @@ where
 }
 
 impl<'r> PortableSearchSession<'r> {
-    #[inline]
-    fn is_match_window_ordinary(
-        &mut self,
-        haystack: &[u8],
-        window: SearchWindow,
-    ) -> Result<bool, SearchError> {
-        if let PortableSearchSessionPlan::Native(regex) = &self.plan {
-            match &regex.plan {
-                PortablePlan::RequiredLiteral(required)
-                    if !required.anchors().start && !required.anchors().end =>
-                {
-                    #[cfg(test)]
-                    required_literal_ordinary_session_probe::record();
-                    return required
-                        .exists_window_value(
-                            haystack,
-                            LiteralWindow::new(window.start(), window.end()),
-                            required_literal_limits(SearchLimits::unlimited()),
-                        )
-                        .map_err(SearchError::from);
-                }
-                PortablePlan::DispatchedRequiredLiteral(required)
-                    if !required.anchors().start && !required.anchors().end =>
-                {
-                    #[cfg(test)]
-                    required_literal_ordinary_session_probe::record();
-                    return required
-                        .exists_window_value(
-                            haystack,
-                            LiteralWindow::new(window.start(), window.end()),
-                            required_literal_limits(SearchLimits::unlimited()),
-                        )
-                        .map_err(SearchError::from);
-                }
-                _ => {}
-            }
-        }
-        self.shortest_match_window_value(haystack, window, SearchLimits::unlimited())
-            .map(|endpoint| endpoint.is_some())
-    }
-
     /// Stable runtime identity of the borrowed matcher.
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
@@ -41202,7 +41256,7 @@ mod tests {
     }
 
     #[test]
-    fn required_literal_ordinary_session_uses_the_boolean_engine() {
+    fn required_literal_ordinary_session_uses_the_value_only_engines() {
         let regex = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
             .build()
             .expect("public byte-mode required-literal pattern builds");
@@ -41223,18 +41277,35 @@ mod tests {
             5,
             "every ordinary boolean call must enter the bound required-literal engine",
         );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::endpoint_calls(),
+            0,
+            "the boolean projection must not request an endpoint",
+        );
 
         super::required_literal_ordinary_session_probe::reset();
-        assert_eq!(
-            ordinary.first_acceptance_at(haystack, 0),
-            regex.shortest_match_at_value(haystack, 0, SearchLimits::unlimited()),
-        );
+        for start in [0, 1, 4, 9, haystack.len()] {
+            assert_eq!(
+                ordinary.shortest_match_at(haystack, start),
+                regex.shortest_match_at_value(
+                    haystack,
+                    start,
+                    SearchLimits::unlimited()
+                ),
+            );
+        }
         assert_eq!(
             super::required_literal_ordinary_session_probe::calls(),
             0,
-            "endpoint selection must retain the canonical engine",
+            "endpoint selection must not use the boolean projection",
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::endpoint_calls(),
+            5,
+            "every ordinary shortest-match call must use the endpoint engine",
         );
 
+        super::required_literal_ordinary_session_probe::reset();
         let anchored = PortableBuilder::new(r"(?-u:\A[a-z]+ZQ)")
             .plan_selection(PlanSelection::ForceRequiredLiteral)
             .build()
@@ -41246,6 +41317,19 @@ mod tests {
             super::required_literal_ordinary_session_probe::calls(),
             0,
             "anchored owners must retain their canonical endpoint engine",
+        );
+        assert_eq!(
+            anchored_ordinary.shortest_match_at(b"aaaaZQ", 0),
+            anchored.shortest_match_at_value(
+                b"aaaaZQ",
+                0,
+                SearchLimits::unlimited()
+            ),
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::endpoint_calls(),
+            0,
+            "anchored endpoints must retain their canonical span engine",
         );
     }
 
