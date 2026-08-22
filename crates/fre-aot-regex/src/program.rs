@@ -7,6 +7,7 @@ use fre_automata::{
     SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLayout,
     WorkspaceLimits, WorkspaceShape,
 };
+use fre_lower::LowerError;
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
     AsciiByteSetNonMemberScanner, AsciiByteSetRunScanner, BYTE_SET_BLOCK_BYTES,
@@ -11127,6 +11128,27 @@ impl CompiledProgram {
             self.output,
         )
         .map(Box::new);
+    }
+
+    pub(crate) fn attach_native_finite_language_for_lower_state_rescue(
+        &mut self,
+        candidate: NativeFiniteLanguageCandidate,
+    ) -> Result<bool, LowerError> {
+        self.native_finite_language = None;
+        if self.engine_selection_reason == Some(EngineSelectionReason::FastMode) {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite lower-state rescue reached a Fast-mode program",
+            });
+        }
+        let Some(program) = NativeFiniteLanguageProgram::bind_for_lower_state_rescue(
+            candidate,
+            self.identity.artifact,
+            self.output,
+        )? else {
+            return Ok(false);
+        };
+        self.native_finite_language = Some(Box::new(program));
+        Ok(true)
     }
 
     /// Return the transient finite-language IR only while its exact artifact

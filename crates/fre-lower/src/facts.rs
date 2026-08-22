@@ -651,6 +651,13 @@ impl FiniteLanguage {
     pub const fn total_bytes(&self) -> usize {
         self.total_bytes
     }
+
+    /// Consume this proof payload and return its source-priority-ordered
+    /// strings without copying their bytes.
+    #[must_use]
+    pub fn into_strings(self) -> Vec<Vec<u8>> {
+        self.strings
+    }
 }
 
 /// One assertion and its possible match-relative context.
@@ -1188,6 +1195,15 @@ impl HirFacts {
     #[must_use]
     pub const fn finite_language(&self) -> &FactProof<FiniteLanguage> {
         &self.finite_language
+    }
+
+    /// Consume this authenticated report and return its finite-language proof.
+    ///
+    /// This avoids a second potentially failing allocation when a downstream
+    /// compiler uses the proof as a bounded resource fallback.
+    #[must_use]
+    pub fn into_finite_language(self) -> FactProof<FiniteLanguage> {
+        self.finite_language
     }
 
     #[must_use]

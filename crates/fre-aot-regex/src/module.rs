@@ -18683,24 +18683,26 @@ fn native_finite_language_layout(
 fn materialize_native_finite_language_data(
     view: NativeFiniteLanguageView<'_>,
     layout: NativeFiniteLanguageLayout,
-) -> Option<Vec<u8>> {
-    match layout.representation {
+) -> Result<Option<Vec<u8>>, ObjectError> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(layout.required_data_bytes)
+        .map_err(|_| ObjectError::Allocation("ordered finite-language native data"))?;
+    data.resize(layout.required_data_bytes, 0);
+    Ok(match layout.representation {
         NativeFiniteLanguageRepresentation::Dense => {
-            materialize_native_finite_language_dense_data(view, layout)
+            materialize_native_finite_language_dense_data(view, layout, data)
         }
         NativeFiniteLanguageRepresentation::SparseFailure => {
-            materialize_native_finite_language_sparse_data(view, layout)
+            materialize_native_finite_language_sparse_data(view, layout, data)
         }
-    }
+    })
 }
 
 fn materialize_native_finite_language_dense_data(
     view: NativeFiniteLanguageView<'_>,
     layout: NativeFiniteLanguageLayout,
+    mut data: Vec<u8>,
 ) -> Option<Vec<u8>> {
-    let mut data = Vec::new();
-    data.try_reserve_exact(layout.required_data_bytes).ok()?;
-    data.resize(layout.required_data_bytes, 0);
     data.get_mut(..256)?.copy_from_slice(view.byte_classes);
 
     let row_offset = usize::try_from(layout.row_offset).ok()?;
@@ -18816,6 +18818,7 @@ fn native_finite_sparse_meta(edge_start: u32, edge_count: u16) -> Option<u32> {
 fn materialize_native_finite_language_sparse_data(
     view: NativeFiniteLanguageView<'_>,
     layout: NativeFiniteLanguageLayout,
+    mut data: Vec<u8>,
 ) -> Option<Vec<u8>> {
     if layout.representation != NativeFiniteLanguageRepresentation::SparseFailure
         || view.sparse_states.len() != view.state_count()
@@ -18823,10 +18826,6 @@ fn materialize_native_finite_language_sparse_data(
     {
         return None;
     }
-    let mut data = Vec::new();
-    data.try_reserve_exact(layout.required_data_bytes).ok()?;
-    data.resize(layout.required_data_bytes, 0);
-
     let root = *view.sparse_states.first()?;
     let root_start = usize::try_from(root.edge_start()).ok()?;
     let root_end = root_start.checked_add(usize::from(root.edge_count()))?;
@@ -19329,18 +19328,14 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
     let Some(report) = cost.report(layout) else {
         return Ok(None);
     };
-    let Some(data) = materialize_native_finite_language_data(view, layout) else {
-        return Ok(None);
-    };
+    let data = selected_native_finite_language_data(materialize_native_finite_language_data(
+        view, layout,
+    ))?;
     let emitted = match target.architecture {
         Architecture::X86_64 => lower_x86_64_native_finite_language(view.output, layout),
         Architecture::Aarch64 => lower_aarch64_native_finite_language(view.output, layout),
     };
-    let (code, relocations) = match emitted {
-        Ok(emitted) => emitted,
-        Err(ObjectError::Allocation(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let (code, relocations) = emitted?;
     Ok(Some((
         NativeLowering {
             code,
@@ -19353,6 +19348,14 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
         },
         report,
     )))
+}
+
+fn selected_native_finite_language_data(
+    outcome: Result<Option<Vec<u8>>, ObjectError>,
+) -> Result<Vec<u8>, ObjectError> {
+    outcome?.ok_or(ObjectError::InvalidModule(
+        "selected ordered finite-language layout could not be materialized",
+    ))
 }
 
 fn lower_native_dfa(
@@ -67553,6 +67556,7 @@ mod tests {
         );
 
         let data = materialize_native_finite_language_data(view, layout)
+            .expect("finite native allocation")
             .expect("validated finite native image");
         assert!(validate_native_finite_language_data(view, layout, &data).is_some());
         let class_count = usize::try_from(layout.class_count).unwrap();
@@ -67700,6 +67704,24 @@ mod tests {
     }
 
     #[test]
+    fn ordered_finite_allocator_failure_is_terminal_at_materialization_seam() {
+        assert_eq!(
+            selected_native_finite_language_data(Err(ObjectError::Allocation(
+                "injected ordered finite-language allocation",
+            ))),
+            Err(ObjectError::Allocation(
+                "injected ordered finite-language allocation",
+            )),
+        );
+        assert_eq!(
+            selected_native_finite_language_data(Ok(None)),
+            Err(ObjectError::InvalidModule(
+                "selected ordered finite-language layout could not be materialized",
+            )),
+        );
+    }
+
+    #[test]
     fn ordered_finite_sparse_rows_compact_and_authenticate_large_languages() {
         let compiled = ordered_finite_test_program(
             &dense_correlated_finite_pattern(true),
@@ -67722,6 +67744,7 @@ mod tests {
         assert_eq!(view.sparse_transition_count(), view.state_count() - 1);
 
         let data = materialize_native_finite_language_data(view, sparse)
+            .expect("finite native allocation")
             .expect("materialize compact finite image");
         assert!(validate_native_finite_language_data(view, sparse, &data).is_some());
         let mut damaged = data;

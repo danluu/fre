@@ -360,6 +360,7 @@ pub fn compile_uniform_capture_selector(
         line_terminator,
         OutputContract::Span,
         native_finite_language_candidate,
+        None,
         request.target,
         request.mode,
         request.selector_limits,

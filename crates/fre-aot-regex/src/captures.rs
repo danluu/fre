@@ -696,6 +696,7 @@ fn compile_captures_validated(
         line_terminator,
         OutputContract::Span,
         native_finite_language_candidate,
+        None,
         target,
         mode,
         limits.selector,

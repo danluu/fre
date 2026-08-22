@@ -1,21 +1,272 @@
+use std::fmt::Write as _;
+
 use fre_automata::{
     Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, K0ResumeSet, K0Workspace,
     RawPlan, SearchError as AutomatonSearchError, StateRole, WorkspaceLimits,
 };
-use fre_syntax::RustProfile;
+use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
 use regex::bytes::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
-    ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
-    EngineSelectionReason, EntryAbi, FeatureSet, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
+    DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi, FeatureSet,
+    PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
+
+fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String {
+    let mut pattern = String::from("(?-u:");
+    let mut first = true;
+    for root in 0..roots {
+        if !first {
+            pattern.push('|');
+        }
+        first = false;
+        let root = u64::try_from(root).expect("test root fits u64");
+        let scrambled_root = root.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let prefix = format!("{scrambled_root:016x}");
+        pattern.push_str(&prefix);
+        for child in 0..children_per_root {
+            pattern.push('|');
+            pattern.push_str(&prefix);
+            let child = u64::try_from(child).expect("test child fits u64");
+            let scrambled_child = root
+                .wrapping_mul(0xd6e8_feb8_6659_fd93)
+                .wrapping_add(child.wrapping_mul(0xa076_1d64_78bd_642f));
+            write!(&mut pattern, "{scrambled_child:016x}")
+                .expect("writing to a String cannot fail");
+        }
+    }
+    pattern.push(')');
+    pattern
+}
+
+fn parsed_rust_bytes(pattern: &str) -> fre_syntax::RustParsed {
+    let parsed = fre_syntax::parse(ParseRequest::rust(
+        pattern,
+        CompatibilityProfile::RustBytes(RustProfile::default()),
+    ))
+    .expect("parse generated Rust-byte fixture");
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        panic!("Rust-byte fixture produced another syntax tree");
+    };
+    parsed
+}
+
+fn assert_same_lower_resource_failure(expected: fre_lower::LowerError, actual: CompileError) {
+    match (expected, actual) {
+        (
+            fre_lower::LowerError::ResourceLimit {
+                resource: expected_resource,
+                needed: expected_needed,
+                limit: expected_limit,
+            },
+            CompileError::Lower(fre_lower::LowerError::ResourceLimit {
+                resource,
+                needed,
+                limit,
+            }),
+        ) => {
+            assert_eq!(resource, expected_resource);
+            assert_eq!(needed, expected_needed);
+            assert_eq!(limit, expected_limit);
+        }
+        (expected, actual) => {
+            panic!("unexpected lower decline: expected {expected:?}, actual {actual:?}")
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end regression covers the ordinary, rescue, and decline contracts"
+)]
+fn lower_state_finite_dictionary_rescue_preserves_declines_and_ordinary_success() {
+    let pattern = generated_prefix_dictionary(64, 16);
+    let parsed = parsed_rust_bytes(&pattern);
+    let ordinary = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        fre_lower::LowerLimits::default(),
+    )
+    .expect("unconstrained generated dictionary lowering")
+    .into_plan();
+    let candidate = crate::finite_language::NativeFiniteLanguageCandidate::analyze(
+        &parsed,
+        OutputContract::Span,
+    )
+    .expect("generated dictionary finite proof");
+    let compact = candidate
+        .priority_trie_raw_plan(fre_lower::LowerLimits::default())
+        .expect("bounded generated dictionary trie")
+        .expect("priority-compatible generated dictionary");
+    assert!(
+        compact.roles.len() < ordinary.roles.len(),
+        "compact={}, ordinary={}",
+        compact.roles.len(),
+        ordinary.roles.len(),
+    );
+
+    let no_dfa = DeterminizeLimits {
+        max_states: 0,
+        max_transitions: 0,
+        max_work: 0,
+    };
+    let baseline_limits = CompileLimitsV1 {
+        determinize: no_dfa,
+        ..CompileLimitsV1::default()
+    };
+    let slow_limits = SlowAotLimits {
+        determinize: no_dfa,
+        ..SlowAotLimits::default()
+    };
+    let baseline = compile_with_slow_aot_limits(
+        CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(baseline_limits),
+        slow_limits,
+    )
+    .expect("ordinary-success baseline");
+    let mut exact_ordinary_limits = baseline_limits;
+    exact_ordinary_limits.lower.automata.max_states = ordinary.roles.len();
+    let exact_ordinary = compile_with_slow_aot_limits(
+        CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(exact_ordinary_limits),
+        slow_limits,
+    )
+    .expect("ordinary lowering at its exact state ceiling");
+    assert_eq!(exact_ordinary.object(), baseline.object());
+    assert_eq!(exact_ordinary.receipt(), baseline.receipt());
+    assert_eq!(exact_ordinary.module(), baseline.module());
+    assert_eq!(
+        exact_ordinary.program().serialize().unwrap(),
+        baseline.program().serialize().unwrap(),
+    );
+
+    let mut rescue_limits = baseline_limits;
+    rescue_limits.lower.automata.max_states = compact.roles.len();
+    let original = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        rescue_limits.lower,
+    )
+    .expect_err("ordinary dictionary lowering must exceed the compact ceiling");
+    assert!(matches!(
+        &original,
+        fre_lower::LowerError::ResourceLimit {
+            resource: fre_lower::LowerResource::States,
+            ..
+        }
+    ));
+    let rescued = compile_with_slow_aot_limits(
+        CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(rescue_limits),
+        slow_limits,
+    )
+    .expect("finite dictionary resource rescue");
+    assert_eq!(rescued.receipt().thompson_states, compact.roles.len());
+    assert!(rescued.receipt().ordered_finite_language_aot.is_some());
+    assert!(!rescued.receipt().runtime_helper_required);
+    assert!(
+        !rescued
+            .program()
+            .native_finite_language_view()
+            .expect("rescued exact finite sidecar")
+            .has_dense_transitions(),
+        "state rescue must not risk an optional dense-row allocation",
+    );
+
+    let fast_error = compile_with_slow_aot_limits(
+        CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span)
+            .limits(rescue_limits),
+        slow_limits,
+    )
+    .expect_err("Fast mode must preserve the ordinary lower failure");
+    assert_same_lower_resource_failure(original, fast_error);
+}
+
+#[test]
+fn mixed_prefix_priority_rescue_returns_the_exact_ordinary_lower_failure() {
+    let pattern = "(?-u:abx|a|aby)";
+    let parsed = parsed_rust_bytes(pattern);
+    let ordinary = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        fre_lower::LowerLimits::default(),
+    )
+    .expect("unconstrained mixed-priority lowering")
+    .into_plan();
+    let mut limits = CompileLimitsV1::default();
+    limits.lower.automata.max_states = ordinary
+        .roles
+        .len()
+        .checked_sub(1)
+        .expect("mixed-priority plan is nonempty");
+    let expected = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        limits.lower,
+    )
+    .expect_err("ordinary mixed-priority lowering must exceed the test ceiling");
+    assert!(matches!(
+        &expected,
+        fre_lower::LowerError::ResourceLimit {
+            resource: fre_lower::LowerResource::States,
+            ..
+        }
+    ));
+    let actual = compile(
+        CompileRequest::new(pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+    )
+    .expect_err("mixed terminal priority must decline rescue");
+    assert_same_lower_resource_failure(expected, actual);
+}
+
+#[test]
+fn non_state_lower_resource_never_enters_finite_rescue() {
+    let pattern = "(?-u:abc|def)";
+    let parsed = parsed_rust_bytes(pattern);
+    let mut limits = CompileLimitsV1::default();
+    limits.lower.max_work = 0;
+    let expected = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        limits.lower,
+    )
+    .expect_err("ordinary lowering must exceed the zero work ceiling");
+    assert!(matches!(
+        expected,
+        fre_lower::LowerError::ResourceLimit {
+            resource: fre_lower::LowerResource::Work,
+            ..
+        }
+    ));
+    let actual = compile(
+        CompileRequest::new(pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+    )
+    .expect_err("a non-state lower limit must remain terminal");
+    assert_same_lower_resource_failure(expected, actual);
+}
 
 #[test]
 fn receipt_records_selected_workspace_optimizer_identity_v25() {

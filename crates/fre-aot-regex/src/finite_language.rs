@@ -5,8 +5,12 @@
 //! additionally attach this sidecar when the current HIR-fact implementation
 //! proves the complete, assertion-free, non-nullable byte language.
 
+use fre_automata::{
+    EdgeKind, RawPlan, StateRole, raw_plan_resource_requirements,
+};
 use fre_lower::{
-    FactLimits, FactOperation, FactOptionalProofs, FactOutput, HirFacts, analyze_facts,
+    FactError, FactLimits, FactOperation, FactOptionalProofs, FactOutput, FactProof, HirFacts,
+    LowerError, LowerLimits, analyze_facts,
 };
 use fre_syntax::RustParsed;
 use sha2::{Digest, Sha256};
@@ -34,6 +38,28 @@ const MAX_ORDERED_FINITE_FAILURE_STEPS: u64 = 64_000_000;
 /// Wider exact languages retain the existing Aho-Corasick candidate. This is
 /// a structural compiler bound, not a source-pattern or benchmark identity.
 const MAX_NATIVE_FINITE_TEDDY_LITERALS: usize = 64;
+
+/// Separately bounded proof envelope used only after ordinary HIR lowering
+/// has already declined a numeric resource. The prospective fact analysis is
+/// deliberately wider than the ordinary optional optimizer envelope so large
+/// literal dictionaries can prove their compact form, while remaining a
+/// closed compiler resource transaction.
+const LOWER_STATE_RESCUE_FACT_LIMITS: FactLimits = FactLimits {
+    max_work: 128_000_000,
+    max_stack_items: 1_000_000,
+    max_hir_nodes: 1_000_000,
+    max_retained_bytes: 64 * 1024 * 1024,
+    max_temporary_bytes: 256 * 1024 * 1024,
+    max_peak_bytes: 320 * 1024 * 1024,
+    max_allocation_attempts: 8_000_000,
+    max_finite_strings: 262_144,
+    max_finite_string_bytes: 8 * 1024 * 1024,
+    max_required_groups: 64,
+    max_required_alternatives: 4_096,
+    max_required_bytes: 1 << 20,
+    max_assertions: 4_096,
+    max_deterministic_states: 1 << 20,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrderedFiniteBuildLimits {
@@ -85,6 +111,69 @@ impl NativeFiniteLanguageCandidate {
         Self::from_facts(&facts, operation)
     }
 
+    /// Prove an exact finite language after ordinary lowering exceeded its
+    /// automaton-state ceiling. Hard allocator, arithmetic, and invariant failures
+    /// remain terminal; a bounded proof refusal simply preserves the original
+    /// lowering error.
+    pub(crate) fn analyze_for_lower_state_rescue(
+        parsed: &RustParsed,
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        let operation = fact_operation(output);
+        let facts = match analyze_facts(parsed, operation, LOWER_STATE_RESCUE_FACT_LIMITS) {
+            Ok(facts) => facts,
+            Err(FactError::ResourceLimit { .. }) => return Ok(None),
+            Err(FactError::AllocationFailed {
+                structure,
+                additional,
+            }) => {
+                return Err(LowerError::AllocationFailed {
+                    structure,
+                    additional,
+                });
+            }
+            Err(FactError::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            Err(FactError::InternalInvariant { detail }) => {
+                return Err(LowerError::InternalInvariant { detail });
+            }
+            Err(FactError::CaptureErasureForCaptureOutput) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite lowering rescue requested capture-erased facts for capture output",
+                });
+            }
+            Err(_) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite lowering rescue observed an unknown fact failure",
+                });
+            }
+        };
+        if !facts.identity().authenticates_current()
+            || facts.operation() != operation
+            || !facts
+                .assertions()
+                .possible()
+                .as_proven()
+                .is_some_and(Vec::is_empty)
+        {
+            return Ok(None);
+        }
+        let FactProof::Proven(language) = facts.into_finite_language() else {
+            return Ok(None);
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(None);
+        }
+        let total_bytes = language.total_bytes();
+        let strings = language.into_strings();
+        Ok(Some(Self {
+            operation,
+            strings,
+            total_bytes,
+        }))
+    }
+
     fn from_facts(facts: &HirFacts, operation: FactOperation) -> Option<Self> {
         if !facts.identity().authenticates_current() || facts.operation() != operation {
             return None;
@@ -116,6 +205,413 @@ impl NativeFiniteLanguageCandidate {
             total_bytes: language.total_bytes(),
         })
     }
+
+    /// Build a compact priority-preserving trie as the stable semantic floor
+    /// for an ordinary-lowering state-cap decline. A terminal prefix is shared
+    /// only when its source priority is uniformly before or uniformly after
+    /// every longer descendant; interleaved priority declines instead of
+    /// changing leftmost-first semantics.
+    pub(crate) fn priority_trie_raw_plan(
+        &self,
+        limits: LowerLimits,
+    ) -> Result<Option<RawPlan>, LowerError> {
+        PriorityTrieRawBuilder::new(&self.strings, self.total_bytes, limits).build()
+    }
+}
+
+#[derive(Debug)]
+struct PriorityTrieNode {
+    edges: Vec<(u8, u32)>,
+    terminal_ordinal: Option<u32>,
+    subtree_min_ordinal: u32,
+    subtree_max_ordinal: u32,
+}
+
+impl PriorityTrieNode {
+    const fn new() -> Self {
+        Self {
+            edges: Vec::new(),
+            terminal_ordinal: None,
+            subtree_min_ordinal: u32::MAX,
+            subtree_max_ordinal: 0,
+        }
+    }
+}
+
+struct PriorityTrieRawBuilder<'a> {
+    strings: &'a [Vec<u8>],
+    total_bytes: usize,
+    limits: LowerLimits,
+}
+
+impl<'a> PriorityTrieRawBuilder<'a> {
+    const fn new(strings: &'a [Vec<u8>], total_bytes: usize, limits: LowerLimits) -> Self {
+        Self {
+            strings,
+            total_bytes,
+            limits,
+        }
+    }
+
+    fn build(self) -> Result<Option<RawPlan>, LowerError> {
+        if self.strings.is_empty() || self.strings.iter().any(Vec::is_empty) {
+            return Ok(None);
+        }
+        let measured_total = self.strings.iter().try_fold(0_usize, |total, string| {
+            total.checked_add(string.len())
+        });
+        if measured_total != Some(self.total_bytes) {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite lowering rescue source-byte accounting changed",
+            });
+        }
+        if u32::try_from(self.strings.len()).is_err() {
+            return Ok(None);
+        }
+        let maximum_trie_states = self
+            .limits
+            .automata
+            .max_edges
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "finite rescue trie-state ceiling",
+            })?
+            .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
+        if maximum_trie_states == 0 {
+            return Ok(None);
+        }
+        let reserve_states = self
+            .total_bytes
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "finite rescue trie-state prospective",
+            })?
+            .min(maximum_trie_states);
+        let mut trie = Vec::new();
+        reserve_exact(&mut trie, reserve_states, "finite rescue trie states")?;
+        trie.push(PriorityTrieNode::new());
+        for (ordinal, string) in self.strings.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| LowerError::ArithmeticOverflow {
+                computation: "finite rescue source ordinal",
+            })?;
+            let mut node = 0_usize;
+            for &byte in string {
+                let edge = trie[node]
+                    .edges
+                    .binary_search_by_key(&byte, |&(candidate, _)| candidate);
+                node = match edge {
+                    Ok(index) => usize::try_from(trie[node].edges[index].1).map_err(|_| {
+                        LowerError::ArithmeticOverflow {
+                            computation: "finite rescue trie target",
+                        }
+                    })?,
+                    Err(index) => {
+                        if trie.len() >= maximum_trie_states {
+                            return Ok(None);
+                        }
+                        reserve_exact(
+                            &mut trie[node].edges,
+                            1,
+                            "finite rescue trie edge",
+                        )?;
+                        reserve_exact(&mut trie, 1, "finite rescue trie state")?;
+                        let next = u32::try_from(trie.len()).map_err(|_| {
+                            LowerError::ArithmeticOverflow {
+                                computation: "finite rescue trie state token",
+                            }
+                        })?;
+                        trie.push(PriorityTrieNode::new());
+                        trie[node].edges.insert(index, (byte, next));
+                        usize::try_from(next).map_err(|_| LowerError::ArithmeticOverflow {
+                            computation: "finite rescue trie state index",
+                        })?
+                    }
+                };
+            }
+            trie[node].terminal_ordinal = Some(
+                trie[node]
+                    .terminal_ordinal
+                    .map_or(ordinal, |prior| prior.min(ordinal)),
+            );
+        }
+
+        for node in (0..trie.len()).rev() {
+            let mut minimum = trie[node].terminal_ordinal.unwrap_or(u32::MAX);
+            let mut maximum = trie[node].terminal_ordinal.unwrap_or(0);
+            for &(_, child) in &trie[node].edges {
+                let child = usize::try_from(child).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "finite rescue child index",
+                    }
+                })?;
+                minimum = minimum.min(trie[child].subtree_min_ordinal);
+                maximum = maximum.max(trie[child].subtree_max_ordinal);
+            }
+            if minimum == u32::MAX {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite rescue trie node had no terminal descendant",
+                });
+            }
+            trie[node].subtree_min_ordinal = minimum;
+            trie[node].subtree_max_ordinal = maximum;
+        }
+
+        let mut final_states = 1_usize;
+        let mut final_edges = 0_usize;
+        for node in &trie {
+            if node.edges.is_empty() {
+                if node.terminal_ordinal.is_none() {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "finite rescue trie leaf was not accepting",
+                    });
+                }
+                continue;
+            }
+            final_states = checked_add(final_states, 1, "finite rescue semantic states")?;
+            final_edges = checked_add(
+                final_edges,
+                node.edges.len(),
+                "finite rescue semantic edges",
+            )?;
+            if let Some(terminal) = node.terminal_ordinal {
+                let (descendant_minimum, descendant_maximum) = descendant_extrema(node, &trie)?;
+                if terminal >= descendant_minimum && terminal <= descendant_maximum {
+                    return Ok(None);
+                }
+                final_states = checked_add(final_states, 1, "finite rescue continuation states")?;
+                final_edges = checked_add(final_edges, 2, "finite rescue priority edges")?;
+            }
+        }
+        if final_states > self.limits.automata.max_states
+            || final_edges > self.limits.automata.max_edges
+            || u32::try_from(final_states).is_err()
+            || u32::try_from(final_edges).is_err()
+        {
+            return Ok(None);
+        }
+        let work = self
+            .total_bytes
+            .checked_add(trie.len().checked_mul(2).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "finite rescue trie work",
+                },
+            )?)
+            .and_then(|work| work.checked_add(final_states))
+            .and_then(|work| work.checked_add(final_edges))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "finite rescue total work",
+            })?;
+        if u64::try_from(work).map_or(true, |work| work > self.limits.max_work) {
+            return Ok(None);
+        }
+        let (storage_bytes, validation_work) =
+            raw_plan_resource_requirements(final_states, final_edges).map_err(|error| {
+                match error {
+                    fre_automata::CompileError::ArithmeticOverflow { computation } => {
+                        LowerError::ArithmeticOverflow { computation }
+                    }
+                    _ => LowerError::InternalInvariant {
+                        detail: "finite rescue raw resource prospective was malformed",
+                    },
+                }
+            })?;
+        if storage_bytes > self.limits.automata.max_storage_bytes
+            || validation_work > self.limits.automata.max_validation_work
+        {
+            return Ok(None);
+        }
+
+        let mut main_tokens = Vec::new();
+        reserve_exact(
+            &mut main_tokens,
+            trie.len(),
+            "finite rescue main-state tokens",
+        )?;
+        main_tokens.resize(trie.len(), u32::MAX);
+        let mut continuation_tokens = Vec::new();
+        reserve_exact(
+            &mut continuation_tokens,
+            trie.len(),
+            "finite rescue continuation tokens",
+        )?;
+        continuation_tokens.resize(trie.len(), u32::MAX);
+        let mut next_token = 1_usize;
+        for (node_index, node) in trie.iter().enumerate() {
+            if node.edges.is_empty() {
+                continue;
+            }
+            main_tokens[node_index] = u32::try_from(next_token).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "finite rescue main-state token",
+                }
+            })?;
+            next_token = checked_add(next_token, 1, "finite rescue state token")?;
+            if node.terminal_ordinal.is_some() {
+                continuation_tokens[node_index] = u32::try_from(next_token).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "finite rescue continuation-state token",
+                    }
+                })?;
+                next_token = checked_add(next_token, 1, "finite rescue state token")?;
+            }
+        }
+        if next_token != final_states || main_tokens[0] == u32::MAX {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite rescue state-token accounting changed",
+            });
+        }
+
+        let mut raw = RawPlan {
+            start: main_tokens[0],
+            roles: Vec::new(),
+            edge_offsets: Vec::new(),
+            edge_targets: Vec::new(),
+            edge_kinds: Vec::new(),
+            byte_starts: Vec::new(),
+            byte_ends: Vec::new(),
+        };
+        reserve_exact(&mut raw.roles, final_states, "finite rescue roles")?;
+        reserve_exact(
+            &mut raw.edge_offsets,
+            checked_add(final_states, 1, "finite rescue offset count")?,
+            "finite rescue offsets",
+        )?;
+        reserve_exact(
+            &mut raw.edge_targets,
+            final_edges,
+            "finite rescue edge targets",
+        )?;
+        reserve_exact(&mut raw.edge_kinds, final_edges, "finite rescue edge kinds")?;
+        reserve_exact(&mut raw.byte_starts, final_edges, "finite rescue byte starts")?;
+        reserve_exact(&mut raw.byte_ends, final_edges, "finite rescue byte ends")?;
+        raw.roles.push(StateRole::Accept);
+        raw.edge_offsets.extend([0, 0]);
+        for (node_index, node) in trie.iter().enumerate() {
+            if node.edges.is_empty() {
+                continue;
+            }
+            if let Some(terminal) = node.terminal_ordinal {
+                let (descendant_minimum, descendant_maximum) = descendant_extrema(node, &trie)?;
+                raw.roles.push(StateRole::Split);
+                if terminal < descendant_minimum {
+                    push_raw_edge(&mut raw, 0, EdgeKind::Epsilon, 0);
+                    push_raw_edge(
+                        &mut raw,
+                        continuation_tokens[node_index],
+                        EdgeKind::Epsilon,
+                        0,
+                    );
+                } else if terminal > descendant_maximum {
+                    push_raw_edge(
+                        &mut raw,
+                        continuation_tokens[node_index],
+                        EdgeKind::Epsilon,
+                        0,
+                    );
+                    push_raw_edge(&mut raw, 0, EdgeKind::Epsilon, 0);
+                } else {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "finite rescue mixed priority passed its preflight",
+                    });
+                }
+                push_raw_offset(&mut raw)?;
+                raw.roles.push(StateRole::Consume);
+            } else {
+                raw.roles.push(StateRole::Consume);
+            }
+            for &(byte, child) in &node.edges {
+                let child = usize::try_from(child).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "finite rescue emitted child index",
+                    }
+                })?;
+                let target = if trie[child].edges.is_empty() {
+                    0
+                } else {
+                    main_tokens[child]
+                };
+                if target == u32::MAX {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "finite rescue child lacked a state token",
+                    });
+                }
+                push_raw_edge(&mut raw, target, EdgeKind::ByteRange, byte);
+            }
+            push_raw_offset(&mut raw)?;
+        }
+        let expected_offsets = checked_add(final_states, 1, "finite rescue final offset count")?;
+        if raw.roles.len() != final_states
+            || raw.edge_offsets.len() != expected_offsets
+            || raw.edge_targets.len() != final_edges
+            || raw.edge_kinds.len() != final_edges
+            || raw.byte_starts.len() != final_edges
+            || raw.byte_ends.len() != final_edges
+        {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite rescue raw table accounting changed",
+            });
+        }
+        Ok(Some(raw))
+    }
+}
+
+fn descendant_extrema(
+    node: &PriorityTrieNode,
+    trie: &[PriorityTrieNode],
+) -> Result<(u32, u32), LowerError> {
+    let mut minimum = u32::MAX;
+    let mut maximum = 0_u32;
+    for &(_, child) in &node.edges {
+        let child = usize::try_from(child).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "finite rescue descendant index",
+        })?;
+        minimum = minimum.min(trie[child].subtree_min_ordinal);
+        maximum = maximum.max(trie[child].subtree_max_ordinal);
+    }
+    if minimum == u32::MAX {
+        return Err(LowerError::InternalInvariant {
+            detail: "finite rescue terminal prefix lacked descendants",
+        });
+    }
+    Ok((minimum, maximum))
+}
+
+fn checked_add(
+    left: usize,
+    right: usize,
+    computation: &'static str,
+) -> Result<usize, LowerError> {
+    left.checked_add(right)
+        .ok_or(LowerError::ArithmeticOverflow { computation })
+}
+
+fn reserve_exact<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    structure: &'static str,
+) -> Result<(), LowerError> {
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| LowerError::AllocationFailed {
+            structure,
+            additional,
+        })
+}
+
+fn push_raw_edge(raw: &mut RawPlan, target: u32, kind: EdgeKind, byte: u8) {
+    raw.edge_targets.push(target);
+    raw.edge_kinds.push(kind);
+    raw.byte_starts.push(byte);
+    raw.byte_ends.push(byte);
+}
+
+fn push_raw_offset(raw: &mut RawPlan) -> Result<(), LowerError> {
+    raw.edge_offsets.push(
+        u32::try_from(raw.edge_targets.len()).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "finite rescue CSR edge offset",
+        })?,
+    );
+    Ok(())
 }
 
 /// One output inherited by an Aho-Corasick state. Width zero is the private
@@ -618,38 +1114,103 @@ struct OrderedFiniteAutomaton {
     root_members: [u64; 4],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedFiniteBuildPurpose {
+    Optional,
+    LowerStateRescue,
+}
+
 impl OrderedFiniteAutomaton {
     fn build(
         strings: &[Vec<u8>],
         total_bytes: usize,
         limits: OrderedFiniteBuildLimits,
     ) -> Option<Self> {
+        Self::build_checked(
+            strings,
+            total_bytes,
+            limits,
+            OrderedFiniteBuildPurpose::Optional,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn build_for_lower_state_rescue(
+        strings: &[Vec<u8>],
+        total_bytes: usize,
+        limits: OrderedFiniteBuildLimits,
+    ) -> Result<Option<Self>, LowerError> {
+        Self::build_checked(
+            strings,
+            total_bytes,
+            limits,
+            OrderedFiniteBuildPurpose::LowerStateRescue,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the checked sparse automaton transaction keeps every allocation and dimension in one failure domain"
+    )]
+    fn build_checked(
+        strings: &[Vec<u8>],
+        total_bytes: usize,
+        limits: OrderedFiniteBuildLimits,
+        purpose: OrderedFiniteBuildPurpose,
+    ) -> Result<Option<Self>, LowerError> {
         if strings.is_empty()
             || strings.iter().any(Vec::is_empty)
-            || strings.len() > usize::try_from(u32::MAX).ok()?
+            || strings.len() > usize::try_from(u32::MAX).unwrap_or(usize::MAX)
         {
-            return None;
+            return Ok(None);
         }
         let measured_total = strings
             .iter()
-            .try_fold(0_usize, |sum, string| sum.checked_add(string.len()))?;
+            .try_fold(0_usize, |sum, string| sum.checked_add(string.len()))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "ordered finite source-byte total",
+            })?;
         if measured_total != total_bytes || limits.max_states == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let maximum_width = strings.iter().map(Vec::len).max()?;
-        let maximum_width = u32::try_from(maximum_width).ok()?;
+        let maximum_width = strings.iter().map(Vec::len).max().ok_or(
+            LowerError::InternalInvariant {
+                detail: "nonempty ordered finite language lacked a maximum width",
+            },
+        )?;
+        let maximum_width = u32::try_from(maximum_width).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "ordered finite maximum width",
+            }
+        })?;
         let reserve_states = total_bytes
-            .checked_add(1)?
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "ordered finite trie-state prospective",
+            })?
             .min(limits.max_states);
         let mut states = Vec::new();
-        states.try_reserve_exact(reserve_states).ok()?;
+        reserve_exact(
+            &mut states,
+            reserve_states,
+            "ordered finite trie states",
+        )?;
         states.push(BuildState::new(0));
         let mut used_bytes = [false; 256];
 
         for (ordinal, string) in strings.iter().enumerate() {
-            let ordinal = u32::try_from(ordinal).ok()?;
-            let width = u32::try_from(string.len()).ok()?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite source ordinal",
+                }
+            })?;
+            let width = u32::try_from(string.len()).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite literal width",
+                }
+            })?;
             let mut state = 0_usize;
             for &byte in string {
                 used_bytes[usize::from(byte)] = true;
@@ -657,20 +1218,40 @@ impl OrderedFiniteAutomaton {
                     .edges
                     .binary_search_by_key(&byte, |&(edge_byte, _)| edge_byte);
                 state = match edge {
-                    Ok(index) => usize::try_from(states[state].edges[index].1).ok()?,
+                    Ok(index) => usize::try_from(states[state].edges[index].1).map_err(|_| {
+                        LowerError::ArithmeticOverflow {
+                            computation: "ordered finite trie target index",
+                        }
+                    })?,
                     Err(index) => {
                         if states.len() >= limits.max_states
-                            || states.len() >= usize::try_from(u32::MAX).ok()?
+                            || states.len() >= usize::try_from(u32::MAX).unwrap_or(usize::MAX)
                         {
-                            return None;
+                            return Ok(None);
                         }
-                        states[state].edges.try_reserve(1).ok()?;
-                        states.try_reserve(1).ok()?;
-                        let next = u32::try_from(states.len()).ok()?;
-                        let depth = states[state].depth.checked_add(1)?;
+                        reserve_exact(
+                            &mut states[state].edges,
+                            1,
+                            "ordered finite trie edge",
+                        )?;
+                        reserve_exact(&mut states, 1, "ordered finite trie state")?;
+                        let next = u32::try_from(states.len()).map_err(|_| {
+                            LowerError::ArithmeticOverflow {
+                                computation: "ordered finite trie state token",
+                            }
+                        })?;
+                        let depth = states[state].depth.checked_add(1).ok_or(
+                            LowerError::ArithmeticOverflow {
+                                computation: "ordered finite trie depth",
+                            },
+                        )?;
                         states.push(BuildState::new(depth));
                         states[state].edges.insert(index, (byte, next));
-                        usize::try_from(next).ok()?
+                        usize::try_from(next).map_err(|_| {
+                            LowerError::ArithmeticOverflow {
+                                computation: "ordered finite trie state index",
+                            }
+                        })?
                     }
                 };
             }
@@ -679,7 +1260,11 @@ impl OrderedFiniteAutomaton {
         }
 
         let mut breadth_first = Vec::new();
-        breadth_first.try_reserve_exact(states.len()).ok()?;
+        reserve_exact(
+            &mut breadth_first,
+            states.len(),
+            "ordered finite breadth-first states",
+        )?;
         breadth_first.push(0_u32);
         for edge in &states[0].edges {
             breadth_first.push(edge.1);
@@ -687,17 +1272,37 @@ impl OrderedFiniteAutomaton {
         let mut cursor = 1_usize;
         let mut failure_steps = 0_u64;
         while cursor < breadth_first.len() {
-            let state = usize::try_from(breadth_first[cursor]).ok()?;
-            cursor = cursor.checked_add(1)?;
+            let state = usize::try_from(breadth_first[cursor]).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite breadth-first state index",
+                }
+            })?;
+            cursor = cursor.checked_add(1).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite breadth-first cursor",
+                },
+            )?;
             let edge_count = states[state].edges.len();
             for edge_index in 0..edge_count {
                 let (byte, next_token) = states[state].edges[edge_index];
-                let next = usize::try_from(next_token).ok()?;
-                let mut fallback = usize::try_from(states[state].failure).ok()?;
+                let next = usize::try_from(next_token).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite failure child index",
+                    }
+                })?;
+                let mut fallback = usize::try_from(states[state].failure).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite failure state index",
+                    }
+                })?;
                 let failure = loop {
-                    failure_steps = failure_steps.checked_add(1)?;
+                    failure_steps = failure_steps.checked_add(1).ok_or(
+                        LowerError::ArithmeticOverflow {
+                            computation: "ordered finite failure-link work",
+                        },
+                    )?;
                     if failure_steps > limits.max_failure_steps {
-                        return None;
+                        return Ok(None);
                     }
                     if let Some(target) = edge_target(&states[fallback].edges, byte) {
                         break target;
@@ -705,63 +1310,119 @@ impl OrderedFiniteAutomaton {
                     if fallback == 0 {
                         break 0;
                     }
-                    fallback = usize::try_from(states[fallback].failure).ok()?;
+                    fallback = usize::try_from(states[fallback].failure).map_err(|_| {
+                        LowerError::ArithmeticOverflow {
+                            computation: "ordered finite fallback index",
+                        }
+                    })?;
                 };
                 states[next].failure = failure;
-                let inherited = states[usize::try_from(failure).ok()?].output;
+                let failure_index = usize::try_from(failure).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite inherited-output index",
+                    }
+                })?;
+                let inherited = states[failure_index].output;
                 states[next].output = states[next].output.dominant(inherited);
                 breadth_first.push(next_token);
             }
         }
         if breadth_first.len() != states.len() {
-            return None;
+            return Err(LowerError::InternalInvariant {
+                detail: "ordered finite breadth-first traversal missed trie states",
+            });
         }
 
         let used_count = used_bytes.iter().filter(|&&used| used).count();
-        let class_count = used_count.checked_add(usize::from(used_count < 256))?;
+        let class_count = used_count
+            .checked_add(usize::from(used_count < 256))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "ordered finite byte-class count",
+            })?;
         if class_count == 0 || class_count > 256 {
-            return None;
+            return Err(LowerError::InternalInvariant {
+                detail: "ordered finite byte-class count was invalid",
+            });
         }
         let mut byte_classes = [0_u8; 256];
         let mut class_representatives = Vec::new();
-        class_representatives
-            .try_reserve_exact(class_count)
-            .ok()?;
+        reserve_exact(
+            &mut class_representatives,
+            class_count,
+            "ordered finite class representatives",
+        )?;
         for byte in 0_u16..=u16::from(u8::MAX) {
             let index = usize::from(byte);
             if used_bytes[index] {
-                byte_classes[index] = u8::try_from(class_representatives.len()).ok()?;
-                class_representatives.push(u8::try_from(byte).ok()?);
+                byte_classes[index] = u8::try_from(class_representatives.len()).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite byte-class token",
+                    }
+                })?;
+                class_representatives.push(u8::try_from(byte).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite class representative",
+                    }
+                })?);
             }
         }
         if used_count < 256 {
-            let other_class = u8::try_from(class_representatives.len()).ok()?;
+            let other_class = u8::try_from(class_representatives.len()).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite other-byte class",
+                }
+            })?;
             let mut representative = None;
             for byte in 0_u16..=u16::from(u8::MAX) {
                 let index = usize::from(byte);
                 if !used_bytes[index] {
                     byte_classes[index] = other_class;
-                    representative.get_or_insert(u8::try_from(byte).ok()?);
+                    representative.get_or_insert(u8::try_from(byte).map_err(|_| {
+                        LowerError::ArithmeticOverflow {
+                            computation: "ordered finite other-byte representative",
+                        }
+                    })?);
                 }
             }
-            class_representatives.push(representative?);
+            class_representatives.push(representative.ok_or(
+                LowerError::InternalInvariant {
+                    detail: "ordered finite other-byte class lacked a representative",
+                },
+            )?);
         }
 
         let explicit_transition_count = states
             .iter()
-            .try_fold(0_usize, |count, state| count.checked_add(state.edges.len()))?;
+            .try_fold(0_usize, |count, state| count.checked_add(state.edges.len()))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "ordered finite sparse transition count",
+            })?;
         if explicit_transition_count > limits.max_transition_cells {
-            return None;
+            return Ok(None);
         }
         let mut sparse_states = Vec::new();
-        sparse_states.try_reserve_exact(states.len()).ok()?;
+        reserve_exact(
+            &mut sparse_states,
+            states.len(),
+            "ordered finite sparse states",
+        )?;
         let mut sparse_edges = Vec::new();
-        sparse_edges
-            .try_reserve_exact(explicit_transition_count)
-            .ok()?;
+        reserve_exact(
+            &mut sparse_edges,
+            explicit_transition_count,
+            "ordered finite sparse edges",
+        )?;
         for state in &states {
-            let edge_start = u32::try_from(sparse_edges.len()).ok()?;
-            let edge_count = u16::try_from(state.edges.len()).ok()?;
+            let edge_start = u32::try_from(sparse_edges.len()).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite sparse edge offset",
+                }
+            })?;
+            let edge_count = u16::try_from(state.edges.len()).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "ordered finite sparse row width",
+                }
+            })?;
             sparse_edges.extend(state.edges.iter().map(|&(byte, target)| {
                 OrderedFiniteSparseEdge { byte, target }
             }));
@@ -773,42 +1434,79 @@ impl OrderedFiniteAutomaton {
             });
         }
         if sparse_edges.len() != explicit_transition_count {
-            return None;
+            return Err(LowerError::InternalInvariant {
+                detail: "ordered finite sparse transition accounting changed",
+            });
         }
 
-        let transition_cells = states.len().checked_mul(class_count)?;
+        let transition_cells = states.len().checked_mul(class_count).ok_or(
+            LowerError::ArithmeticOverflow {
+                computation: "ordered finite dense transition cells",
+            },
+        )?;
         let mut transitions = Vec::new();
         if transition_cells <= limits.max_dense_transition_cells
+            && purpose == OrderedFiniteBuildPurpose::Optional
             && transitions.try_reserve_exact(transition_cells).is_ok()
         {
             transitions.resize(transition_cells, 0_u32);
             for &state_token in &breadth_first {
-                let state = usize::try_from(state_token).ok()?;
+                let state = usize::try_from(state_token).map_err(|_| {
+                    LowerError::ArithmeticOverflow {
+                        computation: "ordered finite dense state index",
+                    }
+                })?;
                 for (class, &representative) in class_representatives.iter().enumerate() {
-                    let target = edge_target(&states[state].edges, representative)
-                        .unwrap_or_else(|| {
-                            if state == 0 {
-                                0
-                            } else {
-                                let failure = usize::try_from(states[state].failure)
-                                    .expect("validated failure state fits usize");
-                                transitions[failure * class_count + class]
+                    let target = if let Some(target) =
+                        edge_target(&states[state].edges, representative)
+                    {
+                        target
+                    } else if state == 0 {
+                        0
+                    } else {
+                        let failure = usize::try_from(states[state].failure).map_err(|_| {
+                            LowerError::ArithmeticOverflow {
+                                computation: "ordered finite dense failure index",
                             }
-                        });
-                    transitions[state * class_count + class] = target;
+                        })?;
+                        let index = failure
+                            .checked_mul(class_count)
+                            .and_then(|index| index.checked_add(class))
+                            .ok_or(LowerError::ArithmeticOverflow {
+                                computation: "ordered finite dense fallback cell",
+                            })?;
+                        *transitions.get(index).ok_or(LowerError::InternalInvariant {
+                            detail: "ordered finite dense fallback cell was not initialized",
+                        })?
+                    };
+                    let index = state
+                        .checked_mul(class_count)
+                        .and_then(|index| index.checked_add(class))
+                        .ok_or(LowerError::ArithmeticOverflow {
+                            computation: "ordered finite dense transition cell",
+                        })?;
+                    *transitions.get_mut(index).ok_or(
+                        LowerError::InternalInvariant {
+                            detail: "ordered finite dense transition cell was out of bounds",
+                        },
+                    )? = target;
                 }
             }
         }
 
         let mut outputs = Vec::new();
-        outputs.try_reserve_exact(states.len()).ok()?;
+        reserve_exact(
+            &mut outputs,
+            states.len(),
+            "ordered finite outputs",
+        )?;
         outputs.extend(states.iter().map(|state| state.output));
         let mut root_members = [0_u64; 4];
         for &(byte, _) in &states[0].edges {
             let index = usize::from(byte);
             root_members[index / 64] |= 1_u64 << (index % 64);
         }
-        Some(Self {
+        Ok(Some(Self {
             byte_classes,
             class_representatives: class_representatives.into_boxed_slice(),
             transitions: transitions.into_boxed_slice(),
@@ -817,7 +1515,7 @@ impl OrderedFiniteAutomaton {
             outputs: outputs.into_boxed_slice(),
             maximum_width,
             root_members,
-        })
+        }))
     }
 
     fn next_state(&self, state: u32, byte: u8) -> u32 {
@@ -908,6 +1606,53 @@ impl NativeFiniteLanguageProgram {
             candidate.total_bytes,
             limits,
         )?;
+        Some(Self::finish_bind(
+            candidate,
+            artifact_identity,
+            output,
+            source_count,
+            automaton,
+        ))
+    }
+
+    pub(crate) fn bind_for_lower_state_rescue(
+        candidate: NativeFiniteLanguageCandidate,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        if artifact_identity == [0; 32] || candidate.operation != fact_operation(output) {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite lower-state rescue sidecar authentication failed",
+            });
+        }
+        let source_count = u32::try_from(candidate.strings.len()).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "finite lower-state rescue source count",
+            }
+        })?;
+        let Some(automaton) = OrderedFiniteAutomaton::build_for_lower_state_rescue(
+            &candidate.strings,
+            candidate.total_bytes,
+            OrderedFiniteBuildLimits::default(),
+        )? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::finish_bind(
+            candidate,
+            artifact_identity,
+            output,
+            source_count,
+            automaton,
+        )))
+    }
+
+    fn finish_bind(
+        candidate: NativeFiniteLanguageCandidate,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+        source_count: u32,
+        automaton: OrderedFiniteAutomaton,
+    ) -> Self {
         let exists_choice = if output == OutputContract::Exists {
             NativeFiniteExistsChoice::derive(
                 &candidate.strings,
@@ -933,7 +1678,7 @@ impl NativeFiniteLanguageProgram {
         } else {
             (Vec::new(), Vec::new())
         };
-        Some(Self {
+        Self {
             artifact_identity,
             output,
             source_count,
@@ -943,7 +1688,7 @@ impl NativeFiniteLanguageProgram {
             exists_choice,
             selected_end_literals,
             selected_end_teddy_choice,
-        })
+        }
     }
 
     pub(crate) fn authenticates(
@@ -1227,7 +1972,7 @@ impl NativeFiniteLanguageProgram {
 
 #[cfg(test)]
 mod tests {
-    use fre_automata::{Automaton, CompileLimits};
+    use fre_automata::{Automaton, CompileLimits, SearchLimits, Span};
     use fre_lower::{
         FactLimits, FactOperation, FactOutput, OperationSemantics, analyze_facts,
     };
@@ -1270,6 +2015,39 @@ mod tests {
         };
         NativeFiniteLanguageProgram::bind(candidate, [7; 32], output)
             .expect("bind finite-language test program")
+    }
+
+    fn raw_candidate(strings: &[&[u8]]) -> NativeFiniteLanguageCandidate {
+        let strings = strings
+            .iter()
+            .map(|string| string.to_vec())
+            .collect::<Vec<_>>();
+        let total_bytes = strings.iter().map(Vec::len).sum();
+        NativeFiniteLanguageCandidate {
+            operation: fact_operation(OutputContract::Span),
+            strings,
+            total_bytes,
+        }
+    }
+
+    fn raw_span(strings: &[&[u8]], haystack: &[u8], window: SearchWindow) -> MatchResult {
+        let raw = raw_candidate(strings)
+            .priority_trie_raw_plan(LowerLimits::default())
+            .expect("priority trie construction")
+            .expect("priority trie admitted");
+        let automaton = Automaton::from_raw(raw, CompileLimits::default())
+            .expect("validate priority trie");
+        let found = automaton
+            .prepare::<Span>()
+            .search_window(
+                haystack,
+                fre_automata::SearchWindow::new(window.start(), window.end()),
+                SearchLimits::unlimited(),
+            )
+            .expect("search priority trie")
+            .into_output()
+            .map(|span| (span.start(), span.end()));
+        MatchResult::Span(found)
     }
 
     fn exists_choice<'a>(
@@ -1461,6 +2239,54 @@ mod tests {
                 "strings={strings:?}, haystack={haystack:?}",
             );
         }
+    }
+
+    #[test]
+    fn priority_trie_raw_preserves_terminal_prefix_order_and_duplicates() {
+        let languages = [
+            vec![
+                b"a".as_slice(),
+                b"ab".as_slice(),
+                b"ac".as_slice(),
+                b"a".as_slice(),
+            ],
+            vec![
+                b"ab".as_slice(),
+                b"ac".as_slice(),
+                b"a".as_slice(),
+                b"a".as_slice(),
+            ],
+        ];
+        let haystacks = enumerate_haystacks(4);
+        for strings in languages {
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            raw_span(&strings, haystack, window),
+                            reference(&strings, OutputContract::Span, haystack, window),
+                            "strings={strings:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn priority_trie_raw_declines_interleaved_terminal_priority() {
+        let mixed = raw_candidate(&[
+            b"abx".as_slice(),
+            b"a".as_slice(),
+            b"aby".as_slice(),
+        ]);
+        assert!(
+            mixed
+                .priority_trie_raw_plan(LowerLimits::default())
+                .expect("bounded mixed-priority analysis")
+                .is_none(),
+        );
     }
 
     #[test]

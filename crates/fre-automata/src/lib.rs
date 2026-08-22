@@ -102,6 +102,7 @@ pub use ordered_edge_dispatch::{
 };
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
+    raw_plan_resource_requirements,
 };
 pub use priority::{
     ActionCapabilities, DirectCount, DirectReduceLimits, DirectReduceReport,

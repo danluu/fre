@@ -2720,9 +2720,14 @@ fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, Compile
     })
 }
 
-/// Canonical allocation-free storage and validation-work prospective for raw
-/// graph dimensions.
-pub(crate) fn raw_plan_resource_requirements(
+/// Return the canonical allocation-free storage and validation-work
+/// prospective for raw graph dimensions.
+///
+/// # Errors
+///
+/// Returns a checked index-space or arithmetic failure when the dimensions
+/// cannot be represented.
+pub fn raw_plan_resource_requirements(
     states: usize,
     edges: usize,
 ) -> Result<(usize, usize), CompileError> {

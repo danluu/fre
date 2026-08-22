@@ -47,7 +47,7 @@ mod seeded_reverse;
 mod uniform_capture;
 
 use fre_automata::{Automaton, RawPlan};
-use fre_lower::{LowerLimits, OperationSemantics};
+use fre_lower::{LowerError, LowerLimits, LowerResource, OperationSemantics};
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustConstructor, RustProfile,
 };
@@ -1522,7 +1522,11 @@ fn compile_raw_prepared_ordered_nfa_v15(
 ///
 /// This leaves [`CompileLimitsV1`] source-compatible and keeps its semantic
 /// program limits distinct from later AOT work. `CompileMode::Fast` never
-/// invokes the slow pass.
+/// invokes the slow pass. In optimizing mode only, an ordinary automaton-state
+/// ceiling may use a separately authenticated exact, assertion-free finite
+/// language when its priority trie fits the same [`LowerLimits`]. Hard
+/// allocation, arithmetic, and invariant failures remain terminal, and an
+/// ordinary lowering success keeps the established optimizer portfolio.
 ///
 /// # Errors
 ///
@@ -1564,17 +1568,47 @@ fn compile_with_slow_aot_limits_and_teddy_policy_v2(
             "Rust byte request produced a non-Rust syntax tree",
         ));
     };
-    let lowered =
-        fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
-    let native_finite_language_candidate = (mode == CompileMode::Optimizing)
-        .then(|| finite_language::NativeFiniteLanguageCandidate::analyze(&parsed, output))
-        .flatten();
+    let (raw, native_finite_language_candidate, finite_lower_state_rescue) =
+        match fre_lower::lower_raw_general(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            limits.lower,
+        ) {
+            Ok(lowered) => {
+                let candidate = (mode == CompileMode::Optimizing)
+                    .then(|| {
+                        finite_language::NativeFiniteLanguageCandidate::analyze(&parsed, output)
+                    })
+                    .flatten();
+                (lowered.into_plan(), candidate, None)
+            }
+            Err(
+                original @ LowerError::ResourceLimit {
+                    resource: LowerResource::States,
+                    ..
+                },
+            )
+                if mode == CompileMode::Optimizing =>
+            {
+                let Some(candidate) = finite_language::NativeFiniteLanguageCandidate::
+                    analyze_for_lower_state_rescue(&parsed, output)?
+                else {
+                    return Err(original.into());
+                };
+                let Some(raw) = candidate.priority_trie_raw_plan(limits.lower)? else {
+                    return Err(original.into());
+                };
+                (raw, Some(candidate), Some(original))
+            }
+            Err(error) => return Err(error.into()),
+        };
     compile_raw_with_line_terminator_and_slow_aot_limits(
         source_bytes,
-        lowered.into_plan(),
+        raw,
         line_terminator,
         output,
         native_finite_language_candidate,
+        finite_lower_state_rescue,
         target,
         mode,
         limits,
@@ -1605,6 +1639,7 @@ pub fn compile_raw(
         raw,
         b'\n',
         output,
+        None,
         None,
         target,
         mode,
@@ -1639,6 +1674,7 @@ pub fn compile_raw_with_line_terminator(
         raw,
         line_terminator,
         output,
+        None,
         None,
         target,
         mode,
@@ -2063,6 +2099,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     line_terminator: u8,
     output: OutputContract,
     native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
+    mut finite_lower_state_rescue: Option<LowerError>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
@@ -2073,16 +2110,35 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
     let stats = automaton.stats();
+    let is_lower_state_rescue = finite_lower_state_rescue.is_some();
+    let build_determinize_limits = if is_lower_state_rescue {
+        DeterminizeLimits {
+            max_states: 0,
+            max_transitions: 0,
+            max_work: 0,
+        }
+    } else {
+        limits.determinize
+    };
     let mut program = CompiledProgram::build(
         raw,
         automaton,
         output,
         mode,
-        limits.determinize,
+        build_determinize_limits,
         limits.max_program_bytes,
     )?;
     if let Some(candidate) = native_finite_language_candidate {
-        program.attach_native_finite_language(candidate);
+        if is_lower_state_rescue {
+            if !program.attach_native_finite_language_for_lower_state_rescue(candidate)? {
+                return Err(finite_lower_state_rescue
+                    .take()
+                    .expect("authenticated lower-state rescue retained its original error")
+                    .into());
+            }
+        } else {
+            program.attach_native_finite_language(candidate);
+        }
     }
     let program_bytes = program.serialized_len()?;
     let program_sha256 = program.artifact_identity();
@@ -2097,13 +2153,25 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             true,
         )?,
         CompileMode::Optimizing => {
+            let optimizing_limits = if is_lower_state_rescue {
+                SlowAotLimits {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        max_transitions: 0,
+                        max_work: 0,
+                    },
+                    ..slow_aot_limits
+                }
+            } else {
+                slow_aot_limits
+            };
             let effective_native_data_limit_bytes = slow_aot_limits
                 .max_native_data_bytes
                 .min(limits.max_object_bytes);
             let optimized = CompiledModule::lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa_and_teddy_policy_v2(
                 &program,
                 target,
-                slow_aot_limits,
+                optimizing_limits,
                 effective_native_data_limit_bytes,
                 true,
                 teddy_policy,
