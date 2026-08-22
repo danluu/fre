@@ -359,6 +359,19 @@ impl CompiledCaptureRegex {
         crate::capture_aot::emit_native_capture_aot_v1(self, limits)
     }
 
+    /// Emit the additive helper-free exact-span participation leaf.
+    ///
+    /// The ordinary Span selector stays authoritative. The additive entry
+    /// accepts only a span selected by that exact object and returns a scalar
+    /// count including group zero. Unsupported schemas/assertions receive an
+    /// explicit unavailable entry and never call semantic runtime code.
+    pub fn emit_native_participation_aot_v1(
+        &self,
+        limits: crate::NativeParticipationAotLimitsV1,
+    ) -> Result<crate::NativeParticipationAotArtifactV1, crate::NativeParticipationAotErrorV1> {
+        crate::participation_aot::emit_native_participation_aot_v1(self, limits)
+    }
+
     /// Emit a fail-closed V1 object for an ordered-many capture request.
     ///
     /// V1 has no pattern-id result field, so an ordered-many adapter must not

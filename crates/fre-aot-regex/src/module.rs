@@ -6177,6 +6177,42 @@ impl CompiledModule {
             .map(|(_, symbol)| symbol.name.as_str())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_test_only_unresolved_runtime_dependency(&mut self) {
+        let symbol = self.symbols.len();
+        let mut symbols = self.symbols.to_vec();
+        symbols.push(ModuleSymbol {
+            name: "fre_aot_regex_participation_auth_test_runtime".to_owned(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+        self.symbols = symbols.into_boxed_slice();
+
+        let mut relocations = self.relocations.to_vec();
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: 0,
+            kind: match self.target.architecture {
+                Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+            },
+            symbol,
+            addend: match self.target.architecture {
+                Architecture::X86_64 => -4,
+                Architecture::Aarch64 => 0,
+            },
+        });
+        self.relocations = relocations.into_boxed_slice();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_test_only_runtime_program_dependency(&mut self) {
+        self.runtime_program_symbol_index = Some(PROGRAM_SYMBOL);
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "validation, fallible reservation, code/data construction, and publication form one transactional append"
@@ -7599,6 +7635,178 @@ impl CompiledModule {
                 .map_err(|_| ObjectError::ArithmeticOverflow("capture materializer offset"))?,
             size: u64::try_from(materialize_code.len())
                 .map_err(|_| ObjectError::ArithmeticOverflow("capture materializer size"))?,
+        });
+        sections[PROGRAM_SECTION].data = data.into_boxed_slice();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        Ok(self)
+    }
+
+    /// Append one exact-span participation bundle and its single helper-free
+    /// entry without changing the incumbent Span selector.
+    pub(crate) fn append_native_participation_export_v1(
+        mut self,
+        bundle_symbol_name: &str,
+        bundle: &[u8],
+        entry_symbol_name: &str,
+        geometry: Option<crate::participation_aot::NativeParticipationPlanGeometryV1>,
+    ) -> Result<Self, ObjectError> {
+        if bundle.is_empty()
+            || bundle_symbol_name.is_empty()
+            || entry_symbol_name.is_empty()
+            || bundle_symbol_name == entry_symbol_name
+            || self
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == bundle_symbol_name || symbol.name == entry_symbol_name)
+        {
+            return Err(ObjectError::InvalidModule(
+                "native participation export is empty or duplicated",
+            ));
+        }
+        if self.sections.get(PROGRAM_SECTION).is_none() || self.sections.get(TEXT_SECTION).is_none()
+        {
+            return Err(ObjectError::InvalidModule(
+                "native participation module is missing a canonical section",
+            ));
+        }
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut data = std::mem::take(&mut sections[PROGRAM_SECTION].data).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        let bundle_offset = data.len().checked_add(7).map(|offset| offset & !7).ok_or(
+            ObjectError::ArithmeticOverflow("native participation bundle alignment"),
+        )?;
+        let data_end =
+            bundle_offset
+                .checked_add(bundle.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "native participation bundle extent",
+                ))?;
+        data.try_reserve_exact(data_end.saturating_sub(data.len()))
+            .map_err(|_| ObjectError::Allocation("native participation bundle"))?;
+        symbols
+            .try_reserve_exact(2)
+            .map_err(|_| ObjectError::Allocation("native participation symbols"))?;
+        data.resize(bundle_offset, 0);
+        data.extend_from_slice(bundle);
+        let bundle_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(bundle_symbol_name, "native participation bundle symbol")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: u64::try_from(bundle_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native participation bundle offset")
+            })?,
+            size: u64::try_from(bundle.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("native participation bundle size"))?,
+        });
+        let entry_offset = text
+            .len()
+            .checked_add(15)
+            .map(|offset| offset & !15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native participation text alignment",
+            ))?;
+        if matches!(self.target.architecture, Architecture::Aarch64)
+            && !text.len().is_multiple_of(4)
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 participation text alignment",
+            ));
+        }
+        let lowering = match (self.target.architecture, geometry) {
+            (Architecture::X86_64, Some(shape)) => NativeParticipationLowering::X86(
+                lower_x86_64_native_participation_v1(self.target, shape)?,
+            ),
+            (Architecture::Aarch64, Some(shape)) => NativeParticipationLowering::Aarch64(
+                lower_aarch64_native_participation_v1(self.target, shape)?,
+            ),
+            (architecture, None) => {
+                NativeParticipationLowering::Negative(native_participation_negative(architecture)?)
+            }
+        };
+        let code_len = lowering.code().len();
+        let text_end = entry_offset.checked_add(code_len).ok_or(
+            ObjectError::ArithmeticOverflow("native participation text extent"),
+        )?;
+        text.try_reserve_exact(text_end.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("native participation text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(entry_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < entry_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        text.extend_from_slice(lowering.code());
+        match lowering {
+            NativeParticipationLowering::X86(lowered) => {
+                relocations
+                    .try_reserve_exact(1)
+                    .map_err(|_| ObjectError::Allocation("native participation relocation"))?;
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(
+                        entry_offset
+                            .checked_add(lowered.plan_relocation_offset)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "native participation relocation",
+                            ))?,
+                    )
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow("native participation relocation")
+                    })?,
+                    kind: RelocationKind::X86PcRelative32,
+                    symbol: bundle_symbol_index,
+                    addend: -4,
+                });
+            }
+            NativeParticipationLowering::Aarch64(lowered) => {
+                relocations
+                    .try_reserve_exact(2)
+                    .map_err(|_| ObjectError::Allocation("native participation relocations"))?;
+                for (offset, kind) in [
+                    (
+                        lowered.plan_page_relocation_offset,
+                        RelocationKind::Aarch64Page21,
+                    ),
+                    (
+                        lowered.plan_page_offset_relocation_offset,
+                        RelocationKind::Aarch64PageOff12,
+                    ),
+                ] {
+                    relocations.push(ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: u64::try_from(entry_offset.checked_add(offset).ok_or(
+                            ObjectError::ArithmeticOverflow("native participation relocation"),
+                        )?)
+                        .map_err(|_| {
+                            ObjectError::ArithmeticOverflow("native participation relocation")
+                        })?,
+                        kind,
+                        symbol: bundle_symbol_index,
+                        addend: 0,
+                    });
+                }
+            }
+            NativeParticipationLowering::Negative(_) => {}
+        }
+        symbols.push(ModuleSymbol {
+            name: owned_string(entry_symbol_name, "native participation entry symbol")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(entry_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native participation entry offset")
+            })?,
+            size: u64::try_from(code_len)
+                .map_err(|_| ObjectError::ArithmeticOverflow("native participation entry size"))?,
         });
         sections[PROGRAM_SECTION].data = data.into_boxed_slice();
         sections[TEXT_SECTION].data = text.into_boxed_slice();
@@ -25092,6 +25300,33 @@ struct Aarch64NativeCaptureNextLowering {
     materializer_call_offset: usize,
 }
 
+struct X86NativeParticipationLowering {
+    code: Vec<u8>,
+    plan_relocation_offset: usize,
+}
+
+struct Aarch64NativeParticipationLowering {
+    code: Vec<u8>,
+    plan_page_relocation_offset: usize,
+    plan_page_offset_relocation_offset: usize,
+}
+
+enum NativeParticipationLowering {
+    X86(X86NativeParticipationLowering),
+    Aarch64(Aarch64NativeParticipationLowering),
+    Negative(Vec<u8>),
+}
+
+impl NativeParticipationLowering {
+    fn code(&self) -> &[u8] {
+        match self {
+            Self::X86(lowered) => &lowered.code,
+            Self::Aarch64(lowered) => &lowered.code,
+            Self::Negative(code) => code,
+        }
+    }
+}
+
 enum NativeCapturePlanLink {
     None,
     X86 {
@@ -25109,6 +25344,795 @@ enum NativeCaptureLocalCalls {
     None,
     X86 { selector: usize, materializer: usize },
     Aarch64 { selector: usize, materializer: usize },
+}
+
+fn native_participation_negative(architecture: Architecture) -> Result<Vec<u8>, ObjectError> {
+    match architecture {
+        Architecture::X86_64 => Ok(vec![
+            0xb8,
+            u8::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_STATUS_UNAVAILABLE)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation status"))?,
+            0,
+            0,
+            0,
+            0xc3,
+        ]),
+        Architecture::Aarch64 => {
+            let mut code = Vec::new();
+            push_bytes(
+                &mut code,
+                &aarch64_movz_w(
+                    0,
+                    u16::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_STATUS_UNAVAILABLE)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("participation status"))?,
+                )?
+                .to_le_bytes(),
+            )?;
+            push_bytes(&mut code, &0xd65f_03c0_u32.to_le_bytes())?;
+            Ok(code)
+        }
+    }
+}
+
+fn native_participation_target_word(target: Target) -> Result<u32, ObjectError> {
+    let architecture = match target.architecture {
+        Architecture::X86_64 => 1_u32,
+        Architecture::Aarch64 => 2,
+    };
+    let operating_system = match target.operating_system {
+        OperatingSystem::Linux => 1_u32,
+        OperatingSystem::Macos => 2,
+    };
+    let abi = match target.abi {
+        CallAbi::SystemV => 1_u32,
+        CallAbi::Aapcs64 => 2,
+    };
+    operating_system
+        .checked_shl(8)
+        .and_then(|os| abi.checked_shl(16).map(|abi| architecture | os | abi))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native participation target header",
+        ))
+}
+
+fn validate_native_participation_geometry(
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<(), ObjectError> {
+    let expected_transitions = geometry
+        .state_count
+        .checked_mul(geometry.alphabet_len)
+        .and_then(|cells| cells.checked_mul(geometry.signature_count))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native participation transition geometry",
+        ))?;
+    let starts_end = geometry
+        .start_states_offset
+        .checked_add(geometry.signature_count.checked_mul(4).ok_or(
+            ObjectError::ArithmeticOverflow("native participation start states"),
+        )?)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native participation start states",
+        ))?;
+    let transitions_end = geometry
+        .transitions_offset
+        .checked_add(geometry.transition_count.checked_mul(4).ok_or(
+            ObjectError::ArithmeticOverflow("native participation transitions"),
+        )?)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native participation transitions",
+        ))?;
+    let accepts_end = geometry
+        .accept_counts_offset
+        .checked_add(geometry.state_count)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native participation accepts",
+        ))?;
+    if geometry.total_bytes < crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        || geometry.group_count == 0
+        || geometry.group_count > 64
+        || geometry.signature_count == 0
+        || geometry.signature_count > 256
+        || geometry.alphabet_len == 0
+        || geometry.alphabet_len > 256
+        || geometry.state_count == 0
+        || geometry.transition_count != expected_transitions
+        || geometry.assertions_offset != crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        || geometry.signatures_offset < geometry.assertions_offset
+        || geometry.byte_classes_offset < geometry.signatures_offset
+        || geometry.boundary_map_offset < geometry.byte_classes_offset + 256
+        || geometry.start_states_offset < geometry.boundary_map_offset + 4
+        || geometry.transitions_offset < starts_end
+        || geometry.accept_counts_offset < transitions_end
+        || geometry.total_bytes != accepts_end
+        || [
+            geometry.total_bytes,
+            geometry.assertions_offset,
+            geometry.signatures_offset,
+            geometry.byte_classes_offset,
+            geometry.boundary_map_offset,
+            geometry.start_states_offset,
+            geometry.transitions_offset,
+            geometry.accept_counts_offset,
+            geometry.group_count,
+            geometry.assertion_count,
+            geometry.signature_count,
+            geometry.alphabet_len,
+            geometry.state_count,
+            geometry.transition_count,
+        ]
+        .iter()
+        .any(|&value| u32::try_from(value).is_err())
+    {
+        return Err(ObjectError::InvalidModule(
+            "native participation geometry does not close",
+        ));
+    }
+    Ok(())
+}
+
+fn aarch64_emit_participation_boundary_signature(
+    assembler: &mut Aarch64Assembler,
+    plan: u8,
+    position: u8,
+    haystack_len: u8,
+    destination: u8,
+    temporary: u8,
+    boundary_map_offset: usize,
+) -> Result<(), ObjectError> {
+    let not_start = assembler.label()?;
+    let not_end = assembler.label()?;
+    aarch64_load_u32_constant(assembler, destination, 0)?;
+    assembler.instruction(aarch64_cmp_x_imm(position, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, not_start)?;
+    aarch64_load_u32_constant(assembler, temporary, 1)?;
+    assembler.instruction(aarch64_add_w_reg(destination, destination, temporary)?)?;
+    assembler.bind(not_start)?;
+    assembler.instruction(aarch64_cmp_x(position, haystack_len)?)?;
+    assembler.branch_cond(AARCH64_NE, not_end)?;
+    aarch64_load_u32_constant(assembler, temporary, 2)?;
+    assembler.instruction(aarch64_add_w_reg(destination, destination, temporary)?)?;
+    assembler.bind(not_end)?;
+    aarch64_load_u64_constant(
+        assembler,
+        temporary,
+        u64::try_from(boundary_map_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation boundary map"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(temporary, plan, temporary)?)?;
+    assembler.instruction(aarch64_load_byte_reg(destination, temporary, destination)?)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "complete request, object geometry, exact-span loop, and transactional return form one native leaf"
+)]
+fn lower_aarch64_native_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<Aarch64NativeParticipationLowering, ObjectError> {
+    validate_native_participation_geometry(geometry)?;
+    const FRAME_BYTES: u16 = 80;
+    let mut assembler = Aarch64Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let accept = assembler.label()?;
+    let returned = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_before_frame)?;
+    assembler.instruction(aarch64_and_low_x(8, 0, 3)?)?;
+    assembler.branch_nonzero_x(8, invalid_before_frame)?;
+    assembler.instruction(aarch64_add_x_imm(8, 0, 64)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_before_frame)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    let plan_page_relocation_offset = assembler.instruction(0x9000_0013)?; // adrp x19, bundle
+    let plan_page_offset_relocation_offset =
+        assembler.instruction(aarch64_add_x_imm(19, 19, 0)?)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 0, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 19)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(20, 0, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 0, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(22, 0, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(23, 0, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(24, 0, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 0, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(25, 0, 56)?)?;
+    assembler.branch_zero_x(20, invalid)?;
+    assembler.instruction(aarch64_cmp_x(22, 23)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(24, invalid)?;
+    assembler.instruction(aarch64_and_low_x(9, 24, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        u64::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation scratch"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.branch_zero_x(25, invalid)?;
+    assembler.instruction(aarch64_and_low_x(9, 25, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(9, 20, 21)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 20)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(
+        9,
+        24,
+        u16::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation scratch"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(9, 24)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(9, 25, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 25)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+
+    // Authenticate the immutable bundle header and every code-addressed
+    // geometry word before reading the haystack or mutating scratch.
+    assembler.instruction(aarch64_load_x_imm(8, 19, 0)?)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC),
+    )?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_w_imm(8, 19, 8)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        9,
+        (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation header"))?
+            << 16)
+            | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION),
+    )?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_w_imm(8, 19, 12)?)?;
+    aarch64_load_u32_constant(&mut assembler, 9, 3)?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(8, 19, 16)?)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        u64::try_from(geometry.total_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation bytes"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(8, 19, 24)?)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL,
+    )?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    for (offset, expected) in [
+        (32_u16, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::DfaAarch64 as u16),
+        ),
+    ] {
+        assembler.instruction(aarch64_load_w_imm(8, 19, offset)?)?;
+        aarch64_load_u32_constant(&mut assembler, 9, expected)?;
+        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (
+            44_u16,
+            u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation scratch"))?,
+        ),
+        (48, u32::try_from(geometry.group_count).unwrap()),
+        (52, u32::try_from(geometry.assertion_count).unwrap()),
+        (56, u32::try_from(geometry.signature_count).unwrap()),
+        (60, u32::try_from(geometry.alphabet_len).unwrap()),
+        (64, u32::try_from(geometry.state_count).unwrap()),
+        (68, u32::try_from(geometry.transition_count).unwrap()),
+    ] {
+        assembler.instruction(aarch64_load_w_imm(8, 19, offset)?)?;
+        aarch64_load_u32_constant(&mut assembler, 9, expected)?;
+        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (72_u16, geometry.assertions_offset),
+        (80, geometry.signatures_offset),
+        (88, geometry.byte_classes_offset),
+        (96, geometry.boundary_map_offset),
+        (104, geometry.start_states_offset),
+        (112, geometry.transitions_offset),
+        (120, geometry.accept_counts_offset),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(8, 19, offset)?)?;
+        aarch64_load_u64_constant(
+            &mut assembler,
+            9,
+            u64::try_from(expected)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation offset"))?,
+        )?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    }
+
+    assembler.instruction(aarch64_mov_x(27, 22)?)?;
+    aarch64_emit_participation_boundary_signature(
+        &mut assembler,
+        19,
+        27,
+        21,
+        8,
+        9,
+        geometry.boundary_map_offset,
+    )?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        9,
+        u32::try_from(geometry.signature_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        u64::try_from(geometry.start_states_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation starts"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(9, 19, 9)?)?;
+    assembler.instruction(aarch64_load_w_uxtw(26, 9, 8)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.state_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(26, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        28,
+        u64::try_from(geometry.transitions_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation transitions"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(28, 19, 28)?)?;
+    assembler.instruction(aarch64_store_x(26, 24, 0)?)?;
+    assembler.instruction(aarch64_store_x(27, 24, 8)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_cmp_x(27, 23)?)?;
+    assembler.branch_cond(AARCH64_EQ, accept)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 20, 27)?)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        9,
+        u64::try_from(geometry.byte_classes_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation byte classes"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(9, 19, 9)?)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 9, 8)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.alphabet_len).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(10, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_add_x_imm(27, 27, 1)?)?;
+    aarch64_emit_participation_boundary_signature(
+        &mut assembler,
+        19,
+        27,
+        21,
+        11,
+        12,
+        geometry.boundary_map_offset,
+    )?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.signature_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(11, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.alphabet_len).unwrap(),
+    )?;
+    assembler.instruction(aarch64_madd_w(10, 26, 8, 10)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.signature_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_madd_w(10, 10, 8, 11)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.transition_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(10, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_load_w_uxtw(26, 28, 10)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        8,
+        u32::try_from(geometry.state_count).unwrap(),
+    )?;
+    assembler.instruction(aarch64_cmp_w(26, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_store_x(26, 24, 0)?)?;
+    assembler.instruction(aarch64_store_x(27, 24, 8)?)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(accept)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        8,
+        u64::try_from(geometry.accept_counts_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation accepts"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(8, 19, 8)?)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 8, 26)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 255)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        8,
+        u16::try_from(geometry.group_count)
+            .map_err(|_| ObjectError::ArithmeticOverflow("participation groups"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.branch_zero_w(8, runtime_failure)?;
+    assembler.instruction(aarch64_store_x(8, 25, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(returned)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        plan_page_relocation_offset,
+        plan_page_offset_relocation_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(Aarch64NativeParticipationLowering {
+        code,
+        plan_page_relocation_offset: relocation_offsets[0],
+        plan_page_offset_relocation_offset: relocation_offsets[1],
+    })
+}
+
+fn lower_x86_64_native_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<X86NativeParticipationLowering, ObjectError> {
+    validate_native_participation_geometry(geometry)?;
+    let displacement = |value: usize, site| {
+        i32::try_from(value)
+            .map(i32::to_le_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow(site))
+    };
+    let boundary_map_offset = displacement(
+        geometry.boundary_map_offset,
+        "x86 participation boundary map",
+    )?;
+    let start_states_offset = displacement(
+        geometry.start_states_offset,
+        "x86 participation start states",
+    )?;
+    let byte_classes_offset = displacement(
+        geometry.byte_classes_offset,
+        "x86 participation byte classes",
+    )?;
+    let transitions_offset =
+        displacement(geometry.transitions_offset, "x86 participation transitions")?;
+    let accept_counts_offset =
+        displacement(geometry.accept_counts_offset, "x86 participation accepts")?;
+    let alphabet = u32::try_from(geometry.alphabet_len).unwrap();
+    let signature_count = u32::try_from(geometry.signature_count).unwrap();
+    let state_count = u32::try_from(geometry.state_count).unwrap();
+    let transition_count = u32::try_from(geometry.transition_count).unwrap();
+
+    let mut assembler = X86Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let accept = assembler.label()?;
+    let returned = assembler.label()?;
+
+    // Validate the complete request object before saving registers. The entry
+    // never dereferences a merely non-null wrapping request extent.
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // request
+    assembler.branch(&[0x0f, 0x84], invalid_before_frame)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?; // alignof(request)
+    assembler.branch(&[0x0f, 0x85], invalid_before_frame)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 64])?;
+    assembler.branch(&[0x0f, 0x82], invalid_before_frame)?;
+
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x3d])?; // bundle(%rip) -> r15
+    let plan_relocation = assembler.label()?;
+    assembler.bind(plan_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x07])?; // paired bundle
+    assembler.instruction(&[0x4c, 0x39, 0xf8])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x8b, 0x5f, 0x08])?; // haystack
+    assembler.instruction(&[0x4c, 0x8b, 0x67, 0x10])?; // haystack_len
+    assembler.instruction(&[0x4c, 0x8b, 0x6f, 0x18])?; // match_start
+    assembler.instruction(&[0x4c, 0x8b, 0x77, 0x20])?; // match_end
+    assembler.instruction(&[0x4c, 0x8b, 0x47, 0x28])?; // scratch
+    assembler.instruction(&[0x48, 0x8b, 0x47, 0x30])?; // scratch_len
+    assembler.instruction(&[0x4c, 0x8b, 0x4f, 0x38])?; // count_out
+
+    assembler.instruction(&[0x48, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?; // start <= end
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe6])?; // end <= length
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, 16])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    for (move_pointer, add_extent) in [
+        (&[0x48, 0x89, 0xd9][..], &[0x4c, 0x01, 0xe1][..]),
+        (&[0x4c, 0x89, 0xc1][..], &[0x48, 0x83, 0xc1, 16][..]),
+        (&[0x4c, 0x89, 0xc9][..], &[0x48, 0x83, 0xc1, 8][..]),
+    ] {
+        assembler.instruction(move_pointer)?;
+        assembler.instruction(add_extent)?;
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+    }
+
+    // The relocated bundle address authenticates ownership; validate every
+    // code-addressed immutable geometry word before reading input or scratch.
+    let mut magic = vec![0x48, 0xb8];
+    magic.extend_from_slice(
+        &u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC).to_le_bytes(),
+    );
+    assembler.instruction(&magic)?;
+    assembler.instruction(&[0x49, 0x39, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    let abi_header = (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("participation header"))?
+        << 16)
+        | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION);
+    for (offset, expected) in [
+        (8_u8, abi_header),
+        (12, 3),
+        (32, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::DfaX86_64 as u16),
+        ),
+        (
+            44,
+            u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation scratch"))?,
+        ),
+        (48, u32::try_from(geometry.group_count).unwrap()),
+        (52, u32::try_from(geometry.assertion_count).unwrap()),
+        (56, signature_count),
+        (60, alphabet),
+        (64, state_count),
+        (68, transition_count),
+    ] {
+        let mut compare = vec![0x41, 0x81, 0x7f, offset];
+        compare.extend_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (16_u8, geometry.total_bytes),
+        (
+            24,
+            usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation seal"))?,
+        ),
+        (72, geometry.assertions_offset),
+        (80, geometry.signatures_offset),
+        (88, geometry.byte_classes_offset),
+        (96, geometry.boundary_map_offset),
+        (104, geometry.start_states_offset),
+        (112, geometry.transitions_offset),
+        (120, geometry.accept_counts_offset),
+    ] {
+        let mut expected_value = vec![0x48, 0xb8];
+        expected_value.extend_from_slice(
+            &u64::try_from(expected)
+                .map_err(|_| ObjectError::ArithmeticOverflow("participation geometry"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&expected_value)?;
+        assembler.instruction(&[0x49, 0x39, 0x47, offset])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    }
+
+    // Initial boundary signature and DFA state.
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.instruction(&[0x0f, 0x94, 0xc0])?;
+    assembler.instruction(&[0x31, 0xc9])?;
+    assembler.instruction(&[0x4d, 0x39, 0xe5])?;
+    assembler.instruction(&[0x0f, 0x94, 0xc1])?;
+    assembler.instruction(&[0xd1, 0xe1])?;
+    assembler.instruction(&[0x09, 0xc8])?;
+    let mut map_signature = vec![0x41, 0x0f, 0xb6, 0x84, 0x07];
+    map_signature.extend_from_slice(&boundary_map_offset);
+    assembler.instruction(&map_signature)?;
+    let mut signature_bound = vec![0x3d];
+    signature_bound.extend_from_slice(&signature_count.to_le_bytes());
+    assembler.instruction(&signature_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    let mut load_start = vec![0x41, 0x8b, 0xac, 0x87];
+    load_start.extend_from_slice(&start_states_offset);
+    assembler.instruction(&load_start)?;
+    let mut state_bound = vec![0x81, 0xfd];
+    state_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&state_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    let mut transitions = vec![0x4d, 0x8d, 0x97];
+    transitions.extend_from_slice(&transitions_offset);
+    assembler.instruction(&transitions)?;
+    assembler.instruction(&[0x49, 0x89, 0x28])?;
+    assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?;
+    assembler.branch(&[0x0f, 0x84], accept)?;
+    assembler.instruction(&[0x42, 0x0f, 0xb6, 0x04, 0x2b])?;
+    let mut map_class = vec![0x41, 0x0f, 0xb6, 0x94, 0x07];
+    map_class.extend_from_slice(&byte_classes_offset);
+    assembler.instruction(&map_class)?;
+    let mut class_bound = vec![0x81, 0xfa];
+    class_bound.extend_from_slice(&alphabet.to_le_bytes());
+    assembler.instruction(&class_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x83, 0xc5, 0x01])?;
+
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.instruction(&[0x0f, 0x94, 0xc0])?;
+    assembler.instruction(&[0x31, 0xc9])?;
+    assembler.instruction(&[0x4d, 0x39, 0xe5])?;
+    assembler.instruction(&[0x0f, 0x94, 0xc1])?;
+    assembler.instruction(&[0xd1, 0xe1])?;
+    assembler.instruction(&[0x09, 0xc8])?;
+    let mut map_signature = vec![0x41, 0x0f, 0xb6, 0x84, 0x07];
+    map_signature.extend_from_slice(&boundary_map_offset);
+    assembler.instruction(&map_signature)?;
+    let mut signature_bound = vec![0x3d];
+    signature_bound.extend_from_slice(&signature_count.to_le_bytes());
+    assembler.instruction(&signature_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x89, 0xc1])?; // signature
+    assembler.instruction(&[0x89, 0xe8])?; // state
+    let mut multiply = vec![0x69, 0xc0];
+    multiply.extend_from_slice(&alphabet.to_le_bytes());
+    assembler.instruction(&multiply)?;
+    assembler.instruction(&[0x01, 0xd0])?; // class
+    let mut multiply = vec![0x69, 0xc0];
+    multiply.extend_from_slice(&signature_count.to_le_bytes());
+    assembler.instruction(&multiply)?;
+    assembler.instruction(&[0x01, 0xc8])?; // signature
+    let mut transition_bound = vec![0x3d];
+    transition_bound.extend_from_slice(&transition_count.to_le_bytes());
+    assembler.instruction(&transition_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x41, 0x8b, 0x2c, 0x82])?;
+    let mut state_bound = vec![0x81, 0xfd];
+    state_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&state_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x89, 0x28])?;
+    assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(accept)?;
+    let mut load_accept = vec![0x41, 0x0f, 0xb6, 0x84, 0x2f];
+    load_accept.extend_from_slice(&accept_counts_offset);
+    assembler.instruction(&load_accept)?;
+    assembler.instruction(&[0x3d, 0xff, 0, 0, 0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    let mut group_bound = vec![0x3d];
+    group_bound.extend_from_slice(&u32::try_from(geometry.group_count).unwrap().to_le_bytes());
+    assembler.instruction(&group_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x89, 0x01])?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let plan_relocation_offset = finished.label_offset(plan_relocation)?;
+    Ok(X86NativeParticipationLowering {
+        code: finished.code,
+        plan_relocation_offset,
+    })
 }
 
 #[allow(

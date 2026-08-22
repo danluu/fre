@@ -34,6 +34,7 @@ mod operation_set_v2;
 mod ordered_literal_artifact;
 mod ordered_many;
 mod ordered_nfa_native;
+mod participation_aot;
 mod prefix_block;
 mod prefix_fast_forward;
 mod prefix_predicate;
@@ -173,6 +174,16 @@ pub use ordered_nfa_native::{
     FrozenOrderedNfaAccountingV1,
     FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
     FrozenOrderedNfaStorageV1,
+};
+pub use participation_aot::{
+    NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION, NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES,
+    NATIVE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN, NATIVE_PARTICIPATION_AOT_V1_MAGIC,
+    NATIVE_PARTICIPATION_AOT_V1_READY_SEAL, NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
+    NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES, NATIVE_PARTICIPATION_AOT_V1_STATUS_UNAVAILABLE,
+    NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID, NativeParticipationAotArtifactV1,
+    NativeParticipationAotDeclineV1, NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
+    NativeParticipationAotReceiptV1, NativeParticipationAotResourceV1,
+    NativeParticipationAotStrategyV1,
 };
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport,

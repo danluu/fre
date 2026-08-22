@@ -169,6 +169,8 @@ pub const STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME: u32 = 8;
 pub const STATUS_DYNAMIC_ROWS_CELL_RESUME: u32 = 9;
 /// A requested capture object entry was published as an explicit negative.
 pub const STATUS_NATIVE_CAPTURE_UNAVAILABLE: u32 = 10;
+/// A requested exact-span participation entry was published as an explicit negative.
+pub const STATUS_NATIVE_PARTICIPATION_UNAVAILABLE: u32 = 10;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -525,6 +527,9 @@ pub const C_API_V3_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 /// C declarations for helper-free identity-suffixed native capture entries.
 pub const C_API_NATIVE_CAPTURE_V1_HEADER: &str =
     include_str!("../include/fre_aot_regex_runtime_captures_v1.h");
+/// C declarations for helper-free identity-suffixed participation entries.
+pub const C_API_NATIVE_PARTICIPATION_V1_HEADER: &str =
+    include_str!("../include/fre_aot_regex_runtime_participation_v1.h");
 
 /// C declarations for the bounded Stage-1 operation-set runtime ABI.
 pub const C_API_OPERATION_SET_V1_HEADER: &str =
@@ -591,6 +596,51 @@ pub type FreAotRegexCaptureNextV1 = unsafe extern "C" fn(
     *mut FreAotRegexCaptureSlotV1,
     usize,
 ) -> u32;
+
+/// Complete request for an object-local exact-span participation replay.
+///
+/// `bundle` must be the paired identity-suffixed bundle symbol from the same
+/// linked object as the entry. The exact span must have been returned by that
+/// object's ordinary full-window Span selector. Selected entries require
+/// exactly 16 bytes of naturally aligned caller-owned scratch and publish
+/// `count_out` only on [`STATUS_MATCH`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexParticipationRequestV1 {
+    pub bundle: *const u8,
+    pub haystack: *const u8,
+    pub haystack_len: usize,
+    pub match_start: usize,
+    pub match_end: usize,
+    pub scratch: *mut u8,
+    pub scratch_len: usize,
+    pub count_out: *mut usize,
+}
+
+/// Object-local helper-free participation replay entry.
+pub type FreAotRegexParticipationExactV1 =
+    unsafe extern "C" fn(*const FreAotRegexParticipationRequestV1) -> u32;
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<FreAotRegexParticipationRequestV1>() == 64);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<FreAotRegexParticipationRequestV1>() == 8);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, bundle) == 0);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, haystack) == 8);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, haystack_len) == 16);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, match_start) == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, match_end) == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, scratch) == 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, scratch_len) == 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexParticipationRequestV1, count_out) == 56);
 
 /// One root-aligned result from a successful operation-set execution.
 ///
@@ -10509,6 +10559,28 @@ mod tests {
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureNextV1"));
         assert_eq!(size_of::<FreAotRegexCaptureMaterializeV1>(), size_of::<usize>());
         assert_eq!(size_of::<FreAotRegexCaptureNextV1>(), size_of::<usize>());
+        assert!(
+            C_API_NATIVE_PARTICIPATION_V1_HEADER
+                .contains("FRE_AOT_REGEX_STATUS_NATIVE_PARTICIPATION_UNAVAILABLE 10u")
+        );
+        assert!(
+            C_API_NATIVE_PARTICIPATION_V1_HEADER
+                .contains("FRE_AOT_REGEX_NATIVE_PARTICIPATION_SCRATCH_BYTES 16u")
+        );
+        assert!(C_API_NATIVE_PARTICIPATION_V1_HEADER.contains("FreAotRegexParticipationRequestV1"));
+        assert!(C_API_NATIVE_PARTICIPATION_V1_HEADER.contains("FreAotRegexParticipationExactV1"));
+        assert_eq!(
+            size_of::<FreAotRegexParticipationRequestV1>(),
+            size_of::<[usize; 8]>(),
+        );
+        assert_eq!(
+            align_of::<FreAotRegexParticipationRequestV1>(),
+            align_of::<usize>(),
+        );
+        assert_eq!(
+            size_of::<FreAotRegexParticipationExactV1>(),
+            size_of::<usize>(),
+        );
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanFillV1>(),
             size_of::<usize>()
