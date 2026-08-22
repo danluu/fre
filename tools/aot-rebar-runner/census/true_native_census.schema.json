@@ -392,6 +392,74 @@
         }
       }
     },
+    "participationCaptureProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_resolution", "capture_group_count", "participation_algorithm_id",
+        "participation_strategy", "participation_semantic_runtime_calls",
+        "participation_assertions", "participation_assertion_signatures",
+        "participation_byte_classes", "participation_dfa_states",
+        "participation_transition_cells", "participation_build_work",
+        "participation_scratch_bytes", "participation_plan_bytes",
+        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
+        "selector_object_sha256", "participation_bundle_sha256",
+        "participation_export_identity_sha256", "participation_object_sha256",
+        "capture_artifact_identity_sha256", "participation_bundle_symbol",
+        "capture_selector_symbol", "participation_entry_symbol"
+      ],
+      "properties": {
+        "capture_resolution": { "const": "native-exact-span-participation-dfa-v1" },
+        "capture_group_count": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "participation_algorithm_id": {
+          "const": "fre-aot-regex.exact-span-participation-dfa.v1"
+        },
+        "participation_strategy": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "participation_semantic_runtime_calls": { "const": 0 },
+        "participation_assertions": {
+          "type": "integer", "minimum": 0, "maximum": 64
+        },
+        "participation_assertion_signatures": {
+          "type": "integer", "minimum": 1, "maximum": 256
+        },
+        "participation_byte_classes": {
+          "type": "integer", "minimum": 1, "maximum": 256
+        },
+        "participation_dfa_states": {
+          "type": "integer", "minimum": 1, "maximum": 131072
+        },
+        "participation_transition_cells": {
+          "type": "integer", "minimum": 1, "maximum": 16777216
+        },
+        "participation_build_work": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "participation_scratch_bytes": { "const": 16 },
+        "participation_plan_bytes": {
+          "type": "integer", "minimum": 256, "maximum": 268435456
+        },
+        "capture_source_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_selector_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_program_sha256": { "$ref": "#/$defs/sha256" },
+        "selector_object_sha256": { "$ref": "#/$defs/sha256" },
+        "participation_bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "participation_export_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "participation_object_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "participation_bundle_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
+        },
+        "capture_selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        },
+        "participation_entry_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -418,11 +486,17 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
-        "kind": { "enum": ["scalar-v2", "composite-v3", "strict-capture-v4"] },
+        "kind": {
+          "enum": [
+            "scalar-v2", "composite-v3", "strict-capture-v4",
+            "participation-capture-v4"
+          ]
+        },
         "composite_kind": {
           "enum": [
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
-            "regex-redux-fixed-v1", "strict-capture-next-v1"
+            "regex-redux-fixed-v1", "strict-capture-next-v1",
+            "exact-span-participation-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -440,6 +514,9 @@
           ]
         },
         "strict_capture": { "$ref": "#/$defs/strictCaptureProvenance" },
+        "participation_capture": {
+          "$ref": "#/$defs/participationCaptureProvenance"
+        },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
         "grep_iteration_strategy": { "type": ["string", "null"] },
@@ -456,14 +533,30 @@
           "type": "array", "items": { "$ref": "#/$defs/componentProvenance" }
         }
       },
-      "allOf": [{
-        "if": {
-          "properties": { "schema": { "const": "fre.aot.rebar-runner.v4" } },
-          "required": ["schema"]
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "strict-capture-v4" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["strict_capture"],
+            "not": { "required": ["participation_capture"] }
+          },
+          "else": { "not": { "required": ["strict_capture"] } }
         },
-        "then": { "required": ["strict_capture"] },
-        "else": { "not": { "required": ["strict_capture"] } }
-      }]
+        {
+          "if": {
+            "properties": { "kind": { "const": "participation-capture-v4" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["participation_capture"],
+            "not": { "required": ["strict_capture"] }
+          },
+          "else": { "not": { "required": ["participation_capture"] } }
+        }
+      ]
     },
     "qualificationPhases": {
       "type": "object",

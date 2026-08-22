@@ -48,7 +48,7 @@ UNIFORM_CAPTURE_ADAPTER_MODELS = {"count-captures", "grep-captures"}
 COMPOSITE_ADAPTER_MODELS = {"regex-redux"}
 NATIVE_ROW_COMPOSITE_KINDS = {
     "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
-    "strict-capture-next-v1",
+    "strict-capture-next-v1", "exact-span-participation-v1",
 }
 FORBIDDEN_PUBLIC_COMPONENTS = {
     "holdout",
@@ -73,6 +73,24 @@ NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL = re.compile(
 NATIVE_CAPTURE_MATERIALIZE_SYMBOL = re.compile(
     r"^fre_aot_regex_capture_materialize_v1_[0-9a-f]{64}$"
 )
+NATIVE_PARTICIPATION_ENTRY_SYMBOL = re.compile(
+    r"^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
+)
+NATIVE_PARTICIPATION_BUNDLE_SYMBOL = re.compile(
+    r"^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
+)
+NATIVE_PARTICIPATION_ALGORITHM_ID = (
+    "fre-aot-regex.exact-span-participation-dfa.v1"
+)
+NATIVE_PARTICIPATION_SCRATCH_BYTES = 16
+NATIVE_PARTICIPATION_HEADER_BYTES = 256
+NATIVE_PARTICIPATION_MAX_ASSERTIONS = 64
+NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES = 256
+NATIVE_PARTICIPATION_MAX_BYTE_CLASSES = 256
+NATIVE_PARTICIPATION_MAX_DFA_STATES = 131_072
+NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS = 16 * 1_024 * 1_024
+NATIVE_PARTICIPATION_MAX_BUILD_WORK = 256 * 1_048_576
+NATIVE_PARTICIPATION_MAX_PLAN_BYTES = 256 * 1_048_576
 CONTROL_PLANE_PREFIXES = (
     "fre_aot_regex_runtime_prepare_",
     "fre_aot_regex_runtime_destroy_",
@@ -143,6 +161,57 @@ def target_architecture(target: str) -> str:
     if target.startswith("aarch64-"):
         return "aarch64"
     raise CensusError("census target has an unsupported architecture")
+
+
+def participation_export_identity(
+    bundle_sha256: str,
+    target: str,
+    feature_bits: str,
+    selector_object_sha256: str,
+    selector_symbol: str,
+) -> str:
+    """Recompute the compiler's frozen native-participation export identity."""
+    architecture = target_architecture(target)
+    architecture_byte = {"x86_64": 1, "aarch64": 2}[architecture]
+    if target.endswith("-linux"):
+        os_byte = 1
+    elif target.endswith("-macos"):
+        os_byte = 2
+    else:
+        raise CensusError("participation target has an unsupported operating system")
+    abi_byte = {"x86_64": 1, "aarch64": 2}[architecture]
+    if re.fullmatch(r"[0-9a-f]{16}", feature_bits) is None:
+        raise CensusError("participation feature bits are not canonical")
+    require_hex64(bundle_sha256, "participation bundle digest")
+    require_hex64(selector_object_sha256, "participation selector object digest")
+    if SYMBOL.fullmatch(selector_symbol) is None:
+        raise CensusError("participation selector symbol is not canonical")
+    digest = hashlib.sha256()
+    digest.update(b"fre-aot-regex/native-participation-aot-v1\0")
+    digest.update(bytes.fromhex(bundle_sha256))
+    digest.update(bytes((architecture_byte, os_byte, abi_byte)))
+    digest.update(int(feature_bits, 16).to_bytes(8, "little"))
+    digest.update(bytes.fromhex(selector_object_sha256))
+    selector_bytes = selector_symbol.encode("ascii", "strict")
+    digest.update(len(selector_bytes).to_bytes(8, "little"))
+    digest.update(selector_bytes)
+    return digest.hexdigest()
+
+
+def participation_plan_bytes(
+    assertions: int,
+    signatures: int,
+    states: int,
+    transition_cells: int,
+) -> int:
+    """Recompute the selected v1 bundle extent from its closed geometry."""
+    signatures_offset = (NATIVE_PARTICIPATION_HEADER_BYTES + assertions * 2 + 7) & ~7
+    byte_classes_offset = signatures_offset + signatures * 8
+    boundary_map_offset = byte_classes_offset + 256
+    start_states_offset = (boundary_map_offset + 4 + 7) & ~7
+    transitions_offset = start_states_offset + signatures * 4
+    accept_counts_offset = transitions_offset + transition_cells * 4
+    return accept_counts_offset + states
 
 
 def canonical(value: object) -> str:
@@ -831,16 +900,14 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "aggregate_strategy", "native_row_bridge", "uniform_capture_bridge",
             "strict_capture_bridge", "source_pattern_count",
             "row_total_object_bytes", "source_to_artifact", "component_count",
-            "capture_resolution", "capture_group_count", "capture_can_match_empty",
+            "capture_resolution", "capture_group_count",
             "capture_source_sha256", "capture_selector_sha256",
-            "capture_program_sha256", "capture_plan_sha256",
-            "capture_bundle_sha256", "capture_artifact_identity_sha256",
-            "capture_materialize_symbol", "capture_selector_symbol", "boundary",
-            "required_comparators",
+            "capture_program_sha256", "capture_artifact_identity_sha256",
+            "capture_selector_symbol", "boundary", "required_comparators",
         }
     else:
         raise CensusError(
-            "runner provenance is neither scalar v2, composite v3, nor strict-capture v4"
+            "runner provenance is neither scalar v2, composite v3, nor native-capture v4"
         )
     missing = required - set(fields)
     if missing:
@@ -955,7 +1022,7 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
     if fields.get("model") == "regex-redux" and count != 15:
         raise CensusError(f"regex-redux must publish exactly 15 components, got {count}")
     if schema == "fre.aot.rebar-runner.v4" and count != 1:
-        raise CensusError(f"strict-capture v4 must publish exactly one component, got {count}")
+        raise CensusError(f"native-capture v4 must publish exactly one component, got {count}")
     native_row = fields.get("native_row_bridge") == "true"
     has_automaton = schema == "fre.aot.rebar-runner.v3" and native_row
     components = []
@@ -1234,6 +1301,198 @@ def strict_capture_proof_from_provenance(
     }
 
 
+def participation_capture_proof_from_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> dict[str, object]:
+    """Normalize the helper-free exact-span capture replay proof surface."""
+    if len(components) != 1:
+        raise CensusError(
+            "exact-span participation provenance does not have exactly one component"
+        )
+    component = components[0]
+    selector_symbol = fields.get("capture_selector_symbol")
+    entry_symbol = fields.get("participation_entry_symbol")
+    bundle_symbol = fields.get("participation_bundle_symbol")
+    if (
+        not isinstance(selector_symbol, str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector_symbol) is None
+        or not isinstance(entry_symbol, str)
+        or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(entry_symbol) is None
+        or not isinstance(bundle_symbol, str)
+        or NATIVE_PARTICIPATION_BUNDLE_SYMBOL.fullmatch(bundle_symbol) is None
+        or len({selector_symbol, entry_symbol, bundle_symbol}) != 3
+    ):
+        raise CensusError("exact-span participation symbols are not canonical")
+    export_identity = require_hex64(
+        fields.get("participation_export_identity_sha256"),
+        "exact-span participation export identity digest",
+    )
+    selector_object = require_hex64(
+        fields.get("selector_object_sha256"),
+        "exact-span participation selector object digest",
+    )
+    bundle_digest = require_hex64(
+        fields.get("participation_bundle_sha256"),
+        "exact-span participation bundle digest",
+    )
+    if not entry_symbol.endswith(export_identity) or not bundle_symbol.endswith(
+        export_identity
+    ):
+        raise CensusError(
+            "exact-span participation symbols differ from their export identity"
+        )
+    expected_export_identity = participation_export_identity(
+        bundle_digest,
+        fields.get("target", ""),
+        fields.get("feature_bits", ""),
+        selector_object,
+        selector_symbol,
+    )
+    if export_identity != expected_export_identity:
+        raise CensusError(
+            "exact-span participation export identity does not authenticate its inputs"
+        )
+    if component["entry_symbol"] != selector_symbol:
+        raise CensusError(
+            "exact-span participation selector differs from its component entry"
+        )
+    if component["required_runtime_symbols"]:
+        raise CensusError(
+            "exact-span participation component requires semantic runtime symbols"
+        )
+    capture_program = require_hex64(
+        fields.get("capture_program_sha256"),
+        "exact-span participation capture program digest",
+    )
+    participation_object = require_hex64(
+        fields.get("participation_object_sha256"),
+        "exact-span participation object digest",
+    )
+    if component["program_sha256"] != capture_program:
+        raise CensusError(
+            "exact-span participation capture program differs from its component"
+        )
+    if component["object_sha256"] != participation_object:
+        raise CensusError(
+            "exact-span participation object differs from its component"
+        )
+    algorithm_id = fields.get("participation_algorithm_id")
+    if algorithm_id != NATIVE_PARTICIPATION_ALGORITHM_ID:
+        raise CensusError("exact-span participation algorithm identity differs")
+    expected_strategy = {
+        "x86_64": 1,
+        "aarch64": 2,
+    }[target_architecture(fields.get("target", ""))]
+    strategy = parse_canonical_decimal(
+        fields.get("participation_strategy"),
+        "exact-span participation strategy",
+        expected_strategy,
+        expected_strategy,
+    )
+    semantic_runtime_calls = parse_canonical_decimal(
+        fields.get("participation_semantic_runtime_calls"),
+        "exact-span participation semantic runtime calls",
+        0,
+        0,
+    )
+    scratch_bytes = parse_canonical_decimal(
+        fields.get("participation_scratch_bytes"),
+        "exact-span participation scratch bytes",
+        NATIVE_PARTICIPATION_SCRATCH_BYTES,
+        NATIVE_PARTICIPATION_SCRATCH_BYTES,
+    )
+    assertions = parse_canonical_decimal(
+        fields.get("participation_assertions"),
+        "exact-span participation assertions",
+        0,
+        NATIVE_PARTICIPATION_MAX_ASSERTIONS,
+    )
+    assertion_signatures = parse_canonical_decimal(
+        fields.get("participation_assertion_signatures"),
+        "exact-span participation assertion signatures",
+        1,
+        NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
+    )
+    byte_classes = parse_canonical_decimal(
+        fields.get("participation_byte_classes"),
+        "exact-span participation byte classes",
+        1,
+        NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
+    )
+    dfa_states = parse_canonical_decimal(
+        fields.get("participation_dfa_states"),
+        "exact-span participation DFA states",
+        1,
+        NATIVE_PARTICIPATION_MAX_DFA_STATES,
+    )
+    transition_cells = parse_canonical_decimal(
+        fields.get("participation_transition_cells"),
+        "exact-span participation transition cells",
+        1,
+        NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
+    )
+    expected_transition_cells = dfa_states * byte_classes * assertion_signatures
+    if transition_cells != expected_transition_cells:
+        raise CensusError(
+            "exact-span participation transition geometry does not close"
+        )
+    plan_bytes = parse_canonical_decimal(
+        fields.get("participation_plan_bytes"),
+        "exact-span participation plan bytes",
+        NATIVE_PARTICIPATION_HEADER_BYTES,
+        NATIVE_PARTICIPATION_MAX_PLAN_BYTES,
+    )
+    if plan_bytes != participation_plan_bytes(
+        assertions, assertion_signatures, dfa_states, transition_cells
+    ):
+        raise CensusError("exact-span participation plan extent does not close")
+    return {
+        "capture_resolution": fields.get("capture_resolution"),
+        "capture_group_count": parse_canonical_decimal(
+            fields.get("capture_group_count"),
+            "exact-span participation group count",
+            1,
+            MAX_NATIVE_ROW_COMPONENTS,
+        ),
+        "participation_algorithm_id": algorithm_id,
+        "participation_strategy": strategy,
+        "participation_semantic_runtime_calls": semantic_runtime_calls,
+        "participation_assertions": assertions,
+        "participation_assertion_signatures": assertion_signatures,
+        "participation_byte_classes": byte_classes,
+        "participation_dfa_states": dfa_states,
+        "participation_transition_cells": transition_cells,
+        "participation_build_work": parse_canonical_decimal(
+            fields.get("participation_build_work"),
+            "exact-span participation build work",
+            1,
+            NATIVE_PARTICIPATION_MAX_BUILD_WORK,
+        ),
+        "participation_scratch_bytes": scratch_bytes,
+        "participation_plan_bytes": plan_bytes,
+        "capture_source_sha256": require_hex64(
+            fields.get("capture_source_sha256"),
+            "exact-span participation source digest",
+        ),
+        "capture_selector_sha256": require_hex64(
+            fields.get("capture_selector_sha256"),
+            "exact-span participation selector digest",
+        ),
+        "capture_program_sha256": capture_program,
+        "selector_object_sha256": selector_object,
+        "participation_bundle_sha256": bundle_digest,
+        "participation_export_identity_sha256": export_identity,
+        "participation_object_sha256": participation_object,
+        "capture_artifact_identity_sha256": require_hex64(
+            fields.get("capture_artifact_identity_sha256"),
+            "exact-span participation artifact identity digest",
+        ),
+        "participation_bundle_symbol": bundle_symbol,
+        "capture_selector_symbol": selector_symbol,
+        "participation_entry_symbol": entry_symbol,
+    }
+
+
 def validate_v3_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
@@ -1350,17 +1609,86 @@ def validate_v3_provenance(
 def validate_v4_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
-    """Validate the exact additive strict-capture v4 provenance contract."""
+    """Validate the closed one-pattern native-capture v4 contracts."""
     if fields.get("disposition") != "executed":
-        raise CensusError("strict-capture provenance disposition is not executed")
+        raise CensusError("native-capture provenance disposition is not executed")
     if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
-        raise CensusError("strict-capture provenance comparator set differs")
+        raise CensusError("native-capture provenance comparator set differs")
     for name in ("compiler_version", "optimizer_version"):
         parse_canonical_decimal(
-            fields.get(name), f"strict-capture provenance {name}", 1, (1 << 32) - 1
+            fields.get(name), f"native-capture provenance {name}", 1, (1 << 32) - 1
         )
     if re.fullmatch(r"[0-9a-f]{16}", fields.get("feature_bits", "")) is None:
-        raise CensusError("strict-capture provenance has invalid feature_bits")
+        raise CensusError("native-capture provenance has invalid feature_bits")
+    source_count, _, source_to_artifact = native_row_topology(fields, components, 1)
+    if source_count != 1 or source_to_artifact != [0]:
+        raise CensusError(
+            "native-capture provenance is not exactly one source and artifact"
+        )
+    base = {
+        "schema", "disposition", "configured", "adapter", "model", "benchmark",
+        "source_commit", "source_tree", "target", "feature_bits",
+        "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
+        "native_row_bridge", "uniform_capture_bridge", "strict_capture_bridge",
+        "source_pattern_count", "row_total_object_bytes", "source_to_artifact",
+        "component_count", "capture_resolution", "capture_group_count",
+        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
+        "capture_artifact_identity_sha256", "capture_selector_symbol", "boundary",
+        "required_comparators",
+    }
+    component_fields = {
+        f"component_0_{suffix}"
+        for suffix in (
+            "native", "source_ordinal", "entry_symbol", "runtime_symbols",
+            "program_sha256", "object_sha256",
+        )
+    }
+    participation = fields.get("participation_capture_bridge") == "true"
+    if participation:
+        expected_adapter = {
+            "count-captures": "general-aot-native-exact-span-participation-count-v1",
+            "grep-captures": "general-aot-native-exact-span-participation-grep-v1",
+        }.get(fields.get("model"))
+        if expected_adapter is None or fields.get("adapter") != expected_adapter:
+            raise CensusError(
+                "exact-span participation provenance has the wrong adapter"
+            )
+        if (
+            fields.get("engine") != "NativeExactSpanParticipationDfaV1"
+            or fields.get("aggregate_strategy")
+            != "native-exact-span-participation-dfa-v1"
+            or fields.get("native_row_bridge") != "true"
+            or fields.get("uniform_capture_bridge") != "false"
+            or fields.get("strict_capture_bridge") != "false"
+            or fields.get("capture_resolution")
+            != "native-exact-span-participation-dfa-v1"
+            or fields.get("boundary")
+            != "native-span-selector-with-helper-free-exact-span-participation-replay"
+        ):
+            raise CensusError(
+                "exact-span participation provenance has a noncanonical route"
+            )
+        participation_capture_proof_from_provenance(fields, components)
+        participation_fields = {
+            "participation_capture_bridge", "participation_algorithm_id",
+            "participation_strategy", "participation_semantic_runtime_calls",
+            "participation_assertions", "participation_assertion_signatures",
+            "participation_byte_classes", "participation_dfa_states",
+            "participation_transition_cells", "participation_build_work",
+            "participation_scratch_bytes", "participation_plan_bytes",
+            "selector_object_sha256", "participation_bundle_sha256",
+            "participation_export_identity_sha256", "participation_object_sha256",
+            "participation_bundle_symbol", "participation_entry_symbol",
+        }
+        expected = base | component_fields | participation_fields
+        if set(fields) != expected:
+            raise CensusError(
+                "runner participation v4 provenance field closure differs: "
+                f"missing={sorted(expected - set(fields))!r} "
+                f"extra={sorted(set(fields) - expected)!r}"
+            )
+        return
+
     expected_adapter = {
         "count-captures": "general-aot-native-single-capture-next-count-v1",
         "grep-captures": "general-aot-native-single-capture-next-grep-v1",
@@ -1379,31 +1707,12 @@ def validate_v4_provenance(
         != "native-search-core-with-native-capture-materialization-adapter-loop"
     ):
         raise CensusError("strict-capture provenance has a noncanonical route")
-    source_count, _, source_to_artifact = native_row_topology(fields, components, 1)
-    if source_count != 1 or source_to_artifact != [0]:
-        raise CensusError("strict-capture provenance is not exactly one source and artifact")
     strict_capture_proof_from_provenance(fields, components)
-    base = {
-        "schema", "disposition", "configured", "adapter", "model", "benchmark",
-        "source_commit", "source_tree", "target", "feature_bits",
-        "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
-        "native_row_bridge", "uniform_capture_bridge", "strict_capture_bridge",
-        "source_pattern_count", "row_total_object_bytes", "source_to_artifact",
-        "component_count", "capture_resolution", "capture_group_count",
-        "capture_can_match_empty", "capture_source_sha256",
-        "capture_selector_sha256", "capture_program_sha256", "capture_plan_sha256",
-        "capture_bundle_sha256", "capture_artifact_identity_sha256",
-        "capture_materialize_symbol", "capture_selector_symbol", "boundary",
-        "required_comparators",
+    strict_fields = {
+        "capture_can_match_empty", "capture_plan_sha256", "capture_bundle_sha256",
+        "capture_materialize_symbol",
     }
-    component_fields = {
-        f"component_0_{suffix}"
-        for suffix in (
-            "native", "source_ordinal", "entry_symbol", "runtime_symbols",
-            "program_sha256", "object_sha256",
-        )
-    }
-    expected = base | component_fields
+    expected = base | component_fields | strict_fields
     if set(fields) != expected:
         raise CensusError(
             "runner v4 provenance field closure differs: "
@@ -1482,6 +1791,21 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             ) is None:
                 raise CensusError("strict-capture route does not select capture_next")
             return entries, "linked-strict-capture-next-adapter-loop"
+        if provenance.get("participation_capture_bridge") == "true" and model in (
+            UNIFORM_CAPTURE_ADAPTER_MODELS
+        ):
+            participation = provenance.get("participation_entry_symbol")
+            if (
+                len(entries) != 1
+                or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entries[0]) is None
+                or not isinstance(participation, str)
+                or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(participation) is None
+                or participation == entries[0]
+            ):
+                raise CensusError(
+                    "exact-span participation route has invalid operation entries"
+                )
+            return [entries[0], participation], "linked-exact-span-participation-adapter-loop"
         if model == "regex-redux":
             return entries, "linked-fixed-composite-adapter-loop"
         if provenance.get("native_row_bridge") == "true" and model in {
@@ -1687,15 +2011,20 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         source_to_artifact = [
             int(value, 10) for value in fields["source_to_artifact"].split(",")
         ]
-        return {
+        participation = fields.get("participation_capture_bridge") == "true"
+        result = {
             **common,
-            "kind": "strict-capture-v4",
-            "composite_kind": "strict-capture-next-v1",
+            "kind": (
+                "participation-capture-v4" if participation else "strict-capture-v4"
+            ),
+            "composite_kind": (
+                "exact-span-participation-v1" if participation
+                else "strict-capture-next-v1"
+            ),
             "source_pattern_count": source_pattern_count,
             "source_to_artifact": source_to_artifact,
             "row_total_object_bytes": int(fields["row_total_object_bytes"], 10),
             "uniform_capture": None,
-            "strict_capture": strict_capture_proof_from_provenance(fields, components),
             "boundary": fields["boundary"],
             "engine": fields["engine"],
             "aggregate_strategy": fields["aggregate_strategy"],
@@ -1711,6 +2040,15 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "required_runtime_symbols": [],
             "components": components,
         }
+        if participation:
+            result["participation_capture"] = (
+                participation_capture_proof_from_provenance(fields, components)
+            )
+        else:
+            result["strict_capture"] = strict_capture_proof_from_provenance(
+                fields, components
+            )
+        return result
     components = components_from_provenance(fields)
     native_row = fields.get("native_row_bridge") == "true"
     uniform_capture = native_row and fields.get("uniform_capture_bridge") == "true"
@@ -1778,6 +2116,26 @@ def operation_route_from_provenance_record(
                     "normalized strict-capture provenance has a non-native operation entry"
                 )
             return entries, "linked-strict-capture-next-adapter-loop"
+        if provenance["composite_kind"] == "exact-span-participation-v1":
+            proof = provenance.get("participation_capture")
+            participation = (
+                proof.get("participation_entry_symbol")
+                if isinstance(proof, dict) else None
+            )
+            selector = entries[0] if len(entries) == 1 else None
+            if (
+                not isinstance(selector, str)
+                or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+                or not isinstance(participation, str)
+                or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(participation) is None
+                or selector == participation
+            ):
+                raise CensusError(
+                    "normalized exact-span participation provenance has invalid entries"
+                )
+            return [selector, participation], (
+                "linked-exact-span-participation-adapter-loop"
+            )
         if len(entries) != len(set(entries)) or not all(
             isinstance(entry, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry)
             for entry in entries
@@ -1899,6 +2257,8 @@ def classification_from_qualification_evidence(
         reason = "native-search-core-with-static-uniform-capture-adapter-loop"
     elif adapter_route == "linked-strict-capture-next-adapter-loop":
         reason = "native-search-capture-core-with-checked-rust-adapter-loop"
+    elif adapter_route == "linked-exact-span-participation-adapter-loop":
+        reason = "native-search-capture-core-with-exact-span-replay-adapter-loop"
     elif adapter_outer_loop:
         reason = "native-search-core-with-adapter-outer-loop"
     else:
@@ -1975,7 +2335,9 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         ],
     }
     normalized_provenance = provenance_receipt(primary_fields)
-    if normalized_provenance["kind"] in {"composite-v3", "strict-capture-v4"} and (
+    if normalized_provenance["kind"] in {
+        "composite-v3", "strict-capture-v4", "participation-capture-v4"
+    } and (
         normalized_provenance["source_pattern_count"]
         != len(job["input"]["pattern_sha256"])
     ):
@@ -2007,14 +2369,18 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     helpers = semantic_helper_symbols(primary_runtime_references)
     if helpers != semantic_helper_symbols(replica_runtime_references):
         raise CensusError("independent binaries have different semantic helper inventories")
-    if normalized_provenance["kind"] == "strict-capture-v4" and helpers:
-        raise CensusError("strict-capture final binary retains semantic runtime symbols")
+    if normalized_provenance["kind"] in {
+        "strict-capture-v4", "participation-capture-v4"
+    } and helpers:
+        raise CensusError("native-capture final binary retains semantic runtime symbols")
     declared_set = set(normalized_provenance["required_runtime_symbols"])
     for component in normalized_provenance["components"]:
         declared_set.update(component["required_runtime_symbols"])
     declared = sorted(declared_set)
-    if normalized_provenance["kind"] == "strict-capture-v4" and declared:
-        raise CensusError("strict-capture provenance requires runtime symbols")
+    if normalized_provenance["kind"] in {
+        "strict-capture-v4", "participation-capture-v4"
+    } and declared:
+        raise CensusError("native-capture provenance requires runtime symbols")
     declared_semantic = [name for name in declared if not name.startswith(CONTROL_PLANE_PREFIXES)]
     if not set(declared_semantic).issubset(helpers):
         raise CensusError("provenance-declared semantic helpers escape independent inventory")
@@ -2333,6 +2699,132 @@ def validate_normalized_strict_capture(
         raise CensusError(f"{context} strict capture component binding differs")
 
 
+def validate_normalized_participation_capture(
+    proof: object,
+    component: dict[str, object],
+    target: object,
+    feature_bits: object,
+    context: str,
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} participation capture proof is not an object")
+    numeric_fields = {
+        "capture_group_count": (1, MAX_NATIVE_ROW_COMPONENTS),
+        "participation_strategy": (1, 2),
+        "participation_semantic_runtime_calls": (0, 0),
+        "participation_assertions": (0, NATIVE_PARTICIPATION_MAX_ASSERTIONS),
+        "participation_assertion_signatures": (
+            1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES
+        ),
+        "participation_byte_classes": (1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES),
+        "participation_dfa_states": (1, NATIVE_PARTICIPATION_MAX_DFA_STATES),
+        "participation_transition_cells": (
+            1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS
+        ),
+        "participation_build_work": (1, NATIVE_PARTICIPATION_MAX_BUILD_WORK),
+        "participation_scratch_bytes": (
+            NATIVE_PARTICIPATION_SCRATCH_BYTES,
+            NATIVE_PARTICIPATION_SCRATCH_BYTES,
+        ),
+        "participation_plan_bytes": (
+            NATIVE_PARTICIPATION_HEADER_BYTES,
+            NATIVE_PARTICIPATION_MAX_PLAN_BYTES,
+        ),
+    }
+    digest_fields = {
+        "capture_source_sha256", "capture_selector_sha256",
+        "capture_program_sha256", "selector_object_sha256",
+        "participation_bundle_sha256", "participation_export_identity_sha256",
+        "participation_object_sha256", "capture_artifact_identity_sha256",
+    }
+    symbol_fields = {
+        "participation_bundle_symbol", "capture_selector_symbol",
+        "participation_entry_symbol",
+    }
+    require_exact_keys(
+        proof,
+        {
+            "capture_resolution", "participation_algorithm_id",
+            *numeric_fields, *digest_fields, *symbol_fields,
+        },
+        f"{context} participation capture proof",
+    )
+    if (
+        proof["capture_resolution"] != "native-exact-span-participation-dfa-v1"
+        or proof["participation_algorithm_id"] != NATIVE_PARTICIPATION_ALGORITHM_ID
+    ):
+        raise CensusError(f"{context} participation capture identity differs")
+    for field, (minimum, maximum) in numeric_fields.items():
+        value = proof[field]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not minimum <= value <= maximum
+        ):
+            raise CensusError(f"{context} {field} is not canonical")
+    if not isinstance(target, str):
+        raise CensusError(f"{context} target is not a string")
+    expected_strategy = {"x86_64": 1, "aarch64": 2}[
+        target_architecture(target)
+    ]
+    if proof["participation_strategy"] != expected_strategy:
+        raise CensusError(
+            f"{context} participation strategy differs from target architecture"
+        )
+    expected_cells = (
+        proof["participation_dfa_states"]
+        * proof["participation_byte_classes"]
+        * proof["participation_assertion_signatures"]
+    )
+    if proof["participation_transition_cells"] != expected_cells:
+        raise CensusError(f"{context} participation transition geometry does not close")
+    if proof["participation_plan_bytes"] != participation_plan_bytes(
+        proof["participation_assertions"],
+        proof["participation_assertion_signatures"],
+        proof["participation_dfa_states"],
+        proof["participation_transition_cells"],
+    ):
+        raise CensusError(f"{context} participation plan extent does not close")
+    for field in digest_fields:
+        require_hex64(proof[field], f"{context} {field}")
+    bundle = proof["participation_bundle_symbol"]
+    selector = proof["capture_selector_symbol"]
+    entry = proof["participation_entry_symbol"]
+    export_identity = proof["participation_export_identity_sha256"]
+    if (
+        not isinstance(bundle, str)
+        or NATIVE_PARTICIPATION_BUNDLE_SYMBOL.fullmatch(bundle) is None
+        or not isinstance(selector, str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+        or not isinstance(entry, str)
+        or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(entry) is None
+        or len({bundle, selector, entry}) != 3
+        or not bundle.endswith(export_identity)
+        or not entry.endswith(export_identity)
+    ):
+        raise CensusError(f"{context} participation symbols are not canonical")
+    if not isinstance(feature_bits, str):
+        raise CensusError(f"{context} feature bits are not a string")
+    expected_export_identity = participation_export_identity(
+        proof["participation_bundle_sha256"],
+        target,
+        feature_bits,
+        proof["selector_object_sha256"],
+        selector,
+    )
+    if export_identity != expected_export_identity:
+        raise CensusError(
+            f"{context} participation export identity does not authenticate its inputs"
+        )
+    if (
+        component["entry_symbol"] != selector
+        or component["program_sha256"] != proof["capture_program_sha256"]
+        or component["object_sha256"] != proof["participation_object_sha256"]
+        or component["required_runtime_symbols"] != []
+    ):
+        raise CensusError(f"{context} participation component binding differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -2347,6 +2839,8 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     }
     if provenance.get("kind") == "strict-capture-v4":
         expected_keys.add("strict_capture")
+    elif provenance.get("kind") == "participation-capture-v4":
+        expected_keys.add("participation_capture")
     require_exact_keys(provenance, expected_keys, context)
     if not isinstance(provenance["components"], list):
         raise CensusError(f"{context} components are not a list")
@@ -2557,6 +3051,54 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         validate_normalized_strict_capture(
             provenance["strict_capture"], component, context
         )
+    elif provenance["kind"] == "participation-capture-v4":
+        components = provenance["components"]
+        component = components[0] if len(components) == 1 else None
+        expected_adapter = {
+            "count-captures": (
+                "general-aot-native-exact-span-participation-count-v1"
+            ),
+            "grep-captures": (
+                "general-aot-native-exact-span-participation-grep-v1"
+            ),
+        }.get(provenance["model"])
+        scalar_fields = (
+            "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
+            "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
+            "reducer_symbol", "span_fill_symbol",
+        )
+        if (
+            provenance["schema"] != "fre.aot.rebar-runner.v4"
+            or provenance["composite_kind"] != "exact-span-participation-v1"
+            or expected_adapter is None
+            or provenance["adapter"] != expected_adapter
+            or provenance["boundary"]
+            != "native-span-selector-with-helper-free-exact-span-participation-replay"
+            or provenance["engine"] != "NativeExactSpanParticipationDfaV1"
+            or provenance["aggregate_strategy"]
+            != "native-exact-span-participation-dfa-v1"
+            or provenance["source_pattern_count"] != 1
+            or provenance["source_to_artifact"] != [0]
+            or not isinstance(provenance["row_total_object_bytes"], int)
+            or isinstance(provenance["row_total_object_bytes"], bool)
+            or not 0 < provenance["row_total_object_bytes"] <= MAX_NATIVE_ROW_OBJECT_BYTES
+            or provenance["uniform_capture"] is not None
+            or provenance["required_runtime_symbols"] != []
+            or any(provenance[field] is not None for field in scalar_fields)
+            or component is None
+            or component["source_ordinal"] != 0
+            or component["automaton_sha256"] is not None
+        ):
+            raise CensusError(
+                f"{context} exact-span participation topology is not canonical"
+            )
+        validate_normalized_participation_capture(
+            provenance["participation_capture"],
+            component,
+            provenance["target"],
+            provenance["feature_bits"],
+            context,
+        )
     else:
         raise CensusError(f"{context} has an unknown provenance kind")
     operation_route_from_provenance_record(provenance)
@@ -2584,7 +3126,9 @@ def validate_artifact_record(artifact: object, context: str) -> dict[str, object
 def validate_provenance_job_binding(
     provenance: dict[str, object], input_identity: dict[str, object]
 ) -> None:
-    if provenance["kind"] not in {"composite-v3", "strict-capture-v4"}:
+    if provenance["kind"] not in {
+        "composite-v3", "strict-capture-v4", "participation-capture-v4"
+    }:
         return
     pattern_hashes = input_identity["pattern_sha256"]
     if provenance["source_pattern_count"] != len(pattern_hashes):
@@ -2809,8 +3353,10 @@ def validate_receipt(
             or declared != expected_declared
         ):
             raise CensusError("qualification route differs from normalized provenance")
-        if provenance["kind"] == "strict-capture-v4" and helpers:
-            raise CensusError("strict-capture final binary retains semantic runtime symbols")
+        if provenance["kind"] in {
+            "strict-capture-v4", "participation-capture-v4"
+        } and helpers:
+            raise CensusError("native-capture final binary retains semantic runtime symbols")
         declared_semantic = [
             symbol for symbol in declared if not symbol.startswith(CONTROL_PLANE_PREFIXES)
         ]

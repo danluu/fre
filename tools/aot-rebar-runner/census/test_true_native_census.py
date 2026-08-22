@@ -350,6 +350,138 @@ def synthetic_uniform_capture_qualification_receipt(
     return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
+def participation_capture_provenance_fields() -> dict[str, str]:
+    selector = f"fre_aot_regex_search_v1_{'a' * 64}"
+    export_identity = CENSUS.participation_export_identity(
+        "6" * 64,
+        "aarch64-linux",
+        "0000000100000000",
+        "5" * 64,
+        selector,
+    )
+    entry = f"fre_aot_regex_participation_exact_v1_{export_identity}"
+    bundle = f"fre_aot_regex_participation_bundle_v1_{export_identity}"
+    return {
+        "schema": "fre.aot.rebar-runner.v4",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": "general-aot-native-exact-span-participation-count-v1",
+        "model": "count-captures",
+        "benchmark": "runtime-job-000",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "NativeExactSpanParticipationDfaV1",
+        "aggregate_strategy": "native-exact-span-participation-dfa-v1",
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "false",
+        "strict_capture_bridge": "false",
+        "participation_capture_bridge": "true",
+        "source_pattern_count": "1",
+        "row_total_object_bytes": "123",
+        "source_to_artifact": "0",
+        "component_count": "1",
+        "component_0_native": "true",
+        "component_0_source_ordinal": "0",
+        "component_0_entry_symbol": selector,
+        "component_0_runtime_symbols": "",
+        "component_0_program_sha256": "3" * 64,
+        "component_0_object_sha256": "4" * 64,
+        "capture_resolution": "native-exact-span-participation-dfa-v1",
+        "capture_group_count": "3",
+        "participation_algorithm_id": (
+            "fre-aot-regex.exact-span-participation-dfa.v1"
+        ),
+        "participation_strategy": "2",
+        "participation_semantic_runtime_calls": "0",
+        "participation_assertions": "0",
+        "participation_assertion_signatures": "1",
+        "participation_byte_classes": "8",
+        "participation_dfa_states": "17",
+        "participation_transition_cells": "136",
+        "participation_build_work": "999",
+        "participation_scratch_bytes": "16",
+        "participation_plan_bytes": "1093",
+        "capture_source_sha256": "1" * 64,
+        "capture_selector_sha256": "2" * 64,
+        "capture_program_sha256": "3" * 64,
+        "selector_object_sha256": "5" * 64,
+        "participation_bundle_sha256": "6" * 64,
+        "participation_export_identity_sha256": export_identity,
+        "participation_object_sha256": "4" * 64,
+        "capture_artifact_identity_sha256": "7" * 64,
+        "participation_bundle_symbol": bundle,
+        "capture_selector_symbol": selector,
+        "participation_entry_symbol": entry,
+        "boundary": (
+            "native-span-selector-with-helper-free-exact-span-participation-replay"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+
+
+def synthetic_participation_capture_qualification_receipt(
+    plan: dict[str, object]
+) -> dict[str, object]:
+    receipt = copy.deepcopy(synthetic_qualification_receipt(plan))
+    receipt.pop("receipt_sha256")
+    job = plan["jobs"][33]
+    fields = participation_capture_provenance_fields()
+    encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+    provenance = CENSUS.provenance_receipt(CENSUS.parse_provenance(encoded))
+    selector = fields["component_0_entry_symbol"]
+    participation = fields["participation_entry_symbol"]
+    entries = [selector, participation]
+    receipt["job"] = {
+        "job_id": job["job_id"],
+        "point_ids": job["point_ids"],
+        "model": job["model"],
+        "input": job["input"],
+        "candidate_klv": job["candidate_klv"],
+    }
+    artifact = {
+        "runner_sha256": "8" * 64,
+        "objects": [{"ordinal": 0, "sha256": "4" * 64, "bytes": 123}],
+    }
+    receipt["artifacts"] = {
+        "primary": artifact,
+        "replica": artifact,
+        "reproducible": True,
+        "compiled_artifact_present": True,
+        "runtime_execution_authenticated_separately": True,
+        "provenance": provenance,
+    }
+    receipt["route"]["operation_entry_symbols"] = entries
+    receipt["route"]["operation_entry_symbols_sha256"] = CENSUS.sha_bytes(
+        CENSUS.canonical(entries).encode()
+    )
+    receipt["route"]["adapter_route"] = (
+        "linked-exact-span-participation-adapter-loop"
+    )
+    first = receipt["phases"]["claimed_entry_negative_traps"][0]
+    first["symbol"] = selector
+    first["marker"]["armed"][0]["symbol"] = selector
+    first["marker"]["triggered"] = selector
+    second = copy.deepcopy(first)
+    second["ordinal"] = 1
+    second["symbol"] = participation
+    second["marker"]["armed"][0]["symbol"] = participation
+    second["marker"]["triggered"] = participation
+    receipt["phases"]["claimed_entry_negative_traps"].append(second)
+    receipt["classification"] = CENSUS.classification_from_qualification_evidence(
+        True,
+        entries,
+        receipt["route"]["adapter_route"],
+        [],
+        receipt["phases"],
+        "aarch64",
+    )
+    return CENSUS.add_digest(receipt, "receipt_sha256")
+
+
 def strict_capture_provenance_fields() -> dict[str, str]:
     next_symbol = f"fre_aot_regex_capture_next_v1_{'a' * 64}"
     return {
@@ -511,6 +643,21 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertIn(
             "strict-capture-next-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        participation = definitions["participationCaptureProvenance"]
+        self.assertFalse(participation["additionalProperties"])
+        self.assertIn("participation_entry_symbol", participation["required"])
+        self.assertEqual(
+            participation["properties"]["participation_semantic_runtime_calls"]["const"],
+            0,
+        )
+        self.assertIn(
+            "participation-capture-v4",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        self.assertIn(
+            "exact-span-participation-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
 
@@ -831,6 +978,174 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(
             validated["classification"]["reason"],
             "native-search-core-with-static-uniform-capture-adapter-loop",
+        )
+
+    def test_participation_capture_v4_closes_both_native_operation_entries(self) -> None:
+        fields = participation_capture_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        provenance = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(
+            provenance, "synthetic exact-span participation"
+        )
+        entries = [
+            fields["capture_selector_symbol"],
+            fields["participation_entry_symbol"],
+        ]
+        self.assertEqual(provenance["kind"], "participation-capture-v4")
+        self.assertEqual(
+            provenance["composite_kind"], "exact-span-participation-v1"
+        )
+        self.assertNotIn("strict_capture", provenance)
+        self.assertEqual(
+            provenance["participation_capture"]["participation_strategy"], 2
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            (entries, "linked-exact-span-participation-adapter-loop"),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(provenance),
+            (entries, "linked-exact-span-participation-adapter-loop"),
+        )
+
+        grep_fields = dict(fields)
+        grep_fields["model"] = "grep-captures"
+        grep_fields["adapter"] = (
+            "general-aot-native-exact-span-participation-grep-v1"
+        )
+        grep_fields["benchmark"] = "synthetic/grep-captures"
+        grep_parsed = CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in grep_fields.items()).encode()
+        )
+        CENSUS.validate_provenance_record(
+            CENSUS.provenance_receipt(grep_parsed),
+            "synthetic exact-span participation grep",
+        )
+
+        wrong_strategy = dict(fields)
+        wrong_strategy["participation_strategy"] = "1"
+        with self.assertRaisesRegex(CENSUS.CensusError, "outside 2..=2"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_strategy.items()
+                ).encode()
+            )
+
+        helper_backed = dict(fields)
+        helper_backed["participation_semantic_runtime_calls"] = "1"
+        with self.assertRaisesRegex(CENSUS.CensusError, "outside 0..=0"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in helper_backed.items()
+                ).encode()
+            )
+
+        wrong_object = dict(fields)
+        wrong_object["participation_object_sha256"] = "9" * 64
+        with self.assertRaisesRegex(CENSUS.CensusError, "differs from its component"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_object.items()
+                ).encode()
+            )
+
+        wrong_bundle = dict(fields)
+        wrong_bundle["participation_bundle_sha256"] = "8" * 64
+        with self.assertRaisesRegex(
+            CENSUS.CensusError, "export identity does not authenticate its inputs"
+        ):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_bundle.items()
+                ).encode()
+            )
+
+        wrong_cells = dict(fields)
+        wrong_cells["participation_transition_cells"] = "135"
+        with self.assertRaisesRegex(CENSUS.CensusError, "geometry does not close"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_cells.items()
+                ).encode()
+            )
+
+        wrong_plan = dict(fields)
+        wrong_plan["participation_plan_bytes"] = "1092"
+        with self.assertRaisesRegex(CENSUS.CensusError, "plan extent does not close"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_plan.items()
+                ).encode()
+            )
+
+        over_cap = dict(fields)
+        over_cap["participation_assertions"] = "65"
+        with self.assertRaisesRegex(CENSUS.CensusError, "outside 0..=64"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in over_cap.items()
+                ).encode()
+            )
+
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
+            CENSUS.parse_provenance(encoded + b" unsealed_field=1")
+
+    def test_participation_receipt_is_native_capture_core_and_traps_both_entries(
+        self,
+    ) -> None:
+        plan = synthetic_plan()
+        receipt = synthetic_participation_capture_qualification_receipt(plan)
+        validated = CENSUS.validate_receipt(receipt, plan)
+        self.assertTrue(
+            validated["classification"]["native_search_core_authenticated"]
+        )
+        self.assertTrue(validated["classification"]["adapter_outer_loop"])
+        self.assertFalse(
+            validated["classification"]["whole_operation_native_authenticated"]
+        )
+        self.assertEqual(
+            validated["classification"]["reason"],
+            "native-search-capture-core-with-exact-span-replay-adapter-loop",
+        )
+        self.assertEqual(
+            len(validated["route"]["operation_entry_symbols"]), 2
+        )
+
+        poisoned_proof = copy.deepcopy(receipt)
+        poisoned_proof.pop("receipt_sha256")
+        poisoned_proof["artifacts"]["provenance"]["participation_capture"][
+            "participation_bundle_sha256"
+        ] = "8" * 64
+        poisoned_proof = CENSUS.add_digest(poisoned_proof, "receipt_sha256")
+        with self.assertRaisesRegex(
+            CENSUS.CensusError, "export identity does not authenticate its inputs"
+        ):
+            CENSUS.validate_receipt(poisoned_proof, plan)
+
+        missing_replay_trap = copy.deepcopy(receipt)
+        missing_replay_trap.pop("receipt_sha256")
+        missing_replay_trap["phases"]["claimed_entry_negative_traps"].pop()
+        missing_replay_trap["classification"] = (
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                missing_replay_trap["route"]["operation_entry_symbols"],
+                missing_replay_trap["route"]["adapter_route"],
+                [],
+                missing_replay_trap["phases"],
+                "aarch64",
+            )
+        )
+        missing_replay_trap = CENSUS.add_digest(
+            missing_replay_trap, "receipt_sha256"
+        )
+        validated_missing = CENSUS.validate_receipt(missing_replay_trap, plan)
+        self.assertFalse(
+            validated_missing["classification"]["native_search_core_authenticated"]
+        )
+        self.assertEqual(
+            validated_missing["classification"]["reason"],
+            "claimed-entry-negative-control-failure",
         )
 
     def test_strict_capture_v4_is_closed_and_selects_capture_next(self) -> None:

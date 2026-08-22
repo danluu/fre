@@ -28,20 +28,26 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - the raw runtime schedule-point denominator for comparison with older runs.
 
 `count-spans` direct-entry iteration, per-line `grep`, the static uniform
-capture multiplier route, and the strict native `capture_next` route can
+capture multiplier route, the helper-free exact-span participation route, and
+the strict native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. The uniform route is labelled separately from both a fused capture
 operation and capture-offset materialization: its native entries select spans;
 the adapter applies an independently sealed per-row participation count. The
-strict route materializes group-zero-inclusive slots natively, then validates
-and reduces those slots in Rust.
+exact-span route separately traps both its ordinary native selector and its
+architecture-specific native participation replay entry; it publishes only a
+checked group count for the selector's exact span. The strict route
+materializes group-zero-inclusive slots natively, then validates and reduces
+those slots in Rust.
 
 `grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
 are exact adapter *shapes*. This admits them to the sealed qualification
 population; it does not turn either build-time proof into an assumption. A
-uniform-proof semantic decline may use the independently authenticated strict
-one-pattern route. Every parse, allocation, resource, emission,
+uniform-proof semantic decline may use an independently authenticated
+one-pattern exact-span participation route, followed by the stricter
+`capture_next` route on an authenticated participation decline. Every parse,
+allocation, resource, emission,
 authentication, multi-source, or remaining semantic decline fails the
 all-or-nothing build and must receive a `record-failure` receipt. It remains in
 the 311-job denominator as nonnative rather than disappearing as unsupported.
@@ -130,7 +136,11 @@ the three selector digest lists. Each source automaton/program/object digest is
 checked against the component selected by `source_to_artifact`. Unrecognized or
 missing raw v3 fields are rejected rather than silently discarded.
 
-Strict-capture v4 must publish exactly one source, artifact, and component. Its
+Native-capture v4 publishes exactly one source, artifact, and component. The
+exact-span variant closes its selector, capture program, DFA geometry, bundle,
+object, architecture-specific strategy, and three distinct selector/bundle/
+replay symbols; its semantic-runtime-call count and final-binary helper
+inventory must both be empty. Strict-capture v4's
 sole component entry is an identity-suffixed native `capture_next`, its declared
 runtime-symbol list is empty, and its object/program identities agree with the
 component receipt. The closed record also seals group count and nullability,
@@ -169,7 +179,10 @@ Three fresh processes authenticate each job:
    stage cannot stand in for proof that the other 14 entries execute.
    The variable-width native-row bridge and uniform-capture row bridge receive
    the same independent negative control for every retained row artifact. The
-   strict-capture v4 route instead traps its sole `capture_next` component entry;
+   exact-span participation v4 runs two independent negative controls: one for
+   its ordinary selector and one for its participation replay. A positive job
+   is not credited merely because the selector ran while the replay remained
+   unexercised. Strict-capture v4 instead traps its sole `capture_next` component entry;
    patching the ordinary selector or materializer is not accepted as evidence
    that the timed capture iterator executed. These routes are reported as
    native search or search/capture cores with an adapter outer loop. The uniform
