@@ -22,6 +22,17 @@ const EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR: u128 = 8;
 const EXACT_FINITE_LITERAL_BYTE_VERIFICATION_UNITS: u128 = 11;
 const EXACT_FINITE_LITERAL_DISPATCH_UNITS: u128 = 8;
 const EXACT_FINITE_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
+/// Frozen before timing: the scalable Teddy miss path scans four complete
+/// runtime vectors while retaining each block's bucket vector. Candidate
+/// predicates are materialized only after the batch is known to contain a hit.
+const EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS: u8 = 4;
+const EXACT_FINITE_TEDDY_UNBATCHED_VECTORS: u8 = 1;
+/// P1..P4 retain a four-vector batch, so the exact leaf must not use the
+/// generic first-candidate helper's P2 scratch.
+const EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH: u8 = 10;
+/// LASTB only accepts P0..P7 as its governing predicate. P5 is outside the
+/// retained P1..P4 batch and may be rematerialized for every selected lane.
+const EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH: u8 = 5;
 /// Hard peak for the report validator's only transient rebuild allocation.
 /// Sixty-four fat slice references occupy 1 KiB on supported 64-bit hosts;
 /// the extra headroom keeps this an explicit compiler resource ceiling.
@@ -400,6 +411,7 @@ fn report_plan_digest(
     digest.update(report.plan_scan_instruction_units.to_le_bytes());
     digest.update(report.emitted_scan_instruction_units.to_le_bytes());
     digest.update(report.guaranteed_vector_bytes.to_le_bytes());
+    digest.update([report.batch_vectors]);
     digest.update(u64::try_from(report.gate_table_bytes).ok()?.to_le_bytes());
     digest.update([match report.selected_target_tier {
         ExactFiniteSelectedEndTeddyAotTargetTier::X86Avx2 => 0,
@@ -650,6 +662,17 @@ const fn report_scanner(isa: MandatoryTeddyIsa) -> StartAccelerator {
         ExactFiniteSelectedEndTeddyAotIsa::X86Avx2 => StartAccelerator::X86Avx2,
         ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd => StartAccelerator::Aarch64Asimd,
         ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve => StartAccelerator::Aarch64Sve,
+    }
+}
+
+const fn report_batch_vectors(isa: MandatoryTeddyIsa) -> u8 {
+    match isa {
+        MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
+            EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS
+        }
+        MandatoryTeddyIsa::X86Avx2
+        | MandatoryTeddyIsa::X86Avx512Bw
+        | MandatoryTeddyIsa::Aarch64Asimd => EXACT_FINITE_TEDDY_UNBATCHED_VECTORS,
     }
 }
 
@@ -1299,10 +1322,88 @@ fn aarch64_exact_mov_w(destination: u8, source: u8) -> Result<u32, ObjectError> 
     Ok(0x2a00_03e0 | aarch64_reg(source, 16)? | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_emit_exact_teddy_sve_first_candidate(
+    assembler: &mut Aarch64Assembler,
+    candidates: u8,
+    buckets: u8,
+    bucket_ready: Aarch64Label,
+) -> Result<(), ObjectError> {
+    // BRKA and BRKB expose independent inclusive/exclusive prefixes from the
+    // same retained candidates. LASTB can recover the bucket while INCP
+    // advances the scalar base, avoiding a predicate -> GPR -> predicate
+    // dependency through ADD/WHILELO.
+    assembler.instruction(aarch64_sve_brka_p0(
+        EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH,
+        candidates,
+    )?)?;
+    assembler.instruction(aarch64_sve_brkb_p0(
+        EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+        candidates,
+    )?)?;
+    assembler.instruction(aarch64_sve_lastb_w(
+        10,
+        EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH,
+        buckets,
+    )?)?;
+    assembler.instruction(aarch64_sve_incp_b(
+        2,
+        EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+    )?)?;
+    assembler.branch(bucket_ready)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two vector routes share exact bounds and three explicit CFG exits"
+)]
+fn aarch64_emit_exact_teddy_sve_batch_route(
+    assembler: &mut Aarch64Assembler,
+    teddy: &NativeMandatoryTeddyLayout,
+    vector: Aarch64Label,
+    single: Aarch64Label,
+    batch_candidate: Aarch64Label,
+    exhausted: Aarch64Label,
+    single_prefix: bool,
+) -> Result<(), ObjectError> {
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(12, u16::from(teddy.plan.columns()))?)?;
+    assembler.branch_cond(AARCH64_LO, exhausted)?;
+    let maximum_offset = teddy
+        .plan
+        .columns()
+        .checked_sub(1)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 exact finite SelectedEnd Teddy has no columns",
+        ))?;
+    assembler.instruction(aarch64_sub_x_imm(10, 3, u16::from(maximum_offset))?)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 10, 2)?)?;
+
+    assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, single)?;
+    aarch64_emit_mandatory_teddy_sve_batch4_candidates(
+        assembler,
+        teddy,
+        vector,
+        single_prefix,
+    )?;
+    aarch64_emit_mandatory_teddy_sve_batch4_any(assembler)?;
+    assembler.branch_cond(AARCH64_NE, batch_candidate)?;
+    assembler.instruction(aarch64_sve_addvl(
+        2,
+        2,
+        EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS,
+    )?)?;
+    assembler.branch(vector)?;
+    Ok(())
+}
+
 fn lower_aarch64_wrapper(
     incumbent_code: &[u8],
     layout: ExactFiniteSelectedEndTeddyDataLayout,
     lane_index_offset: Option<u32>,
+    selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let teddy = layout.teddy;
     if incumbent_code.is_empty()
@@ -1408,35 +1509,123 @@ fn lower_aarch64_wrapper(
             assembler.branch(bucket_ready)?;
         }
         MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
+            let single = assembler.label()?;
             let partial = assembler.label()?;
+            let single_candidate = assembler.label()?;
+            let batch_candidate = assembler.label()?;
+            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+            let single_prefix_vector = if selection_basis
+                == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
+                && batch_plan.single_prefix_max_vector_bytes.is_some()
+            {
+                Some(assembler.label()?)
+            } else {
+                None
+            };
+            let batch_hits = [
+                assembler.label()?,
+                assembler.label()?,
+                assembler.label()?,
+                assembler.label()?,
+            ];
             aarch64_emit_mandatory_teddy_sve_constants(&mut assembler, teddy)?;
             assembler.bind(retry_scan)?;
-            // Exact verification uses W6 and partial batches narrow P0. A
-            // false fingerprint can cross from a full batch into the final
-            // partial batch, so restore every scalable scan invariant before
-            // making either decision again.
+            // Exact verification uses W6, retry bookkeeping changes P1/P10,
+            // and partial batches narrow P0. Restore every scalable scan
+            // invariant before entering the four-vector/single/tail decision.
             assembler.instruction(aarch64_sve_ptrue_b())?;
             assembler.instruction(aarch64_sve_dup_b_imm(26, 0x0f)?)?;
             assembler.instruction(aarch64_sve_cntb(6)?)?;
-            assembler.bind(vector)?;
-            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-            assembler.instruction(aarch64_cmp_x_imm(12, u16::from(teddy.plan.columns()))?)?;
-            assembler.branch_cond(AARCH64_LO, exhausted)?;
-            let maximum_offset =
-                teddy
-                    .plan
-                    .columns()
-                    .checked_sub(1)
-                    .ok_or(ObjectError::InvalidModule(
-                        "AArch64 exact finite SelectedEnd Teddy has no columns",
+            if let (Some(single_prefix_vector), Some(maximum_vector_bytes)) = (
+                single_prefix_vector,
+                batch_plan.single_prefix_max_vector_bytes,
+            ) {
+                // CNTB is invariant for the process. Dispatch once per exact
+                // retry so wider implementations retain the established loop
+                // with no per-batch profitability branch.
+                assembler.instruction(aarch64_cmp_x_imm(6, maximum_vector_bytes)?)?;
+                assembler.branch_cond(AARCH64_LS, single_prefix_vector)?;
+            }
+
+            // Four runtime vectors are 4 * CNTB. Keep Z24/Z25/Z27/Z28 live so
+            // a hit never reloads its block and exact rejection can continue
+            // into later candidate blocks without rescanning them.
+            aarch64_emit_exact_teddy_sve_batch_route(
+                &mut assembler,
+                &teddy,
+                vector,
+                single,
+                batch_candidate,
+                exhausted,
+                false,
+            )?;
+            if let Some(single_prefix_vector) = single_prefix_vector {
+                aarch64_emit_exact_teddy_sve_batch_route(
+                    &mut assembler,
+                    &teddy,
+                    single_prefix_vector,
+                    single,
+                    batch_candidate,
+                    exhausted,
+                    true,
+                )?;
+            }
+
+            assembler.bind(batch_candidate)?;
+            // The miss path needed only an existential reduction. Materialize
+            // durable P1..P4 masks now that the retained bucket vectors are
+            // known to contain at least one candidate.
+            aarch64_emit_mandatory_teddy_sve_batch4_predicates(&mut assembler)?;
+            for (block, &hit) in batch_hits.iter().enumerate() {
+                let predicate = u8::try_from(block)
+                    .ok()
+                    .and_then(|block| block.checked_add(1))
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 exact finite SelectedEnd Teddy batch hit predicate",
                     ))?;
-            assembler.instruction(aarch64_sub_x_imm(10, 3, u16::from(maximum_offset))?)?;
+                assembler.instruction(aarch64_sve_ptest_p0(predicate)?)?;
+                assembler.branch_cond(AARCH64_NE, hit)?;
+            }
+            // The reduction proved a hit. Recomputing through the one-vector
+            // path is a safe progress fallback if a future emitter violates
+            // the retained-predicate invariant.
+            assembler.branch(single)?;
+            for (block, &hit) in batch_hits.iter().enumerate() {
+                assembler.bind(hit)?;
+                let block = u8::try_from(block).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 exact finite SelectedEnd Teddy batch hit block",
+                    )
+                })?;
+                if block == 0 {
+                    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+                } else {
+                    assembler.instruction(aarch64_sve_addvl(21, 2, block)?)?;
+                }
+                assembler.instruction(aarch64_movz_w(7, u16::from(block + 1))?)?;
+                let predicate = block + 1;
+                if predicate != 1 {
+                    assembler.instruction(aarch64_sve_orr_b(1, predicate, predicate)?)?;
+                }
+                let buckets = AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                    [usize::from(block)];
+                assembler.instruction(aarch64_sve_and_z(6, buckets, buckets)?)?;
+                assembler.instruction(aarch64_mov_x(2, 21)?)?;
+                aarch64_emit_exact_teddy_sve_first_candidate(
+                    &mut assembler,
+                    1,
+                    6,
+                    bucket_ready,
+                )?;
+            }
+
+            assembler.bind(single)?;
             assembler.instruction(aarch64_sub_x_reg(12, 10, 2)?)?;
             assembler.instruction(aarch64_cmp_x(12, 6)?)?;
             assembler.branch_cond(AARCH64_LO, partial)?;
             aarch64_emit_mandatory_teddy_sve_candidates(&mut assembler, teddy)?;
             assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
-            assembler.branch_cond(AARCH64_NE, vector_candidate)?;
+            assembler.branch_cond(AARCH64_NE, single_candidate)?;
             assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
             assembler.branch(vector)?;
 
@@ -1446,9 +1635,20 @@ fn lower_aarch64_wrapper(
             assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
             assembler.branch_cond(AARCH64_EQ, exhausted)?;
 
-            assembler.bind(vector_candidate)?;
+            assembler.bind(single_candidate)?;
             assembler.instruction(aarch64_mov_x(21, 2)?)?; // retained block base
-            aarch64_emit_sve_first_candidate(&mut assembler, 1, candidate)?;
+            // Four means no retained later-batch predicate follows this
+            // standalone full vector or predicated final partial vector.
+            assembler.instruction(aarch64_movz_w(
+                7,
+                u16::from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS),
+            )?)?;
+            aarch64_emit_exact_teddy_sve_first_candidate(
+                &mut assembler,
+                1,
+                6,
+                bucket_ready,
+            )?;
             assembler.bind(scalar)?;
             assembler.branch(exhausted)?;
         }
@@ -1460,8 +1660,8 @@ fn lower_aarch64_wrapper(
     }
 
     assembler.bind(candidate)?;
-    // The SVE first-lane helper branches here directly; recover the exact
-    // bucket identity that predicates intentionally discard.
+    // ASIMD vector candidates reach this shared replay. Its scalar tail and
+    // the SVE route already have an exact bucket and enter `bucket_ready`.
     aarch64_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
     assembler.branch_cond(AARCH64_EQ, retry_retained)?;
     assembler.bind(bucket_ready)?;
@@ -1523,15 +1723,65 @@ fn lower_aarch64_wrapper(
     match teddy.isa {
         MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
             // Consume every candidate lane through the rejected base while
-            // retaining the active full/partial predicate. P1 and P0 survive
-            // scalar exact verification; P2 is caller-saved scratch.
+            // retaining the active full/partial predicate. P1..P4 and P0
+            // survive scalar exact verification; P10 is dedicated scratch so
+            // later blocks from a hit-bearing four-vector batch remain live.
             assembler.instruction(aarch64_add_x_imm(12, 2, 1)?)?;
-            assembler.instruction(aarch64_sve_whilelo_b(2, 21, 12)?)?;
-            assembler.instruction(aarch64_sve_not_b(2, 2)?)?;
-            assembler.instruction(aarch64_sve_and_b(1, 1, 2)?)?;
+            assembler.instruction(aarch64_sve_whilelo_b(
+                EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                21,
+                12,
+            )?)?;
+            assembler.instruction(aarch64_sve_not_b(
+                EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+            )?)?;
+            assembler.instruction(aarch64_sve_and_b(
+                1,
+                1,
+                EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+            )?)?;
             assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
             let retained_candidate = assembler.label()?;
             assembler.branch_cond(AARCH64_NE, retained_candidate)?;
+
+            // W7 names the next retained batch block. Standalone full/partial
+            // scans and a hit in block four use the sentinel value four.
+            let next_batch_1 = assembler.label()?;
+            let next_batch_2 = assembler.label()?;
+            let next_batch_3 = assembler.label()?;
+            let select_batch_1 = assembler.label()?;
+            let select_batch_2 = assembler.label()?;
+            let select_batch_3 = assembler.label()?;
+            let block_exhausted = assembler.label()?;
+            assembler.instruction(aarch64_cmp_w_imm(7, 1)?)?;
+            assembler.branch_cond(AARCH64_EQ, next_batch_1)?;
+            assembler.instruction(aarch64_cmp_w_imm(7, 2)?)?;
+            assembler.branch_cond(AARCH64_EQ, next_batch_2)?;
+            assembler.instruction(aarch64_cmp_w_imm(7, 3)?)?;
+            assembler.branch_cond(AARCH64_EQ, next_batch_3)?;
+            assembler.branch(block_exhausted)?;
+
+            assembler.bind(next_batch_1)?;
+            assembler.instruction(aarch64_sve_addvl(21, 21, 1)?)?;
+            assembler.instruction(aarch64_movz_w(7, 2)?)?;
+            assembler.instruction(aarch64_sve_ptest_p0(2)?)?;
+            assembler.branch_cond(AARCH64_NE, select_batch_1)?;
+            assembler.bind(next_batch_2)?;
+            assembler.instruction(aarch64_sve_addvl(21, 21, 1)?)?;
+            assembler.instruction(aarch64_movz_w(7, 3)?)?;
+            assembler.instruction(aarch64_sve_ptest_p0(3)?)?;
+            assembler.branch_cond(AARCH64_NE, select_batch_2)?;
+            assembler.bind(next_batch_3)?;
+            assembler.instruction(aarch64_sve_addvl(21, 21, 1)?)?;
+            assembler.instruction(aarch64_movz_w(
+                7,
+                u16::from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS),
+            )?)?;
+            assembler.instruction(aarch64_sve_ptest_p0(4)?)?;
+            assembler.branch_cond(AARCH64_NE, select_batch_3)?;
+
+            assembler.bind(block_exhausted)?;
             // A final partial P0 has no later candidate block. Advancing it
             // by a full VL could move X2 beyond the public end and make the
             // retry loop's unsigned remaining calculation underflow.
@@ -1541,9 +1791,38 @@ fn lower_aarch64_wrapper(
             assembler.branch_cond(AARCH64_LO, exhausted)?;
             assembler.instruction(aarch64_sve_addvl(2, 21, 1)?)?;
             assembler.branch(retry_scan)?;
+
+            for (label, predicate) in [
+                (select_batch_1, 2_u8),
+                (select_batch_2, 3_u8),
+                (select_batch_3, 4_u8),
+            ] {
+                assembler.bind(label)?;
+                assembler.instruction(aarch64_sve_orr_b(1, predicate, predicate)?)?;
+                let block = usize::from(predicate.checked_sub(1).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 exact finite SelectedEnd Teddy batch bucket",
+                    ),
+                )?);
+                let buckets = AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS[block];
+                assembler.instruction(aarch64_sve_and_z(6, buckets, buckets)?)?;
+                assembler.instruction(aarch64_mov_x(2, 21)?)?;
+                aarch64_emit_exact_teddy_sve_first_candidate(
+                    &mut assembler,
+                    1,
+                    6,
+                    bucket_ready,
+                )?;
+            }
+
             assembler.bind(retained_candidate)?;
             assembler.instruction(aarch64_mov_x(2, 21)?)?;
-            aarch64_emit_sve_first_candidate(&mut assembler, 1, candidate)?;
+            aarch64_emit_exact_teddy_sve_first_candidate(
+                &mut assembler,
+                1,
+                6,
+                bucket_ready,
+            )?;
         }
         MandatoryTeddyIsa::Aarch64Asimd => {
             // Keep V24 intact. Form an exact `lane >= rejected + 1` mask in
@@ -1731,6 +2010,7 @@ fn report_for(
         plan_scan_instruction_units: selection.plan.scan_instruction_units(),
         emitted_scan_instruction_units: tier.scan_instruction_units,
         guaranteed_vector_bytes: tier.block_bytes,
+        batch_vectors: report_batch_vectors(selection.isa),
         gate_table_bytes,
         selected_target_tier: report_target_tier(selection.isa),
         emitted_isa: report_isa(selection.isa),
@@ -1911,7 +2191,12 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
         }
         Architecture::Aarch64 => {
             let (code, mut wrapper_relocations, core_offset) =
-                lower_aarch64_wrapper(&incumbent_code, verifier_layout, lane_index_offset)?;
+                lower_aarch64_wrapper(
+                    &incumbent_code,
+                    verifier_layout,
+                    lane_index_offset,
+                    selection_basis,
+                )?;
             let rebased = checked_rebase_relocations(
                 incumbent_relocations,
                 incumbent_code.len(),
@@ -2483,6 +2768,7 @@ fn report_costs_authenticate_with_basis(
             || report.plan_scan_instruction_units != plan.scan_instruction_units()
             || report.emitted_scan_instruction_units != tier.scan_instruction_units
             || report.guaranteed_vector_bytes != tier.block_bytes
+            || report.batch_vectors != report_batch_vectors(selected_isa)
             || report.gate_table_bytes != expected_gate_table_bytes
             || !table_base.is_multiple_of(alignment)
             || table_end.checked_sub(table_base) != Some(tier.table_bytes)
@@ -2662,6 +2948,107 @@ mod tests {
         }
         pattern.push(')');
         pattern
+    }
+
+    fn sparse_single_prefix_literals() -> Vec<Vec<u8>> {
+        SCANNER_FREE_BYTES
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, first)| {
+                let mut literal = vec![
+                    first,
+                    u8::try_from(ordinal % 4).unwrap(),
+                    SCANNER_FREE_BYTES[(ordinal + 3) % SCANNER_FREE_BYTES.len()],
+                    SCANNER_FREE_BYTES[(ordinal + 7) % SCANNER_FREE_BYTES.len()],
+                    SCANNER_FREE_BYTES[(ordinal + 11) % SCANNER_FREE_BYTES.len()],
+                    SCANNER_FREE_BYTES[(ordinal + 13) % SCANNER_FREE_BYTES.len()],
+                ];
+                if ordinal + 1 == SCANNER_FREE_BYTES.len() {
+                    literal.push(0xc8);
+                }
+                literal
+            })
+            .collect()
+    }
+
+    fn sparse_single_prefix_pattern() -> String {
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in sparse_single_prefix_literals().iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn sparse_single_prefix_three_column_pattern() -> String {
+        let mut literals = sparse_single_prefix_literals();
+        for literal in &mut literals {
+            literal.truncate(3);
+        }
+        literals.last_mut().unwrap().push(0xc8);
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in literals.iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn sve_batch_column_schedule(column: u8, initialize: bool) -> Vec<u32> {
+        let mut schedule = Vec::new();
+        schedule.push(aarch64_add_x_reg(12, 0, 2).unwrap());
+        if column != 0 {
+            schedule.push(aarch64_add_x_imm(12, 12, u16::from(column)).unwrap());
+        }
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            schedule.push(aarch64_sve_ld1b_vl(block, 12, block).unwrap());
+        }
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            schedule.push(aarch64_sve_lsr_b_by_4(4 + block, block).unwrap());
+        }
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            schedule.push(aarch64_sve_and_z(block, block, 26).unwrap());
+        }
+        let low = 16 + 2 * column;
+        let high = low + 1;
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            schedule.push(aarch64_sve_tbl_b(block, low, block).unwrap());
+        }
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            schedule.push(aarch64_sve_tbl_b(4 + block, high, 4 + block).unwrap());
+        }
+        if initialize {
+            for (block, &buckets) in AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                .iter()
+                .enumerate()
+            {
+                let source = u8::try_from(block).unwrap();
+                schedule.push(aarch64_sve_and_z(buckets, source, 4 + source).unwrap());
+            }
+        } else {
+            for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+                schedule.push(aarch64_sve_and_z(block, block, 4 + block).unwrap());
+            }
+            for (block, &buckets) in AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                .iter()
+                .enumerate()
+            {
+                let source = u8::try_from(block).unwrap();
+                schedule.push(aarch64_sve_and_z(buckets, buckets, source).unwrap());
+            }
+        }
+        schedule
     }
 
     fn scanner_free_overlapping_pattern(long_first: bool) -> String {
@@ -2935,6 +3322,15 @@ mod tests {
                 StartAccelerator::None,
             );
             assert_eq!(report.target, target);
+            assert_eq!(
+                report.batch_vectors,
+                if report.emitted_isa == ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve {
+                    EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS
+                } else {
+                    EXACT_FINITE_TEDDY_UNBATCHED_VECTORS
+                },
+                "authenticated batch width: {target:?}",
+            );
             assert!(report.literal_descriptors_offset > report.bucket_ordinal_masks_offset);
             assert!(report.literal_bytes_end > report.literal_bytes_offset);
             assert!(
@@ -3212,6 +3608,17 @@ mod tests {
                 ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
             );
             assert!(report.performance_admission_bypassed);
+            assert_eq!(
+                report.lowering.batch_vectors,
+                if report.lowering.emitted_isa
+                    == ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve
+                {
+                    EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS
+                } else {
+                    EXACT_FINITE_TEDDY_UNBATCHED_VECTORS
+                },
+                "forced authenticated batch width: {target:?}",
+            );
             assert!(report.tail_enters_exact_incumbent);
             assert!(report.lowering.incumbent_complete_dfa.has_accelerator);
             assert_ne!(report.incumbent_start_accelerator, StartAccelerator::None,);
@@ -3368,6 +3775,69 @@ mod tests {
     }
 
     #[test]
+    fn sve_batch_and_single_prefix_code_growth_respect_the_exact_ordinary_object_cap() {
+        let sparse_pattern = sparse_single_prefix_pattern();
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            for pattern in [accelerated_exact_finite_pattern(), sparse_pattern.as_str()] {
+                let request = |max_object_bytes| {
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd)
+                        .limits(crate::CompileLimitsV1 {
+                            max_object_bytes,
+                            ..crate::CompileLimitsV1::default()
+                        })
+                };
+                let ordinary = crate::compile_v2(
+                    crate::CompileRequestV2::new(request(usize::MAX))
+                        .exact_finite_selected_end_teddy(
+                            crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                        ),
+                )
+                .expect("compile the exact ordinary SVE incumbent");
+                let forced = crate::compile_v2(
+                    crate::CompileRequestV2::new(request(usize::MAX))
+                        .exact_finite_selected_end_teddy(
+                            crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+                        ),
+                )
+                .expect("compile the four-vector SVE wrapper");
+                let report = forced
+                    .receipt_v2()
+                    .exact_finite_selected_end_teddy_aot
+                    .expect("forced SVE wrapper receipt");
+                assert_eq!(
+                    report.lowering.batch_vectors,
+                    EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS,
+                );
+                assert!(report.lowering.incumbent_code_offset > 0);
+                assert!(ordinary.object().len() < forced.object().len());
+
+                let capped = crate::compile_v2(
+                    crate::CompileRequestV2::new(request(ordinary.object().len()))
+                        .exact_finite_selected_end_teddy(
+                            crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+                        ),
+                )
+                .expect("the exact ordinary SVE object boundary must fit");
+                assert_eq!(capped.module(), ordinary.module());
+                assert_eq!(capped.object(), ordinary.object());
+                assert_eq!(capped.receipt(), ordinary.receipt());
+                assert!(
+                    capped
+                        .receipt_v2()
+                        .exact_finite_selected_end_teddy_aot
+                        .is_none(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn v2_force_never_bypasses_structural_or_output_gates() {
         let target = avx2_target();
         for (pattern, output) in [
@@ -3441,6 +3911,591 @@ mod tests {
     }
 
     #[test]
+    fn sve_lazy_pair_is_selective_deterministic_and_exact_at_both_depths() {
+        // The first two chronological columns are deliberately common while
+        // the final two are rare and distinct. With one literal per bucket,
+        // the stable frequency oracle must therefore stage columns 1/2 for a
+        // three-column plan and 2/3 for a four-column plan.
+        let literals = (0_u8..8)
+            .map(|ordinal| vec![b' ', b'\n', ordinal, ordinal.wrapping_add(16)])
+            .collect::<Vec<_>>();
+        let portfolio = mandatory_teddy::derive_exact_prefixes(&literals, 4)
+            .expect("three/four-column slim Teddy plans");
+        let mut observed_depths = [false; 5];
+        for plan in portfolio
+            .plans()
+            .copied()
+            .filter(|plan| plan.bank_count() == 1)
+        {
+            let columns = usize::from(plan.columns());
+            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&plan).unwrap();
+            let order = batch_plan.column_order;
+            let expected: &[u8] = match columns {
+                3 => &[2, 1, 0],
+                4 => &[2, 3, 0, 1],
+                _ => panic!("unexpected slim Teddy depth {columns}"),
+            };
+            assert_eq!(&order[..columns], expected);
+            assert_eq!(
+                aarch64_mandatory_teddy_sve_column_union_frequency(
+                    &plan,
+                    usize::from(order[0]),
+                )
+                .unwrap(),
+                8,
+            );
+            assert_eq!(batch_plan.single_prefix_max_vector_bytes, None);
+            observed_depths[columns] = true;
+
+            let bank = plan.bank(0).unwrap();
+            let buckets_at = |column: usize, byte: u8| {
+                bank.low(column).unwrap()[usize::from(byte & 0x0f)]
+                    & bank.high(column).unwrap()[usize::from(byte >> 4)]
+            };
+            for first in u8::MIN..=u8::MAX {
+                for second in u8::MIN..=u8::MAX {
+                    let mut window = [0_u8; 4];
+                    window[usize::from(order[0])] = first;
+                    window[usize::from(order[1])] = second;
+                    let prefix = buckets_at(usize::from(order[0]), first)
+                        & buckets_at(usize::from(order[1]), second);
+                    if buckets_at(usize::from(order[0]), first) == 0 {
+                        assert_eq!(
+                            prefix, 0,
+                            "a singleton miss cannot survive the selected pair",
+                        );
+                    }
+                    let mut reordered = prefix;
+                    for (salt, &column) in order[2..columns].iter().enumerate() {
+                        let byte = first
+                            .wrapping_mul(u8::try_from(salt).unwrap().wrapping_add(3))
+                            .wrapping_add(second)
+                            .wrapping_add(u8::try_from(salt).unwrap());
+                        window[usize::from(column)] = byte;
+                        reordered &= buckets_at(usize::from(column), byte);
+                    }
+                    assert_eq!(
+                        u16::from(reordered),
+                        plan.candidate_buckets(&window[..columns]),
+                        "reordered intersection changed a {columns}-column bucket result",
+                    );
+                    if prefix == 0 {
+                        assert_eq!(reordered, 0, "a prefix miss cannot become a full hit");
+                    }
+                }
+            }
+        }
+        assert!(observed_depths[3] && observed_depths[4]);
+
+        let symmetric = (0_u8..8)
+            .map(|ordinal| vec![ordinal; 4])
+            .collect::<Vec<_>>();
+        let symmetric_plan = mandatory_teddy::derive_exact_prefixes(&symmetric, 4)
+            .unwrap()
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+            .unwrap();
+        assert_eq!(
+            aarch64_mandatory_teddy_sve_batch_plan(&symmetric_plan)
+                .unwrap()
+                .column_order,
+            [0, 1, 2, 3],
+            "equal pair scores must use the lexicographically first pair",
+        );
+
+        let sparse_plan = |distinct_first_bytes: u8| {
+            let literals = (0_u8..8)
+                .map(|ordinal| {
+                    vec![
+                        ordinal.wrapping_add(16),
+                        ordinal % distinct_first_bytes,
+                        ordinal.wrapping_add(64),
+                        ordinal.wrapping_add(96),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            mandatory_teddy::derive_exact_prefixes(&literals, 4)
+                .unwrap()
+                .plans()
+                .copied()
+                .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+                .unwrap()
+        };
+        for (distinct, frequency, maximum_vector_bytes) in [
+            (1_u8, 1_u16, Some(64_u16)),
+            (2, 2, Some(32)),
+            (3, 3, Some(16)),
+            (4, 4, Some(16)),
+            (5, 5, None),
+        ] {
+            let plan = sparse_plan(distinct);
+            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&plan).unwrap();
+            assert_eq!(batch_plan.column_order, [1, 0, 2, 3]);
+            assert_eq!(
+                aarch64_mandatory_teddy_sve_column_union_frequency(
+                    &plan,
+                    usize::from(batch_plan.column_order[0]),
+                )
+                .unwrap(),
+                frequency,
+            );
+            assert_eq!(
+                batch_plan.single_prefix_max_vector_bytes,
+                maximum_vector_bytes,
+                "expected-hit gate boundary for {distinct} exact bytes",
+            );
+        }
+
+        let high_weight = (0_u8..8)
+            .map(|ordinal| {
+                vec![
+                    0xc0_u8.wrapping_add(ordinal),
+                    b'e',
+                    0xc0_u8.wrapping_add((ordinal + 3) % 8),
+                    0xc0_u8.wrapping_add((ordinal + 5) % 8),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let high_weight_plan = mandatory_teddy::derive_exact_prefixes(&high_weight, 4)
+            .unwrap()
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+            .unwrap();
+        let high_weight_batch =
+            aarch64_mandatory_teddy_sve_batch_plan(&high_weight_plan).unwrap();
+        assert_eq!(
+            aarch64_mandatory_teddy_sve_column_union_frequency(
+                &high_weight_plan,
+                usize::from(high_weight_batch.column_order[0]),
+            )
+            .unwrap(),
+            estimated_byte_frequency_units(b'e'),
+        );
+        assert_eq!(high_weight_batch.single_prefix_max_vector_bytes, None);
+
+        let colliding = (0_u8..9)
+            .map(|ordinal| vec![ordinal.wrapping_mul(0x11); 4])
+            .collect::<Vec<_>>();
+        let colliding_plan = mandatory_teddy::derive_exact_prefixes(&colliding, 4)
+            .unwrap()
+            .plans()
+            .copied()
+            .find(|plan| {
+                plan.columns() == 4
+                    && plan.bank_count() == 1
+                    && plan.bucket_count() == 8
+            })
+            .unwrap();
+        let colliding_batch = aarch64_mandatory_teddy_sve_batch_plan(&colliding_plan).unwrap();
+        assert_eq!(
+            aarch64_mandatory_teddy_sve_column_union_frequency(
+                &colliding_plan,
+                usize::from(colliding_batch.column_order[0]),
+            )
+            .unwrap(),
+            29,
+            "the union model must include actual low/high nibble-table collisions",
+        );
+
+        let fat = (0_u8..9)
+            .map(|ordinal| vec![ordinal; 4])
+            .collect::<Vec<_>>();
+        let fat_plan = mandatory_teddy::derive_exact_prefixes(&fat, 4)
+            .unwrap()
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 4 && plan.bank_count() == 2)
+            .unwrap();
+        assert!(
+            aarch64_mandatory_teddy_sve_batch_plan(&fat_plan).is_err(),
+            "a bank-0 score must never order a two-bank plan",
+        );
+    }
+
+    #[test]
+    fn sve_single_prefix_codegen_is_vl_gated_and_returns_to_its_own_loop() {
+        let plan_with_distinct_first_bytes = |distinct_first_bytes: u8| {
+            let literals = (0_u8..8)
+                .map(|ordinal| {
+                    vec![
+                        ordinal.wrapping_add(16),
+                        ordinal % distinct_first_bytes,
+                        ordinal.wrapping_add(64),
+                        ordinal.wrapping_add(96),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            mandatory_teddy::derive_exact_prefixes(&literals, 4)
+                .unwrap()
+                .plans()
+                .copied()
+                .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+                .unwrap()
+        };
+        let sparse = plan_with_distinct_first_bytes(1);
+        let sparse_batch = aarch64_mandatory_teddy_sve_batch_plan(&sparse).unwrap();
+        assert_eq!(sparse_batch.column_order, [1, 0, 2, 3]);
+        assert_eq!(sparse_batch.single_prefix_max_vector_bytes, Some(64));
+
+        let words_for = |plan: MandatoryTeddyPlan, single_prefix: bool| {
+            let mut assembler = Aarch64Assembler::new();
+            let vector = assembler.label().unwrap();
+            assembler.bind(vector).unwrap();
+            let teddy = NativeMandatoryTeddyLayout {
+                plan,
+                isa: MandatoryTeddyIsa::Aarch64Sve,
+                vector_bytes: u8::try_from(AARCH64_SVE_MIN_VECTOR_BYTES).unwrap(),
+                table_base: 0,
+                nibble_mask_offset: u32::from(plan.columns()) * 32,
+                table_end: u32::from(plan.columns()) * 32,
+            };
+            aarch64_emit_mandatory_teddy_sve_batch4_candidates(
+                &mut assembler,
+                &teddy,
+                vector,
+                single_prefix,
+            )?;
+            Ok::<_, ObjectError>(
+                assembler
+                    .finish()?
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let existence = [
+            aarch64_sve_orr_z(4, 24, 25).unwrap(),
+            aarch64_sve_orr_z(5, 27, 28).unwrap(),
+            aarch64_sve_orr_z(4, 4, 5).unwrap(),
+            aarch64_sve_cmpne_zero_b(8, 4).unwrap(),
+            aarch64_sve_ptest_p0(8).unwrap(),
+        ];
+        let ordinary = words_for(sparse, false).unwrap();
+        let early = words_for(sparse, true).unwrap();
+        assert_eq!(
+            early.len(),
+            ordinary.len() + 8,
+            "the singleton candidate body adds one six-instruction survivor check and a two-instruction miss edge",
+        );
+        assert_eq!(
+            ordinary
+                .windows(existence.len())
+                .filter(|window| *window == existence)
+                .count(),
+            1,
+            "the ordinary route has only its two-column lazy check",
+        );
+        assert_eq!(
+            early
+                .windows(existence.len())
+                .filter(|window| *window == existence)
+                .count(),
+            2,
+            "the admitted route adds exactly one singleton check",
+        );
+        let first_check = early
+            .windows(existence.len())
+            .position(|window| window == existence)
+            .unwrap();
+        assert_eq!(
+            &early[..first_check],
+            sve_batch_column_schedule(sparse_batch.column_order[0], true),
+            "the first column must use the direct retained-bucket accumulator",
+        );
+        for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+            assert_eq!(
+                early[..first_check]
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_ld1b_vl(block, 12, block).unwrap())
+                    .count(),
+                1,
+                "the singleton decision must precede block {block}'s second load",
+            );
+        }
+        let survivor_branch = first_check + existence.len();
+        assert_eq!(
+            early[survivor_branch] & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_NE),
+        );
+        assert_eq!(
+            early[survivor_branch + 1],
+            aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+        );
+        assert_eq!(early[survivor_branch + 2] & 0xfc00_0000, 0x1400_0000);
+        let survivor_immediate =
+            (i32::try_from((early[survivor_branch] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+        let second_column = isize::try_from(survivor_branch)
+            .unwrap()
+            .checked_add(isize::try_from(survivor_immediate).unwrap())
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap();
+        assert_eq!(
+            second_column,
+            survivor_branch + 3,
+            "the survivor edge must target the immediately following second column",
+        );
+        let second_schedule =
+            sve_batch_column_schedule(sparse_batch.column_order[1], false);
+        assert_eq!(
+            early.get(second_column..second_column + second_schedule.len()),
+            Some(second_schedule.as_slice()),
+            "the singleton survivor must execute the selected pair's full second column",
+        );
+        let loop_immediate =
+            (i32::try_from(early[survivor_branch + 2] & 0x03ff_ffff).unwrap() << 6) >> 6;
+        assert_eq!(
+            isize::try_from(survivor_branch + 2)
+                .unwrap()
+                .checked_add(isize::try_from(loop_immediate).unwrap()),
+            Some(0),
+            "a singleton miss must return to the same early-check loop",
+        );
+
+        let dense = plan_with_distinct_first_bytes(5);
+        assert_eq!(
+            aarch64_mandatory_teddy_sve_batch_plan(&dense)
+                .unwrap()
+                .single_prefix_max_vector_bytes,
+            None,
+        );
+        assert!(
+            words_for(dense, true).is_err(),
+            "a non-material singleton must not be emitted accidentally",
+        );
+    }
+
+    #[test]
+    fn sve_single_prefix_wrapper_hoists_runtime_vl_dispatch() {
+        let pattern = sparse_single_prefix_pattern();
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let automatic = crate::compile_v2(crate::CompileRequestV2::new(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        ))
+        .expect("compile automatic sparse-prefix fixture");
+        assert!(
+            automatic
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+            "the sparse singleton route must not leak into AutomaticV1",
+        );
+
+        let forced = force_v2(&pattern, target);
+        let report_v2 = forced
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("forced sparse-prefix fixture must select Teddy");
+        assert_eq!(
+            report_v2.selection_basis,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        );
+        let report = report_v2.lowering;
+        assert!((3..=4).contains(&report.columns));
+        let maximum_vector_bytes = 16_u16;
+        let words = forced.module().sections()[TEXT_SECTION].bytes()
+            [..report.incumbent_code_offset]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let dispatch_matches = words
+            .windows(3)
+            .enumerate()
+            .filter(|(_, window)| {
+                window[0] == aarch64_sve_cntb(6).unwrap()
+                    && window[1] == aarch64_cmp_x_imm(6, maximum_vector_bytes).unwrap()
+                    && window[2] & 0xff00_001f
+                        == 0x5400_0000 | u32::from(AARCH64_LS)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispatch_matches.len(),
+            1,
+            "the runtime VL choice must be hoisted out of both batch loops",
+        );
+        let dispatch = dispatch_matches[0];
+        assert_eq!(
+            words[dispatch + 3],
+            aarch64_sub_x_reg(12, 3, 2).unwrap(),
+            "the fall-through route is the unchanged wide-vector loop",
+        );
+        let immediate =
+            (i32::try_from((words[dispatch + 2] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+        let sparse_route = isize::try_from(dispatch + 2)
+            .unwrap()
+            .checked_add(isize::try_from(immediate).unwrap())
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap();
+        assert_eq!(
+            words[sparse_route],
+            aarch64_sub_x_reg(12, 3, 2).unwrap(),
+            "the taken route is the separately emitted singleton loop",
+        );
+        assert!(sparse_route > dispatch + 3);
+        let existence = [
+            aarch64_sve_orr_z(4, 24, 25).unwrap(),
+            aarch64_sve_orr_z(5, 27, 28).unwrap(),
+            aarch64_sve_orr_z(4, 4, 5).unwrap(),
+            aarch64_sve_cmpne_zero_b(8, 4).unwrap(),
+            aarch64_sve_ptest_p0(8).unwrap(),
+        ];
+        assert_eq!(
+            words
+                .windows(existence.len())
+                .filter(|window| *window == existence)
+                .count(),
+            5,
+            "ordinary pair/final checks plus singleton pair/final checks",
+        );
+        assert_eq!(
+            words[dispatch + 3..sparse_route]
+                .windows(existence.len())
+                .filter(|window| *window == existence)
+                .count(),
+            2,
+            "the wide route must retain only pair and final existence checks",
+        );
+        assert_eq!(
+            words[sparse_route..]
+                .windows(existence.len())
+                .filter(|window| *window == existence)
+                .count(),
+            3,
+            "the admitted route must add its singleton check before pair and final checks",
+        );
+        let conditional_target = |index: usize| {
+            let immediate =
+                (i32::try_from((words[index] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            isize::try_from(index)
+                .unwrap()
+                .checked_add(isize::try_from(immediate).unwrap())
+                .and_then(|target| usize::try_from(target).ok())
+        };
+        let unconditional_target = |index: usize| {
+            let immediate = (i32::try_from(words[index] & 0x03ff_ffff).unwrap() << 6) >> 6;
+            isize::try_from(index)
+                .unwrap()
+                .checked_add(isize::try_from(immediate).unwrap())
+                .and_then(|target| usize::try_from(target).ok())
+        };
+        for (route, end, expected_checks) in [
+            (dispatch + 3, sparse_route, 2_usize),
+            (sparse_route, words.len(), 3),
+        ] {
+            let checks = words[route..end]
+                .windows(existence.len())
+                .enumerate()
+                .filter(|(_, window)| *window == existence)
+                .map(|(index, _)| route + index)
+                .collect::<Vec<_>>();
+            assert_eq!(checks.len(), expected_checks);
+            for check in checks {
+                let survivor = check + existence.len();
+                assert_eq!(
+                    words[survivor] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_NE),
+                );
+                assert!(
+                    conditional_target(survivor).is_some_and(|target| target > survivor + 2),
+                    "every survivor edge must skip its complete miss path",
+                );
+                assert_eq!(
+                    words[survivor + 1],
+                    aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                );
+                assert_eq!(
+                    unconditional_target(survivor + 2),
+                    Some(route),
+                    "every singleton/pair/final miss must return to its own loop",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sve_single_prefix_forced_wrapper_covers_three_columns_and_sve2() {
+        let pattern = sparse_single_prefix_three_column_pattern();
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+            .unwrap();
+        let forced = force_v2(&pattern, target);
+        let report = forced
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("forced three-column SVE2 fixture must select Teddy");
+        assert_eq!(
+            report.selection_basis,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        );
+        assert_eq!(report.lowering.columns, 3);
+        let words = forced.module().sections()[TEXT_SECTION].bytes()
+            [..report.lowering.incumbent_code_offset]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words
+                .windows(3)
+                .filter(|window| {
+                    window[0] == aarch64_sve_cntb(6).unwrap()
+                        && window[1] == aarch64_cmp_x_imm(6, 16).unwrap()
+                        && window[2] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(AARCH64_LS)
+                })
+                .count(),
+            1,
+            "the forced three-column SVE2 wrapper must retain one hoisted VL dispatch",
+        );
+    }
+
+    #[test]
+    fn sve_inclusive_prefix_extracts_the_exact_first_and_retried_bucket() {
+        for vector_length in (16_usize..=256).step_by(16) {
+            let buckets = (0..vector_length)
+                .map(|lane| 1_u8 << (lane % 8))
+                .collect::<Vec<_>>();
+            for active_lanes in 1..=vector_length {
+                for first in 0..active_lanes {
+                    let last = active_lanes - 1;
+                    let mut candidates = vec![false; vector_length];
+                    candidates[first] = true;
+                    candidates[last] = true;
+
+                    let extract = |candidates: &[bool]| {
+                        let selected = candidates[..active_lanes]
+                            .iter()
+                            .position(|&candidate| candidate)
+                            .expect("retained candidate");
+                        // BRKA includes every active lane through `selected`,
+                        // so LASTB reads that lane's bucket. Independently,
+                        // BRKB leaves the lanes before `selected`, allowing
+                        // INCP to advance the retained base by its lane count.
+                        let block_base = 37_usize;
+                        let candidate = block_base + selected;
+                        let inclusive_last = (0..active_lanes)
+                            .take_while(|&lane| block_base + lane < candidate + 1)
+                            .last()
+                            .expect("inclusive candidate prefix");
+                        (selected, buckets[inclusive_last])
+                    };
+
+                    assert_eq!(extract(&candidates), (first, buckets[first]));
+                    if first != last {
+                        candidates[first] = false;
+                        assert_eq!(extract(&candidates), (last, buckets[last]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sve_retained_mask_exhaustion_restores_predicate_nibble_mask_and_vl() {
         for features in [
             FeatureSet::of(CpuFeature::Aarch64Sve),
@@ -3464,9 +4519,13 @@ mod tests {
                 .expect("SVE retry rematerialization sequence");
             let consume = [
                 aarch64_add_x_imm(12, 2, 1).unwrap(),
-                aarch64_sve_whilelo_b(2, 21, 12).unwrap(),
-                aarch64_sve_not_b(2, 2).unwrap(),
-                aarch64_sve_and_b(1, 1, 2).unwrap(),
+                aarch64_sve_whilelo_b(EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH, 21, 12).unwrap(),
+                aarch64_sve_not_b(
+                    EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                    EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                )
+                .unwrap(),
+                aarch64_sve_and_b(1, 1, EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH).unwrap(),
                 aarch64_sve_ptest_p0(1).unwrap(),
             ];
             assert!(
@@ -3518,15 +4577,224 @@ mod tests {
             );
             let first_retained = [
                 aarch64_mov_x(2, 21).unwrap(),
-                aarch64_sve_brkb_p0(2, 1).unwrap(),
-                aarch64_sve_incp_b(2, 2).unwrap(),
+                aarch64_sve_brka_p0(EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH, 1).unwrap(),
+                aarch64_sve_brkb_p0(EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH, 1).unwrap(),
+                aarch64_sve_lastb_w(10, EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH, 6).unwrap(),
+                aarch64_sve_incp_b(2, EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH).unwrap(),
             ];
+            assert_eq!(
+                aarch64_sve_brka_p0(5, 1).unwrap(),
+                0x2510_4025,
+                "BRKA P5.B, P0/Z, P1.B architectural encoding",
+            );
             assert!(
                 words
                     .windows(first_retained.len())
                     .any(|window| window == first_retained),
                 "retained P1 hits must restore the block base before the first-lane helper",
             );
+        }
+    }
+
+    #[test]
+    fn sve_four_vector_batch_has_ordered_retained_blocks_and_safe_exhaustion() {
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = compile_selected(&scanner_free_exact_finite_pattern(), target);
+            let report = compiled
+                .receipt()
+                .exact_finite_selected_end_teddy_aot
+                .unwrap();
+            assert_eq!(
+                report.batch_vectors,
+                EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS,
+            );
+            let wrapper = &compiled.module().sections()[TEXT_SECTION].bytes()
+                [..report.incumbent_code_offset];
+            let words = wrapper
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+
+            assert!(words.contains(&aarch64_cmp_x_lsl(12, 6, 2).unwrap()));
+            let (_, baseline) = complete_dfa_baseline(&compiled, target);
+            let selection = select_exact_finite_selected_end_teddy(
+                compiled
+                    .program()
+                    .native_finite_selected_end_teddy_view()
+                    .unwrap(),
+                target,
+                baseline,
+            )
+            .expect("selected SVE Teddy plan");
+            assert_eq!(selection.plan.columns(), report.columns);
+            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&selection.plan).unwrap();
+            assert_eq!(
+                batch_plan.single_prefix_max_vector_bytes, None,
+                "the established dense fixture must retain one batch route",
+            );
+            let order = batch_plan.column_order;
+            let predicates = AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                .iter()
+                .enumerate()
+                .map(|(block, &buckets)| {
+                    aarch64_sve_cmpne_zero_b(u8::try_from(block).unwrap() + 1, buckets)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let existence = [
+                aarch64_sve_orr_z(4, 24, 25).unwrap(),
+                aarch64_sve_orr_z(5, 27, 28).unwrap(),
+                aarch64_sve_orr_z(4, 4, 5).unwrap(),
+                aarch64_sve_cmpne_zero_b(8, 4).unwrap(),
+                aarch64_sve_ptest_p0(8).unwrap(),
+            ];
+
+            let mut prefix = sve_batch_column_schedule(order[0], true);
+            prefix.extend(sve_batch_column_schedule(order[1], false));
+            prefix.extend_from_slice(&existence);
+            let prefix_at = words
+                .windows(prefix.len())
+                .position(|window| window == prefix)
+                .expect("selective two-column SVE batch prefix");
+            let prefix_branch = prefix_at + prefix.len();
+            assert_eq!(
+                words[prefix_branch] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_NE),
+                "only a surviving two-column prefix may enter the lazy suffix",
+            );
+            assert_eq!(
+                words[prefix_branch + 1],
+                aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                "an empty prefix must fall through to the four-VL advance",
+            );
+            assert_eq!(
+                words[prefix_branch + 2] & 0xfc00_0000,
+                0x1400_0000,
+                "the prefix-miss advance must immediately return to the vector loop",
+            );
+
+            let suffix_at = prefix_branch + 3;
+            let prefix_immediate =
+                (i32::try_from((words[prefix_branch] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            assert_eq!(
+                isize::try_from(prefix_branch)
+                    .unwrap()
+                    .checked_add(isize::try_from(prefix_immediate).unwrap())
+                    .unwrap(),
+                isize::try_from(suffix_at).unwrap(),
+                "the prefix-hit branch must target the first lazy suffix instruction",
+            );
+            let mut suffix = Vec::new();
+            for (index, &column) in order[2..usize::from(report.columns)].iter().enumerate() {
+                suffix.extend(sve_batch_column_schedule(column, false));
+                assert!(index < 2, "at most two lazy columns");
+            }
+            suffix.extend_from_slice(&existence);
+            assert_eq!(
+                words.get(suffix_at..suffix_at + suffix.len()),
+                Some(suffix.as_slice()),
+                "prefix hits must finish the exact column-outer schedule: {target:?}",
+            );
+            for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+                let load = aarch64_sve_ld1b_vl(block, 12, block).unwrap();
+                assert!(
+                    words.iter().filter(|&&word| word == load).count()
+                        >= usize::from(report.columns),
+                    "every column must load batch block {block}: {target:?}",
+                );
+                let buckets = AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                    [usize::from(block)];
+                assert!(
+                    words
+                        .iter()
+                        .filter(|&&word| {
+                            word == aarch64_sve_cmpne_zero_b(block + 1, buckets).unwrap()
+                        })
+                        .count()
+                        >= 1,
+                    "a hit must publish retained P{} exactly from its bucket vector: {target:?}",
+                    block + 1,
+                );
+            }
+
+            let reduction_at = suffix_at + suffix.len();
+            assert_eq!(
+                words[reduction_at] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_NE),
+            );
+            assert_eq!(
+                words[reduction_at + 1],
+                aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                "a complete full-miss batch advances by exactly four VLs",
+            );
+            assert_eq!(
+                words.get(reduction_at + 3..reduction_at + 3 + predicates.len()),
+                Some(predicates.as_slice()),
+                "durable predicates must be materialized only on the hit edge",
+            );
+
+            let mut probe_at = reduction_at + 3 + predicates.len();
+            for predicate in 1..=EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+                let relative = words[probe_at..]
+                    .iter()
+                    .position(|&word| word == aarch64_sve_ptest_p0(predicate).unwrap())
+                    .unwrap_or_else(|| panic!("ordered probe P{predicate}: {target:?}"));
+                probe_at += relative;
+                assert_eq!(
+                    words[probe_at + 1] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_NE),
+                    "ordered probe P{predicate} must branch to its block",
+                );
+                probe_at += 2;
+            }
+
+            for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
+                let predicate = block + 1;
+                let mut hit = Vec::new();
+                hit.push(if block == 0 {
+                    aarch64_mov_x(21, 2).unwrap()
+                } else {
+                    aarch64_sve_addvl(21, 2, block).unwrap()
+                });
+                hit.push(aarch64_movz_w(7, u16::from(block + 1)).unwrap());
+                if predicate != 1 {
+                    hit.push(aarch64_sve_orr_b(1, predicate, predicate).unwrap());
+                }
+                let buckets = AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+                    [usize::from(block)];
+                hit.extend([
+                    aarch64_sve_and_z(6, buckets, buckets).unwrap(),
+                    aarch64_mov_x(2, 21).unwrap(),
+                    aarch64_sve_brka_p0(EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH, 1).unwrap(),
+                    aarch64_sve_brkb_p0(EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH, 1).unwrap(),
+                    aarch64_sve_lastb_w(10, EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH, 6).unwrap(),
+                    aarch64_sve_incp_b(2, EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH).unwrap(),
+                ]);
+                assert!(
+                    words.windows(hit.len()).any(|window| window == hit),
+                    "batch block {block} must preserve its base, mask, and next-block state: {target:?}",
+                );
+            }
+
+            for (next_state, predicate) in [(2_u16, 2_u8), (3, 3), (4, 4)] {
+                let exhaustion = [
+                    aarch64_sve_addvl(21, 21, 1).unwrap(),
+                    aarch64_movz_w(7, next_state).unwrap(),
+                    aarch64_sve_ptest_p0(predicate).unwrap(),
+                ];
+                assert!(
+                    words
+                        .windows(exhaustion.len() + 1)
+                        .any(|window| window[..exhaustion.len()] == exhaustion
+                            && window[exhaustion.len()] & 0xff00_001f
+                                == 0x5400_0000 | u32::from(AARCH64_NE)),
+                    "chosen-block exhaustion must test retained P{predicate}: {target:?}",
+                );
+            }
         }
     }
 
@@ -3629,9 +4897,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let consume = [
                 aarch64_add_x_imm(12, 2, 1).unwrap(),
-                aarch64_sve_whilelo_b(2, 21, 12).unwrap(),
-                aarch64_sve_not_b(2, 2).unwrap(),
-                aarch64_sve_and_b(1, 1, 2).unwrap(),
+                aarch64_sve_whilelo_b(EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH, 21, 12).unwrap(),
+                aarch64_sve_not_b(
+                    EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                    EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH,
+                )
+                .unwrap(),
+                aarch64_sve_and_b(1, 1, EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH).unwrap(),
                 aarch64_sve_ptest_p0(1).unwrap(),
             ];
             assert!(
@@ -4078,6 +5350,29 @@ mod tests {
             Ok(false),
         );
 
+        let sve_target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let sve_compiled = compile_selected(&scanner_free_exact_finite_pattern(), sve_target);
+        let sve_report = sve_compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .unwrap();
+        let sve_data = sve_compiled.module().sections()[PROGRAM_SECTION].bytes();
+        assert_eq!(
+            sve_report.batch_vectors,
+            EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS,
+        );
+        let mut changed_report = sve_report;
+        changed_report.batch_vectors = EXACT_FINITE_TEDDY_UNBATCHED_VECTORS;
+        changed_report.prefix_plan_sha256 =
+            report_plan_digest(&changed_report, sve_data).unwrap();
+        assert_eq!(
+            report_costs_authenticate(&changed_report, sve_data, sve_target),
+            Ok(false),
+            "a coherently rehashed batch-width mutation must fail strict receipt authentication",
+        );
+
         let mut changed = data.to_vec();
         changed[usize::try_from(report.literal_descriptors_offset).unwrap()] ^= 1;
         assert!(!verifier_data_authenticates(&report, &changed).unwrap());
@@ -4136,7 +5431,7 @@ mod tests {
         let Some(target) = linked_host_target() else {
             return;
         };
-        let mut cases = Vec::<(String, Vec<(Vec<u8>, usize, usize)>)>::new();
+        let mut cases = Vec::<(String, Vec<(Vec<u8>, usize, usize)>, bool)>::new();
         for long_first in [false, true] {
             let mut order_long = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
             order_long[83..90].fill(0xaa);
@@ -4152,6 +5447,7 @@ mod tests {
                         EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 64,
                     ),
                 ],
+                false,
             ));
         }
 
@@ -4224,6 +5520,7 @@ mod tests {
                 (collision_budget_negative, 19, collision_budget_len),
                 (collision_budget_positive, 19, collision_budget_len),
             ],
+            false,
         ));
 
         let mut binary_eof = vec![0x7e; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 73];
@@ -4234,6 +5531,40 @@ mod tests {
             .expect("collision case")
             .1
             .push((binary_eof, 23, binary_len));
+
+        let sparse_pattern = sparse_single_prefix_pattern();
+        let sparse_literals = sparse_single_prefix_literals();
+        let singleton_miss = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+        let singleton_miss_len = singleton_miss.len();
+        let mut pair_miss = singleton_miss.clone();
+        for base in (64..192).step_by(8) {
+            pair_miss[base + 1] = 0;
+        }
+        let pair_miss_len = pair_miss.len();
+        let mut direct_hit = singleton_miss.clone();
+        direct_hit[96..96 + sparse_literals[0].len()].copy_from_slice(&sparse_literals[0]);
+        let direct_hit_len = direct_hit.len();
+        let mut retry_then_hit = singleton_miss.clone();
+        retry_then_hit[64..68].copy_from_slice(&sparse_literals[1][..4]);
+        retry_then_hit[68] = sparse_literals[1][4] ^ 0xff;
+        retry_then_hit[144..144 + sparse_literals[2].len()]
+            .copy_from_slice(&sparse_literals[2]);
+        let retry_then_hit_len = retry_then_hit.len();
+        let mut tail_hit = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 73];
+        let tail_base = tail_hit.len() - sparse_literals[3].len();
+        tail_hit[tail_base..].copy_from_slice(&sparse_literals[3]);
+        let tail_hit_len = tail_hit.len();
+        cases.push((
+            sparse_pattern,
+            vec![
+                (singleton_miss, 17, singleton_miss_len),
+                (pair_miss, 17, pair_miss_len),
+                (direct_hit, 17, direct_hit_len),
+                (retry_then_hit, 17, retry_then_hit_len),
+                (tail_hit, 17, tail_hit_len),
+            ],
+            true,
+        ));
 
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4247,22 +5578,51 @@ mod tests {
         let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
         let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
         let mut objects = Vec::new();
-        for (artifact, (pattern, windows)) in cases.iter().enumerate() {
-            let compiled = compile_selected(pattern, target);
+        for (artifact, (pattern, windows, forced_v2)) in cases.iter().enumerate() {
+            if *forced_v2
+                && let Ok(expected) = std::env::var("FRE_EXPECT_SVE_VECTOR_LENGTH_BYTES")
+            {
+                let actual = fs::read_to_string("/proc/sys/abi/sve_default_vector_length")
+                    .expect("read the requested Linux SVE vector length")
+                    .trim()
+                    .parse::<u16>()
+                    .expect("parse the requested Linux SVE vector length");
+                assert_eq!(actual, expected.parse::<u16>().unwrap());
+            }
+            let (symbol, object_bytes) = if *forced_v2 {
+                let compiled = force_v2(pattern, target);
+                let report = compiled
+                    .receipt_v2()
+                    .exact_finite_selected_end_teddy_aot
+                    .expect("forced sparse differential must select Teddy");
+                assert_eq!(
+                    report.selection_basis,
+                    ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+                );
+                (
+                    compiled.module().entry_symbol().to_owned(),
+                    compiled.object().to_vec(),
+                )
+            } else {
+                let compiled = compile_selected(pattern, target);
+                (
+                    compiled.module().entry_symbol().to_owned(),
+                    compiled.object().to_vec(),
+                )
+            };
             let reference = compile(
                 CompileRequest::new(pattern, target)
                     .mode(CompileMode::Fast)
                     .output(OutputContract::SelectedEnd),
             )
             .unwrap();
-            let symbol = compiled.module().entry_symbol();
             writeln!(
                 source,
                 "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);",
             )
             .unwrap();
             let object = directory.join(format!("case{artifact}.o"));
-            fs::write(&object, compiled.object()).unwrap();
+            fs::write(&object, object_bytes).unwrap();
             objects.push(object);
             for (window_index, (haystack, start, end)) in windows.iter().enumerate() {
                 let bytes = haystack

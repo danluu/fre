@@ -39,13 +39,13 @@ use crate::{AuthenticatedSuite, CaseSpec, HoldoutError, TimingPolicy, authentica
 
 /// Clock-free schema for the explicit V2 policy comparison.
 pub const AOT_SELECTED_END_V2_CORRECTNESS_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.correctness.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.correctness.v2";
 /// Non-normative hot timing schema for the explicit V2 policy comparison.
 pub const AOT_SELECTED_END_V2_PERFORMANCE_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.performance.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.performance.v2";
 const V2_POLICY_ARTIFACT_BINDING_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.artifact-binding.v1";
-const V2_ELIGIBILITY_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.eligibility.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.artifact-binding.v2";
+const V2_ELIGIBILITY_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.eligibility.v2";
 const V2_SCHEDULE_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.schedule.v1";
 const V2_OBSERVATION_BUDGET_SCHEMA: &str =
     "fre.holdout.aot-selected-end-v2-comparison.observation-budget.v1";
@@ -127,6 +127,7 @@ pub struct AotSelectedEndV2RouteEvidence {
     pub source_bytes: usize,
     pub minimum_width: u32,
     pub maximum_width: u32,
+    pub batch_vectors: u8,
     pub runtime_verification_budget: u16,
 }
 
@@ -817,6 +818,7 @@ fn v2_supplemental_evidence(
                 source_bytes: report.lowering.source_bytes,
                 minimum_width: report.lowering.minimum_width,
                 maximum_width: report.lowering.maximum_width,
+                batch_vectors: report.lowering.batch_vectors,
                 runtime_verification_budget: report.lowering.runtime_verification_budget,
             })
         })

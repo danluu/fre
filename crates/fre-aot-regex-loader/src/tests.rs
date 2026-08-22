@@ -477,6 +477,14 @@ fn exact_teddy_retained_masks_match_portable_in_process_at_guarded_boundaries() 
         .exact_finite_selected_end_teddy_aot
         .expect("host target must select exact finite SelectedEnd Teddy");
     assert_eq!(report.runtime_verification_budget, 64);
+    assert_eq!(
+        report.batch_vectors,
+        if report.emitted_isa == ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve {
+            4
+        } else {
+            1
+        },
+    );
     let plan = Plan::derive(&literals, report);
     assert_eq!(plan.candidate_buckets(&[SEPARATOR; 4]), 0);
 
@@ -580,6 +588,152 @@ fn exact_teddy_retained_masks_match_portable_in_process_at_guarded_boundaries() 
         ),
     };
     let (&false_weight, false_prefix) = candidates.first_key_value().unwrap();
+
+    // Exercise the same four-vector geometry on every local backend. On SVE
+    // this enters the retained P1..P4 batch; ASIMD/x86 provide unchanged
+    // native controls for the exact same guarded windows.
+    {
+        let batch_start = 53;
+        let batch_end = batch_start + report.input_floor_bytes + 4 * vector_bytes + 97;
+        for block in 0..4 {
+            let mut haystack = vec![SEPARATOR; batch_end];
+            let match_base = batch_start + block * vector_bytes + 2;
+            haystack[match_base..match_base + literals[0].len()]
+                .copy_from_slice(&literals[0]);
+            let window = SearchWindow::new(batch_start, batch_end);
+            let (_, bases, selected_end) = trace(&plan, &literals, &haystack, window);
+            assert_eq!(bases.first(), Some(&match_base), "batch block {block}");
+            assert_eq!(
+                selected_end,
+                Some(match_base + literals[0].len()),
+                "batch block {block}",
+            );
+            cases.push((
+                format!("four-vector-hit-block-{block}"),
+                haystack,
+                window,
+            ));
+        }
+
+        let mut competing = vec![SEPARATOR; batch_end];
+        let earlier_base = batch_start + 3;
+        let later_base = batch_start + 2 * vector_bytes + 5;
+        competing[earlier_base..earlier_base + literals[8].len()]
+            .copy_from_slice(&literals[8]);
+        competing[later_base..later_base + literals[0].len()]
+            .copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(batch_start, batch_end);
+        let (_, bases, selected_end) = trace(&plan, &literals, &competing, window);
+        assert_eq!(bases.first(), Some(&earlier_base));
+        assert_eq!(selected_end, Some(earlier_base + literals[8].len()));
+        cases.push((
+            "competing-multi-block-hits-use-earliest-base".to_owned(),
+            competing,
+            window,
+        ));
+
+        let mut false_to_later = vec![SEPARATOR; batch_end];
+        let false_base = batch_start + COLLISION_OFFSET;
+        let match_base = batch_start + 2 * vector_bytes + 3;
+        false_to_later[false_base..false_base + plan.columns].copy_from_slice(false_prefix);
+        false_to_later[match_base..match_base + literals[0].len()]
+            .copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(batch_start, batch_end);
+        let (failures, bases, selected_end) =
+            trace(&plan, &literals, &false_to_later, window);
+        assert_eq!(failures, false_weight);
+        assert_eq!(bases.first(), Some(&false_base));
+        assert_eq!(selected_end, Some(match_base + literals[0].len()));
+        cases.push((
+            "false-block-zero-to-later-match".to_owned(),
+            false_to_later,
+            window,
+        ));
+
+        let mut skip_empty = vec![SEPARATOR; batch_end];
+        let false_base = batch_start + vector_bytes + COLLISION_OFFSET;
+        let match_base = batch_start + 3 * vector_bytes + 3;
+        skip_empty[false_base..false_base + plan.columns].copy_from_slice(false_prefix);
+        skip_empty[match_base..match_base + literals[0].len()]
+            .copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(batch_start, batch_end);
+        let (failures, bases, selected_end) = trace(&plan, &literals, &skip_empty, window);
+        assert_eq!(failures, false_weight);
+        assert_eq!(bases.first(), Some(&false_base));
+        assert_eq!(selected_end, Some(match_base + literals[0].len()));
+        cases.push((
+            "chosen-block-exhaustion-skips-empty-block".to_owned(),
+            skip_empty,
+            window,
+        ));
+
+        let mut all_false = vec![SEPARATOR; batch_end];
+        let false_bases = (0..4)
+            .map(|block| batch_start + block * vector_bytes + COLLISION_OFFSET)
+            .collect::<Vec<_>>();
+        for &base in &false_bases {
+            all_false[base..base + plan.columns].copy_from_slice(false_prefix);
+        }
+        let window = SearchWindow::new(batch_start, batch_end);
+        let (failures, bases, selected_end) = trace(&plan, &literals, &all_false, window);
+        assert_eq!(failures, false_weight * false_bases.len());
+        assert_eq!(bases, false_bases);
+        assert_eq!(selected_end, None);
+        cases.push((
+            "all-four-vector-blocks-are-false".to_owned(),
+            all_false,
+            window,
+        ));
+
+        let all_miss = vec![SEPARATOR; batch_end];
+        let window = SearchWindow::new(batch_start, batch_end);
+        assert_eq!(
+            trace(&plan, &literals, &all_miss, window),
+            (0, Vec::new(), None),
+        );
+        cases.push((
+            "four-vector-full-miss".to_owned(),
+            all_miss,
+            window,
+        ));
+
+        let partial_lanes = (literals[0].len() + 2)
+            .max(plan.columns)
+            .min(vector_bytes - 1);
+        let mut window_bytes = report.input_floor_bytes.max(4 * vector_bytes + plan.columns);
+        while {
+            let candidate_count = window_bytes - plan.columns + 1;
+            candidate_count / vector_bytes < 4
+                || !(candidate_count / vector_bytes).is_multiple_of(4)
+                || candidate_count % vector_bytes != partial_lanes
+        } {
+            window_bytes += 1;
+        }
+        let start = 47;
+        let end = start + window_bytes;
+        let candidate_count = window_bytes - plan.columns + 1;
+        let full_vectors = candidate_count / vector_bytes;
+        let last_batch_base = start + (full_vectors - 4) * vector_bytes;
+        let false_base = last_batch_base + 3 * vector_bytes + COLLISION_OFFSET;
+        let match_base = end - literals[0].len();
+        assert!(match_base >= start + full_vectors * vector_bytes);
+        let mut last_block_to_partial = vec![SEPARATOR; end];
+        last_block_to_partial[false_base..false_base + plan.columns]
+            .copy_from_slice(false_prefix);
+        last_block_to_partial[match_base..end].copy_from_slice(&literals[0]);
+        let window = SearchWindow::new(start, end);
+        let (failures, bases, selected_end) =
+            trace(&plan, &literals, &last_block_to_partial, window);
+        assert_eq!(failures, false_weight);
+        assert_eq!(bases.first(), Some(&false_base));
+        assert_eq!(selected_end, Some(end));
+        cases.push((
+            "last-vector-block-exhaustion-to-partial-eof".to_owned(),
+            last_block_to_partial,
+            window,
+        ));
+    }
+
     let start = 29;
     let end = start + report.input_floor_bytes + 257;
     let mut same_vector = vec![SEPARATOR; end];
@@ -1647,6 +1801,14 @@ mod exact_finite_selected_end_teddy_linux_aarch64_qualification {
         assert_eq!(report.selected_target_tier, expected_tier);
         assert_eq!(report.emitted_isa, expected_isa);
         assert_eq!(report.guaranteed_vector_bytes, 16);
+        assert_eq!(
+            report.batch_vectors,
+            if expected_isa == ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve {
+                4
+            } else {
+                1
+            },
+        );
         let expected_scanner = match expected_isa {
             ExactFiniteSelectedEndTeddyAotIsa::X86Avx2 => StartAccelerator::X86Avx2,
             ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd => StartAccelerator::Aarch64Asimd,
