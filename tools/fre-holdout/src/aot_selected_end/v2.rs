@@ -39,13 +39,13 @@ use crate::{AuthenticatedSuite, CaseSpec, HoldoutError, TimingPolicy, authentica
 
 /// Clock-free schema for the explicit V2 policy comparison.
 pub const AOT_SELECTED_END_V2_CORRECTNESS_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.correctness.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.correctness.v2";
 /// Non-normative hot timing schema for the explicit V2 policy comparison.
 pub const AOT_SELECTED_END_V2_PERFORMANCE_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.performance.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.performance.v2";
 const V2_POLICY_ARTIFACT_BINDING_SCHEMA: &str =
-    "fre.holdout.aot-selected-end-v2-comparison.artifact-binding.v1";
-const V2_ELIGIBILITY_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.eligibility.v1";
+    "fre.holdout.aot-selected-end-v2-comparison.artifact-binding.v2";
+const V2_ELIGIBILITY_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.eligibility.v2";
 const V2_SCHEDULE_SCHEMA: &str = "fre.holdout.aot-selected-end-v2-comparison.schedule.v1";
 const V2_OBSERVATION_BUDGET_SCHEMA: &str =
     "fre.holdout.aot-selected-end-v2-comparison.observation-budget.v1";
