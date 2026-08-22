@@ -890,7 +890,8 @@ use fre_kernels::{
     LiteralSetError, LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan,
     LiteralSetSearchLimits, PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-    PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
+    PackedLiteralSetOrdinaryExecutor, PackedLiteralSetRetainedIterBuildAccounting,
+    PackedLiteralSetSearchLimits,
     RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
     RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
@@ -10715,6 +10716,11 @@ impl PortableRegex {
                     ),
                 }
             }
+            PortablePlan::PackedLiteralSet(packed) => {
+                PortableOrdinarySessionPlan::PackedLiteralSet {
+                    executor: packed.ordinary_executor(),
+                }
+            }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 if let Some(executor) = literal_set.ordinary_executor() {
                     PortableOrdinarySessionPlan::LiteralSetDfa { executor }
@@ -14062,6 +14068,9 @@ enum PortableOrdinarySessionPlan<'a> {
     RequiredLiteral {
         projection: PortableOrdinaryRequiredLiteral<'a>,
         canonical: Box<PortableSearchSession<'a>>,
+    },
+    PackedLiteralSet {
+        executor: PackedLiteralSetOrdinaryExecutor<'a>,
     },
     LiteralSetDfa {
         executor: LiteralSetOrdinaryExecutor<'a>,
@@ -19532,6 +19541,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 required_literal_ordinary_session_probe::record();
                 projection.is_match_at(haystack, start)
             }
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
+                .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
@@ -19569,6 +19581,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 required_literal_ordinary_session_probe::record_endpoint();
                 projection.first_acceptance_at(haystack, start)
             }
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
+                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
@@ -19626,6 +19641,10 @@ impl<'r> PortableOrdinarySession<'r> {
             | PortableOrdinarySessionPlan::Canonical(session) => {
                 session.find_at_value(haystack, start, SearchLimits::unlimited())
             }
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
+                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
@@ -19727,6 +19746,16 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Ok(()))
             }
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => {
+                let mut visitor = visitor;
+                executor.try_visit_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    |(start, end)| visitor(Match { start, end }),
+                )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search)
+            }
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => {
                 try_visit_ordinary_spans_at(
                     haystack.len(),
@@ -19772,32 +19801,41 @@ impl<'r> PortableOrdinarySession<'r> {
         haystack: &[u8],
         start: usize,
     ) -> Result<Option<u64>, SearchError> {
-        let PortableOrdinarySessionPlan::K0 { executor, positive: true } =
-            &mut self.plan
-        else {
-            return Ok(None);
-        };
-
-        let mut cursor = start;
-        let mut count = 0_u64;
-        loop {
-            let Some(selected_end) = executor
-                .selected_end_at(haystack, cursor)
-                .map_err(SearchError::from)?
-            else {
-                return Ok(Some(count));
-            };
-            if selected_end <= cursor {
-                return Err(SearchError::K0(K0SearchError::InternalInvariant {
-                    detail: "positive-width selected-end iteration failed to advance",
-                }));
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::K0 {
+                executor,
+                positive: true,
+            } => {
+                let mut cursor = start;
+                let mut count = 0_u64;
+                loop {
+                    let Some(selected_end) = executor
+                        .selected_end_at(haystack, cursor)
+                        .map_err(SearchError::from)?
+                    else {
+                        return Ok(Some(count));
+                    };
+                    if selected_end <= cursor {
+                        return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                            detail: "positive-width selected-end iteration failed to advance",
+                        }));
+                    }
+                    cursor = selected_end;
+                    count = count.checked_add(1).ok_or(SearchError::K0(
+                        K0SearchError::ArithmeticOverflow {
+                            computation: "positive-width selected-end match count",
+                        },
+                    ))?;
+                }
             }
-            cursor = selected_end;
-            count = count.checked_add(1).ok_or(SearchError::K0(
-                K0SearchError::ArithmeticOverflow {
-                    computation: "positive-width selected-end match count",
-                },
-            ))?;
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
+                .count_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                )
+                .map(Some)
+                .map_err(SearchError::from),
+            _ => Ok(None),
         }
     }
 }

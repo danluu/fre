@@ -884,6 +884,16 @@ pub struct PackedLiteralSetPlan {
     verification_bytes_per_position: usize,
 }
 
+/// Borrowed engine for ordinary unlimited packed literal-set searches.
+///
+/// Construction already sealed nonempty ordered literals and the selected
+/// immutable engine. This projection therefore validates only source windows
+/// and never computes finite-work or diagnostic accounting.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedLiteralSetOrdinaryExecutor<'a> {
+    plan: &'a PackedLiteralSetPlan,
+}
+
 /// Allocation-free cursor over a packed literal set's retained dual engine.
 ///
 /// This cursor exists only when construction admitted both the selected
@@ -1085,6 +1095,13 @@ impl PackedLiteralSetPlan {
         }
     }
 
+    /// Bind the direct ordinary-search engine to this immutable plan.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn ordinary_executor(&self) -> PackedLiteralSetOrdinaryExecutor<'_> {
+        PackedLiteralSetOrdinaryExecutor { plan: self }
+    }
+
     /// Return an allocation-free adaptive cursor when both uniform and native
     /// packed engines were admitted during construction.
     #[cfg(not(feature = "static-dispatch"))]
@@ -1180,6 +1197,56 @@ impl PackedLiteralSetPlan {
         limits: PackedLiteralSetSearchLimits,
     ) -> Result<(Option<(usize, usize)>, PackedLiteralSetAccounting), PackedLiteralSetError> {
         self.find_window_with_native(haystack, window, limits, None)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
+    fn find_window_value_unmetered_with_native(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        iterator_native: Option<&Searcher>,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let window_bytes = &haystack[window.start()..window.end()];
+        let matched = if let Some(native) = iterator_native {
+            native
+                .find(window_bytes)
+                .map(|matched| (matched.start(), matched.end()))
+        } else {
+            match &self.engine {
+                #[cfg(not(feature = "static-dispatch"))]
+                PackedLiteralEngine::UniformWord64(uniform) => uniform.find(window_bytes),
+                #[cfg(not(feature = "static-dispatch"))]
+                PackedLiteralEngine::UniformWord64Retained { uniform, .. } => {
+                    uniform.find(window_bytes)
+                }
+                PackedLiteralEngine::Native(searcher) => searcher
+                    .find(window_bytes)
+                    .map(|matched| (matched.start(), matched.end())),
+                PackedLiteralEngine::NativeSparse {
+                    searcher,
+                    sparse_anchor,
+                } => find_native(searcher, sparse_anchor, window_bytes),
+                PackedLiteralEngine::NativeSharedFragment {
+                    searcher,
+                    shared_fragment,
+                } => find_native_shared_fragment(searcher, shared_fragment, window_bytes),
+                PackedLiteralEngine::NativeSharedColumns {
+                    searcher,
+                    shared_columns,
+                } => find_native_shared_columns(searcher, shared_columns, window_bytes),
+                PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
+            }
+        };
+        Ok(matched.map(|(relative_start, relative_end)| {
+            (
+                window.start() + relative_start,
+                window.start() + relative_end,
+            )
+        }))
     }
 
     #[allow(
@@ -1325,6 +1392,148 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
     ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
         self.find_at(start, limits).map(|(matched, _)| matched)
     }
+
+    /// Search at `start` without finite-work or diagnostic accounting.
+    #[doc(hidden)]
+    pub fn find_at_value_unmetered(
+        &mut self,
+        start: usize,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        if self.last_start.is_some_and(|previous| start < previous) {
+            self.close_matches = 0;
+            self.dense = false;
+        }
+        self.last_start = Some(start);
+        let remaining = self.haystack.len().saturating_sub(start);
+        let use_uniform = self.dense && remaining >= RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
+        let matched = self.plan.find_window_value_unmetered_with_native(
+            self.haystack,
+            Window::new(start, self.haystack.len()),
+            (!use_uniform).then_some(self.native),
+        )?;
+        if let Some((matched_start, _)) = matched {
+            let gap = matched_start.saturating_sub(start);
+            if gap <= RETAINED_ITER_DENSE_GAP_BYTES {
+                self.close_matches = self.close_matches.saturating_add(1);
+                self.dense = self.close_matches >= RETAINED_ITER_DENSE_MATCHES;
+            } else {
+                self.close_matches = 0;
+                self.dense = false;
+            }
+        }
+        Ok(matched)
+    }
+}
+
+impl PackedLiteralSetOrdinaryExecutor<'_> {
+    /// Return the selected ordered span wholly inside `window` without
+    /// finite-work or diagnostic accounting.
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        self.plan
+            .find_window_value_unmetered_with_native(haystack, window, None)
+    }
+
+    /// Return whether a selected ordered span exists inside `window`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn exists_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<bool, PackedLiteralSetError> {
+        self.find_window_value(haystack, window)
+            .map(|matched| matched.is_some())
+    }
+
+    /// Return only the selected ordered span's endpoint inside `window`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<usize>, PackedLiteralSetError> {
+        self.find_window_value(haystack, window)
+            .map(|matched| matched.map(|(_, end)| end))
+    }
+
+    /// Visit non-overlapping positive-width spans without finite accounting.
+    #[doc(hidden)]
+    pub fn try_visit_spans_window_value<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, PackedLiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        validate_window(window, haystack.len())?;
+        #[cfg(not(feature = "static-dispatch"))]
+        let mut retained = self.plan.search_cursor(&haystack[..window.end()]);
+        let mut start = window.start();
+        loop {
+            #[cfg(not(feature = "static-dispatch"))]
+            let matched = if let Some(cursor) = retained.as_mut() {
+                cursor.find_at_value_unmetered(start)?
+            } else {
+                self.find_window_value(haystack, Window::new(start, window.end()))?
+            };
+            #[cfg(feature = "static-dispatch")]
+            let matched =
+                self.find_window_value(haystack, Window::new(start, window.end()))?;
+            let Some(matched) = matched else {
+                return Ok(Ok(()));
+            };
+            if matched.1 <= start {
+                return Err(PackedLiteralSetError::ArithmeticOverflow {
+                    computation: "packed ordinary positive-width iterator progress",
+                });
+            }
+            start = matched.1;
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+
+    /// Count non-overlapping positive-width selected spans without accounting.
+    #[doc(hidden)]
+    pub fn count_spans_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<u64, PackedLiteralSetError> {
+        let mut count = 0_u64;
+        self.try_visit_spans_window_value(haystack, window, |_| {
+            count = count
+                .checked_add(1)
+                .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                    computation: "packed ordinary match count",
+                })?;
+            Ok::<bool, PackedLiteralSetError>(true)
+        })??;
+        Ok(count)
+    }
+}
+
+fn validate_window(window: Window, haystack_len: usize) -> Result<(), PackedLiteralSetError> {
+    if window.start() > window.end() || window.end() > haystack_len {
+        return Err(PackedLiteralSetError::InvalidWindow {
+            start: window.start(),
+            end: window.end(),
+            haystack_len,
+        });
+    }
+    Ok(())
 }
 
 #[inline]
@@ -3795,6 +4004,148 @@ mod tests {
         assert_eq!(
             over_plan.runtime_implementation_id(),
             RUNTIME_IMPLEMENTATION_ID
+        );
+    }
+
+    #[test]
+    fn ordinary_executor_matches_checked_windows_and_skips_work_refusal() {
+        let patterns = [
+            b"foobar".as_slice(),
+            b"foobaz".as_slice(),
+            b"fooquux".as_slice(),
+        ];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let ordinary = plan.ordinary_executor();
+        let haystack = b"xxfoobaz/foobar/no-match";
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected = plan
+                    .find_window(
+                        haystack,
+                        window,
+                        PackedLiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(ordinary.find_window_value(haystack, window), Ok(expected));
+                assert_eq!(
+                    ordinary.exists_window_value(haystack, window),
+                    Ok(expected.is_some()),
+                );
+                assert_eq!(
+                    ordinary.selected_end_window_value(haystack, window),
+                    Ok(expected.map(|(_, end)| end)),
+                );
+            }
+        }
+        let full = Window::full(haystack);
+        assert!(matches!(
+            plan.find_window(
+                haystack,
+                full,
+                PackedLiteralSetSearchLimits { max_work: 0 },
+            ),
+            Err(PackedLiteralSetError::WorkLimit { .. }),
+        ));
+        assert_eq!(ordinary.find_window_value(haystack, full), Ok(Some((2, 8))));
+        for window in [
+            Window::new(haystack.len() + 1, haystack.len()),
+            Window::new(0, haystack.len() + 1),
+        ] {
+            assert!(matches!(
+                ordinary.find_window_value(haystack, window),
+                Err(PackedLiteralSetError::InvalidWindow { .. }),
+            ));
+            assert!(matches!(
+                ordinary.exists_window_value(haystack, window),
+                Err(PackedLiteralSetError::InvalidWindow { .. }),
+            ));
+            assert!(matches!(
+                ordinary.selected_end_window_value(haystack, window),
+                Err(PackedLiteralSetError::InvalidWindow { .. }),
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn ordinary_executor_retains_adaptive_iteration_and_checked_count() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let plan = PackedLiteralSetPlan::new_retained_iter(
+            &patterns,
+            PackedLiteralSetBuildLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(plan.search_cursor(b"").is_some());
+        let ordinary = plan.ordinary_executor();
+        let mut haystack = vec![0xff; 256];
+        haystack[0..8].copy_from_slice(patterns[0]);
+        haystack[8..16].copy_from_slice(patterns[0]);
+        haystack[16..24].copy_from_slice(patterns[1]);
+        haystack[80..88].copy_from_slice(patterns[0]);
+
+        let mut expected = Vec::new();
+        let mut start = 0_usize;
+        while let Some(matched) = plan
+            .find_window(
+                &haystack,
+                Window::new(start, haystack.len()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0
+        {
+            expected.push(matched);
+            start = matched.1;
+        }
+        let mut actual = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans_window_value(
+                    &haystack,
+                    Window::full(&haystack),
+                    |matched| {
+                        actual.push(matched);
+                        Ok::<bool, ()>(true)
+                    },
+                )
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(
+            ordinary.count_spans_window_value(&haystack, Window::full(&haystack)),
+            Ok(u64::try_from(expected.len()).unwrap()),
+        );
+
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans_window_value(
+                    &haystack,
+                    Window::full(&haystack),
+                    |matched| {
+                        stopped.push(matched);
+                        Ok::<bool, &'static str>(false)
+                    },
+                )
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(
+            ordinary
+                .try_visit_spans_window_value(
+                    &haystack,
+                    Window::full(&haystack),
+                    |_| Err::<bool, _>("callback"),
+                )
+                .unwrap(),
+            Err("callback"),
         );
     }
 
