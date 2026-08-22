@@ -10012,12 +10012,16 @@ mod k0_ordinary_exists_route_probe {
     pub(super) struct Counts {
         pub(super) canonical: usize,
         pub(super) prepared: usize,
+        pub(super) direct: usize,
+        pub(super) generic: usize,
     }
 
     std::thread_local! {
         static COUNTS: Cell<Counts> = const { Cell::new(Counts {
             canonical: 0,
             prepared: 0,
+            direct: 0,
+            generic: 0,
         }) };
     }
 
@@ -10035,13 +10039,26 @@ mod k0_ordinary_exists_route_probe {
             slot.set(if prepared {
                 Counts {
                     prepared: counts.prepared.saturating_add(1),
+                    generic: counts.generic.saturating_add(1),
                     ..counts
                 }
             } else {
                 Counts {
                     canonical: counts.canonical.saturating_add(1),
+                    generic: counts.generic.saturating_add(1),
                     ..counts
                 }
+            });
+        });
+    }
+
+    pub(super) fn record_direct_prepared() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                prepared: counts.prepared.saturating_add(1),
+                direct: counts.direct.saturating_add(1),
+                ..counts
             });
         });
     }
@@ -11438,7 +11455,7 @@ impl PortableRegex {
                         .can_use_pooled_compact_ordinary_exists_projection();
                 if compact_prepared {
                     #[cfg(test)]
-                    k0_ordinary_exists_route_probe::record(true);
+                    k0_ordinary_exists_route_probe::record_direct_prepared();
                     if let Some(value) = k0
                         .automaton
                         .search_window_with_optional_pooled_ordinary_exists_value(
@@ -25377,11 +25394,14 @@ mod tests {
                     assert_eq!(regex.is_match(&haystack), hit);
                     assert_eq!(regex.is_match(&haystack), hit);
                     let prepared = if length >= 31 { 1_usize } else { 0 };
+                    let direct = usize::from((31..64).contains(&length));
                     assert_eq!(
                         super::k0_ordinary_exists_route_probe::snapshot(),
                         super::k0_ordinary_exists_route_probe::Counts {
                             canonical: 2 - prepared,
                             prepared,
+                            direct,
+                            generic: 2 - direct,
                         },
                         "selection={selection:?} length={length} hit={hit}",
                     );
@@ -25412,6 +25432,8 @@ mod tests {
             super::k0_ordinary_exists_route_probe::Counts {
                 canonical: 1,
                 prepared: 0,
+                direct: 0,
+                generic: 1,
             },
             "a poolless published proof must not admit the short prepared route",
         );
@@ -25421,6 +25443,8 @@ mod tests {
             super::k0_ordinary_exists_route_probe::Counts {
                 canonical: 1,
                 prepared: 1,
+                direct: 1,
+                generic: 1,
             },
             "the first canonical call populates the regex-owned pool",
         );
@@ -25441,6 +25465,8 @@ mod tests {
                 super::k0_ordinary_exists_route_probe::Counts {
                     canonical: 2,
                     prepared: 0,
+                    direct: 0,
+                    generic: 2,
                 },
                 "{name} must remain canonical below the incumbent threshold",
             );
@@ -25454,6 +25480,8 @@ mod tests {
                 super::k0_ordinary_exists_route_probe::Counts {
                     canonical: 0,
                     prepared: 1,
+                    direct: 0,
+                    generic: 1,
                 },
                 "{name} must retain the existing >=64 prepared policy",
             );
@@ -25482,7 +25510,148 @@ mod tests {
             super::k0_ordinary_exists_route_probe::Counts {
                 canonical: 1,
                 prepared: 3,
+                direct: 3,
+                generic: 1,
             },
+        );
+    }
+
+    #[test]
+    fn compact_prepared_ordinary_exists_preserves_absolute_end_predecessor() {
+        const PATTERN: &str = r"(?-u:(?:ab|c+)\z)";
+        let regex = compact_prepared_k0(PATTERN, PlanSelection::ForceK0);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        assert!(plan.absolute_end_proof.is_some());
+
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut haystack = vec![b'x'; 31];
+        haystack[29..].copy_from_slice(b"ab");
+        super::k0_ordinary_exists_route_probe::reset();
+        for _ in 0..2 {
+            assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        }
+        haystack[30] = b'x';
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(
+            super::k0_ordinary_exists_route_probe::snapshot().direct,
+            0,
+            "absolute-end execution must remain ahead of compact prepared dispatch",
+        );
+    }
+
+    #[test]
+    fn compact_prepared_ordinary_exists_skips_ineligible_short_cut_predecessor() {
+        const PATTERN: &str = r"(?-u:Z(?:abx|a|aby|a|abz|foo)q+)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("short mandatory-cut fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("short mandatory-cut fixture must retain K0");
+        };
+        assert!(plan.absolute_end_proof.is_none());
+        assert!(plan.mandatory_cut.is_some());
+        assert!(plan.negative_prefilter.is_some());
+
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut haystack = vec![b'!'; 31];
+        haystack[26..].copy_from_slice(b"Zabxq");
+        super::k0_ordinary_exists_route_probe::reset();
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(
+            super::k0_ordinary_exists_route_probe::snapshot(),
+            super::k0_ordinary_exists_route_probe::Counts {
+                canonical: 1,
+                prepared: 1,
+                direct: 1,
+                generic: 1,
+            },
+            "a sub-threshold cut must not keep the warm compact call in the generic dispatcher",
+        );
+    }
+
+    #[test]
+    fn compact_prepared_ordinary_exists_keeps_cache_replay_inside_direct_checkout() {
+        const PATTERN: &str = r"(?:ab|a)??b";
+        let regex = compact_prepared_k0(PATTERN, PlanSelection::ForceK0);
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut haystack = vec![b'x'; 31];
+        haystack[29..].copy_from_slice(b"ab");
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+
+        haystack[29] = b'x';
+        super::k0_ordinary_exists_route_probe::reset();
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+        assert_eq!(
+            super::k0_ordinary_exists_route_probe::snapshot(),
+            super::k0_ordinary_exists_route_probe::Counts {
+                canonical: 0,
+                prepared: 2,
+                direct: 2,
+                generic: 0,
+            },
+            "a prepared hole must replay inside the existing checkout without re-entering the facade dispatcher",
+        );
+    }
+
+    #[test]
+    fn compact_prepared_ordinary_exists_preserves_foreign_fallback_and_owner() {
+        let regex = std::sync::Arc::new(compact_prepared_k0(
+            r"(?:ab|a)??b",
+            PlanSelection::ForceK0,
+        ));
+        let mut hit = vec![b'x'; 31];
+        *hit.last_mut().unwrap() = b'b';
+        assert!(regex.is_match(&hit));
+        assert!(regex.is_match(&hit));
+
+        let foreign = std::sync::Arc::clone(&regex);
+        let foreign_counts = std::thread::spawn(move || {
+            let miss = vec![b'x'; 31];
+            super::k0_ordinary_exists_route_probe::reset();
+            assert!(foreign.is_match(&hit));
+            assert!(!foreign.is_match(&miss));
+            super::k0_ordinary_exists_route_probe::snapshot()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            foreign_counts,
+            super::k0_ordinary_exists_route_probe::Counts {
+                canonical: 0,
+                prepared: 2,
+                direct: 2,
+                generic: 0,
+            },
+        );
+
+        let mut owner_hit = vec![b'x'; 31];
+        *owner_hit.last_mut().unwrap() = b'b';
+        super::k0_ordinary_exists_route_probe::reset();
+        assert!(regex.is_match(&owner_hit));
+        assert_eq!(
+            super::k0_ordinary_exists_route_probe::snapshot(),
+            super::k0_ordinary_exists_route_probe::Counts {
+                canonical: 0,
+                prepared: 1,
+                direct: 1,
+                generic: 0,
+            },
+            "foreign fallback use must not displace the warm owner lane",
         );
     }
 
@@ -25492,6 +25661,7 @@ mod tests {
         let mut haystack = vec![b'x'; 31];
         *haystack.last_mut().unwrap() = b'b';
         let window = SearchWindow::full(&haystack);
+        let narrowed = SearchWindow::new(1, haystack.len());
         let expected = Some(Match { start: 30, end: 31 });
 
         assert!(regex.is_match(&haystack));
@@ -25549,6 +25719,28 @@ mod tests {
                 .is_match_window_value(&haystack, window, SearchLimits::unlimited())
                 .unwrap()
         );
+        assert!(
+            regex
+                .is_match_window_value(&haystack, narrowed, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert!(
+            regex
+                .is_match_window(&haystack, narrowed, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: usize::MAX,
+        };
+        let value_error = regex
+            .is_match_window_value(&haystack, narrowed, refusing)
+            .unwrap_err();
+        let accounted_error = regex
+            .is_match_window(&haystack, narrowed, refusing)
+            .unwrap_err();
+        assert_eq!(value_error, accounted_error);
 
         let mut session = regex
             .search_session(SearchSessionLimits::unlimited())
