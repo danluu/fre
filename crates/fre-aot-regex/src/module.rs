@@ -45386,6 +45386,19 @@ fn aarch64_sve_and_z(
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_sve_orr_z(
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<u32, ObjectError> {
+    // As with AND, SVE's unpredicated logical spelling uses D elements while
+    // applying the operation bitwise across the complete scalable register.
+    Ok(0x0460_3000
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_sve_cmplt_zero_b(
     destination: u8,
     source: u8,
@@ -47986,14 +47999,60 @@ fn aarch64_emit_mandatory_teddy_sve_candidates_at(
 /// the scalar nibble tables at that lane.
 const AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS: [u8; 4] = [24, 25, 27, 28];
 
+/// Admit the single-column batch check only while the stable model predicts
+/// at most one first-column survivor across all four runtime vectors. This is
+/// deliberately stricter than instruction-count break-even: at the admitted
+/// boundary the independent-byte model predicts an all-zero batch about 37%
+/// of the time, leaving a material margin for the extra survivor-side test.
+/// Automatic exact-Teddy selection normally prefers the incumbent accelerator
+/// for such a sparse column; this primarily benefits the explicit
+/// forced-structural policy used to compare the composite scanner with stock.
+const AARCH64_MANDATORY_TEDDY_SVE_SINGLE_PREFIX_EXPECTED_HITS: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64MandatoryTeddySveBatchPlan {
+    column_order: [u8; 4],
+    single_prefix_max_vector_bytes: Option<u16>,
+}
+
+fn aarch64_mandatory_teddy_sve_column_union_frequency(
+    plan: &MandatoryTeddyPlan,
+    column: usize,
+) -> Result<u16, ObjectError> {
+    let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
+        "AArch64 SVE Teddy batch has no mask bank",
+    ))?;
+    let low = bank.low(column).ok_or(ObjectError::InvalidModule(
+        "AArch64 SVE Teddy batch has no low table",
+    ))?;
+    let high = bank.high(column).ok_or(ObjectError::InvalidModule(
+        "AArch64 SVE Teddy batch has no high table",
+    ))?;
+    let mut frequency = 0_u16;
+    for byte in u8::MIN..=u8::MAX {
+        if low[usize::from(byte & 0x0f)] & high[usize::from(byte >> 4)] != 0 {
+            frequency = frequency
+                .saturating_add(estimated_byte_frequency_units(byte))
+                .min(BYTE_FREQUENCY_DENOMINATOR);
+        }
+    }
+    Ok(frequency)
+}
+
 /// Order the four possible fingerprint columns so the first two form the
 /// smallest stable-frequency product estimate. An empty intersection after
 /// those two columns proves that every deeper intersection is empty too.
+/// Within the selected pair, put the smaller exact bucket-union frequency
+/// first so a sufficiently sparse singleton can reject a complete batch.
 /// Remaining columns retain chronological order because their order cannot
 /// affect the exact bucket result.
-fn aarch64_mandatory_teddy_sve_batch_column_order(
-    plan: MandatoryTeddyPlan,
-) -> Result<[u8; 4], ObjectError> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded planner keeps pair scoring, orientation, and VL admission auditable together"
+)]
+fn aarch64_mandatory_teddy_sve_batch_plan(
+    plan: &MandatoryTeddyPlan,
+) -> Result<Aarch64MandatoryTeddySveBatchPlan, ObjectError> {
     let columns = usize::from(plan.columns());
     if plan.bank_count() != 1
         || !(3..=4).contains(&columns)
@@ -48007,6 +48066,7 @@ fn aarch64_mandatory_teddy_sve_batch_column_order(
         "AArch64 SVE Teddy batch has no mask bank",
     ))?;
     let mut frequency = [[0_u16; 8]; 4];
+    let mut union_frequency = [0_u16; 4];
     for (column, frequencies) in frequency[..columns].iter_mut().enumerate() {
         let low = bank.low(column).ok_or(ObjectError::InvalidModule(
             "AArch64 SVE Teddy batch has no low table",
@@ -48014,6 +48074,8 @@ fn aarch64_mandatory_teddy_sve_batch_column_order(
         let high = bank.high(column).ok_or(ObjectError::InvalidModule(
             "AArch64 SVE Teddy batch has no high table",
         ))?;
+        union_frequency[column] =
+            aarch64_mandatory_teddy_sve_column_union_frequency(plan, column)?;
         for byte in u8::MIN..=u8::MAX {
             let buckets = low[usize::from(byte & 0x0f)] & high[usize::from(byte >> 4)];
             for (bucket, units) in frequencies
@@ -48055,14 +48117,21 @@ fn aarch64_mandatory_teddy_sve_batch_column_order(
             best = best.min((score, left, right));
         }
     }
+    let (first, second) = if (union_frequency[best.1], best.1)
+        <= (union_frequency[best.2], best.2)
+    {
+        (best.1, best.2)
+    } else {
+        (best.2, best.1)
+    };
     let mut order = [0_u8; 4];
-    order[0] = u8::try_from(best.1)
+    order[0] = u8::try_from(first)
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy first column"))?;
-    order[1] = u8::try_from(best.2)
+    order[1] = u8::try_from(second)
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy second column"))?;
     let mut next = 2_usize;
     for column in 0..columns {
-        if column != best.1 && column != best.2 {
+        if column != first && column != second {
             order[next] = u8::try_from(column).map_err(|_| {
                 ObjectError::ArithmeticOverflow("AArch64 SVE Teddy remaining column")
             })?;
@@ -48071,7 +48140,43 @@ fn aarch64_mandatory_teddy_sve_batch_column_order(
             ))?;
         }
     }
-    Ok(order)
+    let first_frequency = union_frequency[first];
+    if first_frequency == 0 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 SVE Teddy batch has an empty first column",
+        ));
+    }
+    let expected_hits_per_vector_byte = u32::try_from(
+        AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS.len(),
+    )
+    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch vectors"))?
+    .checked_mul(u32::from(first_frequency))
+    .ok_or(ObjectError::ArithmeticOverflow(
+        "AArch64 SVE Teddy singleton expected hits",
+    ))?;
+    let hit_budget = u32::from(AARCH64_MANDATORY_TEDDY_SVE_SINGLE_PREFIX_EXPECTED_HITS)
+        .checked_mul(u32::from(BYTE_FREQUENCY_DENOMINATOR))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 SVE Teddy singleton hit budget",
+        ))?;
+    let raw_maximum = hit_budget.checked_div(expected_hits_per_vector_byte).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 SVE Teddy singleton hit divisor"),
+    )?;
+    let minimum = u32::from(AARCH64_SVE_MIN_VECTOR_BYTES);
+    let rounded = raw_maximum
+        .checked_div(minimum)
+        .and_then(|vectors| vectors.checked_mul(minimum))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 SVE Teddy singleton vector rounding",
+        ))?;
+    let single_prefix_max_vector_bytes = (rounded >= minimum)
+        .then(|| u16::try_from(rounded.min(u32::from(AARCH64_SVE_MAX_VECTOR_BYTES))))
+        .transpose()
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy singleton vector bound"))?;
+    Ok(Aarch64MandatoryTeddySveBatchPlan {
+        column_order: order,
+        single_prefix_max_vector_bytes,
+    })
 }
 
 #[allow(
@@ -48123,18 +48228,28 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_column(
     for block in 0_u8..batch_vectors {
         assembler.instruction(aarch64_sve_tbl_b(4 + block, high, 4 + block)?)?;
     }
-    for block in 0_u8..batch_vectors {
-        assembler.instruction(aarch64_sve_and_z(block, block, 4 + block)?)?;
-    }
-    for (block, &buckets) in AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
-        .iter()
-        .enumerate()
-    {
-        let source = u8::try_from(block)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch source"))?;
-        if initialize {
-            assembler.instruction(aarch64_sve_and_z(buckets, source, source)?)?;
-        } else {
+    if initialize {
+        // The first column has no prior bucket state. Intersect its low/high
+        // table results directly into the retained registers instead of
+        // materializing four temporary intersections and then copying them.
+        for (block, &buckets) in AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+            .iter()
+            .enumerate()
+        {
+            let source = u8::try_from(block)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch source"))?;
+            assembler.instruction(aarch64_sve_and_z(buckets, source, 4 + source)?)?;
+        }
+    } else {
+        for block in 0_u8..batch_vectors {
+            assembler.instruction(aarch64_sve_and_z(block, block, 4 + block)?)?;
+        }
+        for (block, &buckets) in AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS
+            .iter()
+            .enumerate()
+        {
+            let source = u8::try_from(block)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch source"))?;
             assembler.instruction(aarch64_sve_and_z(buckets, buckets, source)?)?;
         }
     }
@@ -48159,16 +48274,37 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_predicates(
     Ok(())
 }
 
+/// Publish NZCV for the existential union of all four retained bucket
+/// vectors without materializing their four durable hit predicates. P8 and
+/// caller-saved Z4/Z5 are scratch; the exact Z24/Z25/Z27/Z28 bucket
+/// identities survive without touching callee-saved V8..V15 state.
+fn aarch64_emit_mandatory_teddy_sve_batch4_any(
+    assembler: &mut Aarch64Assembler,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_orr_z(4, 24, 25)?)?;
+    assembler.instruction(aarch64_sve_orr_z(5, 27, 28)?)?;
+    assembler.instruction(aarch64_sve_orr_z(4, 4, 5)?)?;
+    assembler.instruction(aarch64_sve_cmpne_zero_b(8, 4)?)?;
+    assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+    Ok(())
+}
+
 fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
     assembler: &mut Aarch64Assembler,
     teddy: &NativeMandatoryTeddyLayout,
     vector: Aarch64Label,
+    single_prefix: bool,
 ) -> Result<(), ObjectError> {
     let batch_vectors = u8::try_from(AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch vectors"))?;
     let batch_suffix = assembler.label()?;
-    let order = aarch64_mandatory_teddy_sve_batch_column_order(teddy.plan)?;
-    for (index, &column) in order[..usize::from(teddy.plan.columns())]
+    let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+    if single_prefix && batch_plan.single_prefix_max_vector_bytes.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 SVE Teddy singleton prefix was not admitted",
+        ));
+    }
+    for (index, &column) in batch_plan.column_order[..usize::from(teddy.plan.columns())]
         .iter()
         .enumerate()
     {
@@ -48178,11 +48314,16 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
             column,
             index == 0,
         )?;
+        if index == 0 && single_prefix {
+            let second_column = assembler.label()?;
+            aarch64_emit_mandatory_teddy_sve_batch4_any(assembler)?;
+            assembler.branch_cond(AARCH64_NE, second_column)?;
+            assembler.instruction(aarch64_sve_addvl(2, 2, batch_vectors)?)?;
+            assembler.branch(vector)?;
+            assembler.bind(second_column)?;
+        }
         if index == 1 {
-            aarch64_emit_mandatory_teddy_sve_batch4_predicates(assembler)?;
-            assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
-            assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
-            assembler.instruction(aarch64_sve_orrs_p0_b(8, 8, 9)?)?;
+            aarch64_emit_mandatory_teddy_sve_batch4_any(assembler)?;
             // Make the expected prefix miss the fall-through path. The
             // omitted suffix is branch-only and runs only when at least one
             // prefix bucket survives the whole batch.
@@ -48192,7 +48333,7 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
             assembler.bind(batch_suffix)?;
         }
     }
-    aarch64_emit_mandatory_teddy_sve_batch4_predicates(assembler)
+    Ok(())
 }
 
 /// Produce one exact scalable correlated candidate predicate in P1.
@@ -69884,6 +70025,7 @@ mod tests {
         assert_eq!(aarch64_sve_tbl_b(4, 16, 5).unwrap(), 0x0525_3204);
         assert_eq!(aarch64_sve_lsr_b_by_4(5, 0).unwrap(), 0x042c_9405);
         assert_eq!(aarch64_sve_and_z(6, 0, 19).unwrap(), 0x0433_3006);
+        assert_eq!(aarch64_sve_orr_z(4, 24, 25).unwrap(), 0x0479_3304);
         assert_eq!(aarch64_sve_cmplt_zero_b(1, 0).unwrap(), 0x2500_2001);
         assert_eq!(aarch64_sve_sel_b(7, 1, 17, 16).unwrap(), 0x0530_c627);
         assert_eq!(aarch64_sve_cmpne_zero_b(2, 7).unwrap(), 0x2500_80f2);
@@ -69892,6 +70034,7 @@ mod tests {
         assert!(aarch64_sve_sel_b(0, 16, 0, 0).is_err());
         assert!(aarch64_sve_cmpne_zero_b(16, 0).is_err());
         assert!(aarch64_sve_not_b(0, 16).is_err());
+        assert!(aarch64_sve_orr_z(32, 0, 0).is_err());
     }
 
     #[test]
