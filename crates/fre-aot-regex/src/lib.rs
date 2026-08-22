@@ -313,9 +313,13 @@ pub use rebar_single_capture::{
     RebarSingleCaptureEmptyProgressV1, compile_rebar_single_capture_aot_v1,
 };
 pub use uniform_capture::{
-    CompiledUniformCaptureSelector, UniformCaptureAuthenticationError,
+    CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureSelector,
+    UniformCaptureAuthenticationError,
     UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
-    UniformCaptureCompileRequest, compile_uniform_capture_selector,
+    UniformCaptureCompileRequest, UniformCapturePreparedSpanFillAuthenticationError,
+    UniformCapturePreparedSpanFillCompileDisposition,
+    UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
 };
 
 /// Stable compiler pipeline identity.
