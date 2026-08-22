@@ -744,9 +744,10 @@ fn select_prepared_v15_grep_or_incumbent(
     }
 }
 
-const ORDINARY_GREP_RUNTIME_SYMBOLS: [&str; 3] = [
+const ORDINARY_GREP_RUNTIME_SYMBOLS: [&str; 4] = [
     "fre_aot_regex_runtime_search_v1",
     "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_is_match_batch_exclusive_v1",
     "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
 ];
 const PREPARED_V15_GREP_RUNTIME_SYMBOLS: [&str; 4] = [
@@ -765,6 +766,17 @@ fn has_exact_runtime_symbol_closure(compiled: &CompiledRegex, expected: &[&str])
     let actual = compiled
         .module()
         .required_runtime_symbols()
+        .collect::<Vec<_>>();
+    has_exact_symbol_name_closure(&actual, expected)
+}
+
+fn has_exact_symbol_name_closure(actual: &[&str], expected: &[&str]) -> bool {
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let actual = actual
+        .iter()
+        .copied()
         .collect::<std::collections::BTreeSet<_>>();
     actual.len() == expected.len() && expected.iter().all(|symbol| actual.contains(symbol))
 }
@@ -832,6 +844,54 @@ fn prepared_v15_grep_symbol_identities_are_closed(
         && reducer_identity != ordinary_identity
 }
 
+fn ordinary_grep_symbol_identities_are_closed(
+    ordinary_entry: &str,
+    prepared_entry: &str,
+    exists_batch: &str,
+    reducer: &str,
+    program: &str,
+) -> bool {
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(prepared_identity) =
+        native_symbol_identity(prepared_entry, "fre_aot_regex_search_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(exists_batch_identity) =
+        native_symbol_identity(exists_batch, "fre_aot_regex_is_match_batch_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) =
+        native_symbol_identity(reducer, "fre_aot_regex_grep_count_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    ordinary_identity == prepared_identity
+        && ordinary_identity == exists_batch_identity
+        && ordinary_identity == program_identity
+        && reducer_identity != ordinary_identity
+}
+
+fn ordinary_grep_runtime_bulk_is_authenticated(
+    bulk: Option<PreparedBulkStrategy>,
+    exists_batch: Option<&str>,
+    exists_batch_is_defined: bool,
+) -> bool {
+    matches!(bulk, Some(PreparedBulkStrategy::RuntimeHelper))
+        && exists_batch.is_some_and(|symbol| !symbol.is_empty())
+        && exists_batch_is_defined
+}
+
 fn ordinary_grep_requires_prepared_v15(compiled: &CompiledRegex) -> bool {
     let module = compiled.module();
     let receipt = compiled.receipt();
@@ -839,6 +899,12 @@ fn ordinary_grep_requires_prepared_v15(compiled: &CompiledRegex) -> bool {
         return false;
     };
     let Some(reducer) = module.prepared_grep_count_symbol() else {
+        return false;
+    };
+    let exists_batch = module.prepared_exists_batch_symbol();
+    let exists_batch_is_defined = exists_batch
+        .is_some_and(|symbol| has_defined_symbol(compiled, symbol, SymbolKind::Function, None));
+    let Some(exists_batch) = exists_batch else {
         return false;
     };
     let Some((program, program_len)) = module.required_runtime_program() else {
@@ -853,8 +919,11 @@ fn ordinary_grep_requires_prepared_v15(compiled: &CompiledRegex) -> bool {
         && receipt.required_prepare_capabilities == 0
         && module.prepared_aggregate_exports() == PreparedAggregateExports::GREP_COUNT
         && module.prepared_aggregate_strategy() == Some(PreparedAggregateStrategy::RuntimeHelper)
-        && module.prepared_bulk_strategy()
-            == Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk)
+        && ordinary_grep_runtime_bulk_is_authenticated(
+            module.prepared_bulk_strategy(),
+            Some(exists_batch),
+            exists_batch_is_defined,
+        )
         && module.required_prepare_capabilities() == 0
         && module.prepared_span_fill_symbol().is_none()
         && module.prepared_count_symbol().is_none()
@@ -865,11 +934,24 @@ fn ordinary_grep_requires_prepared_v15(compiled: &CompiledRegex) -> bool {
         && has_defined_symbol(compiled, prepared_entry, SymbolKind::Function, None)
         && has_defined_symbol(compiled, reducer, SymbolKind::Function, None)
         && has_defined_symbol(compiled, program, SymbolKind::Object, Some(program_len))
-        && [module.entry_symbol(), prepared_entry, reducer, program]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == 4
+        && ordinary_grep_symbol_identities_are_closed(
+            module.entry_symbol(),
+            prepared_entry,
+            exists_batch,
+            reducer,
+            program,
+        )
+        && [
+            module.entry_symbol(),
+            prepared_entry,
+            exists_batch,
+            reducer,
+            program,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+            == 5
 }
 
 fn authenticate_prepared_v15_grep(compiled: &CompiledRegex) -> Result<(), String> {
@@ -2252,6 +2334,156 @@ mod tests {
             assert_eq!(selected.object(), expected_object);
             assert_eq!(selected.receipt(), &expected_receipt);
         }
+    }
+
+    #[test]
+    fn ordinary_grep_runtime_bulk_requires_one_defined_runtime_helper_batch_entry() {
+        let exists_batch = format!(
+            "fre_aot_regex_is_match_batch_exclusive_v1_{}",
+            "a".repeat(64)
+        );
+        assert!(ordinary_grep_runtime_bulk_is_authenticated(
+            Some(PreparedBulkStrategy::RuntimeHelper),
+            Some(&exists_batch),
+            true,
+        ));
+        assert!(!ordinary_grep_runtime_bulk_is_authenticated(
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(&exists_batch),
+            true,
+        ));
+        assert!(!ordinary_grep_runtime_bulk_is_authenticated(
+            Some(PreparedBulkStrategy::RuntimeHelper),
+            None,
+            false,
+        ));
+        assert!(!ordinary_grep_runtime_bulk_is_authenticated(
+            Some(PreparedBulkStrategy::RuntimeHelper),
+            Some(""),
+            true,
+        ));
+        assert!(!ordinary_grep_runtime_bulk_is_authenticated(
+            Some(PreparedBulkStrategy::RuntimeHelper),
+            Some(&exists_batch),
+            false,
+        ));
+    }
+
+    #[test]
+    fn ordinary_grep_symbol_identity_requires_exact_closed_suffixes() {
+        let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
+        let prepared = format!("fre_aot_regex_search_exclusive_v1_{}", "a".repeat(64));
+        let exists_batch = format!(
+            "fre_aot_regex_is_match_batch_exclusive_v1_{}",
+            "a".repeat(64)
+        );
+        let reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "b".repeat(64));
+        let program = format!("fre_aot_regex_runtime_program_v1_{}", "a".repeat(64));
+        assert!(ordinary_grep_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            &exists_batch,
+            &reducer,
+            &program,
+        ));
+
+        let poisoned_batch = format!(
+            "fre_aot_regex_is_match_batch_exclusive_v1_{}",
+            "c".repeat(64)
+        );
+        assert!(!ordinary_grep_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            &poisoned_batch,
+            &reducer,
+            &program,
+        ));
+        let aliased_reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "a".repeat(64));
+        assert!(!ordinary_grep_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            &exists_batch,
+            &aliased_reducer,
+            &program,
+        ));
+        assert!(!ordinary_grep_symbol_identities_are_closed(
+            &ordinary, &prepared, "", &reducer, &program,
+        ));
+    }
+
+    #[test]
+    fn ordinary_grep_runtime_symbol_closure_is_exact() {
+        assert!(has_exact_symbol_name_closure(
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+        ));
+        assert!(!has_exact_symbol_name_closure(
+            &ORDINARY_GREP_RUNTIME_SYMBOLS[..3],
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+        ));
+
+        let mut poisoned = ORDINARY_GREP_RUNTIME_SYMBOLS;
+        poisoned[2] = "fre_aot_regex_runtime_poisoned_is_match_batch_exclusive_v1";
+        assert!(!has_exact_symbol_name_closure(
+            &poisoned,
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+        ));
+        let duplicated = [
+            ORDINARY_GREP_RUNTIME_SYMBOLS[0],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[1],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[2],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[3],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[3],
+        ];
+        assert!(!has_exact_symbol_name_closure(
+            &duplicated,
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+        ));
+    }
+
+    #[test]
+    fn ordinary_runtime_helper_grep_is_upgraded_to_authenticated_v15() {
+        let mut benchmark = Benchmark::parse(&fixture(
+            "grep",
+            br"\b\w{25,}\b",
+            b"one_very_long_identifier_name\nshort\n",
+        ))
+        .expect("Unicode grep fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = true;
+        let ordinary = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(benchmark.pattern(), target)
+                .profile(profile)
+                .output(OutputContract::Exists)
+                .mode(CompileMode::Optimizing)
+                .limits(rebar_recovery_compile_limits()),
+            PreparedAggregateExports::GREP_COUNT,
+            rebar_recovery_slow_aot_limits(),
+        )
+        .expect("ordinary RuntimeHelper grep incumbent");
+        assert!(
+            ordinary_grep_requires_prepared_v15(&ordinary),
+            "fixture did not produce the exact ordinary grep incumbent: engine={:?} aggregate={:?} bulk={:?} capabilities={:#x} exists_batch={}",
+            ordinary.receipt().engine,
+            ordinary.module().prepared_aggregate_strategy(),
+            ordinary.module().prepared_bulk_strategy(),
+            ordinary.module().required_prepare_capabilities(),
+            ordinary.module().prepared_exists_batch_symbol().is_some(),
+        );
+
+        let selected = compile_benchmark(&benchmark, target).expect("Rebar grep upgrade");
+        assert_eq!(
+            selected.module().required_prepare_capabilities(),
+            PREPARED_CAPABILITY_ORDERED_NFA_V15
+        );
+        authenticate_prepared_v15_grep(&selected).expect("authenticated prepared V15 grep");
     }
 
     #[test]
