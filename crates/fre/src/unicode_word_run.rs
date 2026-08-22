@@ -24,6 +24,21 @@ pub const FIXED_CLASS_CHUNKS_PLAN_ID: &str = "fixed-byte-class-chunks-linear-v1"
 pub const FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID: &str = "fixed-byte-class-chunks.count.v1";
 pub const FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID: &str = "fixed-byte-class-chunks.span-sum.v1";
 
+#[cfg(test)]
+std::thread_local! {
+    static FULL_PREPARED_CALL_COUNT: core::cell::Cell<usize> = core::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_prepared_call_count() {
+    FULL_PREPARED_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_prepared_call_count() -> usize {
+    FULL_PREPARED_CALL_COUNT.with(core::cell::Cell::get)
+}
+
 const FIXED_BUILD_WORK: usize = 1;
 // The scanner compiles both run-table representations in one complete
 // 128-byte-domain pass and makes one paired-direction dispatch choice.
@@ -700,6 +715,8 @@ impl Plan {
     /// the complete source-independent work envelope.
     #[must_use]
     pub(crate) fn is_match_full_prepared(self, haystack: &[u8]) -> bool {
+        #[cfg(test)]
+        FULL_PREPARED_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         debug_assert!(matches!(
             self,
             Self::Word {

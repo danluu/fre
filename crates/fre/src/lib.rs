@@ -24175,9 +24175,10 @@ mod tests {
         PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
-        PortablePlan, PortableRegex, PortableSearchSession, PortableSearchSessionPlan,
-        PortableSpanVisitLimits, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
-        SearchWindow, SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+        PortablePlan, PortableRegex, PortableRegexSetBuilder, PortableSearchSession,
+        PortableSearchSessionPlan, PortableSpanVisitLimits, PortableTextBuilder,
+        PortableTextRegexSetBuilder, SearchAccounting, SearchError, SearchLimits,
+        SearchSessionLimits, SearchWindow, SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         k0_finite_prefix_hedge_window, k0_finite_suffix_incumbent_single_pass_negative,
         k0_finite_suffix_prefix_hedge_bytes, k0_mandatory_suffix_completed_negative_is_useful,
         observe_k0_finite_suffix_direct_incumbent, observe_k0_finite_suffix_incumbent,
@@ -24202,6 +24203,196 @@ mod tests {
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    #[test]
+    fn unicode_word_ordinary_full_unlimited_matches_find_at_boundaries_and_invalid_bytes() {
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"ab",
+            b"!ab!",
+            b"a\x80b",
+            b"\xffab\x80",
+            "αβ".as_bytes(),
+            "!αβ!".as_bytes(),
+            b"\xce!\xb1",
+            b"a\xcc\x81",
+            b"\xf4\x90\x80\x80ab",
+        ];
+
+        let pattern = r"\b\w{2,}\b";
+        let regex = PortableBuilder::new(pattern).unicode(true).build().unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+
+        for &haystack in haystacks {
+            let expected = regex.find(haystack).is_some();
+            super::unicode_word_run::reset_full_prepared_call_count();
+            assert_eq!(
+                regex.is_match(haystack),
+                expected,
+                "pattern={pattern:?} haystack={haystack:?}",
+            );
+            assert_eq!(
+                super::unicode_word_run::full_prepared_call_count(),
+                1,
+                "pattern={pattern:?} haystack={haystack:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_word_ordinary_full_unlimited_reaches_byte_text_sets_and_sessions() {
+        let pattern = r"\b\w{2,}\b";
+        let byte_regex = PortableBuilder::new(pattern).unicode(true).build().unwrap();
+        let text_regex = PortableTextBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let patterns = [pattern.to_owned()];
+        let byte_set = PortableRegexSetBuilder::new(&patterns)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let text_set = PortableTextRegexSetBuilder::new(&patterns)
+            .unicode(true)
+            .build()
+            .unwrap();
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(byte_regex.is_match("!αβ!".as_bytes()));
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(text_regex.is_match("!αβ!"));
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(
+            byte_set
+                .is_match_value_unlimited("!αβ!".as_bytes())
+                .unwrap()
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(text_set.is_match_value_unlimited("!αβ!").unwrap());
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+
+        let mut byte_session = byte_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(
+            byte_session
+                .is_match_value("!αβ!".as_bytes(), SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+
+        let mut text_session = text_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(
+            text_session
+                .is_match_value("!αβ!", SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+    }
+
+    #[test]
+    fn unicode_word_ordinary_route_keeps_finite_and_narrow_calls_checked() {
+        let regex = PortableBuilder::new(r"\b\w{2,}\b")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+        let haystack = "!αβ!".as_bytes();
+        let full = SearchWindow::full(haystack);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert_eq!(
+            regex.is_match_window_value(
+                haystack,
+                full,
+                SearchLimits {
+                    max_work: 64,
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Ok(true),
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert_eq!(
+            regex.is_match_window_value(
+                haystack,
+                full,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(true),
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        let invalid_bytes = b"\xffab";
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert_eq!(
+            regex.is_match_window_value(
+                invalid_bytes,
+                SearchWindow::full(invalid_bytes),
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::UnicodeWordRun(
+                super::unicode_word_run::Error::WorkLimitExceeded {
+                    needed: 1,
+                    limit: 0,
+                },
+            )),
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        let narrow = SearchWindow::new(1, haystack.len() - 1);
+        let expected = regex
+            .find_window_value(haystack, narrow, SearchLimits::unlimited())
+            .unwrap()
+            .is_some();
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert_eq!(
+            regex
+                .is_match_window_value(haystack, narrow, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert_eq!(
+            regex.is_match_window_value(
+                b"abc",
+                SearchWindow::new(2, 1),
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::UnicodeWordRun(
+                super::unicode_word_run::Error::InvalidWindow {
+                    start: 2,
+                    end: 1,
+                    haystack_len: 3,
+                },
+            )),
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+    }
 
     #[test]
     fn parsed_build_context_authenticates_and_owns_the_attempt_source() {
