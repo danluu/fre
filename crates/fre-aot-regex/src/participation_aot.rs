@@ -143,6 +143,8 @@ impl NativeParticipationAotArtifactV1 {
         self.receipt
     }
 
+    /// Reauthenticate the sealed bundle, native module, object, route, and
+    /// receipt without allocating.
     #[must_use]
     pub fn authenticates_receipt(&self) -> bool {
         artifact_authenticates(self)
@@ -150,6 +152,10 @@ impl NativeParticipationAotArtifactV1 {
 }
 
 /// Independent, deterministic construction ceilings.
+///
+/// These meter the participation construction itself. They do not claim an
+/// exhaustive host-allocator failure contract for cloning the incumbent
+/// selector module or converting already-built owners at publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeParticipationAotLimitsV1 {
     pub view: ExactSpanParticipationNativeV1Limits,
@@ -542,6 +548,7 @@ impl NativeParticipationDfaV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeParticipationPlanGeometryV1 {
     pub total_bytes: usize,
+    pub build_work: usize,
     pub assertions_offset: usize,
     pub signatures_offset: usize,
     pub byte_classes_offset: usize,
@@ -576,17 +583,17 @@ pub(crate) fn emit_native_participation_aot_v1(
     let target = compiled.selector().module().target();
     let selector_object_sha256: [u8; DIGEST_BYTES] =
         Sha256::digest(compiled.selector().object()).into();
-    let selector_entry_symbol = compiled.selector().module().entry_symbol().to_owned();
+    let selector_entry_symbol = owned_string(
+        compiled.selector().module().entry_symbol(),
+        "selector entry symbol",
+    )?;
 
-    let selector_requires_runtime = compiled
-        .selector()
-        .module()
+    let selector_module = compiled.selector().module();
+    let selector_requires_runtime = selector_module
         .required_runtime_symbols()
         .next()
-        .is_some();
-    let view = compiled
-        .capture_program()
-        .exact_span_participation_native_v1_view(limits.view)?;
+        .is_some()
+        || selector_module.required_runtime_program().is_some();
     let (strategy, decline, bundle, geometry, build_work) = if selector_requires_runtime {
         let strategy = NativeParticipationAotStrategyV1::NegativeEntry;
         let decline = NativeParticipationAotDeclineV1::SelectorRequiresRuntime;
@@ -604,7 +611,10 @@ pub(crate) fn emit_native_participation_aot_v1(
             None,
             0,
         )
-    } else if let Some(view) = view {
+    } else if let Some(view) = compiled
+        .capture_program()
+        .exact_span_participation_native_v1_view(limits.view)?
+    {
         if !native_assertions_supported(view) {
             let strategy = NativeParticipationAotStrategyV1::NegativeEntry;
             let decline = NativeParticipationAotDeclineV1::UnsupportedAssertion;
@@ -685,6 +695,8 @@ pub(crate) fn emit_native_participation_aot_v1(
                 .module()
                 .required_runtime_symbols()
                 .count()
+        || module.required_runtime_program()
+            != compiled.selector().module().required_runtime_program()
     {
         return Err(NativeParticipationAotErrorV1::InvalidProgram(
             "participation extension changed the selector route",
@@ -727,6 +739,8 @@ pub(crate) fn emit_native_participation_aot_v1(
         participation_entry_symbol,
         receipt,
     };
+    // Receipt authentication is deliberately allocation-free, so a false
+    // result here cannot hide a host allocation failure behind InvalidProgram.
     if !artifact.authenticates_receipt() {
         return Err(NativeParticipationAotErrorV1::InvalidProgram(
             "fresh participation artifact authentication failed",
@@ -828,13 +842,13 @@ fn encode_selected_bundle(
         None,
         PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS,
         total_bytes,
+        dfa.build_work(),
         dfa.group_count(),
         dfa.assertion_count(),
         dfa.assertion_signature_count(),
         dfa.alphabet_len(),
         dfa.state_count(),
         dfa.transition_count(),
-        assertions_offset,
         signatures_offset,
         byte_classes_offset,
         boundary_map_offset,
@@ -872,6 +886,7 @@ fn encode_selected_bundle(
         bytes,
         NativeParticipationPlanGeometryV1 {
             total_bytes,
+            build_work: dfa.build_work(),
             assertions_offset,
             signatures_offset,
             byte_classes_offset,
@@ -918,8 +933,8 @@ fn encode_negative_bundle(
         Some(decline),
         0,
         total_bytes,
-        identity.groups(),
         0,
+        identity.groups(),
         0,
         0,
         0,
@@ -950,13 +965,13 @@ fn encode_header(
     decline: Option<NativeParticipationAotDeclineV1>,
     flags: u32,
     total_bytes: usize,
+    build_work: usize,
     groups: usize,
     assertions: usize,
     signatures: usize,
     alphabet: usize,
     states: usize,
     transitions: usize,
-    assertions_offset: usize,
     signatures_offset: usize,
     byte_classes_offset: usize,
     boundary_map_offset: usize,
@@ -1018,8 +1033,8 @@ fn encode_header(
     write_u32(bytes, 60, usize_u32(alphabet)?)?;
     write_u32(bytes, 64, usize_u32(states)?)?;
     write_u32(bytes, 68, usize_u32(transitions)?)?;
+    write_u64(bytes, 72, usize_u64(build_work)?)?;
     for (offset, value) in [
-        (72, assertions_offset),
         (80, signatures_offset),
         (88, byte_classes_offset),
         (96, boundary_map_offset),
@@ -1053,13 +1068,13 @@ fn bundle_digest(bytes: &[u8]) -> Result<[u8; DIGEST_BYTES], NativeParticipation
             "bundle digest field",
         ));
     }
-    let mut copy = Vec::new();
-    reserve_exact(&mut copy, bytes.len(), "bundle digest copy")?;
-    copy.extend_from_slice(bytes);
     let mut expected = [0_u8; DIGEST_BYTES];
-    expected.copy_from_slice(&copy[PLAN_DIGEST_OFFSET..PLAN_DIGEST_OFFSET + DIGEST_BYTES]);
-    copy[PLAN_DIGEST_OFFSET..PLAN_DIGEST_OFFSET + DIGEST_BYTES].fill(0);
-    let actual: [u8; DIGEST_BYTES] = Sha256::digest(&copy).into();
+    expected.copy_from_slice(&bytes[PLAN_DIGEST_OFFSET..PLAN_DIGEST_OFFSET + DIGEST_BYTES]);
+    let mut digest = Sha256::new();
+    digest.update(&bytes[..PLAN_DIGEST_OFFSET]);
+    digest.update([0_u8; DIGEST_BYTES]);
+    digest.update(&bytes[PLAN_DIGEST_OFFSET + DIGEST_BYTES..]);
+    let actual: [u8; DIGEST_BYTES] = digest.finalize().into();
     if actual != expected {
         return Err(NativeParticipationAotErrorV1::InvalidProgram(
             "bundle digest",
@@ -1143,6 +1158,7 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         && read_wire_usize_u32(&artifact.bundle, 60) == Some(receipt.byte_classes)
         && read_wire_usize_u32(&artifact.bundle, 64) == Some(receipt.dfa_states)
         && read_wire_usize_u32(&artifact.bundle, 68) == Some(receipt.transition_cells)
+        && read_wire_usize(&artifact.bundle, 72) == Some(receipt.build_work)
         && read_wire_digest(&artifact.bundle, 128) == Some(receipt.capture_sha256)
         && read_wire_digest(&artifact.bundle, 160) == Some(receipt.selector_sha256)
         && read_wire_digest(&artifact.bundle, 192) == Some(receipt.selector_object_sha256)
@@ -1169,8 +1185,6 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
                 && receipt.byte_classes != 0
                 && receipt.dfa_states != 0
                 && receipt.transition_cells != 0
-                && read_wire_usize(&artifact.bundle, 72)
-                    == Some(NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
                 && read_wire_usize(&artifact.bundle, 88).is_some()
                 && read_wire_usize(&artifact.bundle, 96).is_some()
                 && read_wire_usize(&artifact.bundle, 104).is_some()
@@ -1213,12 +1227,16 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
             == Some(artifact.bundle.as_ref())
         && module_symbol_bytes(&artifact.module, &artifact.participation_entry_symbol)
             .is_some_and(|bytes| !bytes.is_empty())
-        && artifact.bundle_symbol
-            == crate::module::identity_symbol(BUNDLE_SYMBOL_PREFIX, &export_identity_sha256)
-                .unwrap_or_default()
-        && artifact.participation_entry_symbol
-            == crate::module::identity_symbol(ENTRY_SYMBOL_PREFIX, &export_identity_sha256)
-                .unwrap_or_default()
+        && identity_symbol_matches(
+            &artifact.bundle_symbol,
+            BUNDLE_SYMBOL_PREFIX,
+            &export_identity_sha256,
+        )
+        && identity_symbol_matches(
+            &artifact.participation_entry_symbol,
+            ENTRY_SYMBOL_PREFIX,
+            &export_identity_sha256,
+        )
         && artifact
             .module
             .symbols()
@@ -1229,6 +1247,24 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
             .symbols()
             .iter()
             .any(|symbol| symbol.name == artifact.participation_entry_symbol)
+}
+
+fn identity_symbol_matches(name: &str, prefix: &str, digest: &[u8]) -> bool {
+    let Some(hex_bytes) = digest.len().checked_mul(2) else {
+        return false;
+    };
+    if name.len() != prefix.len().checked_add(hex_bytes).unwrap_or(usize::MAX)
+        || !name.as_bytes().starts_with(prefix.as_bytes())
+    {
+        return false;
+    }
+    name.as_bytes()[prefix.len()..]
+        .chunks_exact(2)
+        .zip(digest)
+        .all(|(actual, &byte)| {
+            actual[0] == b"0123456789abcdef"[usize::from(byte >> 4)]
+                && actual[1] == b"0123456789abcdef"[usize::from(byte & 0x0f)]
+        })
 }
 
 fn read_wire_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -1940,6 +1976,18 @@ fn reserve_exact<T>(
         .map_err(|_| NativeParticipationAotErrorV1::Allocation(label))
 }
 
+fn owned_string(
+    value: &str,
+    label: &'static str,
+) -> Result<String, NativeParticipationAotErrorV1> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| NativeParticipationAotErrorV1::Allocation(label))?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
 fn false_vec(len: usize, label: &'static str) -> Result<Vec<bool>, NativeParticipationAotErrorV1> {
     let mut values = Vec::new();
     reserve_exact(&mut values, len, label)?;
@@ -2207,9 +2255,18 @@ mod tests {
         artifact.receipt.plan_bytes = original.plan_bytes + 1;
         assert!(!artifact.authenticates_receipt());
         artifact.receipt = original;
+        artifact.receipt.build_work = original.build_work + 1;
+        assert!(!artifact.authenticates_receipt());
+        artifact.receipt = original;
         artifact.receipt.strategy = NativeParticipationAotStrategyV1::DfaX86_64;
         assert!(!artifact.authenticates_receipt());
         artifact.receipt = original;
+        artifact.bundle_symbol.push('_');
+        assert!(!artifact.authenticates_receipt());
+        artifact.bundle_symbol.pop();
+        artifact.participation_entry_symbol.push('_');
+        assert!(!artifact.authenticates_receipt());
+        artifact.participation_entry_symbol.pop();
         artifact.object[0] ^= 1;
         assert!(!artifact.authenticates_receipt());
         artifact.object[0] ^= 1;
@@ -2298,6 +2355,60 @@ mod tests {
             &section.bytes()[start..end],
             &[0x40, 0x01, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]
         );
+    }
+
+    #[test]
+    fn program_only_selector_dependency_gets_authenticated_negative_entry() {
+        let mut compiled = compile_captures(CaptureCompileRequest::new(
+            r"^((?:ab)+)(c)?$",
+            Target::aarch64_macos(),
+        ))
+        .expect("capture compile");
+        assert!(
+            compiled
+                .selector()
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            compiled
+                .selector()
+                .module()
+                .required_runtime_program()
+                .is_none()
+        );
+
+        compiled.inject_test_only_selector_runtime_program_dependency();
+        assert!(
+            compiled
+                .selector()
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            compiled
+                .selector()
+                .module()
+                .required_runtime_program()
+                .is_some()
+        );
+
+        let artifact = compiled
+            .emit_native_participation_aot_v1(NativeParticipationAotLimitsV1::default())
+            .expect("negative artifact");
+        assert_eq!(
+            artifact.receipt().strategy,
+            NativeParticipationAotStrategyV1::NegativeEntry
+        );
+        assert_eq!(
+            artifact.receipt().decline,
+            Some(NativeParticipationAotDeclineV1::SelectorRequiresRuntime)
+        );
+        assert!(artifact.authenticates_receipt());
     }
 
     #[cfg(any(
@@ -2396,25 +2507,30 @@ int main(void) {
   static const uint8_t ababc[] = {'a','b','a','b','c'};
   static const uint8_t ab[] = {'a','b'};
   static const uint8_t empty_owner[] = {0};
-  uint64_t scratch[2] = {0};
+  uint64_t scratch[2] = {0x1111111111111111ULL, 0x2222222222222222ULL};
   size_t count = 99;
   request_t request = {ANCHORED_BUNDLE, abab, sizeof(abab), 0, 4,
                        (uint8_t *)scratch, sizeof(scratch), &count};
   uint32_t status = ANCHORED_ENTRY(&request);
   if (status != 1) return 100 + (int)status;
   if (count != 2) return 110 + (int)count;
+  if (scratch[0] != 0x1111111111111111ULL ||
+      scratch[1] != 0x2222222222222222ULL) return 10;
 
   request.haystack = ababc; request.haystack_len = sizeof(ababc);
   request.match_end = sizeof(ababc); count = 99;
   status = ANCHORED_ENTRY(&request);
   if (status != 1 || count != 3) return 11;
 
-  request.haystack = abab; request.haystack_len = sizeof(abab);
-  request.match_end = 2; count = 77;
+  request.haystack = abab; request.haystack_len = sizeof(abab); request.match_end = 2;
+  request.count_out = (size_t *)&scratch[0];
+  scratch[0] = 0x3333333333333333ULL;
+  scratch[1] = 0x4444444444444444ULL;
   status = ANCHORED_ENTRY(&request);
-  if (status != 3 || count != 77) return 12;
+  if (status != 3 || scratch[0] != 0x3333333333333333ULL ||
+      scratch[1] != 0x4444444444444444ULL) return 12;
 
-  request.match_end = 4; request.bundle = ab; count = 66;
+  request.match_end = 4; request.bundle = ab; request.count_out = &count; count = 66;
   scratch[0] = 0x1111111111111111ULL;
   scratch[1] = 0x2222222222222222ULL;
   status = ANCHORED_ENTRY(&request);
@@ -2428,7 +2544,35 @@ int main(void) {
 
   request.scratch_len = sizeof(scratch); request.count_out = (size_t *)&scratch[0];
   status = ANCHORED_ENTRY(&request);
-  if (status != 1 || scratch[0] != 2) return 15;
+  if (status != 1 || scratch[0] != 2 ||
+      scratch[1] != 0x2222222222222222ULL) return 15;
+
+  union overlap_owner { uint64_t align[2]; uint8_t bytes[16]; } overlap = {
+    .bytes = {'a','b','a','b'}
+  };
+  uint8_t overlap_before[16];
+  memcpy(overlap_before, overlap.bytes, sizeof(overlap_before));
+  count = 88;
+  request = (request_t){ANCHORED_BUNDLE, overlap.bytes, 4, 0, 4,
+                        overlap.bytes, sizeof(overlap.bytes), &count};
+  status = ANCHORED_ENTRY(&request);
+  if (status != 1 || count != 2 ||
+      memcmp(overlap.bytes, overlap_before, sizeof(overlap_before)) != 0) return 16;
+
+  count = 87;
+  request = (request_t){ANCHORED_BUNDLE, abab, sizeof(abab), 0, 4,
+                        (uint8_t *)(uintptr_t)ANCHORED_BUNDLE, 16, &count};
+  status = ANCHORED_ENTRY(&request);
+  if (status != 1 || count != 2) return 17;
+
+  count = 86;
+  request = (request_t){ANCHORED_BUNDLE, abab, sizeof(abab), 0, 4,
+                        (uint8_t *)&request, 16, &count};
+  uint8_t request_before[16];
+  memcpy(request_before, &request, sizeof(request_before));
+  status = ANCHORED_ENTRY(&request);
+  if (status != 1 || count != 2 ||
+      memcmp(&request, request_before, sizeof(request_before)) != 0) return 18;
 
   request = (request_t){PRIORITY_BUNDLE, ab, sizeof(ab), 0, 2,
                         (uint8_t *)scratch, sizeof(scratch), &count};
@@ -2443,10 +2587,32 @@ int main(void) {
   if (status != 1 || count != 2) return 30;
 
   count = 22;
-  unsigned char raw_request[sizeof(request_t) + 8];
-  memset(raw_request, 0, sizeof(raw_request));
-  status = ANCHORED_ENTRY((const request_t *)(raw_request + 1));
+  request = (request_t){ANCHORED_BUNDLE, abab, sizeof(abab), 0, 4,
+                        (uint8_t *)scratch, sizeof(scratch), &count};
+  union request_owner {
+    uint64_t align[9];
+    unsigned char bytes[sizeof(request_t) + 8];
+  } raw_request;
+  memset(&raw_request, 0, sizeof(raw_request));
+  memcpy(raw_request.bytes + 4, &request, sizeof(request));
+  status = ANCHORED_ENTRY((const request_t *)(raw_request.bytes + 4));
   if (status != 2 || count != 22) return 40;
+
+  union misaligned_owner { uint64_t align[3]; uint8_t bytes[24]; } misaligned;
+  uint8_t misaligned_before[24];
+  memset(misaligned.bytes, 0xa5, sizeof(misaligned.bytes));
+  memcpy(misaligned_before, misaligned.bytes, sizeof(misaligned_before));
+  count = 21;
+  request.scratch = misaligned.bytes + 4; request.count_out = &count;
+  status = ANCHORED_ENTRY(&request);
+  if (status != 2 || count != 21 ||
+      memcmp(misaligned.bytes, misaligned_before, sizeof(misaligned_before)) != 0) return 41;
+
+  request.scratch = (uint8_t *)scratch;
+  request.count_out = (size_t *)(misaligned.bytes + 4);
+  status = ANCHORED_ENTRY(&request);
+  if (status != 2 ||
+      memcmp(misaligned.bytes, misaligned_before, sizeof(misaligned_before)) != 0) return 42;
 
   status = NEGATIVE_ENTRY(NULL);
   if (status != 10) return 50;

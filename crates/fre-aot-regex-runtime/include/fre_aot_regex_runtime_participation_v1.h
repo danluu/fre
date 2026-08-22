@@ -15,10 +15,11 @@
  * window. The haystack is bytes; invalid UTF-8 is ordinary input.
  *
  * A selected entry requires non-null, naturally aligned, nonwrapping request,
- * scratch, and count pointers. scratch_len must be exactly 16. The scratch is
- * caller-owned disposable working state; it may change after argument and
- * artifact authentication. MATCH alone publishes count_out. Every other
- * status leaves count_out untouched. A well-formed but nonmatching span is a
+ * scratch, and count pointers. scratch_len must be exactly 16. Scratch is
+ * caller-owned reserved ABI storage: the native scratch channel validates but
+ * never reads or writes it. (An aliased count_out can still publish there on
+ * MATCH.) MATCH alone publishes count_out. Every other status leaves count_out
+ * and scratch untouched. A well-formed but nonmatching span is a
  * RUNTIME_FAILURE. A negative entry returns
  * FRE_AOT_REGEX_STATUS_NATIVE_PARTICIPATION_UNAVAILABLE without reading the
  * request.

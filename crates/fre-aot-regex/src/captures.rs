@@ -319,6 +319,12 @@ pub struct CompiledCaptureRegex {
 }
 
 impl CompiledCaptureRegex {
+    #[cfg(test)]
+    pub(crate) fn inject_test_only_selector_runtime_program_dependency(&mut self) {
+        self.selector
+            .inject_test_only_runtime_program_dependency();
+    }
+
     #[must_use]
     pub const fn selector(&self) -> &CompiledRegex {
         &self.selector

@@ -25470,6 +25470,23 @@ fn validate_native_participation_geometry(
     Ok(())
 }
 
+fn aarch64_native_participation_alignment_mask(
+    destination: u8,
+    source: u8,
+) -> Result<u32, ObjectError> {
+    let alignment = crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN;
+    if alignment != 8 {
+        return Err(ObjectError::InvalidModule(
+            "native participation ABI alignment",
+        ));
+    }
+    // `aarch64_and_low_x` accepts a low-bit count, so log2(8) encodes the
+    // required 0x7 mask for request, scratch, and count pointers.
+    let low_bits = u8::try_from(alignment.trailing_zeros())
+        .map_err(|_| ObjectError::ArithmeticOverflow("native participation alignment"))?;
+    aarch64_and_low_x(destination, source, low_bits)
+}
+
 fn aarch64_emit_participation_boundary_signature(
     assembler: &mut Aarch64Assembler,
     plan: u8,
@@ -25522,7 +25539,7 @@ fn lower_aarch64_native_participation_v1(
     let returned = assembler.label()?;
 
     assembler.branch_zero_x(0, invalid_before_frame)?;
-    assembler.instruction(aarch64_and_low_x(8, 0, 3)?)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(8, 0)?)?;
     assembler.branch_nonzero_x(8, invalid_before_frame)?;
     assembler.instruction(aarch64_add_x_imm(8, 0, 64)?)?;
     assembler.instruction(aarch64_cmp_x(8, 0)?)?;
@@ -25557,7 +25574,7 @@ fn lower_aarch64_native_participation_v1(
     assembler.instruction(aarch64_cmp_x(23, 21)?)?;
     assembler.branch_cond(AARCH64_HI, invalid)?;
     assembler.branch_zero_x(24, invalid)?;
-    assembler.instruction(aarch64_and_low_x(9, 24, 3)?)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(9, 24)?)?;
     assembler.branch_nonzero_x(9, invalid)?;
     aarch64_load_u64_constant(
         &mut assembler,
@@ -25568,7 +25585,7 @@ fn lower_aarch64_native_participation_v1(
     assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, invalid)?;
     assembler.branch_zero_x(25, invalid)?;
-    assembler.instruction(aarch64_and_low_x(9, 25, 3)?)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(9, 25)?)?;
     assembler.branch_nonzero_x(9, invalid)?;
     assembler.instruction(aarch64_add_x_reg(9, 20, 21)?)?;
     assembler.instruction(aarch64_cmp_x(9, 20)?)?;
@@ -25586,7 +25603,8 @@ fn lower_aarch64_native_participation_v1(
     assembler.branch_cond(AARCH64_LO, invalid)?;
 
     // Authenticate the immutable bundle header and every code-addressed
-    // geometry word before reading the haystack or mutating scratch.
+    // geometry word before reading the haystack. Reserved scratch is never
+    // read or written.
     assembler.instruction(aarch64_load_x_imm(8, 19, 0)?)?;
     aarch64_load_u64_constant(
         &mut assembler,
@@ -25663,7 +25681,7 @@ fn lower_aarch64_native_participation_v1(
         assembler.branch_cond(AARCH64_NE, runtime_failure)?;
     }
     for (offset, expected) in [
-        (72_u16, geometry.assertions_offset),
+        (72_u16, geometry.build_work),
         (80, geometry.signatures_offset),
         (88, geometry.byte_classes_offset),
         (96, geometry.boundary_map_offset),
@@ -25721,8 +25739,6 @@ fn lower_aarch64_native_participation_v1(
             .map_err(|_| ObjectError::ArithmeticOverflow("participation transitions"))?,
     )?;
     assembler.instruction(aarch64_add_x_reg(28, 19, 28)?)?;
-    assembler.instruction(aarch64_store_x(26, 24, 0)?)?;
-    assembler.instruction(aarch64_store_x(27, 24, 8)?)?;
 
     assembler.bind(loop_head)?;
     assembler.instruction(aarch64_cmp_x(27, 23)?)?;
@@ -25787,8 +25803,6 @@ fn lower_aarch64_native_participation_v1(
     )?;
     assembler.instruction(aarch64_cmp_w(26, 8)?)?;
     assembler.branch_cond(AARCH64_HS, runtime_failure)?;
-    assembler.instruction(aarch64_store_x(26, 24, 0)?)?;
-    assembler.instruction(aarch64_store_x(27, 24, 8)?)?;
     assembler.branch(loop_head)?;
 
     assembler.bind(accept)?;
@@ -25946,7 +25960,8 @@ fn lower_x86_64_native_participation_v1(
     }
 
     // The relocated bundle address authenticates ownership; validate every
-    // code-addressed immutable geometry word before reading input or scratch.
+    // code-addressed immutable geometry word before reading input. Reserved
+    // scratch is never read or written.
     let mut magic = vec![0x48, 0xb8];
     magic.extend_from_slice(
         &u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC).to_le_bytes(),
@@ -25995,7 +26010,7 @@ fn lower_x86_64_native_participation_v1(
             usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
                 .map_err(|_| ObjectError::ArithmeticOverflow("participation seal"))?,
         ),
-        (72, geometry.assertions_offset),
+        (72, geometry.build_work),
         (80, geometry.signatures_offset),
         (88, geometry.byte_classes_offset),
         (96, geometry.boundary_map_offset),
@@ -26040,8 +26055,6 @@ fn lower_x86_64_native_participation_v1(
     let mut transitions = vec![0x4d, 0x8d, 0x97];
     transitions.extend_from_slice(&transitions_offset);
     assembler.instruction(&transitions)?;
-    assembler.instruction(&[0x49, 0x89, 0x28])?;
-    assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
 
     assembler.bind(loop_head)?;
     assembler.instruction(&[0x4d, 0x39, 0xf5])?;
@@ -26090,8 +26103,6 @@ fn lower_x86_64_native_participation_v1(
     state_bound.extend_from_slice(&state_count.to_le_bytes());
     assembler.instruction(&state_bound)?;
     assembler.branch(&[0x0f, 0x83], runtime_failure)?;
-    assembler.instruction(&[0x49, 0x89, 0x28])?;
-    assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
     assembler.branch(&[0xe9], loop_head)?;
 
     assembler.bind(accept)?;

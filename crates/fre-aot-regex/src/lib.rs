@@ -708,6 +708,11 @@ pub struct CompiledRegexWorkspace {
 }
 
 impl CompiledRegex {
+    #[cfg(test)]
+    pub(crate) fn inject_test_only_runtime_program_dependency(&mut self) {
+        self.module.inject_test_only_runtime_program_dependency();
+    }
+
     #[must_use]
     pub const fn program(&self) -> &CompiledProgram {
         &self.program

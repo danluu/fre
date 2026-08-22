@@ -602,8 +602,9 @@ pub type FreAotRegexCaptureNextV1 = unsafe extern "C" fn(
 /// `bundle` must be the paired identity-suffixed bundle symbol from the same
 /// linked object as the entry. The exact span must have been returned by that
 /// object's ordinary full-window Span selector. Selected entries require
-/// exactly 16 bytes of naturally aligned caller-owned scratch and publish
-/// `count_out` only on [`STATUS_MATCH`].
+/// exactly 16 bytes of naturally aligned caller-owned reserved storage. The
+/// native scratch channel is validated but never read or written. Selected
+/// entries publish `count_out` only on [`STATUS_MATCH`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct FreAotRegexParticipationRequestV1 {
