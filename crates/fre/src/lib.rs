@@ -19533,8 +19533,7 @@ impl<'r> PortableOrdinarySession<'r> {
                 projection.is_match_at(haystack, start)
             }
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
-                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
-                .map(|endpoint| endpoint.is_some())
+                .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
         }
     }

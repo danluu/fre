@@ -474,8 +474,11 @@ impl LiteralSetPlan {
     #[doc(hidden)]
     #[must_use]
     pub fn ordinary_executor(&self) -> Option<LiteralSetOrdinaryExecutor<'_>> {
+        // A generic `AsRef` provider can change between preflight and DFA
+        // construction, so bind positive width from the retained owner too.
         (self.build.match_semantics == LiteralSetMatchSemantics::LeftmostFirst
             && self.build.minimum_pattern_bytes > 0
+            && self.automaton.min_pattern_len() > 0
             && self.folded_long_tail.is_none())
             .then_some(LiteralSetOrdinaryExecutor { plan: self })
     }
@@ -671,6 +674,73 @@ impl LiteralSetPlan {
             .expect("the literal-set DFA supports its construction-selected unanchored input")
             .map(|matched| absolute_match(window.start(), matched))
             .transpose()
+    }
+
+    #[inline(never)]
+    fn selected_end_window_value<const FIRST_ACCEPTANCE: bool>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Option<usize> {
+        let automaton = self.automaton.as_ref();
+        debug_assert!(automaton.prefilter().is_none());
+        let anchored = Anchored::No;
+        let mut state = automaton
+            .start_state(anchored)
+            .expect("the literal-set DFA retains its unanchored start state");
+        let mut at = window.start();
+        let mut selected = None;
+        debug_assert!(!automaton.is_match(state));
+        while at < window.end() {
+            state = automaton.next_state(anchored, state, haystack[at]);
+            at += 1;
+            if automaton.is_special(state) {
+                if automaton.is_dead(state) {
+                    return selected;
+                }
+                debug_assert!(
+                    automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                if automaton.is_match(state) {
+                    if FIRST_ACCEPTANCE {
+                        return Some(at);
+                    }
+                    selected = Some(at);
+                }
+            }
+        }
+        selected
+    }
+
+    #[inline]
+    fn try_exists_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<bool, LiteralSetError> {
+        if self.automaton.prefilter().is_some() {
+            return self
+                .try_find_window_value(haystack, window)
+                .map(|matched| matched.is_some());
+        }
+        Ok(self
+            .selected_end_window_value::<true>(haystack, window)
+            .is_some())
+    }
+
+    #[inline]
+    fn try_selected_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<usize>, LiteralSetError> {
+        if self.automaton.prefilter().is_some() {
+            return self
+                .try_find_window_value(haystack, window)
+                .map(|matched| matched.map(|(_, end)| end));
+        }
+        Ok(self.selected_end_window_value::<false>(haystack, window))
     }
 
     #[inline]
@@ -1254,6 +1324,23 @@ impl LiteralSetOrdinaryExecutor<'_> {
         self.plan.try_find_window_value(haystack, window)
     }
 
+    /// Return whether any literal accepts wholly inside `window` without
+    /// finite-search accounting or selected-span reconstruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::find_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn exists_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<bool, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        self.plan.try_exists_window_value(haystack, window)
+    }
+
     /// Return only the selected span's endpoint without finite-search
     /// accounting.
     ///
@@ -1267,8 +1354,8 @@ impl LiteralSetOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
-        self.find_window_value(haystack, window)
-            .map(|matched| matched.map(|(_, end)| end))
+        validate_window(window, haystack.len())?;
+        self.plan.try_selected_end_window_value(haystack, window)
     }
 }
 
@@ -3608,7 +3695,10 @@ mod folded_long_tail_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
+
+    use aho_corasick::automaton::Automaton;
 
     use super::{LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits};
     use crate::Window;
@@ -3681,6 +3771,10 @@ mod tests {
                 .0;
             assert_eq!(ordinary.find_window_value(haystack, window), Ok(expected));
             assert_eq!(
+                ordinary.exists_window_value(haystack, window),
+                Ok(expected.is_some()),
+            );
+            assert_eq!(
                 ordinary.selected_end_window_value(haystack, window),
                 Ok(expected.map(|(_, end)| end)),
             );
@@ -3712,6 +3806,73 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_selected_endpoint_matches_checked_dense_dfa_search() {
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[0] = vec![1; 4];
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        let haystacks = [
+            [200, 1, 1, 1, 1, 201].as_slice(),
+            [200, 1, 1, 1, 2].as_slice(),
+            [200, 57, 57, 57, 201].as_slice(),
+            [200, 201, 202].as_slice(),
+        ];
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let expected = plan
+                        .find_window(haystack, window, LiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        ordinary.find_window_value(haystack, window),
+                        Ok(expected),
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.exists_window_value(haystack, window),
+                        Ok(expected.is_some()),
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.selected_end_window_value(haystack, window),
+                        Ok(expected.map(|(_, end)| end)),
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                }
+            }
+        }
+
+        patterns.swap(0, 1);
+        let short_first =
+            LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(short_first.automaton.prefilter().is_none());
+        let ordinary = short_first
+            .ordinary_executor()
+            .expect("positive ordered executor");
+        let haystack = [200, 1, 1, 1, 1, 201];
+        let window = Window::full(&haystack);
+        let expected = short_first
+            .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert_eq!(expected, Some((1, 4)));
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(expected),
+        );
+        assert_eq!(ordinary.exists_window_value(&haystack, window), Ok(true));
+        assert_eq!(
+            ordinary.selected_end_window_value(&haystack, window),
+            Ok(Some(4)),
+        );
+    }
+
+    #[test]
     fn ordinary_executor_admission_and_window_validation_are_exact() {
         let positive = LiteralSetPlan::new(
             &[b"ab".as_slice(), b"cd".as_slice()],
@@ -3737,7 +3898,15 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(ordinary.find_window_value(b"abcd", window), Err(expected));
+            assert_eq!(
+                ordinary.find_window_value(b"abcd", window),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                ordinary.exists_window_value(b"abcd", window),
+                Err(expected.clone()),
+            );
+            assert_eq!(ordinary.selected_end_window_value(b"abcd", window), Err(expected));
         }
 
         let nullable = LiteralSetPlan::new(
@@ -3753,6 +3922,27 @@ mod tests {
         )
         .unwrap();
         assert!(streaming.ordinary_executor().is_none());
+
+        struct ChangingPattern(Cell<bool>);
+
+        impl AsRef<[u8]> for ChangingPattern {
+            fn as_ref(&self) -> &[u8] {
+                if self.0.replace(true) {
+                    b""
+                } else {
+                    b"a"
+                }
+            }
+        }
+
+        let changed = LiteralSetPlan::new(
+            &[ChangingPattern(Cell::new(false))],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(changed.build.minimum_pattern_bytes, 1);
+        assert_eq!(changed.automaton.min_pattern_len(), 0);
+        assert!(changed.ordinary_executor().is_none());
     }
 
     #[test]
