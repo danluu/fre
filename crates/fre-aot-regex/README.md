@@ -63,3 +63,16 @@ The additive [AOT regex-set foundation](../../docs/AOT_REGEX_SET.md) compiles
 each source row as an independent Exists program and transactionally fills an
 exact caller-owned bitset. It keeps all-matching-ID semantics separate from
 ordered-many priority and does not change the stable single-program wire.
+
+## Uniform capture participation
+
+`compile_uniform_capture_selector` accepts an already canonical
+`fre_syntax::RustParsed` value. It does not reparse source or implement a
+second capture theorem: `fre-lower` proves uniform nonempty capture
+participation and produces the ordinary capture-free `RawPlan` in one paired
+transaction. FRE then compiles that plan as the unchanged ordinary Span
+selector. A positive receipt binds the proof to the selector automaton,
+stable program, final object, target, and line terminator; a semantic proof
+decline remains explicit. Proof/lowering/compiler failures are terminal, and
+the API rejects selectors with runtime or prepared-handle dependencies so a
+consumer cannot mistake a fallback for a helper-free native entry.

@@ -41,6 +41,7 @@ mod program;
 mod regex_set;
 mod required_literals;
 mod seeded_reverse;
+mod uniform_capture;
 
 use fre_automata::{Automaton, RawPlan};
 use fre_lower::{LowerLimits, OperationSemantics};
@@ -277,6 +278,11 @@ pub use regex_set::{
     RegexSetCompileRequest, RegexSetFillReport, RegexSetOutputError, RegexSetPatternIds,
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
+};
+pub use uniform_capture::{
+    CompiledUniformCaptureSelector, UniformCaptureAuthenticationError,
+    UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
+    UniformCaptureCompileRequest, compile_uniform_capture_selector,
 };
 
 /// Stable compiler pipeline identity.
