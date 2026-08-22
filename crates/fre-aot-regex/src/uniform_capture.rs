@@ -365,6 +365,7 @@ pub fn compile_uniform_capture_selector(
         request.mode,
         request.selector_limits,
         request.selector_slow_aot_limits,
+        crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
     )
     .map_err(UniformCaptureCompileError::Selector)?;
     authenticate_ordinary_native_span(&selector)
