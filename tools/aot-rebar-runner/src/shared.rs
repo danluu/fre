@@ -2,10 +2,11 @@ use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, CompiledRegex, FeatureSet, OperatingSystem,
-    OutputContract, PreparedAggregateExports, SymbolBinding, SymbolKind, Target, compile,
-    compile_with_prepared_aggregate_exports,
+    OutputContract, PreparedAggregateExports, SymbolBinding, SymbolKind, Target,
+    UniformCaptureCompileDisposition, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
+    compile, compile_uniform_capture_selector, compile_with_prepared_aggregate_exports,
 };
-use fre_syntax::RustProfile;
+use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
 /// Maximum source rows accepted by the additive independent-native-row bridge.
@@ -22,7 +23,9 @@ pub enum Model {
     Compile,
     Count,
     SpanSum,
+    CountCaptures,
     GrepCount,
+    GrepCaptures,
     RegexRedux,
 }
 
@@ -35,7 +38,9 @@ impl Model {
             ),
             "count" => Ok(Self::Count),
             "count-spans" => Ok(Self::SpanSum),
+            "count-captures" => Ok(Self::CountCaptures),
             "grep" => Ok(Self::GrepCount),
+            "grep-captures" => Ok(Self::GrepCaptures),
             "regex-redux" => Ok(Self::RegexRedux),
             other => Err(format!(
                 "general AOT Rebar runner does not support model {other:?}"
@@ -48,7 +53,9 @@ impl Model {
             Self::Compile => "compile",
             Self::Count => "count",
             Self::SpanSum => "count-spans",
+            Self::CountCaptures => "count-captures",
             Self::GrepCount => "grep",
+            Self::GrepCaptures => "grep-captures",
             Self::RegexRedux => "regex-redux",
         }
     }
@@ -58,7 +65,9 @@ impl Model {
             Self::Compile => "general-aot-optimizing-object-linked-count-verify-prepared-v2",
             Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
             Self::SpanSum => "general-aot-linked-complete-spans-prepared-v2",
+            Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
             Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+            Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
             Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
     }
@@ -83,7 +92,9 @@ impl Model {
             Self::SpanSum => {
                 "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15"
             }
+            Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
             Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+            Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
             Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
     }
@@ -99,6 +110,7 @@ impl Model {
             Self::Compile | Self::Count => 1 << 1,
             Self::SpanSum => 1 << 2,
             Self::GrepCount => 1 << 3,
+            Self::CountCaptures | Self::GrepCaptures => 0,
             Self::RegexRedux => 0,
         }
     }
@@ -108,6 +120,7 @@ impl Model {
             Self::Compile | Self::Count => PreparedAggregateExports::COUNT,
             Self::SpanSum => PreparedAggregateExports::SPAN_SUM,
             Self::GrepCount => PreparedAggregateExports::GREP_COUNT,
+            Self::CountCaptures | Self::GrepCaptures => PreparedAggregateExports::NONE,
             Self::RegexRedux => PreparedAggregateExports::NONE,
         }
     }
@@ -116,8 +129,17 @@ impl Model {
         match self {
             Self::GrepCount => OutputContract::Exists,
             Self::RegexRedux => OutputContract::Span,
-            Self::Compile | Self::Count | Self::SpanSum => OutputContract::Span,
+            Self::Compile
+            | Self::Count
+            | Self::SpanSum
+            | Self::CountCaptures
+            | Self::GrepCaptures => OutputContract::Span,
         }
+    }
+
+    #[must_use]
+    pub const fn is_capture(self) -> bool {
+        matches!(self, Self::CountCaptures | Self::GrepCaptures)
     }
 }
 
@@ -301,7 +323,10 @@ impl Benchmark {
                 );
             }
             if benchmark.patterns.len() > 1
-                && !matches!(benchmark.model, Model::Count | Model::SpanSum)
+                && !matches!(
+                    benchmark.model,
+                    Model::Count | Model::SpanSum | Model::CountCaptures | Model::GrepCaptures
+                )
             {
                 return Err(format!(
                     "current linked general-AOT multi-pattern bridge supports only count and count-spans, got model {:?} with {} patterns",
@@ -334,7 +359,12 @@ impl Benchmark {
 
     #[must_use]
     pub fn uses_native_row_bridge(&self) -> bool {
-        self.patterns.len() > 1
+        self.patterns.len() > 1 && !self.model.is_capture()
+    }
+
+    #[must_use]
+    pub const fn uses_uniform_capture_bridge(&self) -> bool {
+        self.model.is_capture()
     }
 
     pub fn same_compilation_identity(&self, other: &Self) -> bool {
@@ -368,6 +398,12 @@ pub fn target_from_parts(
 }
 
 pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<CompiledRegex, String> {
+    if benchmark.model.is_capture() {
+        return Err(
+            "capture models require the paired uniform-capture compiler or strict capture compiler"
+                .to_owned(),
+        );
+    }
     if benchmark.uses_native_row_bridge() {
         return Err(
             "single-artifact compilation cannot compile a multi-pattern native-row bridge"
@@ -404,6 +440,175 @@ pub struct NativeRowBridge {
     pub artifacts: Vec<NativeRowArtifact>,
     pub source_to_artifact: Vec<usize>,
     pub total_object_bytes: usize,
+}
+
+/// One all-or-nothing uniform-participation proof per source row, paired with
+/// the independently authenticated ordinary native selector table.
+#[derive(Clone, Debug)]
+pub struct UniformCaptureBridge {
+    pub rows: NativeRowBridge,
+    pub source_receipts: Vec<UniformCaptureCompileReceipt>,
+}
+
+/// Compile one helper-free native selector per distinct row and prove that
+/// every source has one positive, source-independent capture multiplier.
+///
+/// A semantic decline on any source rejects the whole operation. Distinct
+/// capture spellings may erase to the same selector object; in that case the
+/// retained row and multiplier are always those of the lowest source ordinal,
+/// exactly matching Rust's leftmost-first multi-pattern priority.
+pub fn compile_uniform_capture_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<UniformCaptureBridge, String> {
+    if !benchmark.uses_uniform_capture_bridge() || !benchmark.model.is_capture() {
+        return Err(
+            "uniform-capture bridge compilation requires count-captures or grep-captures"
+                .to_owned(),
+        );
+    }
+    if benchmark.patterns.is_empty() || benchmark.patterns.len() > MAX_NATIVE_ROW_BRIDGE_PATTERNS {
+        return Err(format!(
+            "general-AOT uniform-capture bridge pattern count {} is outside 1..={MAX_NATIVE_ROW_BRIDGE_PATTERNS}",
+            benchmark.patterns.len()
+        ));
+    }
+
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let mut exact_sources = BTreeMap::<&str, (usize, UniformCaptureCompileReceipt)>::new();
+    let mut link_artifacts = BTreeMap::<String, usize>::new();
+    let mut defined_link_symbols = BTreeMap::<String, usize>::new();
+    let mut artifacts = Vec::<NativeRowArtifact>::new();
+    let mut source_to_artifact = Vec::new();
+    let mut source_receipts = Vec::new();
+    source_to_artifact
+        .try_reserve_exact(benchmark.patterns.len())
+        .map_err(|_| "uniform-capture source map allocation failed".to_owned())?;
+    source_receipts
+        .try_reserve_exact(benchmark.patterns.len())
+        .map_err(|_| "uniform-capture receipt allocation failed".to_owned())?;
+    let mut total_object_bytes = 0_usize;
+
+    for (source_ordinal, pattern) in benchmark.patterns.iter().enumerate() {
+        if let Some(&(artifact_index, receipt)) = exact_sources.get(pattern.as_str()) {
+            source_to_artifact.push(artifact_index);
+            source_receipts.push(receipt);
+            continue;
+        }
+
+        let parsed = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustBytes(profile.clone()),
+        ))
+        .map_err(|error| {
+            format!("uniform-capture parse failed at source ordinal {source_ordinal}: {error}")
+        })?;
+        let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            return Err(format!(
+                "uniform-capture source ordinal {source_ordinal} did not produce Rust HIR"
+            ));
+        };
+        let compiled = compile_uniform_capture_selector(
+            &parsed,
+            UniformCaptureCompileRequest::new(pattern.len(), target).profile(profile.clone()),
+        )
+        .map_err(|error| {
+            format!(
+                "uniform-capture selector compilation failed at source ordinal {source_ordinal}: {error}"
+            )
+        })?;
+        compiled.authenticate().map_err(|error| {
+            format!(
+                "uniform-capture selector authentication failed at source ordinal {source_ordinal}: {error}"
+            )
+        })?;
+        let (selector, disposition) = compiled.into_parts();
+        let proof = match disposition {
+            UniformCaptureCompileDisposition::Proven(receipt) => receipt,
+            UniformCaptureCompileDisposition::Declined(reason) => {
+                return Err(format!(
+                    "uniform-capture proof declined at source ordinal {source_ordinal}: {reason:?}"
+                ));
+            }
+        };
+        proof.authenticate(&selector).map_err(|error| {
+            format!("uniform-capture proof seal failed at source ordinal {source_ordinal}: {error}")
+        })?;
+        authenticate_native_row(&selector, source_ordinal)?;
+
+        let entry = selector.module().entry_symbol().to_owned();
+        let artifact_index = if let Some(&existing) = link_artifacts.get(&entry) {
+            let prior = &artifacts[existing].compiled;
+            if prior.object() != selector.object()
+                || prior.receipt().object_sha256 != selector.receipt().object_sha256
+            {
+                return Err(format!(
+                    "uniform-capture entry symbol collision at source ordinal {source_ordinal}: {entry:?}"
+                ));
+            }
+            proof.authenticate(prior).map_err(|error| {
+                format!(
+                    "uniform-capture source ordinal {source_ordinal} does not authenticate the retained selector: {error}"
+                )
+            })?;
+            existing
+        } else {
+            let prospective = total_object_bytes
+                .checked_add(selector.object().len())
+                .ok_or_else(|| "uniform-capture object-byte total overflowed".to_owned())?;
+            if prospective > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES {
+                return Err(format!(
+                    "general-AOT uniform-capture objects require {prospective} bytes, limit is {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES}"
+                ));
+            }
+            let index = artifacts.len();
+            for symbol in selector.module().symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global && symbol.section.is_some()
+            }) {
+                if let Some(&prior) = defined_link_symbols.get(&symbol.name) {
+                    return Err(format!(
+                        "uniform-capture source ordinal {source_ordinal} defines link symbol {:?} already owned by artifact {prior}",
+                        symbol.name
+                    ));
+                }
+            }
+            artifacts
+                .try_reserve(1)
+                .map_err(|_| "uniform-capture artifact allocation failed".to_owned())?;
+            artifacts.push(NativeRowArtifact {
+                compiled: selector,
+                first_source_ordinal: source_ordinal,
+            });
+            for symbol in artifacts[index]
+                .compiled
+                .module()
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.binding == SymbolBinding::Global && symbol.section.is_some()
+                })
+            {
+                defined_link_symbols.insert(symbol.name.clone(), index);
+            }
+            link_artifacts.insert(entry, index);
+            total_object_bytes = prospective;
+            index
+        };
+        exact_sources.insert(pattern.as_str(), (artifact_index, proof));
+        source_to_artifact.push(artifact_index);
+        source_receipts.push(proof);
+    }
+
+    Ok(UniformCaptureBridge {
+        rows: NativeRowBridge {
+            artifacts,
+            source_to_artifact,
+            total_object_bytes,
+        },
+        source_receipts,
+    })
 }
 
 /// Compile and authenticate one ordinary native `Span` object per distinct row.
@@ -688,8 +893,17 @@ mod tests {
     }
 
     #[test]
-    fn admits_multi_pattern_reducers_and_rejects_other_multi_models() {
-        assert!(Benchmark::parse(&fixture("count-captures", b"(a)", b"a")).is_err());
+    fn admits_typed_capture_models_and_multi_pattern_reducers() {
+        let captures = Benchmark::parse(&fixture("count-captures", b"(a)", b"a"))
+            .expect("count-captures fixture");
+        assert_eq!(captures.model, Model::CountCaptures);
+        assert!(captures.model.is_capture());
+        assert!(captures.uses_uniform_capture_bridge());
+        assert!(!captures.uses_native_row_bridge());
+        let grep_captures = Benchmark::parse(&fixture("grep-captures", b"(a)", b"a"))
+            .expect("grep-captures fixture");
+        assert_eq!(grep_captures.model, Model::GrepCaptures);
+        assert!(grep_captures.uses_uniform_capture_bridge());
         assert!(Benchmark::parse(&fixture("compile", b"a", b"a")).is_err());
         let mut multi = fixture("count", b"a", b"a");
         let insertion = b"pattern:1:b\n";
@@ -701,6 +915,17 @@ mod tests {
         let parsed = Benchmark::parse(&multi).expect("multi-pattern Count");
         assert_eq!(parsed.patterns, ["a", "b"]);
         assert!(parsed.uses_native_row_bridge());
+
+        let mut multi_captures = fixture("count-captures", b"(a)", b"a");
+        let offset = multi_captures
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi_captures.splice(offset..offset, b"pattern:3:(b)\n".iter().copied());
+        let parsed = Benchmark::parse(&multi_captures).expect("multi-pattern capture model");
+        assert_eq!(parsed.patterns, ["(a)", "(b)"]);
+        assert!(parsed.uses_uniform_capture_bridge());
+        assert!(!parsed.uses_native_row_bridge());
 
         let mut multi_grep = fixture("grep", b"a", b"a");
         let offset = multi_grep
@@ -781,6 +1006,73 @@ mod tests {
     }
 
     #[test]
+    fn uniform_capture_bridge_binds_winning_source_multiplier_after_selector_dedup() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (first, second, expected_first_groups) in [
+            (b"(a+)".as_slice(), b"a+".as_slice(), 2),
+            (b"a+", b"(a+)", 1),
+        ] {
+            let mut klv = fixture("count-captures", first, b"aa x aaa");
+            let insertion = format!(
+                "pattern:{}:{}\n",
+                second.len(),
+                std::str::from_utf8(second).expect("ASCII fixture")
+            );
+            let offset = klv
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            klv.splice(offset..offset, insertion.bytes());
+            let benchmark = Benchmark::parse(&klv).expect("uniform-capture fixture");
+            let bridge =
+                compile_uniform_capture_bridge(&benchmark, target).expect("uniform-capture bridge");
+            assert_eq!(bridge.rows.artifacts.len(), 1);
+            assert_eq!(bridge.rows.source_to_artifact, [0, 0]);
+            assert_eq!(bridge.rows.artifacts[0].first_source_ordinal, 0);
+            let groups = bridge
+                .source_receipts
+                .iter()
+                .map(|receipt| {
+                    receipt
+                        .participation()
+                        .participating_groups_per_match()
+                        .get()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(groups[0], expected_first_groups);
+            assert_eq!(groups.iter().sum::<usize>(), 3);
+            for receipt in &bridge.source_receipts {
+                receipt
+                    .authenticate(&bridge.rows.artifacts[0].compiled)
+                    .expect("each source proof binds the retained selector");
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_capture_bridge_declines_the_complete_job_on_one_unproved_source() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for pattern in [b"(a)?b".as_slice(), b"(a)*".as_slice()] {
+            let benchmark = Benchmark::parse(&fixture("count-captures", pattern, b"aa b"))
+                .expect("decline fixture");
+            let error = compile_uniform_capture_bridge(&benchmark, target)
+                .expect_err("a semantic decline rejects the complete job");
+            assert!(error.contains("source ordinal 0"), "{error}");
+            assert!(error.contains("proof declined"), "{error}");
+        }
+    }
+
+    #[test]
     fn native_row_bridge_pattern_cap_fails_before_compilation() {
         let mut too_many = fixture("count", b"a", b"a");
         let insertion = b"pattern:1:a\n".repeat(MAX_NATIVE_ROW_BRIDGE_PATTERNS);
@@ -848,9 +1140,19 @@ mod tests {
                 PREPARE_OPERATION_SPAN_SUM,
             ),
             (
+                Model::CountCaptures,
+                "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
+                0,
+            ),
+            (
                 Model::GrepCount,
                 "general-aot-linked-per-line-is-match-v1",
                 PREPARE_OPERATION_GREP_COUNT,
+            ),
+            (
+                Model::GrepCaptures,
+                "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
+                0,
             ),
             (
                 Model::RegexRedux,

@@ -223,6 +223,7 @@ dependencies = [
  "bstr",
  "fre-aot-regex",
  "fre-aot-regex-runtime",
+ "fre-lower",
  "fre-syntax",
  "regex-automata 0.4.15",
 ]

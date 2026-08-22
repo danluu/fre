@@ -22,11 +22,13 @@ use fre_aot_regex_runtime::{
     FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
     FreAotRegexPrepareConfigV3, FreAotRegexResultV1, PREPARE_CAPABILITY_KNOWN_FLAGS,
     PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
-    STATUS_INVALID_ARGUMENT, STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
+    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
     fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
     fre_aot_regex_runtime_prepare_exclusive_v3,
 };
-use regex_automata::meta::Regex;
+#[cfg(test)]
+use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
+use regex_automata::{Input, meta::Regex};
 
 #[allow(
     unsafe_code,
@@ -466,7 +468,11 @@ fn strict_native_row_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64
     let reducer = match model {
         shared::Model::Count => SpanScalarReducer::Count,
         shared::Model::SpanSum => SpanScalarReducer::SpanSum,
-        shared::Model::Compile | shared::Model::GrepCount | shared::Model::RegexRedux => {
+        shared::Model::Compile
+        | shared::Model::CountCaptures
+        | shared::Model::GrepCount
+        | shared::Model::GrepCaptures
+        | shared::Model::RegexRedux => {
             return Err("native-row bridge received an unsupported operation model".to_owned());
         }
     };
@@ -502,6 +508,24 @@ fn search_native_rows_with(
     window_start: usize,
     mut search: impl FnMut(usize, &mut FreAotRegexResultV1) -> Result<u32, String>,
 ) -> Result<Option<FreAotRegexResultV1>, String> {
+    search_native_rows_with_identity(row_count, haystack_len, window_start, |row, result| {
+        search(row, result)
+    })
+    .map(|selected| selected.map(|selected| selected.result))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeRowMatch {
+    row: usize,
+    result: FreAotRegexResultV1,
+}
+
+fn search_native_rows_with_identity(
+    row_count: usize,
+    haystack_len: usize,
+    window_start: usize,
+    mut search: impl FnMut(usize, &mut FreAotRegexResultV1) -> Result<u32, String>,
+) -> Result<Option<NativeRowMatch>, String> {
     if window_start > haystack_len {
         return Err(format!(
             "native-row window start {window_start} exceeds haystack length {haystack_len}"
@@ -511,7 +535,7 @@ fn search_native_rows_with(
         return Err("native-row bridge has no linked entry".to_owned());
     }
 
-    let mut selected = None::<FreAotRegexResultV1>;
+    let mut selected = None::<NativeRowMatch>;
     for row in 0..row_count {
         let mut result = FreAotRegexResultV1 {
             start: usize::MAX,
@@ -527,8 +551,8 @@ fn search_native_rows_with(
                         "native row {row} returned span {result:?} before requested start {window_start}"
                     ));
                 }
-                if selected.is_none_or(|current| result.start < current.start) {
-                    selected = Some(result);
+                if selected.is_none_or(|current| result.start < current.result.start) {
+                    selected = Some(NativeRowMatch { row, result });
                 }
             }
             other => {
@@ -543,6 +567,84 @@ fn search_native_rows_with(
         }
     }
     Ok(selected)
+}
+
+fn strict_uniform_capture_count_domain_with(
+    row_group_counts: &[u64],
+    haystack: &[u8],
+    mut search: impl FnMut(usize, usize, &mut FreAotRegexResultV1) -> Result<u32, String>,
+) -> Result<u64, String> {
+    if row_group_counts.is_empty() || row_group_counts.contains(&0) {
+        return Err("uniform-capture row group counts are empty or contain zero".to_owned());
+    }
+    let mut count = 0_u64;
+    let mut start = 0_usize;
+    loop {
+        let Some(selected) = search_native_rows_with_identity(
+            row_group_counts.len(),
+            haystack.len(),
+            start,
+            |row, result| search(row, start, result),
+        )?
+        else {
+            return Ok(count);
+        };
+        if selected.result.start == selected.result.end {
+            return Err(format!(
+                "uniform-capture row {} violated its authenticated positive-width proof",
+                selected.row
+            ));
+        }
+        count = count
+            .checked_add(row_group_counts[selected.row])
+            .ok_or_else(|| "linked AOT uniform capture count overflowed".to_owned())?;
+        start = selected.result.end;
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generated capture row table is the exact statically linked AOT C ABI boundary"
+)]
+fn strict_linked_uniform_capture_domain(haystack: &[u8]) -> Result<u64, String> {
+    strict_uniform_capture_count_domain_with(
+        linked::ROW_PARTICIPATING_GROUPS,
+        haystack,
+        |row, window_start, result| {
+            // SAFETY: route authentication binds every table slot to one
+            // helper-free ordinary Span entry. The slice and aligned result
+            // remain live and disjoint for the complete call.
+            let status = unsafe {
+                linked::search_row(
+                    row,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    window_start,
+                    haystack.len(),
+                    result,
+                )
+            };
+            Ok(status)
+        },
+    )
+}
+
+fn strict_uniform_capture_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64, String> {
+    match model {
+        shared::Model::CountCaptures => strict_linked_uniform_capture_domain(haystack),
+        shared::Model::GrepCaptures => haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(strict_linked_uniform_capture_domain(line)?)
+                .ok_or_else(|| "linked AOT grep-captures count overflowed".to_owned())
+        }),
+        shared::Model::Compile
+        | shared::Model::Count
+        | shared::Model::SpanSum
+        | shared::Model::GrepCount
+        | shared::Model::RegexRedux => {
+            Err("uniform-capture bridge received an unsupported operation model".to_owned())
+        }
+    }
 }
 
 fn main() -> Result<(), DynError> {
@@ -685,7 +787,7 @@ fn print_provenance() {
         let mut provenance = String::new();
         write!(
             &mut provenance,
-            "schema=fre.aot.rebar-runner.v3 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true source_pattern_count={} row_total_object_bytes={} source_to_artifact={} component_count={}",
+            "schema=fre.aot.rebar-runner.v3 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge={} source_pattern_count={} row_total_object_bytes={} source_to_artifact={} component_count={}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -699,6 +801,7 @@ fn print_provenance() {
             linked::OPTIMIZER_VERSION,
             linked::ENGINE,
             linked::AGGREGATE_STRATEGY,
+            linked::UNIFORM_CAPTURE_BRIDGE,
             linked::SOURCE_PATTERN_COUNT,
             linked::ROW_TOTAL_OBJECT_BYTES,
             source_to_artifact,
@@ -708,16 +811,79 @@ fn print_provenance() {
         for component in 0..linked::ROW_ARTIFACT_COUNT {
             write!(
                 &mut provenance,
-                " component_{component}_native=true component_{component}_source_ordinal={} component_{component}_entry_symbol={} component_{component}_runtime_symbols= component_{component}_program_sha256={} component_{component}_object_sha256={}",
+                " component_{component}_native=true component_{component}_source_ordinal={} component_{component}_entry_symbol={} component_{component}_runtime_symbols= component_{component}_automaton_sha256={} component_{component}_program_sha256={} component_{component}_object_sha256={}",
                 linked::ROW_FIRST_SOURCE_ORDINALS[component],
                 linked::ROW_ENTRY_SYMBOLS[component],
+                hex(&linked::ROW_AUTOMATON_SHA256[component]),
                 hex(&linked::ROW_PROGRAM_SHA256[component]),
                 hex(&linked::ROW_OBJECT_SHA256[component]),
             )
             .expect("format native-row component provenance");
         }
+        if linked::UNIFORM_CAPTURE_BRIDGE {
+            let groups = linked::SOURCE_PARTICIPATING_GROUPS
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let minimums = linked::SOURCE_MINIMUM_MATCH_BYTES
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let capture_annotations = linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let proof_work = linked::SOURCE_PROOF_WORK
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let proof_stack = linked::SOURCE_PROOF_PEAK_STACK_ITEMS
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let selector_automata = linked::SOURCE_SELECTOR_AUTOMATON_SHA256
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(",");
+            let selector_programs = linked::SOURCE_SELECTOR_PROGRAM_SHA256
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(",");
+            let selector_objects = linked::SOURCE_SELECTOR_OBJECT_SHA256
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(
+                &mut provenance,
+                " capture_resolution=static-uniform-multiplier capture_proof_algorithm_version={} capture_proof_accounting_version={} source_participating_groups={} source_minimum_match_bytes={} source_capture_annotations={} source_proof_work={} source_proof_peak_stack_items={} source_selector_automaton_sha256={} source_selector_program_sha256={} source_selector_object_sha256={}",
+                linked::UNIFORM_CAPTURE_ALGORITHM_VERSION,
+                linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION,
+                groups,
+                minimums,
+                capture_annotations,
+                proof_work,
+                proof_stack,
+                selector_automata,
+                selector_programs,
+                selector_objects,
+            )
+            .expect("format uniform-capture proof provenance");
+        }
+        let boundary = if linked::UNIFORM_CAPTURE_BRIDGE {
+            "native-search-core-static-uniform-capture-resolution"
+        } else {
+            "complete-native-row-bridge"
+        };
         println!(
-            "{provenance} boundary=complete-native-row-bridge required_comparators=rust-regex-1.12.4,fre-current-runtime"
+            "{provenance} boundary={boundary} required_comparators=rust-regex-1.12.4,fre-current-runtime"
         );
         return;
     }
@@ -806,6 +972,12 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
+    if linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
+        return Err("uniform-capture receipt is not attached to a native-row table".to_owned());
+    }
+    if benchmark.uses_uniform_capture_bridge() != linked::UNIFORM_CAPTURE_BRIDGE {
+        return Err("capture operation and linked proof route disagree".to_owned());
+    }
     if benchmark.model == shared::Model::RegexRedux {
         if linked::REGEX_REDUX_COMPONENT_COUNT != shared::REGEX_REDUX_COMPONENTS
             || linked::REGEX_REDUX_ENTRY_SYMBOLS.len() != shared::REGEX_REDUX_COMPONENTS
@@ -950,12 +1122,11 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
 }
 
 fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), String> {
-    const STRATEGY: &str = "native-independent-span-row-selector-v1";
-    if !benchmark.uses_native_row_bridge()
-        || !matches!(
-            benchmark.model,
-            shared::Model::Count | shared::Model::SpanSum
-        )
+    const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
+    const CAPTURE_STRATEGY: &str = "native-row-static-uniform-capture-multiplier-v1";
+    const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
+    if linked::UNIFORM_CAPTURE_BRIDGE != benchmark.uses_uniform_capture_bridge()
+        || (!linked::UNIFORM_CAPTURE_BRIDGE && !benchmark.uses_native_row_bridge())
     {
         return Err("linked native-row table is bound to an invalid benchmark model".to_owned());
     }
@@ -964,8 +1135,12 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::ROW_ARTIFACT_COUNT == 0
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_FIRST_SOURCE_ORDINALS.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_ENTRY_SYMBOLS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_AUTOMATON_SHA256.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_PROGRAM_SHA256.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_OBJECT_SHA256.len()
+        || linked::ROW_AUTOMATON_SHA256
+            .iter()
+            .any(|digest| *digest == [0; 32])
         || linked::ROW_PROGRAM_SHA256
             .iter()
             .any(|digest| *digest == [0; 32])
@@ -988,18 +1163,89 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::PROGRAM_LEN != 0
         || linked::PREPARED_BULK_STRATEGY != "None"
         || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
-        || linked::AGGREGATE_STRATEGY != STRATEGY
-        || linked::GREP_ITERATION_STRATEGY != "not-applicable"
     {
         return Err("linked native-row table exposes a forbidden prepared/helper route".to_owned());
     }
+    let expected_aggregate_strategy = if linked::UNIFORM_CAPTURE_BRIDGE {
+        CAPTURE_STRATEGY
+    } else {
+        ROW_STRATEGY
+    };
     let expected_span_strategy = if benchmark.model == shared::Model::SpanSum {
-        STRATEGY
+        ROW_STRATEGY
     } else {
         "not-applicable"
     };
-    if linked::SPAN_ITERATION_STRATEGY != expected_span_strategy {
+    let expected_grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
+        GREP_CAPTURE_STRATEGY
+    } else {
+        "not-applicable"
+    };
+    if linked::AGGREGATE_STRATEGY != expected_aggregate_strategy
+        || linked::SPAN_ITERATION_STRATEGY != expected_span_strategy
+        || linked::GREP_ITERATION_STRATEGY != expected_grep_strategy
+    {
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
+    }
+
+    if linked::UNIFORM_CAPTURE_BRIDGE {
+        let source_count = linked::SOURCE_PATTERN_COUNT;
+        if linked::UNIFORM_CAPTURE_ALGORITHM_VERSION
+            != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION
+            || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION
+                != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
+            || linked::ROW_PARTICIPATING_GROUPS.len() != linked::ROW_ARTIFACT_COUNT
+            || linked::SOURCE_PARTICIPATING_GROUPS.len() != source_count
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.len() != source_count
+            || linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len() != source_count
+            || linked::SOURCE_PROOF_WORK.len() != source_count
+            || linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len() != source_count
+            || linked::SOURCE_SELECTOR_AUTOMATON_SHA256.len() != source_count
+            || linked::SOURCE_SELECTOR_PROGRAM_SHA256.len() != source_count
+            || linked::SOURCE_SELECTOR_OBJECT_SHA256.len() != source_count
+            || linked::ROW_PARTICIPATING_GROUPS.contains(&0)
+            || linked::SOURCE_PARTICIPATING_GROUPS.contains(&0)
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.contains(&0)
+            || linked::SOURCE_SELECTOR_AUTOMATON_SHA256
+                .iter()
+                .any(|digest| *digest == [0; 32])
+            || linked::SOURCE_SELECTOR_PROGRAM_SHA256
+                .iter()
+                .any(|digest| *digest == [0; 32])
+            || linked::SOURCE_SELECTOR_OBJECT_SHA256
+                .iter()
+                .any(|digest| *digest == [0; 32])
+        {
+            return Err("linked uniform-capture proof closure is malformed".to_owned());
+        }
+        for source in 0..source_count {
+            let artifact = linked::SOURCE_TO_ARTIFACT[source];
+            if artifact >= linked::ROW_ARTIFACT_COUNT
+                || linked::SOURCE_SELECTOR_AUTOMATON_SHA256[source]
+                    != linked::ROW_AUTOMATON_SHA256[artifact]
+                || linked::SOURCE_SELECTOR_PROGRAM_SHA256[source]
+                    != linked::ROW_PROGRAM_SHA256[artifact]
+                || linked::SOURCE_SELECTOR_OBJECT_SHA256[source]
+                    != linked::ROW_OBJECT_SHA256[artifact]
+            {
+                return Err(
+                    "uniform-capture source proof does not bind its retained selector".to_owned(),
+                );
+            }
+        }
+    } else if linked::UNIFORM_CAPTURE_ALGORITHM_VERSION != 0
+        || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION != 0
+        || !linked::ROW_PARTICIPATING_GROUPS.is_empty()
+        || !linked::SOURCE_PARTICIPATING_GROUPS.is_empty()
+        || !linked::SOURCE_MINIMUM_MATCH_BYTES.is_empty()
+        || !linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.is_empty()
+        || !linked::SOURCE_PROOF_WORK.is_empty()
+        || !linked::SOURCE_PROOF_PEAK_STACK_ITEMS.is_empty()
+        || !linked::SOURCE_SELECTOR_AUTOMATON_SHA256.is_empty()
+        || !linked::SOURCE_SELECTOR_PROGRAM_SHA256.is_empty()
+        || !linked::SOURCE_SELECTOR_OBJECT_SHA256.is_empty()
+    {
+        return Err("ordinary native-row route advertises capture proof state".to_owned());
     }
 
     let mut previous_first = None;
@@ -1012,6 +1258,14 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
             return Err("linked native-row source-priority map is malformed".to_owned());
         }
         previous_first = Some(first_source);
+        if linked::UNIFORM_CAPTURE_BRIDGE
+            && linked::ROW_PARTICIPATING_GROUPS[artifact]
+                != linked::SOURCE_PARTICIPATING_GROUPS[first_source]
+        {
+            return Err(
+                "uniform-capture row multiplier is not its first source's proof".to_owned(),
+            );
+        }
     }
     for (source, &artifact) in linked::SOURCE_TO_ARTIFACT.iter().enumerate() {
         if artifact >= linked::ROW_ARTIFACT_COUNT
@@ -1059,6 +1313,9 @@ fn run_operation(
             session,
             ExclusiveSession::strict_grep_with_direct_entry,
         ),
+        shared::Model::CountCaptures | shared::Model::GrepCaptures => {
+            Err("uniform-capture models require the linked native row multiplier route".to_owned())
+        }
         shared::Model::Count => run_operation_route(benchmark, session, ExclusiveSession::reduce),
         shared::Model::RegexRedux => {
             Err("regex-redux does not use one prepared scalar session".to_owned())
@@ -1176,9 +1433,16 @@ fn run_operation_route(
 }
 
 fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>, String> {
+    let operation = |haystack: &[u8]| {
+        if linked::UNIFORM_CAPTURE_BRIDGE {
+            strict_uniform_capture_reduce(benchmark.model, haystack)
+        } else {
+            strict_native_row_reduce(benchmark.model, haystack)
+        }
+    };
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
-        let actual = strict_native_row_reduce(benchmark.model, black_box(&benchmark.haystack))?;
+        let actual = operation(black_box(&benchmark.haystack))?;
         black_box(actual);
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
             break;
@@ -1192,7 +1456,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
     let run_start = Instant::now();
     for _ in 0..benchmark.max_iters {
         let sample_start = Instant::now();
-        let actual = strict_native_row_reduce(benchmark.model, black_box(&benchmark.haystack))?;
+        let actual = operation(black_box(&benchmark.haystack))?;
         let duration = sample_start.elapsed();
         samples.push(Sample {
             duration,
@@ -1506,6 +1770,30 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
         .syntax(syntax)
         .build_many(&benchmark.patterns)
         .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))?;
+    let mut captures = regex.create_captures();
+    let mut count_capture_domain = |haystack: &[u8]| -> Result<u64, String> {
+        let mut input = Input::new(haystack);
+        let mut count = 0_u64;
+        loop {
+            regex.search_captures(&input, &mut captures);
+            let Some(matched) = captures.get_match() else {
+                return Ok(count);
+            };
+            if matched.start() == matched.end() {
+                return Err(
+                    "public Rebar capture model violated its nonempty-match assumption".to_owned(),
+                );
+            }
+            for group in 0..captures.group_len() {
+                if captures.get_group(group).is_some() {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| "Rust Rebar capture oracle overflow".to_owned())?;
+                }
+            }
+            input.set_start(matched.end());
+        }
+    };
     match benchmark.model {
         shared::Model::Compile | shared::Model::Count => {
             u64::try_from(regex.find_iter(&benchmark.haystack).count())
@@ -1521,6 +1809,7 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
                         .ok_or_else(|| "Rust Rebar SpanSum oracle overflow".to_owned())
                 })
         }
+        shared::Model::CountCaptures => count_capture_domain(&benchmark.haystack),
         shared::Model::GrepCount => benchmark.haystack.lines().try_fold(0_u64, |count, line| {
             if regex.is_match(line) {
                 count
@@ -1529,6 +1818,11 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
             } else {
                 Ok(count)
             }
+        }),
+        shared::Model::GrepCaptures => benchmark.haystack.lines().try_fold(0_u64, |count, line| {
+            count
+                .checked_add(count_capture_domain(line)?)
+                .ok_or_else(|| "Rust Rebar grep-captures oracle overflow".to_owned())
         }),
         shared::Model::RegexRedux => unreachable!("regex-redux oracle returned above"),
     }
@@ -1604,13 +1898,37 @@ mod tests {
             5
         );
         assert_eq!(
+            rust_oracle(&benchmark(shared::Model::CountCaptures, b"baa x aaa")).unwrap(),
+            2
+        );
+        assert_eq!(
             rust_oracle(&benchmark(shared::Model::GrepCount, b"aa\r\nno\na")).unwrap(),
+            2
+        );
+        assert_eq!(
+            rust_oracle(&benchmark(shared::Model::GrepCaptures, b"aa\r\nno\na")).unwrap(),
             2
         );
         assert_eq!(
             rust_oracle(&benchmark(shared::Model::RegexRedux, b">test\nagggtaaa\n")).unwrap(),
             8
         );
+    }
+
+    #[test]
+    fn independent_capture_oracle_counts_participating_groups_and_pattern_priority() {
+        let mut single = benchmark(shared::Model::CountCaptures, b"baa x aaa");
+        single.patterns = vec!["(a+)".to_owned()];
+        assert_eq!(rust_oracle(&single).unwrap(), 4);
+
+        let mut ordered_many = single.clone();
+        ordered_many.patterns = vec!["a+".to_owned(), "(a+)".to_owned()];
+        assert_eq!(rust_oracle(&ordered_many).unwrap(), 2);
+
+        let mut per_line = single;
+        per_line.model = shared::Model::GrepCaptures;
+        per_line.haystack = b"aa\r\nno\na".to_vec();
+        assert_eq!(rust_oracle(&per_line).unwrap(), 4);
     }
 
     #[test]
@@ -1734,6 +2052,34 @@ mod tests {
         })
     }
 
+    fn independent_uniform_capture_count(
+        patterns: &[&str],
+        group_counts: &[u64],
+        haystack: &[u8],
+    ) -> Result<u64, String> {
+        let rows = patterns
+            .iter()
+            .map(|pattern| byte_regex(pattern))
+            .collect::<Vec<_>>();
+        strict_uniform_capture_count_domain_with(
+            group_counts,
+            haystack,
+            |row, window_start, result| {
+                let matched = rows[row]
+                    .find(regex_automata::Input::new(haystack).span(window_start..haystack.len()));
+                if let Some(matched) = matched {
+                    *result = FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    };
+                    Ok(STATUS_MATCH)
+                } else {
+                    Ok(STATUS_NO_MATCH)
+                }
+            },
+        )
+    }
+
     #[test]
     fn independent_native_rows_match_build_many_priority_and_empty_progress() {
         let cases: &[(&[&str], &[u8])] = &[
@@ -1774,6 +2120,58 @@ mod tests {
                 "SpanSum patterns={patterns:?} haystack={haystack:?}"
             );
         }
+    }
+
+    #[test]
+    fn uniform_capture_rows_multiply_the_winning_source_priority() {
+        assert_eq!(
+            independent_uniform_capture_count(&["a+", "(a+)"], &[1, 2], b"aa x aaa"),
+            Ok(2),
+        );
+        assert_eq!(
+            independent_uniform_capture_count(&["(a+)", "a+"], &[2, 1], b"aa x aaa"),
+            Ok(4),
+        );
+        assert_eq!(
+            independent_uniform_capture_count(&["z+", "(a+)"], &[1, 2], b"aa x aaa"),
+            Ok(4),
+        );
+    }
+
+    #[test]
+    fn grep_capture_rows_restart_the_span_selector_for_each_rebar_line() {
+        let haystack = b"a\r\nxa\nno-final-match";
+        let actual = haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(independent_uniform_capture_count(
+                    &["(a\\r?$)"],
+                    &[2],
+                    line,
+                )?)
+                .ok_or_else(|| "test capture total overflowed".to_owned())
+        });
+        assert_eq!(actual, Ok(4));
+        assert_eq!(
+            independent_uniform_capture_count(&["(a\\r?$)"], &[2], haystack),
+            Ok(0),
+            "whole-haystack selection is not a grep-captures substitute"
+        );
+    }
+
+    #[test]
+    fn uniform_capture_rows_fail_closed_on_empty_or_invalid_receipts() {
+        let empty = strict_uniform_capture_count_domain_with(&[1], b"x", |_row, _start, result| {
+            *result = FreAotRegexResultV1 { start: 0, end: 0 };
+            Ok(STATUS_MATCH)
+        })
+        .expect_err("positive-width receipt must be rechecked at runtime");
+        assert!(empty.contains("positive-width proof"), "{empty}");
+
+        let zero = strict_uniform_capture_count_domain_with(&[0], b"x", |_row, _start, _result| {
+            Ok(STATUS_NO_MATCH)
+        })
+        .expect_err("group zero makes every valid multiplier positive");
+        assert!(zero.contains("contain zero"), "{zero}");
     }
 
     #[test]

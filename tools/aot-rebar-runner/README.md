@@ -14,6 +14,12 @@ Optimizing+Span object for each distinct source row and links the deduplicated
 helper-free native objects. A build with no KLV remains a harmless
 unconfigured workspace binary.
 
+`count-captures` and `grep-captures` have an additional all-or-nothing route.
+The compiler proves from the same canonical HIR that every nonempty match has
+one uniform group-zero-inclusive participation count, then seals that proof to
+the exact ordinary native Span selector. Rust selects spans and adds the
+winning row's compile-time count; it does not materialize capture offsets.
+
 ```sh
 rebar klv --max-iters 9 --max-warmup-iters 1 \
   --max-time 1s --max-warmup-time 100ms \
@@ -40,13 +46,13 @@ not admissible evidence.
 
 ## Operation contract
 
-The adapter supports the public `count`, `count-spans`, and `grep` models for
-one pattern, ordered multi-pattern `count` and `count-spans`, and the
-zero-external-pattern `regex-redux` model. Dispatch depends only on the typed
-model and pattern cardinality, not on a benchmark name. It deliberately rejects
-`compile`: emitting a relocatable object is not the Rebar operation of
-constructing a regex that is ready to search. Object-emission timing belongs to
-a separately named compiler-stage benchmark.
+The adapter supports the public `count`, `count-spans`, `count-captures`,
+`grep`, and `grep-captures` models, ordered multi-pattern scalar/capture
+selection, and the zero-external-pattern `regex-redux` model. Dispatch depends
+only on the typed model and pattern cardinality, not on a benchmark name. It
+deliberately rejects `compile`: emitting a relocatable object is not the Rebar
+operation of constructing a regex that is ready to search. Object-emission
+timing belongs to a separately named compiler-stage benchmark.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
@@ -66,6 +72,15 @@ a separately named compiler-stage benchmark.
   call reports a match. The prepared whole-haystack `GrepCount` export may be
   linked to provision the shared program/handle, but is never called by the
   timed Rebar grep operation.
+- `count-captures` repeatedly invokes the helper-free Span row table and adds
+  the selected row's proved group-zero-inclusive participation count with
+  checked arithmetic. `grep-captures` restarts that complete Span iteration on
+  every Rebar line domain. Every source must prove a positive minimum width and
+  uniform participation; one nullable/nonuniform decline rejects the complete
+  build. Runtime authentication rechecks proof versions, positive widths,
+  source/row cardinalities, priority mapping, and automaton/program/object
+  hashes. An independently constructed Rust captures oracle remains
+  authoritative for the final value.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
   and all five ordered substitutions through their separately linked ordinary
   Span entries. Rust owns only checked stage sequencing, replacement copies,
@@ -200,6 +215,11 @@ component or retained native row. Merely linking a component does not count a
 helper-backed entry as native.
 The census reports these componentized routes as native search cores with a
 Rust adapter loop, not as wholly fused native operations.
+Uniform-capture routes additionally publish `capture_resolution` as
+`static-uniform-multiplier`, both proof-identity versions, every source's
+multiplier/minimum/census/accounting, and the selector digests that bind it to
+the retained row. They are reported separately from capture-materializing
+engines and remain outside the strict wholly-native-operation numerator.
 
 ## HEAD campaign reporting
 
