@@ -71,7 +71,7 @@ const UNIFORM_WORD64_STATE_BITS: usize = u64::BITS as usize;
 #[cfg(not(feature = "static-dispatch"))]
 const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 #[cfg(not(feature = "static-dispatch"))]
-const RETAINED_ITER_DENSE_GAP_BYTES: usize = 64;
+const RETAINED_ITER_DENSE_GAP_BYTES: usize = 32;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
 // UniformWord64 admits at least two equal-width literals in one word, so no
@@ -4493,6 +4493,66 @@ mod tests {
                     expected,
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_iterator_density_gap_boundary_preserves_checked_state() {
+        let width = 8;
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let dense_gap = super::RETAINED_ITER_DENSE_GAP_BYTES;
+        assert_eq!(dense_gap, 32);
+        for gap in [dense_gap - 1, dense_gap, dense_gap + 1] {
+            let first = (gap, gap + width);
+            let second = (first.1 + gap, first.1 + gap + width);
+            let third = (second.1, second.1 + width);
+            let mut haystack = vec![0xff; third.1 + 40];
+            for matched in [first, second, third] {
+                haystack[matched.0..matched.1].copy_from_slice(patterns[0]);
+            }
+            let plan = PackedLiteralSetPlan::new_retained_iter(
+                &patterns,
+                PackedLiteralSetBuildLimits::default(),
+                usize::MAX,
+            )
+            .unwrap();
+            let mut unmetered = plan.search_cursor(&haystack).unwrap();
+            let mut checked = plan.search_cursor(&haystack).unwrap();
+
+            for (request, expected) in [(0, first), (first.1, second)] {
+                let unmetered_match = unmetered.find_at_value_unmetered(request).unwrap();
+                let checked_match = checked
+                    .find_at(request, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(unmetered_match, Some(expected));
+                assert_eq!(checked_match, unmetered_match);
+                assert_eq!(checked.close_matches, unmetered.close_matches);
+                assert_eq!(checked.dense, unmetered.dense);
+                if request == 0 {
+                    assert_eq!(unmetered.close_matches, u8::from(gap <= dense_gap));
+                    assert!(!unmetered.dense);
+                }
+            }
+            if gap <= dense_gap {
+                assert_eq!(unmetered.close_matches, 2);
+                assert!(unmetered.dense);
+            } else {
+                assert_eq!(unmetered.close_matches, 0);
+                assert!(!unmetered.dense);
+            }
+
+            let unmetered_match = unmetered.find_at_value_unmetered(second.1).unwrap();
+            let checked_match = checked
+                .find_at(second.1, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(unmetered_match, Some(third));
+            assert_eq!(checked_match, unmetered_match);
+            assert_eq!(checked.close_matches, unmetered.close_matches);
+            assert_eq!(checked.dense, unmetered.dense);
+            assert_eq!(unmetered.dense, gap <= dense_gap);
         }
     }
 
