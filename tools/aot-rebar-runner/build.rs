@@ -398,6 +398,7 @@ fn configured_source(
                 shared::Model::Compile
                     | shared::Model::Count
                     | shared::Model::SpanSum
+                    | shared::Model::GrepCount
                     | shared::Model::CountCaptures
                     | shared::Model::GrepCaptures
             ),
@@ -421,6 +422,10 @@ fn configured_source(
     let grep_iteration_strategy =
         if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "per-line-linked-prepared-span-fill-uniform-capture-v1".to_owned()
+        } else if benchmark.model == shared::Model::GrepCount
+            && required_prepare_capabilities == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+        {
+            "linked-per-line-prepared-span-fill-v15".to_owned()
         } else if benchmark.model == shared::Model::GrepCount {
             "linked-per-line-direct-entry".to_owned()
         } else {
@@ -476,7 +481,9 @@ fn configured_source(
         if prepared_uniform_capture {
             shared::Model::Count.prepare_operation_flags()
         } else {
-            benchmark.model.prepare_operation_flags()
+            benchmark
+                .model
+                .prepare_operation_flags_for_required_capabilities(required_prepare_capabilities)
         }
     )
     .unwrap();
@@ -786,6 +793,7 @@ fn configured_source(
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
+    push_empty_prepared_row_bindings(&mut source, 1);
     source
 }
 
@@ -1001,6 +1009,7 @@ fn configured_regex_redux_source(
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
+    push_empty_prepared_row_bindings(&mut source, 0);
     source
 }
 
@@ -1021,13 +1030,11 @@ fn configured_participation_capture_source(
     assert_eq!(benchmark.patterns.len(), 1);
     let artifact = &bridge.artifact;
     assert!(artifact.authenticates_receipt());
-    assert!(
-        artifact
-            .module()
-            .required_runtime_symbols()
-            .next()
-            .is_none()
-    );
+    assert!(artifact
+        .module()
+        .required_runtime_symbols()
+        .next()
+        .is_none());
     assert!(artifact.module().required_runtime_program().is_none());
     let outer = artifact.receipt();
     let receipt = outer.native();
@@ -1275,6 +1282,7 @@ fn configured_participation_capture_source(
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
+    push_empty_prepared_row_bindings(&mut source, 1);
     source
 }
 
@@ -1295,13 +1303,11 @@ fn configured_strict_capture_source(
     assert_eq!(benchmark.patterns.len(), 1);
     let artifact = &bridge.artifact;
     assert!(artifact.authenticates_receipt());
-    assert!(
-        artifact
-            .module()
-            .required_runtime_symbols()
-            .next()
-            .is_none()
-    );
+    assert!(artifact
+        .module()
+        .required_runtime_symbols()
+        .next()
+        .is_none());
     let receipt = artifact.receipt();
     let next_symbol = artifact.capture_next_symbol();
     let materialize_symbol = artifact.capture_materialize_symbol();
@@ -1531,6 +1537,7 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
+    push_empty_prepared_row_bindings(&mut source, 1);
     source
 }
 
@@ -1587,62 +1594,117 @@ fn configured_native_row_source(
             compiled.receipt().output,
             fre_aot_regex::OutputContract::Span
         );
-        assert!(!compiled.receipt().runtime_helper_required);
-        assert!(
-            compiled
-                .module()
-                .required_runtime_symbols()
-                .next()
-                .is_none()
-        );
-        assert!(
-            !compiled
-                .module()
-                .symbols()
-                .iter()
-                .enumerate()
-                .any(|(index, symbol)| {
-                    symbol.section.is_none()
-                        && compiled
-                            .module()
-                            .relocations()
-                            .iter()
-                            .any(|relocation| relocation.symbol == index)
-                })
-        );
-        assert!(compiled.module().prepared_entry_symbol().is_none());
-        assert!(compiled.module().required_runtime_program().is_none());
+        match artifact.route {
+            shared::NativeRowRoute::Ordinary => {
+                assert!(!compiled.receipt().runtime_helper_required);
+                assert!(compiled
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none());
+                assert!(!compiled
+                    .module()
+                    .symbols()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, symbol)| {
+                        symbol.section.is_none()
+                            && compiled
+                                .module()
+                                .relocations()
+                                .iter()
+                                .any(|relocation| relocation.symbol == index)
+                    }));
+                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert!(compiled.module().required_runtime_program().is_none());
+            }
+            shared::NativeRowRoute::PreparedOrderedNfaV15 => {
+                assert_eq!(
+                    compiled.receipt().required_prepare_capabilities,
+                    fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+                );
+                assert_eq!(
+                    compiled.module().required_prepare_capabilities(),
+                    fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+                );
+                assert_eq!(
+                    compiled.module().prepared_bulk_strategy(),
+                    Some(fre_aot_regex::PreparedBulkStrategy::NativeOrderedNfaLoop)
+                );
+                assert!(compiled.module().prepared_entry_symbol().is_some());
+                assert!(compiled.module().prepared_span_fill_symbol().is_some());
+                assert!(compiled.module().required_runtime_program().is_some());
+            }
+        }
     }
 
+    let has_prepared_v15 = bridge
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.route.is_prepared());
+    let (prepare_max_handle_bytes, prepare_max_scratch_bytes, prepare_max_setup_work) =
+        if has_prepared_v15 {
+            (
+                fre_aot_regex::DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES as u64,
+                fre_aot_regex::FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES as u64,
+                fre_aot_regex::FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+            )
+        } else {
+            (0, 0, 0)
+        };
+    assert!(!uniform_capture_receipts.is_some_and(|_| has_prepared_v15));
     let uniform_capture = uniform_capture_receipts.is_some();
     let selector_fallback = selector_capture_fallback.is_some();
+    assert!(!selector_fallback || !has_prepared_v15);
     let adapter = if selector_fallback {
         assert_eq!(benchmark.model, shared::Model::GrepCaptures);
         "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
     } else {
-        match benchmark.model {
-            shared::Model::Count => "general-aot-native-row-bridge-count-v1",
-            shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
-            shared::Model::GrepCount => "general-aot-native-row-bridge-grep-v1",
-            shared::Model::CountCaptures => {
+        match (benchmark.model, has_prepared_v15) {
+            (shared::Model::Count, false) => "general-aot-native-row-bridge-count-v1",
+            (shared::Model::Count, true) => {
+                "general-aot-native-row-bridge-count-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::SpanSum, false) => "general-aot-native-row-bridge-count-spans-v1",
+            (shared::Model::SpanSum, true) => {
+                "general-aot-native-row-bridge-count-spans-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::GrepCount, false) => "general-aot-native-row-bridge-grep-v1",
+            (shared::Model::GrepCount, true) => {
+                "general-aot-native-row-bridge-grep-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::CountCaptures, false) => {
                 "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
             }
-            shared::Model::GrepCaptures => {
+            (shared::Model::GrepCaptures, false) => {
                 "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
             }
-            shared::Model::Compile | shared::Model::RegexRedux => {
+            (shared::Model::CountCaptures | shared::Model::GrepCaptures, true) => {
+                unreachable!("capture rows never select a prepared fallback")
+            }
+            (shared::Model::Compile | shared::Model::RegexRedux, _) => {
                 unreachable!("parser excludes this multi-pattern model")
             }
         }
+    };
+    let row_strategy = if has_prepared_v15 {
+        "native-independent-span-row-selector-mixed-prepared-v15-v1"
+    } else {
+        "native-independent-span-row-selector-v1"
+    };
+    let grep_row_strategy = if has_prepared_v15 {
+        "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1"
+    } else {
+        "per-line-native-independent-span-row-exists-v1"
     };
     let aggregate_strategy = if selector_fallback {
         "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
     } else if uniform_capture {
         "native-row-static-uniform-capture-multiplier-v1"
     } else if benchmark.model == shared::Model::GrepCount {
-        "per-line-native-independent-span-row-exists-v1"
+        grep_row_strategy
     } else {
-        "native-independent-span-row-selector-v1"
+        row_strategy
     };
     let span_iteration_strategy = if benchmark.model == shared::Model::SpanSum {
         aggregate_strategy
@@ -1653,7 +1715,7 @@ fn configured_native_row_source(
         "per-line-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
     } else {
         match benchmark.model {
-            shared::Model::GrepCount => "per-line-native-independent-span-row-exists-v1",
+            shared::Model::GrepCount => grep_row_strategy,
             shared::Model::GrepCaptures => "per-line-native-row-static-uniform-capture-v1",
             _ => "not-applicable",
         }
@@ -1666,7 +1728,84 @@ fn configured_native_row_source(
     let entry_symbols = bridge
         .artifacts
         .iter()
-        .map(|artifact| artifact.compiled.module().entry_symbol())
+        .map(shared::NativeRowArtifact::entry_symbol)
+        .collect::<Vec<_>>();
+    let row_required_prepare_capabilities = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.compiled.module().required_prepare_capabilities())
+        .collect::<Vec<_>>();
+    let row_prepare_config_versions = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            if artifact.route.is_prepared() {
+                3_u32
+            } else {
+                0_u32
+            }
+        })
+        .collect::<Vec<_>>();
+    let row_prepare_operation_flags = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            if artifact.route.is_prepared() {
+                shared::Model::Count.prepare_operation_flags()
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    let row_program_symbols = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .compiled
+                .module()
+                .required_runtime_program()
+                .map_or("", |(symbol, _)| symbol)
+        })
+        .collect::<Vec<_>>();
+    let row_program_lens = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .compiled
+                .module()
+                .required_runtime_program()
+                .map_or(0, |(_, len)| len)
+        })
+        .collect::<Vec<_>>();
+    let row_span_fill_symbols = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .compiled
+                .module()
+                .prepared_span_fill_symbol()
+                .unwrap_or("")
+        })
+        .collect::<Vec<_>>();
+    let row_prepared_bulk_strategies = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| format!("{:?}", artifact.compiled.module().prepared_bulk_strategy()))
+        .collect::<Vec<_>>();
+    let row_required_runtime_symbols = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .compiled
+                .module()
+                .required_runtime_symbols()
+                .collect::<Vec<_>>()
+                .join(",")
+        })
         .collect::<Vec<_>>();
     let engines = bridge
         .artifacts
@@ -1788,6 +1927,21 @@ fn configured_native_row_source(
     writeln!(source, "pub const PREPARE_OPERATION_FLAGS: u64 = 0;").unwrap();
     writeln!(source, "pub const PREPARE_CONFIG_VERSION: u32 = 0;").unwrap();
     writeln!(source, "pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;").unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_MAX_HANDLE_BYTES: u64 = {prepare_max_handle_bytes};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_MAX_SCRATCH_BYTES: u64 = {prepare_max_scratch_bytes};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_MAX_SETUP_WORK: u64 = {prepare_max_setup_work};"
+    )
+    .unwrap();
     writeln!(source, "pub const EXPECTED_PATTERN: &str = \"\";").unwrap();
     writeln!(
         source,
@@ -1827,6 +1981,46 @@ fn configured_native_row_source(
     writeln!(
         source,
         "pub const ROW_ENTRY_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_REQUIRED_PREPARE_CAPABILITIES: &[u64] = &{row_required_prepare_capabilities:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_CONFIG_VERSIONS: &[u32] = &{row_prepare_config_versions:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_OPERATION_FLAGS: &[u64] = &{row_prepare_operation_flags:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SYMBOLS: &[&str] = &{row_program_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_LENS: &[usize] = &{row_program_lens:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_SPAN_FILL_SYMBOLS: &[&str] = &{row_span_fill_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARED_BULK_STRATEGIES: &[&str] = &{row_prepared_bulk_strategies:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_REQUIRED_RUNTIME_SYMBOLS: &[&str] = &{row_required_runtime_symbols:?};"
     )
     .unwrap();
     writeln!(
@@ -1976,29 +2170,72 @@ fn configured_native_row_source(
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
-    source.push_str(
-        "pub type LinkedRowSearch = unsafe extern \"C\" fn(*const u8, usize, usize, usize, *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
-    );
     source.push_str("unsafe extern \"C\" {\n");
-    for (index, entry_symbol) in entry_symbols.iter().enumerate() {
+    for (index, artifact) in bridge.artifacts.iter().enumerate() {
+        let entry_symbol = artifact.entry_symbol();
         writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
-        writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
+        match artifact.route {
+            shared::NativeRowRoute::Ordinary => {
+                writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
+            }
+            shared::NativeRowRoute::PreparedOrderedNfaV15 => {
+                writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
+                let (program_symbol, _) = artifact
+                    .compiled
+                    .module()
+                    .required_runtime_program()
+                    .expect("authenticated prepared row program");
+                writeln!(source, "    #[link_name = {program_symbol:?}]").unwrap();
+                writeln!(source, "    static LINKED_ROW_PROGRAM_{index}: u8;").unwrap();
+            }
+        }
     }
     source.push_str("}\n");
-    source.push_str("pub static LINKED_ROW_SEARCHES: &[LinkedRowSearch] = &[\n");
-    for index in 0..entry_symbols.len() {
-        writeln!(source, "    LINKED_ROW_ENTRY_{index},").unwrap();
+    if has_prepared_v15 {
+        source.push_str("pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match row {\n");
+        for (index, artifact) in bridge.artifacts.iter().enumerate() {
+            if artifact.route == shared::NativeRowRoute::Ordinary {
+                writeln!(source, "        {index} => unsafe {{ LINKED_ROW_ENTRY_{index}(haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
+            }
+        }
+        source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
+    } else {
+        source.push_str(
+            "pub type LinkedRowSearch = unsafe extern \"C\" fn(*const u8, usize, usize, usize, *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
+        );
+        source.push_str("pub static LINKED_ROW_SEARCHES: &[LinkedRowSearch] = &[\n");
+        for index in 0..entry_symbols.len() {
+            writeln!(source, "    LINKED_ROW_ENTRY_{index},").unwrap();
+        }
+        source.push_str("];\n");
+        source.push_str(
+            "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    let Some(search) = LINKED_ROW_SEARCHES.get(row) else { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; };\n    unsafe { search(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+        );
     }
-    source.push_str("];\n");
+    source.push_str("pub unsafe fn row_program_ptr(row: usize) -> *const u8 {\n    match row {\n");
+    for (index, artifact) in bridge.artifacts.iter().enumerate() {
+        if artifact.route.is_prepared() {
+            writeln!(
+                source,
+                "        {index} => &raw const LINKED_ROW_PROGRAM_{index},"
+            )
+            .unwrap();
+        }
+    }
+    source.push_str("        _ => core::ptr::null(),\n    }\n}\n");
+    source.push_str("pub unsafe fn search_row_prepared(row: usize, handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match row {\n");
+    for (index, artifact) in bridge.artifacts.iter().enumerate() {
+        if artifact.route.is_prepared() {
+            writeln!(source, "        {index} => unsafe {{ LINKED_ROW_ENTRY_{index}(handle, haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
+        }
+    }
+    source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str(
         "pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
     source.push_str(
         "pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
-    );
-    source.push_str(
-        "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    let Some(search) = LINKED_ROW_SEARCHES.get(row) else { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; };\n    unsafe { search(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
     );
     source.push_str(
         "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
@@ -2067,6 +2304,63 @@ fn push_empty_selector_capture_fallback_bindings(source: &mut String) {
     source.push_str("pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = 0;\n");
 }
 
+fn push_empty_prepared_row_bindings(source: &mut String, row_count: usize) {
+    let zeros_u64 = vec![0_u64; row_count];
+    let zeros_u32 = vec![0_u32; row_count];
+    let zeros_usize = vec![0_usize; row_count];
+    let empty_strings = vec![""; row_count];
+    let none_strategies = vec!["None"; row_count];
+    writeln!(
+        source,
+        "pub const ROW_REQUIRED_PREPARE_CAPABILITIES: &[u64] = &{zeros_u64:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_CONFIG_VERSIONS: &[u32] = &{zeros_u32:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARE_OPERATION_FLAGS: &[u64] = &{zeros_u64:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SYMBOLS: &[&str] = &{empty_strings:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_LENS: &[usize] = &{zeros_usize:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_SPAN_FILL_SYMBOLS: &[&str] = &{empty_strings:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARED_BULK_STRATEGIES: &[&str] = &{none_strategies:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_REQUIRED_RUNTIME_SYMBOLS: &[&str] = &{empty_strings:?};"
+    )
+    .unwrap();
+    source.push_str("pub const ROW_PREPARE_MAX_HANDLE_BYTES: u64 = 0;\n");
+    source.push_str("pub const ROW_PREPARE_MAX_SCRATCH_BYTES: u64 = 0;\n");
+    source.push_str("pub const ROW_PREPARE_MAX_SETUP_WORK: u64 = 0;\n");
+    source.push_str(
+        "pub unsafe fn row_program_ptr(_row: usize) -> *const u8 { core::ptr::null() }\n",
+    );
+    source.push_str(
+        "pub unsafe fn search_row_prepared(_row: usize, _handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+    );
+}
+
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
@@ -2128,6 +2422,17 @@ pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;
 pub const SOURCE_TO_ARTIFACT: &[usize] = &[];
 pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];
 pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];
+pub const ROW_REQUIRED_PREPARE_CAPABILITIES: &[u64] = &[];
+pub const ROW_PREPARE_CONFIG_VERSIONS: &[u32] = &[];
+pub const ROW_PREPARE_OPERATION_FLAGS: &[u64] = &[];
+pub const ROW_PROGRAM_SYMBOLS: &[&str] = &[];
+pub const ROW_PROGRAM_LENS: &[usize] = &[];
+pub const ROW_SPAN_FILL_SYMBOLS: &[&str] = &[];
+pub const ROW_PREPARED_BULK_STRATEGIES: &[&str] = &[];
+pub const ROW_REQUIRED_RUNTIME_SYMBOLS: &[&str] = &[];
+pub const ROW_PREPARE_MAX_HANDLE_BYTES: u64 = 0;
+pub const ROW_PREPARE_MAX_SCRATCH_BYTES: u64 = 0;
+pub const ROW_PREPARE_MAX_SETUP_WORK: u64 = 0;
 pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[];
 pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[];
 pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[];
@@ -2188,6 +2493,16 @@ pub unsafe fn search(
 ) -> u32 { 2 }
 pub unsafe fn search_row(
     _row: usize,
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _window_start: usize,
+    _window_end: usize,
+    _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
+) -> u32 { 2 }
+pub unsafe fn row_program_ptr(_row: usize) -> *const u8 { core::ptr::null() }
+pub unsafe fn search_row_prepared(
+    _row: usize,
+    _handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1,
     _haystack: *const u8,
     _haystack_len: usize,
     _window_start: usize,

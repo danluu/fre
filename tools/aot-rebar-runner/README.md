@@ -9,10 +9,12 @@ The checked-in build script consumes one public Rebar KLV file. Scalar models
 compile and link one single-pattern general-AOT artifact. The fixed
 `regex-redux` model has no external patterns; it compiles and links the exact
 15 public Rebar stage patterns as independent ordinary Span artifacts. The
-additive multi-pattern `count`/`count-spans`/`grep` route compiles an ordinary
+additive multi-pattern `count`/`count-spans`/`grep` route compiles an
 Optimizing+Span object for each distinct source row and links the deduplicated
-helper-free native objects. A build with no KLV remains a harmless
-unconfigured workspace binary.
+native objects. Each row is either an ordinary helper-free native entry or,
+only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
+independently authenticated V15 prepared native search entry. A build with
+no KLV remains a harmless unconfigured workspace binary.
 
 `count-captures` and `grep-captures` have an additional all-or-nothing route.
 The compiler proves from the same canonical HIR that every nonempty match has
@@ -90,11 +92,12 @@ timing belongs to a separately named compiler-stage benchmark.
   emit an unused `SpanSum` export to provision the shared prepared
   program/handle, but that scalar export is not called by this model.
 - grep iterates every LF/CRLF line domain and invokes the linked artifact's
-  ordinary public search entry for a single pattern, or every authenticated
-  helper-free Span row for multiple patterns, counting the lines for which any
-  entry reports a match. The prepared whole-haystack `GrepCount` export may be
-  linked to provision the single-pattern shared program/handle, but is never
-  called by the timed Rebar grep operation.
+  authenticated direct native search entry or prepared V15 native Span-fill
+  entry for a single pattern. For multiple patterns it invokes every retained
+  row's corresponding direct or prepared search entry and counts lines for which
+  any row reports a match. Prepared handles are constructed before warmup and
+  timed loops; the whole-haystack `GrepCount` export is never substituted for
+  Rebar's per-line operation.
 - `count-captures` repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
@@ -145,38 +148,45 @@ timing belongs to a separately named compiler-stage benchmark.
   that omitted per-call regex construction is timing-equivalent to Rebar.
 
 For a multi-pattern scalar job, exact duplicate source rows are compiled once;
-distinct source spellings that produce the same complete entry/object are also
-linked once. The retained artifacts remain ordered by their first source
-ordinal. On every iterator window the runner calls every row's ordinary native
-Span entry, validates every result (including losing rows), selects the lowest
-match start, and uses the lowest source ordinal to break a start tie. The
-winning row's own leftmost-first endpoint is authoritative. The outer iterator
-then applies the same byte-wise empty progress and adjacent-empty suppression
-as pinned `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in
-local checked state and are published only after the complete traversal.
+distinct source spellings that produce the same complete route and object are
+also linked once. The retained artifacts remain ordered by their first source
+ordinal. On every iterator window the runner calls every row's ordinary or
+prepared native search entry, validates every result
+(including losing rows), selects the lowest match start, and uses the lowest
+source ordinal to break a start tie. The winning row's own leftmost-first
+endpoint is authoritative. The outer iterator then applies the same byte-wise
+empty progress and adjacent-empty suppression as pinned
+`regex-automata::meta::Regex::build_many`. Count and SpanSum stay in local
+checked state and are published only after the complete traversal.
 
-The ordinary scalar and uniform-capture row bridges have no prepared handle,
-serialized runtime program, scalar helper, or input-dependent deoptimization
-edge. Build-time admission rejects the entire job when any row has an
-unresolved runtime function, a helper-backed receipt, a prepared entry/program,
-a missing/zero-sized public native entry, or any prepared aggregate state. It
-also rejects more than 4,096 source rows or more than 256 MiB of distinct row
-objects before linking. These are explicit fail-closed resource limits. The
-selector-first capture route is the sole explicitly named conditional mixed
-route; its positive fallback profile and trap marker are sealed into generated
-bindings and provenance rather than hidden in the native row's dependency
-surface.
+The mixed bridge admits a prepared row only after exact receipt and linked
+symbol authentication: Ordered-NFA engine, native loop strategy, V15
+capability/config, entry/Span-fill/program identity, and the complete three
+symbol runtime surface. Every other admitted row retains the strict ordinary
+helper-free contract. The single-pattern selector preserves its ordinary
+incumbent byte-for-byte on a safe typed V15 decline; a per-row V15 decline
+rejects the complete multi-pattern bridge. Allocation, emission,
+authentication, and unrelated resource errors are terminal. The bridge has no
+scalar helper, portable semantic fallback, or input-dependent deoptimization
+edge. It rejects more than 4,096 source rows or more than 256 MiB of distinct
+row objects before linking.
+The selector-first capture route remains the sole explicitly named conditional
+stock-positive route; its positive fallback profile and trap marker are sealed
+into generated bindings and provenance rather than hidden in a native row's
+dependency surface.
 
-Except for the fixed regex-redux composite and native-row bridge, one exclusive
-handle is prepared from the exact linked program before every warmup/timed loop
-and destroyed after all samples. Handle preparation,
-result comparison, and destruction are outside every measured duration. The
-compiler receipt selects the preparation ABI without consulting a benchmark
-name. Incumbent objects use the unchanged 64-byte V2 config. An object whose
-explicit receipt requires `OrderedNfaV15` uses the additive 112-byte V3 config,
-sets that exact required-capability bit, and must publish its authenticated
-exclusive Pike scratch transactionally; preparation failure cannot silently
-enter the compatibility helper path.
+One exclusive handle is prepared from each exact linked program before every
+warmup/timed loop that needs it and destroyed after all samples; ordinary rows
+retain an invalid sentinel and allocate no handle. Handle preparation, result
+comparison, and destruction are outside every measured duration. The compiler
+receipt selects the preparation ABI without consulting a benchmark name.
+Incumbent single-object routes use the unchanged 64-byte V2 config. An object
+or retained row whose explicit receipt requires `OrderedNfaV15` uses the
+additive 112-byte V3 config, sets that exact required-capability bit, and must
+publish its authenticated exclusive Pike scratch transactionally. Generated
+receipts bind the handle, scratch, and setup-work ceilings checked by the
+runtime adapter; preparation failure cannot silently enter a compatibility
+helper path.
 
 The `fre.aot.rebar-runner.v2` provenance record separates the compiler's real
 aggregate strategy from the physical `count-spans` iteration route and binds
@@ -264,12 +274,12 @@ all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
 admitted only by its typed zero-pattern model and exact fixed public stage
 table; it is not recognized by benchmark name.
 
-Multi-pattern `grep` uses the same authenticated helper-free `Span` rows but
-restarts their ordered selector for each Rebar byte-line and reduces only
-whether any row matched that line. Its provenance names the distinct
-`per-line-native-independent-span-row-exists-v1` adapter loop. It never scans
-across a line boundary and never substitutes one whole-haystack match stream
-for Rebar's per-line model.
+Multi-pattern `grep` uses the same authenticated direct/prepared native rows,
+restarts their ordered selector for each Rebar byte-line, and reduces only
+whether any row matched that line. Its provenance distinguishes the ordinary
+`per-line-native-independent-span-row-exists-v1` loop from the mixed prepared
+V15 loop. It never scans across a line boundary and never substitutes one
+whole-haystack match stream for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
 prepared program/entry and no semantic runtime-helper relocation. Native

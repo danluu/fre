@@ -21,15 +21,16 @@ use fre_aot_regex::{
 #[cfg(test)]
 use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
 use fre_aot_regex_runtime::{
-    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, FreAotRegexCaptureSlotV1,
+    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
+    fre_aot_regex_runtime_prepare_exclusive_v3, FreAotRegexCaptureSlotV1,
     FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexParticipationRequestV1,
-    FreAotRegexPrepareConfigV2, FreAotRegexPrepareConfigV3, FreAotRegexResultV1, ITER_FINISHED,
+    FreAotRegexPrepareConfigV2, FreAotRegexPrepareConfigV3, FreAotRegexResultV1,
+    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, ITER_FINISHED,
     ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PREPARE_CAPABILITY_KNOWN_FLAGS,
     PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
-    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
-    fre_aot_regex_runtime_prepare_exclusive_v2, fre_aot_regex_runtime_prepare_exclusive_v3,
+    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
 };
-use regex_automata::{Input, meta::Regex};
+use regex_automata::{meta::Regex, Input};
 
 #[allow(
     unsafe_code,
@@ -53,6 +54,57 @@ struct Arguments {
 struct Sample {
     duration: Duration,
     value: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrepareV3Caps {
+    max_handle_bytes: u64,
+    max_scratch_bytes: u64,
+    max_setup_work: u64,
+}
+
+impl PrepareV3Caps {
+    const ZERO: Self = Self {
+        max_handle_bytes: 0,
+        max_scratch_bytes: 0,
+        max_setup_work: 0,
+    };
+
+    fn defaults() -> Self {
+        Self {
+            max_handle_bytes: u64::try_from(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES)
+                .expect("default Ordered-NFA handle cap fits u64"),
+            max_scratch_bytes: u64::try_from(FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES)
+                .expect("default Ordered-NFA scratch cap fits u64"),
+            max_setup_work: FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+        }
+    }
+
+    fn for_required_capabilities(required_capabilities: u64) -> Self {
+        if required_capabilities == 0 {
+            Self::ZERO
+        } else {
+            Self::defaults()
+        }
+    }
+
+    const fn linked_rows() -> Self {
+        Self {
+            max_handle_bytes: linked::ROW_PREPARE_MAX_HANDLE_BYTES,
+            max_scratch_bytes: linked::ROW_PREPARE_MAX_SCRATCH_BYTES,
+            max_setup_work: linked::ROW_PREPARE_MAX_SETUP_WORK,
+        }
+    }
+
+    fn authenticate(self, config: &FreAotRegexPrepareConfigV3) -> Result<(), String> {
+        if config.max_handle_bytes != self.max_handle_bytes
+            || config.max_ordered_nfa_scratch_bytes != self.max_scratch_bytes
+            || config.max_ordered_nfa_setup_work != self.max_setup_work
+        {
+            return Err("prepared V3 runtime caps disagree with provenance".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,7 +134,9 @@ impl ExclusiveSession {
             if model.is_capture() && linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
                 shared::Model::Count.prepare_operation_flags()
             } else {
-                model.prepare_operation_flags()
+                model.prepare_operation_flags_for_required_capabilities(
+                    linked::REQUIRED_PREPARE_CAPABILITIES,
+                )
             };
         if operation_flags != linked::PREPARE_OPERATION_FLAGS {
             return Err("runtime model preparation differs from linked artifact".to_owned());
@@ -114,6 +168,8 @@ impl ExclusiveSession {
             }
             let mut config = FreAotRegexPrepareConfigV3::new(operation_flags);
             config.required_capabilities = linked::REQUIRED_PREPARE_CAPABILITIES;
+            PrepareV3Caps::for_required_capabilities(linked::REQUIRED_PREPARE_CAPABILITIES)
+                .authenticate(&config)?;
             unsafe {
                 fre_aot_regex_runtime_prepare_exclusive_v3(
                     linked::program_ptr(),
@@ -240,6 +296,43 @@ impl ExclusiveSession {
 
     #[allow(
         unsafe_code,
+        reason = "the exact prepared SpanFill is the authenticated per-line Exists boundary"
+    )]
+    fn strict_grep_with_prepared_fill(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        strict_grep_with_search(haystack, |line| {
+            let mut state = FreAotRegexIterStateV1::default();
+            let mut result = FreAotRegexResultV1::default();
+            let mut written = usize::MAX;
+            // SAFETY: this session uniquely owns the prepared handle. The
+            // complete line and aligned state/result/count outputs are live,
+            // pairwise disjoint, and retained only for this call.
+            let status = unsafe {
+                linked::fill_spans(
+                    self.handle,
+                    line.as_ptr(),
+                    line.len(),
+                    &raw mut state,
+                    &raw mut result,
+                    1,
+                    &raw mut written,
+                )
+            };
+            match (status, written) {
+                (STATUS_MATCH, 1) => {
+                    validate_span(result, line.len())?;
+                    Ok(true)
+                }
+                (STATUS_NO_MATCH, 0) => Ok(false),
+                _ => Err(format!(
+                    "identity-suffixed prepared SpanFill {:?} returned status {status} and count {written} for one grep line",
+                    linked::SPAN_FILL_SYMBOL
+                )),
+            }
+        })
+    }
+
+    #[allow(
+        unsafe_code,
         reason = "explicit destruction is the audited exclusive-handle C ABI boundary"
     )]
     fn destroy(mut self) -> Result<(), String> {
@@ -269,6 +362,131 @@ impl Drop for ExclusiveSession {
         // SAFETY: Drop owns the only live handle and is the final fallback
         // when explicit checked destruction did not already consume it.
         let _ = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+    }
+}
+
+/// One preparation-time handle slot per linked independent native row.
+/// Ordinary rows retain `INVALID`; capability-bearing rows own exactly one
+/// V3-prepared handle for the complete benchmark lifetime.
+#[derive(Debug)]
+struct PreparedRowSessions {
+    handles: Vec<FreAotRegexExclusiveHandleV1>,
+}
+
+impl PreparedRowSessions {
+    #[allow(
+        unsafe_code,
+        reason = "per-row V15 preparation is the audited exclusive-handle C ABI boundary"
+    )]
+    fn prepare() -> Result<Self, String> {
+        let mut sessions = Self {
+            handles: Vec::new(),
+        };
+        sessions
+            .handles
+            .try_reserve_exact(linked::ROW_ARTIFACT_COUNT)
+            .map_err(|_| "prepared native-row handle table allocation failed".to_owned())?;
+        for row in 0..linked::ROW_ARTIFACT_COUNT {
+            let capabilities = linked::ROW_REQUIRED_PREPARE_CAPABILITIES
+                .get(row)
+                .copied()
+                .ok_or_else(|| format!("native row {row} has no prepare capability receipt"))?;
+            if capabilities == 0 {
+                sessions.handles.push(FreAotRegexExclusiveHandleV1::INVALID);
+                continue;
+            }
+            let operation_flags = linked::ROW_PREPARE_OPERATION_FLAGS[row];
+            let mut config = FreAotRegexPrepareConfigV3::new(operation_flags);
+            config.required_capabilities = capabilities;
+            PrepareV3Caps::linked_rows().authenticate(&config)?;
+            let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+            // SAFETY: taking the address of a generated immutable program does
+            // not read it; route authentication requires a nonempty extent.
+            let program = unsafe { linked::row_program_ptr(row) };
+            if program.is_null() {
+                return Err(format!("prepared native row {row} has a null program"));
+            }
+            // SAFETY: route authentication binds this row to a nonempty static
+            // program of the recorded extent. `config` is readable and the
+            // aligned output is writable and disjoint from the program.
+            let status = unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v3(
+                    program,
+                    linked::ROW_PROGRAM_LENS[row],
+                    &config,
+                    &raw mut handle,
+                )
+            };
+            if status != STATUS_SUCCESS || handle.is_invalid() {
+                if !handle.is_invalid() {
+                    sessions.handles.push(handle);
+                }
+                return Err(format!(
+                    "prepare exclusive AOT handle for native row {row} returned status {status}"
+                ));
+            }
+            sessions.handles.push(handle);
+        }
+        Ok(sessions)
+    }
+
+    fn prepared_handle(&self, row: usize) -> Result<Option<FreAotRegexExclusiveHandleV1>, String> {
+        let capabilities = linked::ROW_REQUIRED_PREPARE_CAPABILITIES
+            .get(row)
+            .copied()
+            .ok_or_else(|| format!("native row {row} has no prepare capability receipt"))?;
+        let handle = self
+            .handles
+            .get(row)
+            .copied()
+            .ok_or_else(|| format!("native row {row} has no prepared handle slot"))?;
+        match (capabilities, handle.is_invalid()) {
+            (0, true) => Ok(None),
+            (PREPARE_CAPABILITY_ORDERED_NFA_V15, false) => Ok(Some(handle)),
+            _ => Err(format!(
+                "native row {row} handle state disagrees with capability {capabilities:#x}"
+            )),
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "per-row explicit destruction is the audited exclusive-handle C ABI boundary"
+    )]
+    fn destroy(mut self) -> Result<(), String> {
+        let mut first_error = None;
+        for (row, slot) in self.handles.iter_mut().enumerate() {
+            let handle = std::mem::replace(slot, FreAotRegexExclusiveHandleV1::INVALID);
+            if handle.is_invalid() {
+                continue;
+            }
+            // SAFETY: each non-invalid table slot is uniquely owned, distinct,
+            // and consumed once by this terminal destruction pass.
+            let status = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+            if status != STATUS_SUCCESS && first_error.is_none() {
+                first_error = Some(format!(
+                    "destroy exclusive AOT handle for native row {row} returned status {status}"
+                ));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for PreparedRowSessions {
+    #[allow(
+        unsafe_code,
+        reason = "Drop is the terminal fallback for uniquely owned per-row handles"
+    )]
+    fn drop(&mut self) {
+        for slot in &mut self.handles {
+            let handle = std::mem::replace(slot, FreAotRegexExclusiveHandleV1::INVALID);
+            if !handle.is_invalid() {
+                // SAFETY: this slot owns the only live handle and Drop is its
+                // final fallback after any early error.
+                let _ = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+            }
+        }
     }
 }
 
@@ -486,17 +704,51 @@ fn strict_grep_with_search(
     unsafe_code,
     reason = "the generated row table is the exact statically linked AOT C ABI boundary"
 )]
-fn strict_native_row_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64, String> {
+fn search_linked_native_row(
+    sessions: &PreparedRowSessions,
+    row: usize,
+    haystack: &[u8],
+    window_start: usize,
+    result: &mut FreAotRegexResultV1,
+) -> Result<u32, String> {
+    // SAFETY: route authentication binds the selected table slot to exactly
+    // one of these two ABIs. The complete haystack and aligned result remain
+    // live and disjoint for the call; a prepared handle is uniquely owned by
+    // `sessions` and calls are sequential.
+    let status = unsafe {
+        if let Some(handle) = sessions.prepared_handle(row)? {
+            linked::search_row_prepared(
+                row,
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window_start,
+                haystack.len(),
+                result,
+            )
+        } else {
+            linked::search_row(
+                row,
+                haystack.as_ptr(),
+                haystack.len(),
+                window_start,
+                haystack.len(),
+                result,
+            )
+        }
+    };
+    Ok(status)
+}
+
+fn strict_native_row_reduce(
+    model: shared::Model,
+    haystack: &[u8],
+    sessions: &PreparedRowSessions,
+) -> Result<u64, String> {
     if model == shared::Model::GrepCount {
         return strict_grep_with_search(haystack, |line| {
             search_native_rows_with(linked::ROW_ARTIFACT_COUNT, line.len(), 0, |row, result| {
-                // SAFETY: the generated table contains only authenticated
-                // helper-free Span entries. The complete line and aligned
-                // result remain live and disjoint for every row call.
-                let status = unsafe {
-                    linked::search_row(row, line.as_ptr(), line.len(), 0, line.len(), result)
-                };
-                Ok(status)
+                search_linked_native_row(sessions, row, line, 0, result)
             })
             .map(|matched| matched.is_some())
         });
@@ -517,23 +769,7 @@ fn strict_native_row_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64
             linked::ROW_ARTIFACT_COUNT,
             haystack.len(),
             window_start,
-            |row, result| {
-                // SAFETY: the generated table contains only authenticated
-                // public entries from the linked row objects. The complete
-                // haystack and aligned row result stay live and disjoint for
-                // every call.
-                let status = unsafe {
-                    linked::search_row(
-                        row,
-                        haystack.as_ptr(),
-                        haystack.len(),
-                        window_start,
-                        haystack.len(),
-                        result,
-                    )
-                };
-                Ok(status)
-            },
+            |row, result| search_linked_native_row(sessions, row, haystack, window_start, result),
         )
     })
 }
@@ -1308,7 +1544,7 @@ fn print_provenance() {
         let mut provenance = String::new();
         write!(
             &mut provenance,
-            "schema=fre.aot.rebar-runner.v3 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge={} source_pattern_count={} row_total_object_bytes={} source_to_artifact={} component_count={}",
+            "schema=fre.aot.rebar-runner.v3 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge={} source_pattern_count={} row_total_object_bytes={} source_to_artifact={} component_count={} prepare_max_handle_bytes={} prepare_max_scratch_bytes={} prepare_max_setup_work={}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1327,14 +1563,25 @@ fn print_provenance() {
             linked::ROW_TOTAL_OBJECT_BYTES,
             source_to_artifact,
             linked::ROW_ARTIFACT_COUNT,
+            linked::ROW_PREPARE_MAX_HANDLE_BYTES,
+            linked::ROW_PREPARE_MAX_SCRATCH_BYTES,
+            linked::ROW_PREPARE_MAX_SETUP_WORK,
         )
         .expect("format native-row provenance header");
         for component in 0..linked::ROW_ARTIFACT_COUNT {
             write!(
                 &mut provenance,
-                " component_{component}_native=true component_{component}_source_ordinal={} component_{component}_entry_symbol={} component_{component}_runtime_symbols= component_{component}_automaton_sha256={} component_{component}_program_sha256={} component_{component}_object_sha256={}",
+                " component_{component}_native=true component_{component}_source_ordinal={} component_{component}_entry_symbol={} component_{component}_runtime_symbols={} component_{component}_required_prepare_capabilities={:016x} component_{component}_prepare_config_version={} component_{component}_prepare_operation_flags={:016x} component_{component}_runtime_program_symbol={} component_{component}_runtime_program_len={} component_{component}_span_fill_symbol={} component_{component}_prepared_bulk_strategy={} component_{component}_automaton_sha256={} component_{component}_program_sha256={} component_{component}_object_sha256={}",
                 linked::ROW_FIRST_SOURCE_ORDINALS[component],
                 linked::ROW_ENTRY_SYMBOLS[component],
+                linked::ROW_REQUIRED_RUNTIME_SYMBOLS[component],
+                linked::ROW_REQUIRED_PREPARE_CAPABILITIES[component],
+                linked::ROW_PREPARE_CONFIG_VERSIONS[component],
+                linked::ROW_PREPARE_OPERATION_FLAGS[component],
+                linked::ROW_PROGRAM_SYMBOLS[component],
+                linked::ROW_PROGRAM_LENS[component],
+                linked::ROW_SPAN_FILL_SYMBOLS[component],
+                linked::ROW_PREPARED_BULK_STRATEGIES[component],
                 hex(&linked::ROW_AUTOMATON_SHA256[component]),
                 hex(&linked::ROW_PROGRAM_SHA256[component]),
                 hex(&linked::ROW_OBJECT_SHA256[component]),
@@ -1421,7 +1668,7 @@ fn print_provenance() {
             )
         };
     println!(
-        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -1449,6 +1696,7 @@ fn print_provenance() {
         hex(&linked::PROGRAM_SHA256),
         hex(&linked::OBJECT_SHA256),
         linked::PROGRAM_SYMBOL,
+        linked::PROGRAM_LEN,
         linked::ENTRY_SYMBOL,
         linked::REDUCER_SYMBOL,
         linked::SPAN_FILL_SYMBOL,
@@ -1667,10 +1915,11 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if prepared_uniform_capture {
         // The exact per-line or whole-domain route was authenticated above.
     } else if benchmark.model == shared::Model::GrepCount {
-        if linked::GREP_ITERATION_STRATEGY != "linked-per-line-direct-entry"
-            || linked::AGGREGATE_STRATEGY != linked::GREP_ITERATION_STRATEGY
-        {
-            return Err("grep artifact is not bound to the per-line direct-entry route".to_owned());
+        let direct = linked::GREP_ITERATION_STRATEGY == "linked-per-line-direct-entry"
+            && linked::AGGREGATE_STRATEGY == linked::GREP_ITERATION_STRATEGY;
+        let prepared = authenticate_linked_prepared_v15_grep();
+        if !direct && !prepared {
+            return Err("grep artifact is not bound to an authenticated grep route".to_owned());
         }
     } else if linked::GREP_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-grep artifact advertises a grep iterator route".to_owned());
@@ -1698,31 +1947,80 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
             benchmark.model,
             shared::Model::Count
                 | shared::Model::SpanSum
+                | shared::Model::GrepCount
                 | shared::Model::CountCaptures
                 | shared::Model::GrepCaptures
         )
     {
         return Err("Ordered-TNFA capability is bound to an unsupported operation".to_owned());
     }
-    if ordered_nfa_required
-        && !prepared_uniform_capture
-        && !matches!(
+    if ordered_nfa_required && !prepared_uniform_capture {
+        let native_aggregate = matches!(
             linked::AGGREGATE_STRATEGY,
             "Some(NativeOrderedNfaFused)" | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
-        )
-    {
-        return Err("Ordered-TNFA capability has no native aggregate strategy".to_owned());
+        );
+        let native_grep_fill = benchmark.model == shared::Model::GrepCount
+            && linked::AGGREGATE_STRATEGY == "linked-per-line-prepared-span-fill-v15";
+        if !native_aggregate && !native_grep_fill {
+            return Err("Ordered-TNFA capability has no native operation route".to_owned());
+        }
     }
     Ok(())
 }
 
+fn authenticate_linked_prepared_v15_grep() -> bool {
+    const EXPECTED_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1";
+    let Some(entry_identity) =
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(span_fill_identity) = native_symbol_identity(
+        linked::SPAN_FILL_SYMBOL,
+        "fre_aot_regex_fill_spans_exclusive_v1_",
+    ) else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) = native_symbol_identity(
+        linked::REDUCER_SYMBOL,
+        "fre_aot_regex_grep_count_exclusive_v1_",
+    ) else {
+        return false;
+    };
+    linked::ADAPTER == "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15"
+        && linked::ENGINE == "OrderedNfa"
+        && linked::AGGREGATE_STRATEGY == "linked-per-line-prepared-span-fill-v15"
+        && linked::GREP_ITERATION_STRATEGY == linked::AGGREGATE_STRATEGY
+        && linked::SPAN_ITERATION_STRATEGY == "not-applicable"
+        && linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)"
+        && linked::HAS_SPAN_FILL
+        && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
+        && linked::PREPARE_OPERATION_FLAGS == shared::Model::Count.prepare_operation_flags()
+        && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
+        && linked::PROGRAM_LEN != 0
+        && linked::PROGRAM_SHA256 != [0; 32]
+        && linked::OBJECT_SHA256 != [0; 32]
+        && linked::REQUIRED_RUNTIME_SYMBOLS == EXPECTED_RUNTIME_SYMBOLS
+        && entry_identity == span_fill_identity
+        && entry_identity == program_identity
+        && reducer_identity != entry_identity
+}
+
 fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
+    const MIXED_ROW_STRATEGY: &str = "native-independent-span-row-selector-mixed-prepared-v15-v1";
     const CAPTURE_STRATEGY: &str = "native-row-static-uniform-capture-multiplier-v1";
     const PARTICIPATION_STRATEGY: &str = "native-exact-span-participation-dfa-v1";
     const GREP_PARTICIPATION_STRATEGY: &str = "per-line-native-exact-span-participation-dfa-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
+    const MIXED_GREP_ROW_STRATEGY: &str =
+        "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1";
     const SELECTOR_FALLBACK_STRATEGY: &str =
         "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1";
     const GREP_SELECTOR_FALLBACK_STRATEGY: &str =
@@ -1765,6 +2063,14 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::ROW_ARTIFACT_COUNT == 0
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_FIRST_SOURCE_ORDINALS.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_ENTRY_SYMBOLS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_REQUIRED_PREPARE_CAPABILITIES.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_PREPARE_CONFIG_VERSIONS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_PREPARE_OPERATION_FLAGS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_PROGRAM_SYMBOLS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_PROGRAM_LENS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_SPAN_FILL_SYMBOLS.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_PREPARED_BULK_STRATEGIES.len()
+        || linked::ROW_ARTIFACT_COUNT != linked::ROW_REQUIRED_RUNTIME_SYMBOLS.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_AUTOMATON_SHA256.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_PROGRAM_SHA256.len()
         || linked::ROW_ARTIFACT_COUNT != linked::ROW_OBJECT_SHA256.len()
@@ -1783,6 +2089,25 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     if linked::ROW_TOTAL_OBJECT_BYTES > shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES {
         return Err("linked native-row objects exceed the build-time byte cap".to_owned());
     }
+    let has_prepared_v15 = linked::ROW_REQUIRED_PREPARE_CAPABILITIES
+        .iter()
+        .any(|&capabilities| capabilities != 0);
+    let expected_caps = PrepareV3Caps::for_required_capabilities(if has_prepared_v15 {
+        PREPARE_CAPABILITY_ORDERED_NFA_V15
+    } else {
+        0
+    });
+    if PrepareV3Caps::linked_rows() != expected_caps {
+        return Err("linked native-row V3 cap receipt differs from the runtime config".to_owned());
+    }
+    if has_prepared_v15
+        && (linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+            || linked::PARTICIPATION_CAPTURE_BRIDGE
+            || linked::UNIFORM_CAPTURE_BRIDGE
+            || linked::STRICT_CAPTURE_BRIDGE)
+    {
+        return Err("capture rows cannot advertise a prepared V15 fallback".to_owned());
+    }
     if linked::PREPARE_CONFIG_VERSION != 0
         || linked::PREPARE_OPERATION_FLAGS != 0
         || linked::REQUIRED_PREPARE_CAPABILITIES != 0
@@ -1794,7 +2119,7 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::PREPARED_BULK_STRATEGY != "None"
         || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
     {
-        return Err("linked native-row table exposes a forbidden prepared/helper route".to_owned());
+        return Err("linked native-row table exposes a forbidden global prepared route".to_owned());
     }
     let expected_aggregate_strategy = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         SELECTOR_FALLBACK_STRATEGY
@@ -1805,12 +2130,22 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else if linked::UNIFORM_CAPTURE_BRIDGE {
         CAPTURE_STRATEGY
     } else if benchmark.model == shared::Model::GrepCount {
-        GREP_ROW_STRATEGY
+        if has_prepared_v15 {
+            MIXED_GREP_ROW_STRATEGY
+        } else {
+            GREP_ROW_STRATEGY
+        }
+    } else if has_prepared_v15 {
+        MIXED_ROW_STRATEGY
     } else {
         ROW_STRATEGY
     };
     let expected_span_strategy = if benchmark.model == shared::Model::SpanSum {
-        ROW_STRATEGY
+        if has_prepared_v15 {
+            MIXED_ROW_STRATEGY
+        } else {
+            ROW_STRATEGY
+        }
     } else {
         "not-applicable"
     };
@@ -1824,7 +2159,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else if benchmark.model == shared::Model::GrepCaptures {
         GREP_CAPTURE_STRATEGY
     } else if benchmark.model == shared::Model::GrepCount {
-        GREP_ROW_STRATEGY
+        if has_prepared_v15 {
+            MIXED_GREP_ROW_STRATEGY
+        } else {
+            GREP_ROW_STRATEGY
+        }
     } else {
         "not-applicable"
     };
@@ -1833,6 +2172,49 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::GREP_ITERATION_STRATEGY != expected_grep_strategy
     {
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
+    }
+    let expected_adapter = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+    } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        match benchmark.model {
+            shared::Model::CountCaptures => "general-aot-native-exact-span-participation-count-v1",
+            shared::Model::GrepCaptures => "general-aot-native-exact-span-participation-grep-v1",
+            _ => return Err("participation capture bridge has a non-capture adapter".to_owned()),
+        }
+    } else if linked::STRICT_CAPTURE_BRIDGE {
+        match benchmark.model {
+            shared::Model::CountCaptures => "general-aot-native-single-capture-next-count-v1",
+            shared::Model::GrepCaptures => "general-aot-native-single-capture-next-grep-v1",
+            _ => return Err("strict capture bridge has a non-capture adapter".to_owned()),
+        }
+    } else {
+        match (benchmark.model, has_prepared_v15) {
+            (shared::Model::Count, false) => "general-aot-native-row-bridge-count-v1",
+            (shared::Model::Count, true) => {
+                "general-aot-native-row-bridge-count-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::SpanSum, false) => "general-aot-native-row-bridge-count-spans-v1",
+            (shared::Model::SpanSum, true) => {
+                "general-aot-native-row-bridge-count-spans-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::GrepCount, false) => "general-aot-native-row-bridge-grep-v1",
+            (shared::Model::GrepCount, true) => {
+                "general-aot-native-row-bridge-grep-mixed-prepared-ordered-nfa-v15-v1"
+            }
+            (shared::Model::CountCaptures, false) => {
+                "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
+            }
+            (shared::Model::GrepCaptures, false) => {
+                "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
+            }
+            (shared::Model::Compile | shared::Model::RegexRedux, _)
+            | (shared::Model::CountCaptures | shared::Model::GrepCaptures, true) => {
+                return Err("linked native-row table has an impossible adapter shape".to_owned());
+            }
+        }
+    };
+    if linked::ADAPTER != expected_adapter {
+        return Err("linked native-row adapter disagrees with its route receipts".to_owned());
     }
 
     if linked::UNIFORM_CAPTURE_BRIDGE {
@@ -2051,6 +2433,14 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         return Err("non-selector-fallback route advertises mixed capture state".to_owned());
     }
 
+    let row_engines = linked::ENGINE
+        .strip_prefix("IndependentNativeSpanRows(")
+        .and_then(|engines| engines.strip_suffix(')'))
+        .map(|engines| engines.split(',').collect::<Vec<_>>())
+        .ok_or_else(|| "linked native-row engine receipt is malformed".to_owned())?;
+    if row_engines.len() != linked::ROW_ARTIFACT_COUNT {
+        return Err("linked native-row engine cardinality differs".to_owned());
+    }
     let mut previous_first = None;
     for (artifact, &first_source) in linked::ROW_FIRST_SOURCE_ORDINALS.iter().enumerate() {
         if first_source >= linked::SOURCE_PATTERN_COUNT
@@ -2061,6 +2451,88 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
             return Err("linked native-row source-priority map is malformed".to_owned());
         }
         previous_first = Some(first_source);
+        let capabilities = linked::ROW_REQUIRED_PREPARE_CAPABILITIES[artifact];
+        match capabilities {
+            0 => {
+                if linked::ROW_PREPARE_CONFIG_VERSIONS[artifact] != 0
+                    || linked::ROW_PREPARE_OPERATION_FLAGS[artifact] != 0
+                    || !linked::ROW_PROGRAM_SYMBOLS[artifact].is_empty()
+                    || linked::ROW_PROGRAM_LENS[artifact] != 0
+                    || !linked::ROW_SPAN_FILL_SYMBOLS[artifact].is_empty()
+                    || linked::ROW_PREPARED_BULK_STRATEGIES[artifact] != "None"
+                    || !linked::ROW_REQUIRED_RUNTIME_SYMBOLS[artifact].is_empty()
+                {
+                    return Err(format!(
+                        "ordinary native row {artifact} advertises prepared/helper state"
+                    ));
+                }
+                if !matches!(row_engines[artifact], "OrderedDfa" | "OrderedContextDfa")
+                    || native_symbol_identity(
+                        linked::ROW_ENTRY_SYMBOLS[artifact],
+                        "fre_aot_regex_search_v1_",
+                    )
+                    .is_none()
+                {
+                    return Err(format!(
+                        "ordinary native row {artifact} has a noncanonical engine or entry"
+                    ));
+                }
+            }
+            PREPARE_CAPABILITY_ORDERED_NFA_V15 => {
+                let entry_identity = native_symbol_identity(
+                    linked::ROW_ENTRY_SYMBOLS[artifact],
+                    "fre_aot_regex_search_exclusive_v1_",
+                );
+                let program_identity = native_symbol_identity(
+                    linked::ROW_PROGRAM_SYMBOLS[artifact],
+                    "fre_aot_regex_runtime_program_v1_",
+                );
+                let span_fill_identity = native_symbol_identity(
+                    linked::ROW_SPAN_FILL_SYMBOLS[artifact],
+                    "fre_aot_regex_fill_spans_exclusive_v1_",
+                );
+                let runtime_symbols = linked::ROW_REQUIRED_RUNTIME_SYMBOLS[artifact]
+                    .split(',')
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected_runtime_symbols = [
+                    "fre_aot_regex_runtime_search_v1",
+                    "fre_aot_regex_runtime_search_exclusive_v1",
+                    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+                if linked::ROW_PREPARE_CONFIG_VERSIONS[artifact] != PREPARE_CONFIG_V3_VERSION
+                    || linked::ROW_PREPARE_OPERATION_FLAGS[artifact]
+                        != shared::Model::Count.prepare_operation_flags()
+                    || row_engines[artifact] != "OrderedNfa"
+                    || linked::ROW_PROGRAM_SYMBOLS[artifact].is_empty()
+                    || linked::ROW_PROGRAM_LENS[artifact] == 0
+                    || linked::ROW_PROGRAM_LENS[artifact]
+                        > shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+                    || linked::ROW_SPAN_FILL_SYMBOLS[artifact].is_empty()
+                    || linked::ROW_PREPARED_BULK_STRATEGIES[artifact]
+                        != "Some(NativeOrderedNfaLoop)"
+                    || runtime_symbols != expected_runtime_symbols
+                    || entry_identity.is_none()
+                    || entry_identity != program_identity
+                    || entry_identity != span_fill_identity
+                    || linked::ROW_ENTRY_SYMBOLS[artifact] == linked::ROW_PROGRAM_SYMBOLS[artifact]
+                    || linked::ROW_ENTRY_SYMBOLS[artifact]
+                        == linked::ROW_SPAN_FILL_SYMBOLS[artifact]
+                    || linked::ROW_PROGRAM_SYMBOLS[artifact]
+                        == linked::ROW_SPAN_FILL_SYMBOLS[artifact]
+                {
+                    return Err(format!(
+                        "prepared native row {artifact} has an inconsistent V15 closure"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "native row {artifact} requires unknown prepare capabilities {other:#x}"
+                ));
+            }
+        }
         if linked::UNIFORM_CAPTURE_BRIDGE
             && linked::ROW_PARTICIPATING_GROUPS[artifact]
                 != linked::SOURCE_PARTICIPATING_GROUPS[first_source]
@@ -2096,6 +2568,15 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     Ok(())
 }
 
+fn native_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = symbol.strip_prefix(prefix)?;
+    (suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(suffix)
+}
+
 fn run_operation(
     benchmark: &shared::Benchmark,
     session: &mut ExclusiveSession,
@@ -2111,6 +2592,15 @@ fn run_operation(
             session,
             ExclusiveSession::strict_span_sum_with_direct_entry,
         ),
+        shared::Model::GrepCount
+            if linked::GREP_ITERATION_STRATEGY == "linked-per-line-prepared-span-fill-v15" =>
+        {
+            run_operation_route(
+                benchmark,
+                session,
+                ExclusiveSession::strict_grep_with_prepared_fill,
+            )
+        }
         shared::Model::GrepCount => run_operation_route(
             benchmark,
             session,
@@ -2251,6 +2741,15 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
     let stock_positive_fallback = linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
         .then(|| compile_stock_rebar_regex(benchmark))
         .transpose()?;
+    let prepared_rows = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+        || linked::PARTICIPATION_CAPTURE_BRIDGE
+        || linked::STRICT_CAPTURE_BRIDGE
+        || linked::UNIFORM_CAPTURE_BRIDGE
+    {
+        None
+    } else {
+        Some(PreparedRowSessions::prepare()?)
+    };
     let mut operation = |haystack: &[u8]| {
         if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
             strict_linked_selector_capture_grep(
@@ -2266,7 +2765,13 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
         } else {
-            strict_native_row_reduce(benchmark.model, haystack)
+            strict_native_row_reduce(
+                benchmark.model,
+                haystack,
+                prepared_rows
+                    .as_ref()
+                    .expect("ordinary native-row route prepared its handle table"),
+            )
         }
     };
     let warmup_start = Instant::now();
@@ -2297,6 +2802,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
             break;
         }
     }
+    drop(operation);
     if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         let positive_fallback_calls = SELECTOR_CAPTURE_POSITIVE_FALLBACK_CALLS
             .load(Ordering::Relaxed)
@@ -2310,6 +2816,9 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
                 "selector-first mixed-route receipt is inconsistent: positive_fallback_calls={positive_fallback_calls} published_positive={published_positive}"
             ));
         }
+    }
+    if let Some(prepared_rows) = prepared_rows {
+        prepared_rows.destroy()?;
     }
     Ok(samples)
 }
@@ -3068,29 +3577,25 @@ mod tests {
         assert_eq!(impossible_fallback_calls, 0);
 
         let mut fallback_calls = 0_usize;
-        assert!(
-            strict_selector_capture_grep_reduce_with(
-                b"line",
-                |_line, _result| Ok(STATUS_INVALID_ARGUMENT),
-                |_line| {
-                    fallback_calls += 1;
-                    Ok(1)
-                },
-            )
-            .is_err()
-        );
+        assert!(strict_selector_capture_grep_reduce_with(
+            b"line",
+            |_line, _result| Ok(STATUS_INVALID_ARGUMENT),
+            |_line| {
+                fallback_calls += 1;
+                Ok(1)
+            },
+        )
+        .is_err());
         assert_eq!(fallback_calls, 0);
-        assert!(
-            strict_selector_capture_grep_reduce_with(
-                b"line",
-                |_line, result| {
-                    *result = FreAotRegexResultV1 { start: 0, end: 5 };
-                    Ok(STATUS_MATCH)
-                },
-                |_line| Ok(1),
-            )
-            .is_err()
-        );
+        assert!(strict_selector_capture_grep_reduce_with(
+            b"line",
+            |_line, result| {
+                *result = FreAotRegexResultV1 { start: 0, end: 5 };
+                Ok(STATUS_MATCH)
+            },
+            |_line| Ok(1),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3324,28 +3829,24 @@ mod tests {
         assert!(strict_capture_row_participation(5, &[]).is_err());
 
         assert!(validate_strict_capture_state(FreAotRegexIterStateV1::default(), 5).is_ok());
-        assert!(
-            validate_strict_capture_state(
-                FreAotRegexIterStateV1 {
-                    next_start: 6,
-                    ..FreAotRegexIterStateV1::default()
-                },
-                5,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_strict_capture_state(
-                FreAotRegexIterStateV1 {
-                    next_start: 2,
-                    last_match_end: 2,
-                    flags: ITER_PENDING_EMPTY,
-                    reserved: 0,
-                },
-                5,
-            )
-            .is_err()
-        );
+        assert!(validate_strict_capture_state(
+            FreAotRegexIterStateV1 {
+                next_start: 6,
+                ..FreAotRegexIterStateV1::default()
+            },
+            5,
+        )
+        .is_err());
+        assert!(validate_strict_capture_state(
+            FreAotRegexIterStateV1 {
+                next_start: 2,
+                last_match_end: 2,
+                flags: ITER_PENDING_EMPTY,
+                reserved: 0,
+            },
+            5,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3451,11 +3952,9 @@ mod tests {
             klv.extend_from_slice(value);
             klv.push(b'\n');
         }
-        assert!(
-            shared::Benchmark::parse(&klv)
-                .expect_err("object emission is not Rebar compile")
-                .contains("not a search-ready Rebar compile")
-        );
+        assert!(shared::Benchmark::parse(&klv)
+            .expect_err("object emission is not Rebar compile")
+            .contains("not a search-ready Rebar compile"));
     }
 
     #[test]
@@ -3464,21 +3963,17 @@ mod tests {
         overlap
             .push(FreAotRegexResultV1 { start: 1, end: 4 })
             .expect("first span");
-        assert!(
-            overlap
-                .push(FreAotRegexResultV1 { start: 3, end: 5 })
-                .is_err()
-        );
+        assert!(overlap
+            .push(FreAotRegexResultV1 { start: 3, end: 5 })
+            .is_err());
 
         let mut adjacent_empty = StrictSpanAccumulator::new(8);
         adjacent_empty
             .push(FreAotRegexResultV1 { start: 1, end: 4 })
             .expect("first span");
-        assert!(
-            adjacent_empty
-                .push(FreAotRegexResultV1 { start: 4, end: 4 })
-                .is_err()
-        );
+        assert!(adjacent_empty
+            .push(FreAotRegexResultV1 { start: 4, end: 4 })
+            .is_err());
     }
 
     #[test]
