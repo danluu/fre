@@ -928,6 +928,7 @@ pub struct PackedLiteralSetOrdinaryExecutor<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct PackedLiteralSetSearchCursor<'p, 'h> {
     plan: &'p PackedLiteralSetPlan,
+    uniform: &'p UniformWord64,
     native: &'p Searcher,
     haystack: &'h [u8],
     last_start: Option<usize>,
@@ -1134,11 +1135,14 @@ impl PackedLiteralSetPlan {
         &'p self,
         haystack: &'h [u8],
     ) -> Option<PackedLiteralSetSearchCursor<'p, 'h>> {
-        let PackedLiteralEngine::UniformWord64Retained { native, .. } = &self.engine else {
+        let PackedLiteralEngine::UniformWord64Retained { uniform, native } =
+            &self.engine
+        else {
             return None;
         };
         Some(PackedLiteralSetSearchCursor {
             plan: self,
+            uniform,
             native,
             haystack,
             last_start: None,
@@ -1271,30 +1275,6 @@ impl PackedLiteralSetPlan {
                 window.start() + relative_end,
             )
         }))
-    }
-
-    #[cfg(not(feature = "static-dispatch"))]
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "the validated slice and packed engine contracts prove these window-relative additions"
-    )]
-    fn find_window_value_unmetered_uniform(
-        &self,
-        haystack: &[u8],
-        window: Window,
-    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
-        validate_window(window, haystack.len())?;
-        let PackedLiteralEngine::UniformWord64Retained { uniform, .. } = &self.engine else {
-            unreachable!("only retained uniform plans construct adaptive cursors");
-        };
-        Ok(uniform
-            .find(&haystack[window.start()..window.end()])
-            .map(|(relative_start, relative_end)| {
-                (
-                    window.start() + relative_start,
-                    window.start() + relative_end,
-                )
-            }))
     }
 
     #[allow(
@@ -1447,24 +1427,41 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
         &mut self,
         start: usize,
     ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
-        if self.last_start.is_some_and(|previous| start < previous) {
-            self.close_matches = 0;
-            self.dense = false;
+        if start > self.haystack.len() {
+            self.observe_start(start);
+            return Err(PackedLiteralSetError::InvalidWindow {
+                start,
+                end: self.haystack.len(),
+                haystack_len: self.haystack.len(),
+            });
         }
-        self.last_start = Some(start);
-        let remaining = self.haystack.len().saturating_sub(start);
+        Ok(self.find_at_value_unmetered_validated(start))
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the caller-proved suffix and retained-engine contracts prove these offsets"
+    )]
+    fn find_at_value_unmetered_validated(
+        &mut self,
+        start: usize,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(start <= self.haystack.len());
+        self.observe_start(start);
+        let remaining = self.haystack.len() - start;
         let use_uniform = self.dense && remaining >= RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
-        let window = Window::new(start, self.haystack.len());
-        let matched = if use_uniform {
-            self.plan
-                .find_window_value_unmetered_uniform(self.haystack, window)?
+        let window_bytes = &self.haystack[start..];
+        let relative = if use_uniform {
+            self.uniform.find(window_bytes)
         } else {
-            self.plan.find_window_value_unmetered_with_native(
-                self.haystack,
-                window,
-                Some(self.native),
-            )?
+            self.native
+                .find(window_bytes)
+                .map(|matched| (matched.start(), matched.end()))
         };
+        let matched = relative.map(|(matched_start, matched_end)| {
+            (start + matched_start, start + matched_end)
+        });
         if let Some((matched_start, _)) = matched {
             let gap = matched_start.saturating_sub(start);
             if gap <= RETAINED_ITER_DENSE_GAP_BYTES {
@@ -1475,7 +1472,16 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
                 self.dense = false;
             }
         }
-        Ok(matched)
+        matched
+    }
+
+    #[inline(always)]
+    fn observe_start(&mut self, start: usize) {
+        if self.last_start.is_some_and(|previous| start < previous) {
+            self.close_matches = 0;
+            self.dense = false;
+        }
+        self.last_start = Some(start);
     }
 }
 
@@ -1535,7 +1541,7 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
         loop {
             #[cfg(not(feature = "static-dispatch"))]
             let matched = if let Some(cursor) = retained.as_mut() {
-                cursor.find_at_value_unmetered(start)?
+                cursor.find_at_value_unmetered_validated(start)
             } else {
                 self.find_window_value(haystack, Window::new(start, window.end()))?
             };
@@ -4398,6 +4404,53 @@ mod tests {
             start = matched.1;
         }
         assert_eq!(actual, expected);
+
+        let invalid_start = haystack.len().checked_add(1).unwrap();
+        let invalid_error = PackedLiteralSetError::InvalidWindow {
+            start: invalid_start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        };
+        let mut invalid_unmetered = plan.search_cursor(&haystack).unwrap();
+        let mut invalid_checked = plan.search_cursor(&haystack).unwrap();
+        for start in [0, 8] {
+            let unmetered_match = invalid_unmetered
+                .find_at_value_unmetered(start)
+                .unwrap();
+            let checked_match = invalid_checked
+                .find_at(start, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(unmetered_match, checked_match);
+        }
+        assert!(invalid_unmetered.dense);
+        assert_eq!(
+            invalid_unmetered.find_at_value_unmetered(invalid_start),
+            Err(invalid_error.clone()),
+        );
+        assert_eq!(
+            invalid_checked.find_at_value(
+                invalid_start,
+                PackedLiteralSetSearchLimits::unlimited(),
+            ),
+            Err(invalid_error),
+        );
+        assert_eq!(
+            invalid_unmetered.find_at_value_unmetered(80),
+            Ok(Some((80, 88))),
+        );
+        assert_eq!(
+            invalid_checked
+                .find_at_value(80, PackedLiteralSetSearchLimits::unlimited()),
+            Ok(Some((80, 88))),
+        );
+        assert_eq!(invalid_unmetered.close_matches, 1);
+        assert!(!invalid_unmetered.dense);
+        assert_eq!(
+            invalid_checked.close_matches,
+            invalid_unmetered.close_matches,
+        );
+        assert_eq!(invalid_checked.dense, invalid_unmetered.dense);
 
         let work = (haystack.len() + 1)
             .checked_mul(plan.verification_bytes_per_position)
