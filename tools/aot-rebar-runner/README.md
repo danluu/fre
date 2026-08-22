@@ -20,9 +20,16 @@ one uniform group-zero-inclusive participation count, then seals that proof to
 the exact ordinary native Span selector. Rust selects spans and adds the
 winning row's compile-time count; it does not materialize capture offsets.
 If that theorem specifically declines for an exact one-pattern job, the build
-may instead link an independently authenticated helper-free native
-`capture_next` iterator. Parse, lowering, allocation, resource, emission, and
-authentication failures are terminal and are never converted into fallback.
+next tries an independently authenticated native exact-span participation
+artifact. The ordinary Span selector remains authoritative for match choice;
+one helper-free DFA export replays that selected span and publishes only its
+participating group count into caller-owned storage. An authenticated semantic
+negative retains the pre-existing strict `capture_next` fallback. Parse,
+lowering, allocation, unrelated resource, emission, and authentication failures
+are terminal and are never converted into fallback. The adapter permits one
+fixed numeric retry only after the exact default participation DFA-state cap;
+that retry changes the state and dependent construction-work ceilings and
+nothing else.
 
 ```sh
 rebar klv --max-iters 9 --max-warmup-iters 1 \
@@ -86,8 +93,17 @@ timing belongs to a separately named compiler-stage benchmark.
   source/row cardinalities, priority mapping, and automaton/program/object
   hashes. An independently constructed Rust captures oracle remains
   authoritative for the final value.
-  An exact one-pattern semantic decline may select the stricter native
-  `capture_next` route instead. That iterator publishes every
+  After a uniform-proof decline, an exact one-pattern job may instead select a
+  helper-free exact-span participation DFA. Rust iterates spans through the
+  authenticated ordinary selector, passes each exact selected span to the
+  paired replay entry, and adds the returned nonzero count only after a
+  transactional `MATCH` status. The exact 16-byte aligned caller-owned scratch
+  area is reserved and must remain byte-for-byte untouched; non-`MATCH` status
+  must leave the count untouched and fails the operation. `grep-captures`
+  restarts the same checked loop for every Rebar byte-line domain. The stock
+  Rust captures oracle remains authoritative for the final value.
+  An authenticated participation semantic decline may select the stricter
+  native `capture_next` route instead. That iterator publishes every
   group-zero-inclusive slot into one caller-owned allocation, and the adapter
   validates continuation state, fused exhaustion, slot completeness,
   containment, progress, and checked participation totals on every result.
@@ -209,9 +225,11 @@ host tier with `FRE_AOT_REBAR_BENCHMARK_FILTER=<exact-name>` and
 mandatory default remains the complete four-row, base-plus-SIMD correctness
 matrix.
 
-Capture replay, RegexSet all-ID publication and future `MatchStats` remain
-separate typed extensions. They must not be emulated by benchmark-name
-recognition or silently folded into these contracts. The native-row bridge
+Exact one-source capture participation replay is the narrow typed route above;
+general capture materialization, RegexSet all-ID publication and future
+`MatchStats` remain separate typed extensions. They must not be emulated by
+benchmark-name recognition or silently folded into these contracts. The
+native-row bridge
 implements Rebar's ordered `build_many` single-match stream; it is not an
 all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
 admitted only by its typed zero-pattern model and exact fixed public stage
@@ -249,6 +267,13 @@ independently inventoried semantic runtime-symbol surfaces, and
 trap-authenticates `capture_next` itself as the sole component entry. The route
 counts as a native search/capture core with a checked Rust adapter loop, never
 as a wholly fused native operation.
+The mutually exclusive v4 participation record binds the source, selector,
+capture program, sealed replay bundle, build-work extent, all three exported
+symbols, and complete object/artifact identities. It reports
+`capture_resolution=native-exact-span-participation-dfa-v1`, an empty semantic
+runtime dependency surface, and the exact replay geometry. It has the same
+native-core-with-checked-adapter classification and never claims a wholly fused
+operation.
 
 ## HEAD campaign reporting
 

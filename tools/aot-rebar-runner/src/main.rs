@@ -21,9 +21,9 @@ use fre_aot_regex::{
 use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
 use fre_aot_regex_runtime::{
     DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, FreAotRegexCaptureSlotV1,
-    FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
-    FreAotRegexPrepareConfigV3, FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST,
-    ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PREPARE_CAPABILITY_KNOWN_FLAGS,
+    FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexParticipationRequestV1,
+    FreAotRegexPrepareConfigV2, FreAotRegexPrepareConfigV3, FreAotRegexResultV1, ITER_FINISHED,
+    ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PREPARE_CAPABILITY_KNOWN_FLAGS,
     PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
     STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
     fre_aot_regex_runtime_prepare_exclusive_v2, fre_aot_regex_runtime_prepare_exclusive_v3,
@@ -682,6 +682,153 @@ fn strict_uniform_capture_reduce(model: shared::Model, haystack: &[u8]) -> Resul
     }
 }
 
+fn strict_participation_capture_count_domain_with(
+    haystack_len: usize,
+    mut search: impl FnMut(usize) -> Result<Option<FreAotRegexResultV1>, String>,
+    mut participation: impl FnMut(FreAotRegexResultV1) -> Result<u64, String>,
+) -> Result<u64, String> {
+    let mut spans = StrictSpanAccumulator::for_reducer(haystack_len, SpanScalarReducer::Count);
+    let mut total = 0_u64;
+    let mut next_start = 0_usize;
+    let mut last_match_end = None;
+    let mut pending_empty_progress = false;
+    loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            if next_start == haystack_len {
+                return Ok(total);
+            }
+            next_start = next_start.checked_add(1).ok_or_else(|| {
+                "participation selector empty-match progress overflowed".to_owned()
+            })?;
+        }
+
+        let Some(matched) = search(next_start)? else {
+            return Ok(total);
+        };
+        validate_span(matched, haystack_len)?;
+        if matched.start < next_start {
+            return Err(format!(
+                "participation selector returned span {matched:?} before requested start {next_start}"
+            ));
+        }
+        if matched.start == matched.end && last_match_end == Some(matched.end) {
+            if next_start == haystack_len {
+                return Ok(total);
+            }
+            next_start = next_start.checked_add(1).ok_or_else(|| {
+                "participation selector adjacent-empty progress overflowed".to_owned()
+            })?;
+            continue;
+        }
+
+        spans.push(matched)?;
+        let groups = participation(matched)?;
+        if groups == 0 {
+            return Err("participation replay omitted mandatory group zero".to_owned());
+        }
+        total = total
+            .checked_add(groups)
+            .ok_or_else(|| "linked AOT participation capture count overflowed".to_owned())?;
+        next_start = matched.end;
+        last_match_end = Some(matched.end);
+        pending_empty_progress = matched.start == matched.end;
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generated selector, bundle and exact-span participation declarations form one authenticated object-local ABI"
+)]
+fn strict_linked_participation_capture_domain(haystack: &[u8]) -> Result<u64, String> {
+    strict_participation_capture_count_domain_with(
+        haystack.len(),
+        |window_start| {
+            let mut result = FreAotRegexResultV1::default();
+            // SAFETY: route authentication binds row zero to the object-local
+            // helper-free selector. The complete haystack and aligned result
+            // remain live and disjoint for this call.
+            let status = unsafe {
+                linked::search_row(
+                    0,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    window_start,
+                    haystack.len(),
+                    &raw mut result,
+                )
+            };
+            match status {
+                STATUS_NO_MATCH => Ok(None),
+                STATUS_MATCH => Ok(Some(result)),
+                other => Err(format!(
+                    "participation selector {:?} returned status {other}",
+                    linked::PARTICIPATION_SELECTOR_SYMBOL,
+                )),
+            }
+        },
+        |matched| {
+            const SCRATCH_SENTINEL: [u64; 2] = [0x614f_542d_7363_7231, 0x7265_7365_7276_6564];
+            let mut scratch = SCRATCH_SENTINEL;
+            let mut count = usize::MAX;
+            // SAFETY: the generated bundle and exact entry are from the same
+            // authenticated linked object. `matched` came from its paired
+            // selector; all request inputs are live and the naturally aligned
+            // 16-byte reserved scratch and count output are disjoint.
+            let request = FreAotRegexParticipationRequestV1 {
+                bundle: unsafe { linked::participation_bundle_ptr() },
+                haystack: haystack.as_ptr(),
+                haystack_len: haystack.len(),
+                match_start: matched.start,
+                match_end: matched.end,
+                scratch: scratch.as_mut_ptr().cast::<u8>(),
+                scratch_len: std::mem::size_of_val(&scratch),
+                count_out: &raw mut count,
+            };
+            // SAFETY: all pointer, extent, alignment and exact-span obligations
+            // are established above and remain valid for the complete call.
+            let status = unsafe { linked::participation_exact(&raw const request) };
+            if scratch != SCRATCH_SENTINEL {
+                return Err("native participation entry modified reserved scratch".to_owned());
+            }
+            if status != STATUS_MATCH {
+                if count != usize::MAX {
+                    return Err(format!(
+                        "native participation status {status} published count {count} transactionally"
+                    ));
+                }
+                return Err(format!(
+                    "native participation entry {:?} returned status {status} for its selector span",
+                    linked::PARTICIPATION_ENTRY_SYMBOL,
+                ));
+            }
+            if count == 0 || count > linked::PARTICIPATION_GROUP_COUNT {
+                return Err(format!(
+                    "native participation entry published count {count} outside 1..={} for one match",
+                    linked::PARTICIPATION_GROUP_COUNT,
+                ));
+            }
+            u64::try_from(count)
+                .map_err(|_| "native participation count did not fit u64".to_owned())
+        },
+    )
+}
+
+fn strict_participation_capture_reduce(
+    model: shared::Model,
+    haystack: &[u8],
+) -> Result<u64, String> {
+    match model {
+        shared::Model::CountCaptures => strict_linked_participation_capture_domain(haystack),
+        shared::Model::GrepCaptures => haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(strict_linked_participation_capture_domain(line)?)
+                .ok_or_else(|| "linked participation grep-captures count overflowed".to_owned())
+        }),
+        _ => Err("participation capture bridge received an unsupported operation model".to_owned()),
+    }
+}
+
 fn validate_strict_capture_state(
     state: FreAotRegexIterStateV1,
     haystack_len: usize,
@@ -979,6 +1126,52 @@ fn print_provenance() {
         );
         return;
     }
+    if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        println!(
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-exact-span-participation-dfa-v1 capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            linked::CONFIGURED,
+            linked::ADAPTER,
+            linked::EXPECTED_MODEL,
+            linked::EXPECTED_NAME,
+            linked::SOURCE_COMMIT,
+            linked::SOURCE_TREE,
+            linked::TARGET_ARCH,
+            linked::TARGET_OS,
+            linked::FEATURE_BITS,
+            linked::COMPILER_VERSION,
+            linked::OPTIMIZER_VERSION,
+            linked::ENGINE,
+            linked::AGGREGATE_STRATEGY,
+            linked::ROW_TOTAL_OBJECT_BYTES,
+            linked::PARTICIPATION_SELECTOR_SYMBOL,
+            hex(&linked::PARTICIPATION_CAPTURE_SHA256),
+            hex(&linked::PARTICIPATION_OBJECT_SHA256),
+            linked::PARTICIPATION_GROUP_COUNT,
+            linked::PARTICIPATION_ALGORITHM_ID,
+            linked::PARTICIPATION_STRATEGY,
+            linked::PARTICIPATION_SEMANTIC_RUNTIME_CALLS,
+            linked::PARTICIPATION_ASSERTIONS,
+            linked::PARTICIPATION_ASSERTION_SIGNATURES,
+            linked::PARTICIPATION_BYTE_CLASSES,
+            linked::PARTICIPATION_DFA_STATES,
+            linked::PARTICIPATION_TRANSITION_CELLS,
+            linked::PARTICIPATION_BUILD_WORK,
+            linked::PARTICIPATION_SCRATCH_BYTES,
+            linked::PARTICIPATION_PLAN_BYTES,
+            hex(&linked::PARTICIPATION_SOURCE_SHA256),
+            hex(&linked::PARTICIPATION_SELECTOR_SHA256),
+            hex(&linked::PARTICIPATION_CAPTURE_SHA256),
+            hex(&linked::PARTICIPATION_SELECTOR_OBJECT_SHA256),
+            hex(&linked::PARTICIPATION_BUNDLE_SHA256),
+            hex(&linked::PARTICIPATION_EXPORT_IDENTITY_SHA256),
+            hex(&linked::PARTICIPATION_OBJECT_SHA256),
+            hex(&linked::PARTICIPATION_ARTIFACT_IDENTITY_SHA256),
+            linked::PARTICIPATION_BUNDLE_SYMBOL,
+            linked::PARTICIPATION_SELECTOR_SYMBOL,
+            linked::PARTICIPATION_ENTRY_SYMBOL,
+        );
+        return;
+    }
     if linked::STRICT_CAPTURE_BRIDGE {
         println!(
             "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-onepass-capture-next-v1 capture_group_count={} capture_can_match_empty={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} capture_plan_sha256={} capture_bundle_sha256={} capture_artifact_identity_sha256={} capture_materialize_symbol={} capture_selector_symbol={} boundary=native-search-core-with-native-capture-materialization-adapter-loop required_comparators=rust-regex-1.12.4,fre-current-runtime",
@@ -1207,16 +1400,22 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     let prepared_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
-    if linked::STRICT_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
-        return Err(
-            "strict capture receipt is not attached to a native operation route".to_owned(),
-        );
+    if (linked::STRICT_CAPTURE_BRIDGE || linked::PARTICIPATION_CAPTURE_BRIDGE)
+        && !linked::NATIVE_ROW_BRIDGE
+    {
+        return Err("capture receipt is not attached to a native operation route".to_owned());
     }
-    if linked::UNIFORM_CAPTURE_BRIDGE && linked::STRICT_CAPTURE_BRIDGE {
+    if usize::from(linked::UNIFORM_CAPTURE_BRIDGE)
+        + usize::from(linked::STRICT_CAPTURE_BRIDGE)
+        + usize::from(linked::PARTICIPATION_CAPTURE_BRIDGE)
+        > 1
+    {
         return Err("linked capture routes are not mutually exclusive".to_owned());
     }
     if benchmark.model.is_capture()
-        != (linked::UNIFORM_CAPTURE_BRIDGE || linked::STRICT_CAPTURE_BRIDGE)
+        != (linked::UNIFORM_CAPTURE_BRIDGE
+            || linked::STRICT_CAPTURE_BRIDGE
+            || linked::PARTICIPATION_CAPTURE_BRIDGE)
     {
         return Err("capture operation and linked native route disagree".to_owned());
     }
@@ -1421,9 +1620,21 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
 fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
     const CAPTURE_STRATEGY: &str = "native-row-static-uniform-capture-multiplier-v1";
+    const PARTICIPATION_STRATEGY: &str = "native-exact-span-participation-dfa-v1";
+    const GREP_PARTICIPATION_STRATEGY: &str = "per-line-native-exact-span-participation-dfa-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
-    if linked::STRICT_CAPTURE_BRIDGE {
+    if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        if !benchmark.model.is_capture()
+            || benchmark.patterns.len() != 1
+            || linked::UNIFORM_CAPTURE_BRIDGE
+            || linked::STRICT_CAPTURE_BRIDGE
+        {
+            return Err(
+                "linked participation capture route has the wrong operation shape".to_owned(),
+            );
+        }
+    } else if linked::STRICT_CAPTURE_BRIDGE {
         if !benchmark.model.is_capture()
             || benchmark.patterns.len() != 1
             || linked::UNIFORM_CAPTURE_BRIDGE
@@ -1471,7 +1682,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden prepared/helper route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::STRICT_CAPTURE_BRIDGE {
+    let expected_aggregate_strategy = if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        PARTICIPATION_STRATEGY
+    } else if linked::STRICT_CAPTURE_BRIDGE {
         "native-single-capture-next-participation-v1"
     } else if linked::UNIFORM_CAPTURE_BRIDGE {
         CAPTURE_STRATEGY
@@ -1486,7 +1699,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         "not-applicable"
     };
     let expected_grep_strategy =
-        if linked::STRICT_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
+        if linked::PARTICIPATION_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
+            GREP_PARTICIPATION_STRATEGY
+        } else if linked::STRICT_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
             "per-line-native-single-capture-next-v1"
         } else if benchmark.model == shared::Model::GrepCaptures {
             GREP_CAPTURE_STRATEGY
@@ -1598,6 +1813,87 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || !linked::STRICT_CAPTURE_SELECTOR_SYMBOL.is_empty()
     {
         return Err("non-strict route advertises strict capture state".to_owned());
+    }
+
+    if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        let expected_strategy = match linked::TARGET_ARCH {
+            "x86_64" => 1,
+            "aarch64" => 2,
+            _ => {
+                return Err("participation route has an unsupported target architecture".to_owned());
+            }
+        };
+        let digests = [
+            linked::PARTICIPATION_SOURCE_SHA256,
+            linked::PARTICIPATION_CAPTURE_SHA256,
+            linked::PARTICIPATION_SELECTOR_SHA256,
+            linked::PARTICIPATION_SELECTOR_OBJECT_SHA256,
+            linked::PARTICIPATION_BUNDLE_SHA256,
+            linked::PARTICIPATION_EXPORT_IDENTITY_SHA256,
+            linked::PARTICIPATION_OBJECT_SHA256,
+            linked::PARTICIPATION_ARTIFACT_IDENTITY_SHA256,
+        ];
+        if linked::PARTICIPATION_ALGORITHM_ID
+            != fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
+            || linked::PARTICIPATION_STRATEGY != expected_strategy
+            || linked::PARTICIPATION_DECLINE != 0
+            || linked::PARTICIPATION_SEMANTIC_RUNTIME_CALLS != 0
+            || linked::PARTICIPATION_GROUP_COUNT == 0
+            || linked::PARTICIPATION_GROUP_COUNT > shared::MAX_STRICT_CAPTURE_GROUPS
+            || linked::PARTICIPATION_ASSERTION_SIGNATURES == 0
+            || linked::PARTICIPATION_BYTE_CLASSES == 0
+            || linked::PARTICIPATION_DFA_STATES == 0
+            || linked::PARTICIPATION_TRANSITION_CELLS == 0
+            || linked::PARTICIPATION_BUILD_WORK == 0
+            || linked::PARTICIPATION_SCRATCH_BYTES
+                != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+            || linked::PARTICIPATION_PLAN_BYTES
+                < fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+            || digests.contains(&[0; 32])
+            || linked::PARTICIPATION_BUNDLE_SYMBOL.is_empty()
+            || linked::PARTICIPATION_SELECTOR_SYMBOL.is_empty()
+            || linked::PARTICIPATION_ENTRY_SYMBOL.is_empty()
+            || linked::PARTICIPATION_BUNDLE_SYMBOL == linked::PARTICIPATION_SELECTOR_SYMBOL
+            || linked::PARTICIPATION_BUNDLE_SYMBOL == linked::PARTICIPATION_ENTRY_SYMBOL
+            || linked::PARTICIPATION_SELECTOR_SYMBOL == linked::PARTICIPATION_ENTRY_SYMBOL
+            || linked::ROW_ENTRY_SYMBOLS != [linked::PARTICIPATION_SELECTOR_SYMBOL]
+            || linked::ROW_AUTOMATON_SHA256 != [linked::PARTICIPATION_SELECTOR_SHA256]
+            || linked::ROW_PROGRAM_SHA256 != [linked::PARTICIPATION_CAPTURE_SHA256]
+            || linked::ROW_OBJECT_SHA256 != [linked::PARTICIPATION_OBJECT_SHA256]
+            || linked::PROGRAM_SHA256 != linked::PARTICIPATION_CAPTURE_SHA256
+            || linked::OBJECT_SHA256 != linked::PARTICIPATION_OBJECT_SHA256
+            || linked::ENTRY_SYMBOL != linked::PARTICIPATION_SELECTOR_SYMBOL
+            || linked::ROW_TOTAL_OBJECT_BYTES == 0
+            || !linked::OBJECT_BYTES.is_empty()
+        {
+            return Err("linked participation capture identity closure is malformed".to_owned());
+        }
+    } else if !linked::PARTICIPATION_ALGORITHM_ID.is_empty()
+        || linked::PARTICIPATION_STRATEGY != 0
+        || linked::PARTICIPATION_DECLINE != 0
+        || linked::PARTICIPATION_SEMANTIC_RUNTIME_CALLS != 0
+        || linked::PARTICIPATION_GROUP_COUNT != 0
+        || linked::PARTICIPATION_ASSERTIONS != 0
+        || linked::PARTICIPATION_ASSERTION_SIGNATURES != 0
+        || linked::PARTICIPATION_BYTE_CLASSES != 0
+        || linked::PARTICIPATION_DFA_STATES != 0
+        || linked::PARTICIPATION_TRANSITION_CELLS != 0
+        || linked::PARTICIPATION_BUILD_WORK != 0
+        || linked::PARTICIPATION_SCRATCH_BYTES != 0
+        || linked::PARTICIPATION_PLAN_BYTES != 0
+        || linked::PARTICIPATION_SOURCE_SHA256 != [0; 32]
+        || linked::PARTICIPATION_CAPTURE_SHA256 != [0; 32]
+        || linked::PARTICIPATION_SELECTOR_SHA256 != [0; 32]
+        || linked::PARTICIPATION_SELECTOR_OBJECT_SHA256 != [0; 32]
+        || linked::PARTICIPATION_BUNDLE_SHA256 != [0; 32]
+        || linked::PARTICIPATION_EXPORT_IDENTITY_SHA256 != [0; 32]
+        || linked::PARTICIPATION_OBJECT_SHA256 != [0; 32]
+        || linked::PARTICIPATION_ARTIFACT_IDENTITY_SHA256 != [0; 32]
+        || !linked::PARTICIPATION_BUNDLE_SYMBOL.is_empty()
+        || !linked::PARTICIPATION_SELECTOR_SYMBOL.is_empty()
+        || !linked::PARTICIPATION_ENTRY_SYMBOL.is_empty()
+    {
+        return Err("non-participation route advertises participation state".to_owned());
     }
 
     let mut previous_first = None;
@@ -1798,7 +2094,9 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         Vec::new()
     };
     let mut operation = |haystack: &[u8]| {
-        if linked::STRICT_CAPTURE_BRIDGE {
+        if linked::PARTICIPATION_CAPTURE_BRIDGE {
+            strict_participation_capture_reduce(benchmark.model, haystack)
+        } else if linked::STRICT_CAPTURE_BRIDGE {
             strict_capture_reduce(benchmark.model, haystack, &mut capture_slots)
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
@@ -2478,6 +2776,59 @@ mod tests {
         )
     }
 
+    fn independent_participation_capture_count(
+        pattern: &str,
+        haystack: &[u8],
+    ) -> Result<u64, String> {
+        let regex = byte_regex(pattern);
+        let expected = regex
+            .captures_iter(Input::new(haystack))
+            .map(|captures| {
+                let matched = captures
+                    .get_match()
+                    .expect("captures iterator always publishes group zero");
+                let groups = (0..captures.group_len())
+                    .filter(|&group| captures.get_group(group).is_some())
+                    .count();
+                (
+                    FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    },
+                    u64::try_from(groups).expect("small synthetic group count fits u64"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut replay = 0_usize;
+        let total = strict_participation_capture_count_domain_with(
+            haystack.len(),
+            |window_start| {
+                Ok(regex
+                    .find(Input::new(haystack).span(window_start..haystack.len()))
+                    .map(|matched| FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    }))
+            },
+            |selected| {
+                let Some(&(expected_span, groups)) = expected.get(replay) else {
+                    return Err("selector published more spans than capture oracle".to_owned());
+                };
+                if selected != expected_span {
+                    return Err(format!(
+                        "selector span {selected:?} differs from exact replay span {expected_span:?}"
+                    ));
+                }
+                replay += 1;
+                Ok(groups)
+            },
+        )?;
+        if replay != expected.len() {
+            return Err("selector published fewer spans than capture oracle".to_owned());
+        }
+        Ok(total)
+    }
+
     #[test]
     fn independent_native_rows_match_build_many_priority_and_empty_progress() {
         let cases: &[(&[&str], &[u8])] = &[
@@ -2567,6 +2918,79 @@ mod tests {
             independent_uniform_capture_count(&["z+", "(a+)"], &[1, 2], b"aa x aaa"),
             Ok(4),
         );
+    }
+
+    #[test]
+    fn exact_span_participation_loop_matches_synthetic_capture_differentials() {
+        let cases: &[(&str, &[u8])] = &[
+            (r"(a)?b", b"ab b bb"),
+            (r"(?:(a)|(ab))(b)?", b"ab a abb"),
+            (r"((?:ab)+)(c)?", b"ab abc abab ababc"),
+            (r"(a*)", b"baaa"),
+            (r"()", &[0xff, b'a']),
+            (r"(?-u:(\xFF)?)(b+)", &[0xff, b'b', b'b', b' ', b'b']),
+        ];
+        for &(pattern, haystack) in cases {
+            let regex = byte_regex(pattern);
+            let expected = regex
+                .captures_iter(Input::new(haystack))
+                .try_fold(0_u64, |total, captures| {
+                    let groups = (0..captures.group_len())
+                        .filter(|&group| captures.get_group(group).is_some())
+                        .count();
+                    total.checked_add(u64::try_from(groups).expect("small group count"))
+                })
+                .expect("small capture total");
+            assert_eq!(
+                independent_participation_capture_count(pattern, haystack),
+                Ok(expected),
+                "pattern={pattern:?} haystack={haystack:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_span_participation_grep_restarts_each_byte_line() {
+        let pattern = r"(a)?b";
+        let haystack = b"ab\nbb\nnone\nb";
+        let actual = haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(independent_participation_capture_count(pattern, line)?)
+                .ok_or_else(|| "small grep participation total overflowed".to_owned())
+        });
+        let regex = byte_regex(pattern);
+        let expected = haystack.lines().try_fold(0_u64, |total, line| {
+            regex
+                .captures_iter(Input::new(line))
+                .try_fold(total, |subtotal, captures| {
+                    let groups = (0..captures.group_len())
+                        .filter(|&group| captures.get_group(group).is_some())
+                        .count();
+                    subtotal
+                        .checked_add(u64::try_from(groups).expect("small group count"))
+                        .ok_or_else(|| "small oracle total overflowed".to_owned())
+                })
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_span_participation_loop_fails_closed_on_invalid_replay() {
+        let zero = strict_participation_capture_count_domain_with(
+            1,
+            |_start| Ok(Some(FreAotRegexResultV1 { start: 0, end: 1 })),
+            |_matched| Ok(0),
+        )
+        .expect_err("group zero is mandatory");
+        assert!(zero.contains("group zero"), "{zero}");
+
+        let invalid = strict_participation_capture_count_domain_with(
+            1,
+            |_start| Ok(Some(FreAotRegexResultV1 { start: 0, end: 2 })),
+            |_matched| Ok(1),
+        )
+        .expect_err("selector span must remain in bounds");
+        assert!(invalid.contains("invalid span"), "{invalid}");
     }
 
     #[test]

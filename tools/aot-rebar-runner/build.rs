@@ -167,23 +167,46 @@ fn main() {
                 );
             }
             shared::UniformCaptureBridgeDisposition::Declined { .. } => {
-                let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
-                    .expect("compile exact single-pattern helper-free capture route");
-                fs::write(&object_path, bridge.artifact.object())
-                    .expect("write linked strict capture object");
-                fs::write(
-                    &generated_path,
-                    configured_strict_capture_source(
-                        &benchmark,
-                        &bridge,
-                        &architecture,
-                        &operating_system,
-                        feature_bits,
-                        &source_commit,
-                        &source_tree,
-                    ),
-                )
-                .expect("write linked strict capture bindings");
+                match shared::try_compile_participation_capture_bridge(&benchmark, target)
+                    .expect("compile exact-span participation capture bridge")
+                {
+                    shared::ParticipationCaptureBridgeDisposition::Selected(bridge) => {
+                        fs::write(&object_path, bridge.artifact.object())
+                            .expect("write linked participation capture object");
+                        fs::write(
+                            &generated_path,
+                            configured_participation_capture_source(
+                                &benchmark,
+                                &bridge,
+                                &architecture,
+                                &operating_system,
+                                feature_bits,
+                                &source_commit,
+                                &source_tree,
+                            ),
+                        )
+                        .expect("write linked participation capture bindings");
+                    }
+                    shared::ParticipationCaptureBridgeDisposition::Declined { .. } => {
+                        let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
+                            .expect("compile exact single-pattern helper-free capture route");
+                        fs::write(&object_path, bridge.artifact.object())
+                            .expect("write linked strict capture object");
+                        fs::write(
+                            &generated_path,
+                            configured_strict_capture_source(
+                                &benchmark,
+                                &bridge,
+                                &architecture,
+                                &operating_system,
+                                feature_bits,
+                                &source_commit,
+                                &source_tree,
+                            ),
+                        )
+                        .expect("write linked strict capture bindings");
+                    }
+                }
                 println!(
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
                     object_path.display()
@@ -727,6 +750,7 @@ fn configured_source(
         "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
     push_empty_strict_capture_bindings(&mut source);
+    push_empty_participation_capture_bindings(&mut source);
     source
 }
 
@@ -939,6 +963,280 @@ fn configured_regex_redux_source(
         writeln!(source, "        {component} => unsafe {{ REGEX_REDUX_ENTRY_{component}(haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
     }
     source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
+    push_empty_strict_capture_bindings(&mut source);
+    push_empty_participation_capture_bindings(&mut source);
+    source
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generated participation binding closes the Rebar and native artifact identities"
+)]
+fn configured_participation_capture_source(
+    benchmark: &shared::Benchmark,
+    bridge: &shared::ParticipationCaptureBridge,
+    architecture: &str,
+    operating_system: &str,
+    feature_bits: u64,
+    source_commit: &str,
+    source_tree: &str,
+) -> String {
+    assert!(benchmark.model.is_capture());
+    assert_eq!(benchmark.patterns.len(), 1);
+    let artifact = &bridge.artifact;
+    assert!(artifact.authenticates_receipt());
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
+    assert!(artifact.module().required_runtime_program().is_none());
+    let outer = artifact.receipt();
+    let receipt = outer.native();
+    let selector_symbol = artifact.selector_entry_symbol();
+    let bundle_symbol = artifact.bundle_symbol();
+    let participation_symbol = artifact.participation_entry_symbol();
+    let strategy = match receipt.strategy {
+        fre_aot_regex::NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
+        fre_aot_regex::NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
+        fre_aot_regex::NativeParticipationAotStrategyV1::NegativeEntry => {
+            unreachable!("selected participation source cannot contain a negative entry")
+        }
+    };
+    assert!(receipt.decline.is_none());
+    let adapter = match benchmark.model {
+        shared::Model::CountCaptures => "general-aot-native-exact-span-participation-count-v1",
+        shared::Model::GrepCaptures => "general-aot-native-exact-span-participation-grep-v1",
+        _ => unreachable!("participation source requires a capture model"),
+    };
+    let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
+        "per-line-native-exact-span-participation-dfa-v1"
+    } else {
+        "not-applicable"
+    };
+
+    let mut source = String::new();
+    source.push_str("pub const CONFIGURED: bool = true;\n");
+    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = true;\n");
+    writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_NAME: &str = {:?};",
+        benchmark.name
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_MODEL: &str = {:?};",
+        benchmark.model.name()
+    )
+    .unwrap();
+    source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
+    source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 0;\n");
+    source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
+    source.push_str("pub const EXPECTED_PATTERN: &str = \"\";\n");
+    writeln!(
+        source,
+        "pub const EXPECTED_PATTERNS: &[&str] = &{:?};",
+        benchmark.patterns
+    )
+    .unwrap();
+    source.push_str("pub const SOURCE_PATTERN_COUNT: usize = 1;\n");
+    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 1;\n");
+    writeln!(
+        source,
+        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
+        artifact.object().len()
+    )
+    .unwrap();
+    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];\n");
+    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];\n");
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &[{selector_symbol:?}];"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.selector_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.capture_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.object_sha256
+    )
+    .unwrap();
+    source.push_str("pub const UNIFORM_CAPTURE_ALGORITHM_VERSION: u32 = 0;\n");
+    source.push_str("pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = 0;\n");
+    source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_AUTOMATON_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    writeln!(
+        source,
+        "pub const PARTICIPATION_ALGORITHM_ID: &str = {:?};",
+        fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PARTICIPATION_STRATEGY: u16 = {strategy};"
+    )
+    .unwrap();
+    source.push_str("pub const PARTICIPATION_DECLINE: u16 = 0;\n");
+    writeln!(
+        source,
+        "pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = {};",
+        receipt.semantic_runtime_calls
+    )
+    .unwrap();
+    for (name, value) in [
+        ("GROUP_COUNT", receipt.groups),
+        ("ASSERTIONS", receipt.assertions),
+        ("ASSERTION_SIGNATURES", receipt.assertion_signatures),
+        ("BYTE_CLASSES", receipt.byte_classes),
+        ("DFA_STATES", receipt.dfa_states),
+        ("TRANSITION_CELLS", receipt.transition_cells),
+        ("BUILD_WORK", receipt.build_work),
+        ("SCRATCH_BYTES", receipt.scratch_bytes),
+        ("PLAN_BYTES", receipt.plan_bytes),
+    ] {
+        writeln!(source, "pub const PARTICIPATION_{name}: usize = {value};").unwrap();
+    }
+    for (name, digest) in [
+        ("SOURCE", outer.source_sha256()),
+        ("CAPTURE", receipt.capture_sha256),
+        ("SELECTOR", receipt.selector_sha256),
+        ("SELECTOR_OBJECT", receipt.selector_object_sha256),
+        ("BUNDLE", receipt.bundle_sha256),
+        ("EXPORT_IDENTITY", receipt.export_identity_sha256),
+        ("OBJECT", receipt.object_sha256),
+        ("ARTIFACT_IDENTITY", outer.artifact_identity_sha256()),
+    ] {
+        writeln!(
+            source,
+            "pub const PARTICIPATION_{name}_SHA256: [u8; 32] = {digest:?};"
+        )
+        .unwrap();
+    }
+    writeln!(
+        source,
+        "pub const PARTICIPATION_BUNDLE_SYMBOL: &str = {bundle_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PARTICIPATION_SELECTOR_SYMBOL: &str = {selector_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PARTICIPATION_ENTRY_SYMBOL: &str = {participation_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_UNICODE: bool = {};",
+        benchmark.unicode
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_CASE_INSENSITIVE: bool = {};",
+        benchmark.case_insensitive
+    )
+    .unwrap();
+    writeln!(source, "pub const TARGET_ARCH: &str = {architecture:?};").unwrap();
+    writeln!(source, "pub const TARGET_OS: &str = {operating_system:?};").unwrap();
+    writeln!(source, "pub const FEATURE_BITS: u64 = {feature_bits};").unwrap();
+    writeln!(source, "pub const SOURCE_COMMIT: &str = {source_commit:?};").unwrap();
+    writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
+    source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
+    source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
+    writeln!(
+        source,
+        "pub const ENTRY_SYMBOL: &str = {selector_symbol:?};"
+    )
+    .unwrap();
+    source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
+    source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
+    writeln!(
+        source,
+        "pub const GREP_ITERATION_STRATEGY: &str = {grep_strategy:?};"
+    )
+    .unwrap();
+    source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
+    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
+    source.push_str("pub const ENGINE: &str = \"NativeExactSpanParticipationDfaV1\";\n");
+    source.push_str(
+        "pub const AGGREGATE_STRATEGY: &str = \"native-exact-span-participation-dfa-v1\";\n",
+    );
+    writeln!(
+        source,
+        "pub const COMPILER_VERSION: u32 = {};",
+        fre_aot_regex::COMPILER_VERSION
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OPTIMIZER_VERSION: u32 = {};",
+        fre_aot_regex::OPTIMIZER_VERSION
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PROGRAM_SHA256: [u8; 32] = {:?};",
+        receipt.capture_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {:?};",
+        receipt.object_sha256
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
+    source.push_str("unsafe extern \"C\" {\n");
+    writeln!(source, "    #[link_name = {bundle_symbol:?}]").unwrap();
+    source.push_str("    static LINKED_PARTICIPATION_BUNDLE: u8;\n");
+    writeln!(source, "    #[link_name = {selector_symbol:?}]").unwrap();
+    source.push_str("    fn LINKED_PARTICIPATION_SELECTOR(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n");
+    writeln!(source, "    #[link_name = {participation_symbol:?}]").unwrap();
+    source.push_str("    fn LINKED_PARTICIPATION_EXACT(request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32;\n");
+    source.push_str("}\n");
+    source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
+    source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { unsafe { LINKED_PARTICIPATION_SELECTOR(haystack, haystack_len, window_start, window_end, result_out) } }\n");
+    source.push_str("pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { if row != 0 { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; } unsafe { LINKED_PARTICIPATION_SELECTOR(haystack, haystack_len, window_start, window_end, result_out) } }\n");
+    source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { &raw const LINKED_PARTICIPATION_BUNDLE }\n");
+    source.push_str("pub unsafe fn participation_exact(request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { unsafe { LINKED_PARTICIPATION_EXACT(request) } }\n");
+    source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
     source
 }
@@ -1194,6 +1492,7 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
+    push_empty_participation_capture_bindings(&mut source);
     source
 }
 
@@ -1616,6 +1915,7 @@ fn configured_native_row_source(
         "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
     push_empty_strict_capture_bindings(&mut source);
+    push_empty_participation_capture_bindings(&mut source);
     source
 }
 
@@ -1635,6 +1935,37 @@ fn push_empty_strict_capture_bindings(source: &mut String) {
     source.push_str("pub unsafe fn capture_next(_haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, _slot_count: usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
+fn push_empty_participation_capture_bindings(source: &mut String) {
+    source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const PARTICIPATION_ALGORITHM_ID: &str = \"\";\n");
+    source.push_str("pub const PARTICIPATION_STRATEGY: u16 = 0;\n");
+    source.push_str("pub const PARTICIPATION_DECLINE: u16 = 0;\n");
+    source.push_str("pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_GROUP_COUNT: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_ASSERTIONS: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_ASSERTION_SIGNATURES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_BYTE_CLASSES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_DFA_STATES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_TRANSITION_CELLS: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_BUILD_WORK: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_SCRATCH_BYTES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_PLAN_BYTES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_SOURCE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_CAPTURE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_SELECTOR_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_SELECTOR_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_BUNDLE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_EXPORT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const PARTICIPATION_BUNDLE_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const PARTICIPATION_SELECTOR_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const PARTICIPATION_ENTRY_SYMBOL: &str = \"\";\n");
+    source
+        .push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }\n");
+    source.push_str("pub unsafe fn participation_exact(_request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+}
+
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
@@ -1651,6 +1982,31 @@ pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
 pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = "";
 pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = "";
 pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = "";
+pub const PARTICIPATION_CAPTURE_BRIDGE: bool = false;
+pub const PARTICIPATION_ALGORITHM_ID: &str = "";
+pub const PARTICIPATION_STRATEGY: u16 = 0;
+pub const PARTICIPATION_DECLINE: u16 = 0;
+pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = 0;
+pub const PARTICIPATION_GROUP_COUNT: usize = 0;
+pub const PARTICIPATION_ASSERTIONS: usize = 0;
+pub const PARTICIPATION_ASSERTION_SIGNATURES: usize = 0;
+pub const PARTICIPATION_BYTE_CLASSES: usize = 0;
+pub const PARTICIPATION_DFA_STATES: usize = 0;
+pub const PARTICIPATION_TRANSITION_CELLS: usize = 0;
+pub const PARTICIPATION_BUILD_WORK: usize = 0;
+pub const PARTICIPATION_SCRATCH_BYTES: usize = 0;
+pub const PARTICIPATION_PLAN_BYTES: usize = 0;
+pub const PARTICIPATION_SOURCE_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_CAPTURE_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_SELECTOR_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_SELECTOR_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_BUNDLE_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_EXPORT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const PARTICIPATION_BUNDLE_SYMBOL: &str = "";
+pub const PARTICIPATION_SELECTOR_SYMBOL: &str = "";
+pub const PARTICIPATION_ENTRY_SYMBOL: &str = "";
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
@@ -1754,6 +2110,10 @@ pub unsafe fn capture_next(
     _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1,
     _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1,
     _slot_count: usize,
+) -> u32 { 2 }
+pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }
+pub unsafe fn participation_exact(
+    _request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1,
 ) -> u32 { 2 }
 "#
 }

@@ -1,15 +1,19 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
-    Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex,
-    DeterminizeLimits, EngineKind, FeatureSet, OperatingSystem, OutputContract,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1,
-    SlowAotLimits, SymbolBinding, SymbolKind, Target, UniformCaptureAuthenticationError,
-    UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
-    UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileDisposition,
-    UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
-    compile, compile_rebar_single_capture_aot_v1,
+    Architecture, CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1,
+    CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, FeatureSet,
+    NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
+    NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1, OperatingSystem,
+    OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports,
+    PreparedAggregateStrategy, PreparedBulkStrategy, RebarSingleCaptureAotArtifactV1,
+    RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
+    RebarSingleCaptureParticipationAotErrorV1, SlowAotLimits, SymbolBinding, SymbolKind, Target,
+    UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
+    UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
+    UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
+    UniformCapturePreparedSpanFillCompileReceipt, compile, compile_rebar_single_capture_aot_v1,
+    compile_rebar_single_capture_participation_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
     compile_with_prepared_ordered_nfa_v15, compile_with_slow_aot_limits,
@@ -48,6 +52,17 @@ pub const REBAR_RECOVERY_MAX_DFA_STATES: usize = 0;
 pub const REBAR_RECOVERY_MAX_DFA_TRANSITIONS: usize = 0;
 /// Work ceiling paired with [`REBAR_RECOVERY_MAX_DFA_STATES`].
 pub const REBAR_RECOVERY_MAX_DFA_WORK: u64 = 0;
+/// One adapter-local retry ceiling for exact-span participation DFA states.
+///
+/// The default transaction remains authoritative. A retry is permitted only
+/// when native participation construction reports that exact default numeric
+/// ceiling. The retry changes only this ceiling and its predetermined
+/// construction-work envelope; allocation, object, authentication and every
+/// other initial resource failure remain terminal.
+pub const REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES: usize = 131_072;
+/// Construction-work ceiling paired with
+/// [`REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES`].
+pub const REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK: usize = 256 * 1_048_576;
 
 /// Recovery envelope used only after the public, job-specialized Rebar
 /// adapter observes the default lowering-work ceiling. Runtime semantics and
@@ -99,6 +114,41 @@ fn is_uniform_lower_work_limit(error: &UniformCaptureCompileError) -> bool {
             ..
         })
     )
+}
+
+fn is_rebar_participation_lower_work_limit(
+    error: &RebarSingleCaptureParticipationAotErrorV1,
+) -> bool {
+    matches!(
+        error,
+        RebarSingleCaptureParticipationAotErrorV1::Capture(
+            CaptureCompileError::Selector(source)
+        ) if is_lower_work_limit(source)
+    )
+}
+
+fn is_rebar_participation_dfa_state_limit(
+    error: &RebarSingleCaptureParticipationAotErrorV1,
+    attempted_limit: usize,
+) -> bool {
+    matches!(
+        error,
+        RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::DfaStates,
+                required,
+                limit,
+            }
+        ) if *limit == attempted_limit && *required == attempted_limit.saturating_add(1)
+    )
+}
+
+fn rebar_participation_native_retry_limits(
+    mut limits: NativeParticipationAotLimitsV1,
+) -> NativeParticipationAotLimitsV1 {
+    limits.max_dfa_states = REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES;
+    limits.max_build_work = REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK;
+    limits
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -655,6 +705,149 @@ pub struct PreparedUniformCaptureBridge {
 #[derive(Debug)]
 pub struct StrictCaptureBridge {
     pub artifact: RebarSingleCaptureAotArtifactV1,
+}
+
+/// One exact Rebar selector plus an authenticated helper-free exact-span
+/// participation replay export.
+#[derive(Debug)]
+pub struct ParticipationCaptureBridge {
+    pub artifact: RebarSingleCaptureParticipationAotArtifactV1,
+}
+
+/// The participation compiler's sole nonterminal result is its authenticated
+/// negative entry. All construction, resource, allocation, object and
+/// authentication errors remain terminal.
+#[derive(Debug)]
+pub enum ParticipationCaptureBridgeDisposition {
+    Selected(ParticipationCaptureBridge),
+    Declined { reason: String },
+}
+
+/// Compile the additive exact-span participation route after the uniform
+/// theorem has semantically declined.
+pub fn try_compile_participation_capture_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<ParticipationCaptureBridgeDisposition, String> {
+    if !benchmark.model.is_capture() {
+        return Err("participation capture compilation requires a capture model".to_owned());
+    }
+    if benchmark.patterns.len() != 1 {
+        return Ok(ParticipationCaptureBridgeDisposition::Declined {
+            reason: format!(
+                "exact-span participation V1 requires one source, got {}",
+                benchmark.patterns.len()
+            ),
+        });
+    }
+
+    let mut native_limits = NativeParticipationAotLimitsV1::default();
+    native_limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    let compile_with_limits = |compile_limits, native_limits| {
+        let request = RebarSingleCaptureAotRequestV1::new([benchmark.patterns[0].clone()], target)
+            .case_insensitive(benchmark.case_insensitive)
+            .unicode(benchmark.unicode)
+            .compile_limits(compile_limits);
+        compile_rebar_single_capture_participation_aot_v1(request, native_limits)
+    };
+    let compile_with_native_state_retry =
+        |compile_limits| match compile_with_limits(compile_limits, native_limits) {
+            Err(error)
+                if is_rebar_participation_dfa_state_limit(&error, native_limits.max_dfa_states) =>
+            {
+                let retry_limits = rebar_participation_native_retry_limits(native_limits);
+                compile_with_limits(compile_limits, retry_limits)
+            }
+            result => result,
+        };
+    let artifact = match compile_with_native_state_retry(CaptureCompileLimits::default()) {
+        Ok(artifact) => artifact,
+        Err(error) if is_rebar_participation_lower_work_limit(&error) => {
+            let mut compile_limits = CaptureCompileLimits::default();
+            compile_limits.selector = rebar_recovery_compile_limits();
+            compile_limits.selector_slow_aot = rebar_recovery_slow_aot_limits();
+            compile_with_native_state_retry(compile_limits).map_err(|error| {
+                format!("Rebar participation recovery compilation failed: {error}")
+            })?
+        }
+        Err(error) => {
+            return Err(format!("Rebar participation compilation failed: {error}"));
+        }
+    };
+    if !artifact.authenticates_receipt()
+        || artifact.object().is_empty()
+        || artifact.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || artifact.bundle().is_empty()
+    {
+        return Err("participation artifact failed object/receipt authentication".to_owned());
+    }
+    let receipt = artifact.native_receipt();
+    if receipt.strategy == NativeParticipationAotStrategyV1::NegativeEntry {
+        let decline = receipt.decline.ok_or_else(|| {
+            "negative participation artifact omitted its semantic decline".to_owned()
+        })?;
+        return Ok(ParticipationCaptureBridgeDisposition::Declined {
+            reason: format!("{decline:?}"),
+        });
+    }
+    let expected_strategy = match target.architecture {
+        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
+        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+    };
+    let module = artifact.module();
+    let selector = artifact.selector_entry_symbol();
+    let bundle = artifact.bundle_symbol();
+    let participation = artifact.participation_entry_symbol();
+    let entry = module
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == selector)
+        .ok_or_else(|| "participation selector has no public symbol record".to_owned())?;
+    let unresolved = module.symbols().iter().enumerate().any(|(index, symbol)| {
+        symbol.section.is_none()
+            && module
+                .relocations()
+                .iter()
+                .any(|relocation| relocation.symbol == index)
+    });
+    if receipt.strategy != expected_strategy
+        || receipt.decline.is_some()
+        || receipt.semantic_runtime_calls != 0
+        || receipt.groups == 0
+        || receipt.groups > MAX_STRICT_CAPTURE_GROUPS
+        || receipt.assertion_signatures == 0
+        || receipt.byte_classes == 0
+        || receipt.dfa_states == 0
+        || receipt.transition_cells == 0
+        || receipt.build_work == 0
+        || receipt.scratch_bytes != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+        || receipt.plan_bytes != artifact.bundle().len()
+        || selector.is_empty()
+        || bundle.is_empty()
+        || participation.is_empty()
+        || selector == bundle
+        || selector == participation
+        || bundle == participation
+        || module.entry_symbol() != selector
+        || module.required_runtime_symbols().next().is_some()
+        || module.required_runtime_program().is_some()
+        || unresolved
+        || module.prepared_entry_symbol().is_some()
+        || !module.prepared_aggregate_exports().is_empty()
+        || module.required_prepare_capabilities() != 0
+        || entry.binding != SymbolBinding::Global
+        || entry.kind != SymbolKind::Function
+        || entry.section.is_none()
+        || entry.size == 0
+    {
+        return Err(
+            "participation artifact is not a helper-free native DFA selector/replay closure"
+                .to_owned(),
+        );
+    }
+    Ok(ParticipationCaptureBridgeDisposition::Selected(
+        ParticipationCaptureBridge { artifact },
+    ))
 }
 
 /// Compile the typed one-source Rebar capture route after a semantic decline
@@ -1797,6 +1990,164 @@ mod tests {
         many.splice(offset..offset, b"pattern:3:(b)\n".iter().copied());
         let many = Benchmark::parse(&many).expect("multi-source capture fixture");
         assert!(compile_strict_capture_bridge(&many, target).is_err());
+    }
+
+    #[test]
+    fn participation_capture_bridge_selects_after_uniform_semantic_decline() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab b"))
+            .expect("participation capture fixture");
+        assert!(matches!(
+            try_compile_uniform_capture_bridge(&benchmark, target),
+            Ok(UniformCaptureBridgeDisposition::Declined { .. })
+        ));
+        let ParticipationCaptureBridgeDisposition::Selected(bridge) =
+            try_compile_participation_capture_bridge(&benchmark, target)
+                .expect("participation compiler")
+        else {
+            panic!("participation fixture unexpectedly declined");
+        };
+        let receipt = bridge.artifact.native_receipt();
+        let expected = match target.architecture {
+            Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
+            Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+        };
+        assert!(bridge.artifact.authenticates_receipt());
+        assert_eq!(receipt.strategy, expected);
+        assert!(receipt.decline.is_none());
+        assert_eq!(receipt.semantic_runtime_calls, 0);
+        assert!(
+            bridge
+                .artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            bridge
+                .artifact
+                .module()
+                .required_runtime_program()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn participation_state_retry_preserves_already_admitted_artifact_identity() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let compile = |limits| {
+            compile_rebar_single_capture_participation_aot_v1(
+                RebarSingleCaptureAotRequestV1::new(["(a)?b".to_owned()], target),
+                limits,
+            )
+            .expect("already-admitted participation artifact")
+        };
+        let mut ordinary_limits = NativeParticipationAotLimitsV1::default();
+        ordinary_limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+        let retry_limits = rebar_participation_native_retry_limits(ordinary_limits);
+        let mut expected_retry_limits = ordinary_limits;
+        expected_retry_limits.max_dfa_states = REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES;
+        expected_retry_limits.max_build_work = REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK;
+        assert_eq!(retry_limits, expected_retry_limits);
+        let ordinary = compile(ordinary_limits);
+        let retry = compile(retry_limits);
+        assert_eq!(retry.receipt(), ordinary.receipt());
+        assert_eq!(retry.object(), ordinary.object());
+        assert_eq!(retry.bundle(), ordinary.bundle());
+        assert_eq!(retry.bundle_symbol(), ordinary.bundle_symbol());
+        assert_eq!(
+            retry.selector_entry_symbol(),
+            ordinary.selector_entry_symbol()
+        );
+        assert_eq!(
+            retry.participation_entry_symbol(),
+            ordinary.participation_entry_symbol()
+        );
+    }
+
+    #[test]
+    fn participation_state_retry_classifier_is_narrow_and_fail_closed() {
+        let default_limit = NativeParticipationAotLimitsV1::default().max_dfa_states;
+        let exact_state_cap = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::DfaStates,
+                required: default_limit + 1,
+                limit: default_limit,
+            },
+        );
+        assert!(is_rebar_participation_dfa_state_limit(
+            &exact_state_cap,
+            default_limit
+        ));
+
+        let non_exact_state_cap = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::DfaStates,
+                required: default_limit + 2,
+                limit: default_limit,
+            },
+        );
+        assert!(!is_rebar_participation_dfa_state_limit(
+            &non_exact_state_cap,
+            default_limit
+        ));
+        let build_work = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::BuildWork,
+                required: 2,
+                limit: 1,
+            },
+        );
+        assert!(!is_rebar_participation_dfa_state_limit(
+            &build_work,
+            default_limit
+        ));
+        let allocation = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Allocation("injected allocation failure"),
+        );
+        assert!(!is_rebar_participation_dfa_state_limit(
+            &allocation,
+            default_limit
+        ));
+    }
+
+    #[test]
+    fn participation_capture_bridge_preserves_negative_and_cardinality_declines() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let negative = Benchmark::parse(&fixture("count-captures", br"(?m)^((?:ab)+)$", b"ab"))
+            .expect("negative fixture");
+        assert!(matches!(
+            try_compile_participation_capture_bridge(&negative, target),
+            Ok(ParticipationCaptureBridgeDisposition::Declined { .. })
+        ));
+
+        let mut many = fixture("count-captures", b"(a)?b", b"ab");
+        let offset = many
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        many.splice(offset..offset, b"pattern:3:(b)\n".iter().copied());
+        let many = Benchmark::parse(&many).expect("multi-source fixture");
+        assert!(matches!(
+            try_compile_participation_capture_bridge(&many, target),
+            Ok(ParticipationCaptureBridgeDisposition::Declined { .. })
+        ));
     }
 
     #[test]

@@ -17,12 +17,17 @@ use crate::{
     CaptureOnePassDisposition, CompileMode, CompiledModule, NativeCaptureAotDeclineV1,
     NativeCaptureAotError, NativeCaptureAotLimitsV1, NativeCaptureAotReceiptV1,
     NativeCaptureAotStrategyV1, NativeCaptureBundleV1View, NativeCaptureDescriptorV1,
-    OnePassCaptureBuildError, OnePassCaptureBuildFailure, OutputContract, Target,
+    NativeParticipationAotArtifactV1, NativeParticipationAotErrorV1,
+    NativeParticipationAotLimitsV1, NativeParticipationAotReceiptV1,
+    NativeParticipationAotStrategyV1, OnePassCaptureBuildError, OnePassCaptureBuildFailure,
+    OutputContract, Target,
 };
 
 pub const REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY: usize = 1;
 pub const REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/rebar-single-capture-aot-v1\0";
+pub const REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/rebar-single-capture-participation-aot-v1\0";
 
 const DIGEST_BYTES: usize = 32;
 const REBAR_PROFILE_IDENTITY: &[u8] =
@@ -360,6 +365,177 @@ impl RebarSingleCaptureAotArtifactV1 {
     }
 }
 
+/// Rebar/profile/cardinality closure around one exact-span participation
+/// artifact. The embedded native receipt remains authoritative for its sealed
+/// bundle, object and exported symbols; this additive receipt proves that it
+/// was compiled by the pinned one-source Rebar transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebarSingleCaptureParticipationAotReceiptV1 {
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_sha256: [u8; DIGEST_BYTES],
+    profile: RustProfile,
+    target: Target,
+    capture_level: CaptureLevel,
+    group_count: usize,
+    can_match_empty: bool,
+    native: NativeParticipationAotReceiptV1,
+    artifact_identity_sha256: [u8; DIGEST_BYTES],
+}
+
+impl RebarSingleCaptureParticipationAotReceiptV1 {
+    #[must_use]
+    pub const fn source_cardinality(&self) -> usize {
+        self.source_cardinality
+    }
+
+    #[must_use]
+    pub const fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    #[must_use]
+    pub const fn source_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.source_sha256
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &RustProfile {
+        &self.profile
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> Target {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn capture_level(&self) -> CaptureLevel {
+        self.capture_level
+    }
+
+    #[must_use]
+    pub const fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    #[must_use]
+    pub const fn can_match_empty(&self) -> bool {
+        self.can_match_empty
+    }
+
+    #[must_use]
+    pub const fn native(&self) -> NativeParticipationAotReceiptV1 {
+        self.native
+    }
+
+    #[must_use]
+    pub const fn artifact_identity_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.artifact_identity_sha256
+    }
+}
+
+/// One cardinality-authenticated Rebar selector plus an additive helper-free
+/// exact-span participation export. A negative native strategy is retained as
+/// an authenticated semantic decline and is never executable through this
+/// wrapper merely because construction otherwise succeeded.
+#[derive(Debug)]
+pub struct RebarSingleCaptureParticipationAotArtifactV1 {
+    native: NativeParticipationAotArtifactV1,
+    receipt: RebarSingleCaptureParticipationAotReceiptV1,
+}
+
+impl RebarSingleCaptureParticipationAotArtifactV1 {
+    #[must_use]
+    pub fn object(&self) -> &[u8] {
+        self.native.object()
+    }
+
+    #[must_use]
+    pub fn bundle(&self) -> &[u8] {
+        self.native.bundle()
+    }
+
+    #[must_use]
+    pub const fn module(&self) -> &CompiledModule {
+        self.native.module()
+    }
+
+    #[must_use]
+    pub const fn native_receipt(&self) -> NativeParticipationAotReceiptV1 {
+        self.native.receipt()
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &RebarSingleCaptureParticipationAotReceiptV1 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn bundle_symbol(&self) -> &str {
+        self.native.bundle_symbol()
+    }
+
+    #[must_use]
+    pub fn selector_entry_symbol(&self) -> &str {
+        self.native.selector_entry_symbol()
+    }
+
+    #[must_use]
+    pub fn participation_entry_symbol(&self) -> &str {
+        self.native.participation_entry_symbol()
+    }
+
+    /// Recheck the exact Rebar source/profile/schema identity and the complete
+    /// underlying native bundle/module/object/export closure.
+    #[must_use]
+    pub fn authenticates_receipt(&self) -> bool {
+        rebar_single_participation_artifact_authenticates(self)
+    }
+}
+
+/// Failure before publishing a Rebar exact-span participation artifact.
+/// Semantic native declines are successful authenticated negative artifacts,
+/// not members of this error type.
+#[derive(Debug)]
+pub enum RebarSingleCaptureParticipationAotErrorV1 {
+    Capture(CaptureCompileError),
+    Participation(NativeParticipationAotErrorV1),
+    ArithmeticOverflow(&'static str),
+    Authentication(&'static str),
+}
+
+impl fmt::Display for RebarSingleCaptureParticipationAotErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Rebar single-pattern native participation AOT failed: {self:?}",
+        )
+    }
+}
+
+impl std::error::Error for RebarSingleCaptureParticipationAotErrorV1 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(source) => Some(source),
+            Self::Participation(source) => Some(source),
+            Self::ArithmeticOverflow(_) | Self::Authentication(_) => None,
+        }
+    }
+}
+
+impl From<CaptureCompileError> for RebarSingleCaptureParticipationAotErrorV1 {
+    fn from(value: CaptureCompileError) -> Self {
+        Self::Capture(value)
+    }
+}
+
+impl From<NativeParticipationAotErrorV1> for RebarSingleCaptureParticipationAotErrorV1 {
+    fn from(value: NativeParticipationAotErrorV1) -> Self {
+        Self::Participation(value)
+    }
+}
+
 #[derive(Debug)]
 pub enum RebarSingleCaptureAotError {
     Capture(CaptureCompileError),
@@ -404,6 +580,96 @@ impl From<NativeCaptureAotError> for RebarSingleCaptureAotError {
     fn from(value: NativeCaptureAotError) -> Self {
         Self::Native(value)
     }
+}
+
+/// Compile and publish one cardinality-authenticated Rebar exact-span
+/// participation artifact.
+///
+/// The pinned Rebar meta profile and one-source guard are the same transaction
+/// used by [`compile_rebar_single_capture_aot_v1`]. Unlike that stricter
+/// one-pass route, an authenticated negative participation artifact is
+/// returned to the caller so it can preserve its pre-existing fallback. No
+/// construction, resource, allocation, object or authentication error is
+/// converted into that semantic decline.
+pub fn compile_rebar_single_capture_participation_aot_v1(
+    request: RebarSingleCaptureAotRequestV1,
+    participation_limits: NativeParticipationAotLimitsV1,
+) -> Result<RebarSingleCaptureParticipationAotArtifactV1, RebarSingleCaptureParticipationAotErrorV1>
+{
+    let RebarSingleCaptureAotRequestV1 {
+        pattern,
+        target,
+        options,
+        compile_limits,
+        native_limits: _,
+    } = request;
+    let source_bytes = pattern.len();
+    let source_sha256 = participation_source_digest(&pattern)?;
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options = options;
+    let compiled = crate::captures::compile_rebar_single_captures(
+        CaptureCompileRequest::new(pattern, target)
+            .profile(profile.clone())
+            .mode(CompileMode::Optimizing)
+            .limits(compile_limits),
+    )?;
+    compiled.authenticate().map_err(|_| {
+        RebarSingleCaptureParticipationAotErrorV1::Authentication("compiled capture composite")
+    })?;
+    let compile_receipt = compiled.receipt();
+    let identity = compile_receipt.identity;
+    let selector_receipt = compiled.selector().receipt();
+    if compile_receipt.profile != profile
+        || compile_receipt.source_bytes != source_bytes
+        || identity.level() != CaptureLevel::All
+        || selector_receipt.mode != CompileMode::Optimizing
+        || selector_receipt.output != OutputContract::Span
+        || selector_receipt.target != target
+        || selector_receipt.source_bytes != source_bytes
+    {
+        return Err(RebarSingleCaptureParticipationAotErrorV1::Authentication(
+            "single-pattern parse/profile/selector receipt",
+        ));
+    }
+    let can_match_empty = compile_receipt.can_match_empty;
+    let native = compiled.emit_native_participation_aot_v1(participation_limits)?;
+    if !native.authenticates_receipt() {
+        return Err(RebarSingleCaptureParticipationAotErrorV1::Authentication(
+            "native participation bundle/module/object route",
+        ));
+    }
+    let native_receipt = native.receipt();
+    if native_receipt.target != target
+        || native_receipt.groups != identity.groups()
+        || native_receipt.capture_sha256 != identity.capture_sha256()
+        || native_receipt.selector_sha256 != identity.selector_sha256()
+        || native_receipt.semantic_runtime_calls != 0
+    {
+        return Err(RebarSingleCaptureParticipationAotErrorV1::Authentication(
+            "native participation descriptor/capture schema",
+        ));
+    }
+    let mut receipt = RebarSingleCaptureParticipationAotReceiptV1 {
+        source_cardinality: REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
+        source_bytes,
+        source_sha256,
+        profile,
+        target,
+        capture_level: identity.level(),
+        group_count: identity.groups(),
+        can_match_empty,
+        native: native_receipt,
+        artifact_identity_sha256: [0; DIGEST_BYTES],
+    };
+    receipt.artifact_identity_sha256 =
+        rebar_single_participation_artifact_identity(&receipt, &native)?;
+    let artifact = RebarSingleCaptureParticipationAotArtifactV1 { native, receipt };
+    if !artifact.authenticates_receipt() {
+        return Err(RebarSingleCaptureParticipationAotErrorV1::Authentication(
+            "fresh Rebar single-pattern participation artifact",
+        ));
+    }
+    Ok(artifact)
 }
 
 /// Compile and publish one strictly selected helper-free Rebar capture route.
@@ -566,6 +832,144 @@ fn rebar_single_artifact_authenticates(artifact: &RebarSingleCaptureAotArtifactV
             .is_ok_and(|view| view.descriptor() == descriptor)
         && rebar_single_artifact_identity(receipt, native)
             .is_ok_and(|identity| identity == receipt.artifact_identity_sha256)
+}
+
+fn rebar_single_participation_artifact_authenticates(
+    artifact: &RebarSingleCaptureParticipationAotArtifactV1,
+) -> bool {
+    let receipt = &artifact.receipt;
+    let native = &artifact.native;
+    let native_receipt = native.receipt();
+    let mut expected_profile = RustProfile::rebar_1_12_4();
+    expected_profile.options = receipt.profile.options.clone();
+    let selected_strategy = match receipt.target.architecture {
+        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
+        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+    };
+    let route_closes = if native_receipt.strategy == selected_strategy {
+        native_receipt.decline.is_none()
+            && native.module().required_runtime_symbols().next().is_none()
+            && native.module().required_runtime_program().is_none()
+    } else {
+        native_receipt.strategy == NativeParticipationAotStrategyV1::NegativeEntry
+            && native_receipt.decline.is_some()
+    };
+    receipt.source_cardinality == REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY
+        && receipt.source_sha256 != [0; DIGEST_BYTES]
+        && receipt.profile == expected_profile
+        && receipt.target == native_receipt.target
+        && receipt.target == native.module().target()
+        && receipt.capture_level == CaptureLevel::All
+        && receipt.group_count != 0
+        && receipt.group_count == native_receipt.groups
+        && receipt.native == native_receipt
+        && native_receipt.capture_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.selector_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.selector_object_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.bundle_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.export_identity_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.object_sha256 != [0; DIGEST_BYTES]
+        && native_receipt.semantic_runtime_calls == 0
+        && route_closes
+        && native.authenticates_receipt()
+        && rebar_single_participation_artifact_identity(receipt, native)
+            .is_ok_and(|identity| identity == receipt.artifact_identity_sha256)
+}
+
+fn participation_source_digest(
+    source: &str,
+) -> Result<[u8; DIGEST_BYTES], RebarSingleCaptureParticipationAotErrorV1> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/rebar-single-capture-source-v1\0");
+    digest.update(participation_usize_u64(source.len(), "source digest extent")?.to_le_bytes());
+    digest.update(source.as_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn rebar_single_participation_artifact_identity(
+    receipt: &RebarSingleCaptureParticipationAotReceiptV1,
+    native: &NativeParticipationAotArtifactV1,
+) -> Result<[u8; DIGEST_BYTES], RebarSingleCaptureParticipationAotErrorV1> {
+    let mut digest = Sha256::new();
+    digest.update(REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN);
+    digest.update(REBAR_PROFILE_IDENTITY);
+    digest.update(
+        participation_usize_u64(receipt.source_cardinality, "source cardinality")?.to_le_bytes(),
+    );
+    digest.update(participation_usize_u64(receipt.source_bytes, "source bytes")?.to_le_bytes());
+    digest.update(receipt.source_sha256);
+    hash_options(&mut digest, &receipt.profile.options);
+    hash_target(&mut digest, receipt.target);
+    digest.update([
+        match receipt.capture_level {
+            CaptureLevel::All => 1,
+        },
+        u8::from(receipt.can_match_empty),
+    ]);
+    digest.update(
+        participation_usize_u64(receipt.group_count, "capture group identity")?.to_le_bytes(),
+    );
+    let native_receipt = receipt.native;
+    digest.update(
+        match native_receipt.strategy {
+            NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
+            NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
+            NativeParticipationAotStrategyV1::NegativeEntry => 3_u16,
+        }
+        .to_le_bytes(),
+    );
+    digest.update(
+        match native_receipt.decline {
+            None => 0_u16,
+            Some(crate::NativeParticipationAotDeclineV1::SchemaTooWide) => 1_u16,
+            Some(crate::NativeParticipationAotDeclineV1::SelectorRequiresRuntime) => 2_u16,
+            Some(crate::NativeParticipationAotDeclineV1::UnsupportedAssertion) => 3_u16,
+        }
+        .to_le_bytes(),
+    );
+    for value in [
+        native_receipt.semantic_runtime_calls,
+        native_receipt.groups,
+        native_receipt.assertions,
+        native_receipt.assertion_signatures,
+        native_receipt.byte_classes,
+        native_receipt.dfa_states,
+        native_receipt.transition_cells,
+        native_receipt.build_work,
+        native_receipt.scratch_bytes,
+        native_receipt.plan_bytes,
+    ] {
+        digest
+            .update(participation_usize_u64(value, "native participation identity")?.to_le_bytes());
+    }
+    for identity in [
+        native_receipt.capture_sha256,
+        native_receipt.selector_sha256,
+        native_receipt.selector_object_sha256,
+        native_receipt.bundle_sha256,
+        native_receipt.export_identity_sha256,
+        native_receipt.object_sha256,
+    ] {
+        digest.update(identity);
+    }
+    for symbol in [
+        native.selector_entry_symbol(),
+        native.bundle_symbol(),
+        native.participation_entry_symbol(),
+    ] {
+        digest
+            .update(participation_usize_u64(symbol.len(), "route symbol identity")?.to_le_bytes());
+        digest.update(symbol.as_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn participation_usize_u64(
+    value: usize,
+    site: &'static str,
+) -> Result<u64, RebarSingleCaptureParticipationAotErrorV1> {
+    u64::try_from(value)
+        .map_err(|_| RebarSingleCaptureParticipationAotErrorV1::ArithmeticOverflow(site))
 }
 
 fn source_digest(source: &str) -> Result<[u8; DIGEST_BYTES], RebarSingleCaptureAotError> {
@@ -762,6 +1166,75 @@ mod tests {
             default.receipt().artifact_identity_sha256(),
             configured.receipt().artifact_identity_sha256(),
         );
+    }
+
+    #[test]
+    fn participation_wrapper_binds_exact_rebar_profile_and_selected_route() {
+        let mut artifact = compile_rebar_single_capture_participation_aot_v1(
+            request(r"(?:(a)|(ab))(b)?").case_insensitive(true),
+            NativeParticipationAotLimitsV1::default(),
+        )
+        .expect("selected Rebar participation");
+        let receipt = artifact.receipt();
+        assert!(artifact.authenticates_receipt());
+        assert_eq!(receipt.source_cardinality(), 1);
+        assert_eq!(
+            receipt.profile().constructor,
+            RustProfile::rebar_1_12_4().constructor
+        );
+        assert!(receipt.profile().options.case_insensitive);
+        assert_eq!(receipt.group_count(), 4);
+        assert_eq!(
+            receipt.native().strategy,
+            NativeParticipationAotStrategyV1::DfaX86_64,
+        );
+        assert!(receipt.native().decline.is_none());
+        assert_eq!(receipt.native().semantic_runtime_calls, 0);
+        assert!(
+            artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(artifact.module().required_runtime_program().is_none());
+        assert!(!artifact.selector_entry_symbol().is_empty());
+        assert!(!artifact.bundle_symbol().is_empty());
+        assert!(!artifact.participation_entry_symbol().is_empty());
+
+        artifact.receipt.native.build_work += 1;
+        assert!(!artifact.authenticates_receipt());
+    }
+
+    #[test]
+    fn participation_negative_is_explicit_but_construction_errors_are_terminal() {
+        let negative = compile_rebar_single_capture_participation_aot_v1(
+            request(r"(?m)^((?:ab)+)$"),
+            NativeParticipationAotLimitsV1::default(),
+        )
+        .expect("authenticated Rebar participation decline");
+        assert!(negative.authenticates_receipt());
+        assert_eq!(
+            negative.native_receipt().strategy,
+            NativeParticipationAotStrategyV1::NegativeEntry,
+        );
+        assert_eq!(
+            negative.native_receipt().decline,
+            Some(crate::NativeParticipationAotDeclineV1::UnsupportedAssertion),
+        );
+
+        assert!(matches!(
+            compile_rebar_single_capture_participation_aot_v1(
+                request("(a)"),
+                NativeParticipationAotLimitsV1 {
+                    max_plan_bytes: 0,
+                    ..NativeParticipationAotLimitsV1::default()
+                },
+            ),
+            Err(RebarSingleCaptureParticipationAotErrorV1::Participation(
+                NativeParticipationAotErrorV1::Resource { .. }
+            ))
+        ));
     }
 
     #[test]

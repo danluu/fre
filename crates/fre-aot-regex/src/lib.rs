@@ -308,9 +308,12 @@ pub use regex_set::{
 };
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
+    REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN,
     RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotError, RebarSingleCaptureAotReceiptV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureCardinalityError,
-    RebarSingleCaptureEmptyProgressV1, compile_rebar_single_capture_aot_v1,
+    RebarSingleCaptureEmptyProgressV1, RebarSingleCaptureParticipationAotArtifactV1,
+    RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureParticipationAotReceiptV1,
+    compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
 };
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureSelector,
