@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://fre.example/schemas/aot-rebar-true-native-census-v1.json",
+  "$id": "https://fre.example/schemas/aot-rebar-true-native-census-v2.json",
   "title": "FRE public-Rebar true-native census records",
   "oneOf": [
     { "$ref": "#/$defs/plan" },
@@ -94,7 +94,10 @@
         "is_runtime": { "type": "boolean" },
         "exact_adapter": { "type": "boolean" },
         "adapter_reason": { "type": "string", "minLength": 1 },
-        "point_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+        "point_ids": {
+          "type": "array", "items": { "type": "string" },
+          "minItems": 1, "uniqueItems": true
+        }
       }
     },
     "planPoint": {
@@ -128,7 +131,7 @@
         "denominators", "jobs", "points", "plan_sha256"
       ],
       "properties": {
-        "schema": { "const": "fre.aot-rebar.true-native-plan.v1" },
+        "schema": { "const": "fre.aot-rebar.true-native-plan.v2" },
         "candidate_source": { "$ref": "#/$defs/source" },
         "public_corpus": {
           "type": "object",
@@ -147,10 +150,11 @@
         "target": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["triple", "features"],
+          "required": ["triple", "features", "feature_bits"],
           "properties": {
             "triple": { "type": "string", "minLength": 1 },
-            "features": { "type": "string" }
+            "features": { "type": "string" },
+            "feature_bits": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
           }
         },
         "policy": {
@@ -165,7 +169,7 @@
           "properties": {
             "compiler_mode": { "const": "Optimizing" },
             "timing": { "const": false },
-            "public_klv_bytes_hashed": { "type": "boolean" },
+            "public_klv_bytes_hashed": { "const": true },
             "reproducible_builds_required": { "const": 2 },
             "native_proof": { "type": "string" },
             "compiled_artifact_is_runtime_execution": { "const": false },
@@ -189,8 +193,12 @@
             "raw_runtime_schedule_points": { "$ref": "#/$defs/idSet" }
           }
         },
-        "jobs": { "type": "array", "items": { "$ref": "#/$defs/planJob" } },
-        "points": { "type": "array", "items": { "$ref": "#/$defs/planPoint" } },
+        "jobs": {
+          "type": "array", "items": { "$ref": "#/$defs/planJob" }, "minItems": 344
+        },
+        "points": {
+          "type": "array", "items": { "$ref": "#/$defs/planPoint" }, "minItems": 1
+        },
         "plan_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -418,7 +426,7 @@
         "phases", "classification", "receipt_sha256"
       ],
       "properties": {
-        "schema": { "const": "fre.aot-rebar.true-native-job-receipt.v1" },
+        "schema": { "const": "fre.aot-rebar.true-native-job-receipt.v2" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "candidate_source": { "$ref": "#/$defs/source" },
         "job": {
@@ -496,7 +504,7 @@
         "disposition_counts", "job_dispositions", "receipt_manifest", "summary_sha256"
       ],
       "properties": {
-        "schema": { "const": "fre.aot-rebar.true-native-summary.v1" },
+        "schema": { "const": "fre.aot-rebar.true-native-summary.v2" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "candidate_source": { "$ref": "#/$defs/source" },
         "canonical_runtime_denominator": { "$ref": "#/$defs/idSet" },

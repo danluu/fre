@@ -64,7 +64,10 @@ python3 tools/aot-rebar-runner/census/true_native_census.py plan \
 
 `--skip-klv-hashing` is available only with `--dry-run`; a sealed plan must
 hash every public KLV byte stream. Remove `--dry-run` and add `--output` to
-write the immutable `fre.aot-rebar.true-native-plan.v1` manifest.
+write the immutable `fre.aot-rebar.true-native-plan.v2` manifest. Version 2
+also seals the canonical target-feature bit mask and the complete job/point
+topology, so qualification cannot reinterpret feature names or detach a point
+from the job whose input identity it carries.
 
 ## Later qualification run
 
@@ -105,11 +108,13 @@ cardinality, total object bytes, and the exact composite boundary; unrecognized
 raw v3 fields are rejected rather than silently discarded.
 
 The controller requires identical runner/object hashes and normalized
-provenance from both builds. It inventories all defined text symbols in the
-final binary independently of `required_runtime_symbols`. Every executable
-`fre_aot_regex_runtime_*` symbol except the explicit prepare/destroy control
-plane is a semantic helper and is armed. Provenance-declared helpers must be a
-subset of this independent inventory.
+provenance from both builds. It inventories local, global, weak, and imported
+executable runtime-symbol references in the final binary independently of
+`required_runtime_symbols`, while separately requiring each claimed operation
+entry to be defined text. Every executable `fre_aot_regex_runtime_*` symbol
+except the explicit prepare/destroy control plane is a semantic helper and is
+armed. Provenance-declared helpers must be a subset of this independent
+inventory.
 
 Three fresh processes authenticate each job:
 
@@ -162,4 +167,6 @@ python3 tools/aot-rebar-runner/census/true_native_census.py summarize \
 The summary retains all 311 runtime job IDs, every numerator ID, hashes of each
 ID set, per-job dispositions, and a receipt-manifest hash. It cannot report
 100% while any runtime job is unsupported, failed, timed out, missing, helper
-backed, or lacks the claimed-entry negative control.
+On read-back it revalidates the sealed source/schedule/job topology and derives
+every classification from artifact, route, helper, and architecture-specific
+trap evidence; stored classification booleans are never authoritative.

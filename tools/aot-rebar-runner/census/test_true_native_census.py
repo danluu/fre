@@ -46,11 +46,33 @@ def synthetic_plan() -> dict[str, object]:
             "input": input_identity, "candidate_klv": klv_identity,
             "is_runtime": True, "exact_adapter": index != 0,
             "adapter_reason": (
-                "no-exact-current-aot-adapter" if index == 0
+                "unsupported-runtime-model-or-cardinality" if index == 0
                 else "exact-single-pattern-scalar-adapter"
             ),
             "point_ids": [],
         })
+    points = []
+    for ordinal, job in enumerate(jobs):
+        point_id = f"point-{ordinal:03}"
+        job["point_ids"] = [point_id]
+        points.append({
+            "point_id": point_id,
+            "job_id": job["job_id"],
+            "benchmark": job["benchmark"],
+            "model": job["model"],
+            "boundary": "synthetic",
+            "comparator": "synthetic",
+            "expected": 0,
+            "input": input_identity,
+            "candidate_klv": klv_identity,
+            "reference_klv": klv_identity,
+            "source_schedule_sha256": "7" * 64,
+            "source_ordinal": ordinal,
+        })
+    all_point_ids = [point["point_id"] for point in points]
+    runtime_point_ids = [
+        point["point_id"] for point in points if point["model"] != "compile"
+    ]
     unsigned = {
         "schema": CENSUS.PLAN_SCHEMA,
         "candidate_source": {
@@ -66,14 +88,21 @@ def synthetic_plan() -> dict[str, object]:
             "schedules": [{
                 "file_sha256": "7" * 64, "internal_sha256": "8" * 64,
                 "canonical_commit": "1" * 40, "canonical_tree": "2" * 40,
-                "rebar_revision": "6" * 40, "point_count": 1,
+                "rebar_revision": "6" * 40, "point_count": len(points),
             }],
         },
-        "target": {"triple": "aarch64-linux", "features": "asimd"},
+        "target": {
+            "triple": "aarch64-linux",
+            "features": "asimd",
+            "feature_bits": "0000000100000000",
+        },
         "policy": {
             "compiler_mode": "Optimizing", "timing": False,
             "public_klv_bytes_hashed": True, "reproducible_builds_required": 2,
-            "native_proof": "synthetic",
+            "native_proof": (
+                "unmodified-oracle-pass + all-semantic-helper-traps-pass + "
+                "claimed-entry-trap-fires"
+            ),
             "compiled_artifact_is_runtime_execution": False,
             "unsupported_failure_timeout_are_nonnative": True,
             "canonical_denominator": "deduplicated-public-rust-rebar-runtime-job",
@@ -83,13 +112,135 @@ def synthetic_plan() -> dict[str, object]:
             "compile_jobs": CENSUS.id_set(compile_ids),
             "runtime_jobs": CENSUS.id_set(runtime_ids),
             "exact_adapter_runtime_jobs": CENSUS.id_set(runtime_ids[1:]),
-            "all_raw_schedule_points": CENSUS.id_set([]),
-            "raw_runtime_schedule_points": CENSUS.id_set([]),
+            "all_raw_schedule_points": CENSUS.id_set(all_point_ids),
+            "raw_runtime_schedule_points": CENSUS.id_set(runtime_point_ids),
         },
         "jobs": jobs,
-        "points": [],
+        "points": points,
     }
     return CENSUS.add_digest(unsigned, "plan_sha256")
+
+
+def synthetic_qualification_receipt(plan: dict[str, object]) -> dict[str, object]:
+    job = plan["jobs"][34]
+    object_sha256 = "a" * 64
+    identity_suffix = "f" * 64
+    entry = f"fre_aot_regex_count_exclusive_v1_{identity_suffix}"
+    provenance = {
+        "schema": "fre.aot.rebar-runner.v2",
+        "adapter": "general-aot-linked-count-v1",
+        "model": job["model"],
+        "benchmark": job["benchmark"],
+        "source_commit": plan["candidate_source"]["commit"],
+        "source_tree": plan["candidate_source"]["tree"],
+        "target": plan["target"]["triple"],
+        "feature_bits": plan["target"]["feature_bits"],
+        "kind": "scalar-v2",
+        "composite_kind": None,
+        "source_pattern_count": None,
+        "source_to_artifact": [],
+        "row_total_object_bytes": None,
+        "boundary": "complete-native-count",
+        "engine": "OrderedDfa",
+        "aggregate_strategy": "single-pattern",
+        "prepared_bulk_strategy": "linked-reducer",
+        "span_iteration_strategy": "none",
+        "grep_iteration_strategy": "none",
+        "program_sha256": "b" * 64,
+        "object_sha256": object_sha256,
+        "program_symbol": f"fre_aot_regex_program_v1_{identity_suffix}",
+        "entry_symbol": f"fre_aot_regex_search_v1_{identity_suffix}",
+        "reducer_symbol": entry,
+        "span_fill_symbol": "",
+        "required_runtime_symbols": [],
+        "components": [],
+    }
+    artifact = {
+        "runner_sha256": "c" * 64,
+        "objects": [{"ordinal": 0, "sha256": object_sha256, "bytes": 123}],
+    }
+    empty_process = {
+        "outcome": "not-run",
+        "returncode": None,
+        "stdout_bytes": 0,
+        "stdout_sha256": CENSUS.sha_bytes(b""),
+        "stderr_bytes": 0,
+        "stderr_sha256": CENSUS.sha_bytes(b""),
+    }
+    exited_process = {
+        **empty_process,
+        "outcome": "exit",
+        "returncode": 0,
+    }
+    helper_marker = {
+        "status": "missing", "sha256": None, "armed": [], "triggered": None,
+    }
+    entry_marker = {
+        "status": "valid",
+        "sha256": "d" * 64,
+        "kind": "claimed-operation-entry",
+        "architecture": "aarch64",
+        "installed": 1,
+        "expected": 1,
+        "armed": [{
+            "symbol": entry,
+            "offset": "0x100",
+            "before": "fd7bbfa9",
+            "after": "000020d4",
+        }],
+        "triggered": entry,
+        "completed": None,
+    }
+    phases = {
+        "unmodified_oracle": exited_process,
+        "semantic_helper_trap": {"process": empty_process, "marker": helper_marker},
+        "claimed_entry_negative_traps": [{
+            "ordinal": 0,
+            "symbol": entry,
+            "process": {**exited_process, "returncode": CENSUS.TRAP_EXIT},
+            "marker": entry_marker,
+        }],
+    }
+    route = {
+        "operation_entry_symbols": [entry],
+        "operation_entry_symbols_sha256": CENSUS.sha_bytes(
+            CENSUS.canonical([entry]).encode()
+        ),
+        "adapter_route": "linked-reducer",
+        "semantic_helper_symbols": [],
+        "semantic_helper_symbols_sha256": CENSUS.sha_bytes(
+            CENSUS.canonical([]).encode()
+        ),
+        "provenance_declared_runtime_symbols": [],
+        "primary_nm_sha256": "e" * 64,
+        "replica_nm_sha256": "e" * 64,
+    }
+    receipt = {
+        "schema": CENSUS.RECEIPT_SCHEMA,
+        "plan_sha256": plan["plan_sha256"],
+        "candidate_source": plan["candidate_source"],
+        "job": {
+            "job_id": job["job_id"],
+            "point_ids": job["point_ids"],
+            "model": job["model"],
+            "input": job["input"],
+            "candidate_klv": job["candidate_klv"],
+        },
+        "artifacts": {
+            "primary": artifact,
+            "replica": artifact,
+            "reproducible": True,
+            "compiled_artifact_present": True,
+            "runtime_execution_authenticated_separately": True,
+            "provenance": provenance,
+        },
+        "route": route,
+        "phases": phases,
+        "classification": CENSUS.classification_from_qualification_evidence(
+            True, [entry], route["adapter_route"], [], phases, "aarch64"
+        ),
+    }
+    return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
 class TrueNativeCensusTests(unittest.TestCase):
@@ -123,16 +274,23 @@ class TrueNativeCensusTests(unittest.TestCase):
 0000000000001010 T fre_aot_regex_runtime_destroy_exclusive_v1
 0000000000001020 T fre_aot_regex_runtime_search_exclusive_v1
 0000000000001030 W fre_aot_regex_runtime_future_capture_replay_v9
+0000000000001038 t fre_aot_regex_runtime_hidden_local_v1
+                 U fre_aot_regex_runtime_future_shared_v1
 0000000000001040 D fre_aot_regex_runtime_program_v1_deadbeef
 0000000000001050 T fre_aot_regex_count_exclusive_v1_deadbeef
 """
-        symbols = CENSUS.nm_text_symbols(nm)
+        symbols = CENSUS.nm_runtime_references(nm)
         self.assertEqual(
             CENSUS.semantic_helper_symbols(symbols),
             [
                 "fre_aot_regex_runtime_future_capture_replay_v9",
+                "fre_aot_regex_runtime_future_shared_v1",
+                "fre_aot_regex_runtime_hidden_local_v1",
                 "fre_aot_regex_runtime_search_exclusive_v1",
             ],
+        )
+        self.assertNotIn(
+            "fre_aot_regex_runtime_future_shared_v1", CENSUS.nm_text_symbols(nm)
         )
 
     def test_macho_leading_underscore_is_normalized(self) -> None:
@@ -246,6 +404,62 @@ class TrueNativeCensusTests(unittest.TestCase):
         with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
             CENSUS.parse_provenance(encoded + b" unsealed_field=1")
 
+    def test_scalar_v2_provenance_has_a_closed_raw_contract(self) -> None:
+        suffix = "f" * 64
+        fields = {
+            "schema": "fre.aot.rebar-runner.v2",
+            "disposition": "executed",
+            "configured": "true",
+            "adapter": "general-aot-linked-count-v1",
+            "model": "count",
+            "benchmark": "synthetic/scalar",
+            "source_commit": "1" * 40,
+            "source_tree": "2" * 40,
+            "target": "aarch64-linux",
+            "feature_bits": "0000000100000000",
+            "compiler_version": "1",
+            "optimizer_version": "1",
+            "engine": "OrderedDfa",
+            "aggregate_strategy": "single-pattern",
+            "prepared_bulk_strategy": "linked-reducer",
+            "span_iteration_strategy": "none",
+            "grep_iteration_strategy": "none",
+            "prepare_config_version": "1",
+            "prepare_operation_flags": "0000000000000000",
+            "required_prepare_capabilities": "0000000000000000",
+            "prepare_scope": "runtime-handle-state",
+            "object_descriptor_setup": "authenticated-v3-when-required",
+            "max_start_filter_setup_work": "1",
+            "max_grep_count_workspace_bytes": "1",
+            "max_handle_bytes": "0",
+            "max_ordered_nfa_scratch_bytes": "0",
+            "max_ordered_nfa_setup_work": "0",
+            "program_sha256": "3" * 64,
+            "object_sha256": "4" * 64,
+            "program_symbol": f"fre_aot_regex_program_v1_{suffix}",
+            "entry_symbol": f"fre_aot_regex_search_v1_{suffix}",
+            "reducer_symbol": f"fre_aot_regex_count_exclusive_v1_{suffix}",
+            "span_fill_symbol": "",
+            "required_runtime_symbols": (
+                "fre_aot_regex_runtime_search_v1,"
+                "fre_aot_regex_runtime_compiler_private_count_v1"
+            ),
+            "boundary": "runtime-klv-warmup-schedule",
+            "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+        }
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        self.assertEqual(parsed, fields)
+        self.assertEqual(
+            CENSUS.provenance_receipt(parsed)["required_runtime_symbols"],
+            [
+                "fre_aot_regex_runtime_compiler_private_count_v1",
+                "fre_aot_regex_runtime_search_v1",
+            ],
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
+            CENSUS.parse_provenance(encoded + b" unsealed_field=1")
+
     def test_empty_semantic_helper_inventory_is_a_valid_proof_surface(self) -> None:
         phase = {
             "outcome": "not-run",
@@ -261,9 +475,11 @@ class TrueNativeCensusTests(unittest.TestCase):
             "armed": [],
             "triggered": None,
         }
-        self.assertTrue(CENSUS.semantic_helper_control_pass([], phase, marker))
+        self.assertTrue(CENSUS.semantic_helper_control_pass([], phase, marker, "aarch64"))
         self.assertFalse(
-            CENSUS.semantic_helper_control_pass([], phase, {**marker, "armed": [1]})
+            CENSUS.semantic_helper_control_pass(
+                [], phase, {**marker, "armed": [1]}, "aarch64"
+            )
         )
 
     def test_plan_is_closed_and_requires_canonical_311_jobs(self) -> None:
@@ -290,6 +506,49 @@ class TrueNativeCensusTests(unittest.TestCase):
         with self.assertRaisesRegex(CENSUS.CensusError, "311"):
             CENSUS.validate_plan(short)
 
+        altered_policy = copy.deepcopy(plan)
+        altered_policy["policy"]["timing"] = True
+        altered_policy = CENSUS.add_digest(
+            {
+                key: value
+                for key, value in altered_policy.items()
+                if key != "plan_sha256"
+            },
+            "plan_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "policy"):
+            CENSUS.validate_plan(altered_policy)
+
+        point_free = copy.deepcopy(plan)
+        point_free["points"] = []
+        for job in point_free["jobs"]:
+            job["point_ids"] = []
+        point_free["denominators"]["all_raw_schedule_points"] = CENSUS.id_set([])
+        point_free["denominators"]["raw_runtime_schedule_points"] = CENSUS.id_set([])
+        point_free = CENSUS.add_digest(
+            {key: value for key, value in point_free.items() if key != "plan_sha256"},
+            "plan_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "no source points"):
+            CENSUS.validate_plan(point_free)
+
+        malformed_input = copy.deepcopy(plan)
+        job = malformed_input["jobs"][34]
+        job["input"]["pattern_sha256"] = "4" * 64
+        point_id = job["point_ids"][0]
+        point = next(row for row in malformed_input["points"] if row["point_id"] == point_id)
+        point["input"] = job["input"]
+        malformed_input = CENSUS.add_digest(
+            {
+                key: value
+                for key, value in malformed_input.items()
+                if key != "plan_sha256"
+            },
+            "plan_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "pattern identities"):
+            CENSUS.validate_plan(malformed_input)
+
     def test_summary_counts_unsupported_and_missing_receipts_as_nonnative(self) -> None:
         plan = synthetic_plan()
         with tempfile.TemporaryDirectory() as temporary:
@@ -309,6 +568,73 @@ class TrueNativeCensusTests(unittest.TestCase):
             "missing-receipt": 310,
             "unsupported-no-exact-adapter": 1,
         })
+
+    def test_receipt_classification_is_recomputed_from_closed_evidence(self) -> None:
+        plan = synthetic_plan()
+        receipt = synthetic_qualification_receipt(plan)
+        validated = CENSUS.validate_receipt(receipt, plan)
+        self.assertTrue(validated["classification"]["native_search_core_authenticated"])
+
+        forged = copy.deepcopy(receipt)
+        forged["phases"]["claimed_entry_negative_traps"][0]["process"][
+            "returncode"
+        ] = 0
+        forged = CENSUS.add_digest(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"},
+            "receipt_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "differs from its evidence"):
+            CENSUS.validate_receipt(forged, plan)
+
+    def test_control_plane_symbol_cannot_pose_as_native_operation_entry(self) -> None:
+        plan = synthetic_plan()
+        forged = synthetic_qualification_receipt(plan)
+        control_plane = "fre_aot_regex_runtime_prepare_exclusive_v3"
+        forged["artifacts"]["provenance"]["reducer_symbol"] = control_plane
+        forged["route"]["operation_entry_symbols"] = [control_plane]
+        forged["route"]["operation_entry_symbols_sha256"] = CENSUS.sha_bytes(
+            CENSUS.canonical([control_plane]).encode()
+        )
+        negative = forged["phases"]["claimed_entry_negative_traps"][0]
+        negative["symbol"] = control_plane
+        negative["marker"]["armed"][0]["symbol"] = control_plane
+        negative["marker"]["triggered"] = control_plane
+        forged["classification"] = CENSUS.classification_from_qualification_evidence(
+            True,
+            [control_plane],
+            forged["route"]["adapter_route"],
+            [],
+            forged["phases"],
+            "aarch64",
+        )
+        forged = CENSUS.add_digest(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"},
+            "receipt_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "non-native operation entry"):
+            CENSUS.validate_receipt(forged, plan)
+
+    def test_cross_architecture_trap_marker_cannot_authenticate_entry(self) -> None:
+        plan = synthetic_plan()
+        forged = synthetic_qualification_receipt(plan)
+        marker = forged["phases"]["claimed_entry_negative_traps"][0]["marker"]
+        marker["architecture"] = "x86_64"
+        marker["armed"][0]["before"] = "5548"
+        marker["armed"][0]["after"] = "0f0b"
+        forged["classification"] = CENSUS.classification_from_qualification_evidence(
+            True,
+            forged["route"]["operation_entry_symbols"],
+            forged["route"]["adapter_route"],
+            [],
+            forged["phases"],
+            "x86_64",
+        )
+        forged = CENSUS.add_digest(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"},
+            "receipt_sha256",
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "differs from its evidence"):
+            CENSUS.validate_receipt(forged, plan)
 
     def test_public_path_cannot_enter_holdout_component(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
