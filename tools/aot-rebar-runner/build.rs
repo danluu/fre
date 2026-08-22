@@ -581,6 +581,7 @@ fn configured_regex_redux_source(
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
+    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = false;\n");
     writeln!(
         source,
         "pub const ADAPTER: &str = {:?};",
@@ -599,6 +600,14 @@ fn configured_regex_redux_source(
     source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
     source.push_str("pub const EXPECTED_PATTERN: &str = \"\";\n");
     source.push_str("pub const EXPECTED_PATTERNS: &[&str] = &[];\n");
+    source.push_str("pub const SOURCE_PATTERN_COUNT: usize = 0;\n");
+    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 0;\n");
+    source.push_str("pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[];\n");
+    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n");
+    source.push_str("pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const EXPECTED_UNICODE: bool = false;\n");
     source.push_str("pub const EXPECTED_CASE_INSENSITIVE: bool = false;\n");
     writeln!(source, "pub const TARGET_ARCH: &str = {architecture:?};").unwrap();
@@ -677,6 +686,7 @@ fn configured_regex_redux_source(
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn regex_redux_search(component: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match component {\n");
     for component in 0..components.len() {
@@ -931,6 +941,12 @@ fn configured_native_row_source(
         "pub const OBJECT_SHA256: [u8; 32] = {first_object_sha256:?};"
     )
     .unwrap();
+    source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
     source.push_str(
         "pub type LinkedRowSearch = unsafe extern \"C\" fn(*const u8, usize, usize, usize, *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
@@ -958,6 +974,9 @@ fn configured_native_row_source(
     );
     source.push_str(
         "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+    );
+    source.push_str(
+        "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
     source
 }
