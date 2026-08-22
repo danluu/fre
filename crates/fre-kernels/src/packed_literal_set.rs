@@ -2559,22 +2559,80 @@ mod tests {
 
     fn assert_invalid_windows_precede_work(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
         let zero_work = PackedLiteralSetSearchLimits { max_work: 0 };
+        let reversed = PackedLiteralSetError::InvalidWindow {
+            start: 1,
+            end: 0,
+            haystack_len: haystack.len(),
+        };
         assert_eq!(
             plan.find_window(haystack, Window::new(1, 0), zero_work),
-            Err(PackedLiteralSetError::InvalidWindow {
-                start: 1,
-                end: 0,
-                haystack_len: haystack.len(),
-            })
+            Err(reversed.clone())
+        );
+        assert_eq!(
+            plan.find_window_value(haystack, Window::new(1, 0), zero_work),
+            Err(reversed.clone())
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, Window::new(1, 0), zero_work),
+            Err(reversed)
         );
         let past_end = haystack.len().checked_add(1).unwrap();
+        let outside = PackedLiteralSetError::InvalidWindow {
+            start: 0,
+            end: past_end,
+            haystack_len: haystack.len(),
+        };
         assert_eq!(
             plan.find_window(haystack, Window::new(0, past_end), zero_work),
-            Err(PackedLiteralSetError::InvalidWindow {
-                start: 0,
-                end: past_end,
-                haystack_len: haystack.len(),
-            })
+            Err(outside.clone())
+        );
+        assert_eq!(
+            plan.find_window_value(haystack, Window::new(0, past_end), zero_work),
+            Err(outside.clone())
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, Window::new(0, past_end), zero_work),
+            Err(outside)
+        );
+    }
+
+    fn assert_value_projection(
+        plan: &PackedLiteralSetPlan,
+        haystack: &[u8],
+        window: Window,
+        expected_match: Option<(usize, usize)>,
+    ) {
+        let (accounted, accounting) = plan
+            .find_window(haystack, window, PackedLiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accounted, expected_match);
+        let exact = PackedLiteralSetSearchLimits {
+            max_work: accounting.work_upper_bound,
+        };
+        assert_eq!(
+            plan.find_window_value(haystack, window, exact),
+            Ok(expected_match)
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, exact),
+            Ok(expected_match.is_some())
+        );
+
+        let one_below = accounting.work_upper_bound.checked_sub(1).unwrap();
+        let expected_error = PackedLiteralSetError::WorkLimit {
+            needed: accounting.work_upper_bound,
+            limit: one_below,
+        };
+        let refused = PackedLiteralSetSearchLimits {
+            max_work: one_below,
+        };
+        assert_eq!(
+            plan.find_window_value(haystack, window, refused),
+            Err(expected_error.clone())
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, refused),
+            Err(expected_error)
         );
     }
 
@@ -2775,6 +2833,213 @@ mod tests {
         ] {
             assert_search_certificate(&factored, true, factored_haystack, window, expected);
         }
+    }
+
+    #[test]
+    fn value_projection_preserves_every_engine_dispatch_and_exact_work_limit() {
+        let native_patterns = [
+            b"a".as_slice(),
+            b"bb".as_slice(),
+            b"ccc".as_slice(),
+            b"dddd".as_slice(),
+        ];
+        let Some(native) = plan(&native_patterns) else {
+            return;
+        };
+        assert!(matches!(&native.engine, PackedLiteralEngine::Native(_)));
+        assert_value_projection(&native, b"--ccc--", Window::new(1, 6), Some((2, 5)));
+        assert_value_projection(&native, b"-------", Window::new(1, 6), None);
+
+        let Some(sparse) = plan(&[b"aQ", b"bQ", b"cQ"]) else {
+            return;
+        };
+        assert!(matches!(
+            &sparse.engine,
+            PackedLiteralEngine::NativeSparse { .. }
+        ));
+        assert_value_projection(&sparse, b"--cQ--", Window::new(1, 5), Some((2, 4)));
+        assert_value_projection(&sparse, b"------", Window::new(1, 5), None);
+
+        let shared_column_patterns = [
+            b"qbma".as_slice(),
+            b"qbdb".as_slice(),
+            b"qbuc".as_slice(),
+            b"qbld".as_slice(),
+            b"qbce".as_slice(),
+            b"qbtf".as_slice(),
+            b"qbkg".as_slice(),
+            b"qbbh".as_slice(),
+        ];
+        let Some(shared_columns) = plan(&shared_column_patterns) else {
+            return;
+        };
+        assert!(matches!(
+            &shared_columns.engine,
+            PackedLiteralEngine::NativeSharedColumns { .. }
+        ));
+        assert_value_projection(
+            &shared_columns,
+            b"--qbkg--",
+            Window::new(1, 7),
+            Some((2, 6)),
+        );
+        assert_value_projection(&shared_columns, b"--------", Window::new(1, 7), None);
+
+        let Some(shared_fragment) = plan(&shared_prefix_patterns()) else {
+            return;
+        };
+        assert!(matches!(
+            &shared_fragment.engine,
+            PackedLiteralEngine::NativeSharedFragment { .. }
+        ));
+        assert_value_projection(
+            &shared_fragment,
+            b"--aa77--",
+            Window::new(1, 7),
+            Some((2, 6)),
+        );
+        assert_value_projection(&shared_fragment, b"--------", Window::new(1, 7), None);
+
+        let factored_patterns = cartesian_patterns();
+        let factored_refs = pattern_refs(&factored_patterns);
+        let factored =
+            PackedLiteralSetPlan::new(&factored_refs, PackedLiteralSetBuildLimits::default())
+                .unwrap();
+        assert!(matches!(&factored.engine, PackedLiteralEngine::Factored(_)));
+        assert_value_projection(
+            &factored,
+            b"--r8Tv--",
+            Window::new(1, 7),
+            Some((2, 6)),
+        );
+        assert_value_projection(&factored, b"--------", Window::new(1, 7), None);
+
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            let uniform_patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+            let uniform = PackedLiteralSetPlan::new(
+                &uniform_patterns,
+                PackedLiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                &uniform.engine,
+                PackedLiteralEngine::UniformWord64(_)
+            ));
+            assert_value_projection(
+                &uniform,
+                b"--tttaccct--",
+                Window::new(1, 11),
+                Some((2, 10)),
+            );
+            assert_value_projection(&uniform, b"------------", Window::new(1, 11), None);
+
+            let retained = PackedLiteralSetPlan::new_retained_iter(
+                &uniform_patterns,
+                PackedLiteralSetBuildLimits::default(),
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(matches!(
+                &retained.engine,
+                PackedLiteralEngine::UniformWord64Retained { .. }
+            ));
+            assert_value_projection(
+                &retained,
+                b"--agggtaaa--",
+                Window::new(1, 11),
+                Some((2, 10)),
+            );
+            assert_value_projection(&retained, b"------------", Window::new(1, 11), None);
+        }
+    }
+
+    #[test]
+    fn value_projection_matches_accounted_in_every_short_binary_window() {
+        let Some(plan) = plan(&[b"aa", b"bt", b"ta"]) else {
+            return;
+        };
+        for length in 0_usize..=7 {
+            for bits in 0_usize..(1_usize << length) {
+                let haystack = (0..length)
+                    .map(|position| {
+                        if bits & (1_usize << position) == 0 {
+                            b'a'
+                        } else {
+                            b't'
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for start in 0..=length {
+                    for end in start..=length {
+                        let window = Window::new(start, end);
+                        let expected = plan
+                            .find_window(
+                                &haystack,
+                                window,
+                                PackedLiteralSetSearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0;
+                        assert_eq!(
+                            plan.find_window_value(
+                                &haystack,
+                                window,
+                                PackedLiteralSetSearchLimits::unlimited(),
+                            ),
+                            Ok(expected),
+                            "haystack={haystack:?}, window={start}..{end}",
+                        );
+                        assert_eq!(
+                            plan.is_match_window_value(
+                                &haystack,
+                                window,
+                                PackedLiteralSetSearchLimits::unlimited(),
+                            ),
+                            Ok(expected.is_some()),
+                            "haystack={haystack:?}, window={start}..{end}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn value_projection_preserves_arithmetic_error_chronology() {
+        let Some(mut plan) = plan(&[b"aQ", b"bQ", b"cQ"]) else {
+            return;
+        };
+        plan.verification_bytes_per_position = usize::MAX;
+        let haystack = b"x";
+        assert_invalid_windows_precede_work(&plan, haystack);
+        let expected = PackedLiteralSetError::ArithmeticOverflow {
+            computation: "packed literal search work",
+        };
+        assert_eq!(
+            plan.find_window(
+                haystack,
+                Window::full(haystack),
+                PackedLiteralSetSearchLimits::unlimited(),
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                Window::full(haystack),
+                PackedLiteralSetSearchLimits::unlimited(),
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                haystack,
+                Window::full(haystack),
+                PackedLiteralSetSearchLimits::unlimited(),
+            ),
+            Err(expected)
+        );
     }
 
     #[test]

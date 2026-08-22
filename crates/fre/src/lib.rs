@@ -24513,12 +24513,13 @@ mod tests {
         K0ReverseSuffixSpanAttempt, K0SpanSourceCursor,
         LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError, Match,
         OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
-        PlanKind, PlanSelection, PortableBuilder, PortableFindIterAccounting, PortableFindIterError,
-        PortableFindIterLimits, PortableFindIterRunLimits, PortableFindIterStepAccounting,
-        PortableParsedBuildContext, PortablePlan, PortableRegex, PortableRegexSetBuilder,
-        PortableSearchSession, PortableSearchSessionPlan, PortableSpanVisitLimits,
-        PortableTextBuilder, PortableTextRegexSetBuilder, SearchAccounting, SearchError,
-        SearchLimits, SearchSessionLimits, SearchWindow, SimdDispatchContext,
+        PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
+        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+        PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
+        PortablePlan, PortableRegex, PortableRegexSetBuilder, PortableSearchSession,
+        PortableSearchSessionPlan, PortableSpanVisitLimits, PortableTextBuilder,
+        PortableTextRegexSetBuilder, SearchAccounting, SearchError, SearchLimits,
+        SearchSessionLimits, SearchWindow, SimdDispatchContext,
         UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         k0_finite_prefix_hedge_window, k0_finite_suffix_incumbent_single_pass_negative,
         k0_finite_suffix_prefix_hedge_bytes, k0_mandatory_suffix_completed_negative_is_useful,
@@ -24533,9 +24534,7 @@ mod tests {
         try_k0_mandatory_suffix_span_start, try_k0_mandatory_suffix_span_start_for_iteration,
     };
     #[cfg(not(feature = "static-dispatch"))]
-    use super::{
-        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID, PackedLiteralSetError,
-    };
+    use super::PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID;
     use fre_automata::{
         MandatoryCutAnalysisLimits, MandatorySuffixAnalysisLimits, MaximumConsumedDistance,
     };
@@ -39728,6 +39727,129 @@ mod tests {
         assert_eq!(
             wide.runtime_implementation_id(),
             "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1",
+        );
+    }
+
+    #[test]
+    fn packed_literal_set_value_facades_use_the_compact_exact_projection() {
+        let regex = PortableBuilder::new("alpha|beta|gamma")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::PackedLiteralSet);
+        let PortablePlan::PackedLiteralSet(kernel) = &regex.plan else {
+            panic!("finite literal fixture did not retain the public packed owner")
+        };
+
+        let haystack = b"--beta--";
+        let window = SearchWindow::new(1, 7);
+        let expected = Some(Match { start: 2, end: 6 });
+        assert_eq!(
+            kernel
+                .find_window_value(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    fre_kernels::PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|(start, end)| Match { start, end }),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            regex
+                .find_window_value(
+                    haystack,
+                    SearchWindow::new(6, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        assert!(
+            !regex
+                .is_match_window_value(
+                    haystack,
+                    SearchWindow::new(6, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+
+        let (_, SearchAccounting::PackedLiteralSet(accounting)) = regex
+            .find_window(haystack, window, SearchLimits::unlimited())
+            .unwrap()
+        else {
+            panic!("packed fixture returned another accounting family")
+        };
+        let exact_work = u64::try_from(accounting.work_upper_bound).unwrap();
+        let exact = SearchLimits {
+            max_work: exact_work,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(regex.find_window_value(haystack, window, exact), Ok(expected));
+        assert_eq!(regex.is_match_window_value(haystack, window, exact), Ok(true));
+
+        let one_below = SearchLimits {
+            max_work: exact_work.checked_sub(1).unwrap(),
+            max_scratch_bytes: 0,
+        };
+        let expected_error = SearchError::PackedLiteralSet(PackedLiteralSetError::WorkLimit {
+            needed: accounting.work_upper_bound,
+            limit: usize::try_from(exact_work.checked_sub(1).unwrap()).unwrap(),
+        });
+        assert_eq!(
+            regex.find_window_value(haystack, window, one_below),
+            Err(expected_error.clone())
+        );
+        assert_eq!(
+            regex.is_match_window_value(haystack, window, one_below),
+            Err(expected_error)
+        );
+
+        let invalid = SearchWindow::new(2, 1);
+        let zero_work = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        let invalid_error = SearchError::PackedLiteralSet(PackedLiteralSetError::InvalidWindow {
+            start: 2,
+            end: 1,
+            haystack_len: haystack.len(),
+        });
+        assert_eq!(
+            regex.find_window_value(haystack, invalid, zero_work),
+            Err(invalid_error.clone())
+        );
+        assert_eq!(
+            regex.is_match_window_value(haystack, invalid, zero_work),
+            Err(invalid_error)
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            &session.plan,
+            PortableSearchSessionPlan::Native(owner) if core::ptr::eq(*owner, &regex)
+        ));
+        assert_eq!(
+            session.find_window_value(haystack, window, exact),
+            Ok(expected)
+        );
+        assert_eq!(
+            session.is_match_window_value(haystack, window, exact),
+            Ok(true)
         );
     }
 
