@@ -715,22 +715,20 @@ pub fn try_compile_uniform_capture_bridge(
                     .selector_slow_aot_limits(slow_aot_limits),
             )
         };
-        let compiled = match compile_with_limits(
-            CompileLimitsV1::default(),
-            SlowAotLimits::default(),
-        ) {
+        let (ordinary, recovered_from_work_limit) =
+            match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
+                Ok(compiled) => (Ok(compiled), false),
+                Err(error) if is_uniform_lower_work_limit(&error) => (
+                    compile_with_limits(
+                        rebar_recovery_compile_limits(),
+                        rebar_recovery_slow_aot_limits(),
+                    ),
+                    true,
+                ),
+                Err(error) => (Err(error), false),
+            };
+        let compiled = match ordinary {
             Ok(compiled) => compiled,
-            Err(error) if is_uniform_lower_work_limit(&error) => {
-                compile_with_limits(
-                    rebar_recovery_compile_limits(),
-                    rebar_recovery_slow_aot_limits(),
-                )
-                .map_err(|error| {
-                    format!(
-                        "uniform-capture selector recovery compilation failed at source ordinal {source_ordinal}: {error}"
-                    )
-                })?
-            }
             Err(UniformCaptureCompileError::Authentication(
                 UniformCaptureAuthenticationError::RuntimeDependency,
             )) if benchmark.patterns.len() == 1 => {
@@ -801,8 +799,13 @@ pub fn try_compile_uniform_capture_bridge(
                 }
             }
             Err(error) => {
+                let phase = if recovered_from_work_limit {
+                    " recovery"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "uniform-capture selector compilation failed at source ordinal {source_ordinal}: {error}"
+                    "uniform-capture selector{phase} compilation failed at source ordinal {source_ordinal}: {error}"
                 ));
             }
         };
