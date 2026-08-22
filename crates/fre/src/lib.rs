@@ -10905,6 +10905,28 @@ impl PortableRegex {
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .is_match_full_ordinary_value(haystack)
                 .map_err(SearchError::from),
+            PortablePlan::RequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                required
+                    .exists_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map_err(SearchError::from)
+            }
+            PortablePlan::DispatchedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                required
+                    .exists_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map_err(SearchError::from)
+            }
             _ => self.is_match_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
@@ -13942,6 +13964,27 @@ enum PortableOrdinarySessionPlan<'a> {
         positive: bool,
     },
     Canonical(Box<PortableSearchSession<'a>>),
+}
+
+#[cfg(test)]
+mod required_literal_ordinary_session_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19310,10 +19353,13 @@ fn execute_k0_exists_incumbent_general(
 }
 
 impl<'r> PortableOrdinarySession<'r> {
-    /// Whether a match first accepts at or after `start`.
+    /// Whether a match exists at or after `start`.
     ///
-    /// This is only a boolean projection of [`Self::first_acceptance_at`].
-    /// It does not select or reconstruct a complete span.
+    /// K0 uses its endpoint-only engine. An unanchored required-literal owner
+    /// consumes a complete suffix witness without recovering the beginning of
+    /// the greedy class run. Other canonical owners retain the boolean
+    /// projection of [`Self::first_acceptance_at`]. No route selects or
+    /// reconstructs a complete span.
     ///
     /// # Errors
     ///
@@ -19321,8 +19367,17 @@ impl<'r> PortableOrdinarySession<'r> {
     /// execution encounters an allocation, arithmetic, or invariant failure.
     #[inline]
     pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
-        self.first_acceptance_at(haystack, start)
-            .map(|endpoint| endpoint.is_some())
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::K0 { executor, .. } => executor
+                .first_acceptance_at(haystack, start)
+                .map(|endpoint| endpoint.is_some())
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::Canonical(session) => session
+                .is_match_window_ordinary(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                ),
+        }
     }
 
     /// Return the first accepting boundary at or after `start`.
@@ -19593,6 +19648,47 @@ where
 }
 
 impl<'r> PortableSearchSession<'r> {
+    #[inline]
+    fn is_match_window_ordinary(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<bool, SearchError> {
+        if let PortableSearchSessionPlan::Native(regex) = &self.plan {
+            match &regex.plan {
+                PortablePlan::RequiredLiteral(required)
+                    if !required.anchors().start && !required.anchors().end =>
+                {
+                    #[cfg(test)]
+                    required_literal_ordinary_session_probe::record();
+                    return required
+                        .exists_window_value(
+                            haystack,
+                            LiteralWindow::new(window.start(), window.end()),
+                            required_literal_limits(SearchLimits::unlimited()),
+                        )
+                        .map_err(SearchError::from);
+                }
+                PortablePlan::DispatchedRequiredLiteral(required)
+                    if !required.anchors().start && !required.anchors().end =>
+                {
+                    #[cfg(test)]
+                    required_literal_ordinary_session_probe::record();
+                    return required
+                        .exists_window_value(
+                            haystack,
+                            LiteralWindow::new(window.start(), window.end()),
+                            required_literal_limits(SearchLimits::unlimited()),
+                        )
+                        .map_err(SearchError::from);
+                }
+                _ => {}
+            }
+        }
+        self.shortest_match_window_value(haystack, window, SearchLimits::unlimited())
+            .map(|endpoint| endpoint.is_some())
+    }
+
     /// Stable runtime identity of the borrowed matcher.
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
@@ -40928,6 +41024,168 @@ mod tests {
             ))
         ));
         assert_eq!(baseline.build_report().plan, PlanKind::RequiredLiteral);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one containment test keeps the ordinary projection, finite APIs, spans, anchors, bounded plans, and unrelated owners together"
+    )]
+    fn required_literal_ordinary_exists_is_unanchored_unbounded_and_projection_only() {
+        let regex = PortableBuilder::new("a+ZQ")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let mut haystack = b"!ZQ!".to_vec();
+        haystack.extend(core::iter::repeat_n(b'a', 256));
+        haystack.extend_from_slice(b"ZQ");
+        assert!(regex.is_match(&haystack));
+
+        let projected = match &regex.plan {
+            PortablePlan::RequiredLiteral(plan) => plan
+                .exists_window(
+                    &haystack,
+                    fre_kernels::Window::full(&haystack),
+                    fre_kernels::RequiredLiteralSearchLimits::unlimited(),
+                )
+                .unwrap(),
+            PortablePlan::DispatchedRequiredLiteral(plan) => plan
+                .exists_window(
+                    &haystack,
+                    fre_kernels::Window::full(&haystack),
+                    fre_kernels::RequiredLiteralSearchLimits::unlimited(),
+                )
+                .unwrap(),
+            _ => panic!("forced unbounded required literal changed owners"),
+        };
+        assert!(projected.0);
+        assert_eq!(projected.1.backward_bytes_examined, 0);
+
+        let (accounted_match, accounted) = regex
+            .is_match_accounted(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert!(accounted_match);
+        let SearchAccounting::RequiredLiteral(full_accounting) = accounted else {
+            panic!("accounted existence escaped the required-literal owner")
+        };
+        assert!(full_accounting.backward_bytes_examined > 0);
+        let mut expected_projection = full_accounting;
+        expected_projection.backward_bytes_examined = 0;
+        assert_eq!(projected.1, expected_projection);
+
+        let exact = SearchLimits {
+            max_work: full_accounting.work_upper_bound,
+            max_scratch_bytes: full_accounting.scratch_bytes,
+        };
+        assert!(regex.is_match_with_limits(&haystack, exact).unwrap());
+        assert!(matches!(
+            regex.is_match_with_limits(
+                &haystack,
+                SearchLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                }
+            ),
+            Err(SearchError::RequiredLiteral(
+                fre_kernels::RequiredLiteralSearchError::WorkLimit { .. }
+            ))
+        ));
+        let (found, find_accounting) = regex
+            .find_accounted(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        let found = found.expect("the required-literal span remains available");
+        assert_eq!(found.start(), 4);
+        assert_eq!(found.end(), haystack.len());
+        let SearchAccounting::RequiredLiteral(find_accounting) = find_accounting else {
+            panic!("find escaped the required-literal owner")
+        };
+        assert!(find_accounting.backward_bytes_examined > 0);
+
+        let anchored_start = PortableBuilder::new(r"\Aa+ZQ")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &anchored_start.plan,
+            PortablePlan::RequiredLiteral(_) | PortablePlan::DispatchedRequiredLiteral(_)
+        ));
+        assert!(!anchored_start.is_match(b"!aaaaZQ"));
+        assert!(anchored_start.is_match(b"aaaaZQ"));
+
+        let anchored_end = PortableBuilder::new(r"a+ZQ\z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(!anchored_end.is_match(b"aaaaZQ!"));
+        assert!(anchored_end.is_match(b"!aaaaZQ"));
+
+        let bounded = PortableBuilder::new("a{2,4}ZQ")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &bounded.plan,
+            PortablePlan::BoundedRequiredLiteral(_)
+                | PortablePlan::DispatchedBoundedRequiredLiteral(_)
+        ));
+        assert!(!bounded.is_match(b"aZQ"));
+        assert!(bounded.is_match(b"aaZQ"));
+
+        let unrelated = PortableRegex::new("needle").unwrap();
+        assert!(unrelated.is_match(b"a needle remains on its selected owner"));
+        assert!(!unrelated.is_match(b"absent"));
+    }
+
+    #[test]
+    fn required_literal_ordinary_session_uses_the_boolean_engine() {
+        let regex = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
+            .build()
+            .expect("public byte-mode required-literal pattern builds");
+        assert_eq!(regex.build_report().plan, PlanKind::RequiredLiteral);
+        let haystack = b"!ZQ!aaaaZQ!xZQ";
+        let mut ordinary = regex.ordinary_session().unwrap();
+
+        super::required_literal_ordinary_session_probe::reset();
+        for start in [0, 1, 4, 9, haystack.len()] {
+            let expected = regex
+                .shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+                .unwrap()
+                .is_some();
+            assert_eq!(ordinary.is_match_at(haystack, start), Ok(expected));
+        }
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::calls(),
+            5,
+            "every ordinary boolean call must enter the bound required-literal engine",
+        );
+
+        super::required_literal_ordinary_session_probe::reset();
+        assert_eq!(
+            ordinary.first_acceptance_at(haystack, 0),
+            regex.shortest_match_at_value(haystack, 0, SearchLimits::unlimited()),
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::calls(),
+            0,
+            "endpoint selection must retain the canonical engine",
+        );
+
+        let anchored = PortableBuilder::new(r"(?-u:\A[a-z]+ZQ)")
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let mut anchored_ordinary = anchored.ordinary_session().unwrap();
+        assert!(!anchored_ordinary.is_match_at(b"!aaaaZQ", 0).unwrap());
+        assert!(anchored_ordinary.is_match_at(b"aaaaZQ", 0).unwrap());
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::calls(),
+            0,
+            "anchored owners must retain their canonical endpoint engine",
+        );
     }
 
     #[test]
