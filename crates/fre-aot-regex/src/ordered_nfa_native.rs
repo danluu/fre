@@ -15,9 +15,7 @@ use fre_automata::{
 };
 use fre_exact_alloc::try_box_preserve;
 
-use crate::{
-    byte_frequency::estimated_byte_frequency_units, program::OutputContract, ObjectError,
-};
+use crate::{ObjectError, byte_frequency::estimated_byte_frequency_units, program::OutputContract};
 
 /// Stable descriptor magic for a prepared ordered TNFA.
 #[doc(hidden)]
@@ -40,9 +38,11 @@ pub const FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION: u32 = 1;
 pub const FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL: u64 = 0x93b6_e4c1_75da_280f;
 
 /// Structural ceiling for the graph descriptor and its six SoA tables emitted
-/// into authenticated object rodata.
+/// into authenticated object rodata. This is independent of the smaller
+/// mutable-handle budget: increasing it admits larger immutable graphs without
+/// increasing the maximum prepared scratch allocation.
 #[doc(hidden)]
-pub const FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES: usize = 2 * 1024 * 1024;
+pub const FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 /// Structural ceiling for the four exact Pike scratch payloads retained by a
 /// prepared handle.
 #[doc(hidden)]
@@ -997,34 +997,36 @@ fn validate_native_ordered_nfa_start_closure(
     let first = program.instruction(0).ok_or(ObjectError::InvalidModule(
         "ordered-NFA start closure first instruction",
     ))?;
-    if first.state() != raw.start
-        || first.subtree_end() != instruction_count
-        || first.guard() != 0
+    if first.state() != raw.start || first.subtree_end() != instruction_count || first.guard() != 0
     {
-        return Err(ObjectError::InvalidModule(
-            "ordered-NFA start closure root",
-        ));
+        return Err(ObjectError::InvalidModule("ordered-NFA start closure root"));
     }
 
     let edges = raw.edge_targets.len();
     let guarded = program.is_guarded();
     let mut split_edge_visits = 0_usize;
     for instruction_index in 0..instruction_count {
-        let instruction = program.instruction(instruction_index).ok_or(
-            ObjectError::InvalidModule("ordered-NFA start closure instruction extent"),
-        )?;
+        let instruction =
+            program
+                .instruction(instruction_index)
+                .ok_or(ObjectError::InvalidModule(
+                    "ordered-NFA start closure instruction extent",
+                ))?;
         let subtree_end = instruction.subtree_end();
         if subtree_end <= instruction_index || subtree_end > instruction_count {
             return Err(ObjectError::InvalidModule(
                 "ordered-NFA start closure subtree",
             ));
         }
-        let state = usize::try_from(instruction.state()).map_err(|_| {
-            ObjectError::InvalidModule("ordered-NFA start closure state encoding")
-        })?;
-        let role = raw.roles.get(state).copied().ok_or(ObjectError::InvalidModule(
-            "ordered-NFA start closure state bounds",
-        ))?;
+        let state = usize::try_from(instruction.state())
+            .map_err(|_| ObjectError::InvalidModule("ordered-NFA start closure state encoding"))?;
+        let role = raw
+            .roles
+            .get(state)
+            .copied()
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-NFA start closure state bounds",
+            ))?;
         let edge_begin = raw
             .edge_offsets
             .get(state)
@@ -1053,8 +1055,7 @@ fn validate_native_ordered_nfa_start_closure(
         if guarded {
             let guard = instruction.guard();
             if guard > 18
-                || (guard != 0
-                    && assertion_kinds & (1_u32 << guard.saturating_sub(1)) == 0)
+                || (guard != 0 && assertion_kinds & (1_u32 << guard.saturating_sub(1)) == 0)
             {
                 return Err(ObjectError::InvalidModule(
                     "ordered-NFA start closure guard",
@@ -1074,13 +1075,9 @@ fn validate_native_ordered_nfa_start_closure(
                     ));
                 }
                 split_edge_visits = split_edge_visits.checked_add(degree).ok_or(
-                    ObjectError::ArithmeticOverflow(
-                        "ordered-NFA start closure Split-edge visits",
-                    ),
+                    ObjectError::ArithmeticOverflow("ordered-NFA start closure Split-edge visits"),
                 )?;
-                if split_edge_visits
-                    > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS
-                {
+                if split_edge_visits > MAX_NATIVE_ORDERED_NFA_START_CLOSURE_SPLIT_EDGE_VISITS {
                     return Ok(None);
                 }
                 if guarded {
@@ -1089,11 +1086,12 @@ fn validate_native_ordered_nfa_start_closure(
                             "guarded ordered-NFA start closure consuming Split edge",
                         ));
                     }
-                } else if instruction.edge_work() != u32::try_from(degree).map_err(|_| {
-                    ObjectError::InvalidModule(
-                        "plain ordered-NFA start closure edge-work encoding",
-                    )
-                })?
+                } else if instruction.edge_work()
+                    != u32::try_from(degree).map_err(|_| {
+                        ObjectError::InvalidModule(
+                            "plain ordered-NFA start closure edge-work encoding",
+                        )
+                    })?
                     || raw.edge_kinds[edge_begin..edge_end]
                         .iter()
                         .any(|&kind| kind != EdgeKind::Epsilon)
@@ -1197,9 +1195,7 @@ fn validate_native_ordered_edge_dispatch(
         NativeOrderedEdgeTransitions::Direct64(_) => {
             (NativeOrderedEdgeEncoding::Direct64, u32::MAX)
         }
-        NativeOrderedEdgeTransitions::Legacy(_) => {
-            (NativeOrderedEdgeEncoding::Legacy, u32::MAX)
-        }
+        NativeOrderedEdgeTransitions::Legacy(_) => (NativeOrderedEdgeEncoding::Legacy, u32::MAX),
     };
     let transition_count = transitions.len();
     if transition_count == 0 || metadata.is_empty() {
@@ -1240,8 +1236,7 @@ fn validate_native_ordered_edge_dispatch(
         if present_rows >= admitted_rows
             || raw.roles[state] != StateRole::Consume
             || usize::try_from(row.row_ordinal()).ok() != Some(present_rows)
-            || usize::try_from(row.segment_base()).ok()
-                != expected_degree_index.checked_add(1)
+            || usize::try_from(row.segment_base()).ok() != expected_degree_index.checked_add(1)
             || row.last_segment() >= 256
             || row.target_bits() != encoding.target_bits()
         {
@@ -1252,11 +1247,12 @@ fn validate_native_ordered_edge_dispatch(
         let row_ordinal = present_rows;
         let segment_base = usize::try_from(row.segment_base()).unwrap();
         let segment_count = usize::try_from(row.last_segment()).unwrap() + 1;
-        let segment_end = segment_base
-            .checked_add(segment_count)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "ordered-edge dispatch segment extent",
-            ))?;
+        let segment_end =
+            segment_base
+                .checked_add(segment_count)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch segment extent",
+                ))?;
         if segment_end > metadata.len() {
             return Err(ObjectError::InvalidModule(
                 "ordered-edge dispatch segment metadata bounds",
@@ -1283,9 +1279,11 @@ fn validate_native_ordered_edge_dispatch(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "ordered-edge dispatch byte-map row",
             ))?;
-        let map_end = map_start.checked_add(256).ok_or(
-            ObjectError::ArithmeticOverflow("ordered-edge dispatch byte-map extent"),
-        )?;
+        let map_end = map_start
+            .checked_add(256)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-edge dispatch byte-map extent",
+            ))?;
         let Some(map) = byte_map.get(map_start..map_end) else {
             return Err(ObjectError::InvalidModule(
                 "ordered-edge dispatch byte-map bounds",
@@ -1309,11 +1307,12 @@ fn validate_native_ordered_edge_dispatch(
             let end = if local_segment + 1 < segment_count {
                 usize::try_from(metadata[segment_index + 1]).unwrap()
             } else if row_ordinal + 1 < admitted_rows {
-                let next_row_first = segment_index.checked_add(2).ok_or(
-                    ObjectError::ArithmeticOverflow(
-                        "ordered-edge dispatch next-row segment",
-                    ),
-                )?;
+                let next_row_first =
+                    segment_index
+                        .checked_add(2)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "ordered-edge dispatch next-row segment",
+                        ))?;
                 let Some(&next) = metadata.get(next_row_first) else {
                     return Err(ObjectError::InvalidModule(
                         "ordered-edge dispatch next-row metadata",
@@ -1347,7 +1346,9 @@ fn validate_native_ordered_edge_dispatch(
                 let encoded = transition.compiler_private_encoded();
                 let target = encoded & target_mask;
                 let work = encoded >> encoding.target_bits();
-                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                if usize::try_from(target)
+                    .ok()
+                    .is_none_or(|target| target >= states)
                     || work == 0
                 {
                     return Err(ObjectError::InvalidModule(
@@ -1361,7 +1362,9 @@ fn validate_native_ordered_edge_dispatch(
                 let encoded = transition.compiler_private_encoded();
                 let target = u32::try_from(encoded & u64::from(u32::MAX)).unwrap();
                 let work = u32::try_from(encoded >> 32).unwrap();
-                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                if usize::try_from(target)
+                    .ok()
+                    .is_none_or(|target| target >= states)
                     || work == 0
                 {
                     return Err(ObjectError::InvalidModule(
@@ -1380,7 +1383,9 @@ fn validate_native_ordered_edge_dispatch(
                         "ordered-edge dispatch legacy transition",
                     ));
                 };
-                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                if usize::try_from(target)
+                    .ok()
+                    .is_none_or(|target| target >= states)
                     || usize::try_from(edge).ok().is_none_or(|edge| edge >= edges)
                 {
                     return Err(ObjectError::InvalidModule(
@@ -1531,10 +1536,9 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             }
             None => None,
         };
-        let cache_boundary_assertions = boundary_assertion_cache_is_profitable(
-            assertion_edges,
-            assertion_kinds,
-        ) || start_closure_dispatch.is_some_and(|layout| layout.guarded);
+        let cache_boundary_assertions =
+            boundary_assertion_cache_is_profitable(assertion_edges, assertion_kinds)
+                || start_closure_dispatch.is_some_and(|layout| layout.guarded);
         let terminal_exact_set_words = match view.terminal_exact_set {
             Some(exact) => {
                 validate_native_ordered_nfa_terminal_exact_set(exact, edges)?;
@@ -1619,73 +1623,75 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             .ordered_edge_dispatch
             .map(|dispatch| validate_native_ordered_edge_dispatch(dispatch, raw, states, edges))
             .transpose()?;
-        let mut ordered_edge_dispatch = if let Some(shape) = dispatch_shape {
-            let align8 = |value: usize| {
-                value.checked_add(7).map(|rounded| rounded & !7).ok_or(
-                    ObjectError::ArithmeticOverflow("ordered-edge dispatch alignment"),
-                )
-            };
-            let descriptor_offset = align8(base_object_bytes)?;
-            let rows_offset = descriptor_offset
-                .checked_add(ORDERED_NFA_EDGE_DISPATCH_V1_DESCRIPTOR_BYTES)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "ordered-edge dispatch row offset",
-                ))?;
-            let byte_map_offset = rows_offset
-                .checked_add(states.checked_mul(8).ok_or(
-                    ObjectError::ArithmeticOverflow("ordered-edge dispatch row extent"),
-                )?)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "ordered-edge dispatch byte-map offset",
-                ))?;
-            let metadata_offset = byte_map_offset
-                .checked_add(shape.admitted_rows.checked_mul(256).ok_or(
-                    ObjectError::ArithmeticOverflow("ordered-edge dispatch byte-map extent"),
-                )?)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "ordered-edge dispatch metadata offset",
-                ))?;
-            let transition_unaligned = metadata_offset
-                .checked_add(shape.metadata_count.checked_mul(4).ok_or(
-                    ObjectError::ArithmeticOverflow("ordered-edge dispatch metadata extent"),
-                )?)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "ordered-edge dispatch transition offset",
-                ))?;
-            let transitions_offset = if shape.encoding.entry_bytes() == 8 {
-                align8(transition_unaligned)?
-            } else {
-                align4(transition_unaligned)?
-            };
-            let object_bytes = transitions_offset
-                .checked_add(
-                    shape
-                        .transition_count
-                        .checked_mul(shape.encoding.entry_bytes())
+        let mut ordered_edge_dispatch =
+            if let Some(shape) = dispatch_shape {
+                let align8 = |value: usize| {
+                    value.checked_add(7).map(|rounded| rounded & !7).ok_or(
+                        ObjectError::ArithmeticOverflow("ordered-edge dispatch alignment"),
+                    )
+                };
+                let descriptor_offset = align8(base_object_bytes)?;
+                let rows_offset = descriptor_offset
+                    .checked_add(ORDERED_NFA_EDGE_DISPATCH_V1_DESCRIPTOR_BYTES)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "ordered-edge dispatch row offset",
+                    ))?;
+                let byte_map_offset =
+                    rows_offset
+                        .checked_add(states.checked_mul(8).ok_or(
+                            ObjectError::ArithmeticOverflow("ordered-edge dispatch row extent"),
+                        )?)
                         .ok_or(ObjectError::ArithmeticOverflow(
-                            "ordered-edge dispatch transition extent",
-                        ))?,
-                )
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "ordered-edge dispatch object extent",
-                ))?;
-            Some((
-                NativeOrderedEdgeDispatchLayout {
-                    descriptor_offset,
-                    rows_offset,
-                    byte_map_offset,
-                    metadata_offset,
-                    transitions_offset,
-                    admitted_rows: shape.admitted_rows,
-                    metadata_count: shape.metadata_count,
-                    transition_count: shape.transition_count,
-                    encoding: shape.encoding,
-                },
-                object_bytes,
-            ))
-        } else {
-            None
-        };
+                            "ordered-edge dispatch byte-map offset",
+                        ))?;
+                let metadata_offset = byte_map_offset
+                    .checked_add(shape.admitted_rows.checked_mul(256).ok_or(
+                        ObjectError::ArithmeticOverflow("ordered-edge dispatch byte-map extent"),
+                    )?)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "ordered-edge dispatch metadata offset",
+                    ))?;
+                let transition_unaligned = metadata_offset
+                    .checked_add(shape.metadata_count.checked_mul(4).ok_or(
+                        ObjectError::ArithmeticOverflow("ordered-edge dispatch metadata extent"),
+                    )?)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "ordered-edge dispatch transition offset",
+                    ))?;
+                let transitions_offset = if shape.encoding.entry_bytes() == 8 {
+                    align8(transition_unaligned)?
+                } else {
+                    align4(transition_unaligned)?
+                };
+                let object_bytes = transitions_offset
+                    .checked_add(
+                        shape
+                            .transition_count
+                            .checked_mul(shape.encoding.entry_bytes())
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "ordered-edge dispatch transition extent",
+                            ))?,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "ordered-edge dispatch object extent",
+                    ))?;
+                Some((
+                    NativeOrderedEdgeDispatchLayout {
+                        descriptor_offset,
+                        rows_offset,
+                        byte_map_offset,
+                        metadata_offset,
+                        transitions_offset,
+                        admitted_rows: shape.admitted_rows,
+                        metadata_count: shape.metadata_count,
+                        transition_count: shape.transition_count,
+                        encoding: shape.encoding,
+                    },
+                    object_bytes,
+                ))
+            } else {
+                None
+            };
         if ordered_edge_dispatch.is_some_and(|(_, extended_bytes)| {
             extended_bytes > max_object_bytes || u32::try_from(extended_bytes).is_err()
         }) {
@@ -1877,11 +1883,16 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             reason = "V2 sidecar offsets and extents were checked while constructing the selected layout"
         )]
         let ordered_edge_dispatch = if let Some((layout, _)) = ordered_edge_dispatch {
-            let dispatch = view.ordered_edge_dispatch.ok_or(ObjectError::InvalidModule(
-                "ordered-edge dispatch layout without source view",
-            ))?;
+            let dispatch = view
+                .ordered_edge_dispatch
+                .ok_or(ObjectError::InvalidModule(
+                    "ordered-edge dispatch layout without source view",
+                ))?;
             for (field, value) in [
-                (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, layout.rows_offset),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD,
+                    layout.rows_offset,
+                ),
                 (
                     ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
                     layout.byte_map_offset,
@@ -3631,9 +3642,11 @@ mod tests {
             .unwrap()
             .expect("96 contiguous candidates fit exactly");
         assert_eq!(prefix_candidate_bytes(plan), 96);
-        assert!(derive_native_ordered_nfa_start_prefix(membership_words(u8::MIN..=96))
-            .unwrap()
-            .is_none());
+        assert!(
+            derive_native_ordered_nfa_start_prefix(membership_words(u8::MIN..=96))
+                .unwrap()
+                .is_none()
+        );
 
         let exact_four = membership_words([1, 3, 5, 7]);
         let four = derive_native_ordered_nfa_start_prefix(exact_four)
@@ -3653,9 +3666,11 @@ mod tests {
         }
 
         let costly_cover = membership_words((0_u8..=188).step_by(4));
-        assert!(derive_native_ordered_nfa_start_prefix(costly_cover)
-            .unwrap()
-            .is_none());
+        assert!(
+            derive_native_ordered_nfa_start_prefix(costly_cover)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4287,10 +4302,7 @@ mod tests {
 
     #[test]
     fn boundary_assertion_cache_selection_is_compiler_only_and_deterministic() {
-        let program = span_program(
-            r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))",
-            b'\n',
-        );
+        let program = span_program(r"(?-u:(?:\ba|b\bcc|dd\beee|ffff\bggggg|h\z))", b'\n');
         let view = program.native_ordered_nfa_view().unwrap();
         let first = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
             .unwrap()
@@ -4336,7 +4348,10 @@ mod tests {
             .expect("bounded canonical start closure is selected");
         assert_eq!(receipt.guarded, program_view.is_guarded());
         assert_eq!(receipt.instruction_count, program_view.len());
-        assert_eq!(receipt.split_edge_visits.checked_add(1), Some(program_view.len()));
+        assert_eq!(
+            receipt.split_edge_visits.checked_add(1),
+            Some(program_view.len())
+        );
         assert_eq!(first.start_closure_program, Some(program_view));
 
         let without_view = NativeOrderedNfaProgramView {
@@ -4379,7 +4394,10 @@ mod tests {
             .expect("bounded guarded start closure is selected");
         assert!(receipt.guarded);
         assert!(selected.layout.cache_boundary_assertions);
-        assert_eq!(receipt.split_edge_visits.checked_add(1), Some(receipt.instruction_count));
+        assert_eq!(
+            receipt.split_edge_visits.checked_add(1),
+            Some(receipt.instruction_count)
+        );
 
         let without = NativeOrderedNfaObjectImage::try_build(
             NativeOrderedNfaProgramView {
@@ -4500,8 +4518,7 @@ mod tests {
 
     #[test]
     fn oversized_start_closure_is_softly_omitted_without_object_changes() {
-        let program =
-            unary_split_chain_program(MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS);
+        let program = unary_split_chain_program(MAX_NATIVE_ORDERED_NFA_START_CLOSURE_INSTRUCTIONS);
         let view = program
             .native_ordered_nfa_view()
             .expect("optimizing fallback exposes ordered TNFA");
@@ -4748,11 +4765,7 @@ mod tests {
 
     fn different_nonzero(value: u64) -> u64 {
         let changed = value.wrapping_add(1);
-        if changed == 0 {
-            1
-        } else {
-            changed
-        }
+        if changed == 0 { 1 } else { changed }
     }
 
     fn consuming_edge(frozen: &FrozenOrderedNfaStorageV1) -> usize {
@@ -5066,28 +5079,28 @@ mod tests {
             .layout
             .ordered_edge_dispatch
             .expect("the exact sidecar fits the V2 object");
-        let read_u32 = |offset: usize| {
-            u32::from_le_bytes(image.bytes[offset..offset + 4].try_into().unwrap())
-        };
-        let read_u64 = |offset: usize| {
-            u64::from_le_bytes(image.bytes[offset..offset + 8].try_into().unwrap())
-        };
+        let read_u32 =
+            |offset: usize| u32::from_le_bytes(image.bytes[offset..offset + 4].try_into().unwrap());
+        let read_u64 =
+            |offset: usize| u64::from_le_bytes(image.bytes[offset..offset + 8].try_into().unwrap());
         assert_eq!(read_u64(0), ORDERED_NFA_OBJECT_V2_READY_SEAL);
         assert_eq!(read_u64(8), ORDERED_NFA_OBJECT_V2_MAGIC);
         assert_eq!(read_u32(16), ORDERED_NFA_OBJECT_V2_ABI_VERSION);
         assert_eq!(read_u32(20), !ORDERED_NFA_OBJECT_V2_ABI_VERSION);
         assert_eq!(
             read_u32(28),
-            ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
-                | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+            ORDERED_NFA_OBJECT_V1_FLAG_UNICODE | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
         );
         assert_eq!(
-            &image.bytes[ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET
-                ..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32],
+            &image.bytes
+                [ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32],
             &view.artifact_identity
         );
         for (field, expected) in [
-            (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, layout.rows_offset),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD,
+                layout.rows_offset,
+            ),
             (
                 ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
                 layout.byte_map_offset,
@@ -5131,8 +5144,8 @@ mod tests {
             assert_eq!(read_u32(layout.rows_offset + state * 8 + 4), expected[1]);
         }
         assert_eq!(
-            &image.bytes[layout.byte_map_offset
-                ..layout.byte_map_offset + dispatch.segment_by_byte().len()],
+            &image.bytes
+                [layout.byte_map_offset..layout.byte_map_offset + dispatch.segment_by_byte().len()],
             dispatch.segment_by_byte()
         );
         for (index, &expected) in dispatch.segment_metadata().iter().enumerate() {
@@ -5218,12 +5231,10 @@ mod tests {
         let v3 = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
             .unwrap()
             .unwrap();
-        let read_u32 = |offset: usize| {
-            u32::from_le_bytes(v3.bytes[offset..offset + 4].try_into().unwrap())
-        };
-        let read_u64 = |offset: usize| {
-            u64::from_le_bytes(v3.bytes[offset..offset + 8].try_into().unwrap())
-        };
+        let read_u32 =
+            |offset: usize| u32::from_le_bytes(v3.bytes[offset..offset + 4].try_into().unwrap());
+        let read_u64 =
+            |offset: usize| u64::from_le_bytes(v3.bytes[offset..offset + 8].try_into().unwrap());
         assert_eq!(read_u64(0), ORDERED_NFA_OBJECT_V3_READY_SEAL);
         assert_eq!(read_u64(8), ORDERED_NFA_OBJECT_V3_MAGIC);
         assert_eq!(read_u32(16), ORDERED_NFA_OBJECT_V3_ABI_VERSION);
@@ -5256,7 +5267,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(v3.bytes.len(), v2.bytes.len());
-        assert_eq!(v3.layout.ordered_edge_dispatch, v2.layout.ordered_edge_dispatch);
+        assert_eq!(
+            v3.layout.ordered_edge_dispatch,
+            v2.layout.ordered_edge_dispatch
+        );
         assert_eq!(&v3.bytes[32..125], &v2.bytes[32..125]);
         assert_eq!(&v3.bytes[128..], &v2.bytes[128..]);
         assert_eq!(
@@ -5341,11 +5355,13 @@ mod tests {
             accounting.scratch_bytes()
         );
         assert!(accounting.setup_work() > 0);
-        assert!(FrozenOrderedNfaStorageV1::try_new(
-            view,
-            limits(accounting.prospective_handle_bytes() - 1),
-        )
-        .is_none());
+        assert!(
+            FrozenOrderedNfaStorageV1::try_new(
+                view,
+                limits(accounting.prospective_handle_bytes() - 1),
+            )
+            .is_none()
+        );
         assert!(FrozenOrderedNfaStorageV1::try_new(
             view,
             limits(accounting.prospective_handle_bytes()),
@@ -5409,6 +5425,65 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the synthetic chain has fixed dimensions below every u32 and structural ceiling"
+    )]
+    fn immutable_descriptor_cap_admits_large_graph_without_expanding_scratch_cap() {
+        const EDGES: usize = 180_000;
+        const OLD_DESCRIPTOR_CAP: usize = 2 * 1024 * 1024;
+
+        let mut roles = vec![StateRole::Consume; EDGES];
+        roles.push(StateRole::Accept);
+        let mut edge_offsets = (0..=EDGES)
+            .map(|offset| u32::try_from(offset).unwrap())
+            .collect::<Vec<_>>();
+        edge_offsets.push(u32::try_from(EDGES).unwrap());
+        let raw = RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets: (1..=EDGES)
+                .map(|target| u32::try_from(target).unwrap())
+                .collect(),
+            edge_kinds: vec![EdgeKind::ByteRange; EDGES],
+            byte_starts: vec![b'a'; EDGES],
+            byte_ends: vec![b'a'; EDGES],
+        };
+        let view = NativeOrderedNfaProgramView {
+            output: OutputContract::Span,
+            raw: &raw,
+            whole_window_width_bounds: None,
+            start_prefix_first_set: None,
+            ordered_edge_dispatch: None,
+            start_closure_dispatch: None,
+            terminal_exact_set: None,
+            terminal_range: None,
+            line_terminator: b'\n',
+            artifact_identity: [7; 32],
+        };
+        let image = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .expect("four-MiB immutable descriptor envelope");
+        assert!(image.bytes.len() > OLD_DESCRIPTOR_CAP);
+        assert!(image.bytes.len() <= FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES);
+        drop(image);
+
+        let owner = FrozenOrderedNfaPreparedScratchV1::try_new(
+            view,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .expect("large immutable graph still fits the unchanged scratch envelope");
+        assert!(owner.accounting().descriptor_bytes() > OLD_DESCRIPTOR_CAP);
+        assert!(owner.accounting().scratch_bytes() <= FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES);
+        drop(owner);
+
+        let mut old = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        old.max_descriptor_bytes = OLD_DESCRIPTOR_CAP;
+        assert!(FrozenOrderedNfaPreparedScratchV1::try_new(view, old).is_none());
+    }
+
+    #[test]
     fn construction_softly_refuses_non_span_view_variant() {
         let program = span_program(r"a+", b'\n');
         let span = program.native_ordered_nfa_view().unwrap();
@@ -5416,11 +5491,13 @@ mod tests {
             output: OutputContract::Exists,
             ..span
         };
-        assert!(FrozenOrderedNfaStorageV1::try_new(
-            count,
-            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
-        )
-        .is_none());
+        assert!(
+            FrozenOrderedNfaStorageV1::try_new(
+                count,
+                limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+            )
+            .is_none()
+        );
     }
 
     #[test]

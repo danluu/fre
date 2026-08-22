@@ -2,14 +2,17 @@ use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex,
-    DeterminizeLimits, FeatureSet, OperatingSystem, OutputContract, PreparedAggregateExports,
-    RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1, SlowAotLimits, SymbolBinding,
-    SymbolKind, Target, UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
-    UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
-    UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
-    UniformCapturePreparedSpanFillCompileReceipt, compile, compile_rebar_single_capture_aot_v1,
+    DeterminizeLimits, EngineKind, FeatureSet, OperatingSystem, OutputContract,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1,
+    SlowAotLimits, SymbolBinding, SymbolKind, Target, UniformCaptureAuthenticationError,
+    UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
+    UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileDisposition,
+    UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
+    compile, compile_rebar_single_capture_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
-    compile_with_prepared_aggregate_exports_and_slow_aot_limits, compile_with_slow_aot_limits,
+    compile_with_prepared_aggregate_exports_and_slow_aot_limits,
+    compile_with_prepared_ordered_nfa_v15, compile_with_slow_aot_limits,
 };
 use fre_lower::{LowerError, LowerResource};
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
@@ -516,13 +519,104 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
     };
     match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
         Ok(compiled) => Ok(compiled),
-        Err(error) if is_lower_work_limit(&error) => compile_with_limits(
-            rebar_recovery_compile_limits(),
-            rebar_recovery_slow_aot_limits(),
-        )
-        .map_err(|error| format!("general AOT recovery compilation failed: {error}")),
+        Err(error) if is_lower_work_limit(&error) => {
+            let recovered = compile_with_limits(
+                rebar_recovery_compile_limits(),
+                rebar_recovery_slow_aot_limits(),
+            )
+            .map_err(|error| format!("general AOT recovery compilation failed: {error}"))?;
+            if !recovered_scalar_requires_prepared_ordered_nfa(benchmark.model, &recovered) {
+                return Ok(recovered);
+            }
+            let recovered_stats = recovered
+                .program()
+                .stats()
+                .map_err(|error| format!("general AOT recovery stats failed: {error}"))?;
+            let selected = compile_with_prepared_ordered_nfa_v15(
+                CompileRequest::new(benchmark.pattern(), target)
+                    .profile(profile)
+                    .output(OutputContract::Span)
+                    .mode(CompileMode::Optimizing)
+                    .limits(rebar_recovery_compile_limits()),
+                benchmark.model.exports(),
+            )
+            .map_err(|error| {
+                format!(
+                    "general AOT explicit prepared Ordered-NFA compilation failed for {} states/{} edges: {error}",
+                    recovered_stats.thompson_states, recovered_stats.thompson_edges,
+                )
+            })?;
+            authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)?;
+            Ok(selected)
+        }
         Err(error) => Err(format!("general AOT compilation failed: {error}")),
     }
+}
+
+fn recovered_scalar_requires_prepared_ordered_nfa(model: Model, compiled: &CompiledRegex) -> bool {
+    recovered_scalar_route_shape(
+        model,
+        compiled.receipt().engine,
+        compiled.module().prepared_bulk_strategy(),
+        compiled.module().prepared_aggregate_strategy(),
+        compiled.module().required_prepare_capabilities(),
+    )
+}
+
+const fn recovered_scalar_route_shape(
+    model: Model,
+    engine: EngineKind,
+    bulk: Option<PreparedBulkStrategy>,
+    aggregate: Option<PreparedAggregateStrategy>,
+    required_prepare_capabilities: u64,
+) -> bool {
+    matches!(model, Model::Count | Model::SpanSum)
+        && matches!(engine, EngineKind::OrderedNfa)
+        && matches!(bulk, Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk))
+        && matches!(aggregate, Some(PreparedAggregateStrategy::RuntimeHelper))
+        && required_prepare_capabilities == 0
+}
+
+fn authenticate_prepared_ordered_nfa_scalar(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> Result<(), String> {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let reducer_is_present = match model {
+        Model::Count => module.prepared_count_symbol().is_some(),
+        Model::SpanSum => module.prepared_span_sum_symbol().is_some(),
+        _ => false,
+    };
+    if receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Span
+        || receipt.engine != EngineKind::OrderedNfa
+        || receipt.prepared_aggregate_exports != model.exports()
+        || receipt.prepared_aggregate_strategy
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        || receipt.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.prepared_aggregate_exports() != model.exports()
+        || module.prepared_aggregate_strategy()
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        || module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.prepared_entry_symbol().is_none()
+        || module.prepared_span_fill_symbol().is_none()
+        || module.required_runtime_program().is_none()
+        || !reducer_is_present
+        || compiled.object().is_empty()
+        || compiled.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err(format!(
+            "explicit prepared Ordered-NFA scalar route failed authentication: model={} engine={:?} aggregate={:?} bulk={:?} capabilities={:#x}",
+            model.name(),
+            receipt.engine,
+            module.prepared_aggregate_strategy(),
+            module.prepared_bulk_strategy(),
+            module.required_prepare_capabilities(),
+        ));
+    }
+    Ok(())
 }
 
 /// One distinct helper-free native `Span` object in source-priority order.
@@ -1268,6 +1362,87 @@ mod tests {
             rebar.module().entry_symbol(),
             ordinary.module().entry_symbol()
         );
+    }
+
+    #[test]
+    fn recovered_runtime_bulk_shape_has_one_authenticated_prepared_ordered_nfa_replacement() {
+        let mut benchmark = Benchmark::parse(&fixture("count", br"\p{L}+", b" aa"))
+            .expect("assertion-bearing count fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = benchmark.unicode;
+        profile.options.case_insensitive = benchmark.case_insensitive;
+        let recovered = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(benchmark.pattern(), target)
+                .profile(profile.clone())
+                .output(benchmark.model.output())
+                .mode(CompileMode::Optimizing)
+                .limits(rebar_recovery_compile_limits()),
+            benchmark.model.exports(),
+            rebar_recovery_slow_aot_limits(),
+        )
+        .expect("runtime-bulk incumbent");
+        assert!(
+            !recovered_scalar_requires_prepared_ordered_nfa(benchmark.model, &recovered),
+            "the small fixture is already native: engine={:?} aggregate={:?} bulk={:?} capabilities={:#x}",
+            recovered.receipt().engine,
+            recovered.module().prepared_aggregate_strategy(),
+            recovered.module().prepared_bulk_strategy(),
+            recovered.module().required_prepare_capabilities()
+        );
+        assert!(recovered_scalar_route_shape(
+            Model::Count,
+            EngineKind::OrderedNfa,
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+            0,
+        ));
+        assert!(recovered_scalar_route_shape(
+            Model::SpanSum,
+            EngineKind::OrderedNfa,
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+            0,
+        ));
+        assert!(!recovered_scalar_route_shape(
+            Model::GrepCount,
+            EngineKind::OrderedNfa,
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+            0,
+        ));
+        assert!(!recovered_scalar_route_shape(
+            Model::CountCaptures,
+            EngineKind::OrderedNfa,
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+            0,
+        ));
+        assert!(!recovered_scalar_route_shape(
+            Model::Count,
+            EngineKind::OrderedNfa,
+            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        ));
+
+        let selected = compile_with_prepared_ordered_nfa_v15(
+            CompileRequest::new(benchmark.pattern(), target)
+                .profile(profile)
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing)
+                .limits(rebar_recovery_compile_limits()),
+            benchmark.model.exports(),
+        )
+        .expect("explicit prepared Ordered-NFA route");
+        authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)
+            .expect("native scalar route receipt");
     }
 
     #[test]
