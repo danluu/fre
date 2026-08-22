@@ -71,7 +71,7 @@ const UNIFORM_WORD64_STATE_BITS: usize = u64::BITS as usize;
 #[cfg(not(feature = "static-dispatch"))]
 const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 #[cfg(not(feature = "static-dispatch"))]
-const RETAINED_ITER_DENSE_GAP_BYTES: usize = 32;
+const RETAINED_ITER_DENSE_GAP_BYTES: usize = 16;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
 // UniformWord64 admits at least two equal-width literals in one word, so no
@@ -4502,7 +4502,7 @@ mod tests {
         let width = 8;
         let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
         let dense_gap = super::RETAINED_ITER_DENSE_GAP_BYTES;
-        assert_eq!(dense_gap, 32);
+        assert_eq!(dense_gap, 16);
         for gap in [dense_gap - 1, dense_gap, dense_gap + 1] {
             let first = (gap, gap + width);
             let second = (first.1 + gap, first.1 + gap + width);
