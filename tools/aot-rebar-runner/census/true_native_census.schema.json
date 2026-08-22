@@ -305,7 +305,72 @@
           "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
         },
         "program_sha256": { "$ref": "#/$defs/sha256" },
-        "object_sha256": { "$ref": "#/$defs/sha256" }
+        "object_sha256": { "$ref": "#/$defs/sha256" },
+        "prepared_v15": {
+          "anyOf": [
+            { "$ref": "#/$defs/preparedV15ComponentProvenance" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "preparedV15LimitsProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_handle_bytes", "max_scratch_bytes", "max_setup_work"],
+      "properties": {
+        "max_handle_bytes": { "const": 8388608 },
+        "max_scratch_bytes": { "const": 8388608 },
+        "max_setup_work": { "const": 2000000 }
+      }
+    },
+    "preparedV15ComponentProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_prepare_capabilities", "prepare_config_version",
+        "prepare_operation_flags", "runtime_program_symbol",
+        "runtime_program_len", "span_fill_symbol", "prepared_bulk_strategy",
+        "artifact_identity_sha256"
+      ],
+      "properties": {
+        "required_prepare_capabilities": { "const": 1 },
+        "prepare_config_version": { "const": 3 },
+        "prepare_operation_flags": { "const": 2 },
+        "runtime_program_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_runtime_program_v1_[0-9a-f]{64}$"
+        },
+        "runtime_program_len": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "span_fill_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
+        },
+        "prepared_bulk_strategy": { "const": "Some(NativeOrderedNfaLoop)" },
+        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "preparedGrepV15Provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_prepare_capabilities", "prepare_config_version",
+        "prepare_operation_flags", "max_handle_bytes", "max_scratch_bytes",
+        "max_setup_work", "runtime_program_len", "artifact_identity_sha256",
+        "reducer_identity_sha256"
+      ],
+      "properties": {
+        "required_prepare_capabilities": { "const": 1 },
+        "prepare_config_version": { "const": 3 },
+        "prepare_operation_flags": { "const": 2 },
+        "max_handle_bytes": { "const": 8388608 },
+        "max_scratch_bytes": { "const": 8388608 },
+        "max_setup_work": { "const": 2000000 },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "uniformCaptureProvenance": {
@@ -515,14 +580,16 @@
         "kind": {
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
-            "participation-capture-v4", "selector-capture-fallback-v4"
+            "participation-capture-v4", "selector-capture-fallback-v4",
+            "prepared-grep-v15-v2"
           ]
         },
         "composite_kind": {
           "enum": [
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
             "regex-redux-fixed-v1", "strict-capture-next-v1",
-            "exact-span-participation-v1", "selector-negative-certificate-v1"
+            "exact-span-participation-v1", "selector-negative-certificate-v1",
+            "mixed-prepared-native-row-bridge-v15"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -546,6 +613,8 @@
         "selector_capture_fallback": {
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
+        "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
+        "prepared_v15_limits": { "$ref": "#/$defs/preparedV15LimitsProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
         "grep_iteration_strategy": { "type": ["string", "null"] },
@@ -605,6 +674,50 @@
             }
           },
           "else": { "not": { "required": ["selector_capture_fallback"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "prepared-grep-v15-v2" } },
+            "required": ["kind"]
+          },
+          "then": { "required": ["prepared_grep_v15"] },
+          "else": { "not": { "required": ["prepared_grep_v15"] } }
+        },
+        {
+          "if": {
+            "properties": {
+              "composite_kind": {
+                "const": "mixed-prepared-native-row-bridge-v15"
+              }
+            },
+            "required": ["composite_kind"]
+          },
+          "then": {
+            "required": ["prepared_v15_limits"],
+            "properties": {
+              "components": {
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/componentProvenance" },
+                    { "required": ["prepared_v15"] }
+                  ]
+                }
+              }
+            }
+          },
+          "else": {
+            "not": { "required": ["prepared_v15_limits"] },
+            "properties": {
+              "components": {
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/componentProvenance" },
+                    { "not": { "required": ["prepared_v15"] } }
+                  ]
+                }
+              }
+            }
+          }
         }
       ]
     },

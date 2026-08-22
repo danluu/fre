@@ -135,6 +135,16 @@ source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
 now also seals its selector automaton hash and the explicit
 `uniform_capture_bridge` boolean. Ordinary rows must publish `false`.
+An additive mixed V15 route may retain both ordinary helper-free entries and
+prepared native Ordered-NFA entries. Each row then seals its exact engine,
+capability/config/operation flags, complete runtime-symbol set, prepared bulk
+strategy, serialized-program symbol and extent, Span-fill identity, and
+ordinary/prepared state. The top-level record seals the 8 MiB handle and
+scratch ceilings and two-million-unit setup-work ceiling. A scalar prepared
+`grep` seals the same V15 ABI, program extent, native entry/Span-fill/program
+identity, and distinct compatibility-reducer identity in normalized v2
+provenance. The final-binary inventory must find every named text or data
+identity; a provenance-only serialized program is not evidence.
 Uniform-capture rows must publish `true`, the exact
 `static-uniform-multiplier` resolution and native-search-core boundary, positive
 proof identity/work/stack/minimum-width/count fields, one value per source, and
@@ -151,8 +161,9 @@ sole component entry is an identity-suffixed native `capture_next`, its declared
 runtime-symbol list is empty, and its object/program identities agree with the
 component receipt. The closed record also seals group count and nullability,
 source/selector/capture/plan/bundle/artifact digests, and the distinct native
-materializer and ordinary selector symbols. The normalized v2 and v3 receipt
-surfaces remain unchanged; `strict_capture` exists only on normalized v4. The
+materializer and ordinary selector symbols. Prepared V15 adds only the closed
+typed proof objects described above; `strict_capture` exists only on normalized
+v4. The
 independent final-binary inventory must also contain zero semantic runtime
 symbols for this strict route; an unused-but-linked helper is a failed strict
 qualification rather than a trap-only allowance.
@@ -169,7 +180,8 @@ The controller requires identical runner/object hashes and normalized
 provenance from both builds. It inventories local, global, weak, and imported
 executable runtime-symbol references in the final binary independently of
 `required_runtime_symbols`, while separately requiring each claimed operation
-entry to be defined text. Every executable `fre_aot_regex_runtime_*` symbol
+entry to be defined text and every route-bound program identity to be defined
+data. Every executable `fre_aot_regex_runtime_*` symbol
 except the explicit prepare/destroy control plane is a semantic helper and is
 armed. Provenance-declared helpers must be a subset of this independent
 inventory.
@@ -189,7 +201,11 @@ Three fresh processes authenticate each job:
    trap status and name that exact entry. For `count` this is the reducer; for
    bulk `count-spans` it is Span-fill; for direct `count-spans` and `grep` it is
    the ordinary entry. Composite v3 provenance is normalized into a closed
-   component list whose every `component_N_native` claim is true.
+   component list whose every `component_N_native` claim is true. Scalar
+   prepared `grep` traps its native Span-fill entry. A mixed row bridge traps
+   each ordinary search entry or prepared exclusive-search entry; its
+   Span-fill and serialized program remain independently inventoried closure
+   evidence rather than substituted operation entries.
    `regex-redux` must publish exactly 15 component entries,
    per-component runtime-symbol lists, and program/object hashes; the
    controller runs 15 independent negative controls so a trap in the first
@@ -213,7 +229,9 @@ Three fresh processes authenticate each job:
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:
 an unused helper is harmless, while any helper actually reached by the job is
-nonnative. The uniform multiplier receipt is not capture replay or capture
+nonnative. The same rule applies to prepared V15 objects: their selected native
+loop receives credit only if every linked compatibility helper is armed and
+remains untriggered for the complete public job. The uniform multiplier receipt is not capture replay or capture
 materialization: stock Rust captures remain the correctness comparator, while
 only the helper-free native Span selection core is credited here.
 

@@ -277,10 +277,20 @@ def uniform_capture_provenance_fields() -> dict[str, str]:
         "row_total_object_bytes": "123",
         "source_to_artifact": "0",
         "component_count": "1",
+        "prepare_max_handle_bytes": "0",
+        "prepare_max_scratch_bytes": "0",
+        "prepare_max_setup_work": "0",
         "component_0_native": "true",
         "component_0_source_ordinal": "0",
         "component_0_entry_symbol": f"fre_aot_regex_search_v1_{entry_suffix}",
         "component_0_runtime_symbols": "",
+        "component_0_required_prepare_capabilities": "0000000000000000",
+        "component_0_prepare_config_version": "0",
+        "component_0_prepare_operation_flags": "0000000000000000",
+        "component_0_runtime_program_symbol": "",
+        "component_0_runtime_program_len": "0",
+        "component_0_span_fill_symbol": "",
+        "component_0_prepared_bulk_strategy": "None",
         "component_0_automaton_sha256": "a" * 64,
         "component_0_program_sha256": "b" * 64,
         "component_0_object_sha256": "c" * 64,
@@ -298,6 +308,133 @@ def uniform_capture_provenance_fields() -> dict[str, str]:
         "boundary": "native-search-core-static-uniform-capture-resolution",
         "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
     }
+    return fields
+
+
+def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
+    native_identity = "d" * 64
+    aggregate_identity = "e" * 64
+    return {
+        "schema": "fre.aot.rebar-runner.v2",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15",
+        "model": "grep",
+        "benchmark": "synthetic/prepared-grep",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "OrderedNfa",
+        "aggregate_strategy": "linked-per-line-prepared-span-fill-v15",
+        "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+        "span_iteration_strategy": "not-applicable",
+        "grep_iteration_strategy": "linked-per-line-prepared-span-fill-v15",
+        "prepare_config_version": "3",
+        "prepare_operation_flags": "0000000000000002",
+        "required_prepare_capabilities": "0000000000000001",
+        "prepare_scope": "runtime-handle-state",
+        "object_descriptor_setup": "authenticated-v3-when-required",
+        "max_start_filter_setup_work": "100000000",
+        "max_grep_count_workspace_bytes": "67108864",
+        "max_handle_bytes": "8388608",
+        "max_ordered_nfa_scratch_bytes": "8388608",
+        "max_ordered_nfa_setup_work": "2000000",
+        "program_sha256": "3" * 64,
+        "object_sha256": "4" * 64,
+        "program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{native_identity}"
+        ),
+        "program_len": "4096",
+        "entry_symbol": f"fre_aot_regex_search_v1_{native_identity}",
+        "reducer_symbol": (
+            f"fre_aot_regex_grep_count_exclusive_v1_{aggregate_identity}"
+        ),
+        "span_fill_symbol": (
+            f"fre_aot_regex_fill_spans_exclusive_v1_{native_identity}"
+        ),
+        "required_runtime_symbols": ",".join(
+            CENSUS.PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS
+        ),
+        "boundary": "runtime-klv-warmup-schedule",
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+
+
+def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
+    ordinary_identity = "a" * 64
+    prepared_identity = "b" * 64
+    fields = {
+        "schema": "fre.aot.rebar-runner.v3",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": "general-aot-native-row-bridge-grep-mixed-prepared-ordered-nfa-v15-v1",
+        "model": "grep",
+        "benchmark": "synthetic/mixed-prepared-grep",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedNfa)",
+        "aggregate_strategy": (
+            "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1"
+        ),
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "false",
+        "source_pattern_count": "2",
+        "row_total_object_bytes": "8192",
+        "source_to_artifact": "0,1",
+        "component_count": "2",
+        "prepare_max_handle_bytes": "8388608",
+        "prepare_max_scratch_bytes": "8388608",
+        "prepare_max_setup_work": "2000000",
+        "boundary": "complete-native-row-bridge",
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+    fields.update({
+        "component_0_native": "true",
+        "component_0_source_ordinal": "0",
+        "component_0_entry_symbol": (
+            f"fre_aot_regex_search_v1_{ordinary_identity}"
+        ),
+        "component_0_runtime_symbols": "",
+        "component_0_required_prepare_capabilities": "0000000000000000",
+        "component_0_prepare_config_version": "0",
+        "component_0_prepare_operation_flags": "0000000000000000",
+        "component_0_runtime_program_symbol": "",
+        "component_0_runtime_program_len": "0",
+        "component_0_span_fill_symbol": "",
+        "component_0_prepared_bulk_strategy": "None",
+        "component_0_automaton_sha256": "1" * 64,
+        "component_0_program_sha256": "2" * 64,
+        "component_0_object_sha256": "3" * 64,
+        "component_1_native": "true",
+        "component_1_source_ordinal": "1",
+        "component_1_entry_symbol": (
+            f"fre_aot_regex_search_exclusive_v1_{prepared_identity}"
+        ),
+        "component_1_runtime_symbols": ",".join(
+            CENSUS.PREPARED_V15_RUNTIME_SYMBOLS
+        ),
+        "component_1_required_prepare_capabilities": "0000000000000001",
+        "component_1_prepare_config_version": "3",
+        "component_1_prepare_operation_flags": "0000000000000002",
+        "component_1_runtime_program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{prepared_identity}"
+        ),
+        "component_1_runtime_program_len": "4096",
+        "component_1_span_fill_symbol": (
+            f"fre_aot_regex_fill_spans_exclusive_v1_{prepared_identity}"
+        ),
+        "component_1_prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+        "component_1_automaton_sha256": "4" * 64,
+        "component_1_program_sha256": "5" * 64,
+        "component_1_object_sha256": "6" * 64,
+    })
     return fields
 
 
@@ -800,6 +937,14 @@ class TrueNativeCensusTests(unittest.TestCase):
             "selector-capture-fallback-v4",
             definitions["provenance"]["properties"]["kind"]["enum"],
         )
+        self.assertIn(
+            "runtime_program_len",
+            definitions["preparedGrepV15Provenance"]["required"],
+        )
+        self.assertIn(
+            "prepared_v15",
+            definitions["componentProvenance"]["properties"],
+        )
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
         receipt = CENSUS.id_set(["b", "a"])
@@ -835,6 +980,10 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertNotIn(
             "fre_aot_regex_runtime_future_shared_v1", CENSUS.nm_text_symbols(nm)
+        )
+        self.assertIn(
+            "fre_aot_regex_runtime_program_v1_deadbeef",
+            CENSUS.nm_defined_symbols(nm),
         )
 
     def test_macho_leading_underscore_is_normalized(self) -> None:
@@ -904,6 +1053,17 @@ class TrueNativeCensusTests(unittest.TestCase):
                 f"fre_aot_regex_search_v1_{index + 11:064x}"
             )
             fields[f"component_{index}_runtime_symbols"] = ""
+            fields[f"component_{index}_required_prepare_capabilities"] = (
+                "0000000000000000"
+            )
+            fields[f"component_{index}_prepare_config_version"] = "0"
+            fields[f"component_{index}_prepare_operation_flags"] = (
+                "0000000000000000"
+            )
+            fields[f"component_{index}_runtime_program_symbol"] = ""
+            fields[f"component_{index}_runtime_program_len"] = "0"
+            fields[f"component_{index}_span_fill_symbol"] = ""
+            fields[f"component_{index}_prepared_bulk_strategy"] = "None"
             fields[f"component_{index}_automaton_sha256"] = f"{index + 9:064x}"
             fields[f"component_{index}_program_sha256"] = f"{index + 1:064x}"
             fields[f"component_{index}_object_sha256"] = f"{index + 3:064x}"
@@ -932,7 +1092,7 @@ class TrueNativeCensusTests(unittest.TestCase):
             "feature_bits": "0000000000000000",
             "compiler_version": "1",
             "optimizer_version": "1",
-            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedNfa)",
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedContextDfa)",
             "aggregate_strategy": "native-independent-span-row-selector-v1",
             "native_row_bridge": "true",
             "uniform_capture_bridge": "false",
@@ -940,6 +1100,9 @@ class TrueNativeCensusTests(unittest.TestCase):
             "row_total_object_bytes": "4096",
             "source_to_artifact": "0,1,0",
             "component_count": "2",
+            "prepare_max_handle_bytes": "0",
+            "prepare_max_scratch_bytes": "0",
+            "prepare_max_setup_work": "0",
             "boundary": "complete-native-row-bridge",
             "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
         }
@@ -950,6 +1113,17 @@ class TrueNativeCensusTests(unittest.TestCase):
                 f"fre_aot_regex_search_v1_{index + 11:064x}"
             )
             fields[f"component_{index}_runtime_symbols"] = ""
+            fields[f"component_{index}_required_prepare_capabilities"] = (
+                "0000000000000000"
+            )
+            fields[f"component_{index}_prepare_config_version"] = "0"
+            fields[f"component_{index}_prepare_operation_flags"] = (
+                "0000000000000000"
+            )
+            fields[f"component_{index}_runtime_program_symbol"] = ""
+            fields[f"component_{index}_runtime_program_len"] = "0"
+            fields[f"component_{index}_span_fill_symbol"] = ""
+            fields[f"component_{index}_prepared_bulk_strategy"] = "None"
             fields[f"component_{index}_automaton_sha256"] = f"{index + 9:064x}"
             fields[f"component_{index}_program_sha256"] = f"{index + 1:064x}"
             fields[f"component_{index}_object_sha256"] = f"{index + 3:064x}"
@@ -1021,9 +1195,117 @@ class TrueNativeCensusTests(unittest.TestCase):
                 ).encode()
             )
 
+    def test_scalar_prepared_grep_v15_closes_route_caps_and_identities(self) -> None:
+        fields = prepared_scalar_grep_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(receipt, "synthetic prepared grep")
+        self.assertEqual(receipt["kind"], "prepared-grep-v15-v2")
+        self.assertEqual(receipt["prepared_grep_v15"]["runtime_program_len"], 4096)
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            ([fields["span_fill_symbol"]], "linked-prepared-span-fill-grep-adapter-loop"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            sorted([
+                fields["entry_symbol"], fields["program_symbol"],
+                fields["reducer_symbol"],
+            ]),
+        )
+
+        poisons = {
+            "engine": "OrderedDfa",
+            "max_handle_bytes": "8388607",
+            "program_len": "0",
+            "required_runtime_symbols": (
+                fields["required_runtime_symbols"] + ",fre_aot_regex_runtime_future_v1"
+            ),
+            "program_symbol": (
+                f"fre_aot_regex_runtime_program_v1_{'9' * 64}"
+            ),
+            "reducer_symbol": (
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}"
+            ),
+        }
+        for name, value in poisons.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+    def test_mixed_prepared_v15_rows_close_each_component_and_engine(self) -> None:
+        fields = mixed_prepared_grep_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        receipt = CENSUS.provenance_receipt(CENSUS.parse_provenance(encoded))
+        CENSUS.validate_provenance_record(receipt, "synthetic mixed prepared grep")
+        self.assertEqual(
+            receipt["composite_kind"], "mixed-prepared-native-row-bridge-v15"
+        )
+        self.assertIsNone(receipt["components"][0]["prepared_v15"])
+        self.assertEqual(
+            receipt["components"][1]["prepared_v15"]["runtime_program_len"],
+            4096,
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            (
+                [
+                    fields["component_0_entry_symbol"],
+                    fields["component_1_entry_symbol"],
+                ],
+                "linked-native-row-adapter-loop",
+            ),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            sorted([
+                fields["component_1_runtime_program_symbol"],
+                fields["component_1_span_fill_symbol"],
+            ]),
+        )
+
+        poisons = {
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedDfa)",
+            "prepare_max_scratch_bytes": "8388607",
+            "component_1_required_prepare_capabilities": "0000000000000002",
+            "component_1_prepare_config_version": "2",
+            "component_1_prepare_operation_flags": "0000000000000001",
+            "component_1_runtime_program_len": "0",
+            "component_1_runtime_symbols": (
+                fields["component_1_runtime_symbols"]
+                + ",fre_aot_regex_runtime_future_v1"
+            ),
+            "component_1_span_fill_symbol": (
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'8' * 64}"
+            ),
+        }
+        for name, value in poisons.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+        normalized = copy.deepcopy(receipt)
+        normalized["components"][0].pop("prepared_v15")
+        with self.assertRaisesRegex(CENSUS.CensusError, "keys differ"):
+            CENSUS.validate_provenance_record(normalized, "missing ordinary route marker")
+
     def test_uniform_capture_v3_seals_proof_lists_and_mapped_selector_digests(self) -> None:
         fields = uniform_capture_provenance_fields()
         fields.update({
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedContextDfa)",
             "source_pattern_count": "3",
             "row_total_object_bytes": "246",
             "source_to_artifact": "0,1,0",
@@ -1032,6 +1314,13 @@ class TrueNativeCensusTests(unittest.TestCase):
             "component_1_source_ordinal": "1",
             "component_1_entry_symbol": f"fre_aot_regex_search_v1_{'e' * 64}",
             "component_1_runtime_symbols": "",
+            "component_1_required_prepare_capabilities": "0000000000000000",
+            "component_1_prepare_config_version": "0",
+            "component_1_prepare_operation_flags": "0000000000000000",
+            "component_1_runtime_program_symbol": "",
+            "component_1_runtime_program_len": "0",
+            "component_1_span_fill_symbol": "",
+            "component_1_prepared_bulk_strategy": "None",
             "component_1_automaton_sha256": "4" * 64,
             "component_1_program_sha256": "5" * 64,
             "component_1_object_sha256": "6" * 64,
@@ -1618,6 +1907,7 @@ class TrueNativeCensusTests(unittest.TestCase):
             "program_sha256": "3" * 64,
             "object_sha256": "4" * 64,
             "program_symbol": f"fre_aot_regex_program_v1_{suffix}",
+            "program_len": "128",
             "entry_symbol": f"fre_aot_regex_search_v1_{suffix}",
             "reducer_symbol": f"fre_aot_regex_count_exclusive_v1_{suffix}",
             "span_fill_symbol": "",
