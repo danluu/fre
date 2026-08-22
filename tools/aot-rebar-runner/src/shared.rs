@@ -91,6 +91,10 @@ pub fn rebar_recovery_compile_limits() -> CompileLimitsV1 {
 /// allocation ceilings but skips a second, optional determinization pass.
 #[must_use]
 pub fn rebar_recovery_slow_aot_limits() -> SlowAotLimits {
+    native_row_bridge_no_optional_dfa_limits()
+}
+
+fn native_row_bridge_no_optional_dfa_limits() -> SlowAotLimits {
     SlowAotLimits {
         determinize: DeterminizeLimits {
             max_states: REBAR_RECOVERY_MAX_DFA_STATES,
@@ -761,6 +765,7 @@ const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
 ];
+const FROZEN_LOOP_RUNTIME_SYMBOL: &str = "fre_aot_regex_runtime_scan_frozen_loop_v2";
 
 fn unresolved_runtime_function_names(compiled: &CompiledRegex) -> Option<Vec<&str>> {
     let module = compiled.module();
@@ -811,10 +816,10 @@ fn has_exact_optional_symbol_name_closure(
 }
 
 /// Authenticate the complete helper surface published by the current module
-/// itself for a caps-zero native prepared loop. This artifact is never linked
+/// itself for a caps-zero native dynamic loop. This artifact is never linked
 /// by the row bridge: the closed surface is only a typed witness permitting a
 /// fresh, independently authenticated V15 compilation of the same program.
-fn native_prepared_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
+fn native_dynamic_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
     let module = compiled.module();
     let Some(actual) = unresolved_runtime_function_names(compiled) else {
         return false;
@@ -854,6 +859,22 @@ fn native_prepared_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> 
         module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
     ];
     has_exact_optional_symbol_name_closure(&actual, &expected)
+}
+
+fn native_prepared_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
+    compiled
+        .module()
+        .prepared_bulk_strategy()
+        == Some(PreparedBulkStrategy::NativePreparedLoop)
+        && native_dynamic_loop_runtime_symbols_are_closed(compiled)
+}
+
+fn native_frozen_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
+    let module = compiled.module();
+    module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeFrozenLoop)
+        && module.required_prepared_dynamic_rows_loop_scan_runtime_symbol()
+        == Some(FROZEN_LOOP_RUNTIME_SYMBOL)
+        && native_dynamic_loop_runtime_symbols_are_closed(compiled)
 }
 
 fn has_defined_symbol(
@@ -1846,6 +1867,11 @@ pub fn try_compile_uniform_capture_bridge(
 /// retained once at its lowest source ordinal. Any row that exposes a
 /// runtime-dependent ordinary route is replaced only by an explicitly
 /// requested and capability-authenticated prepared Ordered-NFA V15 entry.
+/// The ordinary transaction keeps the canonical semantic-DFA attempt, but the
+/// adapter deliberately bounds the optional slow-DFA retry to zero. The
+/// independent V15 replacement retains the selected transaction's exact
+/// compile limits so its semantic identities can be compared without
+/// normalization.
 /// Compiler, allocation, object, and authentication failures remain terminal.
 pub fn compile_native_row_bridge(
     benchmark: &Benchmark,
@@ -1901,7 +1927,7 @@ pub fn compile_native_row_bridge(
         };
         let (compiled, selected_limits) = match compile_with_limits(
             CompileLimitsV1::default(),
-            SlowAotLimits::default(),
+            native_row_bridge_no_optional_dfa_limits(),
         ) {
             Ok(compiled) => (compiled, CompileLimitsV1::default()),
             Err(error) if is_lower_work_limit(&error) => {
@@ -2126,6 +2152,9 @@ fn ordinary_row_is_well_formed_runtime_dependency(
         Some(PreparedBulkStrategy::NativePreparedLoop) => {
             native_prepared_loop_runtime_symbols_are_closed(compiled)
         }
+        Some(PreparedBulkStrategy::NativeFrozenLoop) => {
+            native_frozen_loop_runtime_symbols_are_closed(compiled)
+        }
         _ => false,
     };
     Ok(receipt.mode == CompileMode::Optimizing
@@ -2142,6 +2171,7 @@ fn ordinary_row_is_well_formed_runtime_dependency(
         && module.prepared_count_symbol().is_none()
         && module.prepared_span_sum_symbol().is_none()
         && module.prepared_grep_count_symbol().is_none()
+        && module.prepared_exists_batch_symbol().is_none()
         && program_len != 0
         && has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
         && has_defined_symbol(compiled, prepared_entry, SymbolKind::Function, None)
@@ -2190,6 +2220,7 @@ fn authenticate_prepared_v15_row(
         || module.prepared_count_symbol().is_some()
         || module.prepared_span_sum_symbol().is_some()
         || module.prepared_grep_count_symbol().is_some()
+        || module.prepared_exists_batch_symbol().is_some()
         || program_len == 0
         || !has_exact_runtime_symbol_closure(compiled, &PREPARED_V15_ROW_RUNTIME_SYMBOLS)
         || !has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
@@ -2932,10 +2963,26 @@ mod tests {
         )
         .expect("host target");
         let bridge = compile_native_row_bridge(&benchmark, target).expect("native-row bridge");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = benchmark.unicode;
+        profile.options.case_insensitive = benchmark.case_insensitive;
+        let ordinary = compile_with_slow_aot_limits(
+            CompileRequest::new("a+", target)
+                .profile(profile)
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing),
+            SlowAotLimits::default(),
+        )
+        .expect("ordinary first-pass DFA winner");
         assert_eq!(bridge.source_to_artifact, [0, 0, 1]);
         assert_eq!(bridge.artifacts.len(), 2);
         assert_eq!(bridge.artifacts[0].first_source_ordinal, 0);
         assert_eq!(bridge.artifacts[1].first_source_ordinal, 2);
+        assert_eq!(bridge.artifacts[0].compiled.object(), ordinary.object());
+        assert_eq!(
+            bridge.artifacts[0].compiled.receipt().object_sha256,
+            ordinary.receipt().object_sha256
+        );
         assert_eq!(
             bridge.total_object_bytes,
             bridge
@@ -2957,7 +3004,7 @@ mod tests {
     }
 
     #[test]
-    fn native_prepared_loop_is_only_a_trigger_for_authenticated_v15() {
+    fn native_dynamic_loop_is_only_a_trigger_for_authenticated_v15() {
         const TRIGGER: &str = r"(?i)(?:abc.?cdccefg|abc.?cdccefg.?hfidg|abc.?hfidg)[=:;=]?\s{0,30}(?:j|kl|k)\s{0,30}[=:;=]?([a-z0-9.!-]{16,200})[^a-z0-9.!-]";
         assert_eq!(TRIGGER.len(), 124);
 
@@ -2973,19 +3020,28 @@ mod tests {
                     .profile(profile)
                     .output(OutputContract::Span)
                     .mode(CompileMode::Optimizing),
-                SlowAotLimits::default(),
+                native_row_bridge_no_optional_dfa_limits(),
             )
-            .expect("shape-equivalent native prepared-loop incumbent");
+            .expect("shape-equivalent native dynamic-loop incumbent");
             assert_eq!(ordinary.receipt().engine, EngineKind::OrderedNfa);
             assert!(ordinary.receipt().runtime_helper_required);
             assert!(ordinary.receipt().prepared_aggregate_exports.is_empty());
             assert!(ordinary.receipt().prepared_aggregate_strategy.is_none());
             assert_eq!(ordinary.receipt().required_prepare_capabilities, 0);
+            let strategy = if architecture == "x86_64" {
+                PreparedBulkStrategy::NativePreparedLoop
+            } else {
+                PreparedBulkStrategy::NativeFrozenLoop
+            };
+            assert_eq!(ordinary.module().prepared_bulk_strategy(), Some(strategy));
             assert_eq!(
-                ordinary.module().prepared_bulk_strategy(),
-                Some(PreparedBulkStrategy::NativePreparedLoop)
+                native_frozen_loop_runtime_symbols_are_closed(&ordinary),
+                strategy == PreparedBulkStrategy::NativeFrozenLoop
             );
-            assert!(native_prepared_loop_runtime_symbols_are_closed(&ordinary));
+            assert_eq!(
+                native_prepared_loop_runtime_symbols_are_closed(&ordinary),
+                strategy == PreparedBulkStrategy::NativePreparedLoop
+            );
             assert!(
                 ordinary_row_is_well_formed_runtime_dependency(&ordinary, 1)
                     .expect("typed runtime-dependency check")
