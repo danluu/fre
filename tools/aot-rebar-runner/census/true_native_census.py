@@ -44,7 +44,11 @@ FEATURE_BITS = {
 }
 TRAP_EXIT = 197
 SCALAR_ADAPTER_MODELS = {"count", "count-spans", "grep"}
+UNIFORM_CAPTURE_ADAPTER_MODELS = {"count-captures", "grep-captures"}
 COMPOSITE_ADAPTER_MODELS = {"regex-redux"}
+NATIVE_ROW_COMPOSITE_KINDS = {
+    "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
+}
 FORBIDDEN_PUBLIC_COMPONENTS = {
     "holdout",
     "private-query",
@@ -84,6 +88,9 @@ def has_exact_adapter(model: str, pattern_count: int) -> bool:
     ) or (
         model == "grep" and pattern_count == 1
     ) or (
+        model in UNIFORM_CAPTURE_ADAPTER_MODELS
+        and 1 <= pattern_count <= MAX_NATIVE_ROW_COMPONENTS
+    ) or (
         model in COMPOSITE_ADAPTER_MODELS and pattern_count == 0
     )
 
@@ -92,6 +99,8 @@ def exact_adapter_reason(model: str, pattern_count: int) -> str:
     exact_adapter = has_exact_adapter(model, pattern_count)
     if exact_adapter and model in {"count", "count-spans"} and pattern_count > 1:
         return "exact-native-row-composite-adapter"
+    if exact_adapter and model in UNIFORM_CAPTURE_ADAPTER_MODELS:
+        return "exact-uniform-capture-native-row-composite-adapter"
     if exact_adapter and model in SCALAR_ADAPTER_MODELS:
         return "exact-single-pattern-scalar-adapter"
     if exact_adapter:
@@ -913,14 +922,14 @@ def component_field(fields: dict[str, str], index: int, suffixes: tuple[str, ...
 def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]]:
     if fields.get("schema") != "fre.aot.rebar-runner.v3":
         return []
-    try:
-        count = int(fields["component_count"], 10)
-    except (KeyError, ValueError) as error:
-        raise CensusError("composite provenance has invalid component_count") from error
+    count = parse_canonical_decimal(
+        fields.get("component_count"),
+        "composite component_count",
+        1,
+        MAX_NATIVE_ROW_COMPONENTS,
+    )
     if fields.get("model") == "regex-redux" and count != 15:
         raise CensusError(f"regex-redux must publish exactly 15 components, got {count}")
-    if count <= 0 or count > MAX_NATIVE_ROW_COMPONENTS:
-        raise CensusError(f"composite component count is out of range: {count}")
     native_row = fields.get("native_row_bridge") == "true"
     components = []
     for index in range(count):
@@ -931,12 +940,18 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
         )
         program_sha256 = component_field(fields, index, ("program_sha256",))
         object_sha256 = component_field(fields, index, ("object_sha256",))
+        automaton_sha256 = (
+            component_field(fields, index, ("automaton_sha256",))
+            if native_row else None
+        )
         if native != "true":
             raise CensusError(f"composite component {index} is not claimed native")
         if SYMBOL.fullmatch(entry) is None:
             raise CensusError(f"composite component {index} has invalid entry symbol")
         require_hex64(program_sha256, f"component {index} program digest")
         require_hex64(object_sha256, f"component {index} object digest")
+        if automaton_sha256 is not None:
+            require_hex64(automaton_sha256, f"component {index} automaton digest")
         runtime_symbols = sorted(filter(None, runtime_text.split(",")))
         if len(runtime_symbols) != len(set(runtime_symbols)) or not all(
             SYMBOL.fullmatch(symbol) for symbol in runtime_symbols
@@ -945,26 +960,183 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
         source_ordinal = None
         if native_row:
             source_ordinal_text = component_field(fields, index, ("source_ordinal",))
-            try:
-                source_ordinal = int(source_ordinal_text, 10)
-            except ValueError as error:
-                raise CensusError(
-                    f"composite component {index} has invalid source ordinal"
-                ) from error
-            if source_ordinal < 0:
-                raise CensusError(
-                    f"composite component {index} has negative source ordinal"
-                )
+            source_ordinal = parse_canonical_decimal(
+                source_ordinal_text,
+                f"composite component {index} source ordinal",
+                0,
+                MAX_NATIVE_ROW_COMPONENTS - 1,
+            )
         components.append({
             "ordinal": index,
             "native": True,
             "source_ordinal": source_ordinal,
             "entry_symbol": entry,
             "required_runtime_symbols": runtime_symbols,
+            "automaton_sha256": automaton_sha256,
             "program_sha256": program_sha256,
             "object_sha256": object_sha256,
         })
     return components
+
+
+def parse_canonical_decimal(
+    text: object, context: str, minimum: int = 0, maximum: int = (1 << 64) - 1
+) -> int:
+    """Parse the runner's canonical unsigned decimal spelling."""
+    if not isinstance(text, str) or re.fullmatch(r"0|[1-9][0-9]*", text) is None:
+        raise CensusError(f"{context} is not canonical unsigned decimal")
+    value = int(text, 10)
+    if value < minimum or value > maximum:
+        raise CensusError(f"{context} is outside {minimum}..={maximum}")
+    return value
+
+
+def parse_canonical_decimal_list(
+    text: object,
+    context: str,
+    count: int,
+    minimum: int = 0,
+    maximum: int = (1 << 64) - 1,
+) -> list[int]:
+    if not isinstance(text, str):
+        raise CensusError(f"{context} is not a decimal list")
+    values = text.split(",") if text else []
+    if len(values) != count:
+        raise CensusError(f"{context} cardinality differs from source_pattern_count")
+    return [
+        parse_canonical_decimal(value, f"{context}[{index}]", minimum, maximum)
+        for index, value in enumerate(values)
+    ]
+
+
+def parse_digest_list(text: object, context: str, count: int) -> list[str]:
+    if not isinstance(text, str):
+        raise CensusError(f"{context} is not a digest list")
+    values = text.split(",") if text else []
+    if len(values) != count:
+        raise CensusError(f"{context} cardinality differs from source_pattern_count")
+    return [require_hex64(value, f"{context}[{index}]") for index, value in enumerate(values)]
+
+
+def native_row_topology(
+    fields: dict[str, str], components: list[dict[str, object]], minimum_sources: int
+) -> tuple[int, int, list[int]]:
+    source_count = parse_canonical_decimal(
+        fields.get("source_pattern_count"),
+        "native-row source_pattern_count",
+        minimum_sources,
+        MAX_NATIVE_ROW_COMPONENTS,
+    )
+    object_bytes = parse_canonical_decimal(
+        fields.get("row_total_object_bytes"),
+        "native-row row_total_object_bytes",
+        1,
+        MAX_NATIVE_ROW_OBJECT_BYTES,
+    )
+    source_to_artifact = parse_canonical_decimal_list(
+        fields.get("source_to_artifact"),
+        "native-row source_to_artifact",
+        source_count,
+        0,
+        max(0, len(components) - 1),
+    )
+    if set(source_to_artifact) != set(range(len(components))):
+        raise CensusError("native-row source-to-artifact map is not surjective")
+    first_sources = [source_to_artifact.index(index) for index in range(len(components))]
+    if first_sources != sorted(first_sources):
+        raise CensusError("native-row component priority is not source ordered")
+    if [component["source_ordinal"] for component in components] != first_sources:
+        raise CensusError("native-row component source ordinals differ from its map")
+    return source_count, object_bytes, source_to_artifact
+
+
+def uniform_capture_proof_from_provenance(
+    fields: dict[str, str],
+    components: list[dict[str, object]],
+    source_count: int,
+    source_to_artifact: list[int],
+) -> dict[str, object]:
+    """Normalize and authenticate the complete same-HIR capture proof surface."""
+    algorithm_version = parse_canonical_decimal(
+        fields.get("capture_proof_algorithm_version"),
+        "capture proof algorithm version",
+        1,
+        (1 << 32) - 1,
+    )
+    accounting_version = parse_canonical_decimal(
+        fields.get("capture_proof_accounting_version"),
+        "capture proof accounting version",
+        1,
+        (1 << 32) - 1,
+    )
+    groups = parse_canonical_decimal_list(
+        fields.get("source_participating_groups"),
+        "source_participating_groups",
+        source_count,
+        1,
+    )
+    minimums = parse_canonical_decimal_list(
+        fields.get("source_minimum_match_bytes"),
+        "source_minimum_match_bytes",
+        source_count,
+        1,
+    )
+    annotations = parse_canonical_decimal_list(
+        fields.get("source_capture_annotations"),
+        "source_capture_annotations",
+        source_count,
+    )
+    proof_work = parse_canonical_decimal_list(
+        fields.get("source_proof_work"), "source_proof_work", source_count, 1
+    )
+    peak_stack = parse_canonical_decimal_list(
+        fields.get("source_proof_peak_stack_items"),
+        "source_proof_peak_stack_items",
+        source_count,
+        1,
+    )
+    selector_automata = parse_digest_list(
+        fields.get("source_selector_automaton_sha256"),
+        "source_selector_automaton_sha256",
+        source_count,
+    )
+    selector_programs = parse_digest_list(
+        fields.get("source_selector_program_sha256"),
+        "source_selector_program_sha256",
+        source_count,
+    )
+    selector_objects = parse_digest_list(
+        fields.get("source_selector_object_sha256"),
+        "source_selector_object_sha256",
+        source_count,
+    )
+    for source, artifact in enumerate(source_to_artifact):
+        component = components[artifact]
+        if groups[source] - 1 > annotations[source]:
+            raise CensusError(
+                f"source {source} participating capture count exceeds its annotations"
+            )
+        if (
+            selector_automata[source] != component["automaton_sha256"]
+            or selector_programs[source] != component["program_sha256"]
+            or selector_objects[source] != component["object_sha256"]
+        ):
+            raise CensusError(
+                f"source {source} selector digests differ from its mapped component"
+            )
+    return {
+        "capture_resolution": fields.get("capture_resolution"),
+        "capture_proof_algorithm_version": algorithm_version,
+        "capture_proof_accounting_version": accounting_version,
+        "source_participating_groups": groups,
+        "source_minimum_match_bytes": minimums,
+        "source_capture_annotations": annotations,
+        "source_proof_work": proof_work,
+        "source_proof_peak_stack_items": peak_stack,
+        "source_selector_automaton_sha256": selector_automata,
+        "source_selector_program_sha256": selector_programs,
+        "source_selector_object_sha256": selector_objects,
+    }
 
 
 def validate_v3_provenance(
@@ -1000,43 +1172,59 @@ def validate_v3_provenance(
         if fields.get("boundary") != "complete-regex-redux-aot-precompiled":
             raise CensusError("regex-redux provenance has the wrong operation boundary")
         expected = base | component_fields
-    elif (
-        fields.get("native_row_bridge") == "true"
-        and fields["model"] in {"count", "count-spans"}
-    ):
-        if fields.get("boundary") != "complete-native-row-bridge":
-            raise CensusError("native-row provenance has the wrong operation boundary")
+    elif fields.get("native_row_bridge") == "true":
         component_fields |= {
-            f"component_{index}_source_ordinal" for index in range(len(components))
+            f"component_{index}_{suffix}"
+            for index in range(len(components))
+            for suffix in ("source_ordinal", "automaton_sha256")
         }
         expected = base | component_fields | {
-            "native_row_bridge", "source_pattern_count", "row_total_object_bytes",
-            "source_to_artifact",
+            "native_row_bridge", "uniform_capture_bridge", "source_pattern_count",
+            "row_total_object_bytes", "source_to_artifact",
         }
-        try:
-            source_count = int(fields["source_pattern_count"], 10)
-            object_bytes = int(fields["row_total_object_bytes"], 10)
-            source_to_artifact = [
-                int(value, 10) for value in fields["source_to_artifact"].split(",")
-            ]
-        except (KeyError, ValueError) as error:
-            raise CensusError("native-row provenance topology is malformed") from error
-        if not 2 <= source_count <= MAX_NATIVE_ROW_COMPONENTS:
-            raise CensusError("native-row source pattern count is out of range")
-        if not 0 < object_bytes <= MAX_NATIVE_ROW_OBJECT_BYTES:
-            raise CensusError("native-row object-byte total is out of range")
-        if len(source_to_artifact) != source_count or any(
-            artifact < 0 or artifact >= len(components)
-            for artifact in source_to_artifact
-        ):
-            raise CensusError("native-row source-to-artifact map is out of range")
-        if set(source_to_artifact) != set(range(len(components))):
-            raise CensusError("native-row source-to-artifact map is not surjective")
-        first_sources = [source_to_artifact.index(index) for index in range(len(components))]
-        if first_sources != sorted(first_sources):
-            raise CensusError("native-row component priority is not source ordered")
-        if [component["source_ordinal"] for component in components] != first_sources:
-            raise CensusError("native-row component source ordinals differ from its map")
+        uniform_capture = fields.get("uniform_capture_bridge")
+        if uniform_capture == "false" and fields["model"] in {"count", "count-spans"}:
+            if fields.get("boundary") != "complete-native-row-bridge":
+                raise CensusError("native-row provenance has the wrong operation boundary")
+            native_row_topology(fields, components, 2)
+        elif uniform_capture == "true" and fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS:
+            if fields.get("boundary") != "native-search-core-static-uniform-capture-resolution":
+                raise CensusError(
+                    "uniform-capture provenance has the wrong operation boundary"
+                )
+            if fields.get("capture_resolution") != "static-uniform-multiplier":
+                raise CensusError("uniform-capture resolution is not the proved static route")
+            expected_adapter = {
+                "count-captures": (
+                    "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
+                ),
+                "grep-captures": (
+                    "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
+                ),
+            }[fields["model"]]
+            if fields.get("adapter") != expected_adapter:
+                raise CensusError("uniform-capture provenance has the wrong adapter")
+            if fields.get("aggregate_strategy") != (
+                "native-row-static-uniform-capture-multiplier-v1"
+            ):
+                raise CensusError("uniform-capture provenance has the wrong strategy")
+            proof_fields = {
+                "capture_resolution", "capture_proof_algorithm_version",
+                "capture_proof_accounting_version", "source_participating_groups",
+                "source_minimum_match_bytes", "source_capture_annotations",
+                "source_proof_work", "source_proof_peak_stack_items",
+                "source_selector_automaton_sha256",
+                "source_selector_program_sha256", "source_selector_object_sha256",
+            }
+            expected |= proof_fields
+            source_count, _, source_to_artifact = native_row_topology(
+                fields, components, 1
+            )
+            uniform_capture_proof_from_provenance(
+                fields, components, source_count, source_to_artifact
+            )
+        else:
+            raise CensusError("runner v3 provenance has an unknown native-row route")
     else:
         raise CensusError("runner v3 provenance has an unknown composite route")
     if set(fields) != expected:
@@ -1115,6 +1303,12 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             "count", "count-spans",
         }:
             return entries, "linked-native-row-adapter-loop"
+        if (
+            provenance.get("native_row_bridge") == "true"
+            and provenance.get("uniform_capture_bridge") == "true"
+            and model in UNIFORM_CAPTURE_ADAPTER_MODELS
+        ):
+            return entries, "linked-uniform-capture-row-adapter-loop"
         raise CensusError(f"unknown composite operation route for model {model!r}")
     if model == "count":
         return [provenance["reducer_symbol"]], "linked-reducer"
@@ -1284,6 +1478,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "source_pattern_count": None,
             "source_to_artifact": [],
             "row_total_object_bytes": None,
+            "uniform_capture": None,
             "boundary": fields.get("boundary"),
             "engine": fields["engine"],
             "aggregate_strategy": fields["aggregate_strategy"],
@@ -1303,21 +1498,31 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         }
     components = components_from_provenance(fields)
     native_row = fields.get("native_row_bridge") == "true"
+    uniform_capture = native_row and fields.get("uniform_capture_bridge") == "true"
+    source_pattern_count = (
+        int(fields["source_pattern_count"], 10) if native_row else 0
+    )
+    source_to_artifact = (
+        [int(value, 10) for value in fields["source_to_artifact"].split(",")]
+        if native_row else []
+    )
     return {
         **common,
         "kind": "composite-v3",
         "composite_kind": (
-            "native-row-bridge-v1" if native_row else "regex-redux-fixed-v1"
+            "uniform-capture-row-bridge-v1" if uniform_capture else
+            "native-row-bridge-v1" if native_row else
+            "regex-redux-fixed-v1"
         ),
-        "source_pattern_count": (
-            int(fields["source_pattern_count"], 10) if native_row else 0
-        ),
-        "source_to_artifact": (
-            [int(value, 10) for value in fields["source_to_artifact"].split(",")]
-            if native_row else []
-        ),
+        "source_pattern_count": source_pattern_count,
+        "source_to_artifact": source_to_artifact,
         "row_total_object_bytes": (
             int(fields["row_total_object_bytes"], 10) if native_row else None
+        ),
+        "uniform_capture": (
+            uniform_capture_proof_from_provenance(
+                fields, components, source_pattern_count, source_to_artifact
+            ) if uniform_capture else None
         ),
         "boundary": fields["boundary"],
         "engine": fields["engine"],
@@ -1356,6 +1561,8 @@ def operation_route_from_provenance_record(
             return entries, "linked-fixed-composite-adapter-loop"
         if provenance["composite_kind"] == "native-row-bridge-v1":
             return entries, "linked-native-row-adapter-loop"
+        if provenance["composite_kind"] == "uniform-capture-row-bridge-v1":
+            return entries, "linked-uniform-capture-row-adapter-loop"
         raise CensusError("normalized provenance has an unknown composite kind")
     model = provenance["model"]
     if model == "count":
@@ -1460,6 +1667,8 @@ def classification_from_qualification_evidence(
         reason = "helper-trap-control-failure"
     elif not negative_pass:
         reason = "claimed-entry-negative-control-failure"
+    elif adapter_route == "linked-uniform-capture-row-adapter-loop":
+        reason = "native-search-core-with-static-uniform-capture-adapter-loop"
     elif adapter_outer_loop:
         reason = "native-search-core-with-adapter-outer-loop"
     else:
@@ -1541,13 +1750,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         != len(job["input"]["pattern_sha256"])
     ):
         raise CensusError("composite provenance source count differs from sealed job")
-    if normalized_provenance["composite_kind"] == "native-row-bridge-v1":
-        source_map = normalized_provenance["source_to_artifact"]
-        pattern_hashes = job["input"]["pattern_sha256"]
-        for source, pattern_hash in enumerate(pattern_hashes):
-            for prior in range(source):
-                if pattern_hash == pattern_hashes[prior] and source_map[source] != source_map[prior]:
-                    raise CensusError("duplicate source patterns map to different artifacts")
+    validate_provenance_job_binding(normalized_provenance, job["input"])
     expected_object_hashes = (
         [normalized_provenance["object_sha256"]]
         if normalized_provenance["kind"] == "scalar-v2"
@@ -1557,7 +1760,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         raise CensusError("primary object files differ from provenance object identities")
     if [row["sha256"] for row in replica_hashes["objects"]] != expected_object_hashes:
         raise CensusError("replica object files differ from provenance object identities")
-    if normalized_provenance["composite_kind"] == "native-row-bridge-v1":
+    if normalized_provenance["composite_kind"] in NATIVE_ROW_COMPOSITE_KINDS:
         expected_total_bytes = normalized_provenance["row_total_object_bytes"]
         if any(
             sum(row["bytes"] for row in artifact["objects"]) != expected_total_bytes
@@ -1769,6 +1972,84 @@ def validate_marker_record(marker: object, context: str) -> None:
             raise CensusError(f"{context} has invalid architecture or patch evidence")
 
 
+def validate_normalized_uniform_capture(
+    proof: object,
+    components: list[dict[str, object]],
+    source_count: int,
+    source_map: list[int],
+    context: str,
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} uniform capture proof is not an object")
+    require_exact_keys(proof, {
+        "capture_resolution", "capture_proof_algorithm_version",
+        "capture_proof_accounting_version", "source_participating_groups",
+        "source_minimum_match_bytes", "source_capture_annotations",
+        "source_proof_work", "source_proof_peak_stack_items",
+        "source_selector_automaton_sha256", "source_selector_program_sha256",
+        "source_selector_object_sha256",
+    }, f"{context} uniform capture proof")
+    if proof["capture_resolution"] != "static-uniform-multiplier":
+        raise CensusError(f"{context} uniform capture resolution differs")
+    for field in (
+        "capture_proof_algorithm_version", "capture_proof_accounting_version",
+    ):
+        value = proof[field]
+        if (
+            not isinstance(value, int) or isinstance(value, bool)
+            or not 1 <= value <= (1 << 32) - 1
+        ):
+            raise CensusError(f"{context} {field} is not a positive u32")
+    numeric_lists = {
+        "source_participating_groups": 1,
+        "source_minimum_match_bytes": 1,
+        "source_capture_annotations": 0,
+        "source_proof_work": 1,
+        "source_proof_peak_stack_items": 1,
+    }
+    for field, minimum in numeric_lists.items():
+        values = proof[field]
+        if (
+            not isinstance(values, list)
+            or len(values) != source_count
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                or not minimum <= value <= (1 << 64) - 1
+                for value in values
+            )
+        ):
+            raise CensusError(f"{context} {field} is not a canonical source list")
+    digest_fields = (
+        "source_selector_automaton_sha256", "source_selector_program_sha256",
+        "source_selector_object_sha256",
+    )
+    for field in digest_fields:
+        values = proof[field]
+        if not isinstance(values, list) or len(values) != source_count:
+            raise CensusError(f"{context} {field} has the wrong cardinality")
+        for source, value in enumerate(values):
+            require_hex64(value, f"{context} {field}[{source}]")
+    for source, artifact in enumerate(source_map):
+        component = components[artifact]
+        if proof["source_participating_groups"][source] - 1 > (
+            proof["source_capture_annotations"][source]
+        ):
+            raise CensusError(
+                f"{context} source {source} participation exceeds annotations"
+            )
+        if (
+            proof["source_selector_automaton_sha256"][source]
+            != component["automaton_sha256"]
+            or proof["source_selector_program_sha256"][source]
+            != component["program_sha256"]
+            or proof["source_selector_object_sha256"][source]
+            != component["object_sha256"]
+        ):
+            raise CensusError(
+                f"{context} source {source} selector digests differ from mapped component"
+            )
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -1776,7 +2057,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
         "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
         "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
-        "aggregate_strategy",
+        "aggregate_strategy", "uniform_capture",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
@@ -1788,13 +2069,27 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             raise CensusError(f"{context} component {index} is not an object")
         require_exact_keys(component, {
             "ordinal", "native", "source_ordinal", "entry_symbol",
-            "required_runtime_symbols",
+            "required_runtime_symbols", "automaton_sha256",
             "program_sha256", "object_sha256",
         }, f"{context} component {index}")
         if component["ordinal"] != index or component["native"] is not True:
             raise CensusError(f"{context} component {index} identity is not canonical")
+        source_ordinal = component["source_ordinal"]
+        if source_ordinal is not None and (
+            not isinstance(source_ordinal, int)
+            or isinstance(source_ordinal, bool)
+            or source_ordinal < 0
+        ):
+            raise CensusError(
+                f"{context} component {index} source ordinal is not canonical"
+            )
         require_hex64(component["program_sha256"], f"{context} component {index} program")
         require_hex64(component["object_sha256"], f"{context} component {index} object")
+        if component["automaton_sha256"] is not None:
+            require_hex64(
+                component["automaton_sha256"],
+                f"{context} component {index} automaton",
+            )
         runtime_symbols = component["required_runtime_symbols"]
         if runtime_symbols != sorted(set(runtime_symbols)) or not all(
             isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in runtime_symbols
@@ -1812,6 +2107,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             or provenance["source_pattern_count"] is not None
             or provenance["source_to_artifact"] != []
             or provenance["row_total_object_bytes"] is not None
+            or provenance["uniform_capture"] is not None
             or provenance["components"] != []
         ):
             raise CensusError(f"{context} scalar/composite fields disagree")
@@ -1827,15 +2123,26 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or provenance["source_pattern_count"] != 0
                 or provenance["source_to_artifact"] != []
                 or provenance["row_total_object_bytes"] is not None
+                or provenance["uniform_capture"] is not None
                 or any(component["source_ordinal"] is not None for component in provenance["components"])
+                or any(component["automaton_sha256"] is not None for component in provenance["components"])
             ):
                 raise CensusError(f"{context} regex-redux topology is not canonical")
         elif provenance["composite_kind"] == "native-row-bridge-v1":
             source_count = provenance["source_pattern_count"]
             source_map = provenance["source_to_artifact"]
             object_bytes = provenance["row_total_object_bytes"]
+            expected_adapter = {
+                "count": "general-aot-native-row-bridge-count-v1",
+                "count-spans": "general-aot-native-row-bridge-count-spans-v1",
+            }.get(provenance["model"])
             if (
-                provenance["model"] not in {"count", "count-spans"}
+                expected_adapter is None
+                or provenance["adapter"] != expected_adapter
+                or provenance["boundary"] != "complete-native-row-bridge"
+                or provenance["aggregate_strategy"]
+                != "native-independent-span-row-selector-v1"
+                or provenance["uniform_capture"] is not None
                 or not isinstance(source_count, int)
                 or isinstance(source_count, bool)
                 or not 2 <= source_count <= MAX_NATIVE_ROW_COMPONENTS
@@ -1852,6 +2159,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                     for artifact in source_map
                 )
                 or set(source_map) != set(range(len(provenance["components"])))
+                or any(
+                    component["automaton_sha256"] is None
+                    for component in provenance["components"]
+                )
             ):
                 raise CensusError(f"{context} native-row topology is not canonical")
             first_sources = [
@@ -1861,6 +2172,60 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 component["source_ordinal"] for component in provenance["components"]
             ] != first_sources:
                 raise CensusError(f"{context} native-row source priority is not canonical")
+        elif provenance["composite_kind"] == "uniform-capture-row-bridge-v1":
+            source_count = provenance["source_pattern_count"]
+            source_map = provenance["source_to_artifact"]
+            object_bytes = provenance["row_total_object_bytes"]
+            expected_adapter = {
+                "count-captures": (
+                    "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
+                ),
+                "grep-captures": (
+                    "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
+                ),
+            }.get(provenance["model"])
+            if (
+                expected_adapter is None
+                or provenance["adapter"] != expected_adapter
+                or provenance["boundary"]
+                != "native-search-core-static-uniform-capture-resolution"
+                or provenance["aggregate_strategy"]
+                != "native-row-static-uniform-capture-multiplier-v1"
+                or not isinstance(source_count, int)
+                or isinstance(source_count, bool)
+                or not 1 <= source_count <= MAX_NATIVE_ROW_COMPONENTS
+                or not isinstance(source_map, list)
+                or len(source_map) != source_count
+                or not isinstance(object_bytes, int)
+                or isinstance(object_bytes, bool)
+                or not 0 < object_bytes <= MAX_NATIVE_ROW_OBJECT_BYTES
+                or any(
+                    not isinstance(artifact, int)
+                    or isinstance(artifact, bool)
+                    or artifact < 0
+                    or artifact >= len(provenance["components"])
+                    for artifact in source_map
+                )
+                or set(source_map) != set(range(len(provenance["components"])))
+                or any(
+                    component["automaton_sha256"] is None
+                    for component in provenance["components"]
+                )
+            ):
+                raise CensusError(f"{context} uniform-capture topology is not canonical")
+            first_sources = [
+                source_map.index(index) for index in range(len(provenance["components"]))
+            ]
+            if first_sources != sorted(first_sources) or [
+                component["source_ordinal"] for component in provenance["components"]
+            ] != first_sources:
+                raise CensusError(
+                    f"{context} uniform-capture source priority is not canonical"
+                )
+            validate_normalized_uniform_capture(
+                provenance["uniform_capture"], provenance["components"],
+                source_count, source_map, context,
+            )
         else:
             raise CensusError(f"{context} has an unknown composite kind")
     else:
@@ -1895,12 +2260,29 @@ def validate_provenance_job_binding(
     pattern_hashes = input_identity["pattern_sha256"]
     if provenance["source_pattern_count"] != len(pattern_hashes):
         raise CensusError("composite provenance source count differs from sealed job")
-    if provenance["composite_kind"] == "native-row-bridge-v1":
+    if provenance["composite_kind"] in NATIVE_ROW_COMPOSITE_KINDS:
         source_map = provenance["source_to_artifact"]
+        proof = provenance["uniform_capture"]
         for source, pattern_hash in enumerate(pattern_hashes):
             for prior in range(source):
-                if pattern_hash == pattern_hashes[prior] and source_map[source] != source_map[prior]:
+                if pattern_hash != pattern_hashes[prior]:
+                    continue
+                if source_map[source] != source_map[prior]:
                     raise CensusError("duplicate source patterns map to different artifacts")
+                if proof is not None and any(
+                    proof[field][source] != proof[field][prior]
+                    for field in (
+                        "source_participating_groups", "source_minimum_match_bytes",
+                        "source_capture_annotations", "source_proof_work",
+                        "source_proof_peak_stack_items",
+                        "source_selector_automaton_sha256",
+                        "source_selector_program_sha256",
+                        "source_selector_object_sha256",
+                    )
+                ):
+                    raise CensusError(
+                        "duplicate source patterns publish different capture proofs"
+                    )
 
 
 def validate_receipt(
@@ -2083,7 +2465,7 @@ def validate_receipt(
             if [row["sha256"] for row in artifact["objects"]] != expected_object_hashes:
                 raise CensusError(f"{label} object files differ from provenance")
             if (
-                provenance["composite_kind"] == "native-row-bridge-v1"
+                provenance["composite_kind"] in NATIVE_ROW_COMPOSITE_KINDS
                 and sum(row["bytes"] for row in artifact["objects"])
                 != provenance["row_total_object_bytes"]
             ):

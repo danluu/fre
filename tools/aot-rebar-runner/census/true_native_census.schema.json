@@ -291,7 +291,7 @@
       "additionalProperties": false,
       "required": [
         "ordinal", "native", "source_ordinal", "entry_symbol", "required_runtime_symbols",
-        "program_sha256", "object_sha256"
+        "automaton_sha256", "program_sha256", "object_sha256"
       ],
       "properties": {
         "ordinal": { "type": "integer", "minimum": 0 },
@@ -301,8 +301,61 @@
         "required_runtime_symbols": {
           "type": "array", "items": { "type": "string" }, "uniqueItems": true
         },
+        "automaton_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        },
         "program_sha256": { "$ref": "#/$defs/sha256" },
         "object_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "uniformCaptureProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_resolution", "capture_proof_algorithm_version",
+        "capture_proof_accounting_version", "source_participating_groups",
+        "source_minimum_match_bytes", "source_capture_annotations",
+        "source_proof_work", "source_proof_peak_stack_items",
+        "source_selector_automaton_sha256", "source_selector_program_sha256",
+        "source_selector_object_sha256"
+      ],
+      "properties": {
+        "capture_resolution": { "const": "static-uniform-multiplier" },
+        "capture_proof_algorithm_version": {
+          "type": "integer", "minimum": 1, "maximum": 4294967295
+        },
+        "capture_proof_accounting_version": {
+          "type": "integer", "minimum": 1, "maximum": 4294967295
+        },
+        "source_participating_groups": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
+        },
+        "source_minimum_match_bytes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
+        },
+        "source_capture_annotations": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 }
+        },
+        "source_proof_work": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
+        },
+        "source_proof_peak_stack_items": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
+        },
+        "source_selector_automaton_sha256": {
+          "type": "array", "items": { "$ref": "#/$defs/sha256" }
+        },
+        "source_selector_program_sha256": {
+          "type": "array", "items": { "$ref": "#/$defs/sha256" }
+        },
+        "source_selector_object_sha256": {
+          "type": "array", "items": { "$ref": "#/$defs/sha256" }
+        }
       }
     },
     "provenance": {
@@ -312,7 +365,7 @@
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
         "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
         "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
-        "aggregate_strategy",
+        "aggregate_strategy", "uniform_capture",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
@@ -328,7 +381,10 @@
         "feature_bits": { "type": "string" },
         "kind": { "enum": ["scalar-v2", "composite-v3"] },
         "composite_kind": {
-          "enum": [null, "native-row-bridge-v1", "regex-redux-fixed-v1"]
+          "enum": [
+            null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
+            "regex-redux-fixed-v1"
+          ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
         "source_to_artifact": {
@@ -338,6 +394,12 @@
         "boundary": { "type": ["string", "null"] },
         "engine": { "type": ["string", "null"] },
         "aggregate_strategy": { "type": ["string", "null"] },
+        "uniform_capture": {
+          "anyOf": [
+            { "$ref": "#/$defs/uniformCaptureProvenance" },
+            { "type": "null" }
+          ]
+        },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
         "grep_iteration_strategy": { "type": ["string", "null"] },

@@ -27,9 +27,19 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - native search cores / successfully executed jobs (diagnostic only); and
 - the raw runtime schedule-point denominator for comparison with older runs.
 
-`count-spans` direct-entry iteration and per-line `grep` can authenticate a
-native search core while retaining a Rust adapter outer loop. They are excluded
-from the strict whole-operation numerator.
+`count-spans` direct-entry iteration, per-line `grep`, and the static uniform
+capture multiplier routes can authenticate a native search core while retaining
+a Rust adapter outer loop. They are excluded from the strict whole-operation
+numerator. The capture route is labelled separately from both a fused capture
+operation and capture-offset materialization: its native entries select spans;
+the adapter applies an independently sealed per-row participation count.
+
+`count-captures` and `grep-captures` with 1..4096 source expressions are exact
+adapter *shapes*. This admits them to the sealed qualification population; it
+does not turn the build-time theorem into an assumption. A nullable,
+non-uniform, resource-limited, or otherwise declined source fails the
+all-or-nothing build and must receive a `record-failure` receipt. It remains in
+the 311-job denominator as nonnative rather than disappearing as unsupported.
 
 ## Privacy boundary and static dry run
 
@@ -104,8 +114,15 @@ Repeat `--primary-object` and `--replica-object` in component ordinal order for
 a composite v3 runner. Its normalized provenance must match every supplied
 object digest in both builds. Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
-cardinality, total object bytes, and the exact composite boundary; unrecognized
-raw v3 fields are rejected rather than silently discarded.
+cardinality, total object bytes, and the exact composite boundary. Every row
+now also seals its selector automaton hash and the explicit
+`uniform_capture_bridge` boolean. Ordinary rows must publish `false`.
+Uniform-capture rows must publish `true`, the exact
+`static-uniform-multiplier` resolution and native-search-core boundary, positive
+proof identity/work/stack/minimum-width/count fields, one value per source, and
+the three selector digest lists. Each source automaton/program/object digest is
+checked against the component selected by `source_to_artifact`. Unrecognized or
+missing raw v3 fields are rejected rather than silently discarded.
 
 The controller requires identical runner/object hashes and normalized
 provenance from both builds. It inventories local, global, weak, and imported
@@ -133,16 +150,19 @@ Three fresh processes authenticate each job:
    per-component runtime-symbol lists, and program/object hashes; the
    controller runs 15 independent negative controls so a trap in the first
    stage cannot stand in for proof that the other 14 entries execute.
-   The variable-width native-row bridge receives the same independent negative
-   control for every retained row artifact. Both composite routes are reported
-   as native search cores with an adapter outer loop; they do not inflate the
-   stricter wholly fused-operation numerator.
+   The variable-width native-row bridge and uniform-capture row bridge receive
+   the same independent negative control for every retained row artifact. Both
+   are reported as native search cores with an adapter outer loop; the uniform
+   route uses the distinct `uniform-capture-row-bridge-v1` provenance kind and
+   `linked-uniform-capture-row-adapter-loop` route. Neither inflates the stricter
+   wholly fused-operation numerator.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:
 an unused helper is harmless, while any helper actually reached by the job is
-nonnative. Capture replay remains unsupported and therefore nonnative until an
-exact adapter and a helper-free materialization path exist.
+nonnative. The uniform multiplier receipt is not capture replay or capture
+materialization: stock Rust captures remain the correctness comparator, while
+only the helper-free native Span selection core is credited here.
 
 If a job cannot reach qualification, seal it rather than deleting it:
 
