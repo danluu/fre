@@ -11422,23 +11422,57 @@ impl PortableRegex {
             return Ok(matched);
         }
         match &self.plan {
-            PortablePlan::K0(k0) => match k0.pooled_value(
-                K0PooledValueOperation::Exists,
-                K0PooledValueExecution::OrdinaryExists,
-                haystack,
-                window,
-                SearchLimits::unlimited(),
-                SearchSessionLimits::unlimited(),
-                self.report.minimum_match_bytes,
-            )? {
-                Some(K0PooledValue::Exists(value)) => Ok(value),
-                Some(K0PooledValue::Span(_)) => unreachable!("existence pool returned a span"),
-                None => k0
-                    .automaton
+            PortablePlan::K0(k0) => {
+                let window_bytes = haystack.len();
+                let compact_prepared = window_bytes
+                    >= PREPARED_COMPACT_ORDINARY_EXISTS_MIN_WINDOW_BYTES
+                    && window_bytes < PREPARED_ORDINARY_EXISTS_MIN_WINDOW_BYTES
+                    // Below this floor the generic mandatory-cut predecessor
+                    // is a pure decline, so it is safe to enter the pooled
+                    // prepared executor before the general sidecar dispatcher.
+                    && window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+                    && matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0)
+                    && k0.absolute_end_proof.is_none()
+                    && k0
+                        .automaton
+                        .can_use_pooled_compact_ordinary_exists_projection();
+                if compact_prepared {
+                    #[cfg(test)]
+                    k0_ordinary_exists_route_probe::record(true);
+                    if let Some(value) = k0
+                        .automaton
+                        .search_window_with_optional_pooled_ordinary_exists_value(
+                            haystack,
+                            window,
+                            SearchSessionLimits::unlimited(),
+                            true,
+                            false,
+                        )?
+                    {
+                        return Ok(value);
+                    }
+                } else {
+                    match k0.pooled_value(
+                        K0PooledValueOperation::Exists,
+                        K0PooledValueExecution::OrdinaryExists,
+                        haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                        SearchSessionLimits::unlimited(),
+                        self.report.minimum_match_bytes,
+                    )? {
+                        Some(K0PooledValue::Exists(value)) => return Ok(value),
+                        Some(K0PooledValue::Span(_)) => {
+                            unreachable!("existence pool returned a span")
+                        }
+                        None => {}
+                    }
+                }
+                k0.automaton
                     .prepare::<Exists>()
                     .search_window(haystack, window, SearchLimits::unlimited())
                     .map(|report| report.into_output())
-                    .map_err(SearchError::from),
+                    .map_err(SearchError::from)
             },
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .is_match_full_ordinary_value(haystack)
