@@ -1685,7 +1685,7 @@ fn validate_window(window: Window, haystack_len: usize) -> Result<(), PackedLite
     Ok(())
 }
 
-#[inline]
+#[inline(never)]
 fn find_native_shared_columns(
     searcher: &Searcher,
     columns: &SharedColumns,
@@ -1710,7 +1710,7 @@ fn find_native_shared_columns(
     })
 }
 
-#[inline]
+#[inline(never)]
 fn find_native_shared_fragment(
     searcher: &Searcher,
     fragment: &SharedFragment,
@@ -1864,7 +1864,7 @@ fn shared_fragment_native_start_budget(
         .saturating_mul(native_minimum_haystack_bytes)
 }
 
-#[inline]
+#[inline(never)]
 fn find_native(
     searcher: &Searcher,
     anchor: &SparseAnchor,
