@@ -73,7 +73,7 @@ const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_DENSE_GAP_BYTES: usize = 64;
 #[cfg(not(feature = "static-dispatch"))]
-const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
+const RETAINED_ITER_DENSE_MATCHES: u8 = 1;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES: usize = 64;
 #[cfg(not(feature = "static-dispatch"))]
@@ -920,7 +920,7 @@ pub struct PackedLiteralSetOrdinaryExecutor<'a> {
 /// This cursor exists only when construction admitted both the selected
 /// equal-width scalar engine and the incumbent native engine. It samples with
 /// the native engine, keeps sparse/no-match suffixes on that engine, and uses
-/// the scalar engine only after two adjacent matches prove a dense local run.
+/// the scalar engine after one nearby match proves a dense local continuation.
 #[cfg(not(feature = "static-dispatch"))]
 #[derive(Clone, Copy, Debug)]
 pub struct PackedLiteralSetSearchCursor<'p, 'h> {
@@ -4356,9 +4356,10 @@ mod tests {
         let mut haystack = vec![0xff; 256];
         haystack[0..8].copy_from_slice(patterns[0]);
         haystack[8..16].copy_from_slice(patterns[0]);
-        // This third adjacent match uses the scalar engine after two native
-        // observations. Its suffix overlaps the following source bytes, while
-        // iterator progress must still expose every complete non-overlap span.
+        // The second adjacent match uses the scalar engine after one nearby
+        // native observation. Its suffix overlaps the following source bytes,
+        // while iterator progress must still expose every complete non-overlap
+        // span.
         haystack[16..24].copy_from_slice(patterns[1]);
         haystack[80..88].copy_from_slice(patterns[0]);
 
