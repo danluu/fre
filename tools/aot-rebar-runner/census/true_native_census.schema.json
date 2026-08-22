@@ -460,6 +460,32 @@
         }
       }
     },
+    "selectorCaptureFallbackProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_resolution", "positive_fallback_profile",
+        "positive_fallback_symbol", "direct_participation_resource",
+        "direct_participation_required", "direct_participation_limit",
+        "selector_entry_symbol"
+      ],
+      "properties": {
+        "capture_resolution": {
+          "const": "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+        },
+        "positive_fallback_profile": { "const": "rust-regex-1.12.4-captures" },
+        "positive_fallback_symbol": {
+          "const": "fre_aot_rebar_runner_stock_capture_positive_fallback_v1"
+        },
+        "direct_participation_resource": { "enum": ["DfaStates", "BuildWork"] },
+        "direct_participation_required": { "type": "integer", "minimum": 1 },
+        "direct_participation_limit": { "type": "integer", "minimum": 1 },
+        "selector_entry_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -489,14 +515,14 @@
         "kind": {
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
-            "participation-capture-v4"
+            "participation-capture-v4", "selector-capture-fallback-v4"
           ]
         },
         "composite_kind": {
           "enum": [
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
             "regex-redux-fixed-v1", "strict-capture-next-v1",
-            "exact-span-participation-v1"
+            "exact-span-participation-v1", "selector-negative-certificate-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -516,6 +542,9 @@
         "strict_capture": { "$ref": "#/$defs/strictCaptureProvenance" },
         "participation_capture": {
           "$ref": "#/$defs/participationCaptureProvenance"
+        },
+        "selector_capture_fallback": {
+          "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
@@ -555,6 +584,27 @@
             "not": { "required": ["strict_capture"] }
           },
           "else": { "not": { "required": ["participation_capture"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "selector-capture-fallback-v4" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["selector_capture_fallback"],
+            "properties": {
+              "engine": {
+                "const": "IndependentNativeSpanRows(OrderedContextDfa)"
+              }
+            },
+            "not": {
+              "anyOf": [
+                { "required": ["strict_capture"] },
+                { "required": ["participation_capture"] }
+              ]
+            }
+          },
+          "else": { "not": { "required": ["selector_capture_fallback"] } }
         }
       ]
     },

@@ -43,6 +43,7 @@ def synthetic_plan() -> dict[str, object]:
     for index, job_id in enumerate(runtime_ids):
         model = (
             "count-captures" if index == 0
+            else "grep-captures" if index == 2
             else "unsupported-runtime" if index == len(runtime_ids) - 1
             else "count"
         )
@@ -52,7 +53,8 @@ def synthetic_plan() -> dict[str, object]:
             "input": input_identity, "candidate_klv": klv_identity,
             "is_runtime": True, "exact_adapter": index != len(runtime_ids) - 1,
             "adapter_reason": (
-                "exact-uniform-capture-native-row-composite-adapter" if index == 0
+                "exact-uniform-capture-native-row-composite-adapter"
+                if index in (0, 2)
                 else "unsupported-runtime-model-or-cardinality"
                 if index == len(runtime_ids) - 1
                 else "exact-single-pattern-scalar-adapter"
@@ -482,6 +484,134 @@ def synthetic_participation_capture_qualification_receipt(
     return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
+def selector_capture_fallback_provenance_fields() -> dict[str, str]:
+    selector = f"fre_aot_regex_search_v1_{'a' * 64}"
+    return {
+        "schema": "fre.aot.rebar-runner.v4",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": (
+            "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+        ),
+        "model": "grep-captures",
+        "benchmark": "runtime-job-002",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "IndependentNativeSpanRows(OrderedContextDfa)",
+        "aggregate_strategy": (
+            "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+        ),
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "false",
+        "strict_capture_bridge": "false",
+        "participation_capture_bridge": "false",
+        "selector_capture_fallback_bridge": "true",
+        "source_pattern_count": "1",
+        "row_total_object_bytes": "123",
+        "source_to_artifact": "0",
+        "component_count": "1",
+        "component_0_native": "true",
+        "component_0_source_ordinal": "0",
+        "component_0_entry_symbol": selector,
+        "component_0_runtime_symbols": "",
+        "component_0_program_sha256": "3" * 64,
+        "component_0_object_sha256": "4" * 64,
+        "capture_resolution": (
+            "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+        ),
+        "positive_fallback_profile": "rust-regex-1.12.4-captures",
+        "positive_fallback_symbol": (
+            "fre_aot_rebar_runner_stock_capture_positive_fallback_v1"
+        ),
+        "direct_participation_resource": "DfaStates",
+        "direct_participation_required": "131073",
+        "direct_participation_limit": "131072",
+        "boundary": (
+            "per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+
+
+def synthetic_selector_capture_fallback_qualification_receipt(
+    plan: dict[str, object]
+) -> dict[str, object]:
+    receipt = copy.deepcopy(synthetic_qualification_receipt(plan))
+    receipt.pop("receipt_sha256")
+    job = plan["jobs"][35]
+    fields = selector_capture_fallback_provenance_fields()
+    encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+    provenance = CENSUS.provenance_receipt(CENSUS.parse_provenance(encoded))
+    selector = fields["component_0_entry_symbol"]
+    fallback = fields["positive_fallback_symbol"]
+    receipt["job"] = {
+        "job_id": job["job_id"],
+        "point_ids": job["point_ids"],
+        "model": job["model"],
+        "input": job["input"],
+        "candidate_klv": job["candidate_klv"],
+    }
+    artifact = {
+        "runner_sha256": "8" * 64,
+        "objects": [{"ordinal": 0, "sha256": "4" * 64, "bytes": 123}],
+    }
+    receipt["artifacts"] = {
+        "primary": artifact,
+        "replica": artifact,
+        "reproducible": True,
+        "compiled_artifact_present": True,
+        "runtime_execution_authenticated_separately": True,
+        "provenance": provenance,
+    }
+    receipt["route"]["operation_entry_symbols"] = [selector]
+    receipt["route"]["operation_entry_symbols_sha256"] = CENSUS.sha_bytes(
+        CENSUS.canonical([selector]).encode()
+    )
+    receipt["route"]["adapter_route"] = (
+        "linked-selector-negative-certificate-adapter-loop"
+    )
+    receipt["route"]["semantic_helper_symbols"] = [fallback]
+    receipt["route"]["semantic_helper_symbols_sha256"] = CENSUS.sha_bytes(
+        CENSUS.canonical([fallback]).encode()
+    )
+    negative = receipt["phases"]["claimed_entry_negative_traps"][0]
+    negative["symbol"] = selector
+    negative["marker"]["armed"][0]["symbol"] = selector
+    negative["marker"]["triggered"] = selector
+    helper = receipt["phases"]["semantic_helper_trap"]
+    helper["process"]["outcome"] = "exit"
+    helper["process"]["returncode"] = 0
+    helper["marker"] = {
+        "status": "valid",
+        "sha256": "f" * 64,
+        "kind": "semantic-helpers",
+        "architecture": "aarch64",
+        "installed": 1,
+        "expected": 1,
+        "armed": [{
+            "symbol": fallback,
+            "offset": "0x200",
+            "before": "fd7bbfa9",
+            "after": "000020d4",
+        }],
+        "triggered": None,
+        "completed": "normal",
+    }
+    receipt["classification"] = CENSUS.classification_from_qualification_evidence(
+        True,
+        [selector],
+        receipt["route"]["adapter_route"],
+        [fallback],
+        receipt["phases"],
+        "aarch64",
+    )
+    return CENSUS.add_digest(receipt, "receipt_sha256")
+
+
 def strict_capture_provenance_fields() -> dict[str, str]:
     next_symbol = f"fre_aot_regex_capture_next_v1_{'a' * 64}"
     return {
@@ -660,6 +790,16 @@ class TrueNativeCensusTests(unittest.TestCase):
             "exact-span-participation-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
+        selector_fallback = definitions["selectorCaptureFallbackProvenance"]
+        self.assertFalse(selector_fallback["additionalProperties"])
+        self.assertEqual(
+            selector_fallback["properties"]["positive_fallback_symbol"]["const"],
+            "fre_aot_rebar_runner_stock_capture_positive_fallback_v1",
+        )
+        self.assertIn(
+            "selector-capture-fallback-v4",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
         receipt = CENSUS.id_set(["b", "a"])
@@ -700,8 +840,13 @@ class TrueNativeCensusTests(unittest.TestCase):
     def test_macho_leading_underscore_is_normalized(self) -> None:
         symbols = CENSUS.nm_text_symbols(
             "0000000100001000 T _fre_aot_regex_runtime_search_v1\n"
+            "0000000100002000 T "
+            "_fre_aot_rebar_runner_stock_capture_positive_fallback_v1\n"
         )
         self.assertIn("fre_aot_regex_runtime_search_v1", symbols)
+        self.assertIn(
+            "fre_aot_rebar_runner_stock_capture_positive_fallback_v1", symbols
+        )
 
     def test_operation_entry_is_the_actual_adapter_boundary(self) -> None:
         common = {
@@ -1090,6 +1235,145 @@ class TrueNativeCensusTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
             CENSUS.parse_provenance(encoded + b" unsealed_field=1")
+
+    def test_selector_capture_fallback_v4_closes_the_mixed_boundary(self) -> None:
+        fields = selector_capture_fallback_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        provenance = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(
+            provenance, "synthetic selector capture fallback"
+        )
+        selector = fields["component_0_entry_symbol"]
+        self.assertEqual(provenance["kind"], "selector-capture-fallback-v4")
+        self.assertEqual(
+            provenance["composite_kind"], "selector-negative-certificate-v1"
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([selector], "linked-selector-negative-certificate-adapter-loop"),
+        )
+        self.assertEqual(
+            CENSUS.conditional_fallback_symbols_from_provenance(provenance),
+            [fields["positive_fallback_symbol"]],
+        )
+
+        wrong_engine = dict(fields)
+        wrong_engine["engine"] = "IndependentNativeSpanRows(RuntimeHelper)"
+        with self.assertRaisesRegex(CENSUS.CensusError, "noncanonical route"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_engine.items()
+                ).encode()
+            )
+
+        normalized_wrong_engine = copy.deepcopy(provenance)
+        normalized_wrong_engine["engine"] = "IndependentNativeSpanRows(FakeEngine)"
+        with self.assertRaisesRegex(CENSUS.CensusError, "topology is not canonical"):
+            CENSUS.validate_provenance_record(
+                normalized_wrong_engine,
+                "synthetic selector capture fallback wrong engine",
+            )
+
+        wrong_limit = dict(fields)
+        wrong_limit["direct_participation_limit"] = "131071"
+        with self.assertRaisesRegex(CENSUS.CensusError, "outside 131072..=131072"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_limit.items()
+                ).encode()
+            )
+
+        build_work = dict(fields)
+        build_work["direct_participation_resource"] = "BuildWork"
+        build_work["direct_participation_required"] = "268435457"
+        build_work["direct_participation_limit"] = "268435456"
+        build_work_record = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in build_work.items()
+                ).encode()
+            )
+        )
+        self.assertEqual(
+            build_work_record["selector_capture_fallback"][
+                "direct_participation_resource"
+            ],
+            "BuildWork",
+        )
+
+        wrong_required = dict(fields)
+        wrong_required["direct_participation_required"] = "131074"
+        with self.assertRaisesRegex(CENSUS.CensusError, "outside 131073..=131073"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_required.items()
+                ).encode()
+            )
+
+        wrong_profile = dict(fields)
+        wrong_profile["positive_fallback_profile"] = "unsealed-stock-profile"
+        with self.assertRaisesRegex(CENSUS.CensusError, "stock profile differs"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in wrong_profile.items()
+                ).encode()
+            )
+
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
+            CENSUS.parse_provenance(encoded + b" capture_group_count=1")
+
+    def test_selector_capture_fallback_is_native_only_while_marker_is_unreached(
+        self,
+    ) -> None:
+        plan = synthetic_plan()
+        receipt = synthetic_selector_capture_fallback_qualification_receipt(plan)
+        validated = CENSUS.validate_receipt(receipt, plan)
+        fallback = selector_capture_fallback_provenance_fields()[
+            "positive_fallback_symbol"
+        ]
+        self.assertTrue(
+            validated["classification"]["native_search_core_authenticated"]
+        )
+        self.assertEqual(
+            validated["classification"]["reason"],
+            "native-negative-certificate-with-unused-stock-capture-fallback",
+        )
+        self.assertEqual(validated["route"]["semantic_helper_symbols"], [fallback])
+
+        triggered = copy.deepcopy(receipt)
+        triggered.pop("receipt_sha256")
+        helper = triggered["phases"]["semantic_helper_trap"]
+        helper["process"]["returncode"] = CENSUS.TRAP_EXIT
+        helper["marker"]["triggered"] = fallback
+        helper["marker"]["completed"] = None
+        triggered["classification"] = CENSUS.classification_from_qualification_evidence(
+            True,
+            triggered["route"]["operation_entry_symbols"],
+            triggered["route"]["adapter_route"],
+            [fallback],
+            triggered["phases"],
+            "aarch64",
+        )
+        triggered = CENSUS.add_digest(triggered, "receipt_sha256")
+        validated_triggered = CENSUS.validate_receipt(triggered, plan)
+        self.assertFalse(
+            validated_triggered["classification"]["native_search_core_authenticated"]
+        )
+        self.assertEqual(
+            validated_triggered["classification"]["reason"],
+            "semantic-runtime-helper-invoked",
+        )
+
+        omitted = copy.deepcopy(receipt)
+        omitted.pop("receipt_sha256")
+        omitted["route"]["semantic_helper_symbols"] = []
+        omitted["route"]["semantic_helper_symbols_sha256"] = CENSUS.sha_bytes(
+            CENSUS.canonical([]).encode()
+        )
+        omitted = CENSUS.add_digest(omitted, "receipt_sha256")
+        with self.assertRaisesRegex(CENSUS.CensusError, "escaped the helper trap set"):
+            CENSUS.validate_receipt(omitted, plan)
 
     def test_participation_receipt_is_native_capture_core_and_traps_both_entries(
         self,

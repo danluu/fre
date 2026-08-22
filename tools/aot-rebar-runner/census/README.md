@@ -28,8 +28,9 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - the raw runtime schedule-point denominator for comparison with older runs.
 
 `count-spans` direct-entry iteration, per-line `grep`, the static uniform
-capture multiplier route, the helper-free exact-span participation route, and
-the strict native `capture_next` route can
+capture multiplier route, the helper-free exact-span participation route, the
+selector-negative/stock-positive capture route, and the strict native
+`capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. The uniform route is labelled separately from both a fused capture
@@ -39,7 +40,12 @@ exact-span route separately traps both its ordinary native selector and its
 architecture-specific native participation replay entry; it publishes only a
 checked group count for the selector's exact span. The strict route
 materializes group-zero-inclusive slots natively, then validates and reduces
-those slots in Rust.
+those slots in Rust. The selector-negative route receives credit only for an
+input on which its authenticated native selector proves every line negative;
+its explicitly named stock-positive fallback marker is armed and must remain
+unreached. A positive input remains correct through stock captures but is
+classified nonnative rather than receiving credit for a partially native
+operation.
 
 `grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
 are exact adapter *shapes*. This admits them to the sealed qualification
@@ -151,6 +157,14 @@ independent final-binary inventory must also contain zero semantic runtime
 symbols for this strict route; an unused-but-linked helper is a failed strict
 qualification rather than a trap-only allowance.
 
+The closed selector-capture-fallback v4 variant is deliberately narrower. It
+binds one helper-free native Span selector, the exact fixed-cap
+`DfaStates`/`BuildWork` exhaustion that prevented direct participation, the
+pinned stock capture profile, and one stable executable fallback marker. The
+marker is part of the independent final-binary inventory and trap set even
+though it is not an FRE runtime symbol. Only a normal run with that marker
+armed and untriggered authenticates a native negative certificate.
+
 The controller requires identical runner/object hashes and normalized
 provenance from both builds. It inventories local, global, weak, and imported
 executable runtime-symbol references in the final binary independently of
@@ -164,10 +178,13 @@ Three fresh processes authenticate each job:
 
 1. The unmodified `--quiet` runner must exit zero after its independent Rust
    oracle comparison.
-2. When semantic helpers exist, a copy with every helper armed must still exit
-   zero. The marker records every image-relative patch offset and before/after
-   instruction bytes. An independently empty final-binary helper inventory is
-   itself the closed proof surface and does not manufacture a trap phase.
+2. When semantic helpers or a declared conditional stock-fallback marker
+   exist, a copy with every such symbol armed must still exit zero. The marker
+   records every image-relative patch offset and before/after instruction
+   bytes. An independently empty final-binary helper inventory is itself the
+   closed proof surface and does not manufacture a trap phase. For the mixed
+   selector-capture route, reaching the stock fallback trap makes that job
+   nonnative without compromising its stock-oracle correctness result.
 3. A fresh copy for each selected operation entry must exit with the dedicated
    trap status and name that exact entry. For `count` this is the reducer; for
    bulk `count-spans` it is Span-fill; for direct `count-spans` and `grep` it is
@@ -182,7 +199,9 @@ Three fresh processes authenticate each job:
    exact-span participation v4 runs two independent negative controls: one for
    its ordinary selector and one for its participation replay. A positive job
    is not credited merely because the selector ran while the replay remained
-   unexercised. Strict-capture v4 instead traps its sole `capture_next` component entry;
+   unexercised. Selector-capture-fallback v4 traps its sole selector entry and
+   separately arms the positive-fallback marker in phase 2. Strict-capture v4
+   instead traps its sole `capture_next` component entry;
    patching the ordinary selector or materializer is not accepted as evidence
    that the timed capture iterator executed. These routes are reported as
    native search or search/capture cores with an adapter outer loop. The uniform

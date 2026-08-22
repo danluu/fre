@@ -49,6 +49,7 @@ COMPOSITE_ADAPTER_MODELS = {"regex-redux"}
 NATIVE_ROW_COMPOSITE_KINDS = {
     "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
     "strict-capture-next-v1", "exact-span-participation-v1",
+    "selector-negative-certificate-v1",
 }
 FORBIDDEN_PUBLIC_COMPONENTS = {
     "holdout",
@@ -91,6 +92,13 @@ NATIVE_PARTICIPATION_MAX_DFA_STATES = 131_072
 NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS = 16 * 1_024 * 1_024
 NATIVE_PARTICIPATION_MAX_BUILD_WORK = 256 * 1_048_576
 NATIVE_PARTICIPATION_MAX_PLAN_BYTES = 256 * 1_048_576
+SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL = (
+    "fre_aot_rebar_runner_stock_capture_positive_fallback_v1"
+)
+SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE = "rust-regex-1.12.4-captures"
+SELECTOR_CAPTURE_ENGINE = "IndependentNativeSpanRows(OrderedContextDfa)"
+SELECTOR_CAPTURE_DFA_STATES_LIMIT = 131_072
+SELECTOR_CAPTURE_BUILD_WORK_LIMIT = 256 * 1_048_576
 CONTROL_PLANE_PREFIXES = (
     "fre_aot_regex_runtime_prepare_",
     "fre_aot_regex_runtime_destroy_",
@@ -900,10 +908,7 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "aggregate_strategy", "native_row_bridge", "uniform_capture_bridge",
             "strict_capture_bridge", "source_pattern_count",
             "row_total_object_bytes", "source_to_artifact", "component_count",
-            "capture_resolution", "capture_group_count",
-            "capture_source_sha256", "capture_selector_sha256",
-            "capture_program_sha256", "capture_artifact_identity_sha256",
-            "capture_selector_symbol", "boundary", "required_comparators",
+            "capture_resolution", "boundary", "required_comparators",
         }
     else:
         raise CensusError(
@@ -1493,6 +1498,64 @@ def participation_capture_proof_from_provenance(
     }
 
 
+def selector_capture_fallback_proof_from_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> dict[str, object]:
+    """Normalize the native-negative/stock-positive mixed capture boundary."""
+    if len(components) != 1:
+        raise CensusError(
+            "selector capture fallback provenance does not have exactly one component"
+        )
+    component = components[0]
+    selector = component["entry_symbol"]
+    if (
+        not isinstance(selector, str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+        or component["required_runtime_symbols"]
+    ):
+        raise CensusError(
+            "selector capture fallback component is not a helper-free native selector"
+        )
+    profile = fields.get("positive_fallback_profile")
+    fallback_symbol = fields.get("positive_fallback_symbol")
+    if profile != SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE:
+        raise CensusError("selector capture fallback stock profile differs")
+    if fallback_symbol != SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL:
+        raise CensusError("selector capture fallback marker symbol differs")
+    resource = fields.get("direct_participation_resource")
+    expected_limit = {
+        "DfaStates": SELECTOR_CAPTURE_DFA_STATES_LIMIT,
+        "BuildWork": SELECTOR_CAPTURE_BUILD_WORK_LIMIT,
+    }.get(resource)
+    if expected_limit is None:
+        raise CensusError("selector capture fallback has an unknown direct resource")
+    limit = parse_canonical_decimal(
+        fields.get("direct_participation_limit"),
+        "selector capture direct participation limit",
+        expected_limit,
+        expected_limit,
+    )
+    required = parse_canonical_decimal(
+        fields.get("direct_participation_required"),
+        "selector capture direct participation requirement",
+        expected_limit + 1,
+        expected_limit + 1,
+    )
+    if required != limit + 1:
+        raise CensusError(
+            "selector capture direct participation exhaustion is not exact"
+        )
+    return {
+        "capture_resolution": fields.get("capture_resolution"),
+        "positive_fallback_profile": profile,
+        "positive_fallback_symbol": fallback_symbol,
+        "direct_participation_resource": resource,
+        "direct_participation_required": required,
+        "direct_participation_limit": limit,
+        "selector_entry_symbol": selector,
+    }
+
+
 def validate_v3_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
@@ -1631,10 +1694,7 @@ def validate_v4_provenance(
         "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
         "native_row_bridge", "uniform_capture_bridge", "strict_capture_bridge",
         "source_pattern_count", "row_total_object_bytes", "source_to_artifact",
-        "component_count", "capture_resolution", "capture_group_count",
-        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
-        "capture_artifact_identity_sha256", "capture_selector_symbol", "boundary",
-        "required_comparators",
+        "component_count", "capture_resolution", "boundary", "required_comparators",
     }
     component_fields = {
         f"component_0_{suffix}"
@@ -1643,6 +1703,43 @@ def validate_v4_provenance(
             "program_sha256", "object_sha256",
         )
     }
+    selector_fallback = fields.get("selector_capture_fallback_bridge") == "true"
+    if selector_fallback:
+        if (
+            fields.get("adapter")
+            != "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+            or fields.get("model") != "grep-captures"
+            or fields.get("engine") != SELECTOR_CAPTURE_ENGINE
+            or fields.get("aggregate_strategy")
+            != "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+            or fields.get("native_row_bridge") != "true"
+            or fields.get("uniform_capture_bridge") != "false"
+            or fields.get("strict_capture_bridge") != "false"
+            or fields.get("participation_capture_bridge") != "false"
+            or fields.get("capture_resolution")
+            != "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+            or fields.get("boundary")
+            != "per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback"
+        ):
+            raise CensusError(
+                "selector capture fallback provenance has a noncanonical route"
+            )
+        selector_capture_fallback_proof_from_provenance(fields, components)
+        fallback_fields = {
+            "participation_capture_bridge", "selector_capture_fallback_bridge",
+            "positive_fallback_profile", "positive_fallback_symbol",
+            "direct_participation_resource", "direct_participation_required",
+            "direct_participation_limit",
+        }
+        expected = base | component_fields | fallback_fields
+        if set(fields) != expected:
+            raise CensusError(
+                "runner selector capture fallback v4 field closure differs: "
+                f"missing={sorted(expected - set(fields))!r} "
+                f"extra={sorted(set(fields) - expected)!r}"
+            )
+        return
+
     participation = fields.get("participation_capture_bridge") == "true"
     if participation:
         expected_adapter = {
@@ -1679,6 +1776,9 @@ def validate_v4_provenance(
             "selector_object_sha256", "participation_bundle_sha256",
             "participation_export_identity_sha256", "participation_object_sha256",
             "participation_bundle_symbol", "participation_entry_symbol",
+            "capture_group_count", "capture_source_sha256",
+            "capture_selector_sha256", "capture_program_sha256",
+            "capture_artifact_identity_sha256", "capture_selector_symbol",
         }
         expected = base | component_fields | participation_fields
         if set(fields) != expected:
@@ -1710,7 +1810,9 @@ def validate_v4_provenance(
     strict_capture_proof_from_provenance(fields, components)
     strict_fields = {
         "capture_can_match_empty", "capture_plan_sha256", "capture_bundle_sha256",
-        "capture_materialize_symbol",
+        "capture_materialize_symbol", "capture_group_count", "capture_source_sha256",
+        "capture_selector_sha256", "capture_program_sha256",
+        "capture_artifact_identity_sha256", "capture_selector_symbol",
     }
     expected = base | component_fields | strict_fields
     if set(fields) != expected:
@@ -1731,7 +1833,9 @@ def nm_symbols_with_types(nm_output: str, symbol_types: set[str]) -> set[str]:
         kind = fields[-2] if len(fields[-2]) == 1 else ""
         if kind not in symbol_types:
             continue
-        if name.startswith("_") and name[1:].startswith("fre_aot_regex_"):
+        if name.startswith("_") and name[1:].startswith(
+            ("fre_aot_regex_", "fre_aot_rebar_runner_")
+        ):
             name = name[1:]
         if SYMBOL.fullmatch(name):
             result.add(name)
@@ -1783,6 +1887,16 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         entries = [str(component["entry_symbol"]) for component in components]
         if len(entries) != len(set(entries)):
             raise CensusError("composite provenance repeats an entry symbol")
+        if provenance.get("selector_capture_fallback_bridge") == "true":
+            if (
+                model != "grep-captures"
+                or len(entries) != 1
+                or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entries[0]) is None
+            ):
+                raise CensusError(
+                    "selector capture fallback route has an invalid selector entry"
+                )
+            return entries, "linked-selector-negative-certificate-adapter-loop"
         if provenance.get("strict_capture_bridge") == "true" and model in (
             UNIFORM_CAPTURE_ADAPTER_MODELS
         ):
@@ -2012,14 +2126,18 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             int(value, 10) for value in fields["source_to_artifact"].split(",")
         ]
         participation = fields.get("participation_capture_bridge") == "true"
+        selector_fallback = fields.get("selector_capture_fallback_bridge") == "true"
         result = {
             **common,
             "kind": (
-                "participation-capture-v4" if participation else "strict-capture-v4"
+                "selector-capture-fallback-v4" if selector_fallback else
+                "participation-capture-v4" if participation else
+                "strict-capture-v4"
             ),
             "composite_kind": (
-                "exact-span-participation-v1" if participation
-                else "strict-capture-next-v1"
+                "selector-negative-certificate-v1" if selector_fallback else
+                "exact-span-participation-v1" if participation else
+                "strict-capture-next-v1"
             ),
             "source_pattern_count": source_pattern_count,
             "source_to_artifact": source_to_artifact,
@@ -2040,7 +2158,11 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "required_runtime_symbols": [],
             "components": components,
         }
-        if participation:
+        if selector_fallback:
+            result["selector_capture_fallback"] = (
+                selector_capture_fallback_proof_from_provenance(fields, components)
+            )
+        elif participation:
             result["participation_capture"] = (
                 participation_capture_proof_from_provenance(fields, components)
             )
@@ -2136,6 +2258,19 @@ def operation_route_from_provenance_record(
             return [selector, participation], (
                 "linked-exact-span-participation-adapter-loop"
             )
+        if provenance["composite_kind"] == "selector-negative-certificate-v1":
+            proof = provenance.get("selector_capture_fallback")
+            selector = entries[0] if len(entries) == 1 else None
+            if (
+                not isinstance(selector, str)
+                or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+                or not isinstance(proof, dict)
+                or proof.get("selector_entry_symbol") != selector
+            ):
+                raise CensusError(
+                    "normalized selector capture fallback has an invalid native entry"
+                )
+            return entries, "linked-selector-negative-certificate-adapter-loop"
         if len(entries) != len(set(entries)) or not all(
             isinstance(entry, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry)
             for entry in entries
@@ -2181,6 +2316,18 @@ def declared_runtime_symbols_from_provenance(
     if not all(isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in symbols):
         raise CensusError("normalized provenance has malformed runtime symbols")
     return sorted(symbols)
+
+
+def conditional_fallback_symbols_from_provenance(
+    provenance: dict[str, object],
+) -> list[str]:
+    if provenance.get("composite_kind") != "selector-negative-certificate-v1":
+        return []
+    proof = provenance.get("selector_capture_fallback")
+    symbol = proof.get("positive_fallback_symbol") if isinstance(proof, dict) else None
+    if symbol != SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL:
+        raise CensusError("normalized selector capture fallback marker differs")
+    return [symbol]
 
 
 def claimed_entry_controls_pass(
@@ -2259,6 +2406,8 @@ def classification_from_qualification_evidence(
         reason = "native-search-capture-core-with-checked-rust-adapter-loop"
     elif adapter_route == "linked-exact-span-participation-adapter-loop":
         reason = "native-search-capture-core-with-exact-span-replay-adapter-loop"
+    elif adapter_route == "linked-selector-negative-certificate-adapter-loop":
+        reason = "native-negative-certificate-with-unused-stock-capture-fallback"
     elif adapter_outer_loop:
         reason = "native-search-core-with-adapter-outer-loop"
     else:
@@ -2336,7 +2485,8 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     }
     normalized_provenance = provenance_receipt(primary_fields)
     if normalized_provenance["kind"] in {
-        "composite-v3", "strict-capture-v4", "participation-capture-v4"
+        "composite-v3", "strict-capture-v4", "participation-capture-v4",
+        "selector-capture-fallback-v4",
     } and (
         normalized_provenance["source_pattern_count"]
         != len(job["input"]["pattern_sha256"])
@@ -2366,13 +2516,24 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     replica_symbols, replica_runtime_references, replica_nm_sha = run_nm(
         args.nm, replica_runner
     )
-    helpers = semantic_helper_symbols(primary_runtime_references)
-    if helpers != semantic_helper_symbols(replica_runtime_references):
+    runtime_helpers = semantic_helper_symbols(primary_runtime_references)
+    if runtime_helpers != semantic_helper_symbols(replica_runtime_references):
         raise CensusError("independent binaries have different semantic helper inventories")
     if normalized_provenance["kind"] in {
         "strict-capture-v4", "participation-capture-v4"
-    } and helpers:
+    } and runtime_helpers:
         raise CensusError("native-capture final binary retains semantic runtime symbols")
+    conditional_fallbacks = conditional_fallback_symbols_from_provenance(
+        normalized_provenance
+    )
+    if (
+        not set(conditional_fallbacks).issubset(primary_symbols)
+        or not set(conditional_fallbacks).issubset(replica_symbols)
+    ):
+        raise CensusError(
+            "conditional capture fallback marker is absent from a final binary"
+        )
+    helpers = sorted(set(runtime_helpers) | set(conditional_fallbacks))
     declared_set = set(normalized_provenance["required_runtime_symbols"])
     for component in normalized_provenance["components"]:
         declared_set.update(component["required_runtime_symbols"])
@@ -2382,7 +2543,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     } and declared:
         raise CensusError("native-capture provenance requires runtime symbols")
     declared_semantic = [name for name in declared if not name.startswith(CONTROL_PLANE_PREFIXES)]
-    if not set(declared_semantic).issubset(helpers):
+    if not set(declared_semantic).issubset(runtime_helpers):
         raise CensusError("provenance-declared semantic helpers escape independent inventory")
     entries, adapter_route = selected_operation_entries(primary_fields)
     if not set(entries).issubset(primary_symbols) or not set(entries).issubset(replica_symbols):
@@ -2825,6 +2986,50 @@ def validate_normalized_participation_capture(
         raise CensusError(f"{context} participation component binding differs")
 
 
+def validate_normalized_selector_capture_fallback(
+    proof: object, component: dict[str, object], context: str
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} selector capture fallback proof is not an object")
+    require_exact_keys(
+        proof,
+        {
+            "capture_resolution", "positive_fallback_profile",
+            "positive_fallback_symbol", "direct_participation_resource",
+            "direct_participation_required", "direct_participation_limit",
+            "selector_entry_symbol",
+        },
+        f"{context} selector capture fallback proof",
+    )
+    resource = proof["direct_participation_resource"]
+    expected_limit = {
+        "DfaStates": SELECTOR_CAPTURE_DFA_STATES_LIMIT,
+        "BuildWork": SELECTOR_CAPTURE_BUILD_WORK_LIMIT,
+    }.get(resource)
+    required = proof["direct_participation_required"]
+    limit = proof["direct_participation_limit"]
+    if (
+        proof["capture_resolution"]
+        != "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+        or proof["positive_fallback_profile"]
+        != SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE
+        or proof["positive_fallback_symbol"]
+        != SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL
+        or expected_limit is None
+        or not isinstance(required, int)
+        or isinstance(required, bool)
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit != expected_limit
+        or required != expected_limit + 1
+        or proof["selector_entry_symbol"] != component["entry_symbol"]
+        or not isinstance(component["entry_symbol"], str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(component["entry_symbol"]) is None
+        or component["required_runtime_symbols"] != []
+    ):
+        raise CensusError(f"{context} selector capture fallback proof differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -2841,6 +3046,8 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         expected_keys.add("strict_capture")
     elif provenance.get("kind") == "participation-capture-v4":
         expected_keys.add("participation_capture")
+    elif provenance.get("kind") == "selector-capture-fallback-v4":
+        expected_keys.add("selector_capture_fallback")
     require_exact_keys(provenance, expected_keys, context)
     if not isinstance(provenance["components"], list):
         raise CensusError(f"{context} components are not a list")
@@ -3099,6 +3306,43 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             provenance["feature_bits"],
             context,
         )
+    elif provenance["kind"] == "selector-capture-fallback-v4":
+        components = provenance["components"]
+        component = components[0] if len(components) == 1 else None
+        scalar_fields = (
+            "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
+            "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
+            "reducer_symbol", "span_fill_symbol",
+        )
+        if (
+            provenance["schema"] != "fre.aot.rebar-runner.v4"
+            or provenance["composite_kind"] != "selector-negative-certificate-v1"
+            or provenance["model"] != "grep-captures"
+            or provenance["adapter"]
+            != "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+            or provenance["boundary"]
+            != "per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback"
+            or provenance["engine"] != SELECTOR_CAPTURE_ENGINE
+            or provenance["aggregate_strategy"]
+            != "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+            or provenance["source_pattern_count"] != 1
+            or provenance["source_to_artifact"] != [0]
+            or not isinstance(provenance["row_total_object_bytes"], int)
+            or isinstance(provenance["row_total_object_bytes"], bool)
+            or not 0 < provenance["row_total_object_bytes"] <= MAX_NATIVE_ROW_OBJECT_BYTES
+            or provenance["uniform_capture"] is not None
+            or provenance["required_runtime_symbols"] != []
+            or any(provenance[field] is not None for field in scalar_fields)
+            or component is None
+            or component["source_ordinal"] != 0
+            or component["automaton_sha256"] is not None
+        ):
+            raise CensusError(
+                f"{context} selector capture fallback topology is not canonical"
+            )
+        validate_normalized_selector_capture_fallback(
+            provenance["selector_capture_fallback"], component, context
+        )
     else:
         raise CensusError(f"{context} has an unknown provenance kind")
     operation_route_from_provenance_record(provenance)
@@ -3127,7 +3371,8 @@ def validate_provenance_job_binding(
     provenance: dict[str, object], input_identity: dict[str, object]
 ) -> None:
     if provenance["kind"] not in {
-        "composite-v3", "strict-capture-v4", "participation-capture-v4"
+        "composite-v3", "strict-capture-v4", "participation-capture-v4",
+        "selector-capture-fallback-v4",
     }:
         return
     pattern_hashes = input_identity["pattern_sha256"]
@@ -3357,6 +3602,13 @@ def validate_receipt(
             "strict-capture-v4", "participation-capture-v4"
         } and helpers:
             raise CensusError("native-capture final binary retains semantic runtime symbols")
+        conditional_fallbacks = conditional_fallback_symbols_from_provenance(
+            provenance
+        )
+        if not set(conditional_fallbacks).issubset(helpers):
+            raise CensusError(
+                "selector capture fallback marker escaped the helper trap set"
+            )
         declared_semantic = [
             symbol for symbol in declared if not symbol.startswith(CONTROL_PLANE_PREFIXES)
         ]
