@@ -7516,72 +7516,92 @@ impl PortableBuilder {
         let derive_guarded_ascii_dictionary = self.selection == PlanSelection::Auto
             && has_guarded_ascii_left
             && has_guarded_ascii_right;
-        let finite_outcome = finite::extract(
-            &rust.hir,
-            self.limits.literal_set.max_patterns,
-            self.limits.literal_set.max_pattern_bytes,
-            nullable_finite_token_repeat_work,
-            self.limits.max_planner_work,
-            derive_guarded_ascii_dictionary,
-            guarded_literal_set::extraction_limits(
-                self.limits.packed_literal_set,
-                guarded_plan_persistent_bytes,
-            ),
-        );
-        if !finite_outcome.has_closed_receipt() {
-            return Err(BuildError::InternalInvariant(
-                "finite outcome lost its extraction-attempt closure",
-            ));
-        }
-        let mut finite_work = finite_outcome.work();
-        let (finite_words, guarded_dictionary) = match finite_outcome {
-            finite::FiniteOutcome::Fits { words, .. } => (Some(words), None),
-            finite::FiniteOutcome::GuardedFiniteBody { dictionary, .. } => {
-                (None, Some(dictionary))
-            }
-            finite::FiniteOutcome::TooLargeFixedSequence { .. }
-            | finite::FiniteOutcome::Unsupported { .. }
-            | finite::FiniteOutcome::GuardedResourceFailure {
-                error: finite::GuardedFiniteBuildError::ConstructionLimit { .. },
-                ..
-            } => (None, None),
-            finite::FiniteOutcome::ResourceFailure { error, .. } => return Err(error),
-            finite::FiniteOutcome::GuardedResourceFailure {
-                error: finite::GuardedFiniteBuildError::Dictionary(error),
-                ..
-            } => match error.kind {
-                guarded_ascii_word::BuildErrorKind::ResourceLimit { .. }
-                | guarded_ascii_word::BuildErrorKind::WorkLimit { .. }
-                | guarded_ascii_word::BuildErrorKind::RepresentationLimit { .. } => (None, None),
-                guarded_ascii_word::BuildErrorKind::AllocationFailed {
-                    structure,
-                    additional,
-                } => {
-                    return Err(BuildError::AllocationFailed {
-                        structure,
-                        additional,
-                    });
+        let mut singleton_literal_handoff = None;
+        let (finite_words, guarded_dictionary, mut finite_work) =
+            match finite::extract_with_singleton_literal_handoff(
+                &rust.hir,
+                self.limits.literal_set.max_patterns,
+                self.limits.literal_set.max_pattern_bytes,
+                nullable_finite_token_repeat_work,
+                self.limits.max_planner_work,
+                derive_guarded_ascii_dictionary,
+                guarded_literal_set::extraction_limits(
+                    self.limits.packed_literal_set,
+                    guarded_plan_persistent_bytes,
+                ),
+            ) {
+                Ok(handoff) => {
+                    if !handoff.has_closed_receipt() {
+                        return Err(BuildError::InternalInvariant(
+                            "singleton finite handoff lost its extraction-attempt closure",
+                        ));
+                    }
+                    let work = handoff.work();
+                    singleton_literal_handoff = Some(handoff);
+                    (None, None, work)
                 }
-                guarded_ascii_word::BuildErrorKind::ArithmeticOverflow { computation } => {
-                    return Err(BuildError::InternalInvariant(computation));
+                Err(finite_outcome) => {
+                    if !finite_outcome.has_closed_receipt() {
+                        return Err(BuildError::InternalInvariant(
+                            "finite outcome lost its extraction-attempt closure",
+                        ));
+                    }
+                    let work = finite_outcome.work();
+                    let (words, dictionary) = match finite_outcome {
+                        finite::FiniteOutcome::Fits { words, .. } => (Some(words), None),
+                        finite::FiniteOutcome::GuardedFiniteBody { dictionary, .. } => {
+                            (None, Some(dictionary))
+                        }
+                        finite::FiniteOutcome::TooLargeFixedSequence { .. }
+                        | finite::FiniteOutcome::Unsupported { .. }
+                        | finite::FiniteOutcome::GuardedResourceFailure {
+                            error: finite::GuardedFiniteBuildError::ConstructionLimit { .. },
+                            ..
+                        } => (None, None),
+                        finite::FiniteOutcome::ResourceFailure { error, .. } => return Err(error),
+                        finite::FiniteOutcome::GuardedResourceFailure {
+                            error: finite::GuardedFiniteBuildError::Dictionary(error),
+                            ..
+                        } => match error.kind {
+                            guarded_ascii_word::BuildErrorKind::ResourceLimit { .. }
+                            | guarded_ascii_word::BuildErrorKind::WorkLimit { .. }
+                            | guarded_ascii_word::BuildErrorKind::RepresentationLimit { .. } => {
+                                (None, None)
+                            }
+                            guarded_ascii_word::BuildErrorKind::AllocationFailed {
+                                structure,
+                                additional,
+                            } => {
+                                return Err(BuildError::AllocationFailed {
+                                    structure,
+                                    additional,
+                                });
+                            }
+                            guarded_ascii_word::BuildErrorKind::ArithmeticOverflow {
+                                computation,
+                            } => {
+                                return Err(BuildError::InternalInvariant(computation));
+                            }
+                            guarded_ascii_word::BuildErrorKind::InternalInvariant { detail } => {
+                                return Err(BuildError::InternalInvariant(detail));
+                            }
+                            guarded_ascii_word::BuildErrorKind::EmptyDictionary
+                            | guarded_ascii_word::BuildErrorKind::ImpossibleDimensions { .. }
+                            | guarded_ascii_word::BuildErrorKind::SourceLengthMismatch { .. }
+                            | guarded_ascii_word::BuildErrorKind::PackedBytesMismatch { .. }
+                            | guarded_ascii_word::BuildErrorKind::EmptyWord { .. }
+                            | guarded_ascii_word::BuildErrorKind::InvalidLeftGuard { .. }
+                            | guarded_ascii_word::BuildErrorKind::InvalidRightGuard { .. }
+                            | guarded_ascii_word::BuildErrorKind::NonAsciiWordByte { .. } => {
+                                return Err(BuildError::InternalInvariant(
+                                    "guarded finite extraction produced an invalid ASCII-word dictionary",
+                                ));
+                            }
+                        },
+                    };
+                    (words, dictionary, work)
                 }
-                guarded_ascii_word::BuildErrorKind::InternalInvariant { detail } => {
-                    return Err(BuildError::InternalInvariant(detail));
-                }
-                guarded_ascii_word::BuildErrorKind::EmptyDictionary
-                | guarded_ascii_word::BuildErrorKind::ImpossibleDimensions { .. }
-                | guarded_ascii_word::BuildErrorKind::SourceLengthMismatch { .. }
-                | guarded_ascii_word::BuildErrorKind::PackedBytesMismatch { .. }
-                | guarded_ascii_word::BuildErrorKind::EmptyWord { .. }
-                | guarded_ascii_word::BuildErrorKind::InvalidLeftGuard { .. }
-                | guarded_ascii_word::BuildErrorKind::InvalidRightGuard { .. }
-                | guarded_ascii_word::BuildErrorKind::NonAsciiWordByte { .. } => {
-                    return Err(BuildError::InternalInvariant(
-                        "guarded finite extraction produced an invalid ASCII-word dictionary",
-                    ));
-                }
-            },
-        };
+            };
         if let Some(dictionary) = guarded_dictionary
             && let Ok(plan) = guarded_literal_set::Plan::build(
                 dictionary,
@@ -7622,42 +7642,50 @@ impl PortableBuilder {
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
-        if let Some(words) = finite_words {
-            if words.len() == 1 {
-                let literal = LiteralPlan::new(&words[0], self.limits.literal)?;
-                let storage = literal.storage_bytes();
-                return Ok(PortableRegex {
-                    source,
-                    capture_names,
-                    line_total_grep_plan,
-                    plan: PortablePlan::ExactLiteral(literal),
+        let singleton_literal = singleton_literal_handoff
+            .as_ref()
+            .map(finite::SingletonLiteralHandoff::literal)
+            .or_else(|| {
+                finite_words
+                    .as_ref()
+                    .and_then(|words| (words.len() == 1).then(|| words[0].as_slice()))
+            });
+        if let Some(singleton_literal) = singleton_literal {
+            let literal = LiteralPlan::new(singleton_literal, self.limits.literal)?;
+            let storage = literal.storage_bytes();
+            return Ok(PortableRegex {
+                source,
+                capture_names,
+                line_total_grep_plan,
+                plan: PortablePlan::ExactLiteral(literal),
+                profile: profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: BuildReport {
                     profile: profile.clone(),
-                    limits: self.limits,
-                    selection: self.selection,
-                    report: BuildReport {
-                        profile: profile.clone(),
-                        admission,
-                        syntax,
-                        plan: PlanKind::ExactLiteral,
-                        planner_work: finite_work,
-                        lowering: None,
-                        states: 0,
-                        edges: 0,
-                        plan_storage_bytes: storage,
-                        source_storage_bytes,
-                        capture_name_storage_bytes,
-                        charged_persistent_bytes: 0,
-                        persistent_byte_limit: 0,
-                        captures_len,
-                        static_captures_len,
-                        minimum_match_bytes,
-                        required_literal: None,
-                        literal_class_run_literal: None,
-                        forward_anchored: None,
-                    }
-                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
-                });
-            }
+                    admission,
+                    syntax,
+                    plan: PlanKind::ExactLiteral,
+                    planner_work: finite_work,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: storage,
+                    source_storage_bytes,
+                    capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
+                    captures_len,
+                    static_captures_len,
+                    minimum_match_bytes,
+                    required_literal: None,
+                    literal_class_run_literal: None,
+                    forward_anchored: None,
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+            });
+        }
+        if let Some(words) = finite_words {
             if words.len() > 1 {
                 #[cfg(not(feature = "static-dispatch"))]
                 let packed_limits = PackedLiteralSetBuildLimits {
@@ -24169,16 +24197,16 @@ mod tests {
         K0MandatorySuffixRecoveryPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterClassState,
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
         K0PackedFrontierPlan, K0PooledValue, K0PooledValueOperation, K0ReverseSuffixSpanAttempt,
-        K0SpanSourceCursor, LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, Match,
+        K0SpanSourceCursor, LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError,
+        Match,
         OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
-        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID, LiteralSetError,
-        PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-        PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
-        PortablePlan, PortableRegex, PortableRegexSetBuilder, PortableSearchSession,
-        PortableSearchSessionPlan, PortableSpanVisitLimits, PortableTextBuilder,
-        PortableTextRegexSetBuilder, SearchAccounting, SearchError, SearchLimits,
-        SearchSessionLimits, SearchWindow, SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+        PlanKind, PlanSelection, PortableBuilder, PortableFindIterAccounting, PortableFindIterError,
+        PortableFindIterLimits, PortableFindIterRunLimits, PortableFindIterStepAccounting,
+        PortableParsedBuildContext, PortablePlan, PortableRegex, PortableRegexSetBuilder,
+        PortableSearchSession, PortableSearchSessionPlan, PortableSpanVisitLimits,
+        PortableTextBuilder, PortableTextRegexSetBuilder, SearchAccounting, SearchError,
+        SearchLimits, SearchSessionLimits, SearchWindow, SimdDispatchContext,
+        UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         k0_finite_prefix_hedge_window, k0_finite_suffix_incumbent_single_pass_negative,
         k0_finite_suffix_prefix_hedge_bytes, k0_mandatory_suffix_completed_negative_is_useful,
         observe_k0_finite_suffix_direct_incumbent, observe_k0_finite_suffix_incumbent,
@@ -24190,6 +24218,10 @@ mod tests {
         try_build_k0_mandatory_cut, try_build_k0_mandatory_suffix, try_build_k0_packed_frontier,
         try_execute_k0_reverse_suffix_span, try_k0_mandatory_suffix_exists,
         try_k0_mandatory_suffix_span_start, try_k0_mandatory_suffix_span_start_for_iteration,
+    };
+    #[cfg(not(feature = "static-dispatch"))]
+    use super::{
+        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID, PackedLiteralSetError,
     };
     use fre_automata::{
         MandatoryCutAnalysisLimits, MandatorySuffixAnalysisLimits, MaximumConsumedDistance,

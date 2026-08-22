@@ -1388,6 +1388,113 @@ struct Shape {
     peak_bytes: usize,
 }
 
+/// Allocation-free handoff of a capture-transparent Empty/Literal language.
+///
+/// Current main's finite extractor performs one analysis traversal and one
+/// materialization traversal. This receipt replays their exact logical work
+/// while retaining no temporary finite-language storage; the caller consumes
+/// the authenticated borrowed bytes directly into the selected literal plan.
+pub(crate) struct SingletonLiteralHandoff<'hir> {
+    literal: &'hir [u8],
+    receipt: FiniteExtractionAttemptReceipt,
+}
+
+impl<'hir> SingletonLiteralHandoff<'hir> {
+    pub(crate) const fn literal(&self) -> &'hir [u8] {
+        self.literal
+    }
+
+    pub(crate) const fn work(&self) -> u64 {
+        self.receipt.actual.work
+    }
+
+    pub(crate) fn has_closed_receipt(&self) -> bool {
+        self.receipt.has_basic_closure()
+            && self.receipt.terminal == FiniteExtractionTerminal::Fits
+            && self.receipt.actual.local == FiniteExtractionLocalActual::default()
+            && self.receipt.actual.guarded.is_none()
+    }
+}
+
+/// Return the borrowed leaf and the incumbent extractor's exact additional
+/// work for a capture-transparent singleton.
+///
+/// Each transparent capture costs one visit and one task publication in both
+/// traversals (four units total). The two root task publications, two leaf
+/// visits, analysis-value publication, outer-word publication, and final
+/// language-value publication contribute the fixed seven units. Literal bytes
+/// contribute one unit each during materialization.
+fn singleton_literal_payload_and_work(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+) -> Option<(&[u8], u64)> {
+    if max_words == 0 {
+        return None;
+    }
+    let mut node = hir;
+    let mut captures = 0_u64;
+    let literal = loop {
+        match node.kind() {
+            HirKind::Capture(capture) => {
+                captures = captures.checked_add(1)?;
+                node = &capture.sub;
+            }
+            HirKind::Empty => break &[][..],
+            HirKind::Literal(literal) if literal.0.len() <= max_bytes => {
+                break literal.0.as_ref();
+            }
+            HirKind::Literal(_)
+            | HirKind::Class(_)
+            | HirKind::Look(_)
+            | HirKind::Repetition(_)
+            | HirKind::Concat(_)
+            | HirKind::Alternation(_) => return None,
+        }
+    };
+    let work = captures
+        .checked_mul(4)?
+        .checked_add(u64::try_from(literal.len()).ok()?)?
+        .checked_add(7)?;
+    Some((literal, work))
+}
+
+/// Prefer the direct singleton handoff only after its complete incumbent work
+/// is pre-admitted. Any ineligible shape, arithmetic refusal, or configured
+/// one-below limit runs the unchanged extractor so partial effects and error
+/// chronology remain authoritative.
+pub(crate) fn extract_with_singleton_literal_handoff(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+    initial_work: u64,
+    work_limit: u64,
+    derive_guarded_dictionary: bool,
+    guarded_limits: GuardedFiniteBuildLimits,
+) -> Result<SingletonLiteralHandoff<'_>, FiniteOutcome> {
+    if let Some((literal, additional_work)) =
+        singleton_literal_payload_and_work(hir, max_words, max_bytes)
+    {
+        let context = FiniteExtractionContext::new(initial_work, work_limit);
+        if context.charge(additional_work).is_ok() {
+            let handoff = SingletonLiteralHandoff {
+                literal,
+                receipt: context.close(FiniteExtractionTerminal::Fits),
+            };
+            debug_assert!(handoff.has_closed_receipt());
+            return Ok(handoff);
+        }
+    }
+    Err(extract(
+        hir,
+        max_words,
+        max_bytes,
+        initial_work,
+        work_limit,
+        derive_guarded_dictionary,
+        guarded_limits,
+    ))
+}
 #[allow(
     clippy::too_many_lines,
     reason = "the iterative task machine keeps every HIR case and early resource refusal visible"
@@ -4214,6 +4321,7 @@ fn concat_pair<'context>(
 
 #[cfg(test)]
 mod tests {
+    use fre_kernels::{LiteralBuildLimits, LiteralPlan};
     use regex_syntax::ParserBuilder;
 
     use super::{
@@ -4290,6 +4398,109 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn singleton_literal_handoff_replays_incumbent_work_without_temporary_storage() {
+        let initial_work = 11_u64;
+        for (pattern, expected) in [
+            ("", b"".as_slice()),
+            ("needle", b"needle".as_slice()),
+            ("(?P<outer>(needle))", b"needle".as_slice()),
+        ] {
+            let hir = parse(pattern);
+            let incumbent = extract(&hir, 64, 512, initial_work, u64::MAX, false);
+            assert!(
+                matches!(&incumbent, FiniteOutcome::Fits { .. }),
+                "pattern={pattern:?}",
+            );
+            let incumbent_work = incumbent.work();
+
+            let handoff = super::extract_with_singleton_literal_handoff(
+                &hir,
+                64,
+                512,
+                initial_work,
+                u64::MAX,
+                false,
+                GuardedFiniteBuildLimits::unlimited(),
+            )
+            .unwrap_or_else(|_| panic!("singleton handoff declined: {pattern:?}"));
+            assert_eq!(handoff.literal(), expected, "pattern={pattern:?}");
+            assert_eq!(handoff.work(), incumbent_work, "pattern={pattern:?}");
+            assert!(handoff.has_closed_receipt(), "pattern={pattern:?}");
+            assert_eq!(
+                handoff.receipt.actual.local,
+                super::FiniteExtractionLocalActual::default(),
+                "pattern={pattern:?}",
+            );
+            let plan = LiteralPlan::new(handoff.literal(), LiteralBuildLimits::default()).unwrap();
+            assert_eq!(plan.needle(), expected, "pattern={pattern:?}");
+        }
+
+        let materialized = extract(&parse("needle"), 64, 512, 0, u64::MAX, false);
+        let FiniteOutcome::Fits { words, receipt } = materialized else {
+            panic!("ordinary singleton materialization did not fit");
+        };
+        assert_eq!(words, [b"needle".to_vec()]);
+        assert!(receipt.actual.local.allocations >= 2);
+        assert_eq!(receipt.actual.local.reallocations, 0);
+        assert_eq!(receipt.actual.local.copied_bytes, b"needle".len());
+    }
+
+    #[test]
+    fn singleton_handoff_is_leaf_only_and_preserves_incumbent_work_refusal() {
+        let hir = parse("(a)(b)");
+        let materialized = match super::extract_with_singleton_literal_handoff(
+            &hir,
+            64,
+            512,
+            0,
+            u64::MAX,
+            false,
+            GuardedFiniteBuildLimits::unlimited(),
+        ) {
+            Ok(_) => panic!("concatenated singleton bypassed ordinary materialization"),
+            Err(outcome) => outcome,
+        };
+        let FiniteOutcome::Fits { words, .. } = materialized else {
+            panic!("concatenated singleton did not retain the incumbent finite route");
+        };
+        assert_eq!(words, [b"ab".to_vec()]);
+
+        let hir = parse("needle");
+        let successful = super::extract_with_singleton_literal_handoff(
+            &hir,
+            64,
+            512,
+            0,
+            u64::MAX,
+            false,
+            GuardedFiniteBuildLimits::unlimited(),
+        )
+        .unwrap_or_else(|_| panic!("unlimited singleton handoff declined"));
+        let successful_work = successful.work();
+        let one_below = successful_work.checked_sub(1).unwrap();
+
+        let failed = match super::extract_with_singleton_literal_handoff(
+            &hir,
+            64,
+            512,
+            0,
+            one_below,
+            false,
+            GuardedFiniteBuildLimits::unlimited(),
+        ) {
+            Ok(_) => panic!("one-below singleton handoff ignored its work limit"),
+            Err(outcome) => outcome,
+        };
+        assert!(matches!(
+            failed,
+            FiniteOutcome::ResourceFailure {
+                error: BuildError::PlannerWorkLimit { needed, limit },
+                ..
+            } if needed == successful_work && limit == one_below
+        ));
+        assert!(failed.has_closed_receipt());
+    }
     #[test]
     fn raw_and_factored_keyword_hir_derive_the_same_exact_dictionary() {
         let raw = r"(?:\b(as)\b)|(?:\b(async)\b)|(?:\b(Self)\b)";
