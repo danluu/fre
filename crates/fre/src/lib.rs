@@ -887,8 +887,8 @@ use fre_kernels::{
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
     LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetFoldAttachment, LiteralSetPlan, LiteralSetSearchLimits,
-    PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
+    LiteralSetError, LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan,
+    LiteralSetSearchLimits, PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
     RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
@@ -10664,10 +10664,11 @@ impl PortableRegex {
     /// A K0 matcher authenticates one source-free executor and settles its
     /// immutable start-filter policy during this call. Unanchored
     /// required-literal matchers bind their value-only projection alongside
-    /// the canonical span session. Other selected plan families bind only the
-    /// existing canonical session with unlimited setup limits. The returned
-    /// owner retains no haystack and may be reused across unrelated inputs by
-    /// one mutable worker.
+    /// the canonical span session. An attachment-free, positive-width
+    /// leftmost-first literal set binds its immutable direct executor. Other
+    /// selected plan families bind only the existing canonical session with
+    /// unlimited setup limits. The returned owner retains no haystack and may
+    /// be reused across unrelated inputs by one mutable worker.
     ///
     /// This is deliberately separate from [`Self::search_session`]: ordinary
     /// methods accept no finite limits and construct no facade accounting.
@@ -10712,6 +10713,15 @@ impl PortableRegex {
                     canonical: Box::new(
                         self.search_session(SearchSessionLimits::unlimited())?,
                     ),
+                }
+            }
+            PortablePlan::LiteralSetDfa(literal_set) => {
+                if let Some(executor) = literal_set.ordinary_executor() {
+                    PortableOrdinarySessionPlan::LiteralSetDfa { executor }
+                } else {
+                    PortableOrdinarySessionPlan::Canonical(Box::new(
+                        self.search_session(SearchSessionLimits::unlimited())?,
+                    ))
                 }
             }
             _ => PortableOrdinarySessionPlan::Canonical(Box::new(
@@ -14052,6 +14062,9 @@ enum PortableOrdinarySessionPlan<'a> {
     RequiredLiteral {
         projection: PortableOrdinaryRequiredLiteral<'a>,
         canonical: Box<PortableSearchSession<'a>>,
+    },
+    LiteralSetDfa {
+        executor: LiteralSetOrdinaryExecutor<'a>,
     },
 }
 
@@ -19519,6 +19532,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 required_literal_ordinary_session_probe::record();
                 projection.is_match_at(haystack, start)
             }
+            PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|endpoint| endpoint.is_some())
+                .map_err(SearchError::from),
         }
     }
 
@@ -19553,6 +19570,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 required_literal_ordinary_session_probe::record_endpoint();
                 projection.first_acceptance_at(haystack, start)
             }
+            PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
         }
     }
 
@@ -19607,6 +19627,10 @@ impl<'r> PortableOrdinarySession<'r> {
             | PortableOrdinarySessionPlan::Canonical(session) => {
                 session.find_at_value(haystack, start, SearchLimits::unlimited())
             }
+            PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
         }
     }
 
@@ -19703,6 +19727,25 @@ impl<'r> PortableOrdinarySession<'r> {
                     }
                 }
                 Ok(Ok(()))
+            }
+            PortableOrdinarySessionPlan::LiteralSetDfa { executor } => {
+                try_visit_ordinary_spans_at(
+                    haystack.len(),
+                    start,
+                    |search_start| {
+                        executor
+                            .find_window_value(
+                                haystack,
+                                LiteralWindow::new(search_start, haystack.len()),
+                            )
+                            .map(|matched| {
+                                matched.map(|(start, end)| Match { start, end })
+                            })
+                            .map_err(SearchError::from)
+                            .map_err(PortableFindIterError::Search)
+                    },
+                    visitor,
+                )
             }
         }
     }
@@ -37487,6 +37530,73 @@ mod tests {
             })
             .is_err());
         assert!(!callback_called);
+    }
+
+    #[test]
+    fn ordinary_literal_set_dfa_binds_positive_ordered_span_and_endpoint_engine() {
+        let regex = PortableBuilder::new("ab|a|ba")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+        ));
+
+        let haystack = b"zzababa";
+        for start in 0..=haystack.len() {
+            let expected = regex
+                .find_at_value(haystack, start, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
+            assert_eq!(
+                ordinary.first_acceptance_at(haystack, start),
+                Ok(expected.map(|matched| matched.end())),
+            );
+            assert_eq!(ordinary.is_match_at(haystack, start), Ok(expected.is_some()));
+
+            let mut expected_spans = Vec::new();
+            let mut cursor = start;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                expected_spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            let mut actual_spans = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_at(haystack, start, |matched| {
+                        actual_spans.push((matched.start(), matched.end()));
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(actual_spans, expected_spans);
+        }
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
+            Ok(None),
+        );
+        assert!(matches!(
+            ordinary.find_at(haystack, haystack.len() + 1),
+            Err(SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
+                start: 8,
+                end: 7,
+                haystack_len: 7,
+            })),
+        ));
     }
 
     #[test]

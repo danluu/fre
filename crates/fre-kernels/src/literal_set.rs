@@ -246,6 +246,19 @@ pub struct LiteralSetPlan {
     folded_long_tail: Option<Box<FoldedLongTail>>,
 }
 
+/// Construction-bound ordinary-search access to a positive-width,
+/// attachment-free literal set.
+///
+/// The private field makes both properties capabilities established once by
+/// [`LiteralSetPlan::ordinary_executor`]. Searches can therefore use the
+/// authoritative matcher directly without repeating a route decision or
+/// constructing finite-search accounting.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct LiteralSetOrdinaryExecutor<'a> {
+    plan: &'a LiteralSetPlan,
+}
+
 /// Construction-sealed opportunity to attach one folded accelerator.
 ///
 /// This wrapper owns the exact DFA built from `patterns` while borrowing that
@@ -454,6 +467,19 @@ impl LiteralSetPlan {
         self.build
     }
 
+    /// Bind the direct ordinary-search engine when every retained literal is
+    /// positive-width and no folded attachment owns the selected route.
+    ///
+    /// A caller receiving `None` must retain the checked canonical engine.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn ordinary_executor(&self) -> Option<LiteralSetOrdinaryExecutor<'_>> {
+        (self.build.match_semantics == LiteralSetMatchSemantics::LeftmostFirst
+            && self.build.minimum_pattern_bytes > 0
+            && self.folded_long_tail.is_none())
+            .then_some(LiteralSetOrdinaryExecutor { plan: self })
+    }
+
     /// Additional owner bytes beyond the trie owner already in its receipt.
     #[doc(hidden)]
     #[must_use]
@@ -628,27 +654,23 @@ impl LiteralSetPlan {
                 haystack, window, limits, accounting, tail,
             );
         }
+        let matched = self.try_find_window_value(haystack, window)?;
+        Ok((matched, accounting))
+    }
+
+    #[inline]
+    fn try_find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         let input = Input::new(&haystack[window.start()..window.end()]);
-        let matched = self
-            .automaton
+        self.automaton
             .as_ref()
             .try_find(&input)
             .expect("the literal-set DFA supports its construction-selected unanchored input")
-            .map(|matched| {
-                let start = window.start().checked_add(matched.start()).ok_or(
-                    LiteralSetError::ArithmeticOverflow {
-                        computation: "literal-set match start",
-                    },
-                )?;
-                let end = window.start().checked_add(matched.end()).ok_or(
-                    LiteralSetError::ArithmeticOverflow {
-                        computation: "literal-set match end",
-                    },
-                )?;
-                Ok((start, end))
-            })
-            .transpose()?;
-        Ok((matched, accounting))
+            .map(|matched| absolute_match(window.start(), matched))
+            .transpose()
     }
 
     #[inline]
@@ -1130,14 +1152,7 @@ impl LiteralSetPlan {
         window: Window,
         accounting: LiteralSetAccounting,
     ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
-        let input = Input::new(&haystack[window.start()..window.end()]);
-        let matched = self
-            .automaton
-            .as_ref()
-            .try_find(&input)
-            .expect("the literal-set DFA supports its construction-selected unanchored input")
-            .map(|matched| absolute_match(window.start(), matched))
-            .transpose()?;
+        let matched = self.try_find_window_value(haystack, window)?;
         Ok((matched, accounting))
     }
 
@@ -1217,6 +1232,43 @@ impl LiteralSetPlan {
             .map(|matched| absolute_match(window.start(), matched))
             .transpose()?;
         Ok((matched, accounting))
+    }
+}
+
+impl LiteralSetOrdinaryExecutor<'_> {
+    /// Return the selected leftmost-first span wholly inside `window` without
+    /// finite-search accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same exact invalid-window and offset-arithmetic errors as
+    /// [`LiteralSetPlan::find_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        self.plan.try_find_window_value(haystack, window)
+    }
+
+    /// Return only the selected span's endpoint without finite-search
+    /// accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::find_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<usize>, LiteralSetError> {
+        self.find_window_value(haystack, window)
+            .map(|matched| matched.map(|(_, end)| end))
     }
 }
 
@@ -1422,13 +1474,7 @@ fn search_accounting(
     haystack_len: usize,
     limits: LiteralSetSearchLimits,
 ) -> Result<LiteralSetAccounting, LiteralSetError> {
-    if window.start() > window.end() || window.end() > haystack_len {
-        return Err(LiteralSetError::InvalidWindow {
-            start: window.start(),
-            end: window.end(),
-            haystack_len,
-        });
-    }
+    validate_window(window, haystack_len)?;
     let searched_bytes =
         window
             .end()
@@ -1453,6 +1499,18 @@ fn search_accounting(
         transitions_upper_bound,
         scratch_bytes: 0,
     })
+}
+
+#[inline]
+fn validate_window(window: Window, haystack_len: usize) -> Result<(), LiteralSetError> {
+    if window.start() > window.end() || window.end() > haystack_len {
+        return Err(LiteralSetError::InvalidWindow {
+            start: window.start(),
+            end: window.end(),
+            haystack_len,
+        });
+    }
+    Ok(())
 }
 
 fn preflight<P: AsRef<[u8]>>(
@@ -1677,6 +1735,13 @@ mod folded_long_tail_tests {
         let (accelerated, attached) = attachment.try_attach(folded_trie(), usize::MAX).unwrap();
         assert!(attached);
         (incumbent, accelerated)
+    }
+
+    #[test]
+    fn folded_attachment_keeps_the_canonical_route() {
+        let (incumbent, accelerated) = plans();
+        assert!(incumbent.ordinary_executor().is_some());
+        assert!(accelerated.ordinary_executor().is_none());
     }
 
     fn singleton_class_plans(
@@ -3597,6 +3662,97 @@ mod tests {
             .unwrap();
         assert_eq!(matches.collect::<Vec<_>>(), [(0, 1), (2, 3), (3, 5)]);
         assert_eq!(accounting, prospective);
+    }
+
+    #[test]
+    fn ordinary_executor_preserves_priority_ranges_and_non_overlapping_iteration() {
+        let plan = LiteralSetPlan::new(
+            &[b"ab".as_slice(), b"a".as_slice(), b"ab".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        let haystack = b"zzababa";
+        for start in 0..=haystack.len() {
+            let window = Window::new(start, haystack.len());
+            let expected = plan
+                .find_window(haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(ordinary.find_window_value(haystack, window), Ok(expected));
+            assert_eq!(
+                ordinary.selected_end_window_value(haystack, window),
+                Ok(expected.map(|(_, end)| end)),
+            );
+        }
+
+        let mut cursor = 0;
+        let mut spans = Vec::new();
+        while let Some(matched) = ordinary
+            .find_window_value(haystack, Window::new(cursor, haystack.len()))
+            .unwrap()
+        {
+            spans.push(matched);
+            cursor = matched.1;
+        }
+        assert_eq!(spans, [(2, 4), (4, 6), (6, 7)]);
+
+        let short_first = LiteralSetPlan::new(
+            &[b"a".as_slice(), b"ab".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            short_first
+                .ordinary_executor()
+                .unwrap()
+                .find_window_value(b"zzab", Window::new(0, 4)),
+            Ok(Some((2, 3))),
+        );
+    }
+
+    #[test]
+    fn ordinary_executor_admission_and_window_validation_are_exact() {
+        let positive = LiteralSetPlan::new(
+            &[b"ab".as_slice(), b"cd".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let ordinary = positive.ordinary_executor().unwrap();
+        for (window, expected) in [
+            (
+                Window::new(3, 2),
+                LiteralSetError::InvalidWindow {
+                    start: 3,
+                    end: 2,
+                    haystack_len: 4,
+                },
+            ),
+            (
+                Window::new(0, 5),
+                LiteralSetError::InvalidWindow {
+                    start: 0,
+                    end: 5,
+                    haystack_len: 4,
+                },
+            ),
+        ] {
+            assert_eq!(ordinary.find_window_value(b"abcd", window), Err(expected));
+        }
+
+        let nullable = LiteralSetPlan::new(
+            &[b"a".as_slice(), b"".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(nullable.ordinary_executor().is_none());
+
+        let streaming = LiteralSetPlan::new_streaming_any(
+            &[b"ab".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(streaming.ordinary_executor().is_none());
     }
 
     #[test]

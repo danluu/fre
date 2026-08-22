@@ -462,7 +462,7 @@ pub use literal_class_run_literal::{
 pub use literal_set::{
     LiteralSetAccounting, LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError,
     LiteralSetFoldAttachment, LiteralSetIterationAccounting, LiteralSetMatchSemantics,
-    LiteralSetMatches, LiteralSetPlan, LiteralSetSearchLimits,
+    LiteralSetMatches, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
 };
 pub use ordered_literal_aggregate::{
     ALGORITHM_ID as ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
