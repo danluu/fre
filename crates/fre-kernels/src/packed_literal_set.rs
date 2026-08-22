@@ -74,8 +74,11 @@ const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 const RETAINED_ITER_DENSE_GAP_BYTES: usize = 64;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
+// UniformWord64 admits at least two equal-width literals in one word, so no
+// retained literal is wider than half its state. After nearby hits, keep the
+// native short-tail path only when even that widest literal cannot fit.
 #[cfg(not(feature = "static-dispatch"))]
-const RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES: usize = 64;
+const RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES: usize = UNIFORM_WORD64_STATE_BITS / 2;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS: usize = 8;
 
@@ -4420,6 +4423,77 @@ mod tests {
                 limit: work.checked_sub(1).unwrap(),
             })
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_iterator_preserves_matches_at_uniform_tail_boundary() {
+        let threshold = super::RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
+        assert_eq!(threshold, 32);
+        for width in [8, threshold] {
+            let first = vec![b'a'; width];
+            let mut second = first.clone();
+            second[width - 1] = b'b';
+            let patterns = [first.as_slice(), second.as_slice()];
+            let plan = PackedLiteralSetPlan::new_retained_iter(
+                &patterns,
+                PackedLiteralSetBuildLimits::default(),
+                usize::MAX,
+            )
+            .unwrap();
+            for remaining in [threshold - 1, threshold, threshold + 1] {
+                let mut haystack = vec![0xff; 160];
+                haystack[..width].copy_from_slice(patterns[0]);
+                haystack[width..width * 2].copy_from_slice(patterns[0]);
+                let tail_start = haystack.len() - remaining;
+                if width <= remaining {
+                    haystack[tail_start..tail_start + width].copy_from_slice(patterns[1]);
+                }
+                let expected = plan
+                    .find_window(
+                        &haystack,
+                        Window::new(tail_start, haystack.len()),
+                        PackedLiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+
+                let mut unmetered = plan.search_cursor(&haystack).unwrap();
+                assert_eq!(unmetered.find_at_value_unmetered(0), Ok(Some((0, width))));
+                assert!(!unmetered.dense);
+                assert_eq!(
+                    unmetered.find_at_value_unmetered(width),
+                    Ok(Some((width, width * 2))),
+                );
+                assert!(unmetered.dense);
+                assert_eq!(unmetered.find_at_value_unmetered(tail_start), Ok(expected));
+
+                let mut checked = plan.search_cursor(&haystack).unwrap();
+                assert_eq!(
+                    checked
+                        .find_at(0, PackedLiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    Some((0, width)),
+                );
+                assert!(!checked.dense);
+                assert_eq!(
+                    checked
+                        .find_at(width, PackedLiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    Some((width, width * 2)),
+                );
+                assert!(checked.dense);
+                assert_eq!(
+                    checked
+                        .find_at(tail_start, PackedLiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    expected,
+                );
+            }
+        }
     }
 
     #[test]
