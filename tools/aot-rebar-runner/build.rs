@@ -93,38 +93,65 @@ fn main() {
         return;
     }
     if benchmark.uses_uniform_capture_bridge() {
-        let bridge = shared::compile_uniform_capture_bridge(&benchmark, target)
-            .expect("compile helper-free public Rebar uniform-capture bridge");
-        let mut object_paths = Vec::new();
-        object_paths
-            .try_reserve_exact(bridge.rows.artifacts.len())
-            .expect("reserve uniform-capture object paths");
-        for (index, artifact) in bridge.rows.artifacts.iter().enumerate() {
-            let row_path = output.join(format!("aot-rebar-capture-row-{index}.o"));
-            fs::write(&row_path, artifact.compiled.object())
-                .expect("write linked uniform-capture selector object");
-            object_paths.push(row_path);
-        }
-        fs::write(&object_path, []).expect("write unused scalar object sentinel");
-        fs::write(
-            &generated_path,
-            configured_native_row_source(
-                &benchmark,
-                &bridge.rows,
-                Some(&bridge.source_receipts),
-                &architecture,
-                &operating_system,
-                feature_bits,
-                &source_commit,
-                &source_tree,
-            ),
-        )
-        .expect("write linked uniform-capture bindings");
-        for row_path in object_paths {
-            println!(
-                "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
-                row_path.display()
-            );
+        match shared::try_compile_uniform_capture_bridge(&benchmark, target)
+            .expect("compile helper-free public Rebar uniform-capture bridge")
+        {
+            shared::UniformCaptureBridgeDisposition::Proven(bridge) => {
+                let mut object_paths = Vec::new();
+                object_paths
+                    .try_reserve_exact(bridge.rows.artifacts.len())
+                    .expect("reserve uniform-capture object paths");
+                for (index, artifact) in bridge.rows.artifacts.iter().enumerate() {
+                    let row_path = output.join(format!("aot-rebar-capture-row-{index}.o"));
+                    fs::write(&row_path, artifact.compiled.object())
+                        .expect("write linked uniform-capture selector object");
+                    object_paths.push(row_path);
+                }
+                fs::write(&object_path, []).expect("write unused scalar object sentinel");
+                fs::write(
+                    &generated_path,
+                    configured_native_row_source(
+                        &benchmark,
+                        &bridge.rows,
+                        Some(&bridge.source_receipts),
+                        &architecture,
+                        &operating_system,
+                        feature_bits,
+                        &source_commit,
+                        &source_tree,
+                    ),
+                )
+                .expect("write linked uniform-capture bindings");
+                for row_path in object_paths {
+                    println!(
+                        "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                        row_path.display()
+                    );
+                }
+            }
+            shared::UniformCaptureBridgeDisposition::Declined { .. } => {
+                let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
+                    .expect("compile exact single-pattern helper-free capture route");
+                fs::write(&object_path, bridge.artifact.object())
+                    .expect("write linked strict capture object");
+                fs::write(
+                    &generated_path,
+                    configured_strict_capture_source(
+                        &benchmark,
+                        &bridge,
+                        &architecture,
+                        &operating_system,
+                        feature_bits,
+                        &source_commit,
+                        &source_tree,
+                    ),
+                )
+                .expect("write linked strict capture bindings");
+                println!(
+                    "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                    object_path.display()
+                );
+            }
         }
         return;
     }
@@ -552,6 +579,7 @@ fn configured_source(
     source.push_str(
         "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
+    push_empty_strict_capture_bindings(&mut source);
     source
 }
 
@@ -764,6 +792,261 @@ fn configured_regex_redux_source(
         writeln!(source, "        {component} => unsafe {{ REGEX_REDUX_ENTRY_{component}(haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
     }
     source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
+    push_empty_strict_capture_bindings(&mut source);
+    source
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generated strict binding closes the complete capture artifact identity"
+)]
+fn configured_strict_capture_source(
+    benchmark: &shared::Benchmark,
+    bridge: &shared::StrictCaptureBridge,
+    architecture: &str,
+    operating_system: &str,
+    feature_bits: u64,
+    source_commit: &str,
+    source_tree: &str,
+) -> String {
+    assert!(benchmark.model.is_capture());
+    assert_eq!(benchmark.patterns.len(), 1);
+    let artifact = &bridge.artifact;
+    assert!(artifact.authenticates_receipt());
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
+    let receipt = artifact.receipt();
+    let next_symbol = artifact.capture_next_symbol();
+    let materialize_symbol = artifact.capture_materialize_symbol();
+    let selector_symbol = artifact.selector_entry_symbol();
+    let adapter = match benchmark.model {
+        shared::Model::CountCaptures => "general-aot-native-single-capture-next-count-v1",
+        shared::Model::GrepCaptures => "general-aot-native-single-capture-next-grep-v1",
+        _ => unreachable!("strict capture source requires a capture model"),
+    };
+    let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
+        "per-line-native-single-capture-next-v1"
+    } else {
+        "not-applicable"
+    };
+
+    let mut source = String::new();
+    source.push_str("pub const CONFIGURED: bool = true;\n");
+    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = true;\n");
+    writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_NAME: &str = {:?};",
+        benchmark.name
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_MODEL: &str = {:?};",
+        benchmark.model.name()
+    )
+    .unwrap();
+    source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
+    source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 0;\n");
+    source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
+    source.push_str("pub const EXPECTED_PATTERN: &str = \"\";\n");
+    writeln!(
+        source,
+        "pub const EXPECTED_PATTERNS: &[&str] = &{:?};",
+        benchmark.patterns
+    )
+    .unwrap();
+    source.push_str("pub const SOURCE_PATTERN_COUNT: usize = 1;\n");
+    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 1;\n");
+    writeln!(
+        source,
+        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
+        artifact.object().len()
+    )
+    .unwrap();
+    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];\n");
+    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];\n");
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &[{next_symbol:?}];"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.selector_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.capture_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
+        receipt.object_sha256()
+    )
+    .unwrap();
+    source.push_str("pub const UNIFORM_CAPTURE_ALGORITHM_VERSION: u32 = 0;\n");
+    source.push_str("pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = 0;\n");
+    source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
+    source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_AUTOMATON_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_GROUP_COUNT: usize = {};",
+        receipt.group_count()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_CAN_MATCH_EMPTY: bool = {};",
+        receipt.can_match_empty()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_SOURCE_SHA256: [u8; 32] = {:?};",
+        receipt.source_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_SELECTOR_SHA256: [u8; 32] = {:?};",
+        receipt.selector_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_CAPTURE_SHA256: [u8; 32] = {:?};",
+        receipt.capture_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_PLAN_SHA256: [u8; 32] = {:?};",
+        receipt.plan_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_BUNDLE_SHA256: [u8; 32] = {:?};",
+        receipt.bundle_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = {:?};",
+        receipt.artifact_identity_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = {next_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = {materialize_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = {selector_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_UNICODE: bool = {};",
+        benchmark.unicode
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_CASE_INSENSITIVE: bool = {};",
+        benchmark.case_insensitive
+    )
+    .unwrap();
+    writeln!(source, "pub const TARGET_ARCH: &str = {architecture:?};").unwrap();
+    writeln!(source, "pub const TARGET_OS: &str = {operating_system:?};").unwrap();
+    writeln!(source, "pub const FEATURE_BITS: u64 = {feature_bits};").unwrap();
+    writeln!(source, "pub const SOURCE_COMMIT: &str = {source_commit:?};").unwrap();
+    writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
+    source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
+    source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
+    writeln!(source, "pub const ENTRY_SYMBOL: &str = {next_symbol:?};").unwrap();
+    source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
+    source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
+    writeln!(
+        source,
+        "pub const GREP_ITERATION_STRATEGY: &str = {grep_strategy:?};"
+    )
+    .unwrap();
+    source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
+    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
+    source.push_str("pub const ENGINE: &str = \"NativeOnePassCaptureV1\";\n");
+    source.push_str(
+        "pub const AGGREGATE_STRATEGY: &str = \"native-single-capture-next-participation-v1\";\n",
+    );
+    writeln!(
+        source,
+        "pub const COMPILER_VERSION: u32 = {};",
+        fre_aot_regex::COMPILER_VERSION
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OPTIMIZER_VERSION: u32 = {};",
+        fre_aot_regex::OPTIMIZER_VERSION
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PROGRAM_SHA256: [u8; 32] = {:?};",
+        receipt.capture_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {:?};",
+        receipt.object_sha256()
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
+    source.push_str("unsafe extern \"C\" {\n");
+    writeln!(source, "    #[link_name = {next_symbol:?}]").unwrap();
+    source.push_str("    fn LINKED_STRICT_CAPTURE_NEXT(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32;\n");
+    source.push_str("}\n");
+    source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
+    source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
     source
 }
 
@@ -1182,13 +1465,42 @@ fn configured_native_row_source(
     source.push_str(
         "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
+    push_empty_strict_capture_bindings(&mut source);
     source
+}
+
+fn push_empty_strict_capture_bindings(source: &mut String) {
+    source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;\n");
+    source.push_str("pub const STRICT_CAPTURE_CAN_MATCH_EMPTY: bool = false;\n");
+    source.push_str("pub const STRICT_CAPTURE_SOURCE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_SELECTOR_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_CAPTURE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_PLAN_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_BUNDLE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = \"\";\n");
+    source.push_str("pub unsafe fn capture_next(_haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, _slot_count: usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
 pub const UNIFORM_CAPTURE_BRIDGE: bool = false;
+pub const STRICT_CAPTURE_BRIDGE: bool = false;
+pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;
+pub const STRICT_CAPTURE_CAN_MATCH_EMPTY: bool = false;
+pub const STRICT_CAPTURE_SOURCE_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_SELECTOR_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_CAPTURE_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_PLAN_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_BUNDLE_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = "";
+pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = "";
+pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = "";
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
@@ -1285,6 +1597,13 @@ pub unsafe fn regex_redux_search(
     _window_start: usize,
     _window_end: usize,
     _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
+) -> u32 { 2 }
+pub unsafe fn capture_next(
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1,
+    _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1,
+    _slot_count: usize,
 ) -> u32 { 2 }
 "#
 }

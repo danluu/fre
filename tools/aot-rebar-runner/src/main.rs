@@ -17,17 +17,17 @@ use fre_aot_regex::{
     CompiledRegex, DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
 };
-use fre_aot_regex_runtime::{
-    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK,
-    FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
-    FreAotRegexPrepareConfigV3, FreAotRegexResultV1, PREPARE_CAPABILITY_KNOWN_FLAGS,
-    PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
-    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
-    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
-    fre_aot_regex_runtime_prepare_exclusive_v3,
-};
 #[cfg(test)]
 use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
+use fre_aot_regex_runtime::{
+    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, FreAotRegexCaptureSlotV1,
+    FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
+    FreAotRegexPrepareConfigV3, FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST,
+    ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PREPARE_CAPABILITY_KNOWN_FLAGS,
+    PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
+    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v2, fre_aot_regex_runtime_prepare_exclusive_v3,
+};
 use regex_automata::{Input, meta::Regex};
 
 #[allow(
@@ -647,6 +647,138 @@ fn strict_uniform_capture_reduce(model: shared::Model, haystack: &[u8]) -> Resul
     }
 }
 
+fn validate_strict_capture_state(
+    state: FreAotRegexIterStateV1,
+    haystack_len: usize,
+) -> Result<(), String> {
+    if state.reserved != 0
+        || state.flags & !ITER_KNOWN_FLAGS != 0
+        || state.next_start > haystack_len
+        || (state.flags & ITER_HAS_LAST != 0 && state.last_match_end > haystack_len)
+        || (state.flags & ITER_PENDING_EMPTY != 0
+            && (state.flags & ITER_HAS_LAST == 0
+                || state.flags & ITER_FINISHED != 0
+                || state.next_start != state.last_match_end))
+    {
+        return Err("strict capture iterator published malformed continuation state".to_owned());
+    }
+    Ok(())
+}
+
+fn strict_capture_row_participation(
+    haystack_len: usize,
+    slots: &[FreAotRegexCaptureSlotV1],
+) -> Result<u64, String> {
+    let Some(group_zero) = slots.first().copied() else {
+        return Err("strict capture result omitted group zero".to_owned());
+    };
+    if group_zero == FreAotRegexCaptureSlotV1::UNMATCHED
+        || group_zero.start > group_zero.end
+        || group_zero.end > haystack_len
+    {
+        return Err("strict capture group zero is malformed or out of bounds".to_owned());
+    }
+    let mut participating = 0_u64;
+    for slot in slots {
+        let start_unset = slot.start == usize::MAX;
+        let end_unset = slot.end == usize::MAX;
+        if start_unset != end_unset {
+            return Err("strict capture result contains a half-unmatched group".to_owned());
+        }
+        if start_unset {
+            continue;
+        }
+        if slot.start < group_zero.start
+            || slot.start > slot.end
+            || slot.end > group_zero.end
+            || slot.end > haystack_len
+        {
+            return Err("strict capture result contains an invalid group span".to_owned());
+        }
+        participating = participating
+            .checked_add(1)
+            .ok_or_else(|| "strict capture participation count overflowed".to_owned())?;
+    }
+    Ok(participating)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generated identity-suffixed capture-next declaration is the audited native ABI boundary"
+)]
+fn strict_linked_capture_count_domain(
+    haystack: &[u8],
+    slots: &mut [FreAotRegexCaptureSlotV1],
+) -> Result<u64, String> {
+    if slots.len() != linked::STRICT_CAPTURE_GROUP_COUNT || slots.is_empty() {
+        return Err("strict capture slot storage disagrees with its linked schema".to_owned());
+    }
+    let mut state = FreAotRegexIterStateV1::default();
+    let mut total = 0_u64;
+    loop {
+        slots.fill(FreAotRegexCaptureSlotV1::UNMATCHED);
+        let before = state;
+        // SAFETY: the complete byte slice, aligned iterator state, and exact
+        // receipt-sized result slice are live and pairwise disjoint. Runtime
+        // authentication admits this call only for the linked native route.
+        let status = unsafe {
+            linked::capture_next(
+                haystack.as_ptr(),
+                haystack.len(),
+                &mut state,
+                slots.as_mut_ptr(),
+                slots.len(),
+            )
+        };
+        validate_strict_capture_state(state, haystack.len())?;
+        match status {
+            STATUS_NO_MATCH => {
+                if state.flags & ITER_FINISHED == 0
+                    || slots
+                        .iter()
+                        .any(|slot| *slot != FreAotRegexCaptureSlotV1::UNMATCHED)
+                {
+                    return Err(
+                        "strict capture exhaustion did not fuse state and clear slots".to_owned(),
+                    );
+                }
+                return Ok(total);
+            }
+            STATUS_MATCH => {
+                if state == before {
+                    return Err("strict capture iterator made no progress".to_owned());
+                }
+                let groups = strict_capture_row_participation(haystack.len(), slots)?;
+                total = total
+                    .checked_add(groups)
+                    .ok_or_else(|| "strict capture total overflowed".to_owned())?;
+            }
+            other => {
+                return Err(format!(
+                    "linked strict capture entry {:?} returned status {other}",
+                    linked::STRICT_CAPTURE_NEXT_SYMBOL,
+                ));
+            }
+        }
+    }
+}
+
+fn strict_capture_reduce(
+    model: shared::Model,
+    haystack: &[u8],
+    slots: &mut [FreAotRegexCaptureSlotV1],
+) -> Result<u64, String> {
+    match model {
+        shared::Model::CountCaptures => strict_linked_capture_count_domain(haystack, slots),
+        shared::Model::GrepCaptures => haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(strict_linked_capture_count_domain(line, slots)?)
+                .ok_or_else(|| "linked strict grep-captures count overflowed".to_owned())
+        }),
+        _ => Err("strict capture bridge received an unsupported operation model".to_owned()),
+    }
+}
+
 fn main() -> Result<(), DynError> {
     let arguments = parse_arguments()?;
     if arguments.version {
@@ -775,6 +907,39 @@ fn print_provenance() {
         }
         println!(
             "{provenance} boundary=complete-regex-redux-aot-precompiled required_comparators=rust-regex-1.12.4,fre-current-runtime"
+        );
+        return;
+    }
+    if linked::STRICT_CAPTURE_BRIDGE {
+        println!(
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-onepass-capture-next-v1 capture_group_count={} capture_can_match_empty={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} capture_plan_sha256={} capture_bundle_sha256={} capture_artifact_identity_sha256={} capture_materialize_symbol={} capture_selector_symbol={} boundary=native-search-core-with-native-capture-materialization-adapter-loop required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            linked::CONFIGURED,
+            linked::ADAPTER,
+            linked::EXPECTED_MODEL,
+            linked::EXPECTED_NAME,
+            linked::SOURCE_COMMIT,
+            linked::SOURCE_TREE,
+            linked::TARGET_ARCH,
+            linked::TARGET_OS,
+            linked::FEATURE_BITS,
+            linked::COMPILER_VERSION,
+            linked::OPTIMIZER_VERSION,
+            linked::ENGINE,
+            linked::AGGREGATE_STRATEGY,
+            linked::ROW_TOTAL_OBJECT_BYTES,
+            linked::STRICT_CAPTURE_NEXT_SYMBOL,
+            hex(&linked::STRICT_CAPTURE_CAPTURE_SHA256),
+            hex(&linked::OBJECT_SHA256),
+            linked::STRICT_CAPTURE_GROUP_COUNT,
+            linked::STRICT_CAPTURE_CAN_MATCH_EMPTY,
+            hex(&linked::STRICT_CAPTURE_SOURCE_SHA256),
+            hex(&linked::STRICT_CAPTURE_SELECTOR_SHA256),
+            hex(&linked::STRICT_CAPTURE_CAPTURE_SHA256),
+            hex(&linked::STRICT_CAPTURE_PLAN_SHA256),
+            hex(&linked::STRICT_CAPTURE_BUNDLE_SHA256),
+            hex(&linked::STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256),
+            linked::STRICT_CAPTURE_MATERIALIZE_SYMBOL,
+            linked::STRICT_CAPTURE_SELECTOR_SYMBOL,
         );
         return;
     }
@@ -972,11 +1137,18 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
-    if linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
-        return Err("uniform-capture receipt is not attached to a native-row table".to_owned());
+    if (linked::UNIFORM_CAPTURE_BRIDGE || linked::STRICT_CAPTURE_BRIDGE)
+        && !linked::NATIVE_ROW_BRIDGE
+    {
+        return Err("capture receipt is not attached to a native operation route".to_owned());
     }
-    if benchmark.uses_uniform_capture_bridge() != linked::UNIFORM_CAPTURE_BRIDGE {
-        return Err("capture operation and linked proof route disagree".to_owned());
+    if linked::UNIFORM_CAPTURE_BRIDGE && linked::STRICT_CAPTURE_BRIDGE {
+        return Err("linked capture routes are not mutually exclusive".to_owned());
+    }
+    if benchmark.model.is_capture()
+        != (linked::UNIFORM_CAPTURE_BRIDGE || linked::STRICT_CAPTURE_BRIDGE)
+    {
+        return Err("capture operation and linked native route disagree".to_owned());
     }
     if benchmark.model == shared::Model::RegexRedux {
         if linked::REGEX_REDUX_COMPONENT_COUNT != shared::REGEX_REDUX_COMPONENTS
@@ -1125,7 +1297,14 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
     const CAPTURE_STRATEGY: &str = "native-row-static-uniform-capture-multiplier-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
-    if linked::UNIFORM_CAPTURE_BRIDGE != benchmark.uses_uniform_capture_bridge()
+    if linked::STRICT_CAPTURE_BRIDGE {
+        if !benchmark.model.is_capture()
+            || benchmark.patterns.len() != 1
+            || linked::UNIFORM_CAPTURE_BRIDGE
+        {
+            return Err("linked strict capture route has the wrong operation shape".to_owned());
+        }
+    } else if linked::UNIFORM_CAPTURE_BRIDGE != benchmark.uses_uniform_capture_bridge()
         || (!linked::UNIFORM_CAPTURE_BRIDGE && !benchmark.uses_native_row_bridge())
     {
         return Err("linked native-row table is bound to an invalid benchmark model".to_owned());
@@ -1166,7 +1345,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden prepared/helper route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::UNIFORM_CAPTURE_BRIDGE {
+    let expected_aggregate_strategy = if linked::STRICT_CAPTURE_BRIDGE {
+        "native-single-capture-next-participation-v1"
+    } else if linked::UNIFORM_CAPTURE_BRIDGE {
         CAPTURE_STRATEGY
     } else {
         ROW_STRATEGY
@@ -1176,11 +1357,14 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else {
         "not-applicable"
     };
-    let expected_grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
-        GREP_CAPTURE_STRATEGY
-    } else {
-        "not-applicable"
-    };
+    let expected_grep_strategy =
+        if linked::STRICT_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
+            "per-line-native-single-capture-next-v1"
+        } else if benchmark.model == shared::Model::GrepCaptures {
+            GREP_CAPTURE_STRATEGY
+        } else {
+            "not-applicable"
+        };
     if linked::AGGREGATE_STRATEGY != expected_aggregate_strategy
         || linked::SPAN_ITERATION_STRATEGY != expected_span_strategy
         || linked::GREP_ITERATION_STRATEGY != expected_grep_strategy
@@ -1246,6 +1430,44 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || !linked::SOURCE_SELECTOR_OBJECT_SHA256.is_empty()
     {
         return Err("ordinary native-row route advertises capture proof state".to_owned());
+    }
+
+    if linked::STRICT_CAPTURE_BRIDGE {
+        if linked::STRICT_CAPTURE_GROUP_COUNT == 0
+            || linked::STRICT_CAPTURE_GROUP_COUNT > shared::MAX_STRICT_CAPTURE_GROUPS
+            || linked::STRICT_CAPTURE_SOURCE_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_SELECTOR_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_CAPTURE_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_PLAN_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_BUNDLE_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256 == [0; 32]
+            || linked::STRICT_CAPTURE_NEXT_SYMBOL.is_empty()
+            || linked::STRICT_CAPTURE_MATERIALIZE_SYMBOL.is_empty()
+            || linked::STRICT_CAPTURE_SELECTOR_SYMBOL.is_empty()
+            || linked::STRICT_CAPTURE_NEXT_SYMBOL == linked::STRICT_CAPTURE_MATERIALIZE_SYMBOL
+            || linked::STRICT_CAPTURE_NEXT_SYMBOL == linked::STRICT_CAPTURE_SELECTOR_SYMBOL
+            || linked::STRICT_CAPTURE_MATERIALIZE_SYMBOL == linked::STRICT_CAPTURE_SELECTOR_SYMBOL
+            || linked::ROW_ENTRY_SYMBOLS != [linked::STRICT_CAPTURE_NEXT_SYMBOL]
+            || linked::ROW_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+            || linked::PROGRAM_SHA256 != linked::STRICT_CAPTURE_CAPTURE_SHA256
+            || linked::OBJECT_SHA256 == [0; 32]
+            || linked::ENTRY_SYMBOL != linked::STRICT_CAPTURE_NEXT_SYMBOL
+        {
+            return Err("linked strict capture identity closure is malformed".to_owned());
+        }
+    } else if linked::STRICT_CAPTURE_GROUP_COUNT != 0
+        || linked::STRICT_CAPTURE_CAN_MATCH_EMPTY
+        || linked::STRICT_CAPTURE_SOURCE_SHA256 != [0; 32]
+        || linked::STRICT_CAPTURE_SELECTOR_SHA256 != [0; 32]
+        || linked::STRICT_CAPTURE_CAPTURE_SHA256 != [0; 32]
+        || linked::STRICT_CAPTURE_PLAN_SHA256 != [0; 32]
+        || linked::STRICT_CAPTURE_BUNDLE_SHA256 != [0; 32]
+        || linked::STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256 != [0; 32]
+        || !linked::STRICT_CAPTURE_NEXT_SYMBOL.is_empty()
+        || !linked::STRICT_CAPTURE_MATERIALIZE_SYMBOL.is_empty()
+        || !linked::STRICT_CAPTURE_SELECTOR_SYMBOL.is_empty()
+    {
+        return Err("non-strict route advertises strict capture state".to_owned());
     }
 
     let mut previous_first = None;
@@ -1433,8 +1655,15 @@ fn run_operation_route(
 }
 
 fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>, String> {
-    let operation = |haystack: &[u8]| {
-        if linked::UNIFORM_CAPTURE_BRIDGE {
+    let mut capture_slots = if linked::STRICT_CAPTURE_BRIDGE {
+        vec![FreAotRegexCaptureSlotV1::UNMATCHED; linked::STRICT_CAPTURE_GROUP_COUNT]
+    } else {
+        Vec::new()
+    };
+    let mut operation = |haystack: &[u8]| {
+        if linked::STRICT_CAPTURE_BRIDGE {
+            strict_capture_reduce(benchmark.model, haystack, &mut capture_slots)
+        } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
         } else {
             strict_native_row_reduce(benchmark.model, haystack)
@@ -2172,6 +2401,61 @@ mod tests {
         })
         .expect_err("group zero makes every valid multiplier positive");
         assert!(zero.contains("contain zero"), "{zero}");
+    }
+
+    #[test]
+    fn strict_capture_slots_and_iterator_state_fail_closed() {
+        let valid = [
+            FreAotRegexCaptureSlotV1 { start: 1, end: 4 },
+            FreAotRegexCaptureSlotV1 { start: 2, end: 2 },
+            FreAotRegexCaptureSlotV1::UNMATCHED,
+        ];
+        assert_eq!(strict_capture_row_participation(5, &valid), Ok(2));
+
+        for invalid in [
+            vec![
+                FreAotRegexCaptureSlotV1 { start: 1, end: 4 },
+                FreAotRegexCaptureSlotV1 {
+                    start: usize::MAX,
+                    end: 2,
+                },
+            ],
+            vec![
+                FreAotRegexCaptureSlotV1 { start: 1, end: 4 },
+                FreAotRegexCaptureSlotV1 { start: 0, end: 2 },
+            ],
+            vec![
+                FreAotRegexCaptureSlotV1 { start: 1, end: 4 },
+                FreAotRegexCaptureSlotV1 { start: 2, end: 5 },
+            ],
+        ] {
+            assert!(strict_capture_row_participation(5, &invalid).is_err());
+        }
+        assert!(strict_capture_row_participation(5, &[]).is_err());
+
+        assert!(validate_strict_capture_state(FreAotRegexIterStateV1::default(), 5).is_ok());
+        assert!(
+            validate_strict_capture_state(
+                FreAotRegexIterStateV1 {
+                    next_start: 6,
+                    ..FreAotRegexIterStateV1::default()
+                },
+                5,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_strict_capture_state(
+                FreAotRegexIterStateV1 {
+                    next_start: 2,
+                    last_match_end: 2,
+                    flags: ITER_PENDING_EMPTY,
+                    reserved: 0,
+                },
+                5,
+            )
+            .is_err()
+        );
     }
 
     #[test]

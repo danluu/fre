@@ -2,9 +2,11 @@ use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, CompiledRegex, FeatureSet, OperatingSystem,
-    OutputContract, PreparedAggregateExports, SymbolBinding, SymbolKind, Target,
+    OutputContract, PreparedAggregateExports, RebarSingleCaptureAotArtifactV1,
+    RebarSingleCaptureAotRequestV1, SymbolBinding, SymbolKind, Target,
     UniformCaptureCompileDisposition, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
-    compile, compile_uniform_capture_selector, compile_with_prepared_aggregate_exports,
+    compile, compile_rebar_single_capture_aot_v1, compile_uniform_capture_selector,
+    compile_with_prepared_aggregate_exports,
 };
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
 
@@ -17,6 +19,10 @@ pub const MAX_NATIVE_ROW_BRIDGE_PATTERNS: usize = 4_096;
 /// Maximum combined bytes of distinct relocatable row objects linked into one
 /// job-specialized bridge binary.
 pub const MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES: usize = 256 * 1_048_576;
+/// Maximum group-zero-inclusive slot count accepted by the strict capture
+/// adapter. This keeps its one caller-owned result allocation inside the same
+/// deliberately small cardinality envelope as the native-row bridge.
+pub const MAX_STRICT_CAPTURE_GROUPS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Model {
@@ -448,6 +454,59 @@ pub struct NativeRowBridge {
 pub struct UniformCaptureBridge {
     pub rows: NativeRowBridge,
     pub source_receipts: Vec<UniformCaptureCompileReceipt>,
+}
+
+/// One exact-cardinality, helper-free native capture iterator.
+#[derive(Debug)]
+pub struct StrictCaptureBridge {
+    pub artifact: RebarSingleCaptureAotArtifactV1,
+}
+
+/// Compile the typed one-source Rebar capture route after a semantic decline
+/// from a more specific static theorem. This function performs no fallback of
+/// its own: every parse, construction, resource, allocator, emission, and
+/// authentication error is terminal.
+pub fn compile_strict_capture_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<StrictCaptureBridge, String> {
+    if !benchmark.model.is_capture() {
+        return Err("strict capture compilation requires a capture model".to_owned());
+    }
+    let mut request =
+        RebarSingleCaptureAotRequestV1::try_from_patterns(benchmark.patterns.clone(), target)
+            .map_err(|error| error.to_string())?;
+    request = request
+        .case_insensitive(benchmark.case_insensitive)
+        .unicode(benchmark.unicode);
+    let artifact = compile_rebar_single_capture_aot_v1(request)
+        .map_err(|error| format!("strict capture compilation failed: {error}"))?;
+    if !artifact.authenticates_receipt()
+        || artifact.object().is_empty()
+        || artifact.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || artifact.receipt().group_count() == 0
+        || artifact.receipt().group_count() > MAX_STRICT_CAPTURE_GROUPS
+        || artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_some()
+    {
+        return Err("strict capture artifact failed helper-free route authentication".to_owned());
+    }
+    let capture_next = artifact.capture_next_symbol();
+    let capture_materialize = artifact.capture_materialize_symbol();
+    let selector = artifact.selector_entry_symbol();
+    if capture_next.is_empty()
+        || capture_materialize.is_empty()
+        || selector.is_empty()
+        || capture_next == capture_materialize
+        || capture_next == selector
+        || capture_materialize == selector
+    {
+        return Err("strict capture artifact has a malformed export closure".to_owned());
+    }
+    Ok(StrictCaptureBridge { artifact })
 }
 
 /// Build-time result that keeps a semantic theorem decline distinct from a
@@ -1111,6 +1170,44 @@ mod tests {
             assert!(error.contains("source ordinal 0"), "{error}");
             assert!(error.contains("proof declined"), "{error}");
         }
+    }
+
+    #[test]
+    fn strict_capture_bridge_is_exactly_one_source_and_helper_free() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab b"))
+            .expect("strict capture fixture");
+        assert!(matches!(
+            try_compile_uniform_capture_bridge(&benchmark, target),
+            Ok(UniformCaptureBridgeDisposition::Declined { .. })
+        ));
+        let strict = compile_strict_capture_bridge(&benchmark, target).expect("strict capture");
+        assert!(strict.artifact.authenticates_receipt());
+        assert!(
+            strict
+                .artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert_eq!(strict.artifact.receipt().source_cardinality(), 1);
+        assert!(strict.artifact.receipt().includes_group_zero());
+        assert!(strict.artifact.receipt().group_count() <= MAX_STRICT_CAPTURE_GROUPS);
+
+        let mut many = fixture("count-captures", b"(a)", b"a");
+        let offset = many
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        many.splice(offset..offset, b"pattern:3:(b)\n".iter().copied());
+        let many = Benchmark::parse(&many).expect("multi-source capture fixture");
+        assert!(compile_strict_capture_bridge(&many, target).is_err());
     }
 
     #[test]

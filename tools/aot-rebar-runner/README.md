@@ -19,6 +19,10 @@ The compiler proves from the same canonical HIR that every nonempty match has
 one uniform group-zero-inclusive participation count, then seals that proof to
 the exact ordinary native Span selector. Rust selects spans and adds the
 winning row's compile-time count; it does not materialize capture offsets.
+If that theorem specifically declines for an exact one-pattern job, the build
+may instead link an independently authenticated helper-free native
+`capture_next` iterator. Parse, lowering, allocation, resource, emission, and
+authentication failures are terminal and are never converted into fallback.
 
 ```sh
 rebar klv --max-iters 9 --max-warmup-iters 1 \
@@ -81,6 +85,14 @@ timing belongs to a separately named compiler-stage benchmark.
   source/row cardinalities, priority mapping, and automaton/program/object
   hashes. An independently constructed Rust captures oracle remains
   authoritative for the final value.
+  An exact one-pattern semantic decline may select the stricter native
+  `capture_next` route instead. That iterator publishes every
+  group-zero-inclusive slot into one caller-owned allocation, and the adapter
+  validates continuation state, fused exhaustion, slot completeness,
+  containment, progress, and checked participation totals on every result.
+  The route admits at most 4,096 capture groups, exposes no runtime helper, and
+  remains a native search/capture core with a checked Rust adapter loop rather
+  than a wholly fused operation.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
   and all five ordered substitutions through their separately linked ordinary
   Span entries. Rust owns only checked stage sequencing, replacement copies,
@@ -220,6 +232,11 @@ Uniform-capture routes additionally publish `capture_resolution` as
 multiplier/minimum/census/accounting, and the selector digests that bind it to
 the retained row. They are reported separately from capture-materializing
 engines and remain outside the strict wholly-native-operation numerator.
+The additive v4 strict-capture record instead binds the native `capture_next`,
+materializer, and selector symbols plus the source, selector, capture program,
+plan, bundle, object, and complete artifact identities. It reports
+`capture_resolution=native-onepass-capture-next-v1`; stock Rust remains the
+independent value oracle.
 
 ## HEAD campaign reporting
 
