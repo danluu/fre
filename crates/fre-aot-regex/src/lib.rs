@@ -40,6 +40,7 @@ mod prefix_predicate;
 mod prefix_relation;
 mod program;
 mod regex_set;
+mod rebar_single_capture;
 mod required_literals;
 mod seeded_reverse;
 mod uniform_capture;
@@ -293,6 +294,12 @@ pub use regex_set::{
     RegexSetCompileRequest, RegexSetFillReport, RegexSetOutputError, RegexSetPatternIds,
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
+};
+pub use rebar_single_capture::{
+    REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
+    RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotError, RebarSingleCaptureAotReceiptV1,
+    RebarSingleCaptureAotRequestV1, RebarSingleCaptureCardinalityError,
+    RebarSingleCaptureEmptyProgressV1, compile_rebar_single_capture_aot_v1,
 };
 pub use uniform_capture::{
     CompiledUniformCaptureSelector, UniformCaptureAuthenticationError,

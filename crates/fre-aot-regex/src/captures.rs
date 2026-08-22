@@ -252,6 +252,12 @@ pub struct CaptureCompileReceipt {
     pub identity: CaptureArtifactIdentity,
     pub profile: RustProfile,
     pub source_bytes: usize,
+    /// Whether the parsed HIR can select a zero-width match.
+    ///
+    /// This is derived in the same parse transaction as both the selector and
+    /// capture program. The pinned byte-regex profiles advance one byte after
+    /// a selected empty match.
+    pub can_match_empty: bool,
     /// Requested optional slow-AOT limits passed to selector compilation,
     /// including when that optional route declines.
     pub selector_slow_aot: SlowAotLimits,
@@ -590,6 +596,21 @@ pub fn compile_captures(
     request: CaptureCompileRequest,
 ) -> Result<CompiledCaptureRegex, CaptureCompileError> {
     validate_profile(&request.profile)?;
+    compile_captures_validated(request)
+}
+
+/// Compile the single-source route after the Rebar-specific cardinality owner
+/// has authenticated the exact pinned meta profile.
+pub(crate) fn compile_rebar_single_captures(
+    request: CaptureCompileRequest,
+) -> Result<CompiledCaptureRegex, CaptureCompileError> {
+    validate_rebar_single_profile(&request.profile)?;
+    compile_captures_validated(request)
+}
+
+fn compile_captures_validated(
+    request: CaptureCompileRequest,
+) -> Result<CompiledCaptureRegex, CaptureCompileError> {
     let CaptureCompileRequest {
         pattern,
         profile,
@@ -616,6 +637,7 @@ pub fn compile_captures(
             "Rust capture request produced a non-Rust syntax tree",
         ));
     };
+    let can_match_empty = parsed.hir.properties().minimum_len() == Some(0);
 
     let built = build_program_from_hir(&parsed.hir, line_terminator, limits.capture_hir)
         .map_err(CaptureCompileError::CaptureBuild)?;
@@ -679,6 +701,7 @@ pub fn compile_captures(
         identity,
         profile,
         source_bytes,
+        can_match_empty,
         selector_slow_aot: limits.selector_slow_aot,
         capture_hir,
         capture_program: capture.usage(),
@@ -690,6 +713,18 @@ pub fn compile_captures(
         onepass,
         receipt,
     })
+}
+
+fn validate_rebar_single_profile(profile: &RustProfile) -> Result<(), CaptureCompileError> {
+    let mut expected = RustProfile::rebar_1_12_4();
+    expected.options = profile.options.clone();
+    if *profile == expected {
+        Ok(())
+    } else {
+        Err(CaptureCompileError::UnsupportedProfile(
+            "exact Rebar 1.12.4 ordered-meta identity with one cardinality-authenticated source",
+        ))
+    }
 }
 
 fn validate_profile(profile: &RustProfile) -> Result<(), CaptureCompileError> {
