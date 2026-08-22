@@ -47976,13 +47976,14 @@ fn aarch64_emit_mandatory_teddy_sve_candidates_at(
 /// Produce four exact scalable correlated candidate predicates while keeping
 /// each block's bucket bytes live in caller-saved scalable registers.
 ///
-/// The ordinary one-vector emitter is block-outer and intentionally reuses a
-/// small scratch bank. A four-vector miss batch has no such dependency: make
-/// it column-outer, compute each column address once, and give the four lookup
-/// chains independent Z registers. Besides removing three address formations
-/// per column, this exposes the independent load/TBL latency to the core. The
-/// retained bucket vectors let the exact wrapper recover a hit's bucket byte
-/// directly instead of replaying the scalar nibble tables at that lane.
+/// The previous four-vector composition called the one-vector emitter in
+/// block-outer order and reused its small scratch bank. A four-vector miss
+/// batch has no such dependency: make it column-outer, compute each column
+/// address once, and give the four lookup chains independent Z registers.
+/// Besides removing three address formations per column, this exposes the
+/// independent load/TBL latency to the core. The retained bucket vectors let
+/// the exact wrapper recover a hit's bucket byte directly instead of replaying
+/// the scalar nibble tables at that lane.
 const AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS: [u8; 4] = [24, 25, 27, 28];
 
 /// Order the four possible fingerprint columns so the first two form the
@@ -48182,9 +48183,9 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
             assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
             assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
             assembler.instruction(aarch64_sve_orrs_p0_b(8, 8, 9)?)?;
-            // A profitable prefix miss is the fall-through path. Keep the
-            // omitted suffix off the predicted path and pay a taken branch
-            // only when at least one prefix bucket survives the whole batch.
+            // Make the expected prefix miss the fall-through path. The
+            // omitted suffix is branch-only and runs only when at least one
+            // prefix bucket survives the whole batch.
             assembler.branch_cond(AARCH64_NE, batch_suffix)?;
             assembler.instruction(aarch64_sve_addvl(2, 2, batch_vectors)?)?;
             assembler.branch(vector)?;

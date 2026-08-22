@@ -1600,8 +1600,8 @@ fn lower_aarch64_wrapper(
     }
 
     assembler.bind(candidate)?;
-    // ASIMD and its scalar tail reach this shared replay. The SVE route keeps
-    // its bucket bytes and enters `bucket_ready` after a direct LASTB extract.
+    // ASIMD vector candidates reach this shared replay. Its scalar tail and
+    // the SVE route already have an exact bucket and enter `bucket_ready`.
     aarch64_emit_mandatory_teddy_scalar_candidate(&mut assembler, teddy)?;
     assembler.branch_cond(AARCH64_EQ, retry_retained)?;
     assembler.bind(bucket_ready)?;
