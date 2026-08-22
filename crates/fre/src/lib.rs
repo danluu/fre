@@ -10356,11 +10356,14 @@ impl PortableRegex {
                 let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
                     && !k0.automaton.stats().has_assertions();
                 let endpoint_eligible = positive || assertion_free_nullable;
-                PortableOrdinarySessionPlan::K0(K0OrdinaryExecutor::new(
-                    &k0.automaton,
-                    endpoint_eligible,
+                PortableOrdinarySessionPlan::K0 {
+                    executor: K0OrdinaryExecutor::new(
+                        &k0.automaton,
+                        endpoint_eligible,
+                        positive,
+                    )?,
                     positive,
-                )?)
+                }
             }
             _ => PortableOrdinarySessionPlan::Canonical(Box::new(
                 self.search_session(SearchSessionLimits::unlimited())?,
@@ -13668,7 +13671,10 @@ pub struct PortableOrdinarySession<'a> {
 
 #[derive(Debug)]
 enum PortableOrdinarySessionPlan<'a> {
-    K0(K0OrdinaryExecutor<'a>),
+    K0 {
+        executor: K0OrdinaryExecutor<'a>,
+        positive: bool,
+    },
     Canonical(Box<PortableSearchSession<'a>>),
 }
 
@@ -19071,7 +19077,7 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<usize>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::K0(executor) => executor
+            PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .first_acceptance_at(haystack, start)
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => session
@@ -19115,7 +19121,7 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::K0(executor) => executor
+            PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .selected_span_at(haystack, start)
                 .map(|matched| {
                     matched.map(|span| Match {
@@ -19184,7 +19190,7 @@ impl<'r> PortableOrdinarySession<'r> {
         F: FnMut(Match) -> Result<bool, E>,
     {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::K0(executor) => {
+            PortableOrdinarySessionPlan::K0 { executor, .. } => {
                 let mut source = K0SpanSourceCursor::new(haystack);
                 try_visit_ordinary_spans_at(
                     haystack.len(),
@@ -19221,6 +19227,58 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Ok(()))
             }
+        }
+    }
+
+    /// Count selected positive-width matches at or after `start` using only
+    /// their ordered endpoints.
+    ///
+    /// `Ok(Some(count))` is returned only for a K0 plan whose immutable build
+    /// report proves that every match consumes at least one byte. Unsupported
+    /// plans return `Ok(None)` before validating `start` or searching the
+    /// haystack. This lets an embedding fall back without duplicating partial
+    /// work. Once execution begins, every error is authoritative.
+    ///
+    /// Each successful search resumes at the selected endpoint. A failure to
+    /// advance despite the positive-width proof is reported as an invariant
+    /// error rather than risking an infinite loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid `start`, an execution failure,
+    /// arithmetic overflow, or a violated positive-width progress proof.
+    #[doc(hidden)]
+    pub fn count_positive_width_selected_ends_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<u64>, SearchError> {
+        let PortableOrdinarySessionPlan::K0 { executor, positive: true } =
+            &mut self.plan
+        else {
+            return Ok(None);
+        };
+
+        let mut cursor = start;
+        let mut count = 0_u64;
+        loop {
+            let Some(selected_end) = executor
+                .selected_end_at(haystack, cursor)
+                .map_err(SearchError::from)?
+            else {
+                return Ok(Some(count));
+            };
+            if selected_end <= cursor {
+                return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                    detail: "positive-width selected-end iteration failed to advance",
+                }));
+            }
+            cursor = selected_end;
+            count = count.checked_add(1).ok_or(SearchError::K0(
+                K0SearchError::ArithmeticOverflow {
+                    computation: "positive-width selected-end match count",
+                },
+            ))?;
         }
     }
 }
@@ -36615,7 +36673,7 @@ mod tests {
         };
         assert!(matches!(
             &ordinary.plan,
-            super::PortableOrdinarySessionPlan::K0(executor)
+            super::PortableOrdinarySessionPlan::K0 { executor, .. }
                 if executor.is_bound_to(&k0.automaton)
         ));
 
@@ -36629,6 +36687,10 @@ mod tests {
         );
         assert_eq!(ordinary.first_acceptance_at(haystack, 2), Ok(None));
         assert_eq!(ordinary.find_at(haystack, 2), Ok(None));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(1))
+        );
         assert!(matches!(
             ordinary.find_at(haystack, haystack.len() + 1),
             Err(SearchError::K0(fre_automata::SearchError::InvalidWindow {
@@ -36652,6 +36714,84 @@ mod tests {
         assert_eq!(
             ordinary.find_at(&reused, 0),
             Ok(Some(Match { start: 0, end: 2 }))
+        );
+    }
+
+    #[test]
+    fn ordinary_positive_selected_end_count_preserves_order_progress_and_offsets() {
+        for (pattern, haystack, start, expected) in [
+            ("a+", &b"zaaa aa"[..], 0, 2),
+            ("a+", &b"zaaa aa"[..], 2, 2),
+            ("ab|a", &b"ababa"[..], 0, 3),
+            ("ab|a", &b"zababa"[..], 3, 2),
+            ("a+", &b"a\0aa"[..], 0, 2),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(Some(expected)),
+                "pattern={pattern:?} haystack={haystack:?} start={start}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_positive_selected_end_count_support_is_decided_before_search() {
+        let nullable = PortableBuilder::new("a*")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut nullable = nullable.ordinary_session().unwrap();
+        assert_eq!(
+            nullable.count_positive_width_selected_ends_at(b"aaa", usize::MAX),
+            Ok(None),
+        );
+
+        let canonical = PortableRegex::new("literal").unwrap();
+        assert_ne!(canonical.build_report().plan, PlanKind::K0);
+        let mut canonical = canonical.ordinary_session().unwrap();
+        assert_eq!(
+            canonical.count_positive_width_selected_ends_at(b"literal", usize::MAX),
+            Ok(None),
+        );
+
+        let positive = PortableBuilder::new("a+")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut positive = positive.ordinary_session().unwrap();
+        assert!(matches!(
+            positive.count_positive_width_selected_ends_at(b"aaa", 4),
+            Err(SearchError::K0(fre_automata::SearchError::InvalidWindow {
+                start: 4,
+                end: 3,
+                haystack_len: 3,
+            }))
+        ));
+    }
+
+    #[test]
+    fn ordinary_positive_selected_end_count_preserves_assertion_context() {
+        let regex = PortableBuilder::new("(?m:^a+)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(b"aa\nab\nba", 0),
+            Ok(Some(2)),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(b"aa\nab\nba", 3),
+            Ok(Some(1)),
         );
     }
 

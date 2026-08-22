@@ -10954,6 +10954,32 @@ impl<'a> K0OrdinaryExecutor<'a> {
         )
     }
 
+    /// Return the selected leftmost-first endpoint in the suffix beginning at
+    /// `start` without reconstructing its span start.
+    ///
+    /// This is the endpoint projection used by positive-width ordinary
+    /// iteration. Unlike [`Self::first_acceptance_at`], it preserves ordered
+    /// selected-match semantics rather than stopping at the earliest accepting
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or execution
+    /// encounters an allocation, arithmetic, or invariant failure.
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_end_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        self.session.search_selected_end_value_untyped(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            SearchLimits::unlimited(),
+        )
+    }
+
     /// Return whether the first-acceptance engine finds a match at or after
     /// `start`.
     ///
