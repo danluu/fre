@@ -26,6 +26,7 @@ mod canonical_literal;
 mod compiler;
 mod error;
 pub mod facts;
+mod uniform_capture;
 
 use fre_automata::{Automaton, CompileLimits, RawPlan};
 use fre_syntax::RustParsed;
@@ -46,6 +47,15 @@ pub use facts::{
     HIR_FACT_ACCOUNTING_VERSION, HIR_FACT_ALGORITHM_VERSION, HirFacts, OnePassCertificate,
     PositionedAssertion, PositionedCapture, ReductionFacts, RequiredAlternatives, RequiredString,
     StringEncoding, UnicodeFacts, WidthRange, analyze_facts, analyze_hir_facts,
+};
+pub use uniform_capture::{
+    UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION,
+    UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION, UniformCaptureLoweredRaw,
+    UniformCaptureLoweringError, UniformCaptureParticipationDecline,
+    UniformCaptureParticipationDisposition, UniformCaptureParticipationError,
+    UniformCaptureParticipationIdentity, UniformCaptureParticipationLimits,
+    UniformCaptureParticipationReceipt, UniformCaptureParticipationResource,
+    lower_raw_general_with_uniform_capture_participation,
 };
 
 /// Whether lowering may erase capture annotations.

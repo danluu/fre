@@ -66,6 +66,25 @@ remains in HIR, including captures in impossible alternatives, stays in the
 reported schema; capture-sensitive operations prevent erasure-based
 reductions.
 
+## Uniform capture-participation receipt
+
+`lower_raw_general_with_uniform_capture_participation` pairs the unchanged
+general capture-erased selector with an additive proof over the exact same
+canonical `RustParsed` HIR. A positive receipt authenticates a nonzero minimum
+match width and one source-independent count of participating user capture
+groups. The theorem covers required and nested captures, equal-cardinality
+alternatives, and repetition only when the participating capture set is
+stable. Optional captures, unequal alternatives, nullable or empty languages,
+and unstable repeated alternatives decline conservatively.
+
+Proof work and the combined iterative task/result stack have independent hard
+limits. Semantic declines remain successful selector lowerings; arithmetic,
+allocation, limit, and invariant failures are terminal and typed separately
+from incumbent lowering errors. Proof construction happens before selector
+lowering, and the paired transaction checks that both paths observed the same
+canonical capture census. It neither reparses source text nor changes the
+selector `RawPlan`, `LowerStats`, route, or bytes.
+
 ## Bounded construction
 
 HIR traversal is postorder over an explicit task stack. Repetition and Unicode
