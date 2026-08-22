@@ -31,6 +31,10 @@ use crate::onepass::{
     OnePassCaptureBuildFailure, OnePassCaptureBuildLimits, OnePassCapturePlan,
     OnePassCaptureWorkspace,
 };
+use crate::participation_native::{
+    ExactSpanParticipationNativeV1Error, ExactSpanParticipationNativeV1Limits,
+    ExactSpanParticipationNativeV1View,
+};
 use crate::profile::CaptureProfile;
 use crate::runtime::commit_capture_group_slots;
 
@@ -1069,6 +1073,29 @@ impl CaptureProgramV1 {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Borrow an authenticated construction view for helper-free exact-span
+    /// capture-participation replay.
+    ///
+    /// The ordinary span selector remains authoritative. This allocation-free
+    /// projection supplies only the prioritized capture graph, stable capture
+    /// digest, and exact fixed-scratch geometry needed to replay one already
+    /// selected span. `Ok(None)` is a source-independent schema decline (more
+    /// than 64 groups); resource errors are terminal for this candidate.
+    #[doc(hidden)]
+    pub fn exact_span_participation_native_v1_view(
+        &self,
+        limits: ExactSpanParticipationNativeV1Limits,
+    ) -> Result<Option<ExactSpanParticipationNativeV1View<'_>>, ExactSpanParticipationNativeV1Error>
+    {
+        crate::participation_native::native_v1_view(
+            self,
+            &self.program,
+            self.usage,
+            &self.semantic_digest,
+            limits,
+        )
     }
 
     /// Fallibly copy exact canonical serialized bytes.

@@ -29,6 +29,7 @@ mod line;
 mod model;
 mod onepass;
 mod participation_cache;
+mod participation_native;
 mod profile;
 mod program_v1;
 mod runtime;
@@ -79,6 +80,16 @@ pub use onepass::{
     OnePassCaptureSearchProspective,
     OnePassCaptureSearchWorkspace,
     OnePassCaptureSearchWorkspaceUsage, OnePassCaptureWorkspace, OnePassCaptureWorkspaceUsage,
+};
+pub use participation_native::{
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_ACCOUNTING_ID,
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_ALGORITHM_ID, EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_ALIGN,
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_BYTES, EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_ALIGN,
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES, ExactSpanParticipationNativeAssertionKindV1,
+    ExactSpanParticipationNativeAssertionV1, ExactSpanParticipationNativeStateV1,
+    ExactSpanParticipationNativeV1Error, ExactSpanParticipationNativeV1Layout,
+    ExactSpanParticipationNativeV1Limits, ExactSpanParticipationNativeV1Resource,
+    ExactSpanParticipationNativeV1View,
 };
 pub use profile::CaptureProfile;
 pub use program_v1::{
