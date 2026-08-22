@@ -4,9 +4,11 @@ use fre_aot_regex::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex,
     DeterminizeLimits, FeatureSet, OperatingSystem, OutputContract, PreparedAggregateExports,
     RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1, SlowAotLimits, SymbolBinding,
-    SymbolKind, Target, UniformCaptureCompileDisposition, UniformCaptureCompileError,
-    UniformCaptureCompileReceipt, UniformCaptureCompileRequest, compile,
-    compile_rebar_single_capture_aot_v1, compile_uniform_capture_selector,
+    SymbolKind, Target, UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
+    UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
+    UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
+    UniformCapturePreparedSpanFillCompileReceipt, compile, compile_rebar_single_capture_aot_v1,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits, compile_with_slow_aot_limits,
 };
 use fre_lower::{LowerError, LowerResource};
@@ -546,6 +548,15 @@ pub struct UniformCaptureBridge {
     pub source_receipts: Vec<UniformCaptureCompileReceipt>,
 }
 
+/// One positive uniform-participation proof paired with the exact prepared
+/// native `SpanFill` selected after the ordinary helper-free route declined
+/// solely because its complete incumbent requires the compatibility runtime.
+#[derive(Clone, Debug)]
+pub struct PreparedUniformCaptureBridge {
+    pub compiled: CompiledRegex,
+    pub receipt: UniformCapturePreparedSpanFillCompileReceipt,
+}
+
 /// One exact-cardinality, helper-free native capture iterator.
 #[derive(Debug)]
 pub struct StrictCaptureBridge {
@@ -608,6 +619,7 @@ pub fn compile_strict_capture_bridge(
 #[derive(Debug)]
 pub enum UniformCaptureBridgeDisposition {
     Proven(UniformCaptureBridge),
+    Prepared(PreparedUniformCaptureBridge),
     Declined {
         source_ordinal: usize,
         reason: String,
@@ -627,6 +639,10 @@ pub fn compile_uniform_capture_bridge(
 ) -> Result<UniformCaptureBridge, String> {
     match try_compile_uniform_capture_bridge(benchmark, target)? {
         UniformCaptureBridgeDisposition::Proven(bridge) => Ok(bridge),
+        UniformCaptureBridgeDisposition::Prepared(_) => Err(
+            "uniform-capture selected the prepared SpanFill bridge instead of an ordinary row"
+                .to_owned(),
+        ),
         UniformCaptureBridgeDisposition::Declined {
             source_ordinal,
             reason,
@@ -714,6 +730,75 @@ pub fn try_compile_uniform_capture_bridge(
                         "uniform-capture selector recovery compilation failed at source ordinal {source_ordinal}: {error}"
                     )
                 })?
+            }
+            Err(UniformCaptureCompileError::Authentication(
+                UniformCaptureAuthenticationError::RuntimeDependency,
+            )) if benchmark.patterns.len() == 1 => {
+                let compile_prepared_with_limits = |limits, slow_aot_limits| {
+                    compile_uniform_capture_prepared_span_fill_selector(
+                        &parsed,
+                        UniformCaptureCompileRequest::new(pattern.len(), target)
+                            .profile(profile.clone())
+                            .selector_limits(limits)
+                            .selector_slow_aot_limits(slow_aot_limits),
+                    )
+                };
+                let disposition = match compile_prepared_with_limits(
+                    CompileLimitsV1::default(),
+                    SlowAotLimits::default(),
+                ) {
+                    Ok(disposition) => disposition,
+                    Err(UniformCapturePreparedSpanFillCompileError::Lower(error))
+                        if matches!(
+                            error,
+                            LowerError::ResourceLimit {
+                                resource: LowerResource::Work,
+                                ..
+                            }
+                        ) =>
+                    {
+                        compile_prepared_with_limits(
+                            rebar_recovery_compile_limits(),
+                            rebar_recovery_slow_aot_limits(),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "uniform-capture prepared SpanFill recovery failed at source ordinal {source_ordinal}: {error}"
+                            )
+                        })?
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "uniform-capture prepared SpanFill compilation failed at source ordinal {source_ordinal}: {error}"
+                        ));
+                    }
+                };
+                match disposition {
+                    UniformCapturePreparedSpanFillCompileDisposition::Selected(selected) => {
+                        selected.authenticate().map_err(|error| {
+                            format!(
+                                "uniform-capture prepared SpanFill authentication failed at source ordinal {source_ordinal}: {error}"
+                            )
+                        })?;
+                        let (compiled, receipt) = selected.into_parts();
+                        if compiled.object().is_empty()
+                            || compiled.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+                        {
+                            return Err(format!(
+                                "uniform-capture prepared SpanFill object at source ordinal {source_ordinal} is empty or exceeds {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
+                            ));
+                        }
+                        return Ok(UniformCaptureBridgeDisposition::Prepared(
+                            PreparedUniformCaptureBridge { compiled, receipt },
+                        ));
+                    }
+                    UniformCapturePreparedSpanFillCompileDisposition::Declined(reason) => {
+                        return Ok(UniformCaptureBridgeDisposition::Declined {
+                            source_ordinal,
+                            reason: format!("{reason:?}"),
+                        });
+                    }
+                }
             }
             Err(error) => {
                 return Err(format!(
@@ -1456,6 +1541,46 @@ mod tests {
             assert!(error.contains("source ordinal 0"), "{error}");
             assert!(error.contains("proof declined"), "{error}");
         }
+    }
+
+    #[test]
+    fn uniform_capture_runtime_dependency_selects_exact_prepared_span_fill() {
+        let pattern = br"\b(?:([\w&&\p{Cyrillic}]{6})|([\w&&\p{Cyrillic}]{5}))\b";
+        let mut benchmark = Benchmark::parse(&fixture("count-captures", pattern, b"words"))
+            .expect("prepared uniform-capture fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let UniformCaptureBridgeDisposition::Prepared(bridge) =
+            try_compile_uniform_capture_bridge(&benchmark, target)
+                .expect("typed runtime dependency selects prepared route")
+        else {
+            panic!("uniform runtime dependency did not select prepared SpanFill");
+        };
+        bridge
+            .receipt
+            .authenticate(&bridge.compiled)
+            .expect("prepared uniform-capture receipt");
+        assert_eq!(
+            bridge
+                .receipt
+                .participation()
+                .participating_groups_per_match()
+                .get(),
+            2,
+        );
+        assert_eq!(
+            bridge.compiled.module().prepared_bulk_strategy(),
+            Some(fre_aot_regex::PreparedBulkStrategy::NativeOrderedNfaLoop),
+        );
+        assert_eq!(
+            bridge.compiled.module().required_prepare_capabilities(),
+            fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
     }
 
     #[test]

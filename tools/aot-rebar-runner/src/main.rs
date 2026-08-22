@@ -77,7 +77,12 @@ impl ExclusiveSession {
     )]
     fn prepare(model: shared::Model) -> Result<Self, String> {
         let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
-        let operation_flags = model.prepare_operation_flags();
+        let operation_flags =
+            if model.is_capture() && linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
+                shared::Model::Count.prepare_operation_flags()
+            } else {
+                model.prepare_operation_flags()
+            };
         if operation_flags != linked::PREPARE_OPERATION_FLAGS {
             return Err("runtime model preparation differs from linked artifact".to_owned());
         }
@@ -156,11 +161,24 @@ impl ExclusiveSession {
         reason = "the generated Span-fill declaration is the exact statically linked AOT C ABI boundary"
     )]
     fn strict_span_sum_with_fill(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        self.strict_scalar_with_fill(haystack, SpanScalarReducer::SpanSum, false)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the generated Span-fill declaration is the exact statically linked AOT C ABI boundary"
+    )]
+    fn strict_scalar_with_fill(
+        &mut self,
+        haystack: &[u8],
+        reducer: SpanScalarReducer,
+        require_positive_width: bool,
+    ) -> Result<u64, String> {
         const SPAN_BUFFER_CAPACITY: usize = 64;
 
         let mut state = FreAotRegexIterStateV1::default();
         let mut spans = [FreAotRegexResultV1::default(); SPAN_BUFFER_CAPACITY];
-        let mut accumulator = StrictSpanAccumulator::new(haystack.len());
+        let mut accumulator = StrictSpanAccumulator::for_reducer(haystack.len(), reducer);
         loop {
             let mut written = usize::MAX;
             // SAFETY: this session uniquely owns the live handle. The whole
@@ -184,10 +202,16 @@ impl ExclusiveSession {
                 ));
             }
             for &matched in &spans[..written] {
+                if require_positive_width && matched.start == matched.end {
+                    return Err(
+                        "prepared uniform-capture SpanFill violated its positive-width proof"
+                            .to_owned(),
+                    );
+                }
                 accumulator.push(matched)?;
             }
             match status {
-                STATUS_NO_MATCH => return Ok(accumulator.sum()),
+                STATUS_NO_MATCH => return Ok(accumulator.value()),
                 STATUS_MATCH if written == spans.len() => {}
                 STATUS_MATCH => {
                     return Err(format!(
@@ -262,6 +286,7 @@ enum SpanScalarReducer {
 }
 
 impl StrictSpanAccumulator {
+    #[cfg(test)]
     const fn new(haystack_len: usize) -> Self {
         Self::for_reducer(haystack_len, SpanScalarReducer::SpanSum)
     }
@@ -318,10 +343,6 @@ impl StrictSpanAccumulator {
             })?;
         self.last = Some(matched);
         Ok(())
-    }
-
-    const fn sum(self) -> u64 {
-        self.value
     }
 
     const fn value(self) -> u64 {
@@ -793,6 +814,40 @@ fn strict_capture_reduce(
     }
 }
 
+fn prepared_uniform_capture_count_domain(
+    session: &mut ExclusiveSession,
+    haystack: &[u8],
+) -> Result<u64, String> {
+    let [groups] = linked::SOURCE_PARTICIPATING_GROUPS else {
+        return Err(
+            "prepared uniform-capture route does not contain exactly one multiplier".to_owned(),
+        );
+    };
+    if *groups == 0 {
+        return Err("prepared uniform-capture multiplier is zero".to_owned());
+    }
+    let matches = session.strict_scalar_with_fill(haystack, SpanScalarReducer::Count, true)?;
+    matches
+        .checked_mul(*groups)
+        .ok_or_else(|| "prepared uniform-capture total overflowed u64".to_owned())
+}
+
+fn prepared_uniform_capture_reduce(
+    model: shared::Model,
+    session: &mut ExclusiveSession,
+    haystack: &[u8],
+) -> Result<u64, String> {
+    match model {
+        shared::Model::CountCaptures => prepared_uniform_capture_count_domain(session, haystack),
+        shared::Model::GrepCaptures => haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(prepared_uniform_capture_count_domain(session, line)?)
+                .ok_or_else(|| "prepared uniform grep-captures total overflowed u64".to_owned())
+        }),
+        _ => Err("prepared uniform-capture route received a non-capture model".to_owned()),
+    }
+}
+
 fn main() -> Result<(), DynError> {
     let arguments = parse_arguments()?;
     if arguments.version {
@@ -1151,10 +1206,11 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
-    if (linked::UNIFORM_CAPTURE_BRIDGE || linked::STRICT_CAPTURE_BRIDGE)
-        && !linked::NATIVE_ROW_BRIDGE
-    {
-        return Err("capture receipt is not attached to a native operation route".to_owned());
+    let prepared_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
+    if linked::STRICT_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE {
+        return Err(
+            "strict capture receipt is not attached to a native operation route".to_owned(),
+        );
     }
     if linked::UNIFORM_CAPTURE_BRIDGE && linked::STRICT_CAPTURE_BRIDGE {
         return Err("linked capture routes are not mutually exclusive".to_owned());
@@ -1244,7 +1300,56 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if linked::HAS_SPAN_FILL != has_named_span_fill {
         return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
     }
-    if benchmark.model == shared::Model::SpanSum {
+    if prepared_uniform_capture {
+        if benchmark.patterns.len() != 1
+            || !benchmark.model.is_capture()
+            || linked::STRICT_CAPTURE_BRIDGE
+            || !linked::HAS_SPAN_FILL
+            || linked::REDUCER_SYMBOL != ""
+            || linked::PREPARE_OPERATION_FLAGS != shared::Model::Count.prepare_operation_flags()
+            || linked::AGGREGATE_STRATEGY
+                != "prepared-span-fill-static-uniform-capture-multiplier-v1"
+            || linked::SPAN_ITERATION_STRATEGY
+                != "linked-prepared-span-fill-uniform-capture-64::Some(NativeOrderedNfaLoop)"
+            || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
+            || linked::ENGINE != "OrderedNfa"
+            || linked::ROW_ARTIFACT_COUNT != 1
+            || linked::SOURCE_PATTERN_COUNT != 1
+            || linked::ROW_AUTOMATON_SHA256.len() != 1
+            || linked::ROW_PROGRAM_SHA256.len() != 1
+            || linked::ROW_OBJECT_SHA256.len() != 1
+            || linked::SOURCE_TO_ARTIFACT != [0]
+            || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+            || linked::ROW_PARTICIPATING_GROUPS.len() != 1
+            || linked::SOURCE_PARTICIPATING_GROUPS.len() != 1
+            || linked::ROW_PARTICIPATING_GROUPS != linked::SOURCE_PARTICIPATING_GROUPS
+            || linked::SOURCE_PARTICIPATING_GROUPS.contains(&0)
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.len() != 1
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.contains(&0)
+            || linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len() != 1
+            || linked::SOURCE_PROOF_WORK.len() != 1
+            || linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len() != 1
+            || linked::SOURCE_SELECTOR_AUTOMATON_SHA256 != linked::ROW_AUTOMATON_SHA256
+            || linked::SOURCE_SELECTOR_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+            || linked::SOURCE_SELECTOR_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+            || linked::UNIFORM_CAPTURE_ALGORITHM_VERSION
+                != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION
+            || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION
+                != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
+            || linked::REQUIRED_RUNTIME_SYMBOLS
+                != "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1"
+        {
+            return Err("prepared uniform-capture identity closure is inconsistent".to_owned());
+        }
+        let expected_grep = if benchmark.model == shared::Model::GrepCaptures {
+            "per-line-linked-prepared-span-fill-uniform-capture-v1"
+        } else {
+            "not-applicable"
+        };
+        if linked::GREP_ITERATION_STRATEGY != expected_grep {
+            return Err("prepared uniform-capture grep domain is inconsistent".to_owned());
+        }
+    } else if benchmark.model == shared::Model::SpanSum {
         let bulk_route = linked::PREPARED_BULK_STRATEGY != "None";
         if linked::HAS_SPAN_FILL != bulk_route {
             return Err(format!(
@@ -1261,7 +1366,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if benchmark.model == shared::Model::Count && linked::AGGREGATE_STRATEGY == "None" {
         return Err("count artifact has no aggregate strategy".to_owned());
     }
-    if benchmark.model == shared::Model::GrepCount {
+    if prepared_uniform_capture {
+        // The exact per-line or whole-domain route was authenticated above.
+    } else if benchmark.model == shared::Model::GrepCount {
         if linked::GREP_ITERATION_STRATEGY != "linked-per-line-direct-entry"
             || linked::AGGREGATE_STRATEGY != linked::GREP_ITERATION_STRATEGY
         {
@@ -1291,12 +1398,16 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if ordered_nfa_required
         && !matches!(
             benchmark.model,
-            shared::Model::Count | shared::Model::SpanSum
+            shared::Model::Count
+                | shared::Model::SpanSum
+                | shared::Model::CountCaptures
+                | shared::Model::GrepCaptures
         )
     {
         return Err("Ordered-TNFA capability is bound to an unsupported operation".to_owned());
     }
     if ordered_nfa_required
+        && !prepared_uniform_capture
         && !matches!(
             linked::AGGREGATE_STRATEGY,
             "Some(NativeOrderedNfaFused)" | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
@@ -1554,8 +1665,15 @@ fn run_operation(
             session,
             ExclusiveSession::strict_grep_with_direct_entry,
         ),
+        shared::Model::CountCaptures | shared::Model::GrepCaptures
+            if linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE =>
+        {
+            run_operation_route(benchmark, session, |session, haystack| {
+                prepared_uniform_capture_reduce(benchmark.model, session, haystack)
+            })
+        }
         shared::Model::CountCaptures | shared::Model::GrepCaptures => {
-            Err("uniform-capture models require the linked native row multiplier route".to_owned())
+            Err("uniform-capture model is not bound to a prepared or native-row route".to_owned())
         }
         shared::Model::Count => run_operation_route(benchmark, session, ExclusiveSession::reduce),
         shared::Model::RegexRedux => {
