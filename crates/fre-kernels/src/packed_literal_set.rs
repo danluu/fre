@@ -76,6 +76,8 @@ const RETAINED_ITER_DENSE_GAP_BYTES: usize = 64;
 const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES: usize = 64;
+#[cfg(not(feature = "static-dispatch"))]
+const RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS: usize = 8;
 
 /// Frozen general-purpose byte-frequency rank used by packed finite-language
 /// anchor selectors. Lower values identify bytes expected to be rarer.
@@ -713,6 +715,25 @@ impl UniformWord64 {
 }
 
 #[cfg(not(feature = "static-dispatch"))]
+fn find_retained_ordinary(
+    uniform: &UniformWord64,
+    native: &Searcher,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
+    let native_start = RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS.min(haystack.len());
+    let overlap = uniform.width.checked_sub(1)?;
+    let uniform_end = native_start.checked_add(overlap)?.min(haystack.len());
+    if let Some(matched) = uniform.find(&haystack[..uniform_end]) {
+        return Some(matched);
+    }
+    let matched = native.find(&haystack[native_start..])?;
+    Some((
+        native_start.checked_add(matched.start())?,
+        native_start.checked_add(matched.end())?,
+    ))
+}
+
+#[cfg(not(feature = "static-dispatch"))]
 fn try_build_uniform_word64<P: AsRef<[u8]>>(
     patterns: &[P],
     build: &PackedLiteralSetBuildAccounting,
@@ -1220,8 +1241,8 @@ impl PackedLiteralSetPlan {
                 #[cfg(not(feature = "static-dispatch"))]
                 PackedLiteralEngine::UniformWord64(uniform) => uniform.find(window_bytes),
                 #[cfg(not(feature = "static-dispatch"))]
-                PackedLiteralEngine::UniformWord64Retained { uniform, .. } => {
-                    uniform.find(window_bytes)
+                PackedLiteralEngine::UniformWord64Retained { uniform, native } => {
+                    find_retained_ordinary(uniform, native, window_bytes)
                 }
                 PackedLiteralEngine::Native(searcher) => searcher
                     .find(window_bytes)
@@ -1247,6 +1268,30 @@ impl PackedLiteralSetPlan {
                 window.start() + relative_end,
             )
         }))
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
+    fn find_window_value_unmetered_uniform(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let PackedLiteralEngine::UniformWord64Retained { uniform, .. } = &self.engine else {
+            unreachable!("only retained uniform plans construct adaptive cursors");
+        };
+        Ok(uniform
+            .find(&haystack[window.start()..window.end()])
+            .map(|(relative_start, relative_end)| {
+                (
+                    window.start() + relative_start,
+                    window.start() + relative_end,
+                )
+            }))
     }
 
     #[allow(
@@ -1406,11 +1451,17 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
         self.last_start = Some(start);
         let remaining = self.haystack.len().saturating_sub(start);
         let use_uniform = self.dense && remaining >= RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
-        let matched = self.plan.find_window_value_unmetered_with_native(
-            self.haystack,
-            Window::new(start, self.haystack.len()),
-            (!use_uniform).then_some(self.native),
-        )?;
+        let window = Window::new(start, self.haystack.len());
+        let matched = if use_uniform {
+            self.plan
+                .find_window_value_unmetered_uniform(self.haystack, window)?
+        } else {
+            self.plan.find_window_value_unmetered_with_native(
+                self.haystack,
+                window,
+                Some(self.native),
+            )?
+        };
         if let Some((matched_start, _)) = matched {
             let gap = matched_start.saturating_sub(start);
             if gap <= RETAINED_ITER_DENSE_GAP_BYTES {
@@ -4082,6 +4133,30 @@ mod tests {
         .unwrap();
         assert!(plan.search_cursor(b"").is_some());
         let ordinary = plan.ordinary_executor();
+        for match_start in [
+            0,
+            super::RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS - 1,
+            super::RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS,
+            40,
+        ] {
+            let mut probe = vec![0xff; 96];
+            probe[match_start..match_start + patterns[0].len()]
+                .copy_from_slice(patterns[0]);
+            let window = Window::full(&probe);
+            let expected = plan
+                .find_window(
+                    &probe,
+                    window,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0;
+            assert_eq!(ordinary.find_window_value(&probe, window), Ok(expected));
+        }
+        assert_eq!(
+            ordinary.find_window_value(&[0xff; 96], Window::new(0, 96)),
+            Ok(None),
+        );
         let mut haystack = vec![0xff; 256];
         haystack[0..8].copy_from_slice(patterns[0]);
         haystack[8..16].copy_from_slice(patterns[0]);
@@ -4147,6 +4222,125 @@ mod tests {
                 .unwrap(),
             Err("callback"),
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_ordinary_hybrid_matches_every_small_window_across_its_split() {
+        let split = super::RETAINED_ORDINARY_UNIFORM_PREFIX_STARTS;
+        for (count, width) in [(2, 8), (8, 8), (2, 16), (4, 16), (2, 32)] {
+            let owned = (0..count)
+                .map(|index| {
+                    let mut pattern = vec![b'a'; width];
+                    let mut value = index;
+                    for offset in 0..3 {
+                        pattern[width - offset - 1] = b"acgt"[value & 3];
+                        value >>= 2;
+                    }
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            let patterns = pattern_refs(&owned);
+            let plan = PackedLiteralSetPlan::new_retained_iter(
+                &patterns,
+                PackedLiteralSetBuildLimits::default(),
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    plan.engine,
+                    PackedLiteralEngine::UniformWord64Retained { .. }
+                ),
+                "count={count}, width={width}"
+            );
+            let ordinary = plan.ordinary_executor();
+            let mut lengths = vec![
+                0,
+                width - 1,
+                width,
+                split - 1,
+                split,
+                split + 1,
+                split + width - 2,
+                split + width - 1,
+                split + width,
+                split + width + 1,
+                63,
+                64,
+                65,
+                split + width.checked_mul(2).unwrap() + 1,
+            ];
+            lengths.sort_unstable();
+            lengths.dedup();
+            for length in lengths {
+                let mut haystacks = vec![vec![0xff; length]];
+                for (case, start) in [
+                    0,
+                    split - 1,
+                    split,
+                    split + 1,
+                    length.saturating_sub(width),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let Some(end) = start.checked_add(width) else {
+                        continue;
+                    };
+                    if end <= length {
+                        let mut haystack = vec![0xff; length];
+                        haystack[start..end].copy_from_slice(patterns[case % count]);
+                        haystacks.push(haystack);
+                    }
+                }
+                if split + width.checked_mul(2).unwrap() <= length {
+                    let mut haystack = vec![0xff; length];
+                    let prefix_start = split - 1;
+                    let prefix_end = prefix_start + width;
+                    haystack[prefix_start..prefix_end].copy_from_slice(patterns[0]);
+                    let tail_start = split + width;
+                    let tail_end = tail_start + width;
+                    haystack[tail_start..tail_end].copy_from_slice(patterns[1]);
+                    haystacks.push(haystack);
+                }
+                for haystack in haystacks {
+                    for start in 0..=length {
+                        for end in start..=length {
+                            let window = Window::new(start, end);
+                            let expected = fixed_width_oracle(&patterns, &haystack, window);
+                            let actual = ordinary
+                                .find_window_value(&haystack, window)
+                                .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "count={count}, width={width}, length={length}, window={start}..{end}"
+                            );
+                            assert_eq!(
+                                ordinary.exists_window_value(&haystack, window).unwrap(),
+                                expected.is_some(),
+                            );
+                            assert_eq!(
+                                ordinary
+                                    .selected_end_window_value(&haystack, window)
+                                    .unwrap(),
+                                expected.map(|(_, selected_end)| selected_end),
+                            );
+                            assert_eq!(
+                                plan.find_window(
+                                    &haystack,
+                                    window,
+                                    PackedLiteralSetSearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                expected,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
