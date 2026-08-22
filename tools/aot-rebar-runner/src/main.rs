@@ -466,7 +466,7 @@ fn strict_native_row_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64
     let reducer = match model {
         shared::Model::Count => SpanScalarReducer::Count,
         shared::Model::SpanSum => SpanScalarReducer::SpanSum,
-        shared::Model::Compile | shared::Model::GrepCount => {
+        shared::Model::Compile | shared::Model::GrepCount | shared::Model::RegexRedux => {
             return Err("native-row bridge received an unsupported operation model".to_owned());
         }
     };

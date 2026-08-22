@@ -755,7 +755,7 @@ fn configured_native_row_source(
     let adapter = match benchmark.model {
         shared::Model::Count => "general-aot-native-row-bridge-count-v1",
         shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
-        shared::Model::Compile | shared::Model::GrepCount => {
+        shared::Model::Compile | shared::Model::GrepCount | shared::Model::RegexRedux => {
             unreachable!("parser excludes this multi-pattern model")
         }
     };

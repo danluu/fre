@@ -903,7 +903,7 @@ fn run_regressions(
                 .module()
                 .prepared_span_sum_symbol()
                 .ok_or("mandatory SpanSum symbol absent")?,
-            Model::Compile | Model::GrepCount => {
+            Model::Compile | Model::GrepCount | Model::RegexRedux => {
                 return Err("mandatory dd6 matrix contains an unexpected model".into());
             }
         };
@@ -1060,7 +1060,9 @@ fn oracle(benchmark: &Benchmark) -> Result<u64, String> {
                 Ok(count)
             }
         }),
-        Model::Compile => Err("mandatory dd6 matrix contains no compile model".to_owned()),
+        Model::Compile | Model::RegexRedux => {
+            Err("mandatory dd6 matrix contains no supported composite model".to_owned())
+        }
     }
 }
 
@@ -1178,7 +1180,7 @@ fn runtime_private_reducer_symbol(model: Model) -> Result<&'static str, DynError
     match model {
         Model::Count => Ok("fre_aot_regex_runtime_compiler_private_count_exclusive_v1"),
         Model::SpanSum => Ok("fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"),
-        Model::Compile | Model::GrepCount => {
+        Model::Compile | Model::GrepCount | Model::RegexRedux => {
             Err("mandatory dd6 matrix contains an unexpected private reducer".into())
         }
     }
@@ -1188,7 +1190,7 @@ fn runtime_reducer_symbol(model: Model) -> Result<&'static str, DynError> {
     match model {
         Model::Count => Ok("fre_aot_regex_runtime_count_exclusive_v1"),
         Model::SpanSum => Ok("fre_aot_regex_runtime_span_sum_exclusive_v1"),
-        Model::Compile | Model::GrepCount => {
+        Model::Compile | Model::GrepCount | Model::RegexRedux => {
             Err("mandatory dd6 matrix contains an unexpected reducer".into())
         }
     }
