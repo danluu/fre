@@ -7309,6 +7309,305 @@ impl CompiledModule {
         Ok(self)
     }
 
+    /// Append one authenticated capture bundle and its two additive entries
+    /// without changing any existing entry or compiler receipt field.
+    pub(crate) fn append_native_capture_exports_v1(
+        mut self,
+        bundle_symbol_name: &str,
+        bundle: &[u8],
+        next_symbol_name: &str,
+        materialize_symbol_name: &str,
+        geometry: Option<crate::capture_aot::NativeCapturePlanGeometryV1>,
+    ) -> Result<Self, ObjectError> {
+        if bundle.is_empty() {
+            return Err(ObjectError::InvalidModule("native capture bundle is empty"));
+        }
+        if self.sections.get(PROGRAM_SECTION).is_none() || self.sections.get(TEXT_SECTION).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "native capture module is missing a canonical section",
+            ));
+        }
+        if [bundle_symbol_name, next_symbol_name, materialize_symbol_name]
+            .iter()
+            .any(|name| name.is_empty())
+            || bundle_symbol_name == next_symbol_name
+            || bundle_symbol_name == materialize_symbol_name
+            || next_symbol_name == materialize_symbol_name
+            || self.symbols.iter().any(|symbol| {
+                symbol.name == bundle_symbol_name
+                    || symbol.name == next_symbol_name
+                    || symbol.name == materialize_symbol_name
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "native capture export symbol is empty or duplicated",
+            ));
+        }
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut data = std::mem::take(&mut sections[PROGRAM_SECTION].data).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        let bundle_offset = data
+            .len()
+            .checked_add(7)
+            .map(|length| length & !7)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native capture bundle alignment",
+            ))?;
+        let final_data_len = bundle_offset.checked_add(bundle.len()).ok_or(
+            ObjectError::ArithmeticOverflow("native capture bundle extent"),
+        )?;
+        data.try_reserve_exact(final_data_len.saturating_sub(data.len()))
+            .map_err(|_| ObjectError::Allocation("native capture bundle data"))?;
+        symbols
+            .try_reserve_exact(3)
+            .map_err(|_| ObjectError::Allocation("native capture export symbols"))?;
+        data.resize(bundle_offset, 0);
+        data.extend_from_slice(bundle);
+        let bundle_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(bundle_symbol_name, "native capture bundle symbol name")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: u64::try_from(bundle_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native capture bundle offset")
+            })?,
+            size: u64::try_from(bundle.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native capture bundle size")
+            })?,
+        });
+
+        let materialize_offset = text.len().checked_add(15)
+            .map(|offset| offset & !15)
+            .ok_or(ObjectError::ArithmeticOverflow("native capture text alignment"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(materialize_offset, 0x90),
+            Architecture::Aarch64 => {
+                if !text.len().is_multiple_of(4) {
+                    return Err(ObjectError::InvalidModule("AArch64 capture text alignment"));
+                }
+                while text.len() < materialize_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        let (materialize_code, next_code, plan_link, local_calls) =
+            if let Some(geometry) = geometry {
+                match self.target.architecture {
+                    Architecture::X86_64 => {
+                        let materialize = lower_x86_64_native_capture_materialize_v1(geometry)?;
+                        let next = lower_x86_64_native_capture_next_v1(geometry.group_count)?;
+                        (
+                            materialize.code,
+                            next.code,
+                            NativeCapturePlanLink::X86 {
+                                displacement: materialize.plan_relocation_offset,
+                                geometry,
+                            },
+                            NativeCaptureLocalCalls::X86 {
+                                selector: next.selector_call_offset,
+                                materializer: next.materializer_call_offset,
+                            },
+                        )
+                    }
+                    Architecture::Aarch64 => {
+                        let materialize = lower_aarch64_native_capture_materialize_v1(geometry)?;
+                        let next = lower_aarch64_native_capture_next_v1(geometry.group_count)?;
+                        (
+                            materialize.code,
+                            next.code,
+                            NativeCapturePlanLink::Aarch64 {
+                                page: materialize.plan_page_relocation_offset,
+                                page_offset: materialize.plan_page_offset_relocation_offset,
+                                geometry,
+                            },
+                            NativeCaptureLocalCalls::Aarch64 {
+                                selector: next.selector_call_offset,
+                                materializer: next.materializer_call_offset,
+                            },
+                        )
+                    }
+                }
+            } else {
+                let negative = match self.target.architecture {
+                    Architecture::X86_64 => vec![
+                        0xb8,
+                        u8::try_from(crate::NATIVE_CAPTURE_AOT_V1_STATUS_UNAVAILABLE)
+                            .map_err(|_| ObjectError::ArithmeticOverflow("capture status"))?,
+                        0,
+                        0,
+                        0,
+                        0xc3,
+                    ],
+                    Architecture::Aarch64 => {
+                        let mut code = Vec::new();
+                        push_bytes(
+                            &mut code,
+                            &aarch64_movz_w(
+                                0,
+                                u16::try_from(crate::NATIVE_CAPTURE_AOT_V1_STATUS_UNAVAILABLE)
+                                    .map_err(|_| ObjectError::ArithmeticOverflow("capture status"))?,
+                            )?.to_le_bytes(),
+                        )?;
+                        push_bytes(&mut code, &0xd65f_03c0_u32.to_le_bytes())?;
+                        code
+                    }
+                };
+                (
+                    negative.clone(),
+                    negative,
+                    NativeCapturePlanLink::None,
+                    NativeCaptureLocalCalls::None,
+                )
+            };
+        text.try_reserve_exact(materialize_code.len())
+            .map_err(|_| ObjectError::Allocation("native capture materializer text"))?;
+        text.extend_from_slice(&materialize_code);
+        let next_offset = text.len().checked_add(15)
+            .map(|offset| offset & !15)
+            .ok_or(ObjectError::ArithmeticOverflow("native capture next alignment"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(next_offset, 0x90),
+            Architecture::Aarch64 => {
+                if !text.len().is_multiple_of(4) {
+                    return Err(ObjectError::InvalidModule("AArch64 capture text alignment"));
+                }
+                while text.len() < next_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        text.try_reserve_exact(next_code.len())
+            .map_err(|_| ObjectError::Allocation("native capture next text"))?;
+        text.extend_from_slice(&next_code);
+
+        match plan_link {
+            NativeCapturePlanLink::None => {}
+            NativeCapturePlanLink::X86 { displacement, geometry } => {
+                let relocation_offset = materialize_offset.checked_add(displacement)
+                    .ok_or(ObjectError::ArithmeticOverflow("capture plan relocation"))?;
+                let plan_addend = geometry.bundle_plan_offset
+                    .checked_add(geometry.transitions_offset)
+                    .ok_or(ObjectError::ArithmeticOverflow("capture plan addend"))?;
+                relocations.try_reserve_exact(1)
+                    .map_err(|_| ObjectError::Allocation("native capture relocation"))?;
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(relocation_offset)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("capture plan relocation"))?,
+                    kind: RelocationKind::X86PcRelative32,
+                    symbol: bundle_symbol_index,
+                    addend: i64::try_from(plan_addend).ok()
+                        .and_then(|addend| addend.checked_sub(4))
+                        .ok_or(ObjectError::ArithmeticOverflow("capture plan addend"))?,
+                });
+            }
+            NativeCapturePlanLink::Aarch64 { page, page_offset, geometry } => {
+                let plan_addend = geometry.bundle_plan_offset
+                    .checked_add(geometry.byte_classes_offset)
+                    .and_then(|addend| i64::try_from(addend).ok())
+                    .ok_or(ObjectError::ArithmeticOverflow("capture plan addend"))?;
+                relocations.try_reserve_exact(2)
+                    .map_err(|_| ObjectError::Allocation("native capture relocations"))?;
+                for (offset, kind) in [
+                    (page, RelocationKind::Aarch64Page21),
+                    (page_offset, RelocationKind::Aarch64PageOff12),
+                ] {
+                    relocations.push(ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: u64::try_from(materialize_offset.checked_add(offset)
+                            .ok_or(ObjectError::ArithmeticOverflow("capture plan relocation"))?)
+                            .map_err(|_| ObjectError::ArithmeticOverflow("capture plan relocation"))?,
+                        kind,
+                        symbol: bundle_symbol_index,
+                        addend: plan_addend,
+                    });
+                }
+            }
+        }
+        let selector_target = usize::try_from(
+            {
+                let selector = symbols.get(self.entry_symbol_index)
+                    .ok_or(ObjectError::InvalidModule("ordinary entry symbol"))?;
+                if selector.section != Some(TEXT_SECTION)
+                    || selector.kind != SymbolKind::Function
+                    || selector.binding != SymbolBinding::Global
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordinary capture selector is not a defined global function",
+                    ));
+                }
+                selector.offset
+            },
+        ).map_err(|_| ObjectError::ArithmeticOverflow("ordinary entry offset"))?;
+        if selector_target >= materialize_offset {
+            return Err(ObjectError::InvalidModule(
+                "ordinary capture selector is outside incumbent text",
+            ));
+        }
+        match local_calls {
+            NativeCaptureLocalCalls::None => {}
+            NativeCaptureLocalCalls::X86 { selector, materializer } => {
+                patch_x86_64_local_call(
+                    &mut text,
+                    next_offset.checked_add(selector)
+                        .ok_or(ObjectError::ArithmeticOverflow("capture selector call"))?,
+                    selector_target,
+                )?;
+                patch_x86_64_local_call(
+                    &mut text,
+                    next_offset.checked_add(materializer)
+                        .ok_or(ObjectError::ArithmeticOverflow("capture materializer call"))?,
+                    materialize_offset,
+                )?;
+            }
+            NativeCaptureLocalCalls::Aarch64 { selector, materializer } => {
+                patch_aarch64_local_call(
+                    &mut text,
+                    next_offset.checked_add(selector)
+                        .ok_or(ObjectError::ArithmeticOverflow("capture selector call"))?,
+                    selector_target,
+                )?;
+                patch_aarch64_local_call(
+                    &mut text,
+                    next_offset.checked_add(materializer)
+                        .ok_or(ObjectError::ArithmeticOverflow("capture materializer call"))?,
+                    materialize_offset,
+                )?;
+            }
+        }
+
+        symbols.push(ModuleSymbol {
+            name: owned_string(next_symbol_name, "native capture next symbol name")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(next_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture next offset"))?,
+            size: u64::try_from(next_code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture next size"))?,
+        });
+        symbols.push(ModuleSymbol {
+            name: owned_string(materialize_symbol_name, "native capture materializer symbol name")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(materialize_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture materializer offset"))?,
+            size: u64::try_from(materialize_code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture materializer size"))?,
+        });
+        sections[PROGRAM_SECTION].data = data.into_boxed_slice();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        Ok(self)
+    }
+
     /// Return the authenticated hole-continuation helper when the additive
     /// prepared entry actually references one.
     #[must_use]
@@ -11914,7 +12213,7 @@ fn prepared_aggregate_module_digest(
     Ok(digest.finalize().into())
 }
 
-fn identity_symbol(prefix: &str, digest: &[u8]) -> Result<String, ObjectError> {
+pub(crate) fn identity_symbol(prefix: &str, digest: &[u8]) -> Result<String, ObjectError> {
     let hex_bytes = digest
         .len()
         .checked_mul(2)
@@ -24768,6 +25067,1071 @@ struct X86Assembler {
     labels: Vec<Option<usize>>,
     fixups: Vec<X86Fixup>,
     instruction_offsets: Vec<usize>,
+}
+
+struct NativeCaptureMaterializerLowering {
+    code: Vec<u8>,
+    plan_relocation_offset: usize,
+}
+
+struct NativeCaptureNextLowering {
+    code: Vec<u8>,
+    selector_call_offset: usize,
+    materializer_call_offset: usize,
+}
+
+struct Aarch64NativeCaptureMaterializerLowering {
+    code: Vec<u8>,
+    plan_page_relocation_offset: usize,
+    plan_page_offset_relocation_offset: usize,
+}
+
+struct Aarch64NativeCaptureNextLowering {
+    code: Vec<u8>,
+    selector_call_offset: usize,
+    materializer_call_offset: usize,
+}
+
+enum NativeCapturePlanLink {
+    None,
+    X86 {
+        displacement: usize,
+        geometry: crate::capture_aot::NativeCapturePlanGeometryV1,
+    },
+    Aarch64 {
+        page: usize,
+        page_offset: usize,
+        geometry: crate::capture_aot::NativeCapturePlanGeometryV1,
+    },
+}
+
+enum NativeCaptureLocalCalls {
+    None,
+    X86 { selector: usize, materializer: usize },
+    Aarch64 { selector: usize, materializer: usize },
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact tag replay, complete validation, and transactional publication form one generated leaf"
+)]
+fn lower_aarch64_native_capture_materialize_v1(
+    geometry: crate::capture_aot::NativeCapturePlanGeometryV1,
+) -> Result<Aarch64NativeCaptureMaterializerLowering, ObjectError> {
+    const SAVED_BYTES: usize = 96;
+    if geometry.group_count == 0
+        || geometry.group_count.checked_mul(2) != Some(geometry.tag_slot_count)
+        || geometry.tag_slot_count > 32
+        || geometry.native_stack_bytes == 0
+        || !geometry.native_stack_bytes.is_multiple_of(16)
+        || geometry.alphabet_len == 0
+        || usize::try_from(geometry.start_state).ok().is_none_or(|start| start >= geometry.state_count)
+    {
+        return Err(ObjectError::InvalidModule("AArch64 capture materializer geometry"));
+    }
+    let frame_bytes = SAVED_BYTES.checked_add(geometry.native_stack_bytes)
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture frame"))?;
+    let scratch_offset = u16::try_from(SAVED_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture scratch"))?;
+    let output_bytes = geometry.group_count.checked_mul(16)
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture output"))?;
+    let transition_delta = geometry.transitions_offset.checked_sub(geometry.byte_classes_offset)
+        .ok_or(ObjectError::InvalidModule("AArch64 capture transition order"))?;
+    let state_delta = geometry.states_offset.checked_sub(geometry.byte_classes_offset)
+        .and_then(|offset| u16::try_from(offset).ok())
+        .filter(|offset| *offset <= 0x0fff)
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture state offset"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let final_state = assembler.label()?;
+    let transition_action = assembler.label()?;
+    let transition_done = assembler.label()?;
+    let match_action = assembler.label()?;
+    let match_done = assembler.label()?;
+    let runtime_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(6, 4, 3)?)?;
+    assembler.branch_nonzero_x(6, invalid)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        6,
+        u64::try_from(geometry.group_count)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture groups"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(6, 4, output_bytes)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 4)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_mov_x(23, 4)?)?;
+    let plan_page = assembler.instruction(0x9000_0018)?; // adrp x24, classes
+    let plan_page_offset = assembler.instruction(aarch64_add_x_imm(24, 24, 0)?)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        27,
+        u64::try_from(transition_delta)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 transition offset"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(27, 24, 27)?)?; // transition base
+    aarch64_load_u32_constant(&mut assembler, 17, u32::try_from(geometry.alphabet_len)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 alphabet"))?)?;
+    aarch64_load_u64_constant(&mut assembler, 6, u64::MAX)?;
+    for slot in 0..geometry.tag_slot_count {
+        assembler.instruction(aarch64_store_x(
+            6,
+            31,
+            scratch_offset.checked_add(u16::try_from(slot * 8)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture slot"))?)
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture slot"))?,
+        )?)?;
+    }
+    aarch64_load_u32_constant(&mut assembler, 25, geometry.start_state)?;
+    assembler.instruction(aarch64_mov_x(26, 21)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_cmp_x(26, 22)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_state)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 19, 26)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 24, 6)?)?;
+    assembler.instruction(aarch64_madd_w(6, 25, 17, 6)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 27, 6, 3)?)?;
+    assembler.instruction(aarch64_load_w_imm(25, 7, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(28, 7, 4)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, u32::MAX)?;
+    assembler.instruction(aarch64_cmp_w(25, 6)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_error)?;
+    assembler.branch_zero_w(28, transition_done)?;
+    assembler.bind(transition_action)?;
+    assembler.instruction(aarch64_rbit_w(6, 28)?)?;
+    assembler.instruction(aarch64_clz_w(6, 6)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, scratch_offset)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 7, 6, 3)?)?;
+    assembler.instruction(aarch64_store_x(26, 7, 0)?)?;
+    assembler.instruction(aarch64_sub_w_imm(6, 28, 1)?)?;
+    assembler.instruction(aarch64_and_w(28, 28, 6)?)?;
+    assembler.branch_nonzero_w(28, transition_action)?;
+    assembler.bind(transition_done)?;
+    assembler.instruction(aarch64_add_x_imm(26, 26, 1)?)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(final_state)?;
+    assembler.instruction(aarch64_add_x_imm(7, 24, state_delta)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 7, 25, 3)?)?;
+    assembler.instruction(aarch64_load_w_imm(28, 7, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 7, 4)?)?;
+    assembler.branch_bit_clear_w(6, 0, runtime_error)?;
+    assembler.branch_zero_w(28, match_done)?;
+    assembler.bind(match_action)?;
+    assembler.instruction(aarch64_rbit_w(6, 28)?)?;
+    assembler.instruction(aarch64_clz_w(6, 6)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, scratch_offset)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 7, 6, 3)?)?;
+    assembler.instruction(aarch64_store_x(26, 7, 0)?)?;
+    assembler.instruction(aarch64_sub_w_imm(6, 28, 1)?)?;
+    assembler.instruction(aarch64_and_w(28, 28, 6)?)?;
+    assembler.branch_nonzero_w(28, match_action)?;
+    assembler.bind(match_done)?;
+
+    assembler.instruction(aarch64_load_x_imm(6, 31, scratch_offset)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 21)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_error)?;
+    assembler.instruction(aarch64_load_x_imm(7, 31, scratch_offset + 8)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 22)?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_error)?;
+    aarch64_load_u64_constant(&mut assembler, 8, u64::MAX)?;
+    for group in 1..geometry.group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        let offset = scratch_offset.checked_add(u16::try_from(group * 16)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group offset"))?)
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 group offset"))?;
+        assembler.instruction(aarch64_load_pair_x(6, 7, 31, i16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group offset"))?)?)?;
+        assembler.instruction(aarch64_cmp_x(6, 8)?)?;
+        assembler.branch_cond(AARCH64_EQ, unset)?;
+        assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+        assembler.branch_cond(AARCH64_EQ, runtime_error)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_error)?;
+        assembler.instruction(aarch64_cmp_x(6, 21)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_error)?;
+        assembler.instruction(aarch64_cmp_x(7, 22)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_error)?;
+        assembler.branch(valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_error)?;
+        assembler.bind(valid)?;
+    }
+    for group in 0..geometry.group_count {
+        let scratch = i16::try_from(SAVED_BYTES + group * 16)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture commit"))?;
+        let output = i16::try_from(group * 16)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture commit"))?;
+        assembler.instruction(aarch64_load_pair_x(6, 7, 31, scratch)?)?;
+        assembler.instruction(aarch64_store_pair_x(6, 7, 23, output)?)?;
+    }
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_error)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [plan_page, plan_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(Aarch64NativeCaptureMaterializerLowering {
+        code,
+        plan_page_relocation_offset: offsets[0],
+        plan_page_offset_relocation_offset: offsets[1],
+    })
+}
+
+fn aarch64_rbit_w(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x5ac0_0000 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_clz_w(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x5ac0_1000 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "iterator validation, nullable progress, two local calls, and transactional publication stay auditable together"
+)]
+fn lower_aarch64_native_capture_next_v1(
+    group_count: usize,
+) -> Result<Aarch64NativeCaptureNextLowering, ObjectError> {
+    const FRAME_BYTES: u16 = 160;
+    const NEXT_OFFSET: u16 = 96;
+    const LAST_OFFSET: u16 = 104;
+    const FLAGS_OFFSET: u16 = 112;
+    const SPAN_OFFSET: u16 = 120;
+    if group_count == 0 {
+        return Err(ObjectError::InvalidModule("AArch64 capture-next groups"));
+    }
+    let output_bytes = group_count.checked_mul(16)
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture-next output"))?;
+    let group_count_u64 = u64::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture-next groups"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let disjoint = assembler.label()?;
+    let no_pending_validation = assembler.label()?;
+    let has_last_validation = assembler.label()?;
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 3, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    aarch64_load_u64_constant(&mut assembler, 5, group_count_u64)?;
+    assembler.instruction(aarch64_cmp_x(4, 5)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 2, 24)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(6, 3, output_bytes)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 3)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_cmp_x(5, 3)?)?;
+    assembler.branch_cond(AARCH64_LS, disjoint)?;
+    assembler.instruction(aarch64_cmp_x(6, 2)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.bind(disjoint)?;
+
+    assembler.instruction(aarch64_load_w_imm(5, 2, 20)?)?;
+    assembler.branch_nonzero_w(5, invalid)?;
+    assembler.instruction(aarch64_load_w_imm(5, 2, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(6, 5, 3)?)?;
+    assembler.instruction(aarch64_cmp_w(5, 6)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(7, 2, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(8, 2, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_bit_clear_w(5, 1, no_pending_validation)?;
+    assembler.branch_bit_clear_w(5, 0, invalid)?;
+    assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.branch_bit_set_w(5, 2, invalid)?;
+    assembler.bind(no_pending_validation)?;
+    assembler.branch_bit_set_w(5, 0, has_last_validation)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+    assembler.branch_nonzero_x(8, invalid)?;
+    assembler.branch(validated)?;
+    assembler.bind(has_last_validation)?;
+    assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(validated)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_load_pair_x(5, 6, 21, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(5, 6, 31, i16::try_from(NEXT_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture-next local"))?)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 21, 16)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, FLAGS_OFFSET)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_load_w_imm(5, 31, FLAGS_OFFSET)?)?;
+    assembler.branch_bit_set_w(5, 2, finished)?;
+    assembler.branch_bit_clear_w(5, 1, search)?;
+    assembler.instruction(aarch64_movz_w(6, 2)?)?;
+    assembler.instruction(aarch64_eor_w(5, 5, 6)?)?;
+    assembler.instruction(aarch64_store_w(5, 31, FLAGS_OFFSET)?)?;
+    assembler.instruction(aarch64_load_x_imm(7, 31, NEXT_OFFSET)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(7, 7, 1)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, NEXT_OFFSET)?)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, NEXT_OFFSET)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, SPAN_OFFSET)?)?;
+    let selector_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_pair_x(7, 8, 31, i16::try_from(SPAN_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture span"))?)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, NEXT_OFFSET)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_error)?;
+    assembler.instruction(aarch64_cmp_x(8, 7)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_error)?;
+    assembler.instruction(aarch64_cmp_x(8, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_error)?;
+    assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, nonempty)?;
+    assembler.instruction(aarch64_load_w_imm(5, 31, FLAGS_OFFSET)?)?;
+    assembler.branch_bit_clear_w(5, 0, accepted_empty)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, LAST_OFFSET)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, accepted_empty)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, NEXT_OFFSET)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
+    assembler.instruction(aarch64_store_x(6, 31, NEXT_OFFSET)?)?;
+    assembler.branch(search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(aarch64_movz_w(5, 1)?)?;
+    assembler.branch(accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(aarch64_movz_w(5, 3)?)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(aarch64_store_x(8, 31, NEXT_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, LAST_OFFSET)?)?;
+    assembler.instruction(aarch64_store_w(5, 31, FLAGS_OFFSET)?)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 7)?)?;
+    assembler.instruction(aarch64_mov_x(3, 8)?)?;
+    assembler.instruction(aarch64_mov_x(4, 22)?)?;
+    aarch64_load_u64_constant(&mut assembler, 5, group_count_u64)?;
+    let materializer_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_NE, returned)?;
+    assembler.instruction(aarch64_load_pair_x(6, 7, 31, i16::try_from(NEXT_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture-next local"))?)?)?;
+    assembler.instruction(aarch64_store_pair_x(6, 7, 21, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(8, 31, FLAGS_OFFSET)?)?;
+    assembler.instruction(aarch64_store_w(8, 21, 16)?)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_load_w_imm(5, 31, FLAGS_OFFSET)?)?;
+    assembler.instruction(aarch64_and_low_w(5, 5, 1)?)?;
+    assembler.instruction(aarch64_movz_w(6, 4)?)?;
+    assembler.instruction(aarch64_orr_w(5, 5, 6)?)?;
+    assembler.instruction(aarch64_store_w(5, 31, FLAGS_OFFSET)?)?;
+    aarch64_load_u64_constant(&mut assembler, 6, u64::MAX)?;
+    assembler.instruction(aarch64_mov_x(7, 6)?)?;
+    for group in 0..group_count {
+        assembler.instruction(aarch64_store_pair_x(
+            6,
+            7,
+            22,
+            i16::try_from(group * 16)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture output"))?,
+        )?)?;
+    }
+    assembler.instruction(aarch64_load_pair_x(6, 7, 31, i16::try_from(NEXT_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture-next local"))?)?)?;
+    assembler.instruction(aarch64_store_pair_x(6, 7, 21, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(8, 31, FLAGS_OFFSET)?)?;
+    assembler.instruction(aarch64_store_w(8, 21, 16)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_error)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+
+    assembler.bind(returned)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [selector_call, materializer_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(Aarch64NativeCaptureNextLowering {
+        code,
+        selector_call_offset: offsets[0],
+        materializer_call_offset: offsets[1],
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact tag replay, complete validation, and transactional publication form one generated leaf"
+)]
+fn lower_x86_64_native_capture_materialize_v1(
+    geometry: crate::capture_aot::NativeCapturePlanGeometryV1,
+) -> Result<NativeCaptureMaterializerLowering, ObjectError> {
+    if geometry.group_count == 0
+        || geometry.group_count.checked_mul(2) != Some(geometry.tag_slot_count)
+        || geometry.tag_slot_count > 32
+        || geometry.native_stack_bytes == 0
+        || !geometry.native_stack_bytes.is_multiple_of(16)
+        || geometry.alphabet_len == 0
+        || usize::try_from(geometry.start_state).ok().is_none_or(|start| start >= geometry.state_count)
+    {
+        return Err(ObjectError::InvalidModule("native capture materializer geometry"));
+    }
+    let alphabet = u32::try_from(geometry.alphabet_len)
+        .map_err(|_| ObjectError::ArithmeticOverflow("capture alphabet"))?;
+    let output_bytes = geometry.group_count.checked_mul(16)
+        .ok_or(ObjectError::ArithmeticOverflow("capture output bytes"))?;
+    let output_bytes_u32 = u32::try_from(output_bytes)
+        .map_err(|_| ObjectError::ArithmeticOverflow("capture output bytes"))?;
+    let class_delta = i64::try_from(geometry.byte_classes_offset)
+        .ok()
+        .and_then(|classes| {
+            i64::try_from(geometry.transitions_offset).ok()
+                .and_then(|transitions| classes.checked_sub(transitions))
+        })
+        .and_then(|delta| i32::try_from(delta).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("capture class delta"))?;
+    let state_delta = i64::try_from(geometry.states_offset)
+        .ok()
+        .and_then(|states| {
+            i64::try_from(geometry.transitions_offset).ok()
+                .and_then(|transitions| states.checked_sub(transitions))
+        })
+        .and_then(|delta| i32::try_from(delta).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("capture state delta"))?;
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let final_state = assembler.label()?;
+    let transition_action = assembler.label()?;
+    let transition_done = assembler.label()?;
+    let match_action = assembler.label()?;
+    let match_done = assembler.label()?;
+    let runtime_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Raw boundary validation. Output remains untouched on every rejection.
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?; // start <= end
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x48, 0x39, 0xf1])?; // end <= length
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_count = vec![0x49, 0x81, 0xf9];
+    exact_count.extend_from_slice(
+        &u32::try_from(geometry.group_count)
+            .map_err(|_| ObjectError::ArithmeticOverflow("capture group count"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&exact_count)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?; // output extent must not wrap
+    let mut add_output = vec![0x48, 0x05];
+    add_output.extend_from_slice(&output_bytes_u32.to_le_bytes());
+    assembler.instruction(&add_output)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+
+    // Five saved registers leave the variable 16-byte stack owner aligned.
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut allocate = vec![0x48, 0x81, 0xec];
+    allocate.extend_from_slice(
+        &u32::try_from(geometry.native_stack_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("capture stack"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&allocate)?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // haystack -> rbx
+    assembler.instruction(&[0x49, 0x89, 0xd4])?; // start -> r12
+    assembler.instruction(&[0x49, 0x89, 0xcd])?; // end -> r13
+    assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output -> r14
+    assembler.instruction(&[0x4c, 0x8d, 0x3d])?; // transitions(%rip) -> r15
+    let plan_relocation = assembler.label()?;
+    assembler.bind(plan_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for slot in 0..geometry.tag_slot_count {
+        x86_capture_store_rsp_imm64(&mut assembler, slot * 8, u64::MAX)?;
+    }
+    let mut initial_state = vec![0x41, 0xb9];
+    initial_state.extend_from_slice(&geometry.start_state.to_le_bytes());
+    assembler.instruction(&initial_state)?;
+    assembler.instruction(&[0x4d, 0x89, 0xe3])?; // position = start
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4d, 0x39, 0xeb])?; // position == end
+    assembler.branch(&[0x0f, 0x84], final_state)?;
+    assembler.instruction(&[0x42, 0x0f, 0xb6, 0x04, 0x1b])?; // haystack[position]
+    let mut map_class = vec![0x41, 0x0f, 0xb6, 0x84, 0x07];
+    map_class.extend_from_slice(&class_delta.to_le_bytes());
+    assembler.instruction(&map_class)?;
+    let mut row = vec![0x45, 0x69, 0xd1]; // r10d = state * alphabet
+    row.extend_from_slice(&alphabet.to_le_bytes());
+    assembler.instruction(&row)?;
+    assembler.instruction(&[0x41, 0x01, 0xc2])?; // + class
+    assembler.instruction(&[0x47, 0x8b, 0x0c, 0xd7])?; // next state
+    assembler.instruction(&[0x43, 0x8b, 0x7c, 0xd7, 0x04])?; // action mask
+    assembler.instruction(&[0x41, 0x83, 0xf9, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], runtime_error)?;
+    assembler.instruction(&[0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], transition_done)?;
+    assembler.bind(transition_action)?;
+    assembler.instruction(&[0x0f, 0xbc, 0xc7])?; // bsf action -> slot
+    assembler.instruction(&[0x4c, 0x89, 0x1c, 0xc4])?; // slots[slot] = position
+    assembler.instruction(&[0x0f, 0xb3, 0xc7])?; // clear selected action bit
+    assembler.instruction(&[0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x85], transition_action)?;
+    assembler.bind(transition_done)?;
+    assembler.instruction(&[0x49, 0x83, 0xc3, 0x01])?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(final_state)?;
+    let mut load_match_flag = vec![0x43, 0x8b, 0x84, 0xcf];
+    load_match_flag.extend_from_slice(
+        &state_delta.checked_add(4)
+            .ok_or(ObjectError::ArithmeticOverflow("capture state flags"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&load_match_flag)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], runtime_error)?;
+    let mut load_match_action = vec![0x43, 0x8b, 0xbc, 0xcf];
+    load_match_action.extend_from_slice(&state_delta.to_le_bytes());
+    assembler.instruction(&load_match_action)?;
+    assembler.instruction(&[0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], match_done)?;
+    assembler.bind(match_action)?;
+    assembler.instruction(&[0x0f, 0xbc, 0xc7])?;
+    assembler.instruction(&[0x4c, 0x89, 0x1c, 0xc4])?;
+    assembler.instruction(&[0x0f, 0xb3, 0xc7])?;
+    assembler.instruction(&[0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x85], match_action)?;
+    assembler.bind(match_done)?;
+
+    // Group zero must be the exact selector span.
+    x86_capture_load_rsp_rax(&mut assembler, 0)?;
+    assembler.instruction(&[0x4c, 0x39, 0xe0])?;
+    assembler.branch(&[0x0f, 0x85], runtime_error)?;
+    x86_capture_load_rsp_rdi(&mut assembler, 8)?;
+    assembler.instruction(&[0x4c, 0x39, 0xef])?;
+    assembler.branch(&[0x0f, 0x85], runtime_error)?;
+    for group in 1..geometry.group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        x86_capture_load_rsp_rax(&mut assembler, group * 16)?;
+        x86_capture_load_rsp_rdi(&mut assembler, group * 16 + 8)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], runtime_error)?;
+        assembler.instruction(&[0x48, 0x39, 0xf8])?; // start <= end
+        assembler.branch(&[0x0f, 0x87], runtime_error)?;
+        assembler.instruction(&[0x4c, 0x39, 0xe0])?; // start >= span start
+        assembler.branch(&[0x0f, 0x82], runtime_error)?;
+        assembler.instruction(&[0x4c, 0x39, 0xef])?; // end <= span end
+        assembler.branch(&[0x0f, 0x87], runtime_error)?;
+        assembler.branch(&[0xe9], valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x85], runtime_error)?;
+        assembler.bind(valid)?;
+    }
+    // Commit only after every raw pair and group zero have closed.
+    for group in 0..geometry.group_count {
+        x86_capture_load_rsp_rax(&mut assembler, group * 16)?;
+        x86_capture_store_r14_rax(&mut assembler, group * 16)?;
+        x86_capture_load_rsp_rdi(&mut assembler, group * 16 + 8)?;
+        x86_capture_store_r14_rdi(&mut assembler, group * 16 + 8)?;
+    }
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_error)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(
+        &u32::try_from(geometry.native_stack_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("capture stack"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&release)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeCaptureMaterializerLowering {
+        plan_relocation_offset: finished.label_offset(plan_relocation)?,
+        code: finished.code,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "iterator validation, nullable progress, two local calls, and transactional publication stay auditable together"
+)]
+fn lower_x86_64_native_capture_next_v1(
+    group_count: usize,
+) -> Result<NativeCaptureNextLowering, ObjectError> {
+    const FRAME_BYTES: u8 = 48;
+    if group_count == 0 {
+        return Err(ObjectError::InvalidModule("native capture-next group count"));
+    }
+    let group_count_u32 = u32::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("capture-next groups"))?;
+    let output_bytes = group_count.checked_mul(16)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("capture-next output"))?;
+    let mut assembler = X86Assembler::new();
+    let disjoint = assembler.label()?;
+    let no_pending_validation = assembler.label()?;
+    let has_last_validation = assembler.label()?;
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // (haystack, length, state, slots, exact_slot_count)
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_count = vec![0x49, 0x81, 0xf8];
+    exact_count.extend_from_slice(&group_count_u32.to_le_bytes());
+    assembler.instruction(&exact_count)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    // The mutable state and output arrays must be complete, nonwrapping, and
+    // disjoint. Haystack aliasing is harmless because all source reads finish
+    // before either successful publication.
+    assembler.instruction(&[0x49, 0x89, 0xd1])?; // state end
+    assembler.instruction(&[0x49, 0x83, 0xc1, 0x18])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x49, 0x89, 0xca])?; // output end
+    let mut add_output = vec![0x49, 0x81, 0xc2];
+    add_output.extend_from_slice(&output_bytes.to_le_bytes());
+    assembler.instruction(&add_output)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x49, 0x39, 0xc9])?; // state_end <= output
+    assembler.branch(&[0x0f, 0x86], disjoint)?;
+    assembler.instruction(&[0x49, 0x39, 0xd2])?; // output_end <= state
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.bind(disjoint)?;
+
+    assembler.instruction(&[0x83, 0x7a, 0x14, 0x00])?; // reserved
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x8b, 0x42, 0x10])?; // flags
+    assembler.instruction(&[0x41, 0x89, 0xc2])?;
+    assembler.instruction(&[0x41, 0x83, 0xe2, 0x07])?;
+    assembler.instruction(&[0x44, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0a])?; // next
+    assembler.instruction(&[0x49, 0x39, 0xf1])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x52, 0x08])?; // last
+    assembler.instruction(&[0x49, 0x39, 0xf2])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], no_pending_validation)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0xa8, 0x04])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.bind(no_pending_validation)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], has_last_validation)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.branch(&[0xe9], validated)?;
+    assembler.bind(has_last_validation)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?; // next >= last
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(validated)?;
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // state
+    assembler.instruction(&[0x49, 0x89, 0xce])?; // output
+    assembler.instruction(&[0x49, 0x8b, 0x45, 0x00])?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x49, 0x8b, 0x45, 0x08])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x49, 0x8b, 0x45, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x10])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0xa8, 0x04])?;
+    assembler.branch(&[0x0f, 0x85], finished)?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], search)?;
+    assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?;
+    assembler.instruction(&[0x4d, 0x39, 0xe1])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0x04, 0x24, 0x01])?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+    assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x44, 0x24, 0x18])?;
+    assembler.instruction(&[0xe8])?;
+    let selector_call = assembler.label()?;
+    assembler.bind(selector_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x18])?; // start
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x20])?; // end
+    assembler.instruction(&[0x4c, 0x3b, 0x0c, 0x24])?;
+    assembler.branch(&[0x0f, 0x82], runtime_error)?;
+    assembler.instruction(&[0x4d, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], runtime_error)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe2])?;
+    assembler.branch(&[0x0f, 0x87], runtime_error)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?;
+    assembler.branch(&[0x0f, 0x85], nonempty)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], accepted_empty)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x54, 0x24, 0x08])?;
+    assembler.branch(&[0x0f, 0x85], accepted_empty)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x24, 0x24])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0x04, 0x24, 0x01])?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(accepted)?;
+    assembler.instruction(&[0x4c, 0x89, 0x14, 0x24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x08])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+    assembler.instruction(&[0x4c, 0x89, 0xca])?;
+    assembler.instruction(&[0x4c, 0x89, 0xd1])?;
+    assembler.instruction(&[0x4d, 0x89, 0xf0])?;
+    let mut materialize_count = vec![0x41, 0xb9];
+    materialize_count.extend_from_slice(&group_count_u32.to_le_bytes());
+    assembler.instruction(&materialize_count)?;
+    assembler.instruction(&[0xe8])?;
+    let materializer_call = assembler.label()?;
+    assembler.bind(materializer_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x4d, 0x89, 0x4d, 0x00])?;
+    assembler.instruction(&[0x4d, 0x89, 0x55, 0x08])?;
+    assembler.instruction(&[0x49, 0x89, 0x45, 0x10])?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x83, 0xe0, 0x01])?;
+    assembler.instruction(&[0x83, 0xc8, 0x04])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.instruction(&[0x48, 0x89, 0xc7])?;
+    for group in 0..group_count {
+        x86_capture_store_r14_rax(&mut assembler, group * 16)?;
+        x86_capture_store_r14_rdi(&mut assembler, group * 16 + 8)?;
+    }
+    assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x4d, 0x89, 0x4d, 0x00])?;
+    assembler.instruction(&[0x4d, 0x89, 0x55, 0x08])?;
+    assembler.instruction(&[0x49, 0x89, 0x45, 0x10])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_error)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished_code = assembler.finish_with_label_offsets()?;
+    Ok(NativeCaptureNextLowering {
+        selector_call_offset: finished_code.label_offset(selector_call)?,
+        materializer_call_offset: finished_code.label_offset(materializer_call)?,
+        code: finished_code.code,
+    })
+}
+
+fn x86_capture_store_rsp_imm64(
+    assembler: &mut X86Assembler,
+    offset: usize,
+    value: u64,
+) -> Result<(), ObjectError> {
+    if value != u64::MAX {
+        return Err(ObjectError::InvalidModule("capture stack immediate"));
+    }
+    if let Some(offset) = u8::try_from(offset).ok().filter(|offset| *offset <= 127) {
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, offset, 0xff, 0xff, 0xff, 0xff])?;
+    } else {
+        let mut instruction = vec![0x48, 0xc7, 0x84, 0x24];
+        instruction.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture stack offset"))?
+                .to_le_bytes(),
+        );
+        instruction.extend_from_slice(&[0xff; 4]);
+        assembler.instruction(&instruction)?;
+    }
+    Ok(())
+}
+
+fn x86_capture_load_rsp_rax(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    x86_capture_rsp_load(assembler, offset, 0)
+}
+
+fn x86_capture_load_rsp_rdi(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    x86_capture_rsp_load(assembler, offset, 7)
+}
+
+fn x86_capture_rsp_load(
+    assembler: &mut X86Assembler,
+    offset: usize,
+    register: u8,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule("capture load register"));
+    }
+    if offset == 0 {
+        assembler.instruction(&[0x48, 0x8b, 0x04 | register << 3, 0x24])?;
+    } else if let Some(offset) = u8::try_from(offset).ok().filter(|offset| *offset <= 127) {
+        assembler.instruction(&[0x48, 0x8b, 0x44 | register << 3, 0x24, offset])?;
+    } else {
+        let mut instruction = vec![0x48, 0x8b, 0x84 | register << 3, 0x24];
+        instruction.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture stack offset"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&instruction)?;
+    }
+    Ok(())
+}
+
+fn x86_capture_store_r14_rax(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    x86_capture_r14_store(assembler, offset, 0)
+}
+
+fn x86_capture_store_r14_rdi(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    x86_capture_r14_store(assembler, offset, 7)
+}
+
+fn x86_capture_r14_store(
+    assembler: &mut X86Assembler,
+    offset: usize,
+    register: u8,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule("capture store register"));
+    }
+    if offset == 0 {
+        assembler.instruction(&[0x49, 0x89, 0x06 | register << 3])?;
+    } else if let Some(offset) = u8::try_from(offset).ok().filter(|offset| *offset <= 127) {
+        assembler.instruction(&[0x49, 0x89, 0x46 | register << 3, offset])?;
+    } else {
+        let mut instruction = vec![0x49, 0x89, 0x86 | register << 3];
+        instruction.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture output offset"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&instruction)?;
+    }
+    Ok(())
 }
 
 impl X86Assembler {

@@ -17,6 +17,7 @@ mod absolute_anchored_cut;
 mod bit_parallel_exists;
 mod bounded_suffix_retry;
 mod byte_frequency;
+mod capture_aot;
 mod captures;
 mod context_dfa;
 mod context_native;
@@ -53,6 +54,20 @@ use sha2::{Digest, Sha256};
 pub use bit_parallel_exists::{
     BitParallelExistsStats, MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
     MAX_BIT_PARALLEL_EXISTS_WORDS, MAX_BIT_PARALLEL_EXISTS_WORK,
+};
+pub use capture_aot::{
+    NATIVE_CAPTURE_AOT_V1_ABI_VERSION, NATIVE_CAPTURE_AOT_V1_BUNDLE_DIGEST_OFFSET,
+    NATIVE_CAPTURE_AOT_V1_CAPTURE_LEVEL_ALL, NATIVE_CAPTURE_AOT_V1_FLAG_BYTE_SEMANTICS,
+    NATIVE_CAPTURE_AOT_V1_FLAG_NATIVE_ONEPASS, NATIVE_CAPTURE_AOT_V1_FLAG_NEGATIVE_ENTRY,
+    NATIVE_CAPTURE_AOT_V1_FLAG_SPAN_SELECTOR, NATIVE_CAPTURE_AOT_V1_HEADER_BYTES,
+    NATIVE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, NATIVE_CAPTURE_AOT_V1_ITER_STATE_ALIGN,
+    NATIVE_CAPTURE_AOT_V1_ITER_STATE_BYTES, NATIVE_CAPTURE_AOT_V1_MAGIC,
+    NATIVE_CAPTURE_AOT_V1_OFFSET_BYTES, NATIVE_CAPTURE_AOT_V1_PLAN_OFFSET,
+    NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_ALIGN, NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES,
+    NATIVE_CAPTURE_AOT_V1_STATUS_UNAVAILABLE, NATIVE_CAPTURE_AOT_V1_UNSET,
+    NativeCaptureAotArtifactV1, NativeCaptureAotDeclineV1, NativeCaptureAotError,
+    NativeCaptureAotLimitsV1, NativeCaptureAotReceiptV1, NativeCaptureAotStrategyV1,
+    NativeCaptureBundleV1Error, NativeCaptureBundleV1View, NativeCaptureDescriptorV1,
 };
 pub use captures::{
     CaptureArtifactIdentity, CaptureAuthenticationError, CaptureCompileError, CaptureCompileLimits,

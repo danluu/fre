@@ -189,6 +189,24 @@ struct Transition {
     action: u32,
 }
 
+/// One assertion-free state exposed to a bounded native exact-span
+/// materializer. This is a construction view, not a stable wire format.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureNativeStateV1 {
+    pub match_action: u32,
+    pub is_match: bool,
+}
+
+/// One assertion-free transition exposed to a bounded native exact-span
+/// materializer. `target_state == u32::MAX` is the canonical dead edge.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureNativeTransitionV1 {
+    pub target_state: u32,
+    pub action: u32,
+}
+
 const _: () = assert!(size_of::<Transition>() == 8);
 
 impl Transition {
@@ -312,6 +330,88 @@ pub struct OnePassCapturePlan {
     inner: Arc<OnePassCaptureInner>,
 }
 
+/// Borrowed, allocation-free view of the construction-complete direct-tag
+/// subset that a native exact-span materializer can lower without calling a
+/// semantic helper.
+///
+/// Admission requires an assertion-free one-pass plan, at most 32 raw tag
+/// words, canonical two-tag group geometry, and state-index transitions that
+/// close exactly. Unsupported plans return no view; execution must not fall
+/// back after selecting this representation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct OnePassCaptureNativeV1View<'a> {
+    inner: &'a OnePassCaptureInner,
+    alphabet_len_u32: u32,
+    start_state: u32,
+}
+
+impl<'a> OnePassCaptureNativeV1View<'a> {
+    #[must_use]
+    pub const fn byte_classes(self) -> &'a [u8; BYTE_DOMAIN] {
+        &self.inner.byte_class
+    }
+
+    #[must_use]
+    pub const fn alphabet_len(self) -> usize {
+        self.inner.alphabet_len
+    }
+
+    #[must_use]
+    pub const fn start_state(self) -> u32 {
+        self.start_state
+    }
+
+    #[must_use]
+    pub const fn state_count(self) -> usize {
+        self.inner.states.len()
+    }
+
+    #[must_use]
+    pub const fn transition_count(self) -> usize {
+        self.inner.transitions.len()
+    }
+
+    #[must_use]
+    pub const fn group_count(self) -> usize {
+        self.inner.group_count
+    }
+
+    #[must_use]
+    pub const fn tag_slot_count(self) -> usize {
+        self.inner.slot_count
+    }
+
+    #[must_use]
+    pub fn states(self) -> impl ExactSizeIterator<Item = OnePassCaptureNativeStateV1> + 'a {
+        self.inner
+            .states
+            .iter()
+            .map(|state| OnePassCaptureNativeStateV1 {
+                match_action: state.match_action,
+                is_match: state.is_match,
+            })
+    }
+
+    #[must_use]
+    pub fn transitions(
+        self,
+    ) -> impl ExactSizeIterator<Item = OnePassCaptureNativeTransitionV1> + 'a {
+        let alphabet_len = self.alphabet_len_u32;
+        self.inner
+            .transitions
+            .iter()
+            .map(move |transition| OnePassCaptureNativeTransitionV1 {
+                target_state: if transition.is_dead() {
+                    u32::MAX
+                } else {
+                    transition.target_row() / alphabet_len
+                },
+                action: transition.action,
+            })
+    }
+}
+
 /// Opaque construction owner shared with one exact one-pass plan.
 ///
 /// Cloning this seal only clones the plan's existing `Arc`; equality is
@@ -363,6 +463,17 @@ impl OnePassCaptureOwnerSeal {
     #[must_use]
     pub fn build_report(&self) -> &OnePassCaptureBuildReport {
         &self.inner.report
+    }
+
+    /// Borrow the complete assertion-free direct-tag tables admitted by the
+    /// native materializer ABI V1.
+    ///
+    /// This is an allocation-free construction query. `None` is a stable
+    /// decline, never permission for an execution-time fallback.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn native_v1_view(&self) -> Option<OnePassCaptureNativeV1View<'_>> {
+        native_v1_view(self.inner.as_ref())
     }
 
     /// Complete capture schema including group zero.
@@ -422,6 +533,63 @@ impl OnePassCaptureOwnerSeal {
         (self.inner.slot_count <= INLINE_CAPTURE_SLOTS)
             .then_some(size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>())
     }
+}
+
+fn native_v1_view(inner: &OnePassCaptureInner) -> Option<OnePassCaptureNativeV1View<'_>> {
+    let alphabet_len_u32 = u32::try_from(inner.alphabet_len).ok()?;
+    let state_count_u32 = u32::try_from(inner.states.len()).ok()?;
+    let expected_transitions = inner.states.len().checked_mul(inner.alphabet_len)?;
+    if !inner.direct_tag_masks
+        || inner.report.assertions != 0
+        || inner.alphabet_len == 0
+        || inner.states.is_empty()
+        || inner.group_count == 0
+        || inner.slot_count == 0
+        || inner.slot_count > DIRECT_TAG_SLOT_LIMIT
+        || inner.group_count.checked_mul(2) != Some(inner.slot_count)
+        || inner.transitions.len() != expected_transitions
+        || inner.start % alphabet_len_u32 != 0
+        || inner
+            .byte_class
+            .iter()
+            .any(|&class| usize::from(class) >= inner.alphabet_len)
+    {
+        return None;
+    }
+    let start_state = inner.start.checked_div(alphabet_len_u32)?;
+    if start_state >= state_count_u32 {
+        return None;
+    }
+    let tag_mask_limit = if inner.slot_count == DIRECT_TAG_SLOT_LIMIT {
+        None
+    } else {
+        Some(1_u32.checked_shl(u32::try_from(inner.slot_count).ok()?)?)
+    };
+    let mask_is_valid = |mask: u32| tag_mask_limit.is_none_or(|limit| mask < limit);
+    if inner
+        .states
+        .iter()
+        .any(|state| !mask_is_valid(state.match_action))
+    {
+        return None;
+    }
+    for transition in &inner.transitions {
+        if !mask_is_valid(transition.action) {
+            return None;
+        }
+        if transition.is_dead() {
+            continue;
+        }
+        let row = transition.target_row();
+        if row % alphabet_len_u32 != 0 || row.checked_div(alphabet_len_u32)? >= state_count_u32 {
+            return None;
+        }
+    }
+    Some(OnePassCaptureNativeV1View {
+        inner,
+        alphabet_len_u32,
+        start_state,
+    })
 }
 
 /// Borrowed schema-authenticated issuer for repeated fixed-stack admissions.
@@ -598,6 +766,15 @@ impl OnePassCapturePlan {
         OnePassCaptureOwnerSeal {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// Borrow the assertion-free direct-tag construction tables admitted by
+    /// the native exact-span materializer. A declined view is terminal for
+    /// that native artifact and never authorizes execution-time replay.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn native_v1_view(&self) -> Option<OnePassCaptureNativeV1View<'_>> {
+        native_v1_view(self.inner.as_ref())
     }
 
     fn exact_work_bounds(&self, span: Span) -> Result<(usize, usize, usize, usize), SearchError> {
@@ -2837,10 +3014,22 @@ const fn allocation(resource: OnePassCaptureBuildResource) -> OnePassCaptureBuil
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        MATCH_WINS, OnePassCaptureBuildError, OnePassCaptureBuildResource, TARGET_ROW_MASK,
-        Transition,
+        MATCH_WINS, OnePassCaptureBuildError, OnePassCaptureBuildLimits,
+        OnePassCaptureBuildResource, OnePassCapturePlan, TARGET_ROW_MASK, Transition,
     };
+    use crate::{Assertion, Ast, BuildLimits, Greed, Program};
+
+    fn plan(ast: &Ast) -> OnePassCapturePlan {
+        let program = Program::compile(ast, BuildLimits::default()).expect("compile fixture");
+        OnePassCapturePlan::try_from_program(
+            Arc::new(program),
+            OnePassCaptureBuildLimits::default(),
+        )
+        .expect("build one-pass fixture")
+    }
 
     #[test]
     fn packed_transition_rejects_the_dead_alias() {
@@ -2860,5 +3049,50 @@ mod tests {
             .expect("largest flagged row is representable");
         assert!(!largest_flagged.is_dead());
         assert_eq!(largest_flagged.target, (TARGET_ROW_MASK - 1) | MATCH_WINS);
+    }
+
+    #[test]
+    fn native_v1_view_is_closed_and_uses_state_indices() {
+        let plan = plan(&Ast::concat([
+            Ast::Byte(b'a').capture(1),
+            Ast::Byte(b'b').repeat(0, None, Greed::Greedy).capture(2),
+        ]));
+        let view = plan
+            .native_v1_view()
+            .expect("assertion-free direct-tag view");
+        assert_eq!(view.group_count(), 3);
+        assert_eq!(view.tag_slot_count(), 6);
+        assert_eq!(
+            view.transition_count(),
+            view.state_count() * view.alphabet_len()
+        );
+        assert!(usize::try_from(view.start_state()).unwrap() < view.state_count());
+        assert!(
+            view.byte_classes()
+                .iter()
+                .all(|&class| usize::from(class) < view.alphabet_len())
+        );
+        let action_limit = 1_u32 << u32::try_from(view.tag_slot_count()).unwrap();
+        assert!(view.states().all(|state| state.match_action < action_limit));
+        assert!(view.transitions().all(|transition| {
+            transition.action < action_limit
+                && (transition.target_state == u32::MAX
+                    || usize::try_from(transition.target_state).unwrap() < view.state_count())
+        }));
+    }
+
+    #[test]
+    fn native_v1_view_declines_assertions_and_wide_tag_geometry() {
+        let asserted = plan(&Ast::concat([
+            Ast::Assert(Assertion::Start),
+            Ast::Byte(b'a').capture(1),
+        ]));
+        assert!(asserted.native_v1_view().is_none());
+
+        let wide = plan(&Ast::concat(
+            (1..=16).map(|index| Ast::Byte(b'a').capture(index)),
+        ));
+        assert_eq!(wide.capture_group_count(), 17);
+        assert!(wide.native_v1_view().is_none());
     }
 }

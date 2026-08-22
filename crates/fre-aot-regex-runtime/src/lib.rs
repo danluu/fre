@@ -167,6 +167,8 @@ pub const STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME: u32 = 8;
 /// consume both synchronously and retry the same unread byte locally.
 #[doc(hidden)]
 pub const STATUS_DYNAMIC_ROWS_CELL_RESUME: u32 = 9;
+/// A requested capture object entry was published as an explicit negative.
+pub const STATUS_NATIVE_CAPTURE_UNAVAILABLE: u32 = 10;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -520,6 +522,9 @@ pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 pub const C_API_V2_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v2.h");
 /// C declarations for additive native Ordered-TNFA preparation.
 pub const C_API_V3_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v3.h");
+/// C declarations for helper-free identity-suffixed native capture entries.
+pub const C_API_NATIVE_CAPTURE_V1_HEADER: &str =
+    include_str!("../include/fre_aot_regex_runtime_captures_v1.h");
 
 /// C declarations for the bounded Stage-1 operation-set runtime ABI.
 pub const C_API_OPERATION_SET_V1_HEADER: &str =
@@ -532,6 +537,60 @@ pub struct FreAotRegexResultV1 {
     pub start: usize,
     pub end: usize,
 }
+
+/// One capture group produced by a native capture object entry.
+///
+/// `{usize::MAX, usize::MAX}` is the only unmatched representation. Equal
+/// in-range offsets represent a participating empty group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexCaptureSlotV1 {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl FreAotRegexCaptureSlotV1 {
+    pub const UNMATCHED: Self = Self {
+        start: usize::MAX,
+        end: usize::MAX,
+    };
+}
+
+impl Default for FreAotRegexCaptureSlotV1 {
+    fn default() -> Self {
+        Self::UNMATCHED
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<FreAotRegexCaptureSlotV1>() == 16);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<FreAotRegexCaptureSlotV1>() == 8);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexCaptureSlotV1, start) == 0);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(FreAotRegexCaptureSlotV1, end) == 8);
+
+/// Object-local exact-span capture materializer. Selected implementations do
+/// not enter this runtime crate; this type only declares their stable ABI.
+pub type FreAotRegexCaptureMaterializeV1 = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    usize,
+    usize,
+    *mut FreAotRegexCaptureSlotV1,
+    usize,
+) -> u32;
+
+/// Object-local non-overlapping capture iterator. Selected implementations do
+/// not enter this runtime crate; this type only declares their stable ABI.
+pub type FreAotRegexCaptureNextV1 = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *mut FreAotRegexIterStateV1,
+    *mut FreAotRegexCaptureSlotV1,
+    usize,
+) -> u32;
 
 /// One root-aligned result from a successful operation-set execution.
 ///
@@ -10351,6 +10410,9 @@ mod tests {
             align_of::<*mut std::ffi::c_void>()
         );
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
+        assert_eq!(size_of::<FreAotRegexCaptureSlotV1>(), size_of::<[usize; 2]>());
+        assert_eq!(align_of::<FreAotRegexCaptureSlotV1>(), align_of::<usize>());
+        assert_eq!(FreAotRegexCaptureSlotV1::default(), FreAotRegexCaptureSlotV1::UNMATCHED);
         assert_eq!(
             size_of::<FreAotRegexIterStateV1>(),
             size_of::<usize>() * 2 + size_of::<u32>() * 2
@@ -10441,6 +10503,12 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveCountV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanSumV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveGrepCountV1"));
+        assert!(C_API_NATIVE_CAPTURE_V1_HEADER
+            .contains("FRE_AOT_REGEX_STATUS_NATIVE_CAPTURE_UNAVAILABLE 10u"));
+        assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureMaterializeV1"));
+        assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureNextV1"));
+        assert_eq!(size_of::<FreAotRegexCaptureMaterializeV1>(), size_of::<usize>());
+        assert_eq!(size_of::<FreAotRegexCaptureNextV1>(), size_of::<usize>());
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanFillV1>(),
             size_of::<usize>()

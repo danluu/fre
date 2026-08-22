@@ -323,6 +323,10 @@ impl CompiledCaptureRegex {
         &self.capture
     }
 
+    pub(crate) const fn onepass_plan(&self) -> Option<&OnePassCapturePlan> {
+        self.onepass.as_ref()
+    }
+
     #[must_use]
     pub const fn receipt(&self) -> &CaptureCompileReceipt {
         &self.receipt
@@ -333,6 +337,33 @@ impl CompiledCaptureRegex {
         self.receipt
             .identity
             .authenticate(self.selector.program(), &self.capture)
+    }
+
+    /// Emit an additive helper-free native capture artifact.
+    ///
+    /// The selector's ordinary identity-suffixed Span entry and all incumbent
+    /// runtime dependencies are preserved. Supported shapes additionally
+    /// export object-local capture-next and exact-span materialization entries
+    /// backed by an authenticated direct-tag plan. Unsupported shapes export
+    /// explicit unavailable entries; execution never falls back to replay.
+    pub fn emit_native_aot_v1(
+        &self,
+        limits: crate::NativeCaptureAotLimitsV1,
+    ) -> Result<crate::NativeCaptureAotArtifactV1, crate::NativeCaptureAotError> {
+        crate::capture_aot::emit_native_capture_aot_v1(self, limits)
+    }
+
+    /// Emit a fail-closed V1 object for an ordered-many capture request.
+    ///
+    /// V1 has no pattern-id result field, so an ordered-many adapter must not
+    /// relabel a combined single-pattern capture plan as native support. The
+    /// returned architecture-correct entries report status 10 transactionally.
+    #[doc(hidden)]
+    pub fn emit_native_ordered_many_negative_aot_v1(
+        &self,
+        limits: crate::NativeCaptureAotLimitsV1,
+    ) -> Result<crate::NativeCaptureAotArtifactV1, crate::NativeCaptureAotError> {
+        crate::capture_aot::emit_native_ordered_many_capture_negative_aot_v1(self, limits)
     }
 
     /// Prepare every source-dependent operation buffer and permanently select

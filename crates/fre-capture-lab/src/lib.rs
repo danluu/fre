@@ -74,7 +74,9 @@ pub use onepass::{
     OnePassCaptureAnchoredInlineAdmission, OnePassCaptureAnchoredInlineIssuer,
     OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
     OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCaptureOwnerSeal,
-    OnePassCapturePlan, OnePassCaptureRefusal, OnePassCaptureSearchProspective,
+    OnePassCaptureNativeStateV1, OnePassCaptureNativeTransitionV1,
+    OnePassCaptureNativeV1View, OnePassCapturePlan, OnePassCaptureRefusal,
+    OnePassCaptureSearchProspective,
     OnePassCaptureSearchWorkspace,
     OnePassCaptureSearchWorkspaceUsage, OnePassCaptureWorkspace, OnePassCaptureWorkspaceUsage,
 };
