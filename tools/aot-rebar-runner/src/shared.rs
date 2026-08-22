@@ -762,23 +762,98 @@ const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
 ];
 
+fn unresolved_runtime_function_names(compiled: &CompiledRegex) -> Option<Vec<&str>> {
+    let module = compiled.module();
+    let mut names = Vec::new();
+    for (index, symbol) in module.symbols().iter().enumerate() {
+        let referenced = module
+            .relocations()
+            .iter()
+            .any(|relocation| relocation.symbol == index);
+        if symbol.section.is_some() || !referenced {
+            continue;
+        }
+        if symbol.binding != SymbolBinding::Global || symbol.kind != SymbolKind::Function {
+            return None;
+        }
+        names.push(symbol.name.as_str());
+    }
+    Some(names)
+}
+
 fn has_exact_runtime_symbol_closure(compiled: &CompiledRegex, expected: &[&str]) -> bool {
-    let actual = compiled
-        .module()
-        .required_runtime_symbols()
-        .collect::<Vec<_>>();
-    has_exact_symbol_name_closure(&actual, expected)
+    unresolved_runtime_function_names(compiled)
+        .is_some_and(|actual| has_exact_symbol_name_closure(&actual, expected))
 }
 
 fn has_exact_symbol_name_closure(actual: &[&str], expected: &[&str]) -> bool {
     if actual.len() != expected.len() {
         return false;
     }
+    let expected_len = expected.len();
     let actual = actual
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    actual.len() == expected.len() && expected.iter().all(|symbol| actual.contains(symbol))
+    let expected = expected
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    actual.len() == expected_len && expected.len() == expected_len && actual == expected
+}
+
+fn has_exact_optional_symbol_name_closure(
+    actual: &[&str],
+    expected: &[Option<&str>],
+) -> bool {
+    let expected = expected.iter().flatten().copied().collect::<Vec<_>>();
+    has_exact_symbol_name_closure(actual, &expected)
+}
+
+/// Authenticate the complete helper surface published by the current module
+/// itself for a caps-zero native prepared loop. This artifact is never linked
+/// by the row bridge: the closed surface is only a typed witness permitting a
+/// fresh, independently authenticated V15 compilation of the same program.
+fn native_prepared_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
+    let module = compiled.module();
+    let Some(actual) = unresolved_runtime_function_names(compiled) else {
+        return false;
+    };
+    let runtime = module.runtime_symbol();
+    if !matches!(
+        runtime,
+        "fre_aot_regex_runtime_search_v1"
+            | "fre_aot_regex_runtime_search_without_endpoint_oracle_v1"
+    ) {
+        return false;
+    }
+    let prepared_runtime = module.required_prepared_runtime_symbol();
+    if prepared_runtime.is_some_and(|symbol| {
+        !matches!(
+            symbol,
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2"
+                | "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3"
+                | "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v3"
+                | "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v4"
+        )
+    }) {
+        return false;
+    }
+    let expected = [
+        Some(runtime),
+        prepared_runtime,
+        module.required_prepared_fallback_runtime_symbol(),
+        module.required_prepared_static_prefix_retire_runtime_symbol(),
+        module.required_prepared_admission_runtime_symbol(),
+        module.required_prepared_preflight_runtime_symbol(),
+        module.required_prepared_dynamic_rows_deopt_runtime_symbol(),
+        module.required_prepared_dynamic_rows_continue_runtime_symbol(),
+        module.required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+        module.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
+        module.required_prepared_span_recovery_runtime_symbol(),
+        module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
+    ];
+    has_exact_optional_symbol_name_closure(&actual, &expected)
 }
 
 fn has_defined_symbol(
@@ -804,6 +879,37 @@ fn native_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> 
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     .then_some(suffix)
+}
+
+fn prepared_row_symbol_identities_are_closed(
+    ordinary_entry: &str,
+    prepared_entry: &str,
+    span_fill: &str,
+    program: &str,
+) -> bool {
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(prepared_identity) =
+        native_symbol_identity(prepared_entry, "fre_aot_regex_search_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(span_fill_identity) =
+        native_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    ordinary_identity == prepared_identity
+        && ordinary_identity == span_fill_identity
+        && ordinary_identity == program_identity
 }
 
 fn prepared_v15_grep_symbol_identities_are_closed(
@@ -1847,6 +1953,14 @@ pub fn compile_native_row_bridge(
                         ));
                     }
                 };
+                if prepared.receipt().automaton_sha256
+                    != compiled.receipt().automaton_sha256
+                    || prepared.receipt().program_sha256 != compiled.receipt().program_sha256
+                {
+                    return Err(format!(
+                        "general AOT prepared V15 row changed the semantic identity at source ordinal {source_ordinal}"
+                    ));
+                }
                 authenticate_prepared_v15_row(&prepared, source_ordinal)?;
                 (prepared, NativeRowRoute::PreparedOrderedNfaV15)
             }
@@ -2005,6 +2119,15 @@ fn ordinary_row_is_well_formed_runtime_dependency(
     let Some((program, program_len)) = module.required_runtime_program() else {
         return Ok(false);
     };
+    let runtime_symbols_are_closed = match module.prepared_bulk_strategy() {
+        Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk) => {
+            has_exact_runtime_symbol_closure(compiled, &PREPARED_V15_ROW_RUNTIME_SYMBOLS)
+        }
+        Some(PreparedBulkStrategy::NativePreparedLoop) => {
+            native_prepared_loop_runtime_symbols_are_closed(compiled)
+        }
+        _ => false,
+    };
     Ok(receipt.mode == CompileMode::Optimizing
         && receipt.output == OutputContract::Span
         && receipt.engine == EngineKind::OrderedNfa
@@ -2014,18 +2137,22 @@ fn ordinary_row_is_well_formed_runtime_dependency(
         && receipt.required_prepare_capabilities == 0
         && module.prepared_aggregate_exports().is_empty()
         && module.prepared_aggregate_strategy().is_none()
-        && module.prepared_bulk_strategy()
-            == Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk)
+        && runtime_symbols_are_closed
         && module.required_prepare_capabilities() == 0
         && module.prepared_count_symbol().is_none()
         && module.prepared_span_sum_symbol().is_none()
         && module.prepared_grep_count_symbol().is_none()
         && program_len != 0
-        && has_exact_runtime_symbol_closure(compiled, &PREPARED_V15_ROW_RUNTIME_SYMBOLS)
         && has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
         && has_defined_symbol(compiled, prepared_entry, SymbolKind::Function, None)
         && has_defined_symbol(compiled, span_fill, SymbolKind::Function, None)
         && has_defined_symbol(compiled, program, SymbolKind::Object, Some(program_len))
+        && prepared_row_symbol_identities_are_closed(
+            module.entry_symbol(),
+            prepared_entry,
+            span_fill,
+            program,
+        )
         && [module.entry_symbol(), prepared_entry, span_fill, program]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -2073,6 +2200,12 @@ fn authenticate_prepared_v15_row(
             program_name,
             SymbolKind::Object,
             Some(program_len),
+        )
+        || !prepared_row_symbol_identities_are_closed(
+            module.entry_symbol(),
+            entry_name,
+            span_fill,
+            program_name,
         )
         || [module.entry_symbol(), entry_name, span_fill, program_name]
             .into_iter()
@@ -2412,6 +2545,37 @@ mod tests {
     }
 
     #[test]
+    fn prepared_row_symbol_identity_requires_one_exact_suffix() {
+        let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
+        let prepared = format!("fre_aot_regex_search_exclusive_v1_{}", "a".repeat(64));
+        let span_fill = format!(
+            "fre_aot_regex_fill_spans_exclusive_v1_{}",
+            "a".repeat(64)
+        );
+        let program = format!("fre_aot_regex_runtime_program_v1_{}", "a".repeat(64));
+        assert!(prepared_row_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            &span_fill,
+            &program,
+        ));
+
+        let wrong_program = format!("fre_aot_regex_runtime_program_v1_{}", "b".repeat(64));
+        assert!(!prepared_row_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            &span_fill,
+            &wrong_program,
+        ));
+        assert!(!prepared_row_symbol_identities_are_closed(
+            &ordinary,
+            &prepared,
+            "fre_aot_regex_fill_spans_exclusive_v1_not-a-digest",
+            &program,
+        ));
+    }
+
+    #[test]
     fn ordinary_grep_runtime_symbol_closure_is_exact() {
         assert!(has_exact_symbol_name_closure(
             &ORDINARY_GREP_RUNTIME_SYMBOLS,
@@ -2438,6 +2602,55 @@ mod tests {
         assert!(!has_exact_symbol_name_closure(
             &duplicated,
             &ORDINARY_GREP_RUNTIME_SYMBOLS,
+        ));
+
+        let duplicated_expected = [
+            ORDINARY_GREP_RUNTIME_SYMBOLS[0],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[1],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[2],
+            ORDINARY_GREP_RUNTIME_SYMBOLS[2],
+        ];
+        assert!(!has_exact_symbol_name_closure(
+            &ORDINARY_GREP_RUNTIME_SYMBOLS,
+            &duplicated_expected,
+        ));
+    }
+
+    #[test]
+    fn optional_runtime_symbol_closure_is_exact() {
+        let actual = ["runtime", "fallback", "preflight"];
+        let expected = [
+            Some("runtime"),
+            None,
+            Some("fallback"),
+            Some("preflight"),
+        ];
+        assert!(has_exact_optional_symbol_name_closure(&actual, &expected));
+        assert!(!has_exact_optional_symbol_name_closure(
+            &actual[..2],
+            &expected,
+        ));
+
+        let extra = ["runtime", "fallback", "preflight", "poisoned"];
+        assert!(!has_exact_optional_symbol_name_closure(&extra, &expected));
+        let poisoned = ["runtime", "fallback", "poisoned"];
+        assert!(!has_exact_optional_symbol_name_closure(
+            &poisoned,
+            &expected,
+        ));
+        let duplicated_actual = ["runtime", "runtime", "preflight"];
+        assert!(!has_exact_optional_symbol_name_closure(
+            &duplicated_actual,
+            &expected,
+        ));
+        let duplicated_expected = [
+            Some("runtime"),
+            Some("fallback"),
+            Some("fallback"),
+        ];
+        assert!(!has_exact_optional_symbol_name_closure(
+            &actual,
+            &duplicated_expected,
         ));
     }
 
@@ -2740,6 +2953,86 @@ mod tests {
                 .next()
                 .is_none());
             assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
+        }
+    }
+
+    #[test]
+    fn native_prepared_loop_is_only_a_trigger_for_authenticated_v15() {
+        const TRIGGER: &str = r"(?i)(?:abc.?cdccefg|abc.?cdccefg.?hfidg|abc.?hfidg)[=:;=]?\s{0,30}(?:j|kl|k)\s{0,30}[=:;=]?([a-z0-9.!-]{16,200})[^a-z0-9.!-]";
+        assert_eq!(TRIGGER.len(), 124);
+
+        for (architecture, operating_system) in [("x86_64", "linux"), ("aarch64", "macos")] {
+            let target =
+                target_from_parts(architecture, operating_system, FeatureSet::EMPTY.bits())
+                    .expect("supported target");
+            let mut profile = RustProfile::rebar_1_12_4();
+            profile.options.unicode = false;
+            profile.options.case_insensitive = false;
+            let ordinary = compile_with_slow_aot_limits(
+                CompileRequest::new(TRIGGER, target)
+                    .profile(profile)
+                    .output(OutputContract::Span)
+                    .mode(CompileMode::Optimizing),
+                SlowAotLimits::default(),
+            )
+            .expect("shape-equivalent native prepared-loop incumbent");
+            assert_eq!(ordinary.receipt().engine, EngineKind::OrderedNfa);
+            assert!(ordinary.receipt().runtime_helper_required);
+            assert!(ordinary.receipt().prepared_aggregate_exports.is_empty());
+            assert!(ordinary.receipt().prepared_aggregate_strategy.is_none());
+            assert_eq!(ordinary.receipt().required_prepare_capabilities, 0);
+            assert_eq!(
+                ordinary.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativePreparedLoop)
+            );
+            assert!(native_prepared_loop_runtime_symbols_are_closed(&ordinary));
+            assert!(
+                ordinary_row_is_well_formed_runtime_dependency(&ordinary, 1)
+                    .expect("typed runtime-dependency check")
+            );
+
+            let benchmark = Benchmark {
+                name: "test/model/native-prepared-loop-upgrade".to_owned(),
+                model: Model::Count,
+                patterns: vec!["a+".to_owned(), TRIGGER.to_owned()],
+                case_insensitive: false,
+                unicode: false,
+                haystack: b"aa no synthetic token".to_vec(),
+                max_iters: 1,
+                max_warmup_iters: 0,
+                max_time: Duration::from_secs(1),
+                max_warmup_time: Duration::ZERO,
+            };
+            let bridge = compile_native_row_bridge(&benchmark, target)
+                .expect("native prepared loop selects explicit V15");
+            assert_eq!(bridge.source_to_artifact, [0, 1]);
+            assert_eq!(bridge.artifacts.len(), 2);
+            assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
+            assert_eq!(
+                bridge.artifacts[1].route,
+                NativeRowRoute::PreparedOrderedNfaV15
+            );
+            let selected = &bridge.artifacts[1].compiled;
+            assert_eq!(
+                selected.module().required_prepare_capabilities(),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15
+            );
+            assert_eq!(
+                selected.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+            );
+            assert!(has_exact_runtime_symbol_closure(
+                selected,
+                &PREPARED_V15_ROW_RUNTIME_SYMBOLS,
+            ));
+            assert_eq!(
+                selected.receipt().automaton_sha256,
+                ordinary.receipt().automaton_sha256,
+            );
+            assert_eq!(
+                selected.receipt().program_sha256,
+                ordinary.receipt().program_sha256,
+            );
         }
     }
 
