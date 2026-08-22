@@ -1999,29 +1999,19 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
         .syntax(syntax)
         .build_many(&benchmark.patterns)
         .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))?;
-    let mut captures = regex.create_captures();
-    let mut count_capture_domain = |haystack: &[u8]| -> Result<u64, String> {
-        let mut input = Input::new(haystack);
-        let mut count = 0_u64;
-        loop {
-            regex.search_captures(&input, &mut captures);
-            let Some(matched) = captures.get_match() else {
-                return Ok(count);
-            };
-            if matched.start() == matched.end() {
-                return Err(
-                    "public Rebar capture model violated its nonempty-match assumption".to_owned(),
-                );
-            }
-            for group in 0..captures.group_len() {
-                if captures.get_group(group).is_some() {
-                    count = count
-                        .checked_add(1)
-                        .ok_or_else(|| "Rust Rebar capture oracle overflow".to_owned())?;
+    let count_capture_domain = |haystack: &[u8]| -> Result<u64, String> {
+        regex
+            .captures_iter(Input::new(haystack))
+            .try_fold(0_u64, |mut count, captures| {
+                for group in 0..captures.group_len() {
+                    if captures.get_group(group).is_some() {
+                        count = count
+                            .checked_add(1)
+                            .ok_or_else(|| "Rust Rebar capture oracle overflow".to_owned())?;
+                    }
                 }
-            }
-            input.set_start(matched.end());
-        }
+                Ok(count)
+            })
     };
     match benchmark.model {
         shared::Model::Compile | shared::Model::Count => {
@@ -2158,6 +2148,26 @@ mod tests {
         per_line.model = shared::Model::GrepCaptures;
         per_line.haystack = b"aa\r\nno\na".to_vec();
         assert_eq!(rust_oracle(&per_line).unwrap(), 4);
+    }
+
+    #[test]
+    fn independent_capture_oracle_preserves_empty_matches_and_empty_groups() {
+        let mut nullable = benchmark(shared::Model::CountCaptures, b"abc");
+        nullable.patterns = vec!["(.*)".to_owned()];
+        assert_eq!(rust_oracle(&nullable), Ok(2));
+
+        nullable.haystack = b"".to_vec();
+        assert_eq!(rust_oracle(&nullable), Ok(2));
+
+        let mut empty_group = benchmark(shared::Model::CountCaptures, b"b");
+        empty_group.patterns = vec!["(a*)b".to_owned()];
+        assert_eq!(rust_oracle(&empty_group), Ok(2));
+        empty_group.patterns = vec!["(a*)".to_owned()];
+        assert_eq!(rust_oracle(&empty_group), Ok(4));
+
+        let mut byte_empty = benchmark(shared::Model::CountCaptures, &[0xC3, 0xA9]);
+        byte_empty.patterns = vec!["()".to_owned()];
+        assert_eq!(rust_oracle(&byte_empty), Ok(6));
     }
 
     #[test]
