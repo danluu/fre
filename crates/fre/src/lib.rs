@@ -5488,15 +5488,23 @@ impl PortableParsedBuildContext {
 /// HIR is accepted only when it is a nonempty UTF-8 literal or a flat,
 /// nonempty alternation of such literals. Excluding LF proves that ripgrep's
 /// line-byte removal was inert; the absence of look assertions proves that
-/// multiline mode was inert. A canonical source is derived here so cloning a
-/// published matcher still replays ordinary source construction exactly.
+/// multiline mode was inert. The pinned HIR Printer's exact source spelling
+/// is derived here so cloning a published matcher and every source/resource
+/// envelope still replay ordinary construction exactly.
 fn append_ripgrep_literal_source(source: &mut String, node: &Hir) {
     let HirKind::Literal(literal) = node.kind() else {
         unreachable!("literal HIR handoff was authenticated above");
     };
     let text = core::str::from_utf8(literal.0.as_ref())
         .expect("literal HIR handoff authenticated UTF-8 above");
+    let grouped = text.chars().nth(1).is_some();
+    if grouped {
+        source.push_str("(?:");
+    }
     regex_syntax::escape_into(text, source);
+    if grouped {
+        source.push(')');
+    }
 }
 
 fn ripgrep_standard_literal_context(
@@ -5547,12 +5555,15 @@ fn ripgrep_standard_literal_context(
 
     let mut literal_bytes = 0_u64;
     let mut source_bytes = if branches.is_some() {
-        hir_nodes.checked_sub(2)?
+        // The pinned HIR Printer wraps every alternation in `(?:...)` and
+        // places one `|` between branches. Since `hir_nodes` is the branch
+        // count plus the root, this is exactly four grouping bytes plus
+        // `branch_count - 1` separators.
+        hir_nodes.checked_add(2)?
     } else {
         0
     };
-    let canonical_source_limit =
-        u64::try_from(canonical_source_limit).unwrap_or(u64::MAX);
+    let canonical_source_limit = u64::try_from(canonical_source_limit).unwrap_or(u64::MAX);
     let within_source_and_work = |source_bytes: u64, literal_bytes: u64| {
         source_bytes <= canonical_source_limit
             && admitted(
@@ -5592,7 +5603,11 @@ fn ripgrep_standard_literal_context(
         }
         let text = core::str::from_utf8(literal.0.as_ref()).ok()?;
         let mut escapes = 0_u64;
+        let mut saw_character = false;
+        let mut grouped = false;
         for character in text.chars() {
+            grouped |= saw_character;
+            saw_character = true;
             if character == '\n' {
                 return None;
             }
@@ -5600,7 +5615,11 @@ fn ripgrep_standard_literal_context(
                 escapes = escapes.checked_add(1)?;
             }
         }
-        let escaped_source_bytes = unescaped_source_bytes.checked_add(escapes)?;
+        debug_assert!(saw_character);
+        let group_bytes = if grouped { 4 } else { 0 };
+        let escaped_source_bytes = unescaped_source_bytes
+            .checked_add(escapes)?
+            .checked_add(group_bytes)?;
         if !within_source_and_work(escaped_source_bytes, next_literal_bytes) {
             return None;
         }
@@ -5624,12 +5643,14 @@ fn ripgrep_standard_literal_context(
 
     let mut source = String::with_capacity(source_bytes_usize);
     if let Some(branches) = branches {
+        source.push_str("(?:");
         for (index, branch) in branches.iter().enumerate() {
             if index != 0 {
                 source.push('|');
             }
             append_ripgrep_literal_source(&mut source, branch);
         }
+        source.push(')');
     } else {
         append_ripgrep_literal_source(&mut source, hir);
     }
@@ -23920,13 +23941,10 @@ mod tests {
         let literal = PortableBuilder::new("")
             .multi_line(true)
             .retained_find_iter(true)
-            .build_ripgrep_standard_literal_hir(
-                &Hir::literal(b"a|b".to_vec()),
-                usize::MAX,
-            )
+            .build_ripgrep_standard_literal_hir(&Hir::literal(b"a|b".to_vec()), usize::MAX)
             .expect("direct literal construction completes")
             .expect("standard literal HIR is admitted");
-        assert_eq!(literal.as_str(), r"a\|b");
+        assert_eq!(literal.as_str(), r"(?:a\|b)");
         assert_eq!(literal.build_report().plan, PlanKind::ExactLiteral);
         assert_eq!(literal.find(b"xxa|byy"), Some(Match { start: 2, end: 5 }));
         assert_eq!(literal.clone().find(b"xxa|byy"), literal.find(b"xxa|byy"));
@@ -23942,7 +23960,7 @@ mod tests {
             .build_ripgrep_standard_literal_hir(&alternatives, usize::MAX)
             .expect("direct literal-set construction completes")
             .expect("flat literal alternation is admitted");
-        assert_eq!(alternatives.as_str(), "needle|thread|fiber");
+        assert_eq!(alternatives.as_str(), "(?:(?:needle)|(?:thread)|(?:fiber))");
         assert!(matches!(
             alternatives.build_report().plan,
             PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
@@ -23978,10 +23996,53 @@ mod tests {
         assert!(
             PortableBuilder::new("")
                 .multi_line(true)
-                .build_ripgrep_standard_literal_hir(&Hir::literal(b"a|b".to_vec()), 3)
+                .build_ripgrep_standard_literal_hir(&Hir::literal(b"a|b".to_vec()), 7)
                 .expect("source envelope refusal is not a construction error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_hir_handoff_reproduces_pinned_printer_source() {
+        let alternatives = Hir::alternation(vec![
+            Hir::literal(b"ab".to_vec()),
+            Hir::literal("é".as_bytes()),
+            Hir::literal(b"x|".to_vec()),
+        ]);
+        let cases = [
+            (Hir::literal(b"a".to_vec()), "a"),
+            (Hir::literal(b"ab".to_vec()), "(?:ab)"),
+            (Hir::literal("é".as_bytes()), "é"),
+            (Hir::literal(b"|".to_vec()), r"\|"),
+            (Hir::literal(b"a|".to_vec()), r"(?:a\|)"),
+            (Hir::literal(b"\0".to_vec()), "\0"),
+            (alternatives, r"(?:(?:ab)|é|(?:x\|))"),
+        ];
+
+        for (hir, expected_source) in cases {
+            assert_eq!(hir.to_string(), expected_source);
+            let source_limit = expected_source.len();
+            let admitted = PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literal_hir(&hir, source_limit)
+                .expect("exact source boundary completes")
+                .expect("exact source boundary admits the HIR");
+            assert_eq!(admitted.as_str(), expected_source);
+            assert_eq!(admitted.build_report().source_storage_bytes, source_limit);
+            assert_eq!(
+                admitted.build_report().syntax.parse_work,
+                u64::try_from(source_limit).expect("focused source length fits u64")
+                    + admitted.build_report().syntax.hir_nodes
+                    + admitted.build_report().syntax.literal_bytes
+            );
+            assert!(
+                PortableBuilder::new("")
+                    .multi_line(true)
+                    .build_ripgrep_standard_literal_hir(&hir, source_limit.saturating_sub(1),)
+                    .expect("below-source boundary completes")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
