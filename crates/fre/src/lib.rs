@@ -19518,9 +19518,9 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// K0 uses its endpoint-only engine. An unanchored required-literal owner
     /// consumes a complete suffix witness without recovering the beginning of
-    /// the greedy class run. Other canonical owners retain the boolean
-    /// projection of [`Self::first_acceptance_at`]. No route selects or
-    /// reconstructs a complete span.
+    /// the greedy class run. Packed and DFA literal sets use their bound
+    /// ordinary executors. Other canonical owners retain the boolean
+    /// projection of [`Self::first_acceptance_at`].
     ///
     /// # Errors
     ///
@@ -19554,10 +19554,11 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// K0 executes its endpoint-only engine. An unanchored required-literal
     /// owner selects the first suffix witness without recovering its greedy
-    /// start. Other canonical fallback plans use the existing value-only
-    /// shortest-match projection with unlimited limits. Assertions inspect
-    /// the complete original haystack and the returned boundary is relative
-    /// to it.
+    /// start. Packed and DFA literal sets return the endpoint selected by
+    /// their bound ordinary executors. Other canonical fallback plans use the
+    /// existing value-only shortest-match projection with unlimited limits.
+    /// Assertions inspect the complete original haystack and the returned
+    /// boundary is relative to it.
     ///
     /// # Errors
     ///
@@ -19610,7 +19611,8 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Return the selected leftmost-first span at or after `start`.
     ///
     /// K0 selects the endpoint first and performs reverse start recovery only
-    /// after a positive result requires it. Canonical fallback plans retain
+    /// after a positive result requires it. Packed and DFA literal sets use
+    /// their bound selected-span engines. Canonical fallback plans retain
     /// their existing selected-span implementation with unlimited limits.
     /// Assertions inspect the complete original haystack and offsets remain
     /// relative to it.
@@ -19781,15 +19783,17 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Count selected positive-width matches at or after `start` using only
     /// their ordered endpoints.
     ///
-    /// `Ok(Some(count))` is returned only for a K0 plan whose immutable build
-    /// report proves that every match consumes at least one byte. Unsupported
-    /// plans return `Ok(None)` before validating `start` or searching the
-    /// haystack. This lets an embedding fall back without duplicating partial
-    /// work. Once execution begins, every error is authoritative.
+    /// `Ok(Some(count))` is returned for a positive-width K0 plan or a packed
+    /// literal-set plan, whose construction admits only nonempty literals.
+    /// Unsupported plans return `Ok(None)` before validating `start` or
+    /// searching the haystack. This lets an embedding fall back without
+    /// duplicating partial work. Once execution begins, every error is
+    /// authoritative.
     ///
-    /// Each successful search resumes at the selected endpoint. A failure to
-    /// advance despite the positive-width proof is reported as an invariant
-    /// error rather than risking an infinite loop.
+    /// Each successful search resumes at the selected endpoint. K0 reports a
+    /// failure to advance despite its positive-width proof as an invariant
+    /// error rather than risking an infinite loop. Packed literal sets use
+    /// their bound non-overlapping span iterator.
     ///
     /// # Errors
     ///
