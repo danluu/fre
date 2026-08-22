@@ -1435,7 +1435,8 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
                 haystack_len: self.haystack.len(),
             });
         }
-        Ok(self.find_at_value_unmetered_validated(start))
+        self.observe_start(start);
+        Ok(self.find_at_value_unmetered_forward_validated(start))
     }
 
     #[inline(always)]
@@ -1443,12 +1444,11 @@ impl PackedLiteralSetSearchCursor<'_, '_> {
         clippy::arithmetic_side_effects,
         reason = "the caller-proved suffix and retained-engine contracts prove these offsets"
     )]
-    fn find_at_value_unmetered_validated(
+    fn find_at_value_unmetered_forward_validated(
         &mut self,
         start: usize,
     ) -> Option<(usize, usize)> {
         debug_assert!(start <= self.haystack.len());
-        self.observe_start(start);
         let remaining = self.haystack.len() - start;
         let use_uniform = self.dense && remaining >= RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
         let window_bytes = &self.haystack[start..];
@@ -1541,7 +1541,10 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
         loop {
             #[cfg(not(feature = "static-dispatch"))]
             let matched = if let Some(cursor) = retained.as_mut() {
-                cursor.find_at_value_unmetered_validated(start)
+                // This cursor is private to this positive-width loop, so each
+                // selected endpoint strictly advances `start`. Arbitrary
+                // public cursor calls retain their backward-start reset.
+                cursor.find_at_value_unmetered_forward_validated(start)
             } else {
                 self.find_window_value(haystack, Window::new(start, window.end()))?
             };
