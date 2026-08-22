@@ -11621,10 +11621,17 @@ impl PortableRegex {
                     .map(fre_automata::SearchReport::into_output)
                     .map_err(SearchError::from),
             },
-            PortablePlan::UnicodeWordRun(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched.is_some())
-                .map_err(SearchError::from),
+            PortablePlan::UnicodeWordRun(plan) => {
+                if window.start() == 0
+                    && window.end() == haystack.len()
+                    && limits == SearchLimits::unlimited()
+                {
+                    return Ok(plan.is_match_full_prepared(haystack));
+                }
+                plan.find_window(haystack, window, limits)
+                    .map(|(matched, _)| matched.is_some())
+                    .map_err(SearchError::from)
+            }
             PortablePlan::AsciiWordRun(plan) => plan
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
