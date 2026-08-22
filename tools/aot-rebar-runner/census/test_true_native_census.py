@@ -350,6 +350,105 @@ def synthetic_uniform_capture_qualification_receipt(
     return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
+def strict_capture_provenance_fields() -> dict[str, str]:
+    next_symbol = f"fre_aot_regex_capture_next_v1_{'a' * 64}"
+    return {
+        "schema": "fre.aot.rebar-runner.v4",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": "general-aot-native-single-capture-next-count-v1",
+        "model": "count-captures",
+        "benchmark": "runtime-job-000",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "NativeOnePassCaptureV1",
+        "aggregate_strategy": "native-single-capture-next-participation-v1",
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "false",
+        "strict_capture_bridge": "true",
+        "source_pattern_count": "1",
+        "row_total_object_bytes": "123",
+        "source_to_artifact": "0",
+        "component_count": "1",
+        "component_0_native": "true",
+        "component_0_source_ordinal": "0",
+        "component_0_entry_symbol": next_symbol,
+        "component_0_runtime_symbols": "",
+        "component_0_program_sha256": "3" * 64,
+        "component_0_object_sha256": "4" * 64,
+        "capture_resolution": "native-onepass-capture-next-v1",
+        "capture_group_count": "3",
+        "capture_can_match_empty": "false",
+        "capture_source_sha256": "1" * 64,
+        "capture_selector_sha256": "2" * 64,
+        "capture_program_sha256": "3" * 64,
+        "capture_plan_sha256": "5" * 64,
+        "capture_bundle_sha256": "6" * 64,
+        "capture_artifact_identity_sha256": "7" * 64,
+        "capture_materialize_symbol": (
+            f"fre_aot_regex_capture_materialize_v1_{'b' * 64}"
+        ),
+        "capture_selector_symbol": f"fre_aot_regex_search_v1_{'c' * 64}",
+        "boundary": (
+            "native-search-core-with-native-capture-materialization-adapter-loop"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+
+
+def synthetic_strict_capture_qualification_receipt(
+    plan: dict[str, object]
+) -> dict[str, object]:
+    receipt = copy.deepcopy(synthetic_qualification_receipt(plan))
+    receipt.pop("receipt_sha256")
+    job = plan["jobs"][33]
+    fields = strict_capture_provenance_fields()
+    encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+    provenance = CENSUS.provenance_receipt(CENSUS.parse_provenance(encoded))
+    entry = fields["component_0_entry_symbol"]
+    receipt["job"] = {
+        "job_id": job["job_id"],
+        "point_ids": job["point_ids"],
+        "model": job["model"],
+        "input": job["input"],
+        "candidate_klv": job["candidate_klv"],
+    }
+    artifact = {
+        "runner_sha256": "8" * 64,
+        "objects": [{"ordinal": 0, "sha256": "4" * 64, "bytes": 123}],
+    }
+    receipt["artifacts"] = {
+        "primary": artifact,
+        "replica": artifact,
+        "reproducible": True,
+        "compiled_artifact_present": True,
+        "runtime_execution_authenticated_separately": True,
+        "provenance": provenance,
+    }
+    receipt["route"]["operation_entry_symbols"] = [entry]
+    receipt["route"]["operation_entry_symbols_sha256"] = CENSUS.sha_bytes(
+        CENSUS.canonical([entry]).encode()
+    )
+    receipt["route"]["adapter_route"] = "linked-strict-capture-next-adapter-loop"
+    negative = receipt["phases"]["claimed_entry_negative_traps"][0]
+    negative["symbol"] = entry
+    negative["marker"]["armed"][0]["symbol"] = entry
+    negative["marker"]["triggered"] = entry
+    receipt["classification"] = CENSUS.classification_from_qualification_evidence(
+        True,
+        [entry],
+        receipt["route"]["adapter_route"],
+        [],
+        receipt["phases"],
+        "aarch64",
+    )
+    return CENSUS.add_digest(receipt, "receipt_sha256")
+
+
 class TrueNativeCensusTests(unittest.TestCase):
     def test_exact_adapter_includes_ordered_many_and_uniform_capture_rows(self) -> None:
         self.assertTrue(CENSUS.has_exact_adapter("count", 1))
@@ -392,6 +491,17 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(
             proof["properties"]["capture_resolution"]["const"],
             "static-uniform-multiplier",
+        )
+        strict = definitions["strictCaptureProvenance"]
+        self.assertFalse(strict["additionalProperties"])
+        self.assertIn("capture_next_symbol", strict["required"])
+        self.assertIn(
+            "strict-capture-v4",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        self.assertIn(
+            "strict-capture-next-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
@@ -601,6 +711,7 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(
             receipt["composite_kind"], "uniform-capture-row-bridge-v1"
         )
+        self.assertNotIn("strict_capture", receipt)
         self.assertEqual(
             receipt["uniform_capture"]["source_participating_groups"], [2, 3, 1]
         )
@@ -667,6 +778,129 @@ class TrueNativeCensusTests(unittest.TestCase):
             validated["classification"]["reason"],
             "native-search-core-with-static-uniform-capture-adapter-loop",
         )
+
+    def test_strict_capture_v4_is_closed_and_selects_capture_next(self) -> None:
+        fields = strict_capture_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        provenance = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(provenance, "synthetic strict capture")
+        self.assertEqual(provenance["kind"], "strict-capture-v4")
+        self.assertEqual(provenance["composite_kind"], "strict-capture-next-v1")
+        self.assertEqual(provenance["required_runtime_symbols"], [])
+        self.assertEqual(
+            provenance["strict_capture"]["capture_next_symbol"],
+            fields["component_0_entry_symbol"],
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            (
+                [fields["component_0_entry_symbol"]],
+                "linked-strict-capture-next-adapter-loop",
+            ),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(provenance),
+            (
+                [fields["component_0_entry_symbol"]],
+                "linked-strict-capture-next-adapter-loop",
+            ),
+        )
+
+        grep_fields = dict(fields)
+        grep_fields["model"] = "grep-captures"
+        grep_fields["adapter"] = "general-aot-native-single-capture-next-grep-v1"
+        grep_fields["benchmark"] = "synthetic/grep-captures"
+        grep_parsed = CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in grep_fields.items()).encode()
+        )
+        CENSUS.validate_provenance_record(
+            CENSUS.provenance_receipt(grep_parsed), "synthetic strict grep capture"
+        )
+
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
+            CENSUS.parse_provenance(encoded + b" unsealed_field=1")
+
+        helper_backed = dict(fields)
+        helper_backed["component_0_runtime_symbols"] = (
+            "fre_aot_regex_runtime_capture_materialize_v1"
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "requires semantic runtime"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in helper_backed.items()
+                ).encode()
+            )
+
+        wrong_entry = dict(fields)
+        wrong_entry["component_0_entry_symbol"] = fields["capture_selector_symbol"]
+        with self.assertRaisesRegex(CENSUS.CensusError, "not native capture_next"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in wrong_entry.items()).encode()
+            )
+
+        wrong_program = dict(fields)
+        wrong_program["capture_program_sha256"] = "9" * 64
+        with self.assertRaisesRegex(CENSUS.CensusError, "differs from its component"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in wrong_program.items()).encode()
+            )
+
+    def test_strict_capture_receipt_is_native_capture_core_not_whole_operation(self) -> None:
+        plan = synthetic_plan()
+        receipt = synthetic_strict_capture_qualification_receipt(plan)
+        validated = CENSUS.validate_receipt(receipt, plan)
+        self.assertTrue(
+            validated["classification"]["native_search_core_authenticated"]
+        )
+        self.assertTrue(validated["classification"]["adapter_outer_loop"])
+        self.assertFalse(
+            validated["classification"]["whole_operation_native_authenticated"]
+        )
+        self.assertEqual(
+            validated["classification"]["reason"],
+            "native-search-capture-core-with-checked-rust-adapter-loop",
+        )
+        self.assertEqual(
+            validated["route"]["operation_entry_symbols"],
+            [strict_capture_provenance_fields()["component_0_entry_symbol"]],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            receipts = root / "receipts"
+            receipts.mkdir()
+            (receipts / "runtime-job-000.json").write_text(
+                json.dumps(receipt), encoding="utf-8"
+            )
+            summary = CENSUS.summarize(argparse.Namespace(
+                plan=str(plan_path), receipts=str(receipts)
+            ))
+        self.assertEqual(
+            summary["fractions"]["native_search_core_over_all_runtime_jobs"],
+            {"numerator": 1, "denominator": 311},
+        )
+        self.assertEqual(
+            summary["fractions"]["whole_operation_native_over_all_runtime_jobs"],
+            {"numerator": 0, "denominator": 311},
+        )
+
+        retained_helper = copy.deepcopy(receipt)
+        retained_helper.pop("receipt_sha256")
+        retained_helper["route"]["semantic_helper_symbols"] = [
+            "fre_aot_regex_runtime_capture_materialize_v1"
+        ]
+        retained_helper["route"]["semantic_helper_symbols_sha256"] = CENSUS.sha_bytes(
+            CENSUS.canonical(
+                retained_helper["route"]["semantic_helper_symbols"]
+            ).encode()
+        )
+        retained_helper = CENSUS.add_digest(retained_helper, "receipt_sha256")
+        with self.assertRaisesRegex(
+            CENSUS.CensusError, "retains semantic runtime symbols"
+        ):
+            CENSUS.validate_receipt(retained_helper, plan)
 
     def test_uniform_capture_build_decline_is_recorded_not_dropped(self) -> None:
         plan = synthetic_plan()
@@ -751,6 +985,7 @@ class TrueNativeCensusTests(unittest.TestCase):
                 "fre_aot_regex_runtime_search_v1",
             ],
         )
+        self.assertNotIn("strict_capture", CENSUS.provenance_receipt(parsed))
         with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
             CENSUS.parse_provenance(encoded + b" unsealed_field=1")
 

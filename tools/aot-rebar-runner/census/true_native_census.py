@@ -48,6 +48,7 @@ UNIFORM_CAPTURE_ADAPTER_MODELS = {"count-captures", "grep-captures"}
 COMPOSITE_ADAPTER_MODELS = {"regex-redux"}
 NATIVE_ROW_COMPOSITE_KINDS = {
     "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
+    "strict-capture-next-v1",
 }
 FORBIDDEN_PUBLIC_COMPONENTS = {
     "holdout",
@@ -65,6 +66,12 @@ NATIVE_COUNT_ENTRY_SYMBOL = re.compile(
 )
 NATIVE_SPAN_FILL_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
+)
+NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL = re.compile(
+    r"^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
+)
+NATIVE_CAPTURE_MATERIALIZE_SYMBOL = re.compile(
+    r"^fre_aot_regex_capture_materialize_v1_[0-9a-f]{64}$"
 )
 CONTROL_PLANE_PREFIXES = (
     "fre_aot_regex_runtime_prepare_",
@@ -820,8 +827,23 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "aggregate_strategy", "component_count", "boundary",
             "required_comparators",
         }
+    elif fields.get("schema") == "fre.aot.rebar-runner.v4":
+        required = common | {
+            "disposition", "compiler_version", "optimizer_version", "engine",
+            "aggregate_strategy", "native_row_bridge", "uniform_capture_bridge",
+            "strict_capture_bridge", "source_pattern_count",
+            "row_total_object_bytes", "source_to_artifact", "component_count",
+            "capture_resolution", "capture_group_count", "capture_can_match_empty",
+            "capture_source_sha256", "capture_selector_sha256",
+            "capture_program_sha256", "capture_plan_sha256",
+            "capture_bundle_sha256", "capture_artifact_identity_sha256",
+            "capture_materialize_symbol", "capture_selector_symbol", "boundary",
+            "required_comparators",
+        }
     else:
-        raise CensusError("runner provenance is neither scalar v2 nor composite v3")
+        raise CensusError(
+            "runner provenance is neither scalar v2, composite v3, nor strict-capture v4"
+        )
     missing = required - set(fields)
     if missing:
         raise CensusError(f"runner provenance omits {sorted(missing)!r}")
@@ -829,9 +851,12 @@ def parse_provenance(output: bytes) -> dict[str, str]:
         raise CensusError("runner is not a configured public Rebar adapter")
     if fields["schema"] == "fre.aot.rebar-runner.v2":
         validate_v2_provenance(fields)
-    else:
+    elif fields["schema"] == "fre.aot.rebar-runner.v3":
         components = components_from_provenance(fields)
         validate_v3_provenance(fields, components)
+    else:
+        components = components_from_provenance(fields)
+        validate_v4_provenance(fields, components)
     return fields
 
 
@@ -920,7 +945,8 @@ def component_field(fields: dict[str, str], index: int, suffixes: tuple[str, ...
 
 
 def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]]:
-    if fields.get("schema") != "fre.aot.rebar-runner.v3":
+    schema = fields.get("schema")
+    if schema not in {"fre.aot.rebar-runner.v3", "fre.aot.rebar-runner.v4"}:
         return []
     count = parse_canonical_decimal(
         fields.get("component_count"),
@@ -930,7 +956,10 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
     )
     if fields.get("model") == "regex-redux" and count != 15:
         raise CensusError(f"regex-redux must publish exactly 15 components, got {count}")
+    if schema == "fre.aot.rebar-runner.v4" and count != 1:
+        raise CensusError(f"strict-capture v4 must publish exactly one component, got {count}")
     native_row = fields.get("native_row_bridge") == "true"
+    has_automaton = schema == "fre.aot.rebar-runner.v3" and native_row
     components = []
     for index in range(count):
         native = component_field(fields, index, ("native",))
@@ -942,7 +971,7 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
         object_sha256 = component_field(fields, index, ("object_sha256",))
         automaton_sha256 = (
             component_field(fields, index, ("automaton_sha256",))
-            if native_row else None
+            if has_automaton else None
         )
         if native != "true":
             raise CensusError(f"composite component {index} is not claimed native")
@@ -1139,6 +1168,74 @@ def uniform_capture_proof_from_provenance(
     }
 
 
+def strict_capture_proof_from_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> dict[str, object]:
+    """Normalize the complete helper-free one-pattern capture artifact surface."""
+    if len(components) != 1:
+        raise CensusError("strict-capture provenance does not have exactly one component")
+    component = components[0]
+    entry_symbol = component["entry_symbol"]
+    materialize_symbol = fields.get("capture_materialize_symbol")
+    selector_symbol = fields.get("capture_selector_symbol")
+    if not isinstance(entry_symbol, str) or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(
+        entry_symbol
+    ) is None:
+        raise CensusError("strict-capture component entry is not native capture_next")
+    if (
+        not isinstance(materialize_symbol, str)
+        or NATIVE_CAPTURE_MATERIALIZE_SYMBOL.fullmatch(materialize_symbol) is None
+    ):
+        raise CensusError("strict-capture materialize symbol is not native")
+    if (
+        not isinstance(selector_symbol, str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector_symbol) is None
+    ):
+        raise CensusError("strict-capture selector symbol is not an ordinary native entry")
+    if len({entry_symbol, materialize_symbol, selector_symbol}) != 3:
+        raise CensusError("strict-capture operation symbols are not distinct")
+    if component["required_runtime_symbols"]:
+        raise CensusError("strict-capture component requires semantic runtime symbols")
+    capture_program = require_hex64(
+        fields.get("capture_program_sha256"), "strict-capture program digest"
+    )
+    if capture_program != component["program_sha256"]:
+        raise CensusError("strict-capture program digest differs from its component")
+    can_match_empty_text = fields.get("capture_can_match_empty")
+    if can_match_empty_text not in {"true", "false"}:
+        raise CensusError("strict-capture nullable flag is not canonical boolean")
+    return {
+        "capture_resolution": fields.get("capture_resolution"),
+        "capture_group_count": parse_canonical_decimal(
+            fields.get("capture_group_count"),
+            "strict-capture group count",
+            1,
+            MAX_NATIVE_ROW_COMPONENTS,
+        ),
+        "capture_can_match_empty": can_match_empty_text == "true",
+        "capture_source_sha256": require_hex64(
+            fields.get("capture_source_sha256"), "strict-capture source digest"
+        ),
+        "capture_selector_sha256": require_hex64(
+            fields.get("capture_selector_sha256"), "strict-capture selector digest"
+        ),
+        "capture_program_sha256": capture_program,
+        "capture_plan_sha256": require_hex64(
+            fields.get("capture_plan_sha256"), "strict-capture plan digest"
+        ),
+        "capture_bundle_sha256": require_hex64(
+            fields.get("capture_bundle_sha256"), "strict-capture bundle digest"
+        ),
+        "capture_artifact_identity_sha256": require_hex64(
+            fields.get("capture_artifact_identity_sha256"),
+            "strict-capture artifact identity digest",
+        ),
+        "capture_next_symbol": entry_symbol,
+        "capture_materialize_symbol": materialize_symbol,
+        "capture_selector_symbol": selector_symbol,
+    }
+
+
 def validate_v3_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
@@ -1235,6 +1332,71 @@ def validate_v3_provenance(
         )
 
 
+def validate_v4_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> None:
+    """Validate the exact additive strict-capture v4 provenance contract."""
+    if fields.get("disposition") != "executed":
+        raise CensusError("strict-capture provenance disposition is not executed")
+    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
+        raise CensusError("strict-capture provenance comparator set differs")
+    for name in ("compiler_version", "optimizer_version"):
+        parse_canonical_decimal(
+            fields.get(name), f"strict-capture provenance {name}", 1, (1 << 32) - 1
+        )
+    if re.fullmatch(r"[0-9a-f]{16}", fields.get("feature_bits", "")) is None:
+        raise CensusError("strict-capture provenance has invalid feature_bits")
+    expected_adapter = {
+        "count-captures": "general-aot-native-single-capture-next-count-v1",
+        "grep-captures": "general-aot-native-single-capture-next-grep-v1",
+    }.get(fields.get("model"))
+    if expected_adapter is None or fields.get("adapter") != expected_adapter:
+        raise CensusError("strict-capture provenance has the wrong adapter")
+    if (
+        fields.get("engine") != "NativeOnePassCaptureV1"
+        or fields.get("aggregate_strategy")
+        != "native-single-capture-next-participation-v1"
+        or fields.get("native_row_bridge") != "true"
+        or fields.get("uniform_capture_bridge") != "false"
+        or fields.get("strict_capture_bridge") != "true"
+        or fields.get("capture_resolution") != "native-onepass-capture-next-v1"
+        or fields.get("boundary")
+        != "native-search-core-with-native-capture-materialization-adapter-loop"
+    ):
+        raise CensusError("strict-capture provenance has a noncanonical route")
+    source_count, _, source_to_artifact = native_row_topology(fields, components, 1)
+    if source_count != 1 or source_to_artifact != [0]:
+        raise CensusError("strict-capture provenance is not exactly one source and artifact")
+    strict_capture_proof_from_provenance(fields, components)
+    base = {
+        "schema", "disposition", "configured", "adapter", "model", "benchmark",
+        "source_commit", "source_tree", "target", "feature_bits",
+        "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
+        "native_row_bridge", "uniform_capture_bridge", "strict_capture_bridge",
+        "source_pattern_count", "row_total_object_bytes", "source_to_artifact",
+        "component_count", "capture_resolution", "capture_group_count",
+        "capture_can_match_empty", "capture_source_sha256",
+        "capture_selector_sha256", "capture_program_sha256", "capture_plan_sha256",
+        "capture_bundle_sha256", "capture_artifact_identity_sha256",
+        "capture_materialize_symbol", "capture_selector_symbol", "boundary",
+        "required_comparators",
+    }
+    component_fields = {
+        f"component_0_{suffix}"
+        for suffix in (
+            "native", "source_ordinal", "entry_symbol", "runtime_symbols",
+            "program_sha256", "object_sha256",
+        )
+    }
+    expected = base | component_fields
+    if set(fields) != expected:
+        raise CensusError(
+            "runner v4 provenance field closure differs: "
+            f"missing={sorted(expected - set(fields))!r} "
+            f"extra={sorted(set(fields) - expected)!r}"
+        )
+
+
 def nm_symbols_with_types(nm_output: str, symbol_types: set[str]) -> set[str]:
     result: set[str] = set()
     for line in nm_output.splitlines():
@@ -1297,6 +1459,14 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         entries = [str(component["entry_symbol"]) for component in components]
         if len(entries) != len(set(entries)):
             raise CensusError("composite provenance repeats an entry symbol")
+        if provenance.get("strict_capture_bridge") == "true" and model in (
+            UNIFORM_CAPTURE_ADAPTER_MODELS
+        ):
+            if len(entries) != 1 or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(
+                entries[0]
+            ) is None:
+                raise CensusError("strict-capture route does not select capture_next")
+            return entries, "linked-strict-capture-next-adapter-loop"
         if model == "regex-redux":
             return entries, "linked-fixed-composite-adapter-loop"
         if provenance.get("native_row_bridge") == "true" and model in {
@@ -1496,6 +1666,36 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             )),
             "components": [],
         }
+    if fields["schema"] == "fre.aot.rebar-runner.v4":
+        components = components_from_provenance(fields)
+        source_pattern_count = int(fields["source_pattern_count"], 10)
+        source_to_artifact = [
+            int(value, 10) for value in fields["source_to_artifact"].split(",")
+        ]
+        return {
+            **common,
+            "kind": "strict-capture-v4",
+            "composite_kind": "strict-capture-next-v1",
+            "source_pattern_count": source_pattern_count,
+            "source_to_artifact": source_to_artifact,
+            "row_total_object_bytes": int(fields["row_total_object_bytes"], 10),
+            "uniform_capture": None,
+            "strict_capture": strict_capture_proof_from_provenance(fields, components),
+            "boundary": fields["boundary"],
+            "engine": fields["engine"],
+            "aggregate_strategy": fields["aggregate_strategy"],
+            "prepared_bulk_strategy": None,
+            "span_iteration_strategy": None,
+            "grep_iteration_strategy": None,
+            "program_sha256": None,
+            "object_sha256": None,
+            "program_symbol": None,
+            "entry_symbol": None,
+            "reducer_symbol": None,
+            "span_fill_symbol": None,
+            "required_runtime_symbols": [],
+            "components": components,
+        }
     components = components_from_provenance(fields)
     native_row = fields.get("native_row_bridge") == "true"
     uniform_capture = native_row and fields.get("uniform_capture_bridge") == "true"
@@ -1550,6 +1750,19 @@ def operation_route_from_provenance_record(
     components = provenance["components"]
     if components:
         entries = [component["entry_symbol"] for component in components]
+        if provenance["composite_kind"] == "strict-capture-next-v1":
+            strict_capture = provenance.get("strict_capture")
+            if (
+                len(entries) != 1
+                or not isinstance(entries[0], str)
+                or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(entries[0]) is None
+                or not isinstance(strict_capture, dict)
+                or strict_capture.get("capture_next_symbol") != entries[0]
+            ):
+                raise CensusError(
+                    "normalized strict-capture provenance has a non-native operation entry"
+                )
+            return entries, "linked-strict-capture-next-adapter-loop"
         if len(entries) != len(set(entries)) or not all(
             isinstance(entry, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry)
             for entry in entries
@@ -1669,6 +1882,8 @@ def classification_from_qualification_evidence(
         reason = "claimed-entry-negative-control-failure"
     elif adapter_route == "linked-uniform-capture-row-adapter-loop":
         reason = "native-search-core-with-static-uniform-capture-adapter-loop"
+    elif adapter_route == "linked-strict-capture-next-adapter-loop":
+        reason = "native-search-capture-core-with-checked-rust-adapter-loop"
     elif adapter_outer_loop:
         reason = "native-search-core-with-adapter-outer-loop"
     else:
@@ -1745,7 +1960,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         ],
     }
     normalized_provenance = provenance_receipt(primary_fields)
-    if normalized_provenance["kind"] == "composite-v3" and (
+    if normalized_provenance["kind"] in {"composite-v3", "strict-capture-v4"} and (
         normalized_provenance["source_pattern_count"]
         != len(job["input"]["pattern_sha256"])
     ):
@@ -1777,10 +1992,14 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     helpers = semantic_helper_symbols(primary_runtime_references)
     if helpers != semantic_helper_symbols(replica_runtime_references):
         raise CensusError("independent binaries have different semantic helper inventories")
+    if normalized_provenance["kind"] == "strict-capture-v4" and helpers:
+        raise CensusError("strict-capture final binary retains semantic runtime symbols")
     declared_set = set(normalized_provenance["required_runtime_symbols"])
     for component in normalized_provenance["components"]:
         declared_set.update(component["required_runtime_symbols"])
     declared = sorted(declared_set)
+    if normalized_provenance["kind"] == "strict-capture-v4" and declared:
+        raise CensusError("strict-capture provenance requires runtime symbols")
     declared_semantic = [name for name in declared if not name.startswith(CONTROL_PLANE_PREFIXES)]
     if not set(declared_semantic).issubset(helpers):
         raise CensusError("provenance-declared semantic helpers escape independent inventory")
@@ -2050,10 +2269,59 @@ def validate_normalized_uniform_capture(
             )
 
 
+def validate_normalized_strict_capture(
+    proof: object, component: dict[str, object], context: str
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} strict capture proof is not an object")
+    require_exact_keys(proof, {
+        "capture_resolution", "capture_group_count", "capture_can_match_empty",
+        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
+        "capture_plan_sha256", "capture_bundle_sha256",
+        "capture_artifact_identity_sha256", "capture_next_symbol",
+        "capture_materialize_symbol", "capture_selector_symbol",
+    }, f"{context} strict capture proof")
+    if proof["capture_resolution"] != "native-onepass-capture-next-v1":
+        raise CensusError(f"{context} strict capture resolution differs")
+    group_count = proof["capture_group_count"]
+    if (
+        not isinstance(group_count, int)
+        or isinstance(group_count, bool)
+        or not 1 <= group_count <= MAX_NATIVE_ROW_COMPONENTS
+        or not isinstance(proof["capture_can_match_empty"], bool)
+    ):
+        raise CensusError(f"{context} strict capture schema is not canonical")
+    for field in (
+        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
+        "capture_plan_sha256", "capture_bundle_sha256",
+        "capture_artifact_identity_sha256",
+    ):
+        require_hex64(proof[field], f"{context} {field}")
+    next_symbol = proof["capture_next_symbol"]
+    materialize_symbol = proof["capture_materialize_symbol"]
+    selector_symbol = proof["capture_selector_symbol"]
+    if (
+        not isinstance(next_symbol, str)
+        or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(next_symbol) is None
+        or not isinstance(materialize_symbol, str)
+        or NATIVE_CAPTURE_MATERIALIZE_SYMBOL.fullmatch(materialize_symbol) is None
+        or not isinstance(selector_symbol, str)
+        or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector_symbol) is None
+        or len({next_symbol, materialize_symbol, selector_symbol}) != 3
+    ):
+        raise CensusError(f"{context} strict capture symbols are not canonical")
+    if (
+        component["entry_symbol"] != next_symbol
+        or component["program_sha256"] != proof["capture_program_sha256"]
+        or component["required_runtime_symbols"] != []
+    ):
+        raise CensusError(f"{context} strict capture component binding differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
-    require_exact_keys(provenance, {
+    expected_keys = {
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
         "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
         "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
@@ -2061,7 +2329,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
-    }, context)
+    }
+    if provenance.get("kind") == "strict-capture-v4":
+        expected_keys.add("strict_capture")
+    require_exact_keys(provenance, expected_keys, context)
     if not isinstance(provenance["components"], list):
         raise CensusError(f"{context} components are not a list")
     for index, component in enumerate(provenance["components"]):
@@ -2228,6 +2499,44 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             )
         else:
             raise CensusError(f"{context} has an unknown composite kind")
+    elif provenance["kind"] == "strict-capture-v4":
+        components = provenance["components"]
+        component = components[0] if len(components) == 1 else None
+        expected_adapter = {
+            "count-captures": "general-aot-native-single-capture-next-count-v1",
+            "grep-captures": "general-aot-native-single-capture-next-grep-v1",
+        }.get(provenance["model"])
+        scalar_fields = (
+            "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
+            "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
+            "reducer_symbol", "span_fill_symbol",
+        )
+        if (
+            provenance["schema"] != "fre.aot.rebar-runner.v4"
+            or provenance["composite_kind"] != "strict-capture-next-v1"
+            or expected_adapter is None
+            or provenance["adapter"] != expected_adapter
+            or provenance["boundary"]
+            != "native-search-core-with-native-capture-materialization-adapter-loop"
+            or provenance["engine"] != "NativeOnePassCaptureV1"
+            or provenance["aggregate_strategy"]
+            != "native-single-capture-next-participation-v1"
+            or provenance["source_pattern_count"] != 1
+            or provenance["source_to_artifact"] != [0]
+            or not isinstance(provenance["row_total_object_bytes"], int)
+            or isinstance(provenance["row_total_object_bytes"], bool)
+            or not 0 < provenance["row_total_object_bytes"] <= MAX_NATIVE_ROW_OBJECT_BYTES
+            or provenance["uniform_capture"] is not None
+            or provenance["required_runtime_symbols"] != []
+            or any(provenance[field] is not None for field in scalar_fields)
+            or component is None
+            or component["source_ordinal"] != 0
+            or component["automaton_sha256"] is not None
+        ):
+            raise CensusError(f"{context} strict-capture topology is not canonical")
+        validate_normalized_strict_capture(
+            provenance["strict_capture"], component, context
+        )
     else:
         raise CensusError(f"{context} has an unknown provenance kind")
     operation_route_from_provenance_record(provenance)
@@ -2255,7 +2564,7 @@ def validate_artifact_record(artifact: object, context: str) -> dict[str, object
 def validate_provenance_job_binding(
     provenance: dict[str, object], input_identity: dict[str, object]
 ) -> None:
-    if provenance["kind"] != "composite-v3":
+    if provenance["kind"] not in {"composite-v3", "strict-capture-v4"}:
         return
     pattern_hashes = input_identity["pattern_sha256"]
     if provenance["source_pattern_count"] != len(pattern_hashes):
@@ -2480,6 +2789,8 @@ def validate_receipt(
             or declared != expected_declared
         ):
             raise CensusError("qualification route differs from normalized provenance")
+        if provenance["kind"] == "strict-capture-v4" and helpers:
+            raise CensusError("strict-capture final binary retains semantic runtime symbols")
         declared_semantic = [
             symbol for symbol in declared if not symbol.startswith(CONTROL_PLANE_PREFIXES)
         ]

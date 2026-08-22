@@ -358,6 +358,40 @@
         }
       }
     },
+    "strictCaptureProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_resolution", "capture_group_count", "capture_can_match_empty",
+        "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
+        "capture_plan_sha256", "capture_bundle_sha256",
+        "capture_artifact_identity_sha256", "capture_next_symbol",
+        "capture_materialize_symbol", "capture_selector_symbol"
+      ],
+      "properties": {
+        "capture_resolution": { "const": "native-onepass-capture-next-v1" },
+        "capture_group_count": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "capture_can_match_empty": { "type": "boolean" },
+        "capture_source_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_selector_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_program_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "capture_next_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
+        },
+        "capture_materialize_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_materialize_v1_[0-9a-f]{64}$"
+        },
+        "capture_selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -371,7 +405,12 @@
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
       ],
       "properties": {
-        "schema": { "enum": ["fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3"] },
+        "schema": {
+          "enum": [
+            "fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3",
+            "fre.aot.rebar-runner.v4"
+          ]
+        },
         "adapter": { "type": "string" },
         "model": { "type": "string" },
         "benchmark": { "type": "string" },
@@ -379,11 +418,11 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
-        "kind": { "enum": ["scalar-v2", "composite-v3"] },
+        "kind": { "enum": ["scalar-v2", "composite-v3", "strict-capture-v4"] },
         "composite_kind": {
           "enum": [
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
-            "regex-redux-fixed-v1"
+            "regex-redux-fixed-v1", "strict-capture-next-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -400,6 +439,7 @@
             { "type": "null" }
           ]
         },
+        "strict_capture": { "$ref": "#/$defs/strictCaptureProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
         "grep_iteration_strategy": { "type": ["string", "null"] },
@@ -415,7 +455,15 @@
         "components": {
           "type": "array", "items": { "$ref": "#/$defs/componentProvenance" }
         }
-      }
+      },
+      "allOf": [{
+        "if": {
+          "properties": { "schema": { "const": "fre.aot.rebar-runner.v4" } },
+          "required": ["schema"]
+        },
+        "then": { "required": ["strict_capture"] },
+        "else": { "not": { "required": ["strict_capture"] } }
+      }]
     },
     "qualificationPhases": {
       "type": "object",

@@ -236,7 +236,11 @@ The additive v4 strict-capture record instead binds the native `capture_next`,
 materializer, and selector symbols plus the source, selector, capture program,
 plan, bundle, object, and complete artifact identities. It reports
 `capture_resolution=native-onepass-capture-next-v1`; stock Rust remains the
-independent value oracle.
+independent value oracle. Census qualification requires empty declared and
+independently inventoried semantic runtime-symbol surfaces, and
+trap-authenticates `capture_next` itself as the sole component entry. The route
+counts as a native search/capture core with a checked Rust adapter loop, never
+as a wholly fused native operation.
 
 ## HEAD campaign reporting
 

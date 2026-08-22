@@ -27,19 +27,24 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - native search cores / successfully executed jobs (diagnostic only); and
 - the raw runtime schedule-point denominator for comparison with older runs.
 
-`count-spans` direct-entry iteration, per-line `grep`, and the static uniform
-capture multiplier routes can authenticate a native search core while retaining
-a Rust adapter outer loop. They are excluded from the strict whole-operation
-numerator. The capture route is labelled separately from both a fused capture
+`count-spans` direct-entry iteration, per-line `grep`, the static uniform
+capture multiplier route, and the strict native `capture_next` route can
+authenticate a native search or search/capture core while retaining a checked
+Rust adapter outer loop. They are excluded from the strict whole-operation
+numerator. The uniform route is labelled separately from both a fused capture
 operation and capture-offset materialization: its native entries select spans;
-the adapter applies an independently sealed per-row participation count.
+the adapter applies an independently sealed per-row participation count. The
+strict route materializes group-zero-inclusive slots natively, then validates
+and reduces those slots in Rust.
 
 `count-captures` and `grep-captures` with 1..4096 source expressions are exact
 adapter *shapes*. This admits them to the sealed qualification population; it
-does not turn the build-time theorem into an assumption. A nullable,
-non-uniform, resource-limited, or otherwise declined source fails the
-all-or-nothing build and must receive a `record-failure` receipt. It remains in
-the 311-job denominator as nonnative rather than disappearing as unsupported.
+does not turn either build-time proof into an assumption. A uniform-proof
+semantic decline may use the independently authenticated strict one-pattern
+route. Every parse, allocation, resource, emission, authentication, multi-source,
+or remaining semantic decline fails the all-or-nothing build and must receive a
+`record-failure` receipt. It remains in the 311-job denominator as nonnative
+rather than disappearing as unsupported.
 
 ## Privacy boundary and static dry run
 
@@ -111,8 +116,9 @@ python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
 ```
 
 Repeat `--primary-object` and `--replica-object` in component ordinal order for
-a composite v3 runner. Its normalized provenance must match every supplied
-object digest in both builds. Native-row v3 additionally seals the complete
+a composite v3 runner or the single-component strict-capture v4 runner. Its
+normalized provenance must match every supplied object digest in both builds.
+Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
 now also seals its selector automaton hash and the explicit
@@ -123,6 +129,17 @@ proof identity/work/stack/minimum-width/count fields, one value per source, and
 the three selector digest lists. Each source automaton/program/object digest is
 checked against the component selected by `source_to_artifact`. Unrecognized or
 missing raw v3 fields are rejected rather than silently discarded.
+
+Strict-capture v4 must publish exactly one source, artifact, and component. Its
+sole component entry is an identity-suffixed native `capture_next`, its declared
+runtime-symbol list is empty, and its object/program identities agree with the
+component receipt. The closed record also seals group count and nullability,
+source/selector/capture/plan/bundle/artifact digests, and the distinct native
+materializer and ordinary selector symbols. The normalized v2 and v3 receipt
+surfaces remain unchanged; `strict_capture` exists only on normalized v4. The
+independent final-binary inventory must also contain zero semantic runtime
+symbols for this strict route; an unused-but-linked helper is a failed strict
+qualification rather than a trap-only allowance.
 
 The controller requires identical runner/object hashes and normalized
 provenance from both builds. It inventories local, global, weak, and imported
@@ -151,11 +168,15 @@ Three fresh processes authenticate each job:
    controller runs 15 independent negative controls so a trap in the first
    stage cannot stand in for proof that the other 14 entries execute.
    The variable-width native-row bridge and uniform-capture row bridge receive
-   the same independent negative control for every retained row artifact. Both
-   are reported as native search cores with an adapter outer loop; the uniform
-   route uses the distinct `uniform-capture-row-bridge-v1` provenance kind and
-   `linked-uniform-capture-row-adapter-loop` route. Neither inflates the stricter
-   wholly fused-operation numerator.
+   the same independent negative control for every retained row artifact. The
+   strict-capture v4 route instead traps its sole `capture_next` component entry;
+   patching the ordinary selector or materializer is not accepted as evidence
+   that the timed capture iterator executed. These routes are reported as
+   native search or search/capture cores with an adapter outer loop. The uniform
+   route uses `uniform-capture-row-bridge-v1` and
+   `linked-uniform-capture-row-adapter-loop`; strict capture uses
+   `strict-capture-next-v1` and `linked-strict-capture-next-adapter-loop`.
+   Neither inflates the stricter wholly fused-operation numerator.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:
