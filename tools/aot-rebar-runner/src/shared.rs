@@ -6,17 +6,19 @@ use fre_aot_regex::{
     NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
     NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1, OperatingSystem,
     OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, RebarSingleCaptureAotArtifactV1,
-    RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
+    PreparedAggregateStrategy, PreparedBulkStrategy, PreparedOrderedNfaV15CompileDisposition,
+    RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1,
+    RebarSingleCaptureParticipationAotArtifactV1,
     RebarSingleCaptureParticipationAotErrorV1, SlowAotLimits, SymbolBinding, SymbolKind, Target,
-    UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
-    UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
-    UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
-    UniformCapturePreparedSpanFillCompileReceipt, compile, compile_rebar_single_capture_aot_v1,
+    UniformCaptureAuthenticationError,
+    UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
+    UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileDisposition,
+    UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
+    compile, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
-    compile_with_prepared_ordered_nfa_v15, compile_with_slow_aot_limits,
+    compile_with_prepared_ordered_nfa_v15_reported, compile_with_slow_aot_limits,
 };
 use fre_lower::{LowerError, LowerResource};
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
@@ -582,7 +584,7 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
                 .program()
                 .stats()
                 .map_err(|error| format!("general AOT recovery stats failed: {error}"))?;
-            let selected = compile_with_prepared_ordered_nfa_v15(
+            let disposition = compile_with_prepared_ordered_nfa_v15_reported(
                 CompileRequest::new(benchmark.pattern(), target)
                     .profile(profile)
                     .output(OutputContract::Span)
@@ -596,10 +598,27 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
                     recovered_stats.thompson_states, recovered_stats.thompson_edges,
                 )
             })?;
-            authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)?;
-            Ok(selected)
+            select_prepared_ordered_nfa_v15_or_recovered(
+                benchmark.model,
+                recovered,
+                disposition,
+            )
         }
         Err(error) => Err(format!("general AOT compilation failed: {error}")),
+    }
+}
+
+fn select_prepared_ordered_nfa_v15_or_recovered(
+    model: Model,
+    recovered: CompiledRegex,
+    disposition: PreparedOrderedNfaV15CompileDisposition,
+) -> Result<CompiledRegex, String> {
+    match disposition {
+        PreparedOrderedNfaV15CompileDisposition::Compiled(selected) => {
+            authenticate_prepared_ordered_nfa_scalar(model, &selected)?;
+            Ok(selected)
+        }
+        PreparedOrderedNfaV15CompileDisposition::Declined(_) => Ok(recovered),
     }
 }
 
@@ -1558,6 +1577,49 @@ mod tests {
     }
 
     #[test]
+    fn safe_v15_declines_return_the_recovered_incumbent_byte_for_byte() {
+        use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
+
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let recovered = compile(
+            CompileRequest::new("ab", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .expect("recovered incumbent fixture");
+        let expected_program = recovered.program().serialize().unwrap();
+        let expected_object = recovered.object().to_vec();
+        let expected_receipt = recovered.receipt().clone();
+        let declines = [
+            PreparedOrderedNfaV15CompileDecline::Unsupported,
+            PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                limit: 7,
+                required: 8,
+            },
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes {
+                limit: 11,
+                required: 12,
+            },
+        ];
+        for decline in declines {
+            let selected = select_prepared_ordered_nfa_v15_or_recovered(
+                Model::Count,
+                recovered.clone(),
+                PreparedOrderedNfaV15CompileDisposition::Declined(decline),
+            )
+            .expect("safe V15 decline");
+            assert_eq!(selected.program().serialize().unwrap(), expected_program);
+            assert_eq!(selected.object(), expected_object);
+            assert_eq!(selected.receipt(), &expected_receipt);
+        }
+    }
+
+    #[test]
     fn recovered_runtime_bulk_shape_has_one_authenticated_prepared_ordered_nfa_replacement() {
         let mut benchmark = Benchmark::parse(&fixture("count", br"\p{L}+", b" aa"))
             .expect("assertion-bearing count fixture");
@@ -1625,7 +1687,7 @@ mod tests {
             PREPARED_CAPABILITY_ORDERED_NFA_V15,
         ));
 
-        let selected = compile_with_prepared_ordered_nfa_v15(
+        let selected = compile_with_prepared_ordered_nfa_v15_reported(
             CompileRequest::new(benchmark.pattern(), target)
                 .profile(profile)
                 .output(OutputContract::Span)
@@ -1633,7 +1695,9 @@ mod tests {
                 .limits(rebar_recovery_compile_limits()),
             benchmark.model.exports(),
         )
-        .expect("explicit prepared Ordered-NFA route");
+        .expect("explicit prepared Ordered-NFA route")
+        .into_compiled()
+        .expect("supported fixture must select V15");
         authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)
             .expect("native scalar route receipt");
     }

@@ -37,12 +37,15 @@ pub const FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION: u32 = 1;
 #[doc(hidden)]
 pub const FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL: u64 = 0x93b6_e4c1_75da_280f;
 
-/// Structural ceiling for the graph descriptor and its six SoA tables emitted
-/// into authenticated object rodata. This is independent of the smaller
-/// mutable-handle budget: increasing it admits larger immutable graphs without
-/// increasing the maximum prepared scratch allocation.
+/// Frozen ordinary structural ceiling for the graph descriptor and its six
+/// SoA tables emitted into authenticated object rodata.
 #[doc(hidden)]
-pub const FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
+pub const FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES: usize = 2 * 1024 * 1024;
+/// Additive immutable-descriptor ceiling selected only by an explicit V15
+/// compiler request and authenticated V15 runtime preparation. It does not
+/// change ordinary V1/V2/V3 construction defaults or mutable scratch limits.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
 /// Structural ceiling for the four exact Pike scratch payloads retained by a
 /// prepared handle.
 #[doc(hidden)]
@@ -1476,9 +1479,23 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
         view: NativeOrderedNfaProgramView<'a>,
         max_object_bytes: usize,
     ) -> Result<NativeOrderedNfaObjectImageBuild<'a>, ObjectError> {
+        Self::try_build_reported_with_descriptor_limit(
+            view,
+            max_object_bytes,
+            FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+        )
+    }
+
+    /// As [`Self::try_build_reported`], with an additive descriptor ceiling
+    /// supplied by an already-selected capability-bound route.
+    pub(crate) fn try_build_reported_with_descriptor_limit(
+        view: NativeOrderedNfaProgramView<'a>,
+        max_object_bytes: usize,
+        max_descriptor_bytes: usize,
+    ) -> Result<NativeOrderedNfaObjectImageBuild<'a>, ObjectError> {
         let mut limits =
             FrozenOrderedNfaLimitsV1::new(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
-        limits.max_descriptor_bytes = FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES;
+        limits.max_descriptor_bytes = max_descriptor_bytes;
         let Some(shape) = validate_ordered_nfa_shape(view, limits) else {
             return Ok(NativeOrderedNfaObjectImageBuild::Unsupported);
         };
@@ -1616,7 +1633,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
         } else {
             (None, 0, graph_end)
         };
-        if base_object_bytes > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES {
+        if base_object_bytes > max_descriptor_bytes {
             return Ok(NativeOrderedNfaObjectImageBuild::Unsupported);
         }
         let dispatch_shape = view
@@ -5429,9 +5446,18 @@ mod tests {
         clippy::arithmetic_side_effects,
         reason = "the synthetic chain has fixed dimensions below every u32 and structural ceiling"
     )]
-    fn immutable_descriptor_cap_admits_large_graph_without_expanding_scratch_cap() {
+    fn explicit_v15_descriptor_cap_does_not_change_ordinary_or_scratch_caps() {
         const EDGES: usize = 180_000;
-        const OLD_DESCRIPTOR_CAP: usize = 2 * 1024 * 1024;
+        const ORDINARY_DESCRIPTOR_CAP: usize = 2 * 1024 * 1024;
+
+        assert_eq!(
+            FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+            ORDINARY_DESCRIPTOR_CAP
+        );
+        assert_eq!(
+            FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
+            4 * 1024 * 1024
+        );
 
         let mut roles = vec![StateRole::Consume; EDGES];
         roles.push(StateRole::Accept);
@@ -5462,25 +5488,46 @@ mod tests {
             line_terminator: b'\n',
             artifact_identity: [7; 32],
         };
-        let image = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
-            .unwrap()
-            .expect("four-MiB immutable descriptor envelope");
-        assert!(image.bytes.len() > OLD_DESCRIPTOR_CAP);
-        assert!(image.bytes.len() <= FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES);
+        assert!(
+            NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+                .unwrap()
+                .is_none(),
+            "the frozen ordinary two-MiB path must remain a soft refusal"
+        );
+        let image = match NativeOrderedNfaObjectImage::try_build_reported_with_descriptor_limit(
+            view,
+            usize::MAX,
+            FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
+        )
+        .unwrap()
+        {
+            NativeOrderedNfaObjectImageBuild::Built(image) => image,
+            NativeOrderedNfaObjectImageBuild::Unsupported
+            | NativeOrderedNfaObjectImageBuild::DataLimit { .. } => {
+                panic!("explicit four-MiB immutable descriptor envelope declined")
+            }
+        };
+        assert!(image.bytes.len() > ORDINARY_DESCRIPTOR_CAP);
+        assert!(image.bytes.len() <= FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES);
         drop(image);
 
-        let owner = FrozenOrderedNfaPreparedScratchV1::try_new(
-            view,
-            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
-        )
-        .expect("large immutable graph still fits the unchanged scratch envelope");
-        assert!(owner.accounting().descriptor_bytes() > OLD_DESCRIPTOR_CAP);
+        assert!(
+            FrozenOrderedNfaPreparedScratchV1::try_new(
+                view,
+                limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+            )
+            .is_none(),
+            "ordinary runtime preparation must retain the frozen two-MiB cap"
+        );
+        let mut explicit_v15 = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        explicit_v15.max_descriptor_bytes = FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES;
+        let owner = FrozenOrderedNfaPreparedScratchV1::try_new(view, explicit_v15)
+            .expect("explicit V15 graph still fits the unchanged scratch envelope");
+        assert!(
+            owner.accounting().descriptor_bytes() > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES
+        );
         assert!(owner.accounting().scratch_bytes() <= FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES);
         drop(owner);
-
-        let mut old = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
-        old.max_descriptor_bytes = OLD_DESCRIPTOR_CAP;
-        assert!(FrozenOrderedNfaPreparedScratchV1::try_new(view, old).is_none());
     }
 
     #[test]

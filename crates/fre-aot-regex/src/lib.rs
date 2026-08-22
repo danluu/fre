@@ -171,6 +171,7 @@ pub use ordered_nfa_native::{
     FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTES, FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC,
     FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL, FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+    FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
     FrozenOrderedNfaAccountingV1,
     FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
     FrozenOrderedNfaStorageV1,
@@ -1220,6 +1221,81 @@ pub fn compile_with_prepared_ordered_nfa_v15(
     )
 }
 
+/// Safe refusal reported by the explicitly selected prepared Ordered-NFA V15
+/// compiler. Every unlisted failure remains a terminal [`CompileError`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedOrderedNfaV15CompileDecline {
+    /// The exact semantic program has no supported native V15 graph view, or
+    /// that view exceeds a fixed structural geometry ceiling.
+    Unsupported,
+    /// The complete immutable prepared image exceeds the caller's explicit
+    /// native-data ceiling.
+    NativeDataBytes { limit: usize, required: usize },
+    /// Every authenticated final-object retry exceeds the caller's explicit
+    /// object-size ceiling.
+    ObjectBytes { limit: usize, required: usize },
+}
+
+/// Typed result of one explicit prepared Ordered-NFA V15 attempt.
+///
+/// `Declined` is the only result that authorizes a caller to retain an
+/// independently authenticated incumbent. Allocation, arithmetic, malformed
+/// module, target, code-generation, and route-authentication failures are
+/// returned as `Err` and must remain terminal.
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation after a selected compiler transaction"
+)]
+pub enum PreparedOrderedNfaV15CompileDisposition {
+    Compiled(CompiledRegex),
+    Declined(PreparedOrderedNfaV15CompileDecline),
+}
+
+impl PreparedOrderedNfaV15CompileDisposition {
+    #[must_use]
+    pub const fn compiled(&self) -> Option<&CompiledRegex> {
+        match self {
+            Self::Compiled(compiled) => Some(compiled),
+            Self::Declined(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn decline(&self) -> Option<PreparedOrderedNfaV15CompileDecline> {
+        match self {
+            Self::Compiled(_) => None,
+            Self::Declined(decline) => Some(*decline),
+        }
+    }
+
+    #[must_use]
+    pub fn into_compiled(self) -> Option<CompiledRegex> {
+        match self {
+            Self::Compiled(compiled) => Some(compiled),
+            Self::Declined(_) => None,
+        }
+    }
+}
+
+/// Compile through the explicit V15 route while reporting only safe
+/// structural and numeric admission refusals.
+///
+/// # Errors
+///
+/// Returns every parse, lower, allocation, overflow, invariant, codegen, and
+/// authentication failure unchanged and terminal.
+pub fn compile_with_prepared_ordered_nfa_v15_reported(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
+        request,
+        exports,
+        SlowAotLimits::default().max_native_data_bytes,
+    )
+}
+
 /// As [`compile_with_prepared_ordered_nfa_v15`], with an exact ceiling for the
 /// additional immutable Ordered-NFA object data. Sizing precedes image
 /// allocation; a miss is returned as a terminal `ProgramBytes` resource error.
@@ -1228,6 +1304,22 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
     exports: PreparedAggregateExports,
     max_native_data_bytes: usize,
 ) -> Result<CompiledRegex, CompileError> {
+    terminalize_prepared_ordered_nfa_v15_disposition(
+        compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
+            request,
+            exports,
+            max_native_data_bytes,
+        )?,
+    )
+}
+
+/// As [`compile_with_prepared_ordered_nfa_v15_reported`], with an exact
+/// ceiling for the additional immutable Ordered-NFA object data.
+pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
     if request.output != OutputContract::Span {
         return Err(CompileError::PreparedAggregateRequiresSpan {
             actual: request.output,
@@ -1257,7 +1349,7 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
     };
     let lowered =
         fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
-    compile_raw_prepared_ordered_nfa_v15(
+    compile_raw_prepared_ordered_nfa_v15_reported(
         source_bytes,
         lowered.into_plan(),
         line_terminator,
@@ -1268,6 +1360,36 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
         exports,
         max_native_data_bytes,
     )
+}
+
+fn terminalize_prepared_ordered_nfa_v15_disposition(
+    disposition: PreparedOrderedNfaV15CompileDisposition,
+) -> Result<CompiledRegex, CompileError> {
+    match disposition {
+        PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => Ok(compiled),
+        PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::Unsupported,
+        ) => Err(ObjectError::InvalidModule(
+            "prepared Ordered-NFA V15 route is unsupported",
+        )
+        .into()),
+        PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::NativeDataBytes { limit, required },
+        ) => Err(ObjectError::Resource {
+            resource: CompileResource::ProgramBytes,
+            limit,
+            required,
+        }
+        .into()),
+        PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required },
+        ) => Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }
+        .into()),
+    }
 }
 
 #[allow(
@@ -1286,6 +1408,37 @@ fn compile_raw_prepared_ordered_nfa_v15(
     exports: PreparedAggregateExports,
     max_native_data_bytes: usize,
 ) -> Result<CompiledRegex, CompileError> {
+    terminalize_prepared_ordered_nfa_v15_disposition(
+        compile_raw_prepared_ordered_nfa_v15_reported(
+            source_bytes,
+            raw,
+            line_terminator,
+            output,
+            target,
+            mode,
+            limits,
+            exports,
+            max_native_data_bytes,
+        )?,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the explicit route keeps one plan, its six additive text retries, and its authenticated receipt in one transaction"
+)]
+fn compile_raw_prepared_ordered_nfa_v15_reported(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
@@ -1316,19 +1469,34 @@ fn compile_raw_prepared_ordered_nfa_v15(
                 .map_err(CompileError::from)
         }
     };
-    let initial = append_exports(
-        CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-            &program,
-            target,
-            true,
-            true,
-            true,
-            true,
-            true,
-            true,
-            max_native_data_bytes,
-        )?,
-    )?;
+    let initial = match CompiledModule::lower_prepared_ordered_nfa_v15_reported(
+        &program,
+        target,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        max_native_data_bytes,
+    )? {
+        module::PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => {
+            append_exports(module)?
+        }
+        module::PreparedOrderedNfaV15LoweringDisposition::Unsupported => {
+            return Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+                PreparedOrderedNfaV15CompileDecline::Unsupported,
+            ));
+        }
+        module::PreparedOrderedNfaV15LoweringDisposition::DataLimit { required } => {
+            return Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+                PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                    limit: max_native_data_bytes,
+                    required,
+                },
+            ));
+        }
+    };
     let format = ObjectFormat::for_target(target);
     let (module, object) = match emit_with_ordered_nfa_accelerator_retries(
         initial,
@@ -1426,8 +1594,23 @@ fn compile_raw_prepared_ordered_nfa_v15(
         },
     )? {
         FinalObjectAttempt::Fit { module, object } => (module, object),
-        FinalObjectAttempt::ObjectBytes { first_error, .. } => {
-            return Err(first_error.into());
+        FinalObjectAttempt::ObjectBytes {
+            first_error:
+                ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    limit,
+                    required,
+                },
+            ..
+        } => {
+            return Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+                PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required },
+            ));
+        }
+        FinalObjectAttempt::ObjectBytes { .. } => {
+            return Err(CompileError::InternalInvariant(
+                "Ordered-NFA final-object refusal lost its ObjectBytes receipt",
+            ));
         }
     };
     if module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
@@ -1512,12 +1695,12 @@ fn compile_raw_prepared_ordered_nfa_v15(
             .sum(),
         object_bytes: object.len(),
     };
-    Ok(CompiledRegex {
+    Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(CompiledRegex {
         program,
         module,
         object: object.into_boxed_slice(),
         receipt,
-    })
+    }))
 }
 
 /// Compile with an explicit resource envelope for the separately selected

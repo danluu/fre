@@ -42,6 +42,8 @@ use crate::{
         MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
     },
     ordered_nfa_native::{
+        FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+        FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectImageBuild,
         NativeOrderedNfaProgramView,
         ORDERED_NFA_OBJECT_V1_ABI_VERSION, ORDERED_NFA_OBJECT_V1_ALIGNMENT,
@@ -1588,6 +1590,15 @@ pub enum PreparedAggregateStrategy {
     /// The Ordered-TNFA reducers use the strategy above while a requested
     /// `GrepCount` export remains an ordinary runtime helper.
     NativeOrderedNfaFusedWithRuntimeHelper,
+}
+
+/// Failure-atomic outcome of the explicitly selected V15 structural and
+/// immutable-data admission. Only these two refusals authorize an incumbent
+/// chosen before this transaction to remain selected.
+pub(crate) enum PreparedOrderedNfaV15LoweringDisposition {
+    Lowered(CompiledModule),
+    Unsupported,
+    DataLimit { required: usize },
 }
 
 /// Object-format-neutral native module.
@@ -4227,11 +4238,56 @@ impl CompiledModule {
         allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        match Self::lower_prepared_ordered_nfa_v15_reported(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+        )? {
+            PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
+            PreparedOrderedNfaV15LoweringDisposition::Unsupported => Err(
+                ObjectError::InvalidModule("prepared Ordered-NFA V15 route is unsupported").into(),
+            ),
+            PreparedOrderedNfaV15LoweringDisposition::DataLimit { required } => {
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: max_native_data_bytes,
+                    required,
+                }
+                .into())
+            }
+        }
+    }
+
+    /// Report only the safe, allocation-free V15 admission refusals. All
+    /// target, serialization, allocation, arithmetic, lowering, codegen, and
+    /// route-authentication failures remain terminal errors.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_reported(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
-        let mut view = program.native_ordered_nfa_view().ok_or_else(|| {
-            ObjectError::InvalidModule("prepared Ordered-NFA V15 route is unsupported")
-        })?;
+        let Some(mut view) = program.native_ordered_nfa_view() else {
+            return Ok(PreparedOrderedNfaV15LoweringDisposition::Unsupported);
+        };
         if !allow_ordered_edge_dispatch {
             view.ordered_edge_dispatch = None;
         }
@@ -4256,23 +4312,16 @@ impl CompiledModule {
                 view,
                 target,
                 max_native_data_bytes,
+                FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
             )? {
                 NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
                     (lowering, layout)
                 }
                 NativeOrderedNfaPreparedOutcome::Unsupported => {
-                    return Err(ObjectError::InvalidModule(
-                        "prepared Ordered-NFA V15 route is unsupported",
-                    )
-                    .into());
+                    return Ok(PreparedOrderedNfaV15LoweringDisposition::Unsupported);
                 }
                 NativeOrderedNfaPreparedOutcome::DataLimit { required } => {
-                    return Err(ObjectError::Resource {
-                        resource: crate::CompileResource::ProgramBytes,
-                        limit: max_native_data_bytes,
-                        required,
-                    }
-                    .into());
+                    return Ok(PreparedOrderedNfaV15LoweringDisposition::DataLimit { required });
                 }
             };
         let module = Self::lower_serialized_with_prelowered(
@@ -4302,7 +4351,7 @@ impl CompiledModule {
                 "prepared Ordered-NFA-only lowering did not publish exact V15 SpanFill",
             ));
         }
-        Ok(module)
+        Ok(PreparedOrderedNfaV15LoweringDisposition::Lowered(module))
     }
 
     #[allow(
@@ -8736,6 +8785,7 @@ fn lower_native_ordered_nfa_prepared(
         view,
         target,
         max_native_data_bytes,
+        FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
     )? {
         NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => Some((lowering, layout)),
         NativeOrderedNfaPreparedOutcome::Unsupported
@@ -8754,6 +8804,7 @@ fn lower_native_ordered_nfa_prepared_reported(
     view: NativeOrderedNfaProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
+    max_descriptor_bytes: usize,
 ) -> Result<NativeOrderedNfaPreparedOutcome, ObjectError> {
     let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
     if serialized_identity != view.artifact_identity {
@@ -8777,7 +8828,11 @@ fn lower_native_ordered_nfa_prepared_reported(
     // allocation-free sizing pass, so the explicit route can report the
     // complete retained-data requirement rather than only the padding floor.
     let object_cap = max_native_data_bytes.saturating_sub(padding);
-    let image = match NativeOrderedNfaObjectImage::try_build_reported(view, object_cap)? {
+    let image = match NativeOrderedNfaObjectImage::try_build_reported_with_descriptor_limit(
+        view,
+        object_cap,
+        max_descriptor_bytes,
+    )? {
         NativeOrderedNfaObjectImageBuild::Built(image) => image,
         NativeOrderedNfaObjectImageBuild::Unsupported => {
             return Ok(NativeOrderedNfaPreparedOutcome::Unsupported);

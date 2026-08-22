@@ -107,6 +107,7 @@ use fre_aot_regex::{
     FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, FROZEN_PREPARED_HEADER_V6_BYTES,
     DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+    FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
     FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES, FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
@@ -2202,6 +2203,9 @@ impl PreparedAotRegex {
         let max_scratch_bytes =
             usize::try_from(config.max_ordered_nfa_scratch_bytes).unwrap_or(usize::MAX);
         let mut limits = FrozenOrderedNfaLimitsV1::new(max_handle_bytes);
+        if requires_ordered_nfa {
+            limits.max_descriptor_bytes = FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES;
+        }
         limits.max_scratch_bytes = limits.max_scratch_bytes.min(max_scratch_bytes);
         limits.max_setup_work = limits.max_setup_work.min(config.max_ordered_nfa_setup_work);
         let owner = prepared

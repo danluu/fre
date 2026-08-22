@@ -1,9 +1,12 @@
 use fre_aot_regex::{
     CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource, EngineKind,
     ObjectError, OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, Target, compile,
+    PreparedAggregateStrategy, PreparedBulkStrategy, PreparedOrderedNfaV15CompileDecline,
+    PreparedOrderedNfaV15CompileDisposition, Target, compile,
     compile_with_prepared_ordered_nfa_v15,
     compile_with_prepared_ordered_nfa_v15_and_native_data_limit,
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported,
+    compile_with_prepared_ordered_nfa_v15_reported,
 };
 
 const PUBLIC_ORDERED_NFA_FIXTURE: &str = r"(?-u:[\x00-\xFF])\bfoo\b";
@@ -51,6 +54,22 @@ fn explicit_route_publishes_exact_v15_span_fill_and_count_on_both_targets() {
 #[test]
 fn explicit_route_resource_and_object_misses_are_terminal() {
     let target = Target::x86_64_linux();
+    let reported_native_data =
+        compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
+            request(target),
+            PreparedAggregateExports::NONE,
+            0,
+        )
+        .expect("numeric admission is a reported disposition");
+    let PreparedOrderedNfaV15CompileDisposition::Declined(
+        PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+            limit: 0,
+            required: reported_required_native_data,
+        },
+    ) = reported_native_data
+    else {
+        panic!("zero native-data ceiling was not reported: {reported_native_data:?}");
+    };
     let required_native_data =
         match compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
             request(target),
@@ -64,6 +83,7 @@ fn explicit_route_resource_and_object_misses_are_terminal() {
             })) => required,
             other => panic!("zero native-data ceiling was not terminal: {other:?}"),
         };
+    assert_eq!(reported_required_native_data, required_native_data);
 
     let unbounded = compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
         request(target),
@@ -86,6 +106,19 @@ fn explicit_route_resource_and_object_misses_are_terminal() {
         max_object_bytes: object_limit,
         ..CompileLimitsV1::default()
     });
+    let reported_object =
+        compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
+            limited.clone(),
+            PreparedAggregateExports::NONE,
+            native_data_bytes,
+        )
+        .expect("object ceiling is a reported disposition");
+    assert!(matches!(
+        reported_object,
+        PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required }
+        ) if limit == object_limit && required > limit
+    ));
     assert!(matches!(
         compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
             limited,
@@ -110,6 +143,15 @@ fn explicit_route_failure_does_not_mutate_the_default_portfolio() {
         before.module().prepared_bulk_strategy(),
         Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
     );
+    assert!(matches!(
+        compile_with_prepared_ordered_nfa_v15_reported(
+            request.clone(),
+            PreparedAggregateExports::NONE,
+        ),
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::Unsupported,
+        ))
+    ));
     assert!(matches!(
         compile_with_prepared_ordered_nfa_v15(request.clone(), PreparedAggregateExports::NONE,),
         Err(CompileError::Object(ObjectError::InvalidModule(
