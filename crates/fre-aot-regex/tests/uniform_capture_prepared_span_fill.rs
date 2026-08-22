@@ -170,9 +170,9 @@ fn positive_route_resource_and_authentication_failures_remain_terminal() {
         &other,
         request(other_pattern.len(), target),
     )
-    .expect_err("a completed non-V15 route is terminal, not fallback permission");
+    .expect_err("an unsupported explicit V15 route is terminal, not fallback permission");
     assert!(matches!(
         route_error,
-        UniformCapturePreparedSpanFillCompileError::Authentication(_)
+        UniformCapturePreparedSpanFillCompileError::Selector(_)
     ));
 }

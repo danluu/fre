@@ -42,7 +42,8 @@ use crate::{
         MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
     },
     ordered_nfa_native::{
-        NativeOrderedNfaObjectImage, NativeOrderedNfaProgramView,
+        NativeOrderedNfaObjectImage, NativeOrderedNfaObjectImageBuild,
+        NativeOrderedNfaProgramView,
         ORDERED_NFA_OBJECT_V1_ABI_VERSION, ORDERED_NFA_OBJECT_V1_ALIGNMENT,
         ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET, ORDERED_NFA_OBJECT_V2_ABI_VERSION,
         ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH,
@@ -4203,6 +4204,105 @@ impl CompiledModule {
             true,
             max_native_data_bytes,
         )
+    }
+
+    /// Lower exactly the already-built semantic program's native Ordered-NFA
+    /// prepared route. No DFA, partial-row, dynamic-row, endpoint-oracle, or
+    /// runtime-adapter alternative is constructed. Structural or numeric
+    /// ineligibility is terminal for this explicitly selected backend, as are
+    /// allocation, code-generation, and object-layout failures.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_with_native_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        target.validate()?;
+        let program_bytes = program.serialize()?;
+        let mut view = program.native_ordered_nfa_view().ok_or_else(|| {
+            ObjectError::InvalidModule("prepared Ordered-NFA V15 route is unsupported")
+        })?;
+        if !allow_ordered_edge_dispatch {
+            view.ordered_edge_dispatch = None;
+        }
+        if !allow_ordered_nfa_terminal_range {
+            view.terminal_range = None;
+        }
+        if !allow_ordered_nfa_start_closure_dispatch {
+            view.start_closure_dispatch = None;
+        }
+        if !allow_ordered_nfa_start_prefix {
+            view.start_prefix_first_set = None;
+        }
+        if !allow_ordered_nfa_whole_window_width_gate {
+            view.whole_window_width_bounds = None;
+        }
+        if !allow_ordered_nfa_terminal_exact_set {
+            view.terminal_exact_set = None;
+        }
+        let (lowering, prepared_layout) =
+            match lower_native_ordered_nfa_prepared_reported(
+                program_bytes.clone(),
+                view,
+                target,
+                max_native_data_bytes,
+            )? {
+                NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
+                    (lowering, layout)
+                }
+                NativeOrderedNfaPreparedOutcome::Unsupported => {
+                    return Err(ObjectError::InvalidModule(
+                        "prepared Ordered-NFA V15 route is unsupported",
+                    )
+                    .into());
+                }
+                NativeOrderedNfaPreparedOutcome::DataLimit { required } => {
+                    return Err(ObjectError::Resource {
+                        resource: crate::CompileResource::ProgramBytes,
+                        limit: max_native_data_bytes,
+                        required,
+                    }
+                    .into());
+                }
+            };
+        let module = Self::lower_serialized_with_prelowered(
+            program_bytes,
+            Some(lowering),
+            Some(prepared_layout),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )?;
+        if module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+            || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+            || module.prepared_entry_symbol().is_none()
+            || module.prepared_span_fill_symbol().is_none()
+        {
+            return Err(CompileError::InternalInvariant(
+                "prepared Ordered-NFA-only lowering did not publish exact V15 SpanFill",
+            ));
+        }
+        Ok(module)
     }
 
     #[allow(
@@ -8626,11 +8726,35 @@ fn lower_runtime_adapter(
 /// read-only-data-cap refusals leave the caller free to select the incumbent
 /// runtime adapter; allocation and malformed-program failures remain hard.
 fn lower_native_ordered_nfa_prepared(
-    mut program_bytes: Vec<u8>,
+    program_bytes: Vec<u8>,
     view: NativeOrderedNfaProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
+    Ok(match lower_native_ordered_nfa_prepared_reported(
+        program_bytes,
+        view,
+        target,
+        max_native_data_bytes,
+    )? {
+        NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => Some((lowering, layout)),
+        NativeOrderedNfaPreparedOutcome::Unsupported
+        | NativeOrderedNfaPreparedOutcome::DataLimit { .. } => None,
+    })
+}
+
+enum NativeOrderedNfaPreparedOutcome {
+    Lowered(NativeLowering, PreparedEntryLayout),
+    Unsupported,
+    DataLimit { required: usize },
+}
+
+fn lower_native_ordered_nfa_prepared_reported(
+    mut program_bytes: Vec<u8>,
+    view: NativeOrderedNfaProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<NativeOrderedNfaPreparedOutcome, ObjectError> {
     let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
     if serialized_identity != view.artifact_identity {
         return Err(ObjectError::InvalidModule(
@@ -8649,11 +8773,23 @@ fn lower_native_ordered_nfa_prepared(
         .ok_or(ObjectError::ArithmeticOverflow(
             "Ordered-NFA object padding",
         ))?;
-    let Some(object_cap) = max_native_data_bytes.checked_sub(padding) else {
-        return Ok(None);
-    };
-    let Some(image) = NativeOrderedNfaObjectImage::try_build(view, object_cap)? else {
-        return Ok(None);
+    // A zero residual cap still asks the image builder to finish its
+    // allocation-free sizing pass, so the explicit route can report the
+    // complete retained-data requirement rather than only the padding floor.
+    let object_cap = max_native_data_bytes.saturating_sub(padding);
+    let image = match NativeOrderedNfaObjectImage::try_build_reported(view, object_cap)? {
+        NativeOrderedNfaObjectImageBuild::Built(image) => image,
+        NativeOrderedNfaObjectImageBuild::Unsupported => {
+            return Ok(NativeOrderedNfaPreparedOutcome::Unsupported);
+        }
+        NativeOrderedNfaObjectImageBuild::DataLimit { required } => {
+            let required = padding
+                .checked_add(required)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "Ordered-NFA retained object bytes",
+                ))?;
+            return Ok(NativeOrderedNfaPreparedOutcome::DataLimit { required });
+        }
     };
     let retained_native_data_bytes = padding
         .checked_add(image.bytes.len())
@@ -8661,7 +8797,9 @@ fn lower_native_ordered_nfa_prepared(
             "Ordered-NFA retained object bytes",
         ))?;
     if retained_native_data_bytes > max_native_data_bytes {
-        return Ok(None);
+        return Ok(NativeOrderedNfaPreparedOutcome::DataLimit {
+            required: retained_native_data_bytes,
+        });
     }
 
     let (mut code, mut relocations) = match target.architecture {
@@ -8747,7 +8885,7 @@ fn lower_native_ordered_nfa_prepared(
 
     program_bytes.resize(object_offset, 0);
     push_bytes(&mut program_bytes, &image.bytes)?;
-    Ok(Some((
+    Ok(NativeOrderedNfaPreparedOutcome::Lowered(
         NativeLowering {
             code,
             data: program_bytes,
@@ -8790,7 +8928,7 @@ fn lower_native_ordered_nfa_prepared(
                 bulk_gate_entry_size,
             }),
         },
-    )))
+    ))
 }
 
 fn lower_ordered_nfa_or_runtime_adapter(

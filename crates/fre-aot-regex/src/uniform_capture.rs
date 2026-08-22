@@ -769,24 +769,16 @@ pub fn compile_uniform_capture_prepared_span_fill_selector(
     }
 
     let line_terminator = request.profile.options.line_terminator;
-    let native_finite_language_candidate = (request.mode == CompileMode::Optimizing)
-        .then(|| {
-            crate::finite_language::NativeFiniteLanguageCandidate::analyze(
-                parsed,
-                OutputContract::Span,
-            )
-        })
-        .flatten();
-    let selector = super::compile_raw_with_line_terminator_and_slow_aot_limits(
+    let selector = super::compile_raw_prepared_ordered_nfa_v15(
         request.source_bytes,
         lowered.into_plan(),
         line_terminator,
         OutputContract::Span,
-        native_finite_language_candidate,
         request.target,
         request.mode,
         request.selector_limits,
-        request.selector_slow_aot_limits,
+        PreparedAggregateExports::NONE,
+        request.selector_slow_aot_limits.max_native_data_bytes,
     )
     .map_err(UniformCapturePreparedSpanFillCompileError::Selector)?;
     authenticate_ordered_nfa_prepared_span_fill(&selector)

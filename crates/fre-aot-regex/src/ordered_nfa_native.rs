@@ -467,6 +467,15 @@ pub(crate) struct NativeOrderedNfaObjectImage<'a> {
     pub(crate) start_closure_program: Option<NativeEpsilonClosureProgramView<'a>>,
 }
 
+/// Failure-atomic result of sizing and constructing one native Ordered-NFA
+/// object image. The reported path distinguishes a structural refusal from an
+/// exact caller byte ceiling before any image allocation is attempted.
+pub(crate) enum NativeOrderedNfaObjectImageBuild<'a> {
+    Built(NativeOrderedNfaObjectImage<'a>),
+    Unsupported,
+    DataLimit { required: usize },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeOrderedEdgeDispatchShape {
     admitted_rows: usize,
@@ -1441,15 +1450,32 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
 
     /// Build one canonical, relocation-free graph image. Numeric/structural or
     /// caller-cap refusal is soft; host allocation failure remains explicit.
+    #[allow(
+        dead_code,
+        reason = "compatibility wrapper retained for existing internal and test callers"
+    )]
     pub(crate) fn try_build(
         view: NativeOrderedNfaProgramView<'a>,
         max_object_bytes: usize,
     ) -> Result<Option<Self>, ObjectError> {
+        Ok(match Self::try_build_reported(view, max_object_bytes)? {
+            NativeOrderedNfaObjectImageBuild::Built(image) => Some(image),
+            NativeOrderedNfaObjectImageBuild::Unsupported
+            | NativeOrderedNfaObjectImageBuild::DataLimit { .. } => None,
+        })
+    }
+
+    /// Report the exact numeric image ceiling separately from structural
+    /// ineligibility while preserving allocation and malformed-input errors.
+    pub(crate) fn try_build_reported(
+        view: NativeOrderedNfaProgramView<'a>,
+        max_object_bytes: usize,
+    ) -> Result<NativeOrderedNfaObjectImageBuild<'a>, ObjectError> {
         let mut limits =
             FrozenOrderedNfaLimitsV1::new(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
         limits.max_descriptor_bytes = FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES;
         let Some(shape) = validate_ordered_nfa_shape(view, limits) else {
-            return Ok(None);
+            return Ok(NativeOrderedNfaObjectImageBuild::Unsupported);
         };
         let raw = view.raw;
         let states = shape.states;
@@ -1587,7 +1613,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             (None, 0, graph_end)
         };
         if base_object_bytes > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES {
-            return Ok(None);
+            return Ok(NativeOrderedNfaObjectImageBuild::Unsupported);
         }
         let dispatch_shape = view
             .ordered_edge_dispatch
@@ -1670,15 +1696,19 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             ordered_edge_dispatch = None;
         }
         let object_bytes = ordered_edge_dispatch.map_or(base_object_bytes, |(_, bytes)| bytes);
-        if object_bytes > max_object_bytes
-            || u32::try_from(object_bytes).is_err()
+        if object_bytes > max_object_bytes {
+            return Ok(NativeOrderedNfaObjectImageBuild::DataLimit {
+                required: object_bytes,
+            });
+        }
+        if u32::try_from(object_bytes).is_err()
             || u32::try_from(states).is_err()
             || u32::try_from(edges).is_err()
             || u32::try_from(shape.closure_slots).is_err()
             || u32::try_from(shape.zero_width_edges).is_err()
             || u32::try_from(unicode_range_count).is_err()
         {
-            return Ok(None);
+            return Ok(NativeOrderedNfaObjectImageBuild::Unsupported);
         }
 
         let mut bytes = Vec::new();
@@ -1967,7 +1997,7 @@ impl<'a> NativeOrderedNfaObjectImage<'a> {
             ordered_edge_dispatch,
             terminal_range,
         };
-        Ok(Some(Self {
+        Ok(NativeOrderedNfaObjectImageBuild::Built(Self {
             bytes,
             layout,
             terminal_exact_set_words,

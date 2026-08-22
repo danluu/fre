@@ -1190,6 +1190,333 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     })
 }
 
+/// Compile one regex through only the prepared Ordered-NFA V15 backend,
+/// optionally appending prepared reducer exports.
+///
+/// This explicit route does not alter or consult the ordinary optimizer's
+/// DFA, partial-row, dynamic-row, or endpoint-oracle backend ordering. Once
+/// parsing and lowering succeed, unsupported Ordered-NFA structure, native
+/// data limits, allocation failures, code-generation failures, and final
+/// object limits are terminal. The returned module is authenticated to publish
+/// [`PreparedBulkStrategy::NativeOrderedNfaLoop`], SpanFill, and exactly
+/// [`PREPARED_CAPABILITY_ORDERED_NFA_V15`].
+///
+/// # Errors
+///
+/// This route requires [`OutputContract::Span`]. It returns the same typed
+/// parse/lower/program/object failures as [`compile`], without falling back to
+/// another backend after the explicit route has been selected.
+pub fn compile_with_prepared_ordered_nfa_v15(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> Result<CompiledRegex, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
+        request,
+        exports,
+        SlowAotLimits::default().max_native_data_bytes,
+    )
+}
+
+/// As [`compile_with_prepared_ordered_nfa_v15`], with an exact ceiling for the
+/// additional immutable Ordered-NFA object data. Sizing precedes image
+/// allocation; a miss is returned as a terminal `ProgramBytes` resource error.
+pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<CompiledRegex, CompileError> {
+    if request.output != OutputContract::Span {
+        return Err(CompileError::PreparedAggregateRequiresSpan {
+            actual: request.output,
+        });
+    }
+    let CompileRequest {
+        pattern,
+        profile,
+        output,
+        target,
+        mode,
+        mut limits,
+    } = request;
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.max_program_bytes = limits.max_program_bytes.min(profile_limit);
+    }
+    let source_bytes = pattern.len();
+    let line_terminator = profile.options.line_terminator;
+    let parsed = fre_syntax::parse(ParseRequest::rust(
+        pattern,
+        CompatibilityProfile::RustBytes(profile),
+    ))?;
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        return Err(CompileError::InternalInvariant(
+            "Rust byte request produced a non-Rust syntax tree",
+        ));
+    };
+    let lowered =
+        fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
+    compile_raw_prepared_ordered_nfa_v15(
+        source_bytes,
+        lowered.into_plan(),
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        exports,
+        max_native_data_bytes,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the explicit route keeps one plan, its six additive text retries, and its authenticated receipt in one transaction"
+)]
+fn compile_raw_prepared_ordered_nfa_v15(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<CompiledRegex, CompileError> {
+    let digest = program::automaton_digest(&raw, line_terminator);
+    let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
+        .with_line_terminator(line_terminator);
+    let stats = automaton.stats();
+    let program = CompiledProgram::build(
+        raw,
+        automaton,
+        output,
+        mode,
+        limits.determinize,
+        limits.max_program_bytes,
+    )?;
+    let program_bytes = program.serialized_len()?;
+    let program_sha256 = program.artifact_identity();
+    let artifact_identity = program.artifact_identity();
+    let serialized_program = program.serialize()?;
+    let max_native_data_bytes = max_native_data_bytes.min(limits.max_object_bytes);
+    let append_exports = |module: CompiledModule| -> Result<CompiledModule, CompileError> {
+        if exports.is_empty() {
+            Ok(module)
+        } else {
+            module
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )
+                .map_err(CompileError::from)
+        }
+    };
+    let initial = append_exports(
+        CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+            &program,
+            target,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            max_native_data_bytes,
+        )?,
+    )?;
+    let format = ObjectFormat::for_target(target);
+    let (module, object) = match emit_with_ordered_nfa_accelerator_retries(
+        initial,
+        format,
+        limits.max_object_bytes,
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    true,
+                    true,
+                    true,
+                    false,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    true,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+        || {
+            append_exports(
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?,
+            )
+        },
+    )? {
+        FinalObjectAttempt::Fit { module, object } => (module, object),
+        FinalObjectAttempt::ObjectBytes { first_error, .. } => {
+            return Err(first_error.into());
+        }
+    };
+    if module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.prepared_entry_symbol().is_none()
+        || module.prepared_span_fill_symbol().is_none()
+        || module.prepared_aggregate_exports() != exports
+    {
+        return Err(CompileError::InternalInvariant(
+            "explicit prepared Ordered-NFA compiler lost its V15 route",
+        ));
+    }
+
+    let object_sha256 = Sha256::digest(&object).into();
+    let engine_selection_reason =
+        program
+            .engine_selection_reason()
+            .ok_or(CompileError::InternalInvariant(
+                "newly compiled program lost engine-selection provenance",
+            ))?;
+    let determinization =
+        program
+            .determinization_report()
+            .cloned()
+            .ok_or(CompileError::InternalInvariant(
+                "newly compiled program lost determinization provenance",
+            ))?;
+    let mut passes = selected_passes(&program, &module);
+    if !exports.is_empty() {
+        passes
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("prepared aggregate pass receipt"))?;
+        let aggregate_index = passes
+            .iter()
+            .position(|pass| *pass == OptimizationPass::PositionIndependentDataLayout)
+            .unwrap_or(passes.len());
+        passes.insert(
+            aggregate_index,
+            OptimizationPass::PreparedAggregateLowering,
+        );
+    }
+    let receipt = CompileReceipt {
+        compiler_version: COMPILER_VERSION,
+        optimizer_version: OPTIMIZER_VERSION,
+        mode,
+        output,
+        target,
+        line_terminator,
+        automaton_sha256: digest,
+        program_sha256,
+        object_sha256,
+        engine: program.engine_kind(),
+        engine_selection_reason,
+        determinization,
+        slow_aot: None,
+        compiler_k0_aot: None,
+        exact_finite_exists_byte_set_aot: None,
+        exact_single_literal_aot: None,
+        ordered_finite_language_aot: None,
+        slow_context_aot: None,
+        source_bytes,
+        thompson_states: stats.states(),
+        thompson_edges: stats.edges(),
+        dfa: program.dfa_stats(),
+        context_determinization: program.context_determinization_report().cloned(),
+        anchored_prefix: program.anchored_prefix_stats(),
+        exact_match_width: program.exact_match_width(),
+        passes: passes.into_boxed_slice(),
+        runtime_helper_required: module.required_runtime_symbols().next().is_some(),
+        prepared_aggregate_exports: module.prepared_aggregate_exports(),
+        prepared_aggregate_strategy: module.prepared_aggregate_strategy(),
+        required_prepare_capabilities: module.required_prepare_capabilities(),
+        start_accelerator: module.start_accelerator(),
+        anchored_prefix_filter_bytes: module.anchored_prefix_filter_bytes(),
+        program_bytes,
+        code_bytes: module.code_bytes(),
+        data_bytes: module
+            .sections()
+            .iter()
+            .filter(|section| section.kind == SectionKind::ReadOnlyData)
+            .map(|section| section.data.len())
+            .sum(),
+        object_bytes: object.len(),
+    };
+    Ok(CompiledRegex {
+        program,
+        module,
+        object: object.into_boxed_slice(),
+        receipt,
+    })
+}
+
 /// Compile with an explicit resource envelope for the separately selected
 /// slow contextual and assertion-free DFA completion passes.
 ///
