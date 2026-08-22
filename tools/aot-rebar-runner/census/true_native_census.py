@@ -415,7 +415,7 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
     schedules = []
     raw_points: dict[str, dict[str, object]] = {}
     jobs: dict[str, dict[str, object]] = {}
-    for raw_path, expected_sha in zip(args.schedule, args.schedule_sha256, strict=True):
+    for raw_path, expected_sha in zip(args.schedule, args.schedule_sha256):
         path = pathlib.Path(raw_path).resolve(strict=True)
         schedule = external_schedule(path, expected_sha)
         schedule_record = {
@@ -1397,7 +1397,7 @@ def claimed_entry_controls_pass(
 ) -> bool:
     if len(controls) != len(entries):
         return False
-    for ordinal, (entry, control) in enumerate(zip(entries, controls, strict=True)):
+    for ordinal, (entry, control) in enumerate(zip(entries, controls)):
         process = control.get("process")
         marker = control.get("marker")
         if not isinstance(process, dict) or not isinstance(marker, dict):
