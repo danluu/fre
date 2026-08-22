@@ -19759,23 +19759,14 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(PortableFindIterError::Search)
             }
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => {
-                try_visit_ordinary_spans_at(
-                    haystack.len(),
-                    start,
-                    |search_start| {
-                        executor
-                            .find_window_value(
-                                haystack,
-                                LiteralWindow::new(search_start, haystack.len()),
-                            )
-                            .map(|matched| {
-                                matched.map(|(start, end)| Match { start, end })
-                            })
-                            .map_err(SearchError::from)
-                            .map_err(PortableFindIterError::Search)
-                    },
-                    visitor,
+                let mut visitor = visitor;
+                executor.try_visit_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    |(start, end)| visitor(Match { start, end }),
                 )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search)
             }
         }
     }
@@ -37626,6 +37617,41 @@ mod tests {
             );
             assert_eq!(actual_spans, expected_spans);
         }
+
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    stopped.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [(2, 4)]);
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |_| Err::<bool, _>("callback"))
+                .unwrap(),
+            Err("callback"),
+        );
+
+        let mut callback_called = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                callback_called = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(
+                SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
+                    start: 8,
+                    end: 7,
+                    haystack_len: 7,
+                })
+            )),
+        ));
+        assert!(!callback_called);
+
         assert_eq!(
             ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
             Ok(None),

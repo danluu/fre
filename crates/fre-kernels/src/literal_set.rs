@@ -1357,6 +1357,54 @@ impl LiteralSetOrdinaryExecutor<'_> {
         validate_window(window, haystack.len())?;
         self.plan.try_selected_end_window_value(haystack, window)
     }
+
+    /// Visit every non-overlapping selected span wholly inside `window`
+    /// without finite-search accounting.
+    ///
+    /// The ordinary-executor capability proves that every selected span has
+    /// positive width. Each successful search can therefore resume directly
+    /// at the selected end without the empty-match suppression required by a
+    /// general regex iterator.
+    ///
+    /// The callback returns `Ok(true)` to continue, `Ok(false)` to stop
+    /// successfully, or `Err(error)` to return that callback error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same exact invalid-window and offset-arithmetic errors as
+    /// [`Self::find_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_visit_spans_window_value<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        validate_window(window, haystack.len())?;
+        let mut cursor = window.start();
+        loop {
+            let Some(matched) = self
+                .plan
+                .try_find_window_value(haystack, Window::new(cursor, window.end()))?
+            else {
+                return Ok(Ok(()));
+            };
+            debug_assert!(
+                matched.1 > cursor,
+                "a positive-width literal-set match must advance its search cursor",
+            );
+            cursor = matched.1;
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3791,6 +3839,42 @@ mod tests {
         }
         assert_eq!(spans, [(2, 4), (4, 6), (6, 7)]);
 
+        let mut visited = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                haystack,
+                Window::new(3, haystack.len()),
+                |matched| {
+                    visited.push(matched);
+                    Ok::<bool, &'static str>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(visited, [(4, 6), (6, 7)]);
+
+        visited.clear();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                haystack,
+                Window::full(haystack),
+                |matched| {
+                    visited.push(matched);
+                    Ok::<bool, &'static str>(false)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(visited, [(2, 4)]);
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                haystack,
+                Window::full(haystack),
+                |_| Err::<bool, _>("callback"),
+            ),
+            Ok(Err("callback")),
+        );
+
         let short_first = LiteralSetPlan::new(
             &[b"a".as_slice(), b"ab".as_slice(), b"a".as_slice()],
             LiteralSetBuildLimits::default(),
@@ -3906,7 +3990,19 @@ mod tests {
                 ordinary.exists_window_value(b"abcd", window),
                 Err(expected.clone()),
             );
-            assert_eq!(ordinary.selected_end_window_value(b"abcd", window), Err(expected));
+            assert_eq!(
+                ordinary.selected_end_window_value(b"abcd", window),
+                Err(expected.clone()),
+            );
+            let mut callback_called = false;
+            assert_eq!(
+                ordinary.try_visit_spans_window_value(b"abcd", window, |_| {
+                    callback_called = true;
+                    Ok::<bool, ()>(true)
+                }),
+                Err(expected),
+            );
+            assert!(!callback_called);
         }
 
         let nullable = LiteralSetPlan::new(
