@@ -11011,6 +11011,11 @@ impl PortableRegex {
     #[inline]
     fn try_is_match_ordinary(&self, haystack: &[u8]) -> Result<bool, SearchError> {
         let window = SearchWindow::full(haystack);
+        if let PortablePlan::BoundedWordClass(plan) = &self.plan
+            && let Some(matched) = plan.ordinary_is_match_full_unmetered(haystack)
+        {
+            return Ok(matched);
+        }
         match &self.plan {
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Exists,

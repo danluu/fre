@@ -33,6 +33,71 @@ const CANDIDATE_SCALAR_PREFIX_BYTES: usize = 8;
 /// while amortizing one bulk call over genuinely reusable rejection work.
 const BULK_SKIP_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
 
+// The canonical Unicode unbounded search consumes at most six logical work
+// units per source byte plus its two endpoint checks. Keeping a slightly wider
+// source-independent envelope preserves the incumbent's overflow behavior on
+// theoretical slices too large for its receipt counters.
+const ORDINARY_UNMETERED_WORK_FACTOR: usize = 8;
+const ORDINARY_UNMETERED_FIXED_WORK: usize = 8;
+
+#[cfg(test)]
+pub(crate) mod ordinary_is_match_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct Counts {
+        pub(crate) calls: usize,
+        pub(crate) candidate_scans: usize,
+        pub(crate) unit_classifications: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            calls: 0,
+            candidate_scans: 0,
+            unit_classifications: 0,
+        }) };
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(crate) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_call() {
+        COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next.calls = next.calls.checked_add(1).expect("ordinary call probe fits");
+            counts.set(next);
+        });
+    }
+
+    pub(super) fn record_candidate_scan() {
+        COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next.candidate_scans = next
+                .candidate_scans
+                .checked_add(1)
+                .expect("ordinary candidate-scan probe fits");
+            counts.set(next);
+        });
+    }
+
+    pub(super) fn record_unit_classification() {
+        COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next.unit_classifications = next
+                .unit_classifications
+                .checked_add(1)
+                .expect("ordinary unit-classification probe fits");
+            counts.set(next);
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryMode {
     Ascii,
@@ -481,6 +546,108 @@ impl CandidateScanner {
         Ok(None)
     }
 
+    /// Mirror the canonical Unicode candidate order after the caller has
+    /// admitted the complete ordinary full-window envelope. Unicode plans do
+    /// not retain the ASCII nonmember run scanner, so their canonical order is
+    /// exactly scalar prefix, wide blocks, narrow block, scalar tail.
+    fn next_unicode_unmetered(
+        &self,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+    ) -> Option<ScannedCandidate> {
+        debug_assert_eq!(self.mode, CandidateMode::UnicodeAsciiMemberOrNonAscii);
+        #[cfg(test)]
+        ordinary_is_match_probe::record_candidate_scan();
+
+        let prefix_end = position
+            .checked_add(
+                end.saturating_sub(position)
+                    .min(CANDIDATE_SCALAR_PREFIX_BYTES),
+            )
+            .expect("the scalar prefix remains inside the source");
+        while position < prefix_end {
+            if let Some(candidate) = self.unicode_scalar_candidate_unmetered(haystack, position) {
+                return Some(candidate);
+            }
+            position = position
+                .checked_add(1)
+                .expect("a position before the source end can advance");
+        }
+
+        while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+            let block_end = position
+                .checked_add(ASCII_WIDE_BYTES)
+                .expect("a proved wide block remains inside the source");
+            let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("the candidate scanner checked its wide extent");
+            let masks = self.classifier.classify_32(block);
+            let candidates = masks.member_mask() | !masks.ascii_mask();
+            if candidates != 0 {
+                let offset = usize::try_from(candidates.trailing_zeros())
+                    .expect("a 32-bit candidate lane fits usize");
+                let candidate_position = position
+                    .checked_add(offset)
+                    .expect("a candidate lane remains inside its block");
+                let bit = 1_u32
+                    .checked_shl(u32::try_from(offset).expect("wide lane fits u32"))
+                    .expect("a wide candidate lane is below 32");
+                if masks.member_mask() & bit != 0 {
+                    return Some(ScannedCandidate::AsciiMember {
+                        position: candidate_position,
+                        byte: block[offset],
+                    });
+                }
+                return Some(ScannedCandidate::NonAscii {
+                    position: candidate_position,
+                });
+            }
+            position = block_end;
+        }
+
+        if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
+            let block_end = position
+                .checked_add(ASCII_NARROW_BYTES)
+                .expect("a proved narrow block remains inside the source");
+            let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("the candidate scanner checked its narrow extent");
+            let masks = self.classifier.classify_16(block);
+            let candidates = masks.member_mask() | !masks.ascii_mask();
+            if candidates != 0 {
+                let offset = usize::try_from(candidates.trailing_zeros())
+                    .expect("a 16-bit candidate lane fits usize");
+                let candidate_position = position
+                    .checked_add(offset)
+                    .expect("a candidate lane remains inside its block");
+                let bit = 1_u16
+                    .checked_shl(u32::try_from(offset).expect("narrow lane fits u32"))
+                    .expect("a narrow candidate lane is below 16");
+                if masks.member_mask() & bit != 0 {
+                    return Some(ScannedCandidate::AsciiMember {
+                        position: candidate_position,
+                        byte: block[offset],
+                    });
+                }
+                return Some(ScannedCandidate::NonAscii {
+                    position: candidate_position,
+                });
+            }
+            position = block_end;
+        }
+
+        while position < end {
+            if let Some(candidate) = self.unicode_scalar_candidate_unmetered(haystack, position) {
+                return Some(candidate);
+            }
+            position = position
+                .checked_add(1)
+                .expect("a position before the source end can advance");
+        }
+        None
+    }
+
     fn scalar_candidate(
         &self,
         haystack: &[u8],
@@ -504,6 +671,21 @@ impl CandidateScanner {
             return Ok(Some(ScannedCandidate::NonAscii { position }));
         }
         Ok(None)
+    }
+
+    fn unicode_scalar_candidate_unmetered(
+        &self,
+        haystack: &[u8],
+        position: usize,
+    ) -> Option<ScannedCandidate> {
+        let byte = haystack[position];
+        if self.classifier.set().contains(byte) {
+            return Some(ScannedCandidate::AsciiMember { position, byte });
+        }
+        if !byte.is_ascii() {
+            return Some(ScannedCandidate::NonAscii { position });
+        }
+        None
     }
 }
 
@@ -735,6 +917,29 @@ impl Plan {
         }
     }
 
+    /// Complete an ordinary unlimited full-window existence call for the
+    /// Unicode unbounded owner, or decline without inspecting source bytes.
+    /// Every other owner and operation retains the canonical accounted path.
+    #[must_use]
+    pub(crate) fn ordinary_is_match_full_unmetered(&self, haystack: &[u8]) -> Option<bool> {
+        let Self::Established(plan) = self else {
+            return None;
+        };
+        if plan.mode != BoundaryMode::Unicode
+            || plan.maximum_units.is_some()
+            || !matches!(&plan.class, ClassMatcher::Unicode { .. })
+            || !plan.candidate_scanner.as_ref().is_some_and(|scanner| {
+                scanner.mode == CandidateMode::UnicodeAsciiMemberOrNonAscii
+            })
+            || !ordinary_unmetered_envelope_fits(haystack.len())
+        {
+            return None;
+        }
+        #[cfg(test)]
+        ordinary_is_match_probe::record_call();
+        Some(plan.is_match_unicode_unbounded_full_unmetered(haystack))
+    }
+
     pub(crate) fn find_window(
         &self,
         haystack: &[u8],
@@ -761,6 +966,159 @@ impl Plan {
 }
 
 impl EstablishedPlan {
+    fn is_match_unicode_unbounded_full_unmetered(&self, haystack: &[u8]) -> bool {
+        debug_assert_eq!(self.mode, BoundaryMode::Unicode);
+        debug_assert!(self.maximum_units.is_none());
+        let end = haystack.len();
+        let mut position = 0_usize;
+        while position < end {
+            let Some((run_start, mut width, run_word)) =
+                self.next_unicode_member_unmetered(haystack, position, end)
+            else {
+                break;
+            };
+            position = run_start;
+            let mut run_units = 0_usize;
+            let mut homogeneous_wordness = true;
+            loop {
+                run_units = run_units
+                    .checked_add(1)
+                    .expect("a source cannot contain more scalars than bytes");
+                position = position
+                    .checked_add(width)
+                    .expect("a decoded scalar within the source can advance");
+                if position >= end {
+                    break;
+                }
+                let (next_admitted, next_width, next_word) =
+                    self.classify_unicode_unit_unmetered(haystack, position, end);
+                if !next_admitted {
+                    break;
+                }
+                homogeneous_wordness &= next_word == run_word;
+                width = next_width;
+            }
+
+            if run_units >= self.minimum_units
+                && self.unbounded_class_run_exists_unmetered(
+                    haystack,
+                    run_start,
+                    position,
+                    run_units,
+                    homogeneous_wordness,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn next_unicode_member_unmetered(
+        &self,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+    ) -> Option<(usize, usize, bool)> {
+        let scanner = self
+            .candidate_scanner
+            .as_ref()
+            .expect("the Unicode path retains its candidate classifier");
+        loop {
+            let candidate = scanner.next_unicode_unmetered(haystack, position, end)?;
+            match candidate {
+                ScannedCandidate::AsciiMember { position, byte } => {
+                    return Some((position, 1, is_ascii_word(byte)));
+                }
+                ScannedCandidate::NonAscii {
+                    position: candidate,
+                } => {
+                    let (admitted, width, word) =
+                        self.classify_unicode_unit_unmetered(haystack, candidate, end);
+                    if admitted {
+                        return Some((candidate, width, word));
+                    }
+                    position = candidate
+                        .checked_add(width)
+                        .expect("a classified scalar within the source can advance");
+                }
+            }
+        }
+    }
+
+    fn unbounded_class_run_exists_unmetered(
+        &self,
+        haystack: &[u8],
+        run_start: usize,
+        run_end: usize,
+        run_units: usize,
+        homogeneous_wordness: bool,
+    ) -> bool {
+        if homogeneous_wordness {
+            return self.is_word_boundary(haystack, run_start)
+                && self.is_word_boundary(haystack, run_end);
+        }
+
+        // With no maximum repetition, the earliest word-boundary start is at
+        // least as useful as every later start. Visit the same decoded class
+        // boundaries as the canonical cursors while retaining only that unit
+        // index and the Boolean projection.
+        let mut earliest_start = None;
+        let mut position = run_start;
+        let mut units = 0_usize;
+        loop {
+            if self.is_word_boundary(haystack, position) {
+                if earliest_start
+                    .is_some_and(|start| units.saturating_sub(start) >= self.minimum_units)
+                {
+                    return true;
+                }
+                if earliest_start.is_none() && units < run_units {
+                    earliest_start = Some(units);
+                }
+            }
+            if position == run_end {
+                break;
+            }
+            let width = self.known_member_width(haystack, position, run_end);
+            position = position
+                .checked_add(width)
+                .expect("a retained class scalar remains inside its run");
+            units = units
+                .checked_add(1)
+                .expect("a source cannot contain more scalars than bytes");
+        }
+        false
+    }
+
+    fn classify_unicode_unit_unmetered(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+    ) -> (bool, usize, bool) {
+        #[cfg(test)]
+        ordinary_is_match_probe::record_unit_classification();
+        let ClassMatcher::Unicode {
+            ascii_words,
+            ranges,
+        } = &self.class
+        else {
+            unreachable!("the Unicode ordinary route owns a Unicode class");
+        };
+        let Some((scalar, width)) = decode_first(&haystack[position..end]) else {
+            return (false, 1, false);
+        };
+        let admitted = if scalar.is_ascii() {
+            let byte = u8::try_from(u32::from(scalar))
+                .expect("an ASCII scalar fits exactly in one byte");
+            ascii_set_contains(*ascii_words, byte)
+        } else {
+            unicode_ranges_contain(ranges, scalar)
+        };
+        (admitted, width, admitted && is_unicode_word(scalar))
+    }
+
     fn find_window(
         &self,
         haystack: &[u8],
@@ -1715,6 +2073,14 @@ fn next_member_boundary(
     }
 }
 
+fn ordinary_unmetered_envelope_fits(haystack_len: usize) -> bool {
+    haystack_len
+        .checked_mul(ORDINARY_UNMETERED_WORK_FACTOR)
+        .and_then(|work| work.checked_add(ORDINARY_UNMETERED_FIXED_WORK))
+        .and_then(|work| u64::try_from(work).ok())
+        .is_some()
+}
+
 fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
     if window.start() > window.end() || window.end() > haystack.len() {
         return Err(Error::InvalidWindow {
@@ -1863,16 +2229,40 @@ fn decode_last(bytes: &[u8]) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use fre_kernels::SimdDispatchContext;
+    use regex::bytes::RegexBuilder as BytesRegexBuilder;
     use regex_syntax::ParserBuilder;
 
     use super::{
         ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, BULK_SKIP_MIN_BYTES,
         BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSetClassifier, CandidateMode, CandidateScanner,
-        InspectionError, InspectionOutcome, PLAN_ID, inspect,
+        InspectionError, InspectionOutcome, PLAN_ID, inspect, ordinary_is_match_probe,
     };
     use crate::{
-        BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchLimits, SearchWindow,
+        BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchError, SearchLimits,
+        SearchSessionLimits, SearchWindow, UnicodeWordRunError,
     };
+
+    fn generated_background(length: usize, seed: u64) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"qxvjkm ,.;/\n";
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let modulus = u64::try_from(ALPHABET.len()).expect("alphabet length fits u64");
+                let index = usize::try_from(state % modulus).expect("alphabet index fits usize");
+                ALPHABET[index]
+            })
+            .collect()
+    }
+
+    fn generated_with_suffix(length: usize, seed: u64, suffix: &[u8]) -> Vec<u8> {
+        assert!(suffix.len() <= length);
+        let mut bytes = generated_background(length - suffix.len(), seed);
+        bytes.extend_from_slice(suffix);
+        bytes
+    }
 
     fn plan(pattern: &str, unicode: bool) -> super::Plan {
         let hir = ParserBuilder::new()
@@ -2454,5 +2844,225 @@ mod tests {
             ),
             Err(crate::UnicodeWordRunError::WorkLimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn ordinary_unmetered_boolean_matches_exact_unicode_greek_late_case() {
+        const PATTERN: &str = r"\b\p{Greek}+\b";
+        let suffix = " Ωμέγα ".as_bytes();
+        let haystack = generated_with_suffix(4_093, 0x1111_2222_3333_4444, suffix);
+        let run_start = haystack.len() - suffix.len() + 1;
+        let run_end = haystack.len() - 1;
+        let plan = plan(PATTERN, true);
+        let canonical = plan
+            .find_window(
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .expect("canonical Greek benchmark search")
+            .0
+            .expect("the benchmark suffix contains one Greek word");
+        assert_eq!(canonical.range(), run_start..run_end);
+        assert_eq!(
+            plan.ordinary_is_match_full_unmetered(&haystack),
+            Some(true)
+        );
+
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("the public benchmark regex builds");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        ordinary_is_match_probe::reset();
+        assert!(regex.is_match(&haystack));
+        let counts = ordinary_is_match_probe::snapshot();
+        assert_eq!(counts.calls, 1);
+        assert!(counts.candidate_scans > 0);
+        assert!(counts.unit_classifications > 0);
+    }
+
+    #[test]
+    fn ordinary_unmetered_boolean_preserves_boundaries_and_malformed_bytes() {
+        const PATTERN: &str = r"\b\p{Greek}{2,}\b";
+        let plan = plan(PATTERN, true);
+        let oracle = BytesRegexBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("Unicode bytes-regex oracle");
+        let cases = [
+            "!αβ!".as_bytes().to_vec(),
+            "aαβ!".as_bytes().to_vec(),
+            "!αβa".as_bytes().to_vec(),
+            "!α!".as_bytes().to_vec(),
+            b"plain ASCII only".to_vec(),
+            [vec![0xff], "αβ".as_bytes().to_vec(), vec![0xff]].concat(),
+            [vec![0xce, b'!'], "αβ".as_bytes().to_vec(), vec![0xb1]].concat(),
+        ];
+        for haystack in cases {
+            let canonical = plan
+                .find_window(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .expect("canonical boundary-context search")
+                .0
+                .is_some();
+            let expected = oracle.is_match(&haystack);
+            assert_eq!(canonical, expected, "canonical parity for {haystack:?}");
+            assert_eq!(
+                plan.ordinary_is_match_full_unmetered(&haystack),
+                Some(expected),
+                "ordinary parity for {haystack:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_unmetered_boolean_differentially_exhausts_short_byte_sources() {
+        let patterns = [
+            r"\b\p{Greek}+\b",
+            r"\b\p{L}{2,}\b",
+            r"\b[\p{Greek}_/]+\b",
+        ];
+        let alphabet = [b'A', b'_', b'/', b'!', 0xff, 0xce, 0xb1];
+        for pattern in patterns {
+            let plan = plan(pattern, true);
+            let oracle = BytesRegexBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .expect("bytes-regex oracle");
+            for length in 0_u32..=5 {
+                for mut encoded in 0..alphabet.len().pow(length) {
+                    let mut haystack = Vec::with_capacity(
+                        usize::try_from(length).expect("small exhaustive source length"),
+                    );
+                    for _ in 0..length {
+                        haystack.push(alphabet[encoded % alphabet.len()]);
+                        encoded /= alphabet.len();
+                    }
+                    let canonical = plan
+                        .find_window(
+                            &haystack,
+                            SearchWindow::full(&haystack),
+                            SearchLimits::unlimited(),
+                        )
+                        .expect("canonical exhaustive search")
+                        .0
+                        .is_some();
+                    assert_eq!(
+                        plan.ordinary_is_match_full_unmetered(&haystack),
+                        Some(canonical),
+                        "ordinary pattern={pattern:?} haystack={haystack:?}",
+                    );
+                    // The incumbent and regex::bytes intentionally diverge on
+                    // some malformed Unicode-boundary contexts. That inherited
+                    // behavior is outside this ordinary value-path lane; valid
+                    // UTF-8 retains complete upstream differential coverage.
+                    if core::str::from_utf8(&haystack).is_ok() {
+                        assert_eq!(
+                            canonical,
+                            oracle.is_match(&haystack),
+                            "canonical pattern={pattern:?} haystack={haystack:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_public_ordinary_is_match_enters_the_unmetered_boolean_route() {
+        const PATTERN: &str = r"\b\p{Greek}+\b";
+        let hit = "!Ωμέγα!".as_bytes();
+        let miss = b"plain ASCII";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("bounded Unicode word-class facade");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+
+        ordinary_is_match_probe::reset();
+        assert!(regex.is_match(hit));
+        assert!(!regex.is_match(miss));
+        let ordinary = ordinary_is_match_probe::snapshot();
+        assert_eq!(ordinary.calls, 2);
+        assert!(ordinary.candidate_scans >= 2);
+
+        assert!(regex
+            .is_match_accounted(hit, SearchLimits::unlimited())
+            .expect("accounted existence")
+            .0);
+        assert!(regex
+            .is_match_value(hit, SearchLimits::unlimited())
+            .expect("explicit value existence"));
+        assert!(regex
+            .is_match_at(hit, 0, SearchLimits::unlimited())
+            .expect("accounted ranged existence")
+            .0);
+        assert!(regex
+            .is_match_window_value(
+                hit,
+                SearchWindow::full(hit),
+                SearchLimits::unlimited(),
+            )
+            .expect("value window existence"));
+        assert!(regex.find(hit).is_some());
+        assert!(regex
+            .find_value(hit, SearchLimits::unlimited())
+            .expect("value span")
+            .is_some());
+
+        let mut locations = regex.capture_locations();
+        assert!(regex
+            .captures_read_value(&mut locations, hit, SearchLimits::unlimited())
+            .expect("capture-free locations")
+            .is_some());
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("native session");
+        assert!(session
+            .is_match_value(hit, SearchLimits::unlimited())
+            .expect("session value existence"));
+
+        let invalid = SearchWindow::new(2, 1);
+        assert!(matches!(
+            regex.is_match_window_value(
+                hit,
+                invalid,
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::UnicodeWordRun(
+                UnicodeWordRunError::InvalidWindow {
+                    start: 2,
+                    end: 1,
+                    haystack_len,
+                }
+            )) if haystack_len == hit.len()
+        ));
+        assert!(matches!(
+            regex.is_match_value(
+                hit,
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::UnicodeWordRun(
+                UnicodeWordRunError::WorkLimitExceeded { .. }
+            ))
+        ));
+
+        let bounded = PortableBuilder::new(r"\b\p{Greek}{2,8}\b")
+            .unicode(true)
+            .build()
+            .expect("bounded maximum fallback fixture");
+        assert_eq!(bounded.runtime_implementation_id(), PLAN_ID);
+        assert!(bounded.is_match(hit));
+        assert_eq!(ordinary_is_match_probe::snapshot(), ordinary);
     }
 }
