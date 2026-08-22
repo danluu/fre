@@ -3256,24 +3256,51 @@ impl CompiledModule {
             .map_err(CompileError::from);
         }
         if let Some(semantic_native) = semantic_native {
+            // Exact-product machines retain their established scheduler. The
+            // bounded finite/Teddy transaction below is specific to the
+            // ordinary complete DFA that those exact leaves compete with.
+            if program.engine_kind() != crate::EngineKind::OrderedDfa {
+                return Self::lower_serialized(
+                    program_bytes,
+                    Some(semantic_native),
+                    false,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    allow_ordered_nfa
+                        .then(|| program.native_ordered_nfa_view())
+                        .flatten()
+                        .map(|view| (view, effective_native_data_limit_bytes)),
+                    target,
+                )
+                .map_err(CompileError::from);
+            }
+
             // A freshly authenticated finite-language sidecar can replace an
             // ordinary complete DFA before target lowering, but only under a
             // conservative target-neutral comparison. Exact-product and
             // contextual machines keep their established portfolios.
-            let finite_candidate = if program.engine_kind() == crate::EngineKind::OrderedDfa
-                && let Some(complete_cost) =
-                    NativeCompleteDfaCost::estimate(&semantic_native)?
-                && let Some(finite_view) = program.native_finite_language_view()
-            {
-                lower_optional_native_finite_language_with_data_limit_and_competitor(
+            let complete_cost = match semantic_native.output {
+                OutputContract::Span => NativeCompleteDfaCost::estimate(&semantic_native)?,
+                OutputContract::SelectedEnd => {
+                    NativeCompleteDfaCost::estimate_selected_end(&semantic_native)?
+                }
+                OutputContract::Exists => None,
+            };
+            let finite_view = program.native_finite_language_view();
+            let finite_candidate =
+                if let (Some(complete_cost), Some(finite_view)) = (complete_cost, finite_view) {
+                    lower_optional_native_finite_language_with_data_limit_and_competitor(
                         finite_view,
                         target,
                         effective_native_data_limit_bytes,
                         Some(complete_cost),
                     )?
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             if let Some((lowering, report)) = finite_candidate {
                 return Self::lower_serialized_with_prelowered(
                     program_bytes,
@@ -3296,53 +3323,86 @@ impl CompiledModule {
                 .map_err(CompileError::from);
             }
 
-            // The exact finite SelectedEnd leaf starts every long valid
-            // window and tail-enters the exact complete semantic DFA that the
-            // established portfolio would otherwise publish. Selection or a
-            // declared-cap miss therefore returns that byte-identical
-            // incumbent, never a newly introduced fallback route.
-            if teddy_policy != crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
-                && program.engine_kind() == crate::EngineKind::OrderedDfa
-                && let Some(teddy_view) = program.native_finite_selected_end_teddy_view()
-                && let Some(baseline_cost) =
-                    NativeCompleteDfaCost::estimate_selected_end(&semantic_native)?
+            // The cost comparison above does not materialize a declined
+            // finite candidate. Lower the ordinary incumbent exactly once
+            // under the same effective native-data ceiling as every optional
+            // wrapper. Only an authenticated numeric ceiling miss is a
+            // recoverable decline; allocation and backend failures are
+            // terminal. If the complete DFA is unavailable, retry the finite
+            // candidate without that unavailable competitor before entering
+            // the later optimizer portfolio.
+            let mut incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
+                semantic_native,
+                target,
+                effective_native_data_limit_bytes,
+            )?;
+            if incumbent.is_none()
+                && let Some(finite_view) = finite_view
+                && let Some((lowering, report)) =
+                    lower_optional_native_finite_language_with_data_limit_and_competitor(
+                        finite_view,
+                        target,
+                        effective_native_data_limit_bytes,
+                        None,
+                    )?
             {
-                let incumbent = match teddy_policy {
-                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic
-                        if !baseline_cost.has_accelerator =>
-                    {
-                        lower_native_dfa(semantic_native, target)?
+                return Self::lower_serialized_with_prelowered(
+                    program_bytes,
+                    Some(lowering),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(report),
+                    false,
+                    None,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    None,
+                    target,
+                )
+                .map_err(CompileError::from);
+            }
+
+            // At this point the complete DFA is the full established
+            // incumbent whenever one exists: a preferred finite/AC lowering
+            // has already won, and a missing capped DFA has no authority to
+            // suppress the later portfolio. Teddy may wrap only this exact
+            // materialization. Every decline retains it byte-for-byte.
+            if teddy_policy != crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
+                && let Some(teddy_view) = program.native_finite_selected_end_teddy_view()
+                && let Some(baseline_cost) = complete_cost
+                && (teddy_policy
+                    == crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible
+                    || !baseline_cost.has_accelerator)
+                && incumbent.is_some()
+            {
+                let selection_basis = match teddy_policy {
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => {
+                        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
                     }
                     crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => {
-                        lower_native_dfa(semantic_native, target)?
+                        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
                     }
-                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
-                    | crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => None,
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled => unreachable!(),
                 };
-                if let Some(incumbent) = incumbent {
-                    let selection_basis = match teddy_policy {
-                        crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic => {
-                            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
-                        }
-                        crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible => {
-                            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
-                        }
-                        crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled => unreachable!(),
-                    };
+                if let Some(incumbent_ref) = incumbent.as_ref() {
                     let baseline_report = match selection_basis {
                         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-                            baseline_cost.selected_end_report(&semantic_native, &incumbent)?
+                            baseline_cost.selected_end_report(&semantic_native, incumbent_ref)?
                         }
                         ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
                             baseline_cost.selected_end_report_with_basis(
                                 &semantic_native,
-                                &incumbent,
+                                incumbent_ref,
                                 selection_basis,
                             )?
                         }
                     };
                     if let Some(baseline_report) = baseline_report {
-                        let incumbent_prefix = incumbent.anchored_prefix_filter_bytes;
                         let selection = match selection_basis {
                             ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
                                 module_exact_finite_selected_end_teddy::
@@ -3361,39 +3421,43 @@ impl CompiledModule {
                                     )
                             }
                         };
-                        let (lowering, teddy_report, teddy_report_v2) = if let Some(selection) =
-                            selection
-                        {
+                        if let Some(selection) = selection {
+                            let incumbent_lowering =
+                                incumbent.take().ok_or(CompileError::InternalInvariant(
+                                    "SelectedEnd Teddy lost its materialized incumbent",
+                                ))?;
+                            let incumbent_prefix = incumbent_lowering.anchored_prefix_filter_bytes;
                             let outcome = match selection_basis {
-                                    ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-                                        module_exact_finite_selected_end_teddy::
-                                            wrap_exact_finite_selected_end_teddy(
-                                                selection,
-                                                incumbent,
-                                                baseline_report,
-                                                target,
-                                                effective_native_data_limit_bytes,
-                                            )?
-                                    }
-                                    ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
-                                        module_exact_finite_selected_end_teddy::
-                                            wrap_exact_finite_selected_end_teddy_forced_v2(
-                                                selection,
-                                                incumbent,
-                                                baseline_report,
-                                                target,
-                                                effective_native_data_limit_bytes,
-                                            )?
-                                    }
-                                };
-                            match outcome {
+                                ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
                                     module_exact_finite_selected_end_teddy::
-                                        ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
-                                            lowering,
-                                            report,
-                                        } => match selection_basis {
+                                        wrap_exact_finite_selected_end_teddy(
+                                            selection,
+                                            incumbent_lowering,
+                                            baseline_report,
+                                            target,
+                                            effective_native_data_limit_bytes,
+                                        )?
+                                }
+                                ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
+                                    module_exact_finite_selected_end_teddy::
+                                        wrap_exact_finite_selected_end_teddy_forced_v2(
+                                            selection,
+                                            incumbent_lowering,
+                                            baseline_report,
+                                            target,
+                                            effective_native_data_limit_bytes,
+                                        )?
+                                }
+                            };
+                            match outcome {
+                                module_exact_finite_selected_end_teddy::
+                                    ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
+                                        lowering,
+                                        report,
+                                    } => {
+                                    let (teddy_report, teddy_report_v2) = match selection_basis {
                                             ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-                                                (lowering, Some(report), None)
+                                                (Some(report), None)
                                             }
                                             ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
                                                 let report_v2 = module_exact_finite_selected_end_teddy::exact_finite_selected_end_teddy_report_v2(
@@ -3402,57 +3466,69 @@ impl CompiledModule {
                                                     selection_basis,
                                                     incumbent_prefix,
                                                 )?;
-                                                (lowering, None, Some(report_v2))
+                                                (None, Some(report_v2))
                                             }
-                                        },
-                                    module_exact_finite_selected_end_teddy::
-                                        ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(
-                                            lowering,
-                                        ) => (lowering, None, None),
+                                        };
+                                    let mut module = Self::lower_serialized_with_prelowered(
+                                        program_bytes,
+                                        Some(lowering),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                        None,
+                                        program.native_context_program_view(),
+                                        program.native_bit_parallel_exists_view(),
+                                        program.native_bit_parallel_endpoint_oracle_view(),
+                                        program.native_partial_dfa_view(),
+                                        program.native_dynamic_rows_view(),
+                                        None,
+                                        target,
+                                    )?;
+                                    if let Some(report) = teddy_report {
+                                        module.install_exact_finite_selected_end_teddy_aot_report(
+                                            report,
+                                            program.artifact_identity(),
+                                            &semantic_native,
+                                        )?;
+                                    }
+                                    if let Some(report) = teddy_report_v2 {
+                                        module.install_exact_finite_selected_end_teddy_aot_report_v2(
+                                            report,
+                                            program.artifact_identity(),
+                                            &semantic_native,
+                                        )?;
+                                    }
+                                    return Ok(module);
                                 }
-                        } else {
-                            (incumbent, None, None)
-                        };
-                        let mut module = Self::lower_serialized_with_prelowered(
-                            program_bytes,
-                            Some(lowering),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            false,
-                            None,
-                            program.native_context_program_view(),
-                            program.native_bit_parallel_exists_view(),
-                            program.native_bit_parallel_endpoint_oracle_view(),
-                            program.native_partial_dfa_view(),
-                            program.native_dynamic_rows_view(),
-                            None,
-                            target,
-                        )?;
-                        if let Some(report) = teddy_report {
-                            module.install_exact_finite_selected_end_teddy_aot_report(
-                                report,
-                                program.artifact_identity(),
-                                &semantic_native,
-                            )?;
+                                module_exact_finite_selected_end_teddy::
+                                    ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(
+                                        restored,
+                                    ) => {
+                                    incumbent = Some(restored);
+                                }
+                            }
                         }
-                        if let Some(report) = teddy_report_v2 {
-                            module.install_exact_finite_selected_end_teddy_aot_report_v2(
-                                report,
-                                program.artifact_identity(),
-                                &semantic_native,
-                            )?;
-                        }
-                        return Ok(module);
                     }
                 }
             }
-            return Self::lower_serialized(
+            // `incumbent` is either the one bounded ordinary materialization
+            // or `None` after an authenticated numeric/target decline. Never
+            // pass `semantic_native` here: doing so would retry the ordinary
+            // route without its effective cap. The remaining arguments are
+            // the unchanged post-native scheduler portfolio.
+            return Self::lower_serialized_with_prelowered(
                 program_bytes,
-                Some(semantic_native),
+                incumbent,
+                None,
+                None,
+                None,
+                None,
+                None,
                 false,
+                None,
                 program.native_context_program_view(),
                 program.native_bit_parallel_exists_view(),
                 program.native_bit_parallel_endpoint_oracle_view(),
@@ -19436,6 +19512,38 @@ fn lower_native_dfa_with_data_limit(
         NativeDfaEntryContract::Public,
         max_native_data_bytes,
     )
+}
+
+/// A numeric native-data miss declines only the speculative Teddy composite.
+/// Allocator failure and every backend/invariant error remain terminal, so a
+/// decline may safely re-enter the established optimizer portfolio.
+fn lower_exact_finite_teddy_incumbent_with_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    exact_finite_teddy_incumbent_outcome(
+        lower_native_dfa_with_data_limit(view, target, max_native_data_bytes),
+        max_native_data_bytes,
+    )
+}
+
+/// Authenticate the one recoverable ordinary-incumbent failure without
+/// hiding allocator, address-space, backend, or invariant failures. Keeping
+/// this classifier pure also gives the allocation-failure boundary an
+/// injectable regression seam.
+fn exact_finite_teddy_incumbent_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match outcome {
+        Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit,
+            required,
+        }) if limit == max_native_data_bytes && required > limit => Ok(None),
+        outcome => outcome,
+    }
 }
 
 /// Lower an optional optimizing candidate without hiding compiler defects.

@@ -3366,7 +3366,7 @@ mod tests {
                     .is_none()
             );
         }
-        for pattern in ["alpha|bravo|cider", "aa|bb|cc|dd"] {
+        for pattern in ["alpha|bravo", "alpha|bravo|cider", "aa|bb|cc|dd"] {
             let compiled = compile(
                 CompileRequest::new(pattern, avx2_target())
                     .mode(CompileMode::Optimizing)
@@ -3379,6 +3379,27 @@ mod tests {
                     .exact_finite_selected_end_teddy_aot
                     .is_none()
             );
+            assert!(
+                compiled
+                    .program()
+                    .native_finite_selected_end_teddy_view()
+                    .is_none(),
+                "two/three literals and sub-three-byte arms are structural declines",
+            );
+            let disabled = crate::compile_v2(
+                crate::CompileRequestV2::new(
+                    CompileRequest::new(pattern, avx2_target())
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd),
+                )
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                ),
+            )
+            .expect("structural Teddy decline must preserve ordinary compilation");
+            assert_byte_identical_module(compiled.module(), disabled.module());
+            assert_eq!(compiled.object(), disabled.object());
+            assert_eq!(compiled.receipt(), disabled.receipt());
         }
         let sixty_five_arms = (0..65)
             .map(|ordinal| format!("x{ordinal:02}"))
@@ -3449,6 +3470,20 @@ mod tests {
             assert!(compiled.receipt().ordered_finite_language_aot.is_none());
             let unchanged = unchanged_selected_end_module(&compiled, target);
             assert_byte_identical_module(compiled.module(), &unchanged);
+            let disabled = crate::compile_v2(
+                crate::CompileRequestV2::new(
+                    CompileRequest::new(&pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd),
+                )
+                .exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                ),
+            )
+            .expect("accelerator Teddy decline must preserve ordinary compilation");
+            assert_byte_identical_module(compiled.module(), disabled.module());
+            assert_eq!(compiled.object(), disabled.object(), "{kind}");
+            assert_eq!(compiled.receipt(), disabled.receipt(), "{kind}");
         }
     }
 
@@ -3552,6 +3587,136 @@ mod tests {
         );
         assert!(
             disabled
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn teddy_incumbent_classifier_only_declines_authenticated_numeric_cap() {
+        let limit = 31;
+        assert!(
+            exact_finite_teddy_incumbent_outcome(
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    required: limit + 1,
+                }),
+                limit,
+            )
+            .unwrap()
+            .is_none(),
+            "an exact effective-cap miss is the one recoverable outcome",
+        );
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(
+                Err(ObjectError::Allocation("injected Teddy incumbent seam")),
+                limit,
+            ),
+            Err(ObjectError::Allocation(_)),
+        ));
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    required: limit,
+                }),
+                limit,
+            ),
+            Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 31,
+                required: 31,
+            }),
+        ));
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: limit - 1,
+                    required: limit,
+                }),
+                limit,
+            ),
+            Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 30,
+                required: 31,
+            }),
+        ));
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(
+                Err(ObjectError::InvalidModule("injected Teddy backend seam")),
+                limit,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+    }
+
+    #[test]
+    fn tiny_native_data_cap_declines_before_teddy_incumbent_and_restores_full_portfolio() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let uncapped = compile_selected(&pattern, target);
+        let ordinary = unchanged_selected_end_module(&uncapped, target);
+        let semantic = uncapped
+            .program()
+            .native_dfa_view()
+            .expect("complete SelectedEnd semantic DFA");
+        let incumbent = lower_native_dfa(semantic, target)
+            .unwrap()
+            .expect("uncapped complete-DFA incumbent");
+        let tiny_cap = incumbent
+            .data
+            .len()
+            .checked_sub(1)
+            .expect("complete-DFA incumbent has native data");
+        assert!(
+            lower_exact_finite_teddy_incumbent_with_data_limit(semantic, target, tiny_cap)
+                .unwrap()
+                .is_none(),
+            "an over-cap DFA must not become the speculative Teddy incumbent",
+        );
+        let limits = crate::SlowAotLimits {
+            max_native_data_bytes: tiny_cap,
+            ..crate::SlowAotLimits::default()
+        };
+        let automatic = crate::compile_v2_with_slow_aot_limits(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(&pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            ),
+            limits,
+        )
+        .expect("tiny-cap Automatic must preserve the established portfolio");
+        let disabled = crate::compile_v2_with_slow_aot_limits(
+            crate::CompileRequestV2::new(
+                CompileRequest::new(&pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .exact_finite_selected_end_teddy(crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled),
+            limits,
+        )
+        .expect("tiny-cap Disabled must preserve the established portfolio");
+        assert_byte_identical_module(automatic.module(), disabled.module());
+        assert_eq!(automatic.object(), disabled.object());
+        assert_eq!(automatic.receipt(), disabled.receipt());
+        assert_ne!(
+            automatic.module(),
+            &ordinary,
+            "an authenticated cap miss must not retry the ordinary DFA unbounded",
+        );
+        let finite_report = automatic
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("an unavailable over-cap DFA must release finite/AC rescue");
+        assert!(finite_report.native_data_bytes <= tiny_cap);
+        assert!(
+            automatic
                 .receipt_v2()
                 .exact_finite_selected_end_teddy_aot
                 .is_none(),
