@@ -5481,6 +5481,206 @@ impl PortableParsedBuildContext {
     }
 }
 
+/// Authenticate the one externally produced HIR shape used by ripgrep's
+/// ordinary, case-sensitive LF line matcher.
+///
+/// This is deliberately a value check, not an authority token. The caller's
+/// HIR is accepted only when it is a nonempty UTF-8 literal or a flat,
+/// nonempty alternation of such literals. Excluding LF proves that ripgrep's
+/// line-byte removal was inert; the absence of look assertions proves that
+/// multiline mode was inert. A canonical source is derived here so cloning a
+/// published matcher still replays ordinary source construction exactly.
+fn append_ripgrep_literal_source(source: &mut String, node: &Hir) {
+    let HirKind::Literal(literal) = node.kind() else {
+        unreachable!("literal HIR handoff was authenticated above");
+    };
+    let text = core::str::from_utf8(literal.0.as_ref())
+        .expect("literal HIR handoff authenticated UTF-8 above");
+    regex_syntax::escape_into(text, source);
+}
+
+fn ripgrep_standard_literal_context(
+    hir: &Hir,
+    limits: BuildLimits,
+    canonical_source_limit: usize,
+) -> Option<PortableParsedBuildContext> {
+    let (branches, hir_nodes, max_depth, traversal_stack) = match hir.kind() {
+        HirKind::Literal(_) => (None, 1_u64, 0_u64, 1_u64),
+        HirKind::Alternation(branches) if branches.len() >= 2 => {
+            let branch_count = u64::try_from(branches.len()).ok()?;
+            (
+                Some(branches.as_slice()),
+                branch_count.checked_add(1)?,
+                1,
+                branch_count,
+            )
+        }
+        _ => return None,
+    };
+
+    let safety = limits.syntax_safety;
+    let quota = match limits.admission {
+        AdmissionPolicy::Strict(_) => None,
+        AdmissionPolicy::Quota(quota) => Some(quota.syntax),
+    };
+    let admitted = |observed: u64, hard: u64, selected: Option<u64>| {
+        observed <= hard && selected.is_none_or(|limit| observed <= limit)
+    };
+    if !admitted(
+        max_depth,
+        safety.max_nesting,
+        quota.map(|quota| quota.max_nesting),
+    ) || !admitted(
+        hir_nodes,
+        safety.max_hir_nodes,
+        quota.map(|quota| quota.max_hir_nodes),
+    ) || !admitted(
+        traversal_stack,
+        safety.max_traversal_stack,
+        quota.map(|quota| quota.max_traversal_stack),
+    ) || !hir.properties().is_utf8()
+        || hir.properties().explicit_captures_len() != 0
+        || !matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0)
+    {
+        return None;
+    }
+
+    let mut literal_bytes = 0_u64;
+    let mut source_bytes = if branches.is_some() {
+        hir_nodes.checked_sub(2)?
+    } else {
+        0
+    };
+    let canonical_source_limit =
+        u64::try_from(canonical_source_limit).unwrap_or(u64::MAX);
+    let within_source_and_work = |source_bytes: u64, literal_bytes: u64| {
+        source_bytes <= canonical_source_limit
+            && admitted(
+                source_bytes,
+                safety.max_pattern_bytes,
+                quota.map(|quota| quota.max_pattern_bytes),
+            )
+            && source_bytes
+                .checked_add(hir_nodes)
+                .and_then(|work| work.checked_add(literal_bytes))
+                .is_some_and(|work| {
+                    admitted(
+                        work,
+                        safety.max_parse_work,
+                        quota.map(|quota| quota.max_parse_work),
+                    )
+                })
+    };
+    if !within_source_and_work(source_bytes, literal_bytes) {
+        return None;
+    }
+    let mut inspect_literal = |node: &Hir| -> Option<()> {
+        let HirKind::Literal(literal) = node.kind() else {
+            return None;
+        };
+        if literal.0.is_empty() {
+            return None;
+        }
+        let bytes = u64::try_from(literal.0.len()).ok()?;
+        let next_literal_bytes = literal_bytes.checked_add(bytes)?;
+        let unescaped_source_bytes = source_bytes.checked_add(bytes)?;
+        // Bound every byte scan by the already authenticated source/work
+        // envelope. A large external literal is refused before UTF-8 or LF
+        // validation traverses it.
+        if !within_source_and_work(unescaped_source_bytes, next_literal_bytes) {
+            return None;
+        }
+        let text = core::str::from_utf8(literal.0.as_ref()).ok()?;
+        let mut escapes = 0_u64;
+        for character in text.chars() {
+            if character == '\n' {
+                return None;
+            }
+            if regex_syntax::is_meta_character(character) {
+                escapes = escapes.checked_add(1)?;
+            }
+        }
+        let escaped_source_bytes = unescaped_source_bytes.checked_add(escapes)?;
+        if !within_source_and_work(escaped_source_bytes, next_literal_bytes) {
+            return None;
+        }
+        literal_bytes = next_literal_bytes;
+        source_bytes = escaped_source_bytes;
+        Some(())
+    };
+    if let Some(branches) = branches {
+        for branch in branches {
+            inspect_literal(branch)?;
+        }
+    } else {
+        inspect_literal(hir)?;
+    }
+
+    let source_bytes_usize = usize::try_from(source_bytes).ok()?;
+    let parse_work = source_bytes
+        .checked_add(hir_nodes)?
+        .checked_add(literal_bytes)?;
+    debug_assert!(within_source_and_work(source_bytes, literal_bytes));
+
+    let mut source = String::with_capacity(source_bytes_usize);
+    if let Some(branches) = branches {
+        for (index, branch) in branches.iter().enumerate() {
+            if index != 0 {
+                source.push('|');
+            }
+            append_ripgrep_literal_source(&mut source, branch);
+        }
+    } else {
+        append_ripgrep_literal_source(&mut source, hir);
+    }
+    debug_assert_eq!(source.len(), source_bytes_usize);
+
+    Some(PortableParsedBuildContext {
+        source: source.into_boxed_str(),
+        admission: match limits.admission {
+            AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
+            AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
+        },
+        syntax: ParseSummary {
+            hir_nodes,
+            max_depth,
+            parse_work,
+            literal_bytes,
+            class_ranges: 0,
+            captures: 0,
+            repetitions: 0,
+            largest_finite_repeat: None,
+            guarantees_valid_utf8_nonempty: true,
+        },
+        rust: fre_syntax::RustParsed { hir: hir.clone() },
+    })
+}
+
+fn is_ripgrep_standard_literal_profile(profile: &RustProfile) -> bool {
+    let (size_limit, dfa_size_limit) = match &profile.constructor {
+        fre_syntax::RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            ..
+        } => (*size_limit, *dfa_size_limit),
+        fre_syntax::RustConstructor::RegexSetBuilder { .. }
+        | fre_syntax::RustConstructor::RebarMeta { .. } => return false,
+    };
+    let mut expected = RustProfile::default();
+    expected.options.multi_line = true;
+    let fre_syntax::RustConstructor::RegexBuilder {
+        size_limit: expected_size_limit,
+        dfa_size_limit: expected_dfa_size_limit,
+        ..
+    } = &mut expected.constructor
+    else {
+        unreachable!("the default Rust profile uses RegexBuilder");
+    };
+    *expected_size_limit = size_limit;
+    *expected_dfa_size_limit = dfa_size_limit;
+    profile == &expected
+}
+
 pub(crate) fn rust_profile_size_limit(profile: &RustProfile) -> Option<usize> {
     match &profile.constructor {
         fre_syntax::RustConstructor::RegexBuilder { size_limit, .. }
@@ -5923,6 +6123,42 @@ impl PortableBuilder {
         self.build_from_parse_attempt(parsed)
     }
 
+    /// Build from ripgrep's exact ordinary case-sensitive literal HIR seam.
+    ///
+    /// This internal integration hook declines unless the builder has the
+    /// pinned Rust stack with `multi_line=true` and every other syntax option
+    /// at its standard value. It independently authenticates a nonempty
+    /// valid-UTF-8 literal or flat literal alternation, rejects LF, derives a
+    /// replayable canonical source, and recomputes all syntax admission facts.
+    /// No result from this check can authorize a later or different HIR.
+    ///
+    /// `canonical_source_limit` preserves the adapter's own bridge envelope.
+    /// `Ok(None)` is a fail-closed refusal; callers may use their existing
+    /// source-addressed construction path.
+    #[doc(hidden)]
+    pub fn build_ripgrep_standard_literal_hir(
+        self,
+        hir: &Hir,
+        canonical_source_limit: usize,
+    ) -> Result<Option<PortableRegex>, BuildError> {
+        if !self.pattern.is_empty()
+            || self.selection != PlanSelection::Auto
+            || self.utf8_start_guarded
+            || !self.byte_native_plans_allowed
+            || !is_ripgrep_standard_literal_profile(&self.profile)
+        {
+            return Ok(None);
+        }
+        let Some(context) = ripgrep_standard_literal_context(
+            hir,
+            self.limits,
+            canonical_source_limit,
+        ) else {
+            return Ok(None);
+        };
+        self.build_from_parsed_context(context).map(Some)
+    }
+
     /// Plan from one already-closed Rust-bytes parse transaction.
     ///
     /// The parse attempt, rather than `self.pattern`, owns the authoritative
@@ -5933,12 +6169,21 @@ impl PortableBuilder {
         parsed: fre_syntax::ParseAttempt,
     ) -> Result<PortableRegex, BuildError> {
         let profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        let context = PortableParsedBuildContext::authenticate(&self, parsed, &profile)?;
+        self.build_from_parsed_context(context)
+    }
+
+    fn build_from_parsed_context(
+        self,
+        context: PortableParsedBuildContext,
+    ) -> Result<PortableRegex, BuildError> {
+        let profile = CompatibilityProfile::RustBytes(self.profile.clone());
         let PortableParsedBuildContext {
             source,
             admission,
             syntax,
             rust,
-        } = PortableParsedBuildContext::authenticate(&self, parsed, &profile)?;
+        } = context;
         let source_storage_bytes = source.len();
         let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
             BuildError::InternalInvariant("syntax capture count does not fit usize")
@@ -23668,6 +23913,136 @@ mod tests {
                 "portable builder received a parsed record for another profile"
             ))
         ));
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_hir_handoff_accepts_only_narrow_exact_values() {
+        let literal = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir(
+                &Hir::literal(b"a|b".to_vec()),
+                usize::MAX,
+            )
+            .expect("direct literal construction completes")
+            .expect("standard literal HIR is admitted");
+        assert_eq!(literal.as_str(), r"a\|b");
+        assert_eq!(literal.build_report().plan, PlanKind::ExactLiteral);
+        assert_eq!(literal.find(b"xxa|byy"), Some(Match { start: 2, end: 5 }));
+        assert_eq!(literal.clone().find(b"xxa|byy"), literal.find(b"xxa|byy"));
+
+        let alternatives = Hir::alternation(vec![
+            Hir::literal(b"needle".to_vec()),
+            Hir::literal(b"thread".to_vec()),
+            Hir::literal(b"fiber".to_vec()),
+        ]);
+        let alternatives = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir(&alternatives, usize::MAX)
+            .expect("direct literal-set construction completes")
+            .expect("flat literal alternation is admitted");
+        assert_eq!(alternatives.as_str(), "needle|thread|fiber");
+        assert!(matches!(
+            alternatives.build_report().plan,
+            PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
+        ));
+        assert_eq!(
+            alternatives.find(b"a fiber then needle"),
+            Some(Match { start: 2, end: 7 })
+        );
+        assert_eq!(
+            alternatives.clone().find(b"a fiber then needle"),
+            alternatives.find(b"a fiber then needle")
+        );
+
+        for refused in [
+            Hir::empty(),
+            Hir::literal(Vec::<u8>::new()),
+            Hir::literal(b"line\nfeed".to_vec()),
+            Hir::literal([0xFF]),
+            Hir::concat(vec![
+                Hir::literal([b'a']),
+                Hir::look(regex_syntax::hir::Look::End),
+            ]),
+            Hir::alternation(vec![Hir::literal([b'a']), Hir::empty()]),
+        ] {
+            assert!(
+                PortableBuilder::new("")
+                    .multi_line(true)
+                    .build_ripgrep_standard_literal_hir(&refused, usize::MAX)
+                    .expect("shape refusal is not a construction error")
+                    .is_none()
+            );
+        }
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literal_hir(&Hir::literal(b"a|b".to_vec()), 3)
+                .expect("source envelope refusal is not a construction error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_hir_handoff_checks_the_complete_profile_and_limits() {
+        for builder in [
+            PortableBuilder::new(""),
+            PortableBuilder::new("not-empty").multi_line(true),
+            PortableBuilder::new("").multi_line(true).unicode(false),
+            PortableBuilder::new("").multi_line(true).case_insensitive(true),
+            PortableBuilder::new("").multi_line(true).dot_matches_new_line(true),
+            PortableBuilder::new("").multi_line(true).crlf(true),
+            PortableBuilder::new("").multi_line(true).swap_greed(true),
+            PortableBuilder::new("").multi_line(true).ignore_whitespace(true),
+            PortableBuilder::new("").multi_line(true).line_terminator(0),
+            PortableBuilder::new("").multi_line(true).nest_limit(249),
+            PortableBuilder::new("").multi_line(true).octal(true),
+            PortableBuilder::new("")
+                .multi_line(true)
+                .plan_selection(PlanSelection::ForceK0),
+        ] {
+            assert!(
+                builder
+                    .build_ripgrep_standard_literal_hir(
+                        &Hir::literal(b"needle".to_vec()),
+                        usize::MAX,
+                    )
+                    .expect("profile refusal is not a construction error")
+                    .is_none()
+            );
+        }
+
+        let mut limits = BuildLimits::default();
+        limits.syntax_safety.max_hir_nodes = 2;
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(limits)
+                .build_ripgrep_standard_literal_hir(
+                    &Hir::alternation(vec![
+                        Hir::literal(b"one".to_vec()),
+                        Hir::literal(b"two".to_vec()),
+                    ]),
+                    usize::MAX,
+                )
+                .expect("admission refusal is not a construction error")
+                .is_none()
+        );
+
+        let mut limits = BuildLimits::default();
+        limits.syntax_safety.max_pattern_bytes = 3;
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(limits)
+                .build_ripgrep_standard_literal_hir(
+                    &Hir::literal(b"four".to_vec()),
+                    usize::MAX,
+                )
+                .expect("source admission refusal is not a construction error")
+                .is_none()
+        );
     }
 
     fn finite_two_barrier_has_vector_scanner() -> bool {
