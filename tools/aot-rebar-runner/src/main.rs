@@ -465,6 +465,20 @@ fn strict_grep_with_search(
     reason = "the generated row table is the exact statically linked AOT C ABI boundary"
 )]
 fn strict_native_row_reduce(model: shared::Model, haystack: &[u8]) -> Result<u64, String> {
+    if model == shared::Model::GrepCount {
+        return strict_grep_with_search(haystack, |line| {
+            search_native_rows_with(linked::ROW_ARTIFACT_COUNT, line.len(), 0, |row, result| {
+                // SAFETY: the generated table contains only authenticated
+                // helper-free Span entries. The complete line and aligned
+                // result remain live and disjoint for every row call.
+                let status = unsafe {
+                    linked::search_row(row, line.as_ptr(), line.len(), 0, line.len(), result)
+                };
+                Ok(status)
+            })
+            .map(|matched| matched.is_some())
+        });
+    }
     let reducer = match model {
         shared::Model::Count => SpanScalarReducer::Count,
         shared::Model::SpanSum => SpanScalarReducer::SpanSum,
@@ -1297,6 +1311,7 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
     const CAPTURE_STRATEGY: &str = "native-row-static-uniform-capture-multiplier-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
+    const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
     if linked::STRICT_CAPTURE_BRIDGE {
         if !benchmark.model.is_capture()
             || benchmark.patterns.len() != 1
@@ -1349,6 +1364,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         "native-single-capture-next-participation-v1"
     } else if linked::UNIFORM_CAPTURE_BRIDGE {
         CAPTURE_STRATEGY
+    } else if benchmark.model == shared::Model::GrepCount {
+        GREP_ROW_STRATEGY
     } else {
         ROW_STRATEGY
     };
@@ -1362,6 +1379,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
             "per-line-native-single-capture-next-v1"
         } else if benchmark.model == shared::Model::GrepCaptures {
             GREP_CAPTURE_STRATEGY
+        } else if benchmark.model == shared::Model::GrepCount {
+            GREP_ROW_STRATEGY
         } else {
             "not-applicable"
         };
@@ -2291,6 +2310,28 @@ mod tests {
         })
     }
 
+    fn independent_row_grep(patterns: &[&str], haystack: &[u8]) -> Result<u64, String> {
+        let rows = patterns
+            .iter()
+            .map(|pattern| byte_regex(pattern))
+            .collect::<Vec<_>>();
+        strict_grep_with_search(haystack, |line| {
+            search_native_rows_with(rows.len(), line.len(), 0, |row, result| {
+                let matched = rows[row].find(line);
+                if let Some(matched) = matched {
+                    *result = FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    };
+                    Ok(STATUS_MATCH)
+                } else {
+                    Ok(STATUS_NO_MATCH)
+                }
+            })
+            .map(|matched| matched.is_some())
+        })
+    }
+
     fn independent_uniform_capture_count(
         patterns: &[&str],
         group_counts: &[u64],
@@ -2357,6 +2398,39 @@ mod tests {
                 independent_row_reduce(patterns, haystack, SpanScalarReducer::SpanSum),
                 expected_sum.map_err(str::to_owned),
                 "SpanSum patterns={patterns:?} haystack={haystack:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_native_rows_match_build_many_grep_line_domains() {
+        let cases: &[(&[&str], &[u8])] = &[
+            (&["z+", "ab", "a", "ab", "q+"], b"none\nabx\nzz\nq"),
+            (&["a$", "z+"], b"a\r\nza\nno\n"),
+            (&["", "never"], b"one\n\ntwo"),
+            (&["never", "(?:ab|)"], &[0xc3, 0xa9, b'\n', b'x']),
+        ];
+        for &(patterns, haystack) in cases {
+            let config = Regex::config().utf8_empty(false);
+            let syntax = regex_automata::util::syntax::Config::new()
+                .utf8(false)
+                .unicode(false);
+            let oracle = Regex::builder()
+                .configure(config)
+                .syntax(syntax)
+                .build_many(patterns)
+                .expect("build-many grep oracle");
+            let expected = haystack.lines().try_fold(0_u64, |count, line| {
+                if oracle.is_match(line) {
+                    count.checked_add(1).ok_or("small grep count overflow")
+                } else {
+                    Ok(count)
+                }
+            });
+            assert_eq!(
+                independent_row_grep(patterns, haystack),
+                expected.map_err(str::to_owned),
+                "GrepCount patterns={patterns:?} haystack={haystack:?}"
             );
         }
     }

@@ -37,14 +37,14 @@ the adapter applies an independently sealed per-row participation count. The
 strict route materializes group-zero-inclusive slots natively, then validates
 and reduces those slots in Rust.
 
-`count-captures` and `grep-captures` with 1..4096 source expressions are exact
-adapter *shapes*. This admits them to the sealed qualification population; it
-does not turn either build-time proof into an assumption. A uniform-proof
-semantic decline may use the independently authenticated strict one-pattern
-route. Every parse, allocation, resource, emission, authentication, multi-source,
-or remaining semantic decline fails the all-or-nothing build and must receive a
-`record-failure` receipt. It remains in the 311-job denominator as nonnative
-rather than disappearing as unsupported.
+`grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
+are exact adapter *shapes*. This admits them to the sealed qualification
+population; it does not turn either build-time proof into an assumption. A
+uniform-proof semantic decline may use the independently authenticated strict
+one-pattern route. Every parse, allocation, resource, emission,
+authentication, multi-source, or remaining semantic decline fails the
+all-or-nothing build and must receive a `record-failure` receipt. It remains in
+the 311-job denominator as nonnative rather than disappearing as unsupported.
 
 ## Privacy boundary and static dry run
 

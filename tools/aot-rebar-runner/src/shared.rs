@@ -331,11 +331,15 @@ impl Benchmark {
             if benchmark.patterns.len() > 1
                 && !matches!(
                     benchmark.model,
-                    Model::Count | Model::SpanSum | Model::CountCaptures | Model::GrepCaptures
+                    Model::Count
+                        | Model::SpanSum
+                        | Model::CountCaptures
+                        | Model::GrepCount
+                        | Model::GrepCaptures
                 )
             {
                 return Err(format!(
-                    "current linked general-AOT multi-pattern bridge supports only count and count-spans, got model {:?} with {} patterns",
+                    "current linked general-AOT multi-pattern bridge does not support model {:?} with {} patterns",
                     benchmark.model,
                     benchmark.patterns.len()
                 ));
@@ -716,10 +720,13 @@ pub fn compile_native_row_bridge(
     target: Target,
 ) -> Result<NativeRowBridge, String> {
     if !benchmark.uses_native_row_bridge()
-        || !matches!(benchmark.model, Model::Count | Model::SpanSum)
+        || !matches!(
+            benchmark.model,
+            Model::Count | Model::SpanSum | Model::GrepCount
+        )
     {
         return Err(
-            "native-row bridge compilation requires a multi-pattern count or count-spans job"
+            "native-row bridge compilation requires a multi-pattern count, count-spans, or grep job"
                 .to_owned(),
         );
     }
@@ -1020,13 +1027,15 @@ mod tests {
         assert!(parsed.uses_uniform_capture_bridge());
         assert!(!parsed.uses_native_row_bridge());
 
-        let mut multi_grep = fixture("grep", b"a", b"a");
+        let mut multi_grep = fixture("grep", b"a", b"a\nno");
         let offset = multi_grep
             .windows(b"haystack".len())
             .position(|window| window == b"haystack")
             .expect("haystack field");
         multi_grep.splice(offset..offset, insertion.iter().copied());
-        assert!(Benchmark::parse(&multi_grep).is_err());
+        let parsed = Benchmark::parse(&multi_grep).expect("multi-pattern GrepCount");
+        assert_eq!(parsed.patterns, ["a", "b"]);
+        assert!(parsed.uses_native_row_bridge());
     }
 
     #[test]

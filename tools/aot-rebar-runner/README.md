@@ -9,7 +9,7 @@ The checked-in build script consumes one public Rebar KLV file. Scalar models
 compile and link one single-pattern general-AOT artifact. The fixed
 `regex-redux` model has no external patterns; it compiles and links the exact
 15 public Rebar stage patterns as independent ordinary Span artifacts. The
-additive multi-pattern `count`/`count-spans` route compiles an ordinary
+additive multi-pattern `count`/`count-spans`/`grep` route compiles an ordinary
 Optimizing+Span object for each distinct source row and links the deduplicated
 helper-free native objects. A build with no KLV remains a harmless
 unconfigured workspace binary.
@@ -72,10 +72,11 @@ timing belongs to a separately named compiler-stage benchmark.
   emit an unused `SpanSum` export to provision the shared prepared
   program/handle, but that scalar export is not called by this model.
 - grep iterates every LF/CRLF line domain and invokes the linked artifact's
-  ordinary public search entry exactly once per line, counting the lines whose
-  call reports a match. The prepared whole-haystack `GrepCount` export may be
-  linked to provision the shared program/handle, but is never called by the
-  timed Rebar grep operation.
+  ordinary public search entry for a single pattern, or every authenticated
+  helper-free Span row for multiple patterns, counting the lines for which any
+  entry reports a match. The prepared whole-haystack `GrepCount` export may be
+  linked to provision the single-pattern shared program/handle, but is never
+  called by the timed Rebar grep operation.
 - `count-captures` repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
@@ -215,6 +216,13 @@ implements Rebar's ordered `build_many` single-match stream; it is not an
 all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
 admitted only by its typed zero-pattern model and exact fixed public stage
 table; it is not recognized by benchmark name.
+
+Multi-pattern `grep` uses the same authenticated helper-free `Span` rows but
+restarts their ordered selector for each Rebar byte-line and reduces only
+whether any row matched that line. Its provenance names the distinct
+`per-line-native-independent-span-row-exists-v1` adapter loop. It never scans
+across a line boundary and never substitutes one whole-haystack match stream
+for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
 prepared program/entry and no semantic runtime-helper relocation. Native

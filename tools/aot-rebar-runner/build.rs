@@ -1127,19 +1127,22 @@ fn configured_native_row_source(
     let adapter = match benchmark.model {
         shared::Model::Count => "general-aot-native-row-bridge-count-v1",
         shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
+        shared::Model::GrepCount => "general-aot-native-row-bridge-grep-v1",
         shared::Model::CountCaptures => {
             "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
         }
         shared::Model::GrepCaptures => {
             "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
         }
-        shared::Model::Compile | shared::Model::GrepCount | shared::Model::RegexRedux => {
+        shared::Model::Compile | shared::Model::RegexRedux => {
             unreachable!("parser excludes this multi-pattern model")
         }
     };
     let uniform_capture = uniform_capture_receipts.is_some();
     let aggregate_strategy = if uniform_capture {
         "native-row-static-uniform-capture-multiplier-v1"
+    } else if benchmark.model == shared::Model::GrepCount {
+        "per-line-native-independent-span-row-exists-v1"
     } else {
         "native-independent-span-row-selector-v1"
     };
@@ -1148,10 +1151,10 @@ fn configured_native_row_source(
     } else {
         "not-applicable"
     };
-    let grep_iteration_strategy = if benchmark.model == shared::Model::GrepCaptures {
-        "per-line-native-row-static-uniform-capture-v1"
-    } else {
-        "not-applicable"
+    let grep_iteration_strategy = match benchmark.model {
+        shared::Model::GrepCount => "per-line-native-independent-span-row-exists-v1",
+        shared::Model::GrepCaptures => "per-line-native-row-static-uniform-capture-v1",
+        _ => "not-applicable",
     };
     let first_source_ordinals = bridge
         .artifacts

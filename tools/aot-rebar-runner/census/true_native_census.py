@@ -90,10 +90,8 @@ class CensusError(RuntimeError):
 def has_exact_adapter(model: str, pattern_count: int) -> bool:
     """Return whether the integrated runner has a typed adapter for this shape."""
     return (
-        model in {"count", "count-spans"}
+        model in {"count", "count-spans", "grep"}
         and 1 <= pattern_count <= MAX_NATIVE_ROW_COMPONENTS
-    ) or (
-        model == "grep" and pattern_count == 1
     ) or (
         model in UNIFORM_CAPTURE_ADAPTER_MODELS
         and 1 <= pattern_count <= MAX_NATIVE_ROW_COMPONENTS
@@ -104,7 +102,7 @@ def has_exact_adapter(model: str, pattern_count: int) -> bool:
 
 def exact_adapter_reason(model: str, pattern_count: int) -> str:
     exact_adapter = has_exact_adapter(model, pattern_count)
-    if exact_adapter and model in {"count", "count-spans"} and pattern_count > 1:
+    if exact_adapter and model in {"count", "count-spans", "grep"} and pattern_count > 1:
         return "exact-native-row-composite-adapter"
     if exact_adapter and model in UNIFORM_CAPTURE_ADAPTER_MODELS:
         return "exact-uniform-capture-native-row-composite-adapter"
@@ -1280,9 +1278,26 @@ def validate_v3_provenance(
             "row_total_object_bytes", "source_to_artifact",
         }
         uniform_capture = fields.get("uniform_capture_bridge")
-        if uniform_capture == "false" and fields["model"] in {"count", "count-spans"}:
+        if uniform_capture == "false" and fields["model"] in {
+            "count", "count-spans", "grep",
+        }:
             if fields.get("boundary") != "complete-native-row-bridge":
                 raise CensusError("native-row provenance has the wrong operation boundary")
+            expected_adapter = {
+                "count": "general-aot-native-row-bridge-count-v1",
+                "count-spans": "general-aot-native-row-bridge-count-spans-v1",
+                "grep": "general-aot-native-row-bridge-grep-v1",
+            }[fields["model"]]
+            expected_strategy = (
+                "per-line-native-independent-span-row-exists-v1"
+                if fields["model"] == "grep"
+                else "native-independent-span-row-selector-v1"
+            )
+            if (
+                fields.get("adapter") != expected_adapter
+                or fields.get("aggregate_strategy") != expected_strategy
+            ):
+                raise CensusError("native-row provenance has the wrong typed route")
             native_row_topology(fields, components, 2)
         elif uniform_capture == "true" and fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS:
             if fields.get("boundary") != "native-search-core-static-uniform-capture-resolution":
@@ -1470,7 +1485,7 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         if model == "regex-redux":
             return entries, "linked-fixed-composite-adapter-loop"
         if provenance.get("native_row_bridge") == "true" and model in {
-            "count", "count-spans",
+            "count", "count-spans", "grep",
         }:
             return entries, "linked-native-row-adapter-loop"
         if (
@@ -2406,13 +2421,18 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             expected_adapter = {
                 "count": "general-aot-native-row-bridge-count-v1",
                 "count-spans": "general-aot-native-row-bridge-count-spans-v1",
+                "grep": "general-aot-native-row-bridge-grep-v1",
             }.get(provenance["model"])
+            expected_strategy = (
+                "per-line-native-independent-span-row-exists-v1"
+                if provenance["model"] == "grep"
+                else "native-independent-span-row-selector-v1"
+            )
             if (
                 expected_adapter is None
                 or provenance["adapter"] != expected_adapter
                 or provenance["boundary"] != "complete-native-row-bridge"
-                or provenance["aggregate_strategy"]
-                != "native-independent-span-row-selector-v1"
+                or provenance["aggregate_strategy"] != expected_strategy
                 or provenance["uniform_capture"] is not None
                 or not isinstance(source_count, int)
                 or isinstance(source_count, bool)

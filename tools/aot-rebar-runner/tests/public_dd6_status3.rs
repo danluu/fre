@@ -262,7 +262,10 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
 
     let result = (|| {
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        for (index, model) in [Model::Count, Model::SpanSum].into_iter().enumerate() {
+        for (index, model) in [Model::Count, Model::SpanSum, Model::GrepCount]
+            .into_iter()
+            .enumerate()
+        {
             let klv_bytes = configured_native_rows_klv(model);
             let benchmark = Benchmark::parse(&klv_bytes)?;
             let expected = oracle(&benchmark)?;
@@ -339,7 +342,6 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                 "source_pattern_count=5",
                 "source_to_artifact=0,1,2,1,3",
                 "component_count=4",
-                "aggregate_strategy=native-independent-span-row-selector-v1",
                 "boundary=complete-native-row-bridge",
             ] {
                 if !provenance.contains(expected_field) {
@@ -348,6 +350,17 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                     )
                     .into());
                 }
+            }
+            let expected_strategy = if model == Model::GrepCount {
+                "aggregate_strategy=per-line-native-independent-span-row-exists-v1"
+            } else {
+                "aggregate_strategy=native-independent-span-row-selector-v1"
+            };
+            if !provenance.contains(expected_strategy) {
+                return Err(format!(
+                    "native-row provenance omitted {expected_strategy:?}: {provenance}"
+                )
+                .into());
             }
             for component in 0..4 {
                 for expected_field in [

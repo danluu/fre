@@ -450,7 +450,7 @@ def synthetic_strict_capture_qualification_receipt(
 
 
 class TrueNativeCensusTests(unittest.TestCase):
-    def test_exact_adapter_includes_ordered_many_and_uniform_capture_rows(self) -> None:
+    def test_exact_adapter_includes_ordered_many_grep_and_uniform_capture_rows(self) -> None:
         self.assertTrue(CENSUS.has_exact_adapter("count", 1))
         self.assertTrue(CENSUS.has_exact_adapter("count", 3))
         self.assertFalse(
@@ -458,7 +458,17 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertTrue(CENSUS.has_exact_adapter("count-spans", 2))
         self.assertTrue(CENSUS.has_exact_adapter("grep", 1))
-        self.assertFalse(CENSUS.has_exact_adapter("grep", 2))
+        self.assertTrue(CENSUS.has_exact_adapter("grep", 2))
+        self.assertTrue(
+            CENSUS.has_exact_adapter("grep", CENSUS.MAX_NATIVE_ROW_COMPONENTS)
+        )
+        self.assertFalse(
+            CENSUS.has_exact_adapter("grep", CENSUS.MAX_NATIVE_ROW_COMPONENTS + 1)
+        )
+        self.assertEqual(
+            CENSUS.exact_adapter_reason("grep", 2),
+            "exact-native-row-composite-adapter",
+        )
         for model in ("count-captures", "grep-captures"):
             self.assertFalse(CENSUS.has_exact_adapter(model, 0))
             self.assertTrue(CENSUS.has_exact_adapter(model, 1))
@@ -653,18 +663,62 @@ class TrueNativeCensusTests(unittest.TestCase):
             fields[f"component_{index}_object_sha256"] = f"{index + 3:064x}"
         encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
         parsed = CENSUS.parse_provenance(encoded)
+        self.assertEqual(parsed, fields)
         receipt = CENSUS.provenance_receipt(parsed)
         CENSUS.validate_provenance_record(receipt, "synthetic native row")
         self.assertEqual(receipt["composite_kind"], "native-row-bridge-v1")
         self.assertIsNone(receipt["uniform_capture"])
         self.assertEqual(receipt["source_pattern_count"], 3)
         self.assertEqual(receipt["source_to_artifact"], [0, 1, 0])
+        self.assertIsNone(receipt["span_iteration_strategy"])
+        self.assertIsNone(receipt["grep_iteration_strategy"])
         self.assertEqual(
             [component["source_ordinal"] for component in receipt["components"]],
             [0, 1],
         )
         with self.assertRaisesRegex(CENSUS.CensusError, "field closure differs"):
             CENSUS.parse_provenance(encoded + b" unsealed_field=1")
+
+        grep_fields = dict(fields)
+        grep_fields.update({
+            "adapter": "general-aot-native-row-bridge-grep-v1",
+            "model": "grep",
+            "aggregate_strategy": "per-line-native-independent-span-row-exists-v1",
+        })
+        grep_encoded = " ".join(
+            f"{key}={value}" for key, value in grep_fields.items()
+        ).encode()
+        grep_receipt = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(grep_encoded)
+        )
+        CENSUS.validate_provenance_record(
+            grep_receipt, "synthetic multi-pattern grep row"
+        )
+        self.assertEqual(
+            grep_receipt["aggregate_strategy"],
+            "per-line-native-independent-span-row-exists-v1",
+        )
+        self.assertIsNone(grep_receipt["span_iteration_strategy"])
+        self.assertIsNone(grep_receipt["grep_iteration_strategy"])
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(grep_receipt),
+            (
+                [
+                    f"fre_aot_regex_search_v1_{index + 11:064x}"
+                    for index in range(2)
+                ],
+                "linked-native-row-adapter-loop",
+            ),
+        )
+
+        poisoned_grep = dict(grep_fields)
+        poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"
+        with self.assertRaisesRegex(CENSUS.CensusError, "wrong typed route"):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in poisoned_grep.items()
+                ).encode()
+            )
 
         missing_false = dict(fields)
         missing_false.pop("uniform_capture_bridge")
