@@ -49,11 +49,11 @@ pub use k0::{
     K0CompilerPrefill, K0CompilerPrefillAttempt, K0CompilerPrefillLimits, K0CompilerPrefillUsage,
     K0DynamicLoopPlan, K0DynamicLoopStartAction, K0DynamicRootProjection,
     K0FullyPrefilledResumeCacheReceipt, K0FullyPrefilledResumeMapProjection,
-    K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0PositiveEndLimits,
-    K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndStartOutcome,
-    K0PositiveEndStartVerification, K0PositiveEndVerification, K0ResumeSet, K0SearchSession,
-    K0SpanSourceCursor, K0StartFilterPreparationReceipt, K0Workspace, WorkspaceLayout,
-    WorkspaceLimits, WorkspaceShape,
+    K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0OrdinaryExecutor,
+    K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndReceipt,
+    K0PositiveEndStartOutcome, K0PositiveEndStartVerification, K0PositiveEndVerification,
+    K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0StartFilterPreparationReceipt,
+    K0Workspace, WorkspaceLayout, WorkspaceLimits, WorkspaceShape,
 };
 pub use mandatory_cut::{
     DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ATTEMPTS, DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ITEMS,

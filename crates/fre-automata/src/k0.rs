@@ -7680,6 +7680,30 @@ pub struct K0SearchSession<'a> {
     pooled_return: Option<PooledWorkspaceReturn<'a>>,
 }
 
+/// Source-free K0 owner for ordinary unlimited value searches.
+///
+/// This is the binding seam for the non-AOT ordinary executor. Construction
+/// selects one adaptive workspace, authenticates it against one immutable
+/// automaton, and settles the immutable start-filter policy before any source
+/// is observed. Calls expose only values: they accept neither finite limits
+/// nor accounting destinations.
+///
+/// The first implementation deliberately shares the canonical K0 session
+/// substrate. In particular, first acceptance uses the endpoint-only contract,
+/// while selected Span uses the existing forward selector and performs reverse
+/// start recovery only after a positive selected endpoint needs it. A later
+/// unmetered loop specialization can therefore replace this delegation without
+/// changing the owner or facade boundary.
+///
+/// No source borrow is retained here. Repeated Span iteration instead passes a
+/// caller-owned [`K0SpanSourceCursor`], whose lifetime authenticates any
+/// source-derived scanner overlay.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct K0OrdinaryExecutor<'a> {
+    session: K0SearchSession<'a>,
+}
+
 /// Private limits for authenticating one positive match endpoint.
 ///
 /// These limits bound only the verifier invocation. They neither replace nor
@@ -10873,6 +10897,129 @@ impl K0Workspace {
     fn pop_stack(&mut self) -> Option<Thread> {
         self.stack_len = self.stack_len.checked_sub(1)?;
         self.stack.get(self.stack_len).copied()
+    }
+}
+
+impl<'a> K0OrdinaryExecutor<'a> {
+    /// Bind one adaptive ordinary executor to `automaton`.
+    ///
+    /// `endpoint_eligible` and `bidirectional` are source-independent planner
+    /// facts with the same meaning as on [`K0SearchSession::new_adaptive_selected`].
+    /// A false optional capability never changes matching semantics: the
+    /// shared canonical substrate falls back to ordinary Pike execution.
+    /// Construction uses the unlimited ordinary envelope and resolves the
+    /// immutable start-filter policy before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if the selected source-free workspace cannot be
+    /// represented or allocated, or if immutable preparation fails.
+    #[doc(hidden)]
+    pub fn new(
+        automaton: &'a Automaton,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Self, SearchError> {
+        let mut session = K0SearchSession::new_adaptive_selected(
+            automaton,
+            WorkspaceLimits::unlimited(),
+            endpoint_eligible,
+            bidirectional,
+        )?;
+        let _preparation = session.prepare_start_filter_with_setup_work_limit(u64::MAX)?;
+        Ok(Self { session })
+    }
+
+    /// Return the first accepting boundary in the suffix beginning at `start`.
+    ///
+    /// This endpoint engine does not select a leftmost-first Span and never
+    /// requests reverse start recovery. Assertions still inspect the complete
+    /// original haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or execution
+    /// encounters an allocation, arithmetic, or invariant failure.
+    #[doc(hidden)]
+    #[inline]
+    pub fn first_acceptance_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        self.session.search_earliest_end_value_untyped(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            SearchLimits::unlimited(),
+        )
+    }
+
+    /// Return whether the first-acceptance engine finds a match at or after
+    /// `start`.
+    ///
+    /// This is only a boolean projection of [`Self::first_acceptance_at`]; it
+    /// does not add a third search engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::first_acceptance_at`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
+        self.first_acceptance_at(haystack, start)
+            .map(|endpoint| endpoint.is_some())
+    }
+
+    /// Return the selected leftmost-first Span in the suffix beginning at
+    /// `start`.
+    ///
+    /// The temporary source cursor makes every source-derived scanner mask
+    /// call-local. Iterators should use [`Self::selected_span_at_source_cursor`]
+    /// to retain those masks for one exact source borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or execution
+    /// encounters an allocation, arithmetic, or invariant failure.
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_span_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        let mut source = K0SpanSourceCursor::new(haystack);
+        self.selected_span_at_source_cursor(&mut source, start)
+    }
+
+    /// Return one selected Span while retaining invocation-local scanner state
+    /// in a caller-owned cursor bound to the exact source borrow.
+    ///
+    /// The executor itself remains source-free. A facade may repeatedly call
+    /// this method for monotonically advancing iterator suffixes, then discard
+    /// the cursor before reusing the executor with another source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a cursor/session
+    /// binding, allocation, arithmetic, or invariant failure.
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_span_at_source_cursor(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        self.session
+            .search_span_value_at_source_untyped(source, start, SearchLimits::unlimited())
+    }
+
+    /// Whether this executor remains bound to the exact immutable automaton
+    /// instance supplied at construction.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_bound_to(&self, automaton: &Automaton) -> bool {
+        self.session.is_bound_to(automaton)
     }
 }
 
@@ -38540,10 +38687,11 @@ mod tests {
             START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0CompilerPrefill,
-        K0CompilerPrefillLimits, K0OrderedResumeCompletion, K0PositiveEndLimits,
-        K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet, K0SearchSession,
-        K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
-        SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+        K0CompilerPrefillLimits, K0OrderedResumeCompletion, K0OrdinaryExecutor,
+        K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet,
+        K0SearchSession, K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan,
+        ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
+        WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -81896,6 +82044,198 @@ mod tests {
             K0ResumeSet::new(&plan, 1, 2, [(&duplicate[..], false)]),
             Err(SearchError::InvalidResumeState { .. })
         ));
+    }
+
+    #[test]
+    fn ordinary_executor_keeps_first_acceptance_distinct_from_selected_span() {
+        let plan = ordered_a_or_ab(true);
+        assert!(!plan.start_filter_proof.is_initialized());
+        let mut ordinary = K0OrdinaryExecutor::new(&plan, true, true).unwrap();
+        assert!(ordinary.is_bound_to(&plan));
+        assert!(
+            plan.start_filter_proof.is_initialized()
+                || plan.start_filter_proof.is_permanently_ordinary()
+        );
+
+        // The low-priority one-byte branch accepts first, while the
+        // high-priority two-byte branch selects the final Span.
+        let haystack = b"zab!";
+        assert_eq!(ordinary.first_acceptance_at(haystack, 0), Ok(Some(2)));
+        assert_eq!(ordinary.is_match_at(haystack, 0), Ok(true));
+        assert_eq!(
+            ordinary.selected_span_at(haystack, 0),
+            Ok(Some(MatchSpan::new(1, 3)))
+        );
+        assert_eq!(ordinary.first_acceptance_at(haystack, 2), Ok(None));
+        assert_eq!(ordinary.selected_span_at(haystack, 2), Ok(None));
+
+        assert!(matches!(
+            ordinary.first_acceptance_at(haystack, haystack.len() + 1),
+            Err(SearchError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 4,
+            })
+        ));
+        assert!(matches!(
+            ordinary.selected_span_at(haystack, haystack.len() + 1),
+            Err(SearchError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn ordinary_executor_matches_checked_k0_across_cold_short_context_and_nullable_calls() {
+        fn check(
+            plan: &Automaton,
+            endpoint_eligible: bool,
+            bidirectional: bool,
+            haystacks: &[&[u8]],
+        ) {
+            let mut checked = K0SearchSession::new_adaptive_selected(
+                plan,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            let mut ordinary =
+                K0OrdinaryExecutor::new(plan, endpoint_eligible, bidirectional).unwrap();
+            for &haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    let window = SearchWindow::new(start, haystack.len());
+                    let expected_endpoint = checked
+                        .search_window::<EarliestEnd>(
+                            haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    let expected_span = checked
+                        .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        ordinary.first_acceptance_at(haystack, start).unwrap(),
+                        expected_endpoint,
+                        "first acceptance differed for {haystack:?} at {start}",
+                    );
+                    assert_eq!(
+                        ordinary.selected_span_at(haystack, start).unwrap(),
+                        expected_span,
+                        "selected Span differed for {haystack:?} at {start}",
+                    );
+                }
+            }
+        }
+
+        check(
+            &ordered_a_or_ab(true),
+            true,
+            true,
+            &[b"", b"a", b"ab", b"zab", b"aba"],
+        );
+        check(
+            &asserted_ordered_a_or_ab(true),
+            true,
+            true,
+            &[b"", b"a", b"ab", b"x\nab", b"ab\nab"],
+        );
+        check(
+            &empty_or_ab(false),
+            true,
+            false,
+            &[b"", b"a", b"ab", b"zz", b"zab"],
+        );
+        check(
+            &absolute_nullable_or_colon(),
+            false,
+            false,
+            &[b"", b":", b"x:", b"::", b"x"],
+        );
+        check(
+            &greedy_a_plus_or_a(),
+            true,
+            true,
+            &[b"", b"a", b"aa", b"zaaa", b"aaaz"],
+        );
+    }
+
+    #[test]
+    fn ordinary_executor_retains_only_source_free_state() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let mut ordinary = K0OrdinaryExecutor::new(&plan, true, true).unwrap();
+
+        let source = b"zzabxxab";
+        let mut cursor = K0SpanSourceCursor::new(source);
+        assert_eq!(
+            ordinary.selected_span_at_source_cursor(&mut cursor, 0),
+            Ok(Some(MatchSpan::new(2, 4)))
+        );
+        assert_eq!(
+            ordinary.selected_span_at_source_cursor(&mut cursor, 4),
+            Ok(Some(MatchSpan::new(6, 8)))
+        );
+        drop(cursor);
+
+        let mut reused = b"xxabxx".to_vec();
+        let address = reused.as_ptr();
+        assert_eq!(
+            ordinary.selected_span_at(&reused, 0),
+            Ok(Some(MatchSpan::new(2, 4)))
+        );
+        reused.copy_from_slice(b"xxxxxx");
+        assert_eq!(reused.as_ptr(), address);
+        assert_eq!(ordinary.first_acceptance_at(&reused, 0), Ok(None));
+        assert_eq!(ordinary.selected_span_at(&reused, 0), Ok(None));
+        reused.copy_from_slice(b"abxxxx");
+        assert_eq!(reused.as_ptr(), address);
+        assert_eq!(ordinary.first_acceptance_at(&reused, 0), Ok(Some(2)));
+        assert_eq!(
+            ordinary.selected_span_at(&reused, 0),
+            Ok(Some(MatchSpan::new(0, 2)))
+        );
+    }
+
+    #[test]
+    fn ordinary_executors_share_one_immutable_plan_across_workers() {
+        let plan = ordered_a_or_ab(true);
+        assert!(!plan.start_filter_proof.is_initialized());
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let mut ordinary = K0OrdinaryExecutor::new(&plan, true, true).unwrap();
+                (
+                    ordinary.first_acceptance_at(b"zzab", 0),
+                    ordinary.selected_span_at(b"zzab", 0),
+                )
+            });
+            let second = scope.spawn(|| {
+                let mut ordinary = K0OrdinaryExecutor::new(&plan, true, true).unwrap();
+                (
+                    ordinary.first_acceptance_at(b"aba", 1),
+                    ordinary.selected_span_at(b"aba", 1),
+                )
+            });
+
+            assert_eq!(
+                first.join().unwrap(),
+                (Ok(Some(3)), Ok(Some(MatchSpan::new(2, 4))))
+            );
+            assert_eq!(
+                second.join().unwrap(),
+                (Ok(Some(3)), Ok(Some(MatchSpan::new(2, 3))))
+            );
+        });
+
+        assert!(
+            plan.start_filter_proof.is_initialized()
+                || plan.start_filter_proof.is_permanently_ordinary()
+        );
     }
 
     #[test]
