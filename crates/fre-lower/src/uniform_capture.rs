@@ -311,8 +311,7 @@ pub fn lower_raw_general_with_uniform_capture_participation(
     lower_limits: LowerLimits,
     proof_limits: UniformCaptureParticipationLimits,
 ) -> Result<UniformCaptureLoweredRaw, UniformCaptureLoweringError> {
-    let participation = Analyzer::new(proof_limits)
-        .run(&parsed.hir)
+    let participation = analyze_uniform_capture_participation(parsed, proof_limits)
         .map_err(UniformCaptureLoweringError::Participation)?;
     let lowered = lower_raw_general(parsed, operation, lower_limits)
         .map_err(UniformCaptureLoweringError::Lower)?;
@@ -329,6 +328,26 @@ pub fn lower_raw_general_with_uniform_capture_participation(
         lowered,
         participation,
     })
+}
+
+/// Prove or conservatively decline uniform capture participation without
+/// constructing a selector backend.
+///
+/// This is the prospective entry point for a capture-backend portfolio. A
+/// caller may choose another independently authenticated backend only when
+/// this returns [`UniformCaptureParticipationDisposition::Declined`]. Every
+/// resource, allocation, arithmetic, and invariant error remains terminal and
+/// must not be converted into fallback permission.
+///
+/// Keeping this phase separate prevents a semantic theorem decline from being
+/// hidden by a later, fallible selector lowering or object construction. The
+/// paired [`lower_raw_general_with_uniform_capture_participation`] entry point
+/// uses this exact analysis before constructing its unchanged selector.
+pub fn analyze_uniform_capture_participation(
+    parsed: &RustParsed,
+    limits: UniformCaptureParticipationLimits,
+) -> Result<UniformCaptureParticipationDisposition, UniformCaptureParticipationError> {
+    Analyzer::new(limits).run(&parsed.hir)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

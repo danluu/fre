@@ -55,7 +55,7 @@ pub use uniform_capture::{
     UniformCaptureParticipationDisposition, UniformCaptureParticipationError,
     UniformCaptureParticipationIdentity, UniformCaptureParticipationLimits,
     UniformCaptureParticipationReceipt, UniformCaptureParticipationResource,
-    lower_raw_general_with_uniform_capture_participation,
+    analyze_uniform_capture_participation, lower_raw_general_with_uniform_capture_participation,
 };
 
 /// Whether lowering may erase capture annotations.

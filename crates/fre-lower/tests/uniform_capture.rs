@@ -2,7 +2,8 @@ use fre_lower::{
     LowerError, LowerLimits, OperationSemantics, UniformCaptureLoweringError,
     UniformCaptureParticipationDecline, UniformCaptureParticipationDisposition,
     UniformCaptureParticipationError, UniformCaptureParticipationLimits,
-    UniformCaptureParticipationReceipt, UniformCaptureParticipationResource, lower_raw_general,
+    UniformCaptureParticipationReceipt, UniformCaptureParticipationResource,
+    analyze_uniform_capture_participation, lower_raw_general,
     lower_raw_general_with_uniform_capture_participation,
 };
 use fre_syntax::{
@@ -316,5 +317,75 @@ fn proof_limits_are_terminal_and_distinct_from_semantic_declines_and_lowering_er
     assert!(matches!(
         lower_error,
         UniformCaptureLoweringError::Lower(LowerError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn prospective_decline_precedes_fallible_selector_construction() {
+    let fixture = parsed(r"(a)?b");
+    assert_eq!(
+        analyze_uniform_capture_participation(
+            &fixture,
+            UniformCaptureParticipationLimits::default(),
+        )
+        .expect("semantic preflight is not terminal"),
+        UniformCaptureParticipationDisposition::Declined(
+            UniformCaptureParticipationDecline::NonUniform,
+        ),
+    );
+
+    let error = lower_raw_general_with_uniform_capture_participation(
+        &fixture,
+        OperationSemantics::CaptureFree,
+        LowerLimits {
+            max_work: 0,
+            ..LowerLimits::default()
+        },
+        UniformCaptureParticipationLimits::default(),
+    )
+    .expect_err("paired construction still owns its selector failure");
+    assert!(matches!(
+        error,
+        UniformCaptureLoweringError::Lower(LowerError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn prospective_proof_matches_the_paired_transaction_exactly() {
+    let fixture = parsed(r"((a))|(b(c))");
+    let prospective = analyze_uniform_capture_participation(
+        &fixture,
+        UniformCaptureParticipationLimits::default(),
+    )
+    .expect("prospective proof");
+    let paired = transaction(&fixture, UniformCaptureParticipationLimits::default())
+        .expect("paired construction");
+    assert_eq!(prospective, paired.participation());
+}
+
+#[test]
+fn prospective_resource_error_is_not_fallback_permission() {
+    let fixture = parsed(r"((a))|(b(c))");
+    let proof = analyze_uniform_capture_participation(
+        &fixture,
+        UniformCaptureParticipationLimits::default(),
+    )
+    .expect("baseline prospective")
+    .proof()
+    .expect("positive fixture");
+    let limit = proof.work().checked_sub(1).expect("positive work");
+    assert!(matches!(
+        analyze_uniform_capture_participation(
+            &fixture,
+            UniformCaptureParticipationLimits {
+                max_work: limit,
+                max_stack_items: proof.peak_stack_items(),
+            },
+        ),
+        Err(UniformCaptureParticipationError::ResourceLimit {
+            resource: UniformCaptureParticipationResource::Work,
+            limit: actual,
+            ..
+        }) if actual == limit
     ));
 }
