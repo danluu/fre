@@ -5421,6 +5421,37 @@ struct PortableParsedBuildContext {
     rust: fre_syntax::RustParsed,
 }
 
+/// Result of consuming ripgrep's ordinary literal HIR construction candidate.
+///
+/// A refusal returns the exact owned HIR so the adapter can preserve its
+/// canonical source fallback without cloning the recursive HIR allocation
+/// graph on the admitted path.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum RipgrepStandardLiteralHirBuild {
+    /// FRE independently authenticated and built the literal HIR.
+    Built(PortableRegex),
+    /// FRE declined the seam and returned the unchanged HIR to its owner.
+    Refused(Hir),
+}
+
+struct RipgrepStandardLiteralContext {
+    source: Box<str>,
+    admission: AdmissionStatus,
+    syntax: ParseSummary,
+}
+
+impl RipgrepStandardLiteralContext {
+    fn with_hir(self, hir: Hir) -> PortableParsedBuildContext {
+        PortableParsedBuildContext {
+            source: self.source,
+            admission: self.admission,
+            syntax: self.syntax,
+            rust: fre_syntax::RustParsed { hir },
+        }
+    }
+}
+
 impl PortableParsedBuildContext {
     fn authenticate(
         builder: &PortableBuilder,
@@ -5511,7 +5542,7 @@ fn ripgrep_standard_literal_context(
     hir: &Hir,
     limits: BuildLimits,
     canonical_source_limit: usize,
-) -> Option<PortableParsedBuildContext> {
+) -> Option<RipgrepStandardLiteralContext> {
     let (branches, hir_nodes, max_depth, traversal_stack) = match hir.kind() {
         HirKind::Literal(_) => (None, 1_u64, 0_u64, 1_u64),
         HirKind::Alternation(branches) if branches.len() >= 2 => {
@@ -5656,7 +5687,7 @@ fn ripgrep_standard_literal_context(
     }
     debug_assert_eq!(source.len(), source_bytes_usize);
 
-    Some(PortableParsedBuildContext {
+    Some(RipgrepStandardLiteralContext {
         source: source.into_boxed_str(),
         admission: match limits.admission {
             AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
@@ -5673,7 +5704,6 @@ fn ripgrep_standard_literal_context(
             largest_finite_repeat: None,
             guarantees_valid_utf8_nonempty: true,
         },
-        rust: fre_syntax::RustParsed { hir: hir.clone() },
     })
 }
 
@@ -6162,12 +6192,7 @@ impl PortableBuilder {
         hir: &Hir,
         canonical_source_limit: usize,
     ) -> Result<Option<PortableRegex>, BuildError> {
-        if !self.pattern.is_empty()
-            || self.selection != PlanSelection::Auto
-            || self.utf8_start_guarded
-            || !self.byte_native_plans_allowed
-            || !is_ripgrep_standard_literal_profile(&self.profile)
-        {
+        if !self.accepts_ripgrep_standard_literal_hir() {
             return Ok(None);
         }
         let Some(context) = ripgrep_standard_literal_context(
@@ -6177,7 +6202,43 @@ impl PortableBuilder {
         ) else {
             return Ok(None);
         };
-        self.build_from_parsed_context(context).map(Some)
+        self.build_from_parsed_context(context.with_hir(hir.clone()))
+            .map(Some)
+    }
+
+    /// Consume ripgrep's exact ordinary case-sensitive literal HIR seam.
+    ///
+    /// This applies the same independent authentication and construction as
+    /// [`Self::build_ripgrep_standard_literal_hir`], but transfers the HIR
+    /// allocation graph on success. A refusal returns that exact graph for the
+    /// caller's canonical fallback. Finite/accounted and session APIs are not
+    /// involved in this construction-only integration hook.
+    #[doc(hidden)]
+    pub fn build_ripgrep_standard_literal_hir_owned(
+        self,
+        hir: Hir,
+        canonical_source_limit: usize,
+    ) -> Result<RipgrepStandardLiteralHirBuild, BuildError> {
+        if !self.accepts_ripgrep_standard_literal_hir() {
+            return Ok(RipgrepStandardLiteralHirBuild::Refused(hir));
+        }
+        let Some(context) = ripgrep_standard_literal_context(
+            &hir,
+            self.limits,
+            canonical_source_limit,
+        ) else {
+            return Ok(RipgrepStandardLiteralHirBuild::Refused(hir));
+        };
+        self.build_from_parsed_context(context.with_hir(hir))
+            .map(RipgrepStandardLiteralHirBuild::Built)
+    }
+
+    fn accepts_ripgrep_standard_literal_hir(&self) -> bool {
+        self.pattern.is_empty()
+            && self.selection == PlanSelection::Auto
+            && !self.utf8_start_guarded
+            && self.byte_native_plans_allowed
+            && is_ripgrep_standard_literal_profile(&self.profile)
     }
 
     /// Plan from one already-closed Rust-bytes parse transaction.
