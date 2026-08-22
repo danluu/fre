@@ -22,6 +22,7 @@ regex-automata = "=0.4.15"
 
 [build-dependencies]
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
+fre-lower = { path = "../../crates/fre-lower" }
 fre-syntax = { path = "../../crates/fre-syntax" }
 
 [lints.rust]

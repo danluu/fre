@@ -903,7 +903,19 @@ pub fn compile_with_prepared_aggregate_exports(
     )
 }
 
-pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+/// Compile with prepared reducers and an explicit resource envelope for the
+/// separately selected slow AOT completion pass.
+///
+/// This is the prepared-export counterpart to [`compile_with_slow_aot_limits`].
+/// It leaves the semantic-program limits in [`CompileRequest`] independent of
+/// the later optional native completion work.
+///
+/// # Errors
+///
+/// Returns the same typed failures as
+/// [`compile_with_prepared_aggregate_exports`]. Exhausting a slow-AOT numeric
+/// resource declines that optional candidate and preserves bounded fallbacks.
+pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     request: CompileRequest,
     exports: PreparedAggregateExports,
     slow_aot_limits: SlowAotLimits,

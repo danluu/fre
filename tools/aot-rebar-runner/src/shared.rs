@@ -1,13 +1,15 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use fre_aot_regex::{
-    Architecture, CompileMode, CompileRequest, CompiledRegex, FeatureSet, OperatingSystem,
-    OutputContract, PreparedAggregateExports, RebarSingleCaptureAotArtifactV1,
-    RebarSingleCaptureAotRequestV1, SymbolBinding, SymbolKind, Target,
-    UniformCaptureCompileDisposition, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
-    compile, compile_rebar_single_capture_aot_v1, compile_uniform_capture_selector,
-    compile_with_prepared_aggregate_exports,
+    Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex,
+    DeterminizeLimits, FeatureSet, OperatingSystem, OutputContract, PreparedAggregateExports,
+    RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1, SlowAotLimits, SymbolBinding,
+    SymbolKind, Target, UniformCaptureCompileDisposition, UniformCaptureCompileError,
+    UniformCaptureCompileReceipt, UniformCaptureCompileRequest, compile,
+    compile_rebar_single_capture_aot_v1, compile_uniform_capture_selector,
+    compile_with_prepared_aggregate_exports_and_slow_aot_limits, compile_with_slow_aot_limits,
 };
+use fre_lower::{LowerError, LowerResource};
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
@@ -23,6 +25,76 @@ pub const MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES: usize = 256 * 1_048_576;
 /// adapter. This keeps its one caller-owned result allocation inside the same
 /// deliberately small cardinality envelope as the native-row bridge.
 pub const MAX_STRICT_CAPTURE_GROUPS: usize = 4_096;
+/// Public Rebar adapter-local lowering work ceiling.
+///
+/// This is deliberately additive to the general compiler defaults. The public
+/// suite contains otherwise ordinary selector graphs just beyond the
+/// default construction envelope; raising a limit cannot change the emitted
+/// graph for requests already below it.
+pub const REBAR_MAX_LOWER_WORK: u64 = 32_000_000;
+/// State ceiling for the optional DFA after a default lowering-work decline.
+///
+/// Zero is intentional: on the recovered public jobs, even constructing the
+/// first subset closure can dominate build time before a positive state cap is
+/// observed. The complete ordered-NFA program is already the bounded universal
+/// incumbent, so the adapter skips this optional optimizer on its retry.
+pub const REBAR_RECOVERY_MAX_DFA_STATES: usize = 0;
+/// Transition ceiling paired with [`REBAR_RECOVERY_MAX_DFA_STATES`].
+pub const REBAR_RECOVERY_MAX_DFA_TRANSITIONS: usize = 0;
+/// Work ceiling paired with [`REBAR_RECOVERY_MAX_DFA_STATES`].
+pub const REBAR_RECOVERY_MAX_DFA_WORK: u64 = 0;
+
+/// Recovery envelope used only after the public, job-specialized Rebar
+/// adapter observes the default lowering-work ceiling. Runtime semantics and
+/// all stable compiler defaults remain unchanged.
+#[must_use]
+pub fn rebar_recovery_compile_limits() -> CompileLimitsV1 {
+    let mut limits = CompileLimitsV1::default();
+    limits.lower.max_work = REBAR_MAX_LOWER_WORK;
+    limits.determinize = DeterminizeLimits {
+        max_states: REBAR_RECOVERY_MAX_DFA_STATES,
+        max_transitions: REBAR_RECOVERY_MAX_DFA_TRANSITIONS,
+        max_work: REBAR_RECOVERY_MAX_DFA_WORK,
+    };
+    limits
+}
+
+/// Slow-AOT envelope paired with [`rebar_recovery_compile_limits`].
+///
+/// The first/default transaction has already exhausted only the semantic
+/// lowering-work budget. The retry retains the ordinary native-data and
+/// allocation ceilings but skips a second, optional determinization pass.
+#[must_use]
+pub fn rebar_recovery_slow_aot_limits() -> SlowAotLimits {
+    SlowAotLimits {
+        determinize: DeterminizeLimits {
+            max_states: REBAR_RECOVERY_MAX_DFA_STATES,
+            max_transitions: REBAR_RECOVERY_MAX_DFA_TRANSITIONS,
+            max_work: REBAR_RECOVERY_MAX_DFA_WORK,
+        },
+        ..SlowAotLimits::default()
+    }
+}
+
+fn is_lower_work_limit(error: &CompileError) -> bool {
+    matches!(
+        error,
+        CompileError::Lower(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            ..
+        })
+    )
+}
+
+fn is_uniform_lower_work_limit(error: &UniformCaptureCompileError) -> bool {
+    matches!(
+        error,
+        UniformCaptureCompileError::Lower(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            ..
+        })
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Model {
@@ -429,12 +501,26 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
     let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = benchmark.unicode;
     profile.options.case_insensitive = benchmark.case_insensitive;
-    let request = CompileRequest::new(benchmark.pattern(), target)
-        .profile(profile)
-        .output(benchmark.model.output())
-        .mode(CompileMode::Optimizing);
-    compile_with_prepared_aggregate_exports(request, benchmark.model.exports())
-        .map_err(|error| format!("general AOT compilation failed: {error}"))
+    let compile_with_limits = |limits, slow_aot_limits| {
+        compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(benchmark.pattern(), target)
+                .profile(profile.clone())
+                .output(benchmark.model.output())
+                .mode(CompileMode::Optimizing)
+                .limits(limits),
+            benchmark.model.exports(),
+            slow_aot_limits,
+        )
+    };
+    match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
+        Ok(compiled) => Ok(compiled),
+        Err(error) if is_lower_work_limit(&error) => compile_with_limits(
+            rebar_recovery_compile_limits(),
+            rebar_recovery_slow_aot_limits(),
+        )
+        .map_err(|error| format!("general AOT recovery compilation failed: {error}")),
+        Err(error) => Err(format!("general AOT compilation failed: {error}")),
+    }
 }
 
 /// One distinct helper-free native `Span` object in source-priority order.
@@ -604,15 +690,37 @@ pub fn try_compile_uniform_capture_bridge(
                 "uniform-capture source ordinal {source_ordinal} did not produce Rust HIR"
             ));
         };
-        let compiled = compile_uniform_capture_selector(
-            &parsed,
-            UniformCaptureCompileRequest::new(pattern.len(), target).profile(profile.clone()),
-        )
-        .map_err(|error| {
-            format!(
-                "uniform-capture selector compilation failed at source ordinal {source_ordinal}: {error}"
+        let compile_with_limits = |limits, slow_aot_limits| {
+            compile_uniform_capture_selector(
+                &parsed,
+                UniformCaptureCompileRequest::new(pattern.len(), target)
+                    .profile(profile.clone())
+                    .selector_limits(limits)
+                    .selector_slow_aot_limits(slow_aot_limits),
             )
-        })?;
+        };
+        let compiled = match compile_with_limits(
+            CompileLimitsV1::default(),
+            SlowAotLimits::default(),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) if is_uniform_lower_work_limit(&error) => {
+                compile_with_limits(
+                    rebar_recovery_compile_limits(),
+                    rebar_recovery_slow_aot_limits(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "uniform-capture selector recovery compilation failed at source ordinal {source_ordinal}: {error}"
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "uniform-capture selector compilation failed at source ordinal {source_ordinal}: {error}"
+                ));
+            }
+        };
         compiled.authenticate().map_err(|error| {
             format!(
                 "uniform-capture selector authentication failed at source ordinal {source_ordinal}: {error}"
@@ -757,15 +865,38 @@ pub fn compile_native_row_bridge(
             continue;
         }
 
-        let request = CompileRequest::new(pattern, target)
-            .profile(profile.clone())
-            .output(OutputContract::Span)
-            .mode(CompileMode::Optimizing);
-        let compiled = compile(request).map_err(|error| {
-            format!(
-                "general AOT native-row compilation failed at source ordinal {source_ordinal}: {error}"
+        let compile_with_limits = |limits, slow_aot_limits| {
+            compile_with_slow_aot_limits(
+                CompileRequest::new(pattern, target)
+                    .profile(profile.clone())
+                    .output(OutputContract::Span)
+                    .mode(CompileMode::Optimizing)
+                    .limits(limits),
+                slow_aot_limits,
             )
-        })?;
+        };
+        let compiled = match compile_with_limits(
+            CompileLimitsV1::default(),
+            SlowAotLimits::default(),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) if is_lower_work_limit(&error) => {
+                compile_with_limits(
+                    rebar_recovery_compile_limits(),
+                    rebar_recovery_slow_aot_limits(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "general AOT native-row recovery compilation failed at source ordinal {source_ordinal}: {error}"
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "general AOT native-row compilation failed at source ordinal {source_ordinal}: {error}"
+                ));
+            }
+        };
         authenticate_native_row(&compiled, source_ordinal)?;
 
         let entry = compiled.module().entry_symbol().to_owned();
@@ -976,6 +1107,152 @@ mod tests {
         let end = offset.checked_add(field.len()).expect("pattern field end");
         output.drain(offset..end);
         output
+    }
+
+    #[test]
+    fn rebar_recovery_envelope_changes_only_work_and_determinization() {
+        let ordinary = CompileLimitsV1::default();
+        let rebar = rebar_recovery_compile_limits();
+        let ordinary_slow = SlowAotLimits::default();
+        let rebar_slow = rebar_recovery_slow_aot_limits();
+        assert_eq!(rebar.lower.max_work, REBAR_MAX_LOWER_WORK);
+        assert_eq!(rebar.lower.max_stack_items, ordinary.lower.max_stack_items);
+        assert_eq!(rebar.lower.automata, ordinary.lower.automata);
+        assert_eq!(
+            rebar.determinize,
+            DeterminizeLimits {
+                max_states: REBAR_RECOVERY_MAX_DFA_STATES,
+                max_transitions: REBAR_RECOVERY_MAX_DFA_TRANSITIONS,
+                max_work: REBAR_RECOVERY_MAX_DFA_WORK,
+            }
+        );
+        assert_eq!(rebar.max_program_bytes, ordinary.max_program_bytes);
+        assert_eq!(rebar.max_object_bytes, ordinary.max_object_bytes);
+        assert!(rebar.lower.max_work > ordinary.lower.max_work);
+        assert!(rebar.determinize.max_states < ordinary.determinize.max_states);
+        assert_eq!(rebar_slow.determinize, rebar.determinize);
+        assert_eq!(
+            rebar_slow.max_allocation_bytes,
+            ordinary_slow.max_allocation_bytes
+        );
+        assert_eq!(
+            rebar_slow.max_native_data_bytes,
+            ordinary_slow.max_native_data_bytes
+        );
+    }
+
+    #[test]
+    fn rebar_construction_envelope_preserves_already_admitted_artifact_identity() {
+        let benchmark = Benchmark::parse(&fixture("count", b"a+", b"baa")).expect("count fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let compile_with_limits = |limits| {
+            let mut profile = RustProfile::rebar_1_12_4();
+            profile.options.unicode = benchmark.unicode;
+            profile.options.case_insensitive = benchmark.case_insensitive;
+            compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(benchmark.pattern(), target)
+                    .profile(profile)
+                    .output(benchmark.model.output())
+                    .mode(CompileMode::Optimizing)
+                    .limits(limits),
+                benchmark.model.exports(),
+                SlowAotLimits::default(),
+            )
+            .expect("already-admitted fixture")
+        };
+        let ordinary = compile_with_limits(CompileLimitsV1::default());
+        let rebar = compile_benchmark(&benchmark, target).expect("Rebar default-first compile");
+        assert_eq!(rebar.object(), ordinary.object());
+        assert_eq!(
+            rebar.receipt().program_sha256,
+            ordinary.receipt().program_sha256
+        );
+        assert_eq!(
+            rebar.receipt().object_sha256,
+            ordinary.receipt().object_sha256
+        );
+        assert_eq!(
+            rebar.module().entry_symbol(),
+            ordinary.module().entry_symbol()
+        );
+    }
+
+    #[test]
+    fn rebar_construction_envelope_preserves_uniform_selector_identity() {
+        let pattern = "(a+)";
+        let profile = RustProfile::rebar_1_12_4();
+        let parsed = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustBytes(profile.clone()),
+        ))
+        .expect("capture fixture parse");
+        let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            panic!("capture fixture did not produce Rust HIR");
+        };
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let ordinary = compile_uniform_capture_selector(
+            &parsed,
+            UniformCaptureCompileRequest::new(pattern.len(), target).profile(profile),
+        )
+        .expect("already-admitted capture fixture");
+        ordinary.authenticate().expect("ordinary transaction");
+        let (ordinary_selector, ordinary_disposition) = ordinary.into_parts();
+        let benchmark = Benchmark::parse(&fixture("count-captures", pattern.as_bytes(), b"aaa"))
+            .expect("Rebar capture fixture");
+        let rebar = compile_uniform_capture_bridge(&benchmark, target).expect("Rebar bridge");
+        assert_eq!(rebar.rows.artifacts.len(), 1);
+        let rebar_selector = &rebar.rows.artifacts[0].compiled;
+        assert_eq!(
+            ordinary_disposition.receipt(),
+            Some(rebar.source_receipts[0])
+        );
+        assert_eq!(rebar_selector.object(), ordinary_selector.object());
+        assert_eq!(
+            rebar_selector.receipt().program_sha256,
+            ordinary_selector.receipt().program_sha256
+        );
+        assert_eq!(
+            rebar_selector.receipt().object_sha256,
+            ordinary_selector.receipt().object_sha256
+        );
+    }
+
+    #[test]
+    fn rebar_recovery_never_retries_non_work_or_allocation_failures() {
+        let states = CompileError::Lower(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            needed: 2,
+            limit: 1,
+        });
+        let allocation = CompileError::Lower(LowerError::AllocationFailed {
+            structure: "test",
+            additional: 1,
+        });
+        assert!(!is_lower_work_limit(&states));
+        assert!(!is_lower_work_limit(&allocation));
+        assert!(!is_uniform_lower_work_limit(
+            &UniformCaptureCompileError::Lower(LowerError::AllocationFailed {
+                structure: "test",
+                additional: 1,
+            })
+        ));
+        assert!(is_lower_work_limit(&CompileError::Lower(
+            LowerError::ResourceLimit {
+                resource: LowerResource::Work,
+                needed: 2,
+                limit: 1,
+            }
+        )));
     }
 
     #[test]
