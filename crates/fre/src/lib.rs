@@ -868,8 +868,9 @@ pub use text_set::{
 };
 
 use fre_automata::{
-    Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
-    K0PositiveEndStartOutcome, K0SpanSourceCursor, K0StartFilterPreparationReceipt,
+    Automaton, EarliestEnd, Exists, K0OrdinaryExecutor, K0PositiveEndLimits,
+    K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0SearchSession, K0SpanSourceCursor,
+    K0StartFilterPreparationReceipt,
     MandatoryCutAnalysisLimits, MandatoryCutCandidate, MandatoryCutContinuation,
     MandatoryCutContinuationAnalysis, MandatoryCutDeclineReason, MandatoryCutResource,
     MandatoryLiteralFrontierAnalysis, MandatoryLiteralFrontierAnalysisLimits,
@@ -10331,6 +10332,43 @@ impl PortableRegex {
         }
     }
 
+    /// Bind reusable worker-owned state for ordinary unlimited searches.
+    ///
+    /// A K0 matcher authenticates one source-free executor and settles its
+    /// immutable start-filter policy during this call. Other selected plan
+    /// families bind the existing canonical session with unlimited setup
+    /// limits. The returned owner retains no haystack and may be reused across
+    /// unrelated inputs by one mutable worker.
+    ///
+    /// This is deliberately separate from [`Self::search_session`]: ordinary
+    /// methods accept no finite limits and construct no facade accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if fallible K0 workspace allocation or
+    /// immutable preparation fails. Canonical fallback construction returns
+    /// the same setup failures as [`Self::search_session`].
+    pub fn ordinary_session(&self) -> Result<PortableOrdinarySession<'_>, SearchError> {
+        let plan = match &self.plan {
+            PortablePlan::K0(k0) => {
+                let positive =
+                    matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
+                let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
+                    && !k0.automaton.stats().has_assertions();
+                let endpoint_eligible = positive || assertion_free_nullable;
+                PortableOrdinarySessionPlan::K0(K0OrdinaryExecutor::new(
+                    &k0.automaton,
+                    endpoint_eligible,
+                    positive,
+                )?)
+            }
+            _ => PortableOrdinarySessionPlan::Canonical(Box::new(
+                self.search_session(SearchSessionLimits::unlimited())?,
+            )),
+        };
+        Ok(PortableOrdinarySession { plan })
+    }
+
     /// Prepare a demand-grown reusable search session over this immutable
     /// matcher.
     ///
@@ -13611,6 +13649,27 @@ impl PortableK0StartFilterSetupAccounting {
 #[derive(Debug)]
 pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
+}
+
+/// Worker-owned state for ordinary unlimited portable searches.
+///
+/// K0 matchers bind one source-free executor, including its immutable
+/// capabilities and reusable workspace, when this session is constructed.
+/// Other matcher families retain the existing canonical search session. No
+/// method on this type accepts finite limits or publishes accounting; callers
+/// that need either contract should use [`PortableSearchSession`] instead.
+///
+/// A session never retains a haystack. It can therefore be reused across
+/// unrelated sources by one mutable, thread-confined worker.
+#[derive(Debug)]
+pub struct PortableOrdinarySession<'a> {
+    plan: PortableOrdinarySessionPlan<'a>,
+}
+
+#[derive(Debug)]
+enum PortableOrdinarySessionPlan<'a> {
+    K0(K0OrdinaryExecutor<'a>),
+    Canonical(Box<PortableSearchSession<'a>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18976,6 +19035,237 @@ fn execute_k0_exists_incumbent_general(
         *negative_prefilter_exists_state = attempt.state_after_success;
     }
     result
+}
+
+impl<'r> PortableOrdinarySession<'r> {
+    /// Whether a match first accepts at or after `start`.
+    ///
+    /// This is only a boolean projection of [`Self::first_acceptance_at`].
+    /// It does not select or reconstruct a complete span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or ordinary
+    /// execution encounters an allocation, arithmetic, or invariant failure.
+    #[inline]
+    pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
+        self.first_acceptance_at(haystack, start)
+            .map(|endpoint| endpoint.is_some())
+    }
+
+    /// Return the first accepting boundary at or after `start`.
+    ///
+    /// K0 executes its endpoint-only engine. Canonical fallback plans use the
+    /// existing value-only shortest-match projection with unlimited limits.
+    /// Assertions inspect the complete original haystack and the returned
+    /// boundary is relative to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or ordinary
+    /// execution encounters an allocation, arithmetic, or invariant failure.
+    #[inline]
+    pub fn first_acceptance_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::K0(executor) => executor
+                .first_acceptance_at(haystack, start)
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::Canonical(session) => session
+                .shortest_match_at_value(haystack, start, SearchLimits::unlimited()),
+        }
+    }
+
+    /// Return the first accepting boundary at or after `start`.
+    ///
+    /// This ripgrep-facing name is an exact alias for
+    /// [`Self::first_acceptance_at`] and does not add another search engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::first_acceptance_at`].
+    #[inline]
+    pub fn shortest_match_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        self.first_acceptance_at(haystack, start)
+    }
+
+    /// Return the selected leftmost-first span at or after `start`.
+    ///
+    /// K0 selects the endpoint first and performs reverse start recovery only
+    /// after a positive result requires it. Canonical fallback plans retain
+    /// their existing selected-span implementation with unlimited limits.
+    /// Assertions inspect the complete original haystack and offsets remain
+    /// relative to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if `start` exceeds the haystack or ordinary
+    /// execution encounters an allocation, arithmetic, or invariant failure.
+    #[inline]
+    pub fn find_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<Match>, SearchError> {
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::K0(executor) => executor
+                .selected_span_at(haystack, start)
+                .map(|matched| {
+                    matched.map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    })
+                })
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::Canonical(session) => {
+                session.find_at_value(haystack, start, SearchLimits::unlimited())
+            }
+        }
+    }
+
+    /// Visit every non-overlapping selected span from the start of `haystack`.
+    ///
+    /// The callback returns `Ok(true)` to continue, `Ok(false)` to stop
+    /// successfully, or `Err(error)` to return that callback error. Search
+    /// failures are kept in the outer result so an embedding can distinguish
+    /// them without wrapping its callback error.
+    ///
+    /// Empty matches make byte-wise progress and use the same suppression rule
+    /// as the portable byte iterator. K0 retains its source cursor only for
+    /// this call; dropping or returning from the visitor leaves the worker
+    /// session source-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableFindIterError`] if selected-span iteration fails. K0
+    /// wraps only its underlying [`SearchError`]; canonical fallback plans
+    /// preserve the existing iterator error contract.
+    #[inline]
+    pub fn try_visit_spans<F, E>(
+        &mut self,
+        haystack: &[u8],
+        visitor: F,
+    ) -> Result<Result<(), E>, PortableFindIterError>
+    where
+        F: FnMut(Match) -> Result<bool, E>,
+    {
+        self.try_visit_spans_at(haystack, 0, visitor)
+    }
+
+    /// Visit every non-overlapping selected span at or after `start`.
+    ///
+    /// This is the ranged companion to [`Self::try_visit_spans`]. Assertions
+    /// retain complete original-haystack context and offsets remain absolute.
+    /// K0 passes the first selected item directly to the callback without an
+    /// accounting iterator, result buffer, or search-call cap. Canonical
+    /// fallback plans preserve their existing unlimited value iterator and
+    /// any construction-selected native source cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableFindIterError`] if `start` exceeds the haystack or
+    /// selected-span iteration fails. Underlying search failures remain in its
+    /// [`PortableFindIterError::Search`] variant.
+    #[inline]
+    pub fn try_visit_spans_at<F, E>(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        visitor: F,
+    ) -> Result<Result<(), E>, PortableFindIterError>
+    where
+        F: FnMut(Match) -> Result<bool, E>,
+    {
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::K0(executor) => {
+                let mut source = K0SpanSourceCursor::new(haystack);
+                try_visit_ordinary_spans_at(
+                    haystack.len(),
+                    start,
+                    |search_start| {
+                        executor
+                            .selected_span_at_source_cursor(&mut source, search_start)
+                            .map(|matched| {
+                                matched.map(|span| Match {
+                                    start: span.start(),
+                                    end: span.end(),
+                                })
+                            })
+                            .map_err(SearchError::from)
+                            .map_err(PortableFindIterError::Search)
+                    },
+                    visitor,
+                )
+            }
+            PortableOrdinarySessionPlan::Canonical(session) => {
+                let matches = session.find_iter_value_at(
+                    haystack,
+                    start,
+                    PortableFindIterRunLimits::unlimited(),
+                );
+                let mut visitor = visitor;
+                for matched in matches {
+                    let matched = matched?;
+                    match visitor(matched) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(())),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                Ok(Ok(()))
+            }
+        }
+    }
+}
+
+fn try_visit_ordinary_spans_at<F, E, S>(
+    haystack_len: usize,
+    mut start: usize,
+    mut search: S,
+    mut visitor: F,
+) -> Result<Result<(), E>, PortableFindIterError>
+where
+    F: FnMut(Match) -> Result<bool, E>,
+    S: FnMut(usize) -> Result<Option<Match>, PortableFindIterError>,
+{
+    let mut last_match_end = None;
+    let mut pending_empty_progress = false;
+    loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            if start == haystack_len {
+                return Ok(Ok(()));
+            }
+            start += 1;
+        }
+
+        let Some(matched) = search(start)? else {
+            return Ok(Ok(()));
+        };
+        if matched.is_empty() && last_match_end == Some(matched.end()) {
+            if start == haystack_len {
+                return Ok(Ok(()));
+            }
+            start += 1;
+            continue;
+        }
+
+        start = matched.end();
+        last_match_end = Some(matched.end());
+        pending_empty_progress = matched.is_empty();
+        match visitor(matched) {
+            Ok(true) => {}
+            Ok(false) => return Ok(Ok(())),
+            Err(error) => return Ok(Err(error)),
+        }
+    }
 }
 
 impl<'r> PortableSearchSession<'r> {
@@ -36308,6 +36598,192 @@ mod tests {
 
         let captured = PortableRegex::new("(Sherlock)").unwrap();
         assert_eq!(captured.build_report().plan, PlanKind::ExactLiteral);
+    }
+
+    #[test]
+    fn ordinary_session_binds_k0_and_separates_first_acceptance_from_span_selection() {
+        let regex = PortableBuilder::new("ab|a")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let PortablePlan::K0(k0) = &regex.plan else {
+            unreachable!("forced ordinary fixture must retain K0")
+        };
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::K0(executor)
+                if executor.is_bound_to(&k0.automaton)
+        ));
+
+        let haystack = b"zab!";
+        assert_eq!(ordinary.first_acceptance_at(haystack, 0), Ok(Some(2)));
+        assert_eq!(ordinary.shortest_match_at(haystack, 0), Ok(Some(2)));
+        assert_eq!(ordinary.is_match_at(haystack, 0), Ok(true));
+        assert_eq!(
+            ordinary.find_at(haystack, 0),
+            Ok(Some(Match { start: 1, end: 3 }))
+        );
+        assert_eq!(ordinary.first_acceptance_at(haystack, 2), Ok(None));
+        assert_eq!(ordinary.find_at(haystack, 2), Ok(None));
+        assert!(matches!(
+            ordinary.find_at(haystack, haystack.len() + 1),
+            Err(SearchError::K0(fre_automata::SearchError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 4,
+            }))
+        ));
+
+        let mut reused = b"zab".to_vec();
+        let address = reused.as_ptr();
+        assert_eq!(
+            ordinary.find_at(&reused, 0),
+            Ok(Some(Match { start: 1, end: 3 }))
+        );
+        reused.copy_from_slice(b"zzz");
+        assert_eq!(reused.as_ptr(), address);
+        assert_eq!(ordinary.find_at(&reused, 0), Ok(None));
+        reused.copy_from_slice(b"abz");
+        assert_eq!(reused.as_ptr(), address);
+        assert_eq!(
+            ordinary.find_at(&reused, 0),
+            Ok(Some(Match { start: 0, end: 2 }))
+        );
+    }
+
+    #[test]
+    fn ordinary_session_canonical_fallback_preserves_unlimited_value_semantics() {
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(_)
+        ));
+
+        let haystack = b"xxneedle--needle";
+        for start in 0..=haystack.len() {
+            assert_eq!(
+                ordinary.first_acceptance_at(haystack, start),
+                regex.shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+            );
+            assert_eq!(
+                ordinary.find_at(haystack, start),
+                regex.find_at_value(haystack, start, SearchLimits::unlimited())
+            );
+        }
+
+        let mut visited = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    visited.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(visited, [(2, 8), (10, 16)]);
+
+        let mut callback_called = false;
+        assert!(ordinary
+            .try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                callback_called = true;
+                Ok::<bool, ()>(true)
+            })
+            .is_err());
+        assert!(!callback_called);
+    }
+
+    #[test]
+    fn ordinary_k0_span_visitor_starts_directly_and_makes_byte_empty_progress() {
+        let regex = PortableBuilder::new("a*")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut ordinary = regex.ordinary_session().unwrap();
+
+        let mut visited = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(b"bbb", |matched| {
+                    visited.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(true)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(visited, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+
+        visited.clear();
+        assert_eq!(
+            ordinary
+                .try_visit_spans_at(b"bbb", 1, |matched| {
+                    visited.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(true)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(visited, [(1, 1), (2, 2), (3, 3)]);
+
+        visited.clear();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(b"aaa", |matched| {
+                    visited.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(true)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(visited, [(0, 3)]);
+
+        let mut callbacks = 0;
+        assert_eq!(
+            ordinary
+                .try_visit_spans(b"bbb", |_| {
+                    callbacks += 1;
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(callbacks, 1, "the first item is delivered directly");
+        assert_eq!(
+            ordinary
+                .try_visit_spans(b"bbb", |_| Err::<bool, _>("callback"))
+                .unwrap(),
+            Err("callback")
+        );
+        assert_eq!(
+            ordinary.find_at(b"aaa", 0),
+            Ok(Some(Match { start: 0, end: 3 }))
+        );
+
+        let mut callback_called = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(b"bbb", 4, |_| {
+                callback_called = true;
+                Ok::<bool, &'static str>(true)
+            }),
+            Err(PortableFindIterError::Search(SearchError::K0(
+                fre_automata::SearchError::InvalidWindow {
+                    start: 4,
+                    end: 3,
+                    haystack_len: 3,
+                }
+            )))
+        ));
+        assert!(!callback_called);
     }
 
     #[test]
