@@ -1542,8 +1542,12 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
             #[cfg(not(feature = "static-dispatch"))]
             let matched = if let Some(cursor) = retained.as_mut() {
                 // This cursor is private to this positive-width loop, so each
-                // selected endpoint strictly advances `start`. Arbitrary
-                // public cursor calls retain their backward-start reset.
+                // selected endpoint strictly advances `start`; retain its
+                // last-start state without repeating the backward comparison.
+                debug_assert!(
+                    cursor.last_start.is_none_or(|last| start > last)
+                );
+                cursor.last_start = Some(start);
                 cursor.find_at_value_unmetered_forward_validated(start)
             } else {
                 self.find_window_value(haystack, Window::new(start, window.end()))?
