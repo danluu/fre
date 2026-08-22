@@ -30,6 +30,17 @@ are terminal and are never converted into fallback. The adapter permits one
 fixed numeric retry only after the exact default participation DFA-state cap;
 that retry changes the state and dependent construction-work ceilings and
 nothing else.
+If that fixed retry itself exhausts exactly its `DfaStates` or `BuildWork`
+ceiling for a one-source `grep-captures` operation, one final mixed adapter may
+retain the helper-free ordinary Span selector already emitted by the uniform
+transaction. Per LF-free line, a native `NO_MATCH` is an exact negative
+certificate and returns zero without capture work. A native positive invokes
+the pinned stock Rust capture implementation, preceded by the stable exported
+marker `fre_aot_rebar_runner_stock_capture_positive_fallback_v1`. The marker is
+an atomic side effect, remains visible under optimization, and makes every
+used positive fallback nonnative to trap-based qualification. This adapter is
+never selected for allocation, object, authentication, arithmetic, nonnumeric
+resource, multi-source, or non-grep failures.
 
 ```sh
 rebar klv --max-iters 9 --max-warmup-iters 1 \
@@ -110,6 +121,17 @@ timing belongs to a separately named compiler-stage benchmark.
   The route admits at most 4,096 capture groups, exposes no runtime helper, and
   remains a native search/capture core with a checked Rust adapter loop rather
   than a wholly fused operation.
+  If the fixed direct-participation construction envelope is exhausted, the
+  one-source grep-only selector-first adapter instead calls that exact native
+  selector once per line. Negative lines are complete native certificates;
+  only positive lines enter the declared stock capture fallback. The selector
+  status/span is checked before fallback, stock remains authoritative for all
+  positive captures, and the final independent Rust oracle remains
+  authoritative for the operation. A runtime consistency receipt also
+  requires zero marker calls whenever every timed result is zero, and at least
+  one marker call whenever a positive result is published. This is an honest
+  conditional mixed route, not a claim that positive capture materialization
+  became native.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
   and all five ordered substitutions through their separately linked ordinary
   Span entries. Rust owns only checked stage sequencing, replacement copies,
@@ -133,14 +155,17 @@ then applies the same byte-wise empty progress and adjacent-empty suppression
 as pinned `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in
 local checked state and are published only after the complete traversal.
 
-This bridge has no prepared handle, serialized runtime program, scalar helper,
-or input-dependent deoptimization edge. Build-time admission rejects the
-entire job when any row has an unresolved runtime function, a helper-backed
-receipt, a prepared entry/program, a missing/zero-sized public native entry, or
-any prepared aggregate state. It also rejects more than 4,096 source rows or
-more than 256 MiB of distinct row objects before linking. These are explicit
-fail-closed resource limits; the bridge never mixes native rows with a portable
-semantic fallback.
+The ordinary scalar and uniform-capture row bridges have no prepared handle,
+serialized runtime program, scalar helper, or input-dependent deoptimization
+edge. Build-time admission rejects the entire job when any row has an
+unresolved runtime function, a helper-backed receipt, a prepared entry/program,
+a missing/zero-sized public native entry, or any prepared aggregate state. It
+also rejects more than 4,096 source rows or more than 256 MiB of distinct row
+objects before linking. These are explicit fail-closed resource limits. The
+selector-first capture route is the sole explicitly named conditional mixed
+route; its positive fallback profile and trap marker are sealed into generated
+bindings and provenance rather than hidden in the native row's dependency
+surface.
 
 Except for the fixed regex-redux composite and native-row bridge, one exclusive
 handle is prepared from the exact linked program before every warmup/timed loop
@@ -168,6 +193,10 @@ so it cannot warm the candidate's first-call path. The normal output remains Reb
 `nanoseconds,value` format. `--provenance` emits the adapter, compiler and
 optimizer versions, target/features, engine/aggregate strategy, exact symbols,
 required runtime surface, and program/object SHA-256 identities.
+The mixed selector-first route uses schema `fre.aot.rebar-runner.v4` and also
+publishes `selector_capture_fallback_bridge`, `capture_resolution`, the stock
+positive-fallback profile/symbol, and the exact direct-participation resource,
+required value, and limit that selected the route.
 
 ## Qualification before using results
 

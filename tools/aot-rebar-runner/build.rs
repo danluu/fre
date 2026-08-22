@@ -114,6 +114,7 @@ fn main() {
                         &benchmark,
                         &bridge.rows,
                         Some(&bridge.source_receipts),
+                        None,
                         &architecture,
                         &operating_system,
                         feature_bits,
@@ -166,18 +167,28 @@ fn main() {
                     object_path.display()
                 );
             }
-            shared::UniformCaptureBridgeDisposition::Declined { .. } => {
-                match shared::try_compile_participation_capture_bridge(&benchmark, target)
-                    .expect("compile exact-span participation capture bridge")
-                {
-                    shared::ParticipationCaptureBridgeDisposition::Selected(bridge) => {
-                        fs::write(&object_path, bridge.artifact.object())
-                            .expect("write linked participation capture object");
+            shared::UniformCaptureBridgeDisposition::Declined { selector, .. } => {
+                match shared::try_compile_participation_capture_bridge(&benchmark, target) {
+                    Err(shared::ParticipationCaptureBridgeError::DfaEnvelopeExhausted(
+                        exhaustion,
+                    )) => {
+                        let selector = selector.expect(
+                            "direct participation exhausted without an authenticated ordinary selector",
+                        );
+                        let bridge = shared::compile_selector_capture_fallback_bridge(
+                            &benchmark, selector, exhaustion,
+                        )
+                        .expect("compile selector-first capture fallback bridge");
+                        let artifact = &bridge.rows.artifacts[0].compiled;
+                        fs::write(&object_path, artifact.object())
+                            .expect("write linked selector-first capture object");
                         fs::write(
                             &generated_path,
-                            configured_participation_capture_source(
+                            configured_native_row_source(
                                 &benchmark,
-                                &bridge,
+                                &bridge.rows,
+                                None,
+                                Some(&bridge),
                                 &architecture,
                                 &operating_system,
                                 feature_bits,
@@ -185,27 +196,49 @@ fn main() {
                                 &source_tree,
                             ),
                         )
-                        .expect("write linked participation capture bindings");
+                        .expect("write linked selector-first capture bindings");
                     }
-                    shared::ParticipationCaptureBridgeDisposition::Declined { .. } => {
-                        let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
-                            .expect("compile exact single-pattern helper-free capture route");
-                        fs::write(&object_path, bridge.artifact.object())
-                            .expect("write linked strict capture object");
-                        fs::write(
-                            &generated_path,
-                            configured_strict_capture_source(
-                                &benchmark,
-                                &bridge,
-                                &architecture,
-                                &operating_system,
-                                feature_bits,
-                                &source_commit,
-                                &source_tree,
-                            ),
-                        )
-                        .expect("write linked strict capture bindings");
+                    Err(error) => {
+                        panic!("compile exact-span participation capture bridge: {error}")
                     }
+                    Ok(disposition) => match disposition {
+                        shared::ParticipationCaptureBridgeDisposition::Selected(bridge) => {
+                            fs::write(&object_path, bridge.artifact.object())
+                                .expect("write linked participation capture object");
+                            fs::write(
+                                &generated_path,
+                                configured_participation_capture_source(
+                                    &benchmark,
+                                    &bridge,
+                                    &architecture,
+                                    &operating_system,
+                                    feature_bits,
+                                    &source_commit,
+                                    &source_tree,
+                                ),
+                            )
+                            .expect("write linked participation capture bindings");
+                        }
+                        shared::ParticipationCaptureBridgeDisposition::Declined { .. } => {
+                            let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
+                                .expect("compile exact single-pattern helper-free capture route");
+                            fs::write(&object_path, bridge.artifact.object())
+                                .expect("write linked strict capture object");
+                            fs::write(
+                                &generated_path,
+                                configured_strict_capture_source(
+                                    &benchmark,
+                                    &bridge,
+                                    &architecture,
+                                    &operating_system,
+                                    feature_bits,
+                                    &source_commit,
+                                    &source_tree,
+                                ),
+                            )
+                            .expect("write linked strict capture bindings");
+                        }
+                    },
                 }
                 println!(
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
@@ -233,6 +266,7 @@ fn main() {
             configured_native_row_source(
                 &benchmark,
                 &bridge,
+                None,
                 None,
                 &architecture,
                 &operating_system,
@@ -751,6 +785,7 @@ fn configured_source(
     );
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
+    push_empty_selector_capture_fallback_bindings(&mut source);
     source
 }
 
@@ -965,6 +1000,7 @@ fn configured_regex_redux_source(
     source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
+    push_empty_selector_capture_fallback_bindings(&mut source);
     source
 }
 
@@ -1238,6 +1274,7 @@ fn configured_participation_capture_source(
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
+    push_empty_selector_capture_fallback_bindings(&mut source);
     source
 }
 
@@ -1493,6 +1530,7 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
     push_empty_participation_capture_bindings(&mut source);
+    push_empty_selector_capture_fallback_bindings(&mut source);
     source
 }
 
@@ -1504,17 +1542,23 @@ fn configured_native_row_source(
     benchmark: &shared::Benchmark,
     bridge: &shared::NativeRowBridge,
     uniform_capture_receipts: Option<&[fre_aot_regex::UniformCaptureCompileReceipt]>,
+    selector_capture_fallback: Option<&shared::SelectorCaptureFallbackBridge>,
     architecture: &str,
     operating_system: &str,
     feature_bits: u64,
     source_commit: &str,
     source_tree: &str,
 ) -> String {
-    assert!(benchmark.uses_native_row_bridge() || benchmark.uses_uniform_capture_bridge());
+    assert!(
+        benchmark.uses_native_row_bridge()
+            || benchmark.uses_uniform_capture_bridge()
+            || selector_capture_fallback.is_some()
+    );
     assert!(!bridge.artifacts.is_empty());
     assert_eq!(bridge.source_to_artifact.len(), benchmark.patterns.len());
+    assert!(!(uniform_capture_receipts.is_some() && selector_capture_fallback.is_some()));
     assert_eq!(
-        uniform_capture_receipts.is_some(),
+        uniform_capture_receipts.is_some() || selector_capture_fallback.is_some(),
         benchmark.uses_uniform_capture_bridge()
     );
     if let Some(receipts) = uniform_capture_receipts {
@@ -1570,22 +1614,30 @@ fn configured_native_row_source(
         assert!(compiled.module().required_runtime_program().is_none());
     }
 
-    let adapter = match benchmark.model {
-        shared::Model::Count => "general-aot-native-row-bridge-count-v1",
-        shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
-        shared::Model::GrepCount => "general-aot-native-row-bridge-grep-v1",
-        shared::Model::CountCaptures => {
-            "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
-        }
-        shared::Model::GrepCaptures => {
-            "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
-        }
-        shared::Model::Compile | shared::Model::RegexRedux => {
-            unreachable!("parser excludes this multi-pattern model")
+    let uniform_capture = uniform_capture_receipts.is_some();
+    let selector_fallback = selector_capture_fallback.is_some();
+    let adapter = if selector_fallback {
+        assert_eq!(benchmark.model, shared::Model::GrepCaptures);
+        "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+    } else {
+        match benchmark.model {
+            shared::Model::Count => "general-aot-native-row-bridge-count-v1",
+            shared::Model::SpanSum => "general-aot-native-row-bridge-count-spans-v1",
+            shared::Model::GrepCount => "general-aot-native-row-bridge-grep-v1",
+            shared::Model::CountCaptures => {
+                "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
+            }
+            shared::Model::GrepCaptures => {
+                "general-aot-uniform-capture-native-row-grep-adapter-loop-v1"
+            }
+            shared::Model::Compile | shared::Model::RegexRedux => {
+                unreachable!("parser excludes this multi-pattern model")
+            }
         }
     };
-    let uniform_capture = uniform_capture_receipts.is_some();
-    let aggregate_strategy = if uniform_capture {
+    let aggregate_strategy = if selector_fallback {
+        "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+    } else if uniform_capture {
         "native-row-static-uniform-capture-multiplier-v1"
     } else if benchmark.model == shared::Model::GrepCount {
         "per-line-native-independent-span-row-exists-v1"
@@ -1597,10 +1649,14 @@ fn configured_native_row_source(
     } else {
         "not-applicable"
     };
-    let grep_iteration_strategy = match benchmark.model {
-        shared::Model::GrepCount => "per-line-native-independent-span-row-exists-v1",
-        shared::Model::GrepCaptures => "per-line-native-row-static-uniform-capture-v1",
-        _ => "not-applicable",
+    let grep_iteration_strategy = if selector_fallback {
+        "per-line-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
+    } else {
+        match benchmark.model {
+            shared::Model::GrepCount => "per-line-native-independent-span-row-exists-v1",
+            shared::Model::GrepCaptures => "per-line-native-row-static-uniform-capture-v1",
+            _ => "not-applicable",
+        }
     };
     let first_source_ordinals = bridge
         .artifacts
@@ -1680,6 +1736,42 @@ fn configured_native_row_source(
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
     )
     .unwrap();
+    if let Some(fallback) = selector_capture_fallback {
+        let resource = match fallback.direct_participation.resource {
+            fre_aot_regex::NativeParticipationAotResourceV1::DfaStates => "DfaStates",
+            fre_aot_regex::NativeParticipationAotResourceV1::BuildWork => "BuildWork",
+            _ => unreachable!("selector fallback admits only the fixed DFA envelope"),
+        };
+        source.push_str("pub const SELECTOR_CAPTURE_FALLBACK_BRIDGE: bool = true;\n");
+        writeln!(
+            source,
+            "pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str = {:?};",
+            shared::REBAR_SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL,
+        )
+        .unwrap();
+        source.push_str(
+            "pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE: &str = \"rust-regex-1.12.4-captures\";\n",
+        );
+        writeln!(
+            source,
+            "pub const SELECTOR_CAPTURE_DIRECT_RESOURCE: &str = {resource:?};"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SELECTOR_CAPTURE_DIRECT_REQUIRED: usize = {};",
+            fallback.direct_participation.required,
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = {};",
+            fallback.direct_participation.limit,
+        )
+        .unwrap();
+    } else {
+        push_empty_selector_capture_fallback_bindings(&mut source);
+    }
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
     writeln!(
         source,
@@ -1966,6 +2058,15 @@ fn push_empty_participation_capture_bindings(source: &mut String) {
     source.push_str("pub unsafe fn participation_exact(_request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
+fn push_empty_selector_capture_fallback_bindings(source: &mut String) {
+    source.push_str("pub const SELECTOR_CAPTURE_FALLBACK_BRIDGE: bool = false;\n");
+    source.push_str("pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE: &str = \"\";\n");
+    source.push_str("pub const SELECTOR_CAPTURE_DIRECT_RESOURCE: &str = \"\";\n");
+    source.push_str("pub const SELECTOR_CAPTURE_DIRECT_REQUIRED: usize = 0;\n");
+    source.push_str("pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = 0;\n");
+}
+
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
@@ -2007,6 +2108,12 @@ pub const PARTICIPATION_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
 pub const PARTICIPATION_BUNDLE_SYMBOL: &str = "";
 pub const PARTICIPATION_SELECTOR_SYMBOL: &str = "";
 pub const PARTICIPATION_ENTRY_SYMBOL: &str = "";
+pub const SELECTOR_CAPTURE_FALLBACK_BRIDGE: bool = false;
+pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str = "";
+pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE: &str = "";
+pub const SELECTOR_CAPTURE_DIRECT_RESOURCE: &str = "";
+pub const SELECTOR_CAPTURE_DIRECT_REQUIRED: usize = 0;
+pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = 0;
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
 use fre_aot_regex::{
     Architecture, CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1,
@@ -65,6 +65,10 @@ pub const REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES: usize = 131_072;
 /// Construction-work ceiling paired with
 /// [`REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES`].
 pub const REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK: usize = 256 * 1_048_576;
+/// Stable, statically visible marker invoked immediately before the exact
+/// stock capture fallback on a selector-positive line.
+pub const REBAR_SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str =
+    "fre_aot_rebar_runner_stock_capture_positive_fallback_v1";
 
 /// Recovery envelope used only after the public, job-specialized Rebar
 /// adapter observes the default lowering-work ceiling. Runtime semantics and
@@ -733,6 +737,24 @@ pub struct ParticipationCaptureBridge {
     pub artifact: RebarSingleCaptureParticipationAotArtifactV1,
 }
 
+/// Exact deterministic construction envelope exhausted by the optional
+/// direct-DFA participation leaf. This is distinct from allocation, object,
+/// authentication and every non-numeric compiler failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParticipationDfaEnvelopeExhaustion {
+    pub resource: NativeParticipationAotResourceV1,
+    pub required: usize,
+    pub limit: usize,
+}
+
+/// One helper-free exact ordinary Span selector used as a negative
+/// certificate before an explicitly declared stock positive capture route.
+#[derive(Debug)]
+pub struct SelectorCaptureFallbackBridge {
+    pub rows: NativeRowBridge,
+    pub direct_participation: ParticipationDfaEnvelopeExhaustion,
+}
+
 /// The participation compiler's sole nonterminal result is its authenticated
 /// negative entry. All construction, resource, allocation, object and
 /// authentication errors remain terminal.
@@ -742,14 +764,71 @@ pub enum ParticipationCaptureBridgeDisposition {
     Declined { reason: String },
 }
 
+/// A terminal participation compiler failure or the one typed construction
+/// exhaustion that a separately authenticated selector-first adapter may
+/// consume.
+#[derive(Debug)]
+pub enum ParticipationCaptureBridgeError {
+    Terminal(String),
+    DfaEnvelopeExhausted(ParticipationDfaEnvelopeExhaustion),
+}
+
+impl fmt::Display for ParticipationCaptureBridgeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Terminal(message) => formatter.write_str(message),
+            Self::DfaEnvelopeExhausted(exhaustion) => write!(
+                formatter,
+                "direct participation DFA exhausted {:?}: required {}, limit {}",
+                exhaustion.resource, exhaustion.required, exhaustion.limit,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParticipationCaptureBridgeError {}
+
+fn participation_dfa_envelope_exhaustion(
+    error: &RebarSingleCaptureParticipationAotErrorV1,
+) -> Option<ParticipationDfaEnvelopeExhaustion> {
+    let RebarSingleCaptureParticipationAotErrorV1::Participation(
+        NativeParticipationAotErrorV1::Resource {
+            resource,
+            required,
+            limit,
+        },
+    ) = error
+    else {
+        return None;
+    };
+    let exact_limit = match resource {
+        NativeParticipationAotResourceV1::DfaStates => {
+            *limit == REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES
+        }
+        NativeParticipationAotResourceV1::BuildWork => {
+            *limit == REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK
+        }
+        _ => false,
+    };
+    (exact_limit && *required == limit.saturating_add(1)).then_some(
+        ParticipationDfaEnvelopeExhaustion {
+            resource: *resource,
+            required: *required,
+            limit: *limit,
+        },
+    )
+}
+
 /// Compile the additive exact-span participation route after the uniform
 /// theorem has semantically declined.
 pub fn try_compile_participation_capture_bridge(
     benchmark: &Benchmark,
     target: Target,
-) -> Result<ParticipationCaptureBridgeDisposition, String> {
+) -> Result<ParticipationCaptureBridgeDisposition, ParticipationCaptureBridgeError> {
     if !benchmark.model.is_capture() {
-        return Err("participation capture compilation requires a capture model".to_owned());
+        return Err(ParticipationCaptureBridgeError::Terminal(
+            "participation capture compilation requires a capture model".to_owned(),
+        ));
     }
     if benchmark.patterns.len() != 1 {
         return Ok(ParticipationCaptureBridgeDisposition::Declined {
@@ -785,12 +864,29 @@ pub fn try_compile_participation_capture_bridge(
             let mut compile_limits = CaptureCompileLimits::default();
             compile_limits.selector = rebar_recovery_compile_limits();
             compile_limits.selector_slow_aot = rebar_recovery_slow_aot_limits();
-            compile_with_native_state_retry(compile_limits).map_err(|error| {
-                format!("Rebar participation recovery compilation failed: {error}")
-            })?
+            match compile_with_native_state_retry(compile_limits) {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    if let Some(exhaustion) = participation_dfa_envelope_exhaustion(&error) {
+                        return Err(ParticipationCaptureBridgeError::DfaEnvelopeExhausted(
+                            exhaustion,
+                        ));
+                    }
+                    return Err(ParticipationCaptureBridgeError::Terminal(format!(
+                        "Rebar participation recovery compilation failed: {error}"
+                    )));
+                }
+            }
         }
         Err(error) => {
-            return Err(format!("Rebar participation compilation failed: {error}"));
+            if let Some(exhaustion) = participation_dfa_envelope_exhaustion(&error) {
+                return Err(ParticipationCaptureBridgeError::DfaEnvelopeExhausted(
+                    exhaustion,
+                ));
+            }
+            return Err(ParticipationCaptureBridgeError::Terminal(format!(
+                "Rebar participation compilation failed: {error}"
+            )));
         }
     };
     if !artifact.authenticates_receipt()
@@ -798,12 +894,16 @@ pub fn try_compile_participation_capture_bridge(
         || artifact.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
         || artifact.bundle().is_empty()
     {
-        return Err("participation artifact failed object/receipt authentication".to_owned());
+        return Err(ParticipationCaptureBridgeError::Terminal(
+            "participation artifact failed object/receipt authentication".to_owned(),
+        ));
     }
     let receipt = artifact.native_receipt();
     if receipt.strategy == NativeParticipationAotStrategyV1::NegativeEntry {
         let decline = receipt.decline.ok_or_else(|| {
-            "negative participation artifact omitted its semantic decline".to_owned()
+            ParticipationCaptureBridgeError::Terminal(
+                "negative participation artifact omitted its semantic decline".to_owned(),
+            )
         })?;
         return Ok(ParticipationCaptureBridgeDisposition::Declined {
             reason: format!("{decline:?}"),
@@ -821,7 +921,11 @@ pub fn try_compile_participation_capture_bridge(
         .symbols()
         .iter()
         .find(|symbol| symbol.name == selector)
-        .ok_or_else(|| "participation selector has no public symbol record".to_owned())?;
+        .ok_or_else(|| {
+            ParticipationCaptureBridgeError::Terminal(
+                "participation selector has no public symbol record".to_owned(),
+            )
+        })?;
     let unresolved = module.symbols().iter().enumerate().any(|(index, symbol)| {
         symbol.section.is_none()
             && module
@@ -859,14 +963,64 @@ pub fn try_compile_participation_capture_bridge(
         || entry.section.is_none()
         || entry.size == 0
     {
-        return Err(
+        return Err(ParticipationCaptureBridgeError::Terminal(
             "participation artifact is not a helper-free native DFA selector/replay closure"
                 .to_owned(),
-        );
+        ));
     }
     Ok(ParticipationCaptureBridgeDisposition::Selected(
         ParticipationCaptureBridge { artifact },
     ))
+}
+
+/// Select the one-source grep-captures negative-certificate adapter after the
+/// fixed direct-participation construction envelope has been exhausted.
+///
+/// The selector was produced by the same parsed-HIR uniform transaction and
+/// is re-authenticated here. It is authoritative only for proving that an
+/// LF-free line has no match. Positive lines are deliberately outside this
+/// artifact and must enter the separately declared exact stock capture route.
+pub fn compile_selector_capture_fallback_bridge(
+    benchmark: &Benchmark,
+    selector: NativeRowArtifact,
+    direct_participation: ParticipationDfaEnvelopeExhaustion,
+) -> Result<SelectorCaptureFallbackBridge, String> {
+    if benchmark.model != Model::GrepCaptures || benchmark.patterns.len() != 1 {
+        return Err("selector-first capture fallback requires one-source grep-captures".to_owned());
+    }
+    if selector.first_source_ordinal != 0 {
+        return Err("selector-first capture fallback lost source ordinal zero".to_owned());
+    }
+    authenticate_native_row(&selector.compiled, 0)?;
+    let total_object_bytes = selector.compiled.object().len();
+    if total_object_bytes == 0 || total_object_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES {
+        return Err(format!(
+            "selector-first capture object requires {total_object_bytes} bytes, limit is {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES}"
+        ));
+    }
+    let exact_limit = match direct_participation.resource {
+        NativeParticipationAotResourceV1::DfaStates => {
+            direct_participation.limit == REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES
+        }
+        NativeParticipationAotResourceV1::BuildWork => {
+            direct_participation.limit == REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK
+        }
+        _ => false,
+    };
+    if !exact_limit || direct_participation.required != direct_participation.limit.saturating_add(1)
+    {
+        return Err(
+            "selector-first capture fallback received an inexact construction decline".to_owned(),
+        );
+    }
+    Ok(SelectorCaptureFallbackBridge {
+        rows: NativeRowBridge {
+            artifacts: vec![selector],
+            source_to_artifact: vec![0],
+            total_object_bytes,
+        },
+        direct_participation,
+    })
 }
 
 /// Compile the typed one-source Rebar capture route after a semantic decline
@@ -929,6 +1083,11 @@ pub enum UniformCaptureBridgeDisposition {
     Declined {
         source_ordinal: usize,
         reason: String,
+        /// The exact helper-free selector emitted from the same parsed HIR as
+        /// an ordinary conservative proof decline. A prepared-selector
+        /// decline has no independently usable ordinary artifact. A later
+        /// adapter may consume `Some` only under independent authentication.
+        selector: Option<NativeRowArtifact>,
     },
 }
 
@@ -952,6 +1111,7 @@ pub fn compile_uniform_capture_bridge(
         UniformCaptureBridgeDisposition::Declined {
             source_ordinal,
             reason,
+            ..
         } => Err(format!(
             "uniform-capture proof declined at source ordinal {source_ordinal}: {reason}"
         )),
@@ -1100,6 +1260,7 @@ pub fn try_compile_uniform_capture_bridge(
                         return Ok(UniformCaptureBridgeDisposition::Declined {
                             source_ordinal,
                             reason: format!("{reason:?}"),
+                            selector: None,
                         });
                     }
                 }
@@ -1124,9 +1285,14 @@ pub fn try_compile_uniform_capture_bridge(
         let proof = match disposition {
             UniformCaptureCompileDisposition::Proven(receipt) => receipt,
             UniformCaptureCompileDisposition::Declined(reason) => {
+                authenticate_native_row(&selector, source_ordinal)?;
                 return Ok(UniformCaptureBridgeDisposition::Declined {
                     source_ordinal,
                     reason: format!("{reason:?}"),
+                    selector: Some(NativeRowArtifact {
+                        compiled: selector,
+                        first_source_ordinal: source_ordinal,
+                    }),
                 });
             }
         };
@@ -2184,6 +2350,95 @@ mod tests {
             &allocation,
             default_limit
         ));
+
+        let exhausted_states = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::DfaStates,
+                required: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES + 1,
+                limit: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
+            },
+        );
+        assert_eq!(
+            participation_dfa_envelope_exhaustion(&exhausted_states),
+            Some(ParticipationDfaEnvelopeExhaustion {
+                resource: NativeParticipationAotResourceV1::DfaStates,
+                required: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES + 1,
+                limit: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
+            })
+        );
+        let exhausted_work = RebarSingleCaptureParticipationAotErrorV1::Participation(
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::BuildWork,
+                required: REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK + 1,
+                limit: REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK,
+            },
+        );
+        assert!(participation_dfa_envelope_exhaustion(&exhausted_work).is_some());
+        assert!(participation_dfa_envelope_exhaustion(&exact_state_cap).is_none());
+        assert!(participation_dfa_envelope_exhaustion(&allocation).is_none());
+    }
+
+    #[test]
+    fn selector_capture_fallback_reuses_the_uniform_transaction_selector() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let benchmark = Benchmark::parse(&fixture("grep-captures", b"(a)?b", b"no\nab"))
+            .expect("selector fallback fixture");
+        let UniformCaptureBridgeDisposition::Declined {
+            source_ordinal,
+            selector,
+            ..
+        } = try_compile_uniform_capture_bridge(&benchmark, target)
+            .expect("uniform compiler publishes its semantic decline")
+        else {
+            panic!("fixture unexpectedly proved uniform participation");
+        };
+        assert_eq!(source_ordinal, 0);
+        let exhaustion = ParticipationDfaEnvelopeExhaustion {
+            resource: NativeParticipationAotResourceV1::DfaStates,
+            required: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES + 1,
+            limit: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
+        };
+        let bridge = compile_selector_capture_fallback_bridge(
+            &benchmark,
+            selector.expect("ordinary semantic decline retains its selector"),
+            exhaustion,
+        )
+        .expect("authenticated selector-first bridge");
+        assert_eq!(bridge.rows.artifacts.len(), 1);
+        assert_eq!(bridge.rows.source_to_artifact, [0]);
+        assert_eq!(bridge.direct_participation, exhaustion);
+        authenticate_native_row(&bridge.rows.artifacts[0].compiled, 0)
+            .expect("retained helper-free selector");
+
+        let wrong_limit = ParticipationDfaEnvelopeExhaustion {
+            resource: NativeParticipationAotResourceV1::DfaStates,
+            required: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
+            limit: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES - 1,
+        };
+        assert!(
+            compile_selector_capture_fallback_bridge(
+                &benchmark,
+                bridge.rows.artifacts[0].clone(),
+                wrong_limit,
+            )
+            .is_err()
+        );
+
+        let count_benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab"))
+            .expect("count capture fixture");
+        assert!(
+            compile_selector_capture_fallback_bridge(
+                &count_benchmark,
+                bridge.rows.artifacts.into_iter().next().expect("one row"),
+                exhaustion,
+            )
+            .is_err()
+        );
     }
 
     #[test]

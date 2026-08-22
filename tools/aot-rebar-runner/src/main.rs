@@ -8,6 +8,7 @@ use std::{
     fmt::Write as _,
     hint::black_box,
     io::{self, Read, Write},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -829,6 +830,71 @@ fn strict_participation_capture_reduce(
     }
 }
 
+fn strict_selector_capture_grep_reduce_with(
+    haystack: &[u8],
+    mut search: impl FnMut(&[u8], &mut FreAotRegexResultV1) -> Result<u32, String>,
+    mut positive_capture_fallback: impl FnMut(&[u8]) -> Result<u64, String>,
+) -> Result<u64, String> {
+    haystack.lines().try_fold(0_u64, |total, line| {
+        let mut selected = FreAotRegexResultV1 {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        let count = match search(line, &mut selected)? {
+            STATUS_NO_MATCH => 0,
+            STATUS_MATCH => {
+                validate_span(selected, line.len())?;
+                positive_capture_fallback(line)?
+            }
+            status => {
+                return Err(format!(
+                    "selector-first capture entry returned status {status}"
+                ));
+            }
+        };
+        total
+            .checked_add(count)
+            .ok_or_else(|| "selector-first grep-captures count overflowed".to_owned())
+    })
+}
+
+static SELECTOR_CAPTURE_POSITIVE_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Statically visible positive-route marker. The atomic side effect keeps the
+/// call observable to qualification tooling even under optimization; the
+/// actual fallback immediately following it is the exact pinned stock capture
+/// implementation.
+#[allow(
+    unsafe_code,
+    reason = "the stable exported marker makes the mixed positive fallback route visible to static and trap qualification"
+)]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn fre_aot_rebar_runner_stock_capture_positive_fallback_v1() {
+    SELECTOR_CAPTURE_POSITIVE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generated row-zero declaration is the authenticated helper-free Span selector ABI"
+)]
+fn strict_linked_selector_capture_grep(haystack: &[u8], stock: &Regex) -> Result<u64, String> {
+    strict_selector_capture_grep_reduce_with(
+        haystack,
+        |line, result| {
+            // SAFETY: route authentication binds row zero to the exact
+            // helper-free selector for the same one-source stock profile.
+            let status =
+                unsafe { linked::search_row(0, line.as_ptr(), line.len(), 0, line.len(), result) };
+            Ok(status)
+        },
+        |line| {
+            fre_aot_rebar_runner_stock_capture_positive_fallback_v1();
+            stock_capture_count_domain(stock, line)
+        },
+    )
+}
+
 fn validate_strict_capture_state(
     state: FreAotRegexIterStateV1,
     haystack_len: usize,
@@ -1126,6 +1192,34 @@ fn print_provenance() {
         );
         return;
     }
+    if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        println!(
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=false selector_capture_fallback_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-selector-negative-certificate-with-stock-positive-capture-fallback-v1 positive_fallback_profile={} positive_fallback_symbol={} direct_participation_resource={} direct_participation_required={} direct_participation_limit={} boundary=per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            linked::CONFIGURED,
+            linked::ADAPTER,
+            linked::EXPECTED_MODEL,
+            linked::EXPECTED_NAME,
+            linked::SOURCE_COMMIT,
+            linked::SOURCE_TREE,
+            linked::TARGET_ARCH,
+            linked::TARGET_OS,
+            linked::FEATURE_BITS,
+            linked::COMPILER_VERSION,
+            linked::OPTIMIZER_VERSION,
+            linked::ENGINE,
+            linked::AGGREGATE_STRATEGY,
+            linked::ROW_TOTAL_OBJECT_BYTES,
+            linked::ROW_ENTRY_SYMBOLS[0],
+            hex(&linked::ROW_PROGRAM_SHA256[0]),
+            hex(&linked::ROW_OBJECT_SHA256[0]),
+            linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE,
+            linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL,
+            linked::SELECTOR_CAPTURE_DIRECT_RESOURCE,
+            linked::SELECTOR_CAPTURE_DIRECT_REQUIRED,
+            linked::SELECTOR_CAPTURE_DIRECT_LIMIT,
+        );
+        return;
+    }
     if linked::PARTICIPATION_CAPTURE_BRIDGE {
         println!(
             "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-exact-span-participation-dfa-v1 capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators=rust-regex-1.12.4,fre-current-runtime",
@@ -1400,7 +1494,10 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     let prepared_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
-    if (linked::STRICT_CAPTURE_BRIDGE || linked::PARTICIPATION_CAPTURE_BRIDGE)
+    if ((!prepared_uniform_capture && linked::UNIFORM_CAPTURE_BRIDGE)
+        || linked::STRICT_CAPTURE_BRIDGE
+        || linked::PARTICIPATION_CAPTURE_BRIDGE
+        || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE)
         && !linked::NATIVE_ROW_BRIDGE
     {
         return Err("capture receipt is not attached to a native operation route".to_owned());
@@ -1408,6 +1505,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if usize::from(linked::UNIFORM_CAPTURE_BRIDGE)
         + usize::from(linked::STRICT_CAPTURE_BRIDGE)
         + usize::from(linked::PARTICIPATION_CAPTURE_BRIDGE)
+        + usize::from(linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE)
         > 1
     {
         return Err("linked capture routes are not mutually exclusive".to_owned());
@@ -1415,7 +1513,8 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if benchmark.model.is_capture()
         != (linked::UNIFORM_CAPTURE_BRIDGE
             || linked::STRICT_CAPTURE_BRIDGE
-            || linked::PARTICIPATION_CAPTURE_BRIDGE)
+            || linked::PARTICIPATION_CAPTURE_BRIDGE
+            || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE)
     {
         return Err("capture operation and linked native route disagree".to_owned());
     }
@@ -1624,7 +1723,22 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const GREP_PARTICIPATION_STRATEGY: &str = "per-line-native-exact-span-participation-dfa-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
-    if linked::PARTICIPATION_CAPTURE_BRIDGE {
+    const SELECTOR_FALLBACK_STRATEGY: &str =
+        "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1";
+    const GREP_SELECTOR_FALLBACK_STRATEGY: &str =
+        "per-line-native-selector-negative-certificate-stock-positive-capture-fallback-v1";
+    if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        if benchmark.model != shared::Model::GrepCaptures
+            || benchmark.patterns.len() != 1
+            || linked::UNIFORM_CAPTURE_BRIDGE
+            || linked::STRICT_CAPTURE_BRIDGE
+            || linked::PARTICIPATION_CAPTURE_BRIDGE
+        {
+            return Err(
+                "linked selector-first capture route has the wrong operation shape".to_owned(),
+            );
+        }
+    } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
         if !benchmark.model.is_capture()
             || benchmark.patterns.len() != 1
             || linked::UNIFORM_CAPTURE_BRIDGE
@@ -1682,7 +1796,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden prepared/helper route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::PARTICIPATION_CAPTURE_BRIDGE {
+    let expected_aggregate_strategy = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        SELECTOR_FALLBACK_STRATEGY
+    } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
         PARTICIPATION_STRATEGY
     } else if linked::STRICT_CAPTURE_BRIDGE {
         "native-single-capture-next-participation-v1"
@@ -1698,18 +1814,20 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else {
         "not-applicable"
     };
-    let expected_grep_strategy =
-        if linked::PARTICIPATION_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
-            GREP_PARTICIPATION_STRATEGY
-        } else if linked::STRICT_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
-            "per-line-native-single-capture-next-v1"
-        } else if benchmark.model == shared::Model::GrepCaptures {
-            GREP_CAPTURE_STRATEGY
-        } else if benchmark.model == shared::Model::GrepCount {
-            GREP_ROW_STRATEGY
-        } else {
-            "not-applicable"
-        };
+    let expected_grep_strategy = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        GREP_SELECTOR_FALLBACK_STRATEGY
+    } else if linked::PARTICIPATION_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures
+    {
+        GREP_PARTICIPATION_STRATEGY
+    } else if linked::STRICT_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures {
+        "per-line-native-single-capture-next-v1"
+    } else if benchmark.model == shared::Model::GrepCaptures {
+        GREP_CAPTURE_STRATEGY
+    } else if benchmark.model == shared::Model::GrepCount {
+        GREP_ROW_STRATEGY
+    } else {
+        "not-applicable"
+    };
     if linked::AGGREGATE_STRATEGY != expected_aggregate_strategy
         || linked::SPAN_ITERATION_STRATEGY != expected_span_strategy
         || linked::GREP_ITERATION_STRATEGY != expected_grep_strategy
@@ -1894,6 +2012,43 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || !linked::PARTICIPATION_ENTRY_SYMBOL.is_empty()
     {
         return Err("non-participation route advertises participation state".to_owned());
+    }
+
+    if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        let expected_limit = match linked::SELECTOR_CAPTURE_DIRECT_RESOURCE {
+            "DfaStates" => shared::REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
+            "BuildWork" => shared::REBAR_PARTICIPATION_RETRY_MAX_BUILD_WORK,
+            _ => {
+                return Err(
+                    "selector-first capture route has an unknown direct resource".to_owned(),
+                );
+            }
+        };
+        if linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL
+            != shared::REBAR_SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL
+            || linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE != "rust-regex-1.12.4-captures"
+            || linked::SELECTOR_CAPTURE_DIRECT_LIMIT != expected_limit
+            || linked::SELECTOR_CAPTURE_DIRECT_REQUIRED
+                != linked::SELECTOR_CAPTURE_DIRECT_LIMIT.saturating_add(1)
+            || linked::SOURCE_PATTERN_COUNT != 1
+            || linked::ROW_ARTIFACT_COUNT != 1
+            || linked::SOURCE_TO_ARTIFACT != [0]
+            || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+            || linked::ROW_TOTAL_OBJECT_BYTES == 0
+            || linked::ROW_ENTRY_SYMBOLS[0].is_empty()
+            || linked::OBJECT_SHA256 != linked::ROW_OBJECT_SHA256[0]
+            || linked::PROGRAM_SHA256 != linked::ROW_PROGRAM_SHA256[0]
+            || !linked::OBJECT_BYTES.is_empty()
+        {
+            return Err("linked selector-first capture identity closure is malformed".to_owned());
+        }
+    } else if !linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL.is_empty()
+        || !linked::SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE.is_empty()
+        || !linked::SELECTOR_CAPTURE_DIRECT_RESOURCE.is_empty()
+        || linked::SELECTOR_CAPTURE_DIRECT_REQUIRED != 0
+        || linked::SELECTOR_CAPTURE_DIRECT_LIMIT != 0
+    {
+        return Err("non-selector-fallback route advertises mixed capture state".to_owned());
     }
 
     let mut previous_first = None;
@@ -2093,8 +2248,18 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
     } else {
         Vec::new()
     };
+    let stock_positive_fallback = linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+        .then(|| compile_stock_rebar_regex(benchmark))
+        .transpose()?;
     let mut operation = |haystack: &[u8]| {
-        if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+            strict_linked_selector_capture_grep(
+                haystack,
+                stock_positive_fallback
+                    .as_ref()
+                    .ok_or_else(|| "selector-first route omitted its stock fallback".to_owned())?,
+            )
+        } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
             strict_participation_capture_reduce(benchmark.model, haystack)
         } else if linked::STRICT_CAPTURE_BRIDGE {
             strict_capture_reduce(benchmark.model, haystack, &mut capture_slots)
@@ -2112,6 +2277,8 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
             break;
         }
     }
+    let positive_fallback_calls_before_samples =
+        SELECTOR_CAPTURE_POSITIVE_FALLBACK_CALLS.load(Ordering::Relaxed);
 
     let capacity = usize::try_from(benchmark.max_iters)
         .unwrap_or(usize::MAX)
@@ -2128,6 +2295,20 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         });
         if run_start.elapsed() >= benchmark.max_time {
             break;
+        }
+    }
+    if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+        let positive_fallback_calls = SELECTOR_CAPTURE_POSITIVE_FALLBACK_CALLS
+            .load(Ordering::Relaxed)
+            .checked_sub(positive_fallback_calls_before_samples)
+            .ok_or_else(|| {
+                "selector-first positive fallback marker counter regressed".to_owned()
+            })?;
+        let published_positive = samples.iter().any(|sample| sample.value != 0);
+        if (positive_fallback_calls != 0) != published_positive {
+            return Err(format!(
+                "selector-first mixed-route receipt is inconsistent: positive_fallback_calls={positive_fallback_calls} published_positive={published_positive}"
+            ));
         }
     }
     Ok(samples)
@@ -2418,10 +2599,7 @@ fn rust_regex_redux_oracle(haystack: &[u8]) -> Result<RegexReduxStageReceipt, St
     })
 }
 
-fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
-    if benchmark.model == shared::Model::RegexRedux {
-        return rust_regex_redux_oracle(&benchmark.haystack).map(|receipt| receipt.final_length);
-    }
+fn compile_stock_rebar_regex(benchmark: &shared::Benchmark) -> Result<Regex, String> {
     let config = Regex::config()
         .utf8_empty(false)
         .nfa_size_limit(Some(104_857_600));
@@ -2429,25 +2607,33 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
         .utf8(false)
         .unicode(benchmark.unicode)
         .case_insensitive(benchmark.case_insensitive);
-    let regex = Regex::builder()
+    Regex::builder()
         .configure(config)
         .syntax(syntax)
         .build_many(&benchmark.patterns)
-        .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))?;
-    let count_capture_domain = |haystack: &[u8]| -> Result<u64, String> {
-        regex
-            .captures_iter(Input::new(haystack))
-            .try_fold(0_u64, |mut count, captures| {
-                for group in 0..captures.group_len() {
-                    if captures.get_group(group).is_some() {
-                        count = count
-                            .checked_add(1)
-                            .ok_or_else(|| "Rust Rebar capture oracle overflow".to_owned())?;
-                    }
+        .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))
+}
+
+fn stock_capture_count_domain(regex: &Regex, haystack: &[u8]) -> Result<u64, String> {
+    regex
+        .captures_iter(Input::new(haystack))
+        .try_fold(0_u64, |mut count, captures| {
+            for group in 0..captures.group_len() {
+                if captures.get_group(group).is_some() {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| "Rust Rebar capture oracle overflow".to_owned())?;
                 }
-                Ok(count)
-            })
-    };
+            }
+            Ok(count)
+        })
+}
+
+fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
+    if benchmark.model == shared::Model::RegexRedux {
+        return rust_regex_redux_oracle(&benchmark.haystack).map(|receipt| receipt.final_length);
+    }
+    let regex = compile_stock_rebar_regex(benchmark)?;
     match benchmark.model {
         shared::Model::Compile | shared::Model::Count => {
             u64::try_from(regex.find_iter(&benchmark.haystack).count())
@@ -2463,7 +2649,7 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
                         .ok_or_else(|| "Rust Rebar SpanSum oracle overflow".to_owned())
                 })
         }
-        shared::Model::CountCaptures => count_capture_domain(&benchmark.haystack),
+        shared::Model::CountCaptures => stock_capture_count_domain(&regex, &benchmark.haystack),
         shared::Model::GrepCount => benchmark.haystack.lines().try_fold(0_u64, |count, line| {
             if regex.is_match(line) {
                 count
@@ -2475,7 +2661,7 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
         }),
         shared::Model::GrepCaptures => benchmark.haystack.lines().try_fold(0_u64, |count, line| {
             count
-                .checked_add(count_capture_domain(line)?)
+                .checked_add(stock_capture_count_domain(&regex, line)?)
                 .ok_or_else(|| "Rust Rebar grep-captures oracle overflow".to_owned())
         }),
         shared::Model::RegexRedux => unreachable!("regex-redux oracle returned above"),
@@ -2827,6 +3013,84 @@ mod tests {
             return Err("selector published fewer spans than capture oracle".to_owned());
         }
         Ok(total)
+    }
+
+    #[test]
+    fn selector_first_capture_fallback_skips_negatives_and_fails_closed() {
+        let selector = byte_regex(r"(a)(b)?");
+        let stock = byte_regex(r"(a)(b)?");
+        let mut positive_calls = 0_usize;
+        let actual = strict_selector_capture_grep_reduce_with(
+            b"no\nab\nx\naba",
+            |line, result| {
+                if let Some(matched) = selector.find(line) {
+                    *result = FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    };
+                    Ok(STATUS_MATCH)
+                } else {
+                    Ok(STATUS_NO_MATCH)
+                }
+            },
+            |line| {
+                positive_calls += 1;
+                stock_capture_count_domain(&stock, line)
+            },
+        )
+        .expect("selector-first exact positive fallback");
+        assert_eq!(actual, 8);
+        assert_eq!(positive_calls, 2);
+
+        let cross_line = byte_regex("a\\nb");
+        let mut impossible_fallback_calls = 0_usize;
+        assert_eq!(
+            strict_selector_capture_grep_reduce_with(
+                b"a\nb\nnone",
+                |line, result| {
+                    if let Some(matched) = cross_line.find(line) {
+                        *result = FreAotRegexResultV1 {
+                            start: matched.start(),
+                            end: matched.end(),
+                        };
+                        Ok(STATUS_MATCH)
+                    } else {
+                        Ok(STATUS_NO_MATCH)
+                    }
+                },
+                |_line| {
+                    impossible_fallback_calls += 1;
+                    Ok(99)
+                },
+            ),
+            Ok(0),
+        );
+        assert_eq!(impossible_fallback_calls, 0);
+
+        let mut fallback_calls = 0_usize;
+        assert!(
+            strict_selector_capture_grep_reduce_with(
+                b"line",
+                |_line, _result| Ok(STATUS_INVALID_ARGUMENT),
+                |_line| {
+                    fallback_calls += 1;
+                    Ok(1)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(fallback_calls, 0);
+        assert!(
+            strict_selector_capture_grep_reduce_with(
+                b"line",
+                |_line, result| {
+                    *result = FreAotRegexResultV1 { start: 0, end: 5 };
+                    Ok(STATUS_MATCH)
+                },
+                |_line| Ok(1),
+            )
+            .is_err()
+        );
     }
 
     #[test]
