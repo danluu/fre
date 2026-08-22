@@ -450,6 +450,21 @@ pub struct UniformCaptureBridge {
     pub source_receipts: Vec<UniformCaptureCompileReceipt>,
 }
 
+/// Build-time result that keeps a semantic theorem decline distinct from a
+/// terminal parse, lowering, allocation, authentication, or object failure.
+///
+/// Capture adapters may try another independently authenticated native route
+/// only for `Declined`. An `Err` remains terminal and must never be converted
+/// into a fallback.
+#[derive(Debug)]
+pub enum UniformCaptureBridgeDisposition {
+    Proven(UniformCaptureBridge),
+    Declined {
+        source_ordinal: usize,
+        reason: String,
+    },
+}
+
 /// Compile one helper-free native selector per distinct row and prove that
 /// every source has one positive, source-independent capture multiplier.
 ///
@@ -461,6 +476,22 @@ pub fn compile_uniform_capture_bridge(
     benchmark: &Benchmark,
     target: Target,
 ) -> Result<UniformCaptureBridge, String> {
+    match try_compile_uniform_capture_bridge(benchmark, target)? {
+        UniformCaptureBridgeDisposition::Proven(bridge) => Ok(bridge),
+        UniformCaptureBridgeDisposition::Declined {
+            source_ordinal,
+            reason,
+        } => Err(format!(
+            "uniform-capture proof declined at source ordinal {source_ordinal}: {reason}"
+        )),
+    }
+}
+
+/// Compile the uniform route while preserving its sole nonterminal outcome.
+pub fn try_compile_uniform_capture_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<UniformCaptureBridgeDisposition, String> {
     if !benchmark.uses_uniform_capture_bridge() || !benchmark.model.is_capture() {
         return Err(
             "uniform-capture bridge compilation requires count-captures or grep-captures"
@@ -528,9 +559,10 @@ pub fn compile_uniform_capture_bridge(
         let proof = match disposition {
             UniformCaptureCompileDisposition::Proven(receipt) => receipt,
             UniformCaptureCompileDisposition::Declined(reason) => {
-                return Err(format!(
-                    "uniform-capture proof declined at source ordinal {source_ordinal}: {reason:?}"
-                ));
+                return Ok(UniformCaptureBridgeDisposition::Declined {
+                    source_ordinal,
+                    reason: format!("{reason:?}"),
+                });
             }
         };
         proof.authenticate(&selector).map_err(|error| {
@@ -601,14 +633,16 @@ pub fn compile_uniform_capture_bridge(
         source_receipts.push(proof);
     }
 
-    Ok(UniformCaptureBridge {
-        rows: NativeRowBridge {
-            artifacts,
-            source_to_artifact,
-            total_object_bytes,
+    Ok(UniformCaptureBridgeDisposition::Proven(
+        UniformCaptureBridge {
+            rows: NativeRowBridge {
+                artifacts,
+                source_to_artifact,
+                total_object_bytes,
+            },
+            source_receipts,
         },
-        source_receipts,
-    })
+    ))
 }
 
 /// Compile and authenticate one ordinary native `Span` object per distinct row.
@@ -1065,6 +1099,13 @@ mod tests {
         for pattern in [b"(a)?b".as_slice(), b"(a)*".as_slice()] {
             let benchmark = Benchmark::parse(&fixture("count-captures", pattern, b"aa b"))
                 .expect("decline fixture");
+            assert!(matches!(
+                try_compile_uniform_capture_bridge(&benchmark, target),
+                Ok(UniformCaptureBridgeDisposition::Declined {
+                    source_ordinal: 0,
+                    ..
+                })
+            ));
             let error = compile_uniform_capture_bridge(&benchmark, target)
                 .expect_err("a semantic decline rejects the complete job");
             assert!(error.contains("source ordinal 0"), "{error}");
