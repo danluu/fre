@@ -2304,22 +2304,35 @@ def marker_patch_evidence_pass(
 ) -> bool:
     expected_after = TRAP_PATCHES.get(expected_architecture)
     armed = marker.get("armed")
-    return (
-        expected_after is not None
-        and marker.get("architecture") == expected_architecture
-        and isinstance(armed, list)
-        and all(
-            isinstance(record, dict)
-            and record.get("after") == expected_after
-            and isinstance(record.get("before"), str)
-            and len(record["before"]) == len(expected_after)
-            and re.fullmatch(r"[0-9a-f]+", record["before"]) is not None
-            and record["before"] != expected_after
-            and isinstance(record.get("offset"), str)
-            and re.fullmatch(r"0x[0-9a-f]+", record["offset"]) is not None
-            for record in armed
-        )
-    )
+    if (
+        expected_after is None
+        or marker.get("architecture") != expected_architecture
+        or not isinstance(armed, list)
+    ):
+        return False
+    seen_offsets: set[str] = set()
+    for record in armed:
+        if not isinstance(record, dict):
+            return False
+        before = record.get("before")
+        offset = record.get("offset")
+        if (
+            record.get("after") != expected_after
+            or not isinstance(before, str)
+            or len(before) != len(expected_after)
+            or re.fullmatch(r"[0-9a-f]+", before) is None
+            or not isinstance(offset, str)
+            or re.fullmatch(r"0x(?:0|[1-9a-f][0-9a-f]*)", offset) is None
+        ):
+            return False
+        if offset in seen_offsets:
+            if before != expected_after:
+                return False
+        else:
+            if before == expected_after:
+                return False
+            seen_offsets.add(offset)
+    return True
 
 
 def semantic_helper_control_pass(

@@ -193,7 +193,14 @@ Three fresh processes authenticate each job:
 2. When semantic helpers or a declared conditional stock-fallback marker
    exist, a copy with every such symbol armed must still exit zero. The marker
    records every image-relative patch offset and before/after instruction
-   bytes. An independently empty final-binary helper inventory is itself the
+   bytes. Repeated exact offset strings within one marker retain their closed
+   symbol order and count: the first record at an offset must authenticate
+   non-trap original bytes, while every later record at that exact offset must
+   observe the trap bytes installed by the first record. This is sequential
+   patch evidence for the closed marker, not a general cross-image identity
+   claim based on equal numeric offsets. A trap in the first record, a second
+   set of non-trap bytes, or a non-canonical offset is rejected. An
+   independently empty final-binary helper inventory is itself the
    closed proof surface and does not manufacture a trap phase. For the mixed
    selector-capture route, reaching the stock fallback trap makes that job
    nonnative without compromising its stock-oracle correctness result.

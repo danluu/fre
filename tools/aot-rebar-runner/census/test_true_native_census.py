@@ -2135,6 +2135,144 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(marker["armed"][0]["offset"], "0x1234")
         self.assertEqual(marker["triggered"], "fre_aot_regex_search_v1_deadbeef")
 
+        helpers = [
+            "fre_aot_regex_runtime_helper_alpha",
+            "fre_aot_regex_runtime_helper_alias",
+            "fre_aot_regex_runtime_helper_second_alias",
+        ]
+        helper_phase = {
+            "outcome": "exit",
+            "returncode": 0,
+            "stdout_bytes": 0,
+            "stdout_sha256": CENSUS.sha_bytes(b""),
+            "stderr_bytes": 0,
+            "stderr_sha256": CENSUS.sha_bytes(b""),
+        }
+        alias_marker = {
+            "status": "valid",
+            "sha256": "d" * 64,
+            "kind": "semantic-helpers",
+            "architecture": "aarch64",
+            "installed": 3,
+            "expected": 3,
+            "armed": [
+                {
+                    "symbol": helpers[0],
+                    "offset": "0x100",
+                    "before": "fd7bbfa9",
+                    "after": "000020d4",
+                },
+                {
+                    "symbol": helpers[1],
+                    "offset": "0x100",
+                    "before": "000020d4",
+                    "after": "000020d4",
+                },
+                {
+                    "symbol": helpers[2],
+                    "offset": "0x100",
+                    "before": "000020d4",
+                    "after": "000020d4",
+                },
+            ],
+            "triggered": None,
+            "completed": "normal",
+        }
+        self.assertTrue(CENSUS.marker_patch_evidence_pass(alias_marker, "aarch64"))
+        self.assertTrue(CENSUS.semantic_helper_control_pass(
+            helpers, helper_phase, alias_marker, "aarch64"
+        ))
+
+        for triggered in (helpers[0], helpers[1], "unowned-signal"):
+            with self.subTest(triggered=triggered):
+                triggered_marker = copy.deepcopy(alias_marker)
+                triggered_marker["triggered"] = triggered
+                triggered_marker["completed"] = None
+                self.assertFalse(CENSUS.semantic_helper_control_pass(
+                    helpers, helper_phase, triggered_marker, "aarch64"
+                ))
+
+        x86_alias_marker = copy.deepcopy(alias_marker)
+        x86_alias_marker["architecture"] = "x86_64"
+        x86_alias_marker["installed"] = 2
+        x86_alias_marker["expected"] = 2
+        x86_alias_marker["armed"] = x86_alias_marker["armed"][:2]
+        x86_alias_marker["armed"][0]["before"] = "5548"
+        x86_alias_marker["armed"][0]["after"] = "0f0b"
+        x86_alias_marker["armed"][1]["before"] = "0f0b"
+        x86_alias_marker["armed"][1]["after"] = "0f0b"
+        self.assertTrue(CENSUS.marker_patch_evidence_pass(
+            x86_alias_marker, "x86_64"
+        ))
+        self.assertTrue(CENSUS.semantic_helper_control_pass(
+            helpers[:2], helper_phase, x86_alias_marker, "x86_64"
+        ))
+
+        first_record_is_trap = copy.deepcopy(alias_marker)
+        first_record_is_trap["armed"][0]["before"] = "000020d4"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            first_record_is_trap, "aarch64"
+        ))
+
+        second_record_is_not_trap = copy.deepcopy(alias_marker)
+        second_record_is_not_trap["armed"][1]["before"] = "a57bbfa9"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            second_record_is_not_trap, "aarch64"
+        ))
+
+        trap_at_new_offset = copy.deepcopy(alias_marker)
+        trap_at_new_offset["armed"][1]["offset"] = "0x101"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            trap_at_new_offset, "aarch64"
+        ))
+
+        reordered_alias = copy.deepcopy(alias_marker)
+        reordered_alias["armed"].reverse()
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            reordered_alias, "aarch64"
+        ))
+
+        noncanonical_offset = copy.deepcopy(alias_marker)
+        noncanonical_offset["armed"][1]["offset"] = "0x0100"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            noncanonical_offset, "aarch64"
+        ))
+
+        malformed_first_record = copy.deepcopy(alias_marker)
+        malformed_first_record["armed"][0]["before"] = "nothex!!"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            malformed_first_record, "aarch64"
+        ))
+
+        wrong_first_patch = copy.deepcopy(alias_marker)
+        wrong_first_patch["armed"][0]["after"] = "fd7bbfa9"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            wrong_first_patch, "aarch64"
+        ))
+
+        wrong_patch = copy.deepcopy(alias_marker)
+        wrong_patch["armed"][1]["after"] = "fd7bbfa9"
+        self.assertFalse(CENSUS.marker_patch_evidence_pass(
+            wrong_patch, "aarch64"
+        ))
+
+        wrong_symbol_order = copy.deepcopy(alias_marker)
+        wrong_symbol_order["armed"][0]["symbol"] = helpers[1]
+        wrong_symbol_order["armed"][1]["symbol"] = helpers[0]
+        self.assertTrue(CENSUS.marker_patch_evidence_pass(
+            wrong_symbol_order, "aarch64"
+        ))
+        self.assertFalse(CENSUS.semantic_helper_control_pass(
+            helpers, helper_phase, wrong_symbol_order, "aarch64"
+        ))
+
+        wrong_count = copy.deepcopy(alias_marker)
+        wrong_count["installed"] = 1
+        self.assertTrue(CENSUS.marker_patch_evidence_pass(wrong_count, "aarch64"))
+        self.assertFalse(CENSUS.semantic_helper_control_pass(
+            helpers, helper_phase, wrong_count, "aarch64"
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
