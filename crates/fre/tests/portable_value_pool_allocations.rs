@@ -131,3 +131,30 @@ fn ordinary_k0_calls_reuse_scratch_without_allocating_after_warmup() {
     }
     assert_eq!(warm.change(), Stats::default());
 }
+
+#[test]
+fn ordinary_prepared_k0_exists_is_allocation_free_after_warmup() {
+    let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .unwrap();
+    let missing = vec![b'x'; 128];
+    let mut matching = missing.clone();
+    matching.extend_from_slice(b"abacabacz");
+
+    // The first pass constructs and fills the matcher-owned workspace. The
+    // second pass proves both source outcomes can use its prepared rows before
+    // allocation accounting begins.
+    assert!(regex.is_match(&matching));
+    assert!(!regex.is_match(&missing));
+    assert!(regex.is_match(&matching));
+    assert!(!regex.is_match(&missing));
+
+    let warm = Region::new(GLOBAL);
+    for _ in 0..64 {
+        assert!(regex.is_match(&matching));
+        assert!(!regex.is_match(&missing));
+    }
+    assert_eq!(warm.change(), Stats::default());
+}

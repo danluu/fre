@@ -1145,6 +1145,132 @@ impl Automaton {
         .is_some_and(|result| result.is_ok())
     }
 
+    /// Return whether the immutable start proof admits the ordinary prepared
+    /// projection's first scanner set.
+    ///
+    /// `false` is a performance-policy decline. The facade must use canonical
+    /// execution, which may initialize a proof that makes a later call
+    /// eligible. Workspace identity and row completeness are authenticated
+    /// separately inside the borrowed execution entry.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn can_use_pooled_ordinary_exists_projection(&self) -> bool {
+        crate::k0::can_prepare_ordinary_exists_projection(self)
+    }
+
+    /// Return whether an already-populated value pool and immutable start
+    /// proof admit the compact ordinary prepared Exists policy.
+    ///
+    /// This read-only facade gate accepts only one-, two- or three-byte start
+    /// scanners. It deliberately borrows the private scanner discriminant:
+    /// the wider classifier payload is neither copied nor exposed. A false
+    /// result keeps the caller on canonical pooled execution. A true result
+    /// remains only a performance hint; the borrowed execution entry repeats
+    /// every workspace and row authentication before reading source.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn can_use_pooled_compact_ordinary_exists_projection(&self) -> bool {
+        self.pooled_workspace.get().is_some()
+            && crate::k0::can_prepare_compact_ordinary_exists_projection(self)
+    }
+
+    /// Search ordinary Rust-style existence through the automaton-owned
+    /// workspace, allowing a fully prepared direct-row hit to omit canonical
+    /// per-invocation limits and accounting.
+    ///
+    /// See [`Self::can_use_pooled_ordinary_exists_projection`] for the
+    /// read-only facade admission check. This entry repeats every proof while
+    /// authenticating the borrowed workspace, so concurrent initialization or
+    /// a stale facade observation can only decline to canonical execution.
+    /// It is intentionally distinct from
+    /// [`Self::search_window_with_optional_pooled_exists_value`]: explicit
+    /// value calls carrying [`SearchLimits::unlimited`] stay canonical.
+    ///
+    /// A cold workspace, cache hole, or unsupported shape replays canonical
+    /// unlimited K0 from the original window. `Ok(None)` means optional
+    /// workspace construction was unavailable; an actual result is wrapped in
+    /// `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if authenticated execution or canonical replay
+    /// fails. Unlimited optional construction failure remains `Ok(None)`.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_ordinary_exists_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<bool>, SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let workspace_limits =
+            Self::pooled_workspace_limits_for_search(workspace_limits, SearchLimits::unlimited());
+        let warm = self.try_with_warm_owner_workspace(
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+            |workspace| {
+                crate::k0::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    Self::pooled_workspace_owner_bytes(),
+                )
+            },
+        );
+        if let Some(result) = warm {
+            return result.map(Some);
+        }
+        self.search_window_with_optional_pooled_ordinary_exists_value_slow(
+            haystack,
+            window,
+            workspace_limits,
+            endpoint_eligible,
+            bidirectional,
+        )
+    }
+
+    #[inline(never)]
+    fn search_window_with_optional_pooled_ordinary_exists_value_slow(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<bool>, SearchError> {
+        let Some(mut checkout) = (match self.try_checkout_pooled_workspace_with_setup(
+            workspace_limits,
+            u64::MAX,
+            endpoint_eligible,
+            bidirectional,
+        ) {
+            Ok(checkout) => checkout,
+            Err(_) => return Ok(None),
+        }) else {
+            return Ok(None);
+        };
+        let external_scratch_bytes = checkout.external_retained_scratch_bytes();
+        let result = crate::k0::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+            self,
+            haystack,
+            window,
+            &mut checkout,
+            external_scratch_bytes,
+        );
+        if result.is_ok() {
+            checkout.commit();
+        }
+        result.map(Some)
+    }
+
     /// Search for existence through the automaton-owned optional value-only
     /// workspace. The workspace is checked out only from this exact immutable
     /// automaton and is returned only after a successful execution.

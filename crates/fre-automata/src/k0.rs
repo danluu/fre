@@ -4322,6 +4322,70 @@ impl PreparedContextualSelfLoop {
     }
 }
 
+/// Borrow-scoped prepared view used only by ordinary Rust-style existence.
+///
+/// Unlike [`K0DynamicRootProjection`], this view may borrow an adaptive
+/// workspace because it never exports an address or survives a mutable cache
+/// operation. A first unpublished cell ends the borrow and sends the caller
+/// back to canonical K0 from its original window.
+struct PreparedOrdinaryExistsProjection<'a> {
+    automaton: &'a Automaton,
+    rows: &'a [u32],
+    row_stride: usize,
+    initial_row: u32,
+    scanner: Option<StartPositionScanner>,
+}
+
+impl PreparedOrdinaryExistsProjection<'_> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "projection construction authenticates every direct row and byte class"
+    )]
+    #[inline]
+    fn cell(&self, row: u32, byte: u8) -> Result<u32, SearchError> {
+        let row = usize::try_from(row).map_err(|_| SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 row does not fit usize",
+        })?;
+        let class = usize::from(self.automaton.byte_classes().class_of(byte));
+        // Construction authenticates the initial row and every later row is
+        // a token published by the same identity-bound direct cache. Mirror
+        // `LazyWorkspace::direct_cell`: keep those graph-shape proofs off the
+        // per-byte release path and retain safe slice indexing as the final
+        // memory-safety guard.
+        debug_assert_ne!(self.row_stride, 0);
+        debug_assert_eq!(row % self.row_stride, 0);
+        debug_assert!(row < self.rows.len());
+        debug_assert!(class < self.row_stride);
+        self.rows
+            .get(row + class)
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "ordinary prepared K0 cell is outside the authenticated cache",
+            })
+    }
+
+    #[inline]
+    fn decode_next_row(&self, cell: u32) -> Result<Option<u32>, SearchError> {
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(None);
+        }
+        let row = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "ordinary prepared K0 row token underflowed",
+            })?;
+        #[cfg(debug_assertions)]
+        {
+            let row_index = usize::try_from(row).expect("ordinary prepared K0 row fits usize");
+            debug_assert_ne!(self.row_stride, 0);
+            debug_assert_eq!(row_index % self.row_stride, 0);
+            debug_assert!(row_index < self.rows.len());
+        }
+        Ok(Some(row))
+    }
+}
+
 /// Exact source-provenance effect retained by one immutable direct self-loop.
 ///
 /// `Reset` is deliberately absent: K0's assertion-free nonrestarting loop
@@ -13220,6 +13284,484 @@ fn next_prepared_contextual_start_candidate(
         })
 }
 
+fn prepare_ordinary_exists_projection<'a>(
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+) -> Result<Option<PreparedOrdinaryExistsProjection<'a>>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "ordinary prepared K0 workspace belongs to another automaton",
+        });
+    }
+    let lazy = &workspace.lazy;
+    if !workspace.bound_capabilities.lazy
+        || workspace.bound_capabilities.contextual
+        || automaton.stats().assertion_edges() != 0
+        || !lazy.is_allocated()
+        || !lazy.is_bound_to(automaton)
+        || lazy.context.is_allocated()
+        || !lazy.initialized
+        || lazy.declined
+        || lazy.saturated
+        // Canonical warm execution already consumes these authenticated
+        // long-loop scanners. A scalar prepared walk must not displace them.
+        || !lazy.loop_skip_plans.is_empty()
+        || lazy.cache_identity == 0
+    {
+        return Ok(None);
+    }
+    let Some(proof) = automaton.start_filter_proof.get() else {
+        return Ok(None);
+    };
+    if proof.force_haystack_start || proof.relaxed_nullable {
+        return Ok(None);
+    }
+    if matches!(
+        proof.scanner.as_ref().map(|scanner| &scanner.scanner),
+        Some(StartScanner::Set(_))
+    ) {
+        // Canonical Set execution can select a target-specific 256-byte
+        // classifier and ASCII nonmember scanner. This first prepared slice
+        // deliberately declines instead of replacing that stronger lane with
+        // its portable 16-byte fallback.
+        return Ok(None);
+    }
+    match lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => {}
+        LazyInitialKind::NullablePrefix
+        | LazyInitialKind::NullableTerminal
+        | LazyInitialKind::Uninitialized => return Ok(None),
+    }
+    if lazy.initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 positive cache has no initial state",
+        });
+    }
+    let row_stride = usize::try_from(lazy.direct_row_stride).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 row stride does not fit usize",
+        }
+    })?;
+    if row_stride == 0
+        || row_stride > BYTE_ALPHABET
+        || automaton.byte_classes().count() > row_stride
+        || lazy.state_len == 0
+        || lazy.state_len > DIRECT_LAZY_MAX_STATES
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 direct-cache geometry is invalid",
+        });
+    }
+    let live_cells = lazy
+        .state_len
+        .checked_mul(row_stride)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "ordinary prepared K0 live cells",
+        })?;
+    let rows = lazy
+        .rows
+        .get(..live_cells)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 live rows exceed initialized storage",
+        })?;
+    let initial_row = lazy.row_offset(lazy.initial)?;
+    let initial_index = usize::try_from(initial_row).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 initial row does not fit usize",
+        }
+    })?;
+    if initial_index.checked_rem(row_stride) != Some(0) || initial_index >= rows.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 initial row is outside the live cache",
+        });
+    }
+    Ok(Some(PreparedOrdinaryExistsProjection {
+        automaton,
+        rows,
+        row_stride,
+        initial_row,
+        scanner: proof.scanner,
+    }))
+}
+
+#[inline]
+pub(crate) fn can_prepare_ordinary_exists_projection(automaton: &Automaton) -> bool {
+    let Some(proof) = automaton.start_filter_proof.get() else {
+        return false;
+    };
+    automaton.stats().assertion_edges() == 0
+        && !proof.force_haystack_start
+        && !proof.relaxed_nullable
+        && !matches!(
+            proof.scanner.as_ref().map(|scanner| &scanner.scanner),
+            Some(StartScanner::Set(_))
+        )
+}
+
+#[inline]
+pub(crate) fn can_prepare_compact_ordinary_exists_projection(automaton: &Automaton) -> bool {
+    let Some(proof) = automaton.start_filter_proof.get() else {
+        return false;
+    };
+    automaton.stats().assertion_edges() == 0
+        && !proof.force_haystack_start
+        && !proof.relaxed_nullable
+        && proof.scanner.as_ref().is_some_and(|scanner| {
+            matches!(
+                &scanner.scanner,
+                StartScanner::One(_)
+                    | StartScanner::Two(_, _)
+                    | StartScanner::Three(_, _, _)
+            )
+        })
+}
+
+/// Execute one already-prepared assertion-free Exists machine without a work
+/// ledger or mutable invocation state.
+///
+/// A cache hole is a transactional decline. The caller drops this borrowed
+/// view and replays canonical unlimited K0 from the original window, which is
+/// the only path allowed to grow or replace adaptive storage.
+fn try_prepared_ordinary_exists(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+) -> Result<Option<bool>, SearchError> {
+    let Some(projection) = prepare_ordinary_exists_projection(automaton, workspace)? else {
+        return Ok(None);
+    };
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 window exceeds the validated haystack",
+        })?;
+    let mut row = projection.initial_row;
+    let mut position = window.start();
+    let mut scanner_cursor = RetainedStartMaskCursor::default();
+    loop {
+        if row == projection.initial_row {
+            if let Some(scanner) = projection.scanner.as_ref() {
+                position = next_prepared_ordinary_start_candidate(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    &mut scanner_cursor,
+                )?;
+                if position == window.end() {
+                    return Ok(Some(false));
+                }
+            }
+        }
+        if position >= window.end() {
+            return if position == window.end() {
+                Ok(Some(false))
+            } else {
+                Err(SearchError::InternalInvariant {
+                    detail: "ordinary prepared K0 position exceeded its window",
+                })
+            };
+        }
+        let cell = projection.cell(row, haystack[position])?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 source progress",
+            })?;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return Ok(Some(true));
+        }
+        let Some(next_row) = projection.decode_next_row(cell)? else {
+            return Ok(Some(false));
+        };
+        row = next_row;
+    }
+}
+
+fn next_prepared_ordinary_start_candidate(
+    scanner: &StartPositionScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    let scanner_offset = usize::from(scanner.offset);
+    let scan_start = position
+        .checked_add(scanner_offset)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "ordinary prepared K0 scanner position",
+        })?;
+    if scan_start >= end {
+        cursor.clear();
+        return Ok(end);
+    }
+    let scan_position = next_prepared_ordinary_scanner_position(
+        &scanner.scanner,
+        haystack,
+        scan_start,
+        end,
+        cursor,
+    )?;
+    if scan_position == end {
+        cursor.clear();
+        return Ok(end);
+    }
+    scan_position
+        .checked_sub(scanner_offset)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 scanner matched before its exact offset",
+        })
+}
+
+fn next_prepared_ordinary_scanner_position(
+    scanner: &StartScanner,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    if matches!(
+        scanner,
+        StartScanner::Range { .. } | StartScanner::AsciiSet { .. } | StartScanner::Set(_)
+    ) {
+        match cursor.take(position, end)? {
+            RetainedStartCandidate::Unavailable => {}
+            RetainedStartCandidate::Candidate(candidate) => return Ok(candidate),
+            RetainedStartCandidate::ResumeAt(resume) => position = resume,
+        }
+    }
+    let remaining = haystack
+        .get(position..end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "ordinary prepared K0 scanner exceeded its window",
+        })?;
+    match scanner {
+        StartScanner::Empty => Ok(end),
+        StartScanner::One(byte) => prepared_ordinary_relative_candidate(
+            position,
+            end,
+            memchr(*byte, remaining),
+        ),
+        StartScanner::Two(first, second) => prepared_ordinary_relative_candidate(
+            position,
+            end,
+            memchr2(*first, *second, remaining),
+        ),
+        StartScanner::Three(first, second, third) => prepared_ordinary_relative_candidate(
+            position,
+            end,
+            memchr3(*first, *second, *third, remaining),
+        ),
+        StartScanner::Range {
+            start,
+            end: range_end,
+        } => next_prepared_ordinary_range_position(
+            *start,
+            *range_end,
+            haystack,
+            position,
+            end,
+            cursor,
+        ),
+        StartScanner::AsciiSet {
+            set,
+            classifier,
+        } => next_prepared_ordinary_ascii_position(
+            *set,
+            classifier,
+            haystack,
+            position,
+            end,
+            cursor,
+        ),
+        StartScanner::Set(classifier) => next_prepared_ordinary_set_position(
+            classifier,
+            haystack,
+            position,
+            end,
+            cursor,
+        ),
+    }
+}
+
+fn prepared_ordinary_relative_candidate(
+    position: usize,
+    end: usize,
+    relative: Option<usize>,
+) -> Result<usize, SearchError> {
+    relative.map_or(Ok(end), |relative| {
+        position
+            .checked_add(relative)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 scanner candidate",
+            })
+    })
+}
+
+fn next_prepared_ordinary_range_position(
+    start: u8,
+    end_byte: u8,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    debug_assert!(start <= end_byte);
+    let width = end_byte.wrapping_sub(start);
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let block_end = position.checked_add(BYTE_SET_BLOCK_BYTES).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 range block end",
+            },
+        )?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack
+            .get(position..block_end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "ordinary prepared K0 range block exceeded its window",
+            })?
+            .try_into()
+            .expect("checked ordinary prepared K0 range block");
+        let members = classify_byte_delta_16(start, width, block).member_mask();
+        if members != 0 {
+            return cursor.retain_complete_block(
+                position,
+                BYTE_SET_BLOCK_BYTES,
+                u64::from(members),
+                end,
+            );
+        }
+        position = block_end;
+    }
+    let relative = haystack[position..end]
+        .iter()
+        .position(|&byte| byte.wrapping_sub(start) <= width);
+    prepared_ordinary_relative_candidate(position, end, relative)
+}
+
+fn next_prepared_ordinary_ascii_position(
+    set: ByteSet,
+    classifier: &StartAsciiClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    let nonmembers = classifier.nonmember_scanner();
+    let mut fixed_block_proved = false;
+    while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+        if fixed_block_proved && end.saturating_sub(position) >= ASCII_START_BULK_MIN_BYTES {
+            let mut bulk_len = end.saturating_sub(position);
+            bulk_len -= bulk_len % ASCII_WIDE_BYTES;
+            if bulk_len >= ASCII_START_BULK_MIN_BYTES {
+                let bulk_end = position.checked_add(bulk_len).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "ordinary prepared K0 ASCII nonmember-run end",
+                    },
+                )?;
+                let skipped = nonmembers
+                    .scan_forward(&haystack[position..bulk_end])
+                    .nonmember_run_len();
+                let completed = skipped - (skipped % ASCII_WIDE_BYTES);
+                position = position.checked_add(completed).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "ordinary prepared K0 ASCII nonmember-run progress",
+                    },
+                )?;
+                if position == bulk_end {
+                    if position == end {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                // Reclassify the complete block containing the first member
+                // and retain every candidate lane, exactly as the canonical
+                // unlimited scanner does without its work ledger.
+            }
+        }
+        let block_end = position.checked_add(ASCII_WIDE_BYTES).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 ASCII block end",
+            },
+        )?;
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked ordinary prepared K0 ASCII block");
+        let members = classifier.classifier().classify_32(block).member_mask();
+        if members != 0 {
+            return cursor.retain_complete_block(
+                position,
+                ASCII_WIDE_BYTES,
+                u64::from(members),
+                end,
+            );
+        }
+        position = block_end;
+        fixed_block_proved = true;
+    }
+    if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
+        let block_end = position.checked_add(ASCII_NARROW_BYTES).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 narrow ASCII block end",
+            },
+        )?;
+        let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked ordinary prepared K0 narrow ASCII block");
+        let members = classifier.classifier().classify_16(block).member_mask();
+        if members != 0 {
+            return cursor.retain_complete_block(
+                position,
+                ASCII_NARROW_BYTES,
+                u64::from(members),
+                end,
+            );
+        }
+        position = block_end;
+    }
+    let relative = haystack[position..end]
+        .iter()
+        .position(|&byte| set.contains(byte));
+    prepared_ordinary_relative_candidate(position, end, relative)
+}
+
+fn next_prepared_ordinary_set_position(
+    classifier: &StartByteSetClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let block_end = position.checked_add(BYTE_SET_BLOCK_BYTES).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "ordinary prepared K0 byte-set block end",
+            },
+        )?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked ordinary prepared K0 byte-set block");
+        let members = classifier.classifier().classify_16(block).member_mask();
+        if members != 0 {
+            return cursor.retain_complete_block(
+                position,
+                BYTE_SET_BLOCK_BYTES,
+                u64::from(members),
+                end,
+            );
+        }
+        position = block_end;
+    }
+    let set = classifier.set();
+    let relative = haystack[position..end]
+        .iter()
+        .position(|&byte| set.contains(byte));
+    prepared_ordinary_relative_candidate(position, end, relative)
+}
+
 /// Try already-filled direct rows or contextual records for one authenticated
 /// value call. A direct miss hands off mutably at its exact first unread byte;
 /// an admitted contextual first hole does the same with its owned continuation.
@@ -16222,6 +16764,16 @@ std::thread_local! {
     /// Incomplete-row normalized contextual self-loops served by the
     /// invocation-local prepared cache on this test thread.
     static PREPARED_CONTEXTUAL_SELF_LOOP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Ordinary Exists calls completed entirely by the prepared unmetered
+    /// direct-row lane on this test thread.
+    static PREPARED_ORDINARY_EXISTS_COMPLETIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Ordinary Exists calls that left the prepared lane and replayed the
+    /// canonical unlimited executor from their original window.
+    static PREPARED_ORDINARY_EXISTS_REPLAYS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -20144,6 +20696,43 @@ pub(crate) fn search_prevalidated_contextual_ordinary_span_value_with_authentica
         external_scratch_bytes,
     )
     .map(|found| K0OrderedResumeValue::new(found, K0OrderedResumeCompletion::NotFullyWarm))
+}
+
+/// Execute the ordinary Rust-style Exists policy through one authenticated
+/// pooled workspace.
+///
+/// A completed prepared-row probe does not construct [`SearchLimits`],
+/// [`SetupAccounting`], or [`WorkMeter`]. Every decline drops its immutable
+/// projection before canonical unlimited execution restarts at `window`.
+pub(crate) fn search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    external_scratch_bytes: usize,
+) -> Result<bool, SearchError> {
+    validate_window(haystack, window)?;
+    if workspace.bound_automaton_identity == automaton.identity() {
+        if let Some(found) =
+            try_prepared_ordinary_exists(automaton, haystack, window, workspace)?
+        {
+            #[cfg(test)]
+            PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                .with(|count| count.set(count.get().saturating_add(1)));
+            return Ok(found);
+        }
+    }
+    #[cfg(test)]
+    PREPARED_ORDINARY_EXISTS_REPLAYS
+        .with(|count| count.set(count.get().saturating_add(1)));
+    search_prevalidated_exists_value_with_authenticated_workspace_and_external_scratch(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        SearchLimits::unlimited(),
+        external_scratch_bytes,
+    )
 }
 
 pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace(
@@ -43447,6 +44036,42 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b'b'],
                 byte_ends: vec![0, 0, b'a', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn lazy_optional_ab_or_a_then_b() -> Automaton {
+        // Raw Thompson equivalent of `(?:ab|a)??b`. The outer optional takes
+        // its empty branch first, while the inner alternation preserves `ab`
+        // before `a`.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 5, 6, 7, 8, 8],
+                edge_targets: vec![5, 1, 2, 4, 3, 5, 5, 6],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, 0, b'a', b'b', b'a', b'b'],
+                byte_ends: vec![0, 0, 0, 0, b'a', b'b', b'a', b'b'],
             },
             CompileLimits::default(),
         )
@@ -73200,6 +73825,572 @@ mod tests {
             }
         }
         assert!(comparisons > 40_000);
+    }
+
+    #[test]
+    fn prepared_ordinary_exists_completes_read_only_and_replays_holes_canonically() {
+        let plan = byte_chain(&[
+            (b'A', b'Z'),
+            (b'a', b'z'),
+            (b'a', b'z'),
+            (b'0', b'9'),
+        ]);
+        let haystack = b".Abc7~";
+        let window = SearchWindow::full(haystack);
+        let mut session = K0SearchSession::new_adaptive_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            session
+                .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        let before_generation = session.workspace.generation;
+        let before_rows = session.workspace.lazy.rows.clone();
+        let before_states = session.workspace.lazy.state_len;
+        let before_items = session.workspace.lazy.item_len;
+        assert!(
+            super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                &plan,
+                haystack,
+                window,
+                &mut session.workspace,
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            1,
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            0,
+        );
+        assert_eq!(session.workspace.generation, before_generation);
+        assert_eq!(session.workspace.lazy.rows, before_rows);
+        assert_eq!(session.workspace.lazy.state_len, before_states);
+        assert_eq!(session.workspace.lazy.item_len, before_items);
+
+        let initial_row = usize::try_from(
+            session
+                .workspace
+                .lazy
+                .row_offset(session.workspace.lazy.initial)
+                .unwrap(),
+        )
+        .unwrap();
+        let first_cell = initial_row + usize::from(byte_class(&plan, b'A'));
+        session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert!(
+            super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                &plan,
+                haystack,
+                window,
+                &mut session.workspace,
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            0,
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            1,
+        );
+        assert_ne!(
+            session.workspace.lazy.rows[first_cell],
+            super::LAZY_CELL_UNFILLED,
+            "canonical replay must publish the missing transition",
+        );
+
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert!(
+            session
+                .search_exists_value(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            0,
+            "explicit unlimited value execution must remain canonical",
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            0,
+            "explicit unlimited value execution must not enter the ordinary marker",
+        );
+    }
+
+    #[test]
+    fn compact_nullable_prepared_ordinary_exists_completes_read_only_at_31_bytes() {
+        let plan = lazy_optional_ab_or_a_then_b();
+        let mut haystack = vec![b'x'; 31];
+        *haystack.last_mut().unwrap() = b'b';
+        let window = SearchWindow::full(&haystack);
+        let mut session = K0SearchSession::new_adaptive_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            session
+                .search_window::<Exists>(&haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        assert!(matches!(
+            plan.start_filter_proof
+                .get()
+                .and_then(|proof| proof.scanner.as_ref())
+                .map(|scanner| &scanner.scanner),
+            Some(StartScanner::Two(b'a', b'b')),
+        ));
+        assert!(super::can_prepare_compact_ordinary_exists_projection(
+            &plan
+        ));
+
+        let before = format!("{:#?}", &session.workspace);
+        let retained_before = session.workspace.retained_bytes();
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert!(
+            super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                &plan,
+                &haystack,
+                window,
+                &mut session.workspace,
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            1,
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            0,
+        );
+        assert_eq!(
+            format!("{:#?}", &session.workspace),
+            before,
+            "the compact prepared probe must leave every logical workspace field unchanged",
+        );
+        assert_eq!(session.workspace.retained_bytes(), retained_before);
+    }
+
+    #[test]
+    fn compact_nullable_prepared_ordinary_exists_preserves_owner_across_foreign_fallback() {
+        let plan = lazy_optional_ab_or_a_then_b();
+        let mut hit = vec![b'x'; 31];
+        *hit.last_mut().unwrap() = b'b';
+        let miss = vec![b'x'; 31];
+        let limits = WorkspaceLimits::unlimited();
+
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert_eq!(
+            plan.search_window_with_optional_pooled_ordinary_exists_value(
+                &hit,
+                SearchWindow::full(&hit),
+                limits,
+                true,
+                false,
+            )
+            .unwrap(),
+            Some(true),
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            0,
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            1,
+            "the main owner is established by one canonical cold replay",
+        );
+        assert!(plan.can_use_pooled_compact_ordinary_exists_projection());
+
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+                    super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+                    assert_eq!(
+                        plan.search_window_with_optional_pooled_ordinary_exists_value(
+                            &hit,
+                            SearchWindow::full(&hit),
+                            limits,
+                            true,
+                            false,
+                        )
+                        .unwrap(),
+                        Some(true),
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                            .with(std::cell::Cell::get),
+                        0,
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+                        1,
+                        "the foreign thread must canonically warm its cold fallback lane",
+                    );
+
+                    assert_eq!(
+                        plan.search_window_with_optional_pooled_ordinary_exists_value(
+                            &hit,
+                            SearchWindow::full(&hit),
+                            limits,
+                            true,
+                            false,
+                        )
+                        .unwrap(),
+                        Some(true),
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                            .with(std::cell::Cell::get),
+                        1,
+                        "the warmed foreign fallback must retain and reuse its prepared rows",
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+                        1,
+                    );
+
+                    assert_eq!(
+                        plan.search_window_with_optional_pooled_ordinary_exists_value(
+                            &miss,
+                            SearchWindow::full(&miss),
+                            limits,
+                            true,
+                            false,
+                        )
+                        .unwrap(),
+                        Some(false),
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                            .with(std::cell::Cell::get),
+                        2,
+                    );
+                    assert_eq!(
+                        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+                        1,
+                    );
+                })
+                .join()
+                .unwrap();
+        });
+
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert_eq!(
+            plan.search_window_with_optional_pooled_ordinary_exists_value(
+                &hit,
+                SearchWindow::full(&hit),
+                limits,
+                true,
+                false,
+            )
+            .unwrap(),
+            Some(true),
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            1,
+            "the foreign fallback must not displace the main owner's warm lane",
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            0,
+        );
+    }
+
+    #[test]
+    fn prepared_ordinary_exists_admission_requires_a_supported_initialized_proof() {
+        let supported = ascii_root_bytes(b"a");
+        assert!(!super::can_prepare_ordinary_exists_projection(&supported));
+        assert!(!super::can_prepare_compact_ordinary_exists_projection(
+            &supported
+        ));
+        let mut supported_session = K0SearchSession::new_adaptive_selected(
+            &supported,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            supported_session
+                .search_window::<Exists>(
+                    b"xa",
+                    SearchWindow::full(b"xa"),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        assert!(super::can_prepare_ordinary_exists_projection(&supported));
+        assert!(super::can_prepare_compact_ordinary_exists_projection(
+            &supported
+        ));
+
+        let wide = ascii_root_bytes(&[0x00, 0x40, 0x80, 0xc0, 0xff]);
+        let mut wide_session = K0SearchSession::new_adaptive_selected(
+            &wide,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            wide_session
+                .search_window::<Exists>(
+                    &[0x80],
+                    SearchWindow::new(0, 1),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        assert!(matches!(
+            wide
+                .start_filter_proof
+                .get()
+                .and_then(|proof| proof.scanner.as_ref())
+                .map(|scanner| &scanner.scanner),
+            Some(StartScanner::Set(_)),
+        ));
+        assert!(!super::can_prepare_ordinary_exists_projection(&wide));
+        assert!(!super::can_prepare_compact_ordinary_exists_projection(&wide));
+    }
+
+    #[test]
+    fn compact_ordinary_exists_admission_is_exactly_one_two_or_three() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"a", true),
+            (b"ab", true),
+            (b"abc", true),
+            (b"abcd", false),
+            (b"aceg", false),
+        ];
+        for &(bytes, expected_compact) in cases {
+            let plan = ascii_root_bytes(bytes);
+            let mut session = K0SearchSession::new_adaptive_selected(
+                &plan,
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap();
+            assert!(
+                session
+                    .search_window::<Exists>(
+                        b"a",
+                        SearchWindow::full(b"a"),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output()
+            );
+            let scanner = plan
+                .start_filter_proof
+                .get()
+                .and_then(|proof| proof.scanner.as_ref())
+                .expect("the exact byte root publishes its scanner");
+            assert!(matches!(
+                (bytes, &scanner.scanner),
+                (b"a", StartScanner::One(b'a'))
+                    | (b"ab", StartScanner::Two(b'a', b'b'))
+                    | (b"abc", StartScanner::Three(b'a', b'b', b'c'))
+                    | (
+                        b"abcd",
+                        StartScanner::Range {
+                            start: b'a',
+                            end: b'd'
+                        }
+                    )
+                    | (b"aceg", StartScanner::AsciiSet { .. })
+            ));
+            assert_eq!(
+                super::can_prepare_compact_ordinary_exists_projection(&plan),
+                expected_compact,
+                "bytes={bytes:?}",
+            );
+            assert!(
+                !plan.can_use_pooled_compact_ordinary_exists_projection(),
+                "a caller-owned warm session is not a populated regex-owned pool: bytes={bytes:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_ordinary_exists_preserves_canonical_retained_loop_execution() {
+        let plan = a_plus(true);
+        pin_without_start_filter(&plan);
+        let haystack = vec![b'a'; super::LAZY_LOOP_SKIP_MIN_BYTES * 4];
+        let window = SearchWindow::full(&haystack);
+        let mut session = K0SearchSession::new_adaptive_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(&haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        assert!(!session.workspace.lazy.loop_skip_plans.is_empty());
+
+        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(|count| count.set(0));
+        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+        assert!(
+            super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                &plan,
+                &haystack,
+                window,
+                &mut session.workspace,
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS.with(std::cell::Cell::get),
+            0,
+            "a scalar prepared walk must not displace a retained loop scanner",
+        );
+        assert_eq!(
+            super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(std::cell::Cell::get),
+            1,
+        );
+    }
+
+    #[test]
+    fn prepared_ordinary_exists_matches_canonical_across_scanners_windows_and_source_changes() {
+        let plans = [
+            ascii_root_bytes(b"a"),
+            ascii_root_bytes(b"ac"),
+            ascii_root_bytes(b"abc"),
+            ascii_root_bytes(b"aceg"),
+            ascii_root_bytes(&[0x00, 0x40, 0x80, 0xc0, 0xff]),
+            byte_chain(&[(b'A', b'Z'), (b'a', b'z'), (b'0', b'9')]),
+            a_star(true),
+            empty_or_ab(false),
+            asserted_line_a(),
+        ];
+        let haystacks = bounded_words(&[0x00, b'A', b'a', b'b', b'1', 0x80, 0xff], 2);
+        let mut completions = 0usize;
+        let mut replays = 0usize;
+        let mut comparisons = 0usize;
+
+        for plan in &plans {
+            let mut candidate = K0SearchSession::new_adaptive_selected(
+                plan,
+                WorkspaceLimits::unlimited(),
+                true,
+                false,
+            )
+            .unwrap();
+            let mut canonical =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, false)
+                    .unwrap();
+            for source in &haystacks {
+                let mut haystack = source.clone();
+                let address = haystack.as_ptr();
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        candidate
+                            .search_window::<Exists>(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let expected = canonical
+                            .search_window::<Exists>(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        super::PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                            .with(|count| count.set(0));
+                        super::PREPARED_ORDINARY_EXISTS_REPLAYS.with(|count| count.set(0));
+                        let actual = super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                            plan,
+                            &haystack,
+                            window,
+                            &mut candidate.workspace,
+                            0,
+                        )
+                        .unwrap();
+                        assert_eq!(actual, expected);
+                        completions = completions.saturating_add(
+                            super::PREPARED_ORDINARY_EXISTS_COMPLETIONS
+                                .with(std::cell::Cell::get),
+                        );
+                        replays = replays.saturating_add(
+                            super::PREPARED_ORDINARY_EXISTS_REPLAYS
+                                .with(std::cell::Cell::get),
+                        );
+                        comparisons = comparisons.saturating_add(1);
+                    }
+                }
+                for byte in &mut haystack {
+                    *byte = byte.wrapping_add(1);
+                }
+                assert_eq!(haystack.as_ptr(), address);
+                let window = SearchWindow::full(&haystack);
+                let expected = canonical
+                    .search_window::<Exists>(
+                        &haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                let actual = super::search_prevalidated_ordinary_exists_value_with_authenticated_workspace_and_external_scratch(
+                    plan,
+                    &haystack,
+                    window,
+                    &mut candidate.workspace,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+        assert!(comparisons > 2_500);
+        assert!(completions > 1_000, "prepared lane never gained broad coverage");
+        assert!(
+            replays > 100,
+            "unsupported nullable/contextual shapes did not exercise canonical replay",
+        );
     }
 
     #[test]
