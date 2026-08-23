@@ -159,6 +159,19 @@ empty progress and adjacent-empty suppression as pinned
 `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in local
 checked state and are published only after the complete traversal.
 
+Count and SpanSum first attempt an additive shared ordered-many route for
+2..=4,096 rows. That route independently parses every source, preserves source
+order in one ordered-NFA program, and invokes one generated Count or SpanSum
+reducer per benchmark operation. It therefore removes the Rust per-row outer
+loop, but its V15 reducer deliberately retains semantic runtime helpers for
+prepared search, span fill, and scalar reduction. Provenance names this the
+`linked-shared-ordered-many-helper-backed-reducer` route. The census gives it a
+closed `semantic-helper-backed` boundary: it is useful integration plumbing,
+but it cannot enter the strict helper-free whole-operation-native numerator.
+Typed unsupported and byte-limit declines retain the independent-row
+incumbent; allocation, invariant, emission, and authentication failures remain
+terminal.
+
 The mixed bridge admits a prepared row only after exact receipt and linked
 symbol authentication: Ordered-NFA engine, native loop strategy, V15
 capability/config, entry/Span-fill/program identity, and the complete three

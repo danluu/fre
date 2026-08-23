@@ -373,6 +373,36 @@
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "sharedOrderedManyProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_schema_version", "source_pattern_count",
+        "ordered_sources_sha256", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "artifact_identity_sha256",
+        "reducer_identity_sha256"
+      ],
+      "properties": {
+        "receipt_schema_version": { "const": 1 },
+        "source_pattern_count": {
+          "type": "integer", "minimum": 2, "maximum": 4096
+        },
+        "ordered_sources_sha256": { "$ref": "#/$defs/sha256" },
+        "required_prepare_capabilities": { "const": 1 },
+        "prepare_config_version": { "const": 3 },
+        "prepare_operation_flags": { "enum": [2, 4] },
+        "max_handle_bytes": { "const": 8388608 },
+        "max_scratch_bytes": { "const": 8388608 },
+        "max_setup_work": { "const": 2000000 },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "uniformCaptureProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -558,7 +588,7 @@
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
         "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
         "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
-        "aggregate_strategy", "uniform_capture",
+        "aggregate_strategy", "uniform_capture", "shared_ordered_many",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
@@ -581,7 +611,7 @@
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
             "participation-capture-v4", "selector-capture-fallback-v4",
-            "prepared-grep-v15-v2"
+            "prepared-grep-v15-v2", "shared-ordered-many-v2"
           ]
         },
         "composite_kind": {
@@ -589,7 +619,8 @@
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
             "regex-redux-fixed-v1", "strict-capture-next-v1",
             "exact-span-participation-v1", "selector-negative-certificate-v1",
-            "mixed-prepared-native-row-bridge-v15"
+            "mixed-prepared-native-row-bridge-v15",
+            "shared-ordered-many-native-reducer-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -603,6 +634,12 @@
         "uniform_capture": {
           "anyOf": [
             { "$ref": "#/$defs/uniformCaptureProvenance" },
+            { "type": "null" }
+          ]
+        },
+        "shared_ordered_many": {
+          "anyOf": [
+            { "$ref": "#/$defs/sharedOrderedManyProvenance" },
             { "type": "null" }
           ]
         },
@@ -682,6 +719,22 @@
           },
           "then": { "required": ["prepared_grep_v15"] },
           "else": { "not": { "required": ["prepared_grep_v15"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "shared-ordered-many-v2" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "shared_ordered_many": {
+                "$ref": "#/$defs/sharedOrderedManyProvenance"
+              }
+            }
+          },
+          "else": {
+            "properties": { "shared_ordered_many": { "type": "null" } }
+          }
         },
         {
           "if": {

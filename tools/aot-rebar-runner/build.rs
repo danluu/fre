@@ -148,6 +148,7 @@ fn main() {
                         &benchmark,
                         compiled,
                         Some(&bridge.receipt),
+                        None,
                         &object_path,
                         program_symbol,
                         program_len,
@@ -249,6 +250,67 @@ fn main() {
         return;
     }
     if benchmark.uses_native_row_bridge() {
+        let shared = if matches!(benchmark.model, shared::Model::Count | shared::Model::SpanSum)
+            && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        {
+            Some(
+                shared::try_compile_shared_ordered_many_aggregate(&benchmark, target)
+                    .expect("attempt shared ordered-many public Rebar aggregate"),
+            )
+        } else {
+            None
+        };
+        match shared {
+            Some(shared::SharedOrderedManyAggregateDisposition::Compiled(artifact)) => {
+                let compiled = artifact.compiled();
+                let (program_symbol, program_len) = compiled
+                    .module()
+                    .required_runtime_program()
+                    .expect("shared ordered-many aggregate publishes its exact runtime program");
+                let entry_symbol = compiled.module().entry_symbol();
+                let span_fill_symbol = compiled.module().prepared_span_fill_symbol();
+                let reducer_symbol = match benchmark.model {
+                    shared::Model::Count => compiled
+                        .module()
+                        .prepared_count_symbol()
+                        .expect("shared Count export"),
+                    shared::Model::SpanSum => compiled
+                        .module()
+                        .prepared_span_sum_symbol()
+                        .expect("shared SpanSum export"),
+                    _ => unreachable!("shared ordered-many gate accepts only scalar models"),
+                };
+                fs::write(&object_path, compiled.object())
+                    .expect("write linked shared ordered-many object");
+                fs::write(
+                    &generated_path,
+                    configured_source(
+                        &benchmark,
+                        compiled,
+                        None,
+                        Some(&artifact.receipt()),
+                        &object_path,
+                        program_symbol,
+                        program_len,
+                        entry_symbol,
+                        span_fill_symbol,
+                        Some(reducer_symbol),
+                        &architecture,
+                        &operating_system,
+                        feature_bits,
+                        &source_commit,
+                        &source_tree,
+                    ),
+                )
+                .expect("write linked shared ordered-many bindings");
+                println!(
+                    "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                    object_path.display()
+                );
+                return;
+            }
+            Some(shared::SharedOrderedManyAggregateDisposition::Declined(_)) | None => {}
+        }
         let bridge = shared::compile_native_row_bridge(&benchmark, target)
             .expect("compile helper-free public Rebar native-row bridge");
         let mut object_paths = Vec::new();
@@ -317,6 +379,7 @@ fn main() {
             &benchmark,
             &compiled,
             None,
+            None,
             &object_path,
             program_symbol,
             program_len,
@@ -367,6 +430,7 @@ fn configured_source(
     benchmark: &shared::Benchmark,
     compiled: &fre_aot_regex::CompiledRegex,
     uniform_capture_receipt: Option<&fre_aot_regex::UniformCapturePreparedSpanFillCompileReceipt>,
+    ordered_many_receipt: Option<&fre_aot_regex::OrderedManyAotReceipt>,
     object_path: &std::path::Path,
     program_symbol: &str,
     program_len: usize,
@@ -381,7 +445,24 @@ fn configured_source(
 ) -> String {
     let receipt = compiled.receipt();
     let prepared_uniform_capture = uniform_capture_receipt.is_some();
+    let shared_ordered_many = ordered_many_receipt.is_some();
     assert_eq!(prepared_uniform_capture, benchmark.model.is_capture());
+    assert_eq!(shared_ordered_many, benchmark.patterns.len() > 1);
+    assert!(!prepared_uniform_capture || !shared_ordered_many);
+    if let Some(ordered) = ordered_many_receipt {
+        assert_eq!(ordered.rows, benchmark.patterns.len());
+        assert_eq!(
+            ordered.pattern_bytes,
+            benchmark.patterns.iter().map(String::len).sum::<usize>()
+        );
+        assert_eq!(ordered.program_sha256, receipt.program_sha256);
+        assert_eq!(ordered.object_sha256, receipt.object_sha256);
+        assert_eq!(ordered.exports, benchmark.model.exports());
+        assert_eq!(
+            Some(ordered.aggregate_strategy),
+            receipt.prepared_aggregate_strategy
+        );
+    }
     assert_eq!(prepared_uniform_capture, reducer_symbol.is_none());
     assert!(!prepared_uniform_capture || benchmark.patterns.len() == 1);
     assert!(!prepared_uniform_capture || span_fill_symbol.is_some());
@@ -413,7 +494,10 @@ fn configured_source(
     let native_scalar_reducer =
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
             .expect("compiled native scalar reducer failed build-time authentication");
-    let span_iteration_strategy = if prepared_uniform_capture {
+    let span_iteration_strategy = if shared_ordered_many && benchmark.model == shared::Model::SpanSum
+    {
+        "linked-shared-ordered-many-native-span-sum-reducer-v1".to_owned()
+    } else if prepared_uniform_capture {
         format!("linked-prepared-span-fill-uniform-capture-64::{prepared_bulk_strategy}")
     } else if benchmark.model != shared::Model::SpanSum {
         "not-applicable".to_owned()
@@ -452,13 +536,38 @@ fn configured_source(
     .unwrap();
     writeln!(
         source,
+        "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = {shared_ordered_many};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = {};",
+        ordered_many_receipt.map_or(0, |receipt| receipt.schema_version)
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = {:?};",
+        ordered_many_receipt.map_or([0; 32], |receipt| receipt.ordered_sources_sha256)
+    )
+    .unwrap();
+    writeln!(
+        source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {prepared_uniform_capture};"
     )
     .unwrap();
     writeln!(
         source,
         "pub const ADAPTER: &str = {:?};",
-        if prepared_uniform_capture {
+        if shared_ordered_many {
+            match benchmark.model {
+                shared::Model::Count => "general-aot-shared-ordered-many-native-count-v1",
+                shared::Model::SpanSum => {
+                    "general-aot-shared-ordered-many-native-span-sum-v1"
+                }
+                _ => unreachable!("shared ordered-many binding has a non-scalar model"),
+            }
+        } else if prepared_uniform_capture {
             "general-aot-uniform-capture-prepared-span-fill-v1"
         } else {
             benchmark
@@ -504,16 +613,25 @@ fn configured_source(
     writeln!(
         source,
         "pub const EXPECTED_PATTERN: &str = {:?};",
-        benchmark.pattern()
+        if shared_ordered_many {
+            ""
+        } else {
+            benchmark.pattern()
+        }
     )
     .unwrap();
     writeln!(
         source,
-        "pub const EXPECTED_PATTERNS: &[&str] = &[{:?}];",
-        benchmark.pattern()
+        "pub const EXPECTED_PATTERNS: &[&str] = &{:?};",
+        benchmark.patterns
     )
     .unwrap();
-    writeln!(source, "pub const SOURCE_PATTERN_COUNT: usize = 1;").unwrap();
+    writeln!(
+        source,
+        "pub const SOURCE_PATTERN_COUNT: usize = {};",
+        benchmark.patterns.len()
+    )
+    .unwrap();
     writeln!(source, "pub const ROW_ARTIFACT_COUNT: usize = 1;").unwrap();
     writeln!(
         source,
@@ -521,7 +639,12 @@ fn configured_source(
         compiled.object().len()
     )
     .unwrap();
-    writeln!(source, "pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];").unwrap();
+    writeln!(
+        source,
+        "pub const SOURCE_TO_ARTIFACT: &[usize] = &{:?};",
+        vec![0_usize; benchmark.patterns.len()]
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];"
@@ -887,6 +1010,9 @@ fn configured_regex_redux_source(
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = false;\n");
     source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
+    source.push_str("pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;\n");
+    source.push_str("pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     writeln!(
         source,
@@ -1069,6 +1195,9 @@ fn configured_participation_capture_source(
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
     source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
+    source.push_str("pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;\n");
+    source.push_str("pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
@@ -1333,6 +1462,9 @@ fn configured_strict_capture_source(
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
     source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
+    source.push_str("pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;\n");
+    source.push_str("pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
@@ -1878,6 +2010,9 @@ fn configured_native_row_source(
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_SCALAR_REDUCER: bool = false;").unwrap();
+    writeln!(source, "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;").unwrap();
+    writeln!(source, "pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;").unwrap();
+    writeln!(source, "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];").unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
@@ -2373,6 +2508,9 @@ fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
 pub const NATIVE_SCALAR_REDUCER: bool = false;
+pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;
+pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;
+pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];
 pub const UNIFORM_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;

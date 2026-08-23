@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
 use fre_aot_regex::{
-    compile, compile_rebar_single_capture_aot_v1,
+    compile, compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
@@ -10,6 +10,8 @@ use fre_aot_regex::{
     CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, FeatureSet,
     NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
     NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1, OperatingSystem,
+    OrderedManyAotArtifact, OrderedManyAotCompileDecline, OrderedManyAotCompileDisposition,
+    OrderedManyAotCompileLimits, OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow,
     OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
     PreparedOrderedNfaV15CompileDisposition, RebarSingleCaptureAotArtifactV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
@@ -952,6 +954,18 @@ const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
 ];
+const PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS: [&str; 4] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+];
+const PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS: [&str; 4] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+    "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+];
 const FROZEN_LOOP_RUNTIME_SYMBOL: &str = "fre_aot_regex_runtime_scan_frozen_loop_v2";
 
 fn unresolved_runtime_function_names(compiled: &CompiledRegex) -> Option<Vec<&str>> {
@@ -1179,6 +1193,48 @@ fn direct_native_grep_symbol_identities_are_closed(
         return false;
     };
     reducer_identity == program_identity && reducer_identity != ordinary_identity
+}
+
+fn shared_ordered_many_symbol_identities_are_closed(
+    model: Model,
+    ordinary_entry: &str,
+    prepared_entry: &str,
+    span_fill: &str,
+    reducer: &str,
+    program: &str,
+) -> bool {
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(prepared_identity) =
+        native_symbol_identity(prepared_entry, "fre_aot_regex_search_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(span_fill_identity) =
+        native_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
+    else {
+        return false;
+    };
+    let reducer_prefix = match model {
+        Model::Count => "fre_aot_regex_count_exclusive_v1_",
+        Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        _ => return false,
+    };
+    let Some(reducer_identity) = native_symbol_identity(reducer, reducer_prefix) else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    ordinary_identity == prepared_identity
+        && ordinary_identity == span_fill_identity
+        && ordinary_identity == program_identity
+        && reducer_identity != ordinary_identity
 }
 
 fn ordinary_grep_symbol_identities_are_closed(
@@ -1465,6 +1521,198 @@ pub struct NativeRowBridge {
     pub artifacts: Vec<NativeRowArtifact>,
     pub source_to_artifact: Vec<usize>,
     pub total_object_bytes: usize,
+}
+
+/// Compile one genuine shared-scan ordered multi-pattern reducer.
+///
+/// This route joins independently parsed canonical HIRs into one ordered
+/// automaton and emits one native Count or SpanSum entry. It never invokes or
+/// retains the independent native-row bridge. The caller may fall back only
+/// after classifying the returned typed error outside this function.
+pub fn compile_shared_ordered_many_aggregate(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<OrderedManyAotArtifact, String> {
+    match try_compile_shared_ordered_many_aggregate(benchmark, target)? {
+        SharedOrderedManyAggregateDisposition::Compiled(artifact) => Ok(artifact),
+        SharedOrderedManyAggregateDisposition::Declined(decline) => Err(format!(
+            "shared ordered-many AOT compilation declined: {decline:?}"
+        )),
+    }
+}
+
+/// The only result that authorizes the build adapter to retain its complete
+/// independent-row incumbent.
+#[derive(Clone, Debug)]
+pub enum SharedOrderedManyAggregateDisposition {
+    Compiled(OrderedManyAotArtifact),
+    Declined(OrderedManyAotCompileDecline),
+}
+
+/// Attempt the shared route without swallowing allocator, invariant, object or
+/// authentication failures.
+pub fn try_compile_shared_ordered_many_aggregate(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<SharedOrderedManyAggregateDisposition, String> {
+    if benchmark.patterns.len() <= 1
+        || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        || !matches!(benchmark.model, Model::Count | Model::SpanSum)
+    {
+        return Err(format!(
+            "shared ordered-many AOT requires a 2..={} row Count/SpanSum job, got model={} rows={}",
+            fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS,
+            benchmark.model.name(),
+            benchmark.patterns.len(),
+        ));
+    }
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(benchmark.patterns.len())
+        .map_err(|_| "shared ordered-many row allocation failed".to_owned())?;
+    for (ordinal, pattern) in benchmark.patterns.iter().enumerate() {
+        let id = u32::try_from(ordinal)
+            .map_err(|_| format!("shared ordered-many source ordinal {ordinal} overflowed"))?;
+        rows.push(OrderedManyRow::new(
+            OrderedManyPatternId::new(id),
+            pattern.clone(),
+        ));
+    }
+    let mut limits = OrderedManyAotCompileLimits::default();
+    limits.max_rows = fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS;
+    limits.max_pattern_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "shared ordered-many source byte sum overflowed".to_owned())?;
+    limits.compile = rebar_recovery_compile_limits();
+    limits.compile.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    let disposition = compile_ordered_many_aot_reported(
+        OrderedManyAotCompileRequest::new(rows, target)
+            .profile(profile.clone())
+            .mode(CompileMode::Optimizing)
+            .limits(limits),
+        benchmark.model.exports(),
+        native_row_bridge_no_optional_dfa_limits(),
+    )
+    .map_err(|error| format!("shared ordered-many AOT compilation failed: {error}"))?;
+    let artifact = match disposition {
+        OrderedManyAotCompileDisposition::Compiled(artifact) => artifact,
+        OrderedManyAotCompileDisposition::Declined(decline) => {
+            return Ok(SharedOrderedManyAggregateDisposition::Declined(decline));
+        }
+    };
+    authenticate_shared_ordered_many_aggregate(benchmark, target, &profile, &artifact)?;
+    Ok(SharedOrderedManyAggregateDisposition::Compiled(artifact))
+}
+
+fn authenticate_shared_ordered_many_aggregate(
+    benchmark: &Benchmark,
+    target: Target,
+    profile: &RustProfile,
+    artifact: &OrderedManyAotArtifact,
+) -> Result<(), String> {
+    let compiled = artifact.compiled();
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let shared_receipt = artifact.receipt();
+    let strategy = module.prepared_aggregate_strategy();
+    let reducer = match benchmark.model {
+        Model::Count => module.prepared_count_symbol(),
+        Model::SpanSum => module.prepared_span_sum_symbol(),
+        _ => None,
+    };
+    let prepared_entry = module.prepared_entry_symbol();
+    let span_fill = module.prepared_span_fill_symbol();
+    let program = module.required_runtime_program();
+    let symbol_surface_closed = match strategy {
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused) => {
+            let expected = match benchmark.model {
+                Model::Count => &PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS[..],
+                Model::SpanSum => &PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS[..],
+                _ => &[][..],
+            };
+            module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                && module.required_prepare_capabilities()
+                    == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                && receipt.runtime_helper_required
+                && has_exact_runtime_symbol_closure(compiled, expected)
+                && prepared_entry.is_some_and(|symbol| {
+                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                })
+                && span_fill.is_some_and(|symbol| {
+                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                })
+                && reducer.is_some_and(|symbol| {
+                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                })
+                && program.is_some_and(|(symbol, len)| {
+                    len != 0
+                        && has_defined_symbol(
+                            compiled,
+                            symbol,
+                            SymbolKind::Object,
+                            Some(len),
+                        )
+                })
+                && prepared_entry
+                    .zip(span_fill)
+                    .zip(reducer)
+                    .zip(program)
+                    .is_some_and(
+                        |(((prepared_entry, span_fill), reducer), (program, _))| {
+                            shared_ordered_many_symbol_identities_are_closed(
+                                benchmark.model,
+                                module.entry_symbol(),
+                                prepared_entry,
+                                span_fill,
+                                reducer,
+                                program,
+                            )
+                        },
+                    )
+                && has_defined_symbol(
+                    compiled,
+                    module.entry_symbol(),
+                    SymbolKind::Function,
+                    None,
+                )
+        }
+        _ => false,
+    };
+    if artifact.profile() != profile
+        || receipt.target != target
+        || receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Span
+        || receipt.engine != EngineKind::OrderedNfa
+        || receipt.prepared_aggregate_exports != benchmark.model.exports()
+        || receipt.prepared_aggregate_strategy != strategy
+        || module.prepared_aggregate_exports() != benchmark.model.exports()
+        || program.is_none()
+        || reducer.is_none()
+        || !symbol_surface_closed
+        || shared_receipt.rows != benchmark.patterns.len()
+        || shared_receipt.pattern_bytes
+            != benchmark.patterns.iter().map(String::len).sum::<usize>()
+        || shared_receipt.program_sha256 != receipt.program_sha256
+        || shared_receipt.object_sha256 != receipt.object_sha256
+        || shared_receipt.exports != benchmark.model.exports()
+        || Some(shared_receipt.aggregate_strategy) != strategy
+        || compiled.object().is_empty()
+        || compiled.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err(format!(
+            "shared ordered-many AOT authentication failed: model={} rows={} strategy={strategy:?} bulk={:?} capabilities={:#x} unresolved={:?}",
+            benchmark.model.name(),
+            benchmark.patterns.len(),
+            module.prepared_bulk_strategy(),
+            module.required_prepare_capabilities(),
+            unresolved_runtime_function_names(compiled),
+        ));
+    }
+    Ok(())
 }
 
 /// One all-or-nothing uniform-participation proof per source row, paired with
@@ -3334,6 +3582,139 @@ mod tests {
                 .next()
                 .is_none());
             assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
+        }
+    }
+
+    #[test]
+    fn shared_ordered_many_aggregate_is_one_native_semantic_program() {
+        let mut multi = fixture("count", b"ab", b"abaabb");
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(
+            offset..offset,
+            b"pattern:1:a\npattern:2:b+\n".iter().copied(),
+        );
+        let benchmark = Benchmark::parse(&multi).expect("shared ordered-many fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("shared ordered-many aggregate");
+        assert_eq!(artifact.receipt().rows, 3);
+        assert_eq!(
+            artifact.compiled().module().prepared_aggregate_exports(),
+            PreparedAggregateExports::COUNT,
+        );
+        assert!(matches!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeOrderedNfaFused
+        ));
+        assert!(artifact.compiled().module().prepared_count_symbol().is_some());
+        assert_ne!(artifact.receipt().ordered_sources_sha256, [0; 32]);
+    }
+
+    #[test]
+    #[ignore = "requires FRE_TEST_NOSEY_KLV naming the public Nosey Parker multi KLV"]
+    fn public_nosey_parker_multi_compiles_as_one_shared_native_reducer() {
+        let path = std::env::var_os("FRE_TEST_NOSEY_KLV")
+            .expect("FRE_TEST_NOSEY_KLV names the public KLV");
+        let bytes = std::fs::read(path).expect("read public Nosey Parker KLV");
+        let benchmark = Benchmark::parse(&bytes).expect("parse public Nosey Parker KLV");
+        assert_eq!(benchmark.name, "curated/13-noseyparker/multi");
+        assert_eq!(benchmark.model, Model::Count);
+        assert_eq!(benchmark.patterns.len(), 96);
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("compile public Nosey Parker shared reducer");
+        assert_eq!(artifact.receipt().rows, 96);
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeOrderedNfaFused,
+        );
+        assert_eq!(
+            artifact.compiled().module().prepared_bulk_strategy(),
+            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+        );
+        assert!(artifact.compiled().module().prepared_count_symbol().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires FRE_TEST_REBAR_MULTI_DIR naming a public Rebar KLV directory"]
+    fn public_scalar_multi_schedule_admits_shared_reducers() {
+        let directory = std::env::var_os("FRE_TEST_REBAR_MULTI_DIR")
+            .expect("FRE_TEST_REBAR_MULTI_DIR names the public KLV directory");
+        let mut jobs = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("read public KLV directory") {
+            let path = entry.expect("public KLV directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("klv") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read public scalar-multi KLV");
+            let benchmark = match Benchmark::parse(&bytes) {
+                Ok(benchmark) => benchmark,
+                Err(error)
+                    if error
+                        == "general AOT object emission is not a search-ready Rebar compile operation" =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("parse public scalar-multi KLV {path:?}: {error}"),
+            };
+            if benchmark.patterns.len() > 1
+                && matches!(benchmark.model, Model::Count | Model::SpanSum)
+            {
+                jobs.push((benchmark.name.clone(), benchmark, path));
+            }
+        }
+        jobs.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut unique_jobs = Vec::new();
+        for job in jobs {
+            if unique_jobs.iter().any(|existing: &(String, Benchmark, _)| {
+                job.1.same_compilation_identity(&existing.1)
+            }) {
+                continue;
+            }
+            unique_jobs.push(job);
+        }
+        let jobs = unique_jobs;
+        let mut row_counts = jobs
+            .iter()
+            .map(|(_, benchmark, _)| benchmark.patterns.len())
+            .collect::<Vec<_>>();
+        row_counts.sort_unstable();
+        assert_eq!(row_counts, [88, 88, 96, 2_663, 2_663]);
+
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (name, benchmark, _) in jobs {
+            let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+                .unwrap_or_else(|error| panic!("public {name:?} shared reducer: {error}"));
+            assert_eq!(artifact.receipt().rows, benchmark.patterns.len());
+            assert_eq!(
+                artifact.receipt().aggregate_strategy,
+                PreparedAggregateStrategy::NativeOrderedNfaFused,
+            );
+            eprintln!(
+                "shared-admission name={name:?} model={} rows={} pattern_bytes={} object_bytes={}",
+                benchmark.model.name(),
+                artifact.receipt().rows,
+                artifact.receipt().pattern_bytes,
+                artifact.compiled().object().len(),
+            );
         }
     }
 

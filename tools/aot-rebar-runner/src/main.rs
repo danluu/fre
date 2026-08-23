@@ -1603,8 +1603,13 @@ fn print_provenance() {
                 FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
             )
         };
+    let boundary = if linked::SHARED_ORDERED_MANY_AGGREGATE {
+        "single-call-shared-ordered-many-helper-backed-reducer"
+    } else {
+        "runtime-klv-warmup-schedule"
+    };
     println!(
-        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -1621,6 +1626,10 @@ fn print_provenance() {
         linked::PREPARED_BULK_STRATEGY,
         linked::SPAN_ITERATION_STRATEGY,
         linked::GREP_ITERATION_STRATEGY,
+        linked::SHARED_ORDERED_MANY_AGGREGATE,
+        linked::SOURCE_PATTERN_COUNT,
+        linked::ORDERED_MANY_RECEIPT_SCHEMA,
+        hex(&linked::ORDERED_MANY_SOURCES_SHA256),
         linked::PREPARE_CONFIG_VERSION,
         linked::PREPARE_OPERATION_FLAGS,
         linked::REQUIRED_PREPARE_CAPABILITIES,
@@ -1637,6 +1646,7 @@ fn print_provenance() {
         linked::REDUCER_SYMBOL,
         linked::SPAN_FILL_SYMBOL,
         linked::REQUIRED_RUNTIME_SYMBOLS,
+        boundary,
     );
 }
 
@@ -1645,7 +1655,7 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
         !linked::NATIVE_ROW_BRIDGE
             && linked::EXPECTED_PATTERN.is_empty()
             && linked::EXPECTED_PATTERNS.is_empty()
-    } else if linked::NATIVE_ROW_BRIDGE {
+    } else if linked::NATIVE_ROW_BRIDGE || linked::SHARED_ORDERED_MANY_AGGREGATE {
         linked::EXPECTED_PATTERN.is_empty() && !linked::EXPECTED_PATTERNS.is_empty()
     } else {
         linked::EXPECTED_PATTERNS == [linked::EXPECTED_PATTERN]
@@ -1678,6 +1688,28 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     let prepared_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
+    if linked::SHARED_ORDERED_MANY_AGGREGATE
+        != (linked::ORDERED_MANY_RECEIPT_SCHEMA
+            == fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
+            && linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32])
+    {
+        return Err("shared ordered-many route disagrees with its source receipt".to_owned());
+    }
+    if !linked::SHARED_ORDERED_MANY_AGGREGATE
+        && (linked::ORDERED_MANY_RECEIPT_SCHEMA != 0
+            || linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32])
+    {
+        return Err("non-shared route contains an ordered-many source receipt".to_owned());
+    }
+    if linked::SHARED_ORDERED_MANY_AGGREGATE
+        && (linked::NATIVE_ROW_BRIDGE
+            || linked::UNIFORM_CAPTURE_BRIDGE
+            || linked::STRICT_CAPTURE_BRIDGE
+            || linked::PARTICIPATION_CAPTURE_BRIDGE
+            || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE)
+    {
+        return Err("shared ordered-many route overlaps another adapter route".to_owned());
+    }
     if ((!prepared_uniform_capture && linked::UNIFORM_CAPTURE_BRIDGE)
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::PARTICIPATION_CAPTURE_BRIDGE
@@ -1775,7 +1807,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if linked::NATIVE_ROW_BRIDGE {
         return authenticate_native_row_route(benchmark);
     }
-    if benchmark.uses_native_row_bridge() {
+    if linked::SHARED_ORDERED_MANY_AGGREGATE {
+        authenticate_linked_shared_ordered_many(benchmark)?;
+    } else if benchmark.uses_native_row_bridge() {
         return Err("multi-pattern KLV is not bound to a native-row bridge".to_owned());
     }
     let has_named_span_fill = !linked::SPAN_FILL_SYMBOL.is_empty();
@@ -1995,6 +2029,91 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
         && entry_identity == span_fill_identity
         && entry_identity == program_identity
         && reducer_identity != entry_identity
+}
+
+fn authenticate_linked_shared_ordered_many(
+    benchmark: &shared::Benchmark,
+) -> Result<(), String> {
+    const COUNT_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
+    const SPAN_SUM_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
+    let (adapter, reducer_prefix, runtime_symbols, span_iteration) = match benchmark.model {
+        shared::Model::Count => (
+            "general-aot-shared-ordered-many-native-count-v1",
+            "fre_aot_regex_count_exclusive_v1_",
+            COUNT_RUNTIME_SYMBOLS,
+            "not-applicable",
+        ),
+        shared::Model::SpanSum => (
+            "general-aot-shared-ordered-many-native-span-sum-v1",
+            "fre_aot_regex_span_sum_exclusive_v1_",
+            SPAN_SUM_RUNTIME_SYMBOLS,
+            "linked-shared-ordered-many-native-span-sum-reducer-v1",
+        ),
+        _ => {
+            return Err(
+                "shared ordered-many artifact is bound to a non-Count/SpanSum model".to_owned(),
+            );
+        }
+    };
+    let sources = benchmark.patterns.len();
+    let valid_source_map = linked::SOURCE_TO_ARTIFACT.len() == sources
+        && linked::SOURCE_TO_ARTIFACT.iter().all(|&artifact| artifact == 0);
+    let entry_identity = native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_");
+    let prepared_identity = native_symbol_identity(
+        linked::SPAN_FILL_SYMBOL,
+        "fre_aot_regex_fill_spans_exclusive_v1_",
+    );
+    let program_identity = native_symbol_identity(
+        linked::PROGRAM_SYMBOL,
+        "fre_aot_regex_runtime_program_v1_",
+    );
+    let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix);
+    if sources < 2
+        || sources > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        || linked::NATIVE_ROW_BRIDGE
+        || linked::EXPECTED_PATTERN != ""
+        || linked::SOURCE_PATTERN_COUNT != sources
+        || !valid_source_map
+        || linked::ROW_ARTIFACT_COUNT != 1
+        || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+        || linked::ROW_ENTRY_SYMBOLS != [linked::ENTRY_SYMBOL]
+        || linked::ROW_AUTOMATON_SHA256.len() != 1
+        || linked::ROW_AUTOMATON_SHA256[0] == [0; 32]
+        || linked::ROW_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+        || linked::ROW_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+        || linked::ROW_TOTAL_OBJECT_BYTES != linked::OBJECT_BYTES.len()
+        || linked::OBJECT_BYTES.is_empty()
+        || linked::PROGRAM_LEN == 0
+        || linked::PROGRAM_SHA256 == [0; 32]
+        || linked::OBJECT_SHA256 == [0; 32]
+        || linked::ADAPTER != adapter
+        || linked::ENGINE != "OrderedNfa"
+        || linked::AGGREGATE_STRATEGY != "Some(NativeOrderedNfaFused)"
+        || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
+        || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION
+        || linked::PREPARE_OPERATION_FLAGS != benchmark.model.prepare_operation_flags()
+        || linked::REQUIRED_PREPARE_CAPABILITIES != PREPARE_CAPABILITY_ORDERED_NFA_V15
+        || !linked::HAS_SPAN_FILL
+        || linked::SPAN_ITERATION_STRATEGY != span_iteration
+        || linked::GREP_ITERATION_STRATEGY != "not-applicable"
+        || linked::REQUIRED_RUNTIME_SYMBOLS != runtime_symbols
+        || reducer_identity.is_none()
+        || entry_identity.is_none()
+        || entry_identity != prepared_identity
+        || entry_identity != program_identity
+        || entry_identity == reducer_identity
+        || linked::ROW_REQUIRED_PREPARE_CAPABILITIES != [0]
+        || linked::ROW_PREPARE_CONFIG_VERSIONS != [0]
+        || linked::ROW_PREPARE_OPERATION_FLAGS != [0]
+        || linked::ROW_PROGRAM_SYMBOLS != [""]
+        || linked::ROW_PROGRAM_LENS != [0]
+        || linked::ROW_SPAN_FILL_SYMBOLS != [""]
+        || linked::ROW_PREPARED_BULK_STRATEGIES != ["None"]
+        || linked::ROW_REQUIRED_RUNTIME_SYMBOLS != [""]
+    {
+        return Err("shared ordered-many linked identity closure is inconsistent".to_owned());
+    }
+    Ok(())
 }
 
 fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), String> {
@@ -2669,7 +2788,9 @@ fn run_operation(
     session: &mut ExclusiveSession,
 ) -> Result<Vec<Sample>, String> {
     match benchmark.model {
-        shared::Model::SpanSum if linked::NATIVE_SCALAR_REDUCER => {
+        shared::Model::SpanSum
+            if linked::NATIVE_SCALAR_REDUCER || linked::SHARED_ORDERED_MANY_AGGREGATE =>
+        {
             run_operation_route(benchmark, session, ExclusiveSession::reduce)
         }
         shared::Model::SpanSum if linked::HAS_SPAN_FILL => run_operation_route(

@@ -41,12 +41,22 @@ PREPARED_V15_MAX_SETUP_WORK = 2_000_000
 PREPARED_V15_CAPABILITY = 1
 PREPARED_V15_CONFIG_VERSION = 3
 PREPARED_V15_SPAN_OPERATION_FLAGS = 1 << 1
+PREPARED_V15_SPAN_SUM_OPERATION_FLAGS = 1 << 2
+ORDERED_MANY_RECEIPT_VERSION = 1
 PREPARED_V15_RUNTIME_SYMBOLS = (
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_search_v1",
 )
 PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS = PREPARED_V15_RUNTIME_SYMBOLS
+PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS = tuple(sorted((
+    *PREPARED_V15_RUNTIME_SYMBOLS,
+    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+)))
+PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS = tuple(sorted((
+    *PREPARED_V15_RUNTIME_SYMBOLS,
+    "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+)))
 FEATURE_BITS = {
     "sse2": 1 << 0,
     "avx2": 1 << 1,
@@ -143,10 +153,11 @@ class CensusError(RuntimeError):
 
 
 class OperationBoundary(Enum):
-    """Closed distinction between a native result and native search glue."""
+    """Closed distinction between strict native work and integration glue."""
 
     WHOLE_OPERATION = "whole-operation"
     RUST_ADAPTER_LOOP = "rust-adapter-loop"
+    SEMANTIC_HELPER_BACKED = "semantic-helper-backed"
 
 
 class OperationRoutePolicy(NamedTuple):
@@ -202,6 +213,10 @@ OPERATION_ROUTE_POLICIES = {
     "linked-selector-negative-certificate-adapter-loop": OperationRoutePolicy(
         OperationBoundary.RUST_ADAPTER_LOOP,
         "native-negative-certificate-with-unused-stock-capture-fallback",
+    ),
+    "linked-shared-ordered-many-helper-backed-reducer": OperationRoutePolicy(
+        OperationBoundary.SEMANTIC_HELPER_BACKED,
+        "single-call-native-reducer-retains-semantic-runtime-helpers",
     ),
 }
 NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES = {
@@ -1051,6 +1066,8 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         "source_commit", "source_tree", "target", "feature_bits",
         "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
+        "shared_ordered_many", "source_pattern_count",
+        "ordered_many_receipt_schema", "ordered_many_sources_sha256",
         "prepare_config_version", "prepare_operation_flags",
         "required_prepare_capabilities", "prepare_scope", "object_descriptor_setup",
         "max_start_filter_setup_work", "max_grep_count_workspace_bytes",
@@ -1067,8 +1084,8 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         )
     if fields["disposition"] != "executed":
         raise CensusError("scalar provenance disposition is not executed")
-    if fields["boundary"] != "runtime-klv-warmup-schedule":
-        raise CensusError("scalar provenance has the wrong operation boundary")
+    if fields["shared_ordered_many"] not in {"true", "false"}:
+        raise CensusError("scalar provenance has an invalid shared ordered-many flag")
     if fields["required_comparators"] != "rust-regex-1.12.4,fre-current-runtime":
         raise CensusError("scalar provenance comparator set differs")
     if fields["prepare_scope"] != "runtime-handle-state" or fields[
@@ -1097,6 +1114,10 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
             raise CensusError(f"scalar provenance has negative {name}")
     require_hex64(fields["program_sha256"], "provenance program digest")
     require_hex64(fields["object_sha256"], "provenance object digest")
+    require_hex64(
+        fields["ordered_many_sources_sha256"],
+        "provenance ordered-many source digest",
+    )
     parse_canonical_decimal(
         fields["program_len"], "scalar runtime program length", 1,
         MAX_SERIALIZED_PROGRAM_BYTES,
@@ -1112,6 +1133,19 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         SYMBOL.fullmatch(symbol) for symbol in runtime_symbols
     ):
         raise CensusError("scalar provenance runtime symbol list is malformed")
+    if fields["shared_ordered_many"] == "true":
+        shared_ordered_many_v15_proof(fields)
+    else:
+        source_count = parse_canonical_decimal(
+            fields["source_pattern_count"], "scalar source_pattern_count", 1, 1
+        )
+        if (
+            source_count != 1
+            or fields["ordered_many_receipt_schema"] != "0"
+            or fields["ordered_many_sources_sha256"] != "0" * 64
+            or fields["boundary"] != "runtime-klv-warmup-schedule"
+        ):
+            raise CensusError("non-shared scalar provenance retains an ordered-many receipt")
     if fields["model"] == "grep":
         capabilities = int(fields["required_prepare_capabilities"], 16)
         if capabilities == PREPARED_V15_CAPABILITY:
@@ -1222,6 +1256,108 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
         "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
         "prepare_operation_flags": PREPARED_V15_SPAN_OPERATION_FLAGS,
+        "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
+        "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
+        "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
+        "runtime_program_len": int(fields["program_len"], 10),
+        "artifact_identity_sha256": entry_suffix,
+        "reducer_identity_sha256": reducer_suffix,
+    }
+
+
+def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
+    """Authenticate one combined multi-source native Count/SpanSum reducer."""
+    route = {
+        "count": (
+            "general-aot-shared-ordered-many-native-count-v1",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS,
+            "not-applicable",
+        ),
+        "count-spans": (
+            "general-aot-shared-ordered-many-native-span-sum-v1",
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS,
+            "linked-shared-ordered-many-native-span-sum-reducer-v1",
+        ),
+    }.get(fields.get("model"))
+    if route is None:
+        raise CensusError("shared ordered-many provenance has an unsupported model")
+    adapter, reducer_pattern, operation_flags, runtime_symbols, span_iteration = route
+    source_count = parse_canonical_decimal(
+        fields.get("source_pattern_count"),
+        "shared ordered-many source_pattern_count",
+        2,
+        MAX_NATIVE_ROW_COMPONENTS,
+    )
+    receipt_schema = parse_canonical_decimal(
+        fields.get("ordered_many_receipt_schema"),
+        "shared ordered-many receipt schema",
+        ORDERED_MANY_RECEIPT_VERSION,
+        ORDERED_MANY_RECEIPT_VERSION,
+    )
+    ordered_sources = fields.get("ordered_many_sources_sha256", "")
+    require_hex64(ordered_sources, "shared ordered-many source digest")
+    if ordered_sources == "0" * 64:
+        raise CensusError("shared ordered-many source digest is zero")
+    if (
+        fields.get("shared_ordered_many") != "true"
+        or fields.get("adapter") != adapter
+        or fields.get("engine") != "OrderedNfa"
+        or fields.get("aggregate_strategy") != "Some(NativeOrderedNfaFused)"
+        or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
+        or fields.get("span_iteration_strategy") != span_iteration
+        or fields.get("grep_iteration_strategy") != "not-applicable"
+        or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
+        or fields.get("prepare_operation_flags") != f"{operation_flags:016x}"
+        or fields.get("required_prepare_capabilities")
+        != f"{PREPARED_V15_CAPABILITY:016x}"
+        or fields.get("max_start_filter_setup_work") != "100000000"
+        or fields.get("max_grep_count_workspace_bytes") != "67108864"
+        or fields.get("max_handle_bytes") != str(PREPARED_V15_MAX_HANDLE_BYTES)
+        or fields.get("max_ordered_nfa_scratch_bytes")
+        != str(PREPARED_V15_MAX_SCRATCH_BYTES)
+        or fields.get("max_ordered_nfa_setup_work")
+        != str(PREPARED_V15_MAX_SETUP_WORK)
+        or fields.get("boundary")
+        != "single-call-shared-ordered-many-helper-backed-reducer"
+    ):
+        raise CensusError("shared ordered-many provenance has a noncanonical route or cap")
+    actual_runtime_symbols = tuple(sorted(filter(
+        None, fields.get("required_runtime_symbols", "").split(",")
+    )))
+    if actual_runtime_symbols != runtime_symbols:
+        raise CensusError("shared ordered-many runtime dependency set differs")
+    entry_suffix = symbol_identity_suffix(
+        fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
+        "shared ordered-many ordinary entry",
+    )
+    span_fill_suffix = symbol_identity_suffix(
+        fields["span_fill_symbol"], NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+        "shared ordered-many SpanFill entry",
+    )
+    program_suffix = symbol_identity_suffix(
+        fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
+        "shared ordered-many runtime program",
+    )
+    reducer_suffix = symbol_identity_suffix(
+        fields["reducer_symbol"], reducer_pattern,
+        "shared ordered-many reducer",
+    )
+    if (
+        len({entry_suffix, span_fill_suffix, program_suffix}) != 1
+        or reducer_suffix == entry_suffix
+    ):
+        raise CensusError("shared ordered-many symbol identities disagree")
+    return {
+        "receipt_schema_version": receipt_schema,
+        "source_pattern_count": source_count,
+        "ordered_sources_sha256": ordered_sources,
+        "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
+        "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
+        "prepare_operation_flags": operation_flags,
         "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
         "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
         "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
@@ -2305,6 +2441,11 @@ def run_nm(nm: str, binary: pathlib.Path) -> tuple[set[str], set[str], set[str],
 
 def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], str]:
     model = provenance["model"]
+    if provenance.get("shared_ordered_many") == "true":
+        shared_ordered_many_v15_proof(provenance)
+        return [provenance["reducer_symbol"]], (
+            "linked-shared-ordered-many-helper-backed-reducer"
+        )
     components = components_from_provenance(provenance)
     if components:
         entries = [str(component["entry_symbol"]) for component in components]
@@ -2545,19 +2686,35 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         )
     }
     if fields["schema"] == "fre.aot.rebar-runner.v2":
+        shared_ordered_many = fields["shared_ordered_many"] == "true"
         prepared_grep_v15 = (
             fields["model"] == "grep"
             and fields["required_prepare_capabilities"]
             == f"{PREPARED_V15_CAPABILITY:016x}"
         )
+        shared_proof = (
+            shared_ordered_many_v15_proof(fields) if shared_ordered_many else None
+        )
+        source_pattern_count = (
+            int(fields["source_pattern_count"], 10) if shared_ordered_many else None
+        )
         result = {
             **common,
-            "kind": "prepared-grep-v15-v2" if prepared_grep_v15 else "scalar-v2",
-            "composite_kind": None,
-            "source_pattern_count": None,
-            "source_to_artifact": [],
+            "kind": (
+                "shared-ordered-many-v2" if shared_ordered_many else
+                "prepared-grep-v15-v2" if prepared_grep_v15 else "scalar-v2"
+            ),
+            "composite_kind": (
+                "shared-ordered-many-native-reducer-v1"
+                if shared_ordered_many else None
+            ),
+            "source_pattern_count": source_pattern_count,
+            "source_to_artifact": (
+                [0] * source_pattern_count if shared_ordered_many else []
+            ),
             "row_total_object_bytes": None,
             "uniform_capture": None,
+            "shared_ordered_many": shared_proof,
             "boundary": fields.get("boundary"),
             "engine": fields["engine"],
             "aggregate_strategy": fields["aggregate_strategy"],
@@ -2602,6 +2759,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "source_to_artifact": source_to_artifact,
             "row_total_object_bytes": int(fields["row_total_object_bytes"], 10),
             "uniform_capture": None,
+            "shared_ordered_many": None,
             "boundary": fields["boundary"],
             "engine": fields["engine"],
             "aggregate_strategy": fields["aggregate_strategy"],
@@ -2667,6 +2825,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
                 fields, components, source_pattern_count, source_to_artifact
             ) if uniform_capture else None
         ),
+        "shared_ordered_many": None,
         "boundary": fields["boundary"],
         "engine": fields["engine"],
         "aggregate_strategy": fields["aggregate_strategy"],
@@ -2695,6 +2854,15 @@ def operation_route_from_provenance_record(
     provenance: dict[str, object],
 ) -> tuple[list[str], str]:
     """Reconstruct the exact operation entries from normalized provenance."""
+    if provenance.get("kind") == "shared-ordered-many-v2":
+        validate_normalized_shared_ordered_many(
+            provenance.get("shared_ordered_many"), provenance,
+            "normalized shared ordered-many provenance",
+        )
+        reducer = provenance.get("reducer_symbol")
+        if not isinstance(reducer, str):
+            raise CensusError("normalized shared ordered-many reducer is absent")
+        return [reducer], "linked-shared-ordered-many-helper-backed-reducer"
     components = provenance["components"]
     if components:
         entries = [component["entry_symbol"] for component in components]
@@ -2821,6 +2989,14 @@ def identity_defined_symbols_from_provenance(
     provenance: dict[str, object],
 ) -> list[str]:
     """Return route-bound defined symbols authenticated but not invoked."""
+    if provenance.get("kind") == "shared-ordered-many-v2":
+        symbols = [
+            provenance.get("entry_symbol"), provenance.get("span_fill_symbol"),
+            provenance.get("program_symbol"),
+        ]
+        if not all(isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in symbols):
+            raise CensusError("shared ordered-many identity symbol set is malformed")
+        return sorted(symbols)
     if provenance.get("kind") == "prepared-grep-v15-v2":
         return sorted([
             provenance["entry_symbol"], provenance["span_fill_symbol"],
@@ -3012,7 +3188,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     normalized_provenance = provenance_receipt(primary_fields)
     if normalized_provenance["kind"] in {
         "composite-v3", "strict-capture-v4", "participation-capture-v4",
-        "selector-capture-fallback-v4",
+        "selector-capture-fallback-v4", "shared-ordered-many-v2",
     } and (
         normalized_provenance["source_pattern_count"]
         != len(job["input"]["pattern_sha256"])
@@ -3021,7 +3197,9 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     validate_provenance_job_binding(normalized_provenance, job["input"])
     expected_object_hashes = (
         [normalized_provenance["object_sha256"]]
-        if normalized_provenance["kind"] in {"scalar-v2", "prepared-grep-v15-v2"}
+        if normalized_provenance["kind"] in {
+            "scalar-v2", "prepared-grep-v15-v2", "shared-ordered-many-v2",
+        }
         else [component["object_sha256"] for component in normalized_provenance["components"]]
     )
     if [row["sha256"] for row in primary_hashes["objects"]] != expected_object_hashes:
@@ -3035,7 +3213,9 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
             for artifact in (primary_hashes, replica_hashes)
         ):
             raise CensusError("native-row object files differ from its total-byte receipt")
-    if normalized_provenance["kind"] == "prepared-grep-v15-v2" and any(
+    if normalized_provenance["kind"] in {
+        "prepared-grep-v15-v2", "shared-ordered-many-v2",
+    } and any(
         not 0 < row["bytes"] <= MAX_NATIVE_ROW_OBJECT_BYTES
         for artifact in (primary_hashes, replica_hashes)
         for row in artifact["objects"]
@@ -3671,6 +3851,111 @@ def validate_normalized_prepared_grep_v15(
         raise CensusError(f"{context} scalar prepared V15 proof differs")
 
 
+def validate_normalized_shared_ordered_many(
+    proof: object, provenance: dict[str, object], context: str
+) -> None:
+    """Close one normalized multi-source Count/SpanSum reducer receipt."""
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} shared ordered-many proof is not an object")
+    require_exact_keys(
+        proof,
+        {
+            "receipt_schema_version", "source_pattern_count",
+            "ordered_sources_sha256", "required_prepare_capabilities",
+            "prepare_config_version", "prepare_operation_flags",
+            "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+            "runtime_program_len", "artifact_identity_sha256",
+            "reducer_identity_sha256",
+        },
+        f"{context} shared ordered-many proof",
+    )
+    route = {
+        "count": (
+            "general-aot-shared-ordered-many-native-count-v1",
+            "not-applicable",
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS,
+            NATIVE_COUNT_ENTRY_SYMBOL,
+        ),
+        "count-spans": (
+            "general-aot-shared-ordered-many-native-span-sum-v1",
+            "linked-shared-ordered-many-native-span-sum-reducer-v1",
+            PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS,
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+        ),
+    }.get(provenance.get("model"))
+    if route is None:
+        raise CensusError(f"{context} has an unsupported shared model")
+    adapter, span_iteration, operation_flags, runtime_symbols, reducer_pattern = route
+    source_count = proof.get("source_pattern_count")
+    source_map = provenance.get("source_to_artifact")
+    if (
+        provenance.get("schema") != "fre.aot.rebar-runner.v2"
+        or provenance.get("kind") != "shared-ordered-many-v2"
+        or provenance.get("composite_kind")
+        != "shared-ordered-many-native-reducer-v1"
+        or provenance.get("adapter") != adapter
+        or provenance.get("boundary")
+        != "single-call-shared-ordered-many-helper-backed-reducer"
+        or provenance.get("engine") != "OrderedNfa"
+        or provenance.get("aggregate_strategy")
+        != "Some(NativeOrderedNfaFused)"
+        or provenance.get("prepared_bulk_strategy")
+        != "Some(NativeOrderedNfaLoop)"
+        or provenance.get("span_iteration_strategy") != span_iteration
+        or provenance.get("grep_iteration_strategy") != "not-applicable"
+        or not isinstance(source_count, int)
+        or isinstance(source_count, bool)
+        or not 2 <= source_count <= MAX_NATIVE_ROW_COMPONENTS
+        or provenance.get("source_pattern_count") != source_count
+        or source_map != [0] * source_count
+        or provenance.get("row_total_object_bytes") is not None
+        or provenance.get("uniform_capture") is not None
+        or provenance.get("components") != []
+        or provenance.get("required_runtime_symbols") != list(runtime_symbols)
+    ):
+        raise CensusError(f"{context} shared ordered-many topology differs")
+    entry = provenance.get("entry_symbol")
+    span_fill = provenance.get("span_fill_symbol")
+    program = provenance.get("program_symbol")
+    reducer = provenance.get("reducer_symbol")
+    if not all(isinstance(value, str) for value in (entry, span_fill, program, reducer)):
+        raise CensusError(f"{context} shared ordered-many symbols are malformed")
+    entry_suffix = symbol_identity_suffix(entry, NATIVE_SEARCH_ENTRY_SYMBOL, context)
+    span_fill_suffix = symbol_identity_suffix(
+        span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context
+    )
+    program_suffix = symbol_identity_suffix(
+        program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context
+    )
+    reducer_suffix = symbol_identity_suffix(reducer, reducer_pattern, context)
+    for field in ("ordered_sources_sha256", "artifact_identity_sha256", "reducer_identity_sha256"):
+        value = proof.get(field)
+        if not isinstance(value, str):
+            raise CensusError(f"{context} {field} is malformed")
+        require_hex64(value, f"{context} {field}")
+    runtime_program_len = proof.get("runtime_program_len")
+    if (
+        proof.get("receipt_schema_version") != ORDERED_MANY_RECEIPT_VERSION
+        or proof.get("required_prepare_capabilities") != PREPARED_V15_CAPABILITY
+        or proof.get("prepare_config_version") != PREPARED_V15_CONFIG_VERSION
+        or proof.get("prepare_operation_flags") != operation_flags
+        or proof.get("max_handle_bytes") != PREPARED_V15_MAX_HANDLE_BYTES
+        or proof.get("max_scratch_bytes") != PREPARED_V15_MAX_SCRATCH_BYTES
+        or proof.get("max_setup_work") != PREPARED_V15_MAX_SETUP_WORK
+        or proof.get("ordered_sources_sha256") == "0" * 64
+        or not isinstance(runtime_program_len, int)
+        or isinstance(runtime_program_len, bool)
+        or not 1 <= runtime_program_len <= MAX_SERIALIZED_PROGRAM_BYTES
+        or proof.get("artifact_identity_sha256") != entry_suffix
+        or proof.get("reducer_identity_sha256") != reducer_suffix
+        or len({entry_suffix, span_fill_suffix, program_suffix}) != 1
+        or reducer_suffix == entry_suffix
+    ):
+        raise CensusError(f"{context} shared ordered-many proof differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -3678,7 +3963,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         "schema", "adapter", "model", "benchmark", "source_commit", "source_tree",
         "target", "feature_bits", "kind", "composite_kind", "source_pattern_count",
         "source_to_artifact", "row_total_object_bytes", "boundary", "engine",
-        "aggregate_strategy", "uniform_capture",
+        "aggregate_strategy", "uniform_capture", "shared_ordered_many",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
@@ -3735,6 +4020,11 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in required_runtime
     ):
         raise CensusError(f"{context} runtime symbols are not canonical")
+    if (
+        provenance["kind"] != "shared-ordered-many-v2"
+        and provenance["shared_ordered_many"] is not None
+    ):
+        raise CensusError(f"{context} non-shared route retains a shared proof")
     if provenance["kind"] in {"scalar-v2", "prepared-grep-v15-v2"}:
         if (
             provenance["schema"] != "fre.aot.rebar-runner.v2"
@@ -3794,6 +4084,12 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or reducer_suffix == entry_suffix
             ):
                 raise CensusError(f"{context} scalar direct native grep route differs")
+    elif provenance["kind"] == "shared-ordered-many-v2":
+        require_hex64(provenance["program_sha256"], f"{context} shared program")
+        require_hex64(provenance["object_sha256"], f"{context} shared object")
+        validate_normalized_shared_ordered_many(
+            provenance["shared_ordered_many"], provenance, context
+        )
     elif provenance["kind"] == "composite-v3":
         if provenance["schema"] != "fre.aot.rebar-runner.v3" or not provenance["components"]:
             raise CensusError(f"{context} composite fields disagree")
@@ -4145,12 +4441,12 @@ def validate_provenance_job_binding(
 ) -> None:
     if provenance["kind"] not in {
         "composite-v3", "strict-capture-v4", "participation-capture-v4",
-        "selector-capture-fallback-v4",
+        "selector-capture-fallback-v4", "shared-ordered-many-v2",
     }:
         return
     pattern_hashes = input_identity["pattern_sha256"]
     if provenance["source_pattern_count"] != len(pattern_hashes):
-        raise CensusError("composite provenance source count differs from sealed job")
+        raise CensusError("multi-source provenance count differs from sealed job")
     if provenance["composite_kind"] in NATIVE_ROW_COMPOSITE_KINDS:
         source_map = provenance["source_to_artifact"]
         proof = provenance["uniform_capture"]
@@ -4349,7 +4645,9 @@ def validate_receipt(
         validate_provenance_job_binding(provenance, planned["input"])
         expected_object_hashes = (
             [provenance["object_sha256"]]
-            if provenance["kind"] in {"scalar-v2", "prepared-grep-v15-v2"}
+            if provenance["kind"] in {
+                "scalar-v2", "prepared-grep-v15-v2", "shared-ordered-many-v2",
+            }
             else [component["object_sha256"] for component in provenance["components"]]
         )
         for label, artifact in (("primary", primary), ("replica", replica)):
@@ -4361,7 +4659,9 @@ def validate_receipt(
                 != provenance["row_total_object_bytes"]
             ):
                 raise CensusError(f"{label} native-row object byte total differs")
-            if provenance["kind"] == "prepared-grep-v15-v2" and any(
+            if provenance["kind"] in {
+                "prepared-grep-v15-v2", "shared-ordered-many-v2",
+            } and any(
                 not 0 < row["bytes"] <= MAX_NATIVE_ROW_OBJECT_BYTES
                 for row in artifact["objects"]
             ):
