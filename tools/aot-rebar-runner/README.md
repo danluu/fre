@@ -125,8 +125,14 @@ timing belongs to a separately named compiler-stage benchmark.
 - Single-pattern `grep` calls its identity-suffixed native `GrepCount` reducer
   exactly once per sample. That generated reducer owns Rebar's LF/CRLF line
   domain, including empty input, lone CR, trailing LF, and checked
-  transactional `u64` publication, and calls only its authenticated local
-  ordinary search or prepared V15 search. For multiple patterns the runner
+  transactional `u64` publication, and calls only its authenticated
+  object-local search. When an ordinary GrepCount incumbent needs the prepared
+  Ordered-NFA V15 route, the runner first requests the closed scalar-operation
+  surface: its sole global function is GrepCount, its search and capability
+  gate are object-local, and it has no unresolved runtime functions. Only a
+  typed unsupported, native-data-byte, or object-byte decline preserves the
+  exact incumbent; allocation, lowering, emission, and authentication errors
+  remain terminal. For multiple patterns the runner
   still invokes every retained row's corresponding direct or prepared search
   entry per line and counts lines for which any row reports a match. Prepared
   handles are constructed before warmup and timed loops.
@@ -234,11 +240,12 @@ semantic-helper traps, and selected-entry trap all agree.
 If the ordinary optimizer does not publish that exact helper-free reducer, the
 same semantic plan may select the additive scalar-operation-only V15 route.
 That object has `entry_abi=PreparedScalarReduceV1`: the sole global function is
-the Count or SpanSum reducer, its search and required-capability gate are local,
+the Count, SpanSum, or single-pattern GrepCount reducer, its search and
+required-capability gate are local,
 and its runtime-function surface is empty. A legacy or wrongly prepared handle
 fails closed instead of entering a compatibility reducer. The older prepared
-V15 search API and its entry/SpanFill/helper topology remain unchanged for row,
-grep, and capture consumers. Typed V15 unsupported and byte-limit declines
+V15 search API and its entry/SpanFill/helper topology remain unchanged for row
+and capture consumers. Typed V15 unsupported and byte-limit declines
 retain the independent-row incumbent byte-for-byte; allocation, invariant,
 emission, semantic-identity, and authentication failures remain terminal. An
 ordinary program/object representation cap may consult that same reported V15

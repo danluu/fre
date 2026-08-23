@@ -786,6 +786,7 @@ fn configured_source(
         || native_uniform_capture_operation_only;
     let scalar_entry_symbol = match benchmark.model {
         shared::Model::SpanSum => compiled.module().prepared_span_sum_symbol(),
+        shared::Model::GrepCount => compiled.module().prepared_grep_count_symbol(),
         _ => compiled.module().prepared_count_symbol(),
     };
     assert_eq!(

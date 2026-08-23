@@ -6716,7 +6716,8 @@ impl CompiledModule {
                 .and_then(|index| self.symbols.get(index));
             let entry = self.symbols.get(self.entry_symbol_index);
             let exact_export = exports == PreparedAggregateExports::COUNT
-                || exports == PreparedAggregateExports::SPAN_SUM;
+                || exports == PreparedAggregateExports::SPAN_SUM
+                || exports == PreparedAggregateExports::GREP_COUNT;
             let exact_surface = exact_export
                 && self.prepared_span_fill_symbol_index.is_none()
                 && self.prepared_exists_batch_symbol_index.is_none()
@@ -6761,7 +6762,8 @@ impl CompiledModule {
                     )
                 ));
         let prepared_grep_target = grep_reducer_requested
-            && self.prepared_bulk_strategy == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+            && (ordered_nfa_operation_only
+                || self.prepared_bulk_strategy == Some(PreparedBulkStrategy::NativeOrderedNfaLoop));
         let prepared_search_target = if prepared_span_target || prepared_grep_target
         {
             self.native_prepared_bulk_search_target
@@ -7932,14 +7934,21 @@ impl CompiledModule {
             }
         }
         let operation_entry_symbol_index = if ordered_nfa_operation_only {
-            let reducer = match (prepared_count_symbol_index, prepared_span_sum_symbol_index) {
-                (Some(reducer), None) | (None, Some(reducer)) => reducer,
-                _ => {
-                    return Err(ObjectError::InvalidModule(
-                        "Ordered-NFA operation-only module has no unique scalar reducer",
-                    ));
-                }
-            };
+            let mut reducers = [
+                prepared_count_symbol_index,
+                prepared_span_sum_symbol_index,
+                prepared_grep_count_symbol_index,
+            ]
+            .into_iter()
+            .flatten();
+            let reducer = reducers.next().ok_or(ObjectError::InvalidModule(
+                "Ordered-NFA operation-only module has no scalar reducer",
+            ))?;
+            if reducers.next().is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA operation-only module has no unique scalar reducer",
+                ));
+            }
             let mut global_functions = symbols
                 .iter()
                 .enumerate()

@@ -363,22 +363,28 @@ pub const fn is_native_whole_scalar_reducer(
     model: Model,
     strategy: Option<PreparedAggregateStrategy>,
 ) -> bool {
-    matches!(model, Model::Count | Model::SpanSum)
-        && matches!(
-            strategy,
+    matches!(
+        (model, strategy),
+        (
+            Model::Count | Model::SpanSum,
             Some(
                 PreparedAggregateStrategy::NativeFused
                     | PreparedAggregateStrategy::NativeOrderedNfaFused
             )
+        ) | (
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
         )
+    )
 }
 
-/// Authenticate that the selected Count or `SpanSum` export is one complete
-/// generated text function over the exact linked program.
+/// Authenticate that the selected Count, `SpanSum`, or operation-only
+/// `GrepCount` export is one complete generated text function over the exact
+/// linked program.
 ///
 /// The aggregate strategy is only the first gate. This also closes the export
 /// set, prepared capability/bulk shape, canonical program/reducer identity,
-/// defined-text extent, and every unresolved aggregate relocation. For
+/// defined-text extent, and every unresolved relocation. For
 /// `NativeFused`, the compiler strategy has already closed the reducer's
 /// transitive local-call target as an ordinary helper-free entry. The scalar
 /// V15 surface instead exports only its reducer; its search and required
@@ -404,7 +410,11 @@ pub fn authenticate_native_whole_scalar_reducer(
             module.prepared_span_sum_symbol(),
             "fre_aot_regex_span_sum_exclusive_v1_",
         ),
-        _ => unreachable!("native whole scalar reducer is restricted to Count and SpanSum"),
+        Model::GrepCount => (
+            module.prepared_grep_count_symbol(),
+            "fre_aot_regex_grep_count_exclusive_v1_",
+        ),
+        _ => unreachable!("native whole scalar reducer is restricted to scalar models"),
     };
     let reducer_name = reducer_name
         .ok_or_else(|| "native scalar strategy has no model-specific reducer symbol".to_owned())?;
@@ -443,6 +453,7 @@ pub fn authenticate_native_whole_scalar_reducer(
         || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
         || receipt.runtime_helper_required
         || !bulk_shape_is_exact
+        || !has_exact_runtime_symbol_closure(compiled, &[])
         || reducer_name == program_name
         || program_len == 0
         || receipt.program_sha256 == [0; 32]
@@ -968,24 +979,47 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)?;
         return Ok(compiled);
     }
-    if compiled.module().required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15 {
+    let grep_needs_operation_only_v15 = if compiled.module().required_prepare_capabilities()
+        == PREPARED_CAPABILITY_ORDERED_NFA_V15
+    {
         authenticate_prepared_v15_grep(&compiled)?;
-        return Ok(compiled);
-    }
-    if !ordinary_grep_requires_prepared_v15(&compiled) {
+        true
+    } else {
+        ordinary_grep_requires_prepared_v15(&compiled)
+    };
+    if !grep_needs_operation_only_v15 {
         authenticate_direct_native_grep(&compiled)?;
         return Ok(compiled);
     }
-    let disposition = compile_with_prepared_ordered_nfa_v15_reported(
+    let attempt = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
         CompileRequest::new(benchmark.pattern(), target)
             .profile(profile)
             .output(OutputContract::Span)
             .mode(CompileMode::Optimizing)
             .limits(selected_limits),
         PreparedAggregateExports::GREP_COUNT,
-    )
-    .map_err(|error| format!("general AOT prepared V15 grep compilation failed: {error}"))?;
-    select_prepared_v15_grep_or_incumbent(compiled, disposition)
+    );
+    match classify_grep_operation_only_attempt(attempt)? {
+        Some(selected) => {
+            authenticate_prepared_ordered_nfa_scalar(Model::GrepCount, &selected)?;
+            Ok(selected)
+        }
+        None => Ok(compiled),
+    }
+}
+
+fn classify_grep_operation_only_attempt(
+    attempt: Result<PreparedOrderedNfaV15CompileDisposition, CompileError>,
+) -> Result<Option<CompiledRegex>, String> {
+    match attempt {
+        Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => {
+            Ok(Some(compiled))
+        }
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(_)) => Ok(None),
+        Err(error) => Err(format!(
+            "general AOT operation-only prepared V15 grep compilation failed: {error}"
+        )),
+    }
 }
 
 fn select_prepared_ordered_nfa_v15_or_incumbent(
@@ -1173,6 +1207,7 @@ fn authenticate_prepared_ordered_nfa_scalar(
     let reducer_is_present = match model {
         Model::Count => module.prepared_count_symbol().is_some(),
         Model::SpanSum => module.prepared_span_sum_symbol().is_some(),
+        Model::GrepCount => module.prepared_grep_count_symbol().is_some(),
         _ => false,
     };
     if receipt.mode != CompileMode::Optimizing
@@ -1197,6 +1232,9 @@ fn authenticate_prepared_ordered_nfa_scalar(
         || match model {
             Model::Count => module.prepared_count_symbol() != Some(module.entry_symbol()),
             Model::SpanSum => module.prepared_span_sum_symbol() != Some(module.entry_symbol()),
+            Model::GrepCount => {
+                module.prepared_grep_count_symbol() != Some(module.entry_symbol())
+            }
             _ => true,
         }
         || compiled.object().is_empty()
@@ -1217,19 +1255,6 @@ fn authenticate_prepared_ordered_nfa_scalar(
         );
     }
     Ok(())
-}
-
-fn select_prepared_v15_grep_or_incumbent(
-    incumbent: CompiledRegex,
-    disposition: PreparedOrderedNfaV15CompileDisposition,
-) -> Result<CompiledRegex, String> {
-    match disposition {
-        PreparedOrderedNfaV15CompileDisposition::Compiled(selected) => {
-            authenticate_prepared_v15_grep(&selected)?;
-            Ok(selected)
-        }
-        PreparedOrderedNfaV15CompileDisposition::Declined(_) => Ok(incumbent),
-    }
 }
 
 const ORDINARY_GREP_RUNTIME_SYMBOLS: [&str; 4] = [
@@ -3967,8 +3992,8 @@ mod tests {
     }
 
     #[test]
-    fn safe_v15_grep_declines_return_the_incumbent_byte_for_byte() {
-        use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
+    fn operation_only_v15_grep_declines_preserve_incumbent_and_errors_stay_terminal() {
+        use fre_aot_regex::{ObjectError, PreparedOrderedNfaV15CompileDecline};
 
         let target = target_from_parts(
             std::env::consts::ARCH,
@@ -3998,15 +4023,22 @@ mod tests {
                 required: 12,
             },
         ] {
-            let selected = select_prepared_v15_grep_or_incumbent(
-                incumbent.clone(),
+            let candidate = classify_grep_operation_only_attempt(Ok(
                 PreparedOrderedNfaV15CompileDisposition::Declined(decline),
-            )
-            .expect("safe grep V15 decline");
+            ))
+            .expect("typed operation-only grep decline");
+            assert!(candidate.is_none());
+            let selected = candidate.unwrap_or_else(|| incumbent.clone());
             assert_eq!(selected.program().serialize().unwrap(), expected_program);
             assert_eq!(selected.object(), expected_object);
             assert_eq!(selected.receipt(), &expected_receipt);
         }
+
+        let error = classify_grep_operation_only_attempt(Err(CompileError::Object(
+            ObjectError::Allocation("injected operation-only GrepCount allocation"),
+        )))
+        .expect_err("allocator failure must remain terminal");
+        assert!(error.contains("injected operation-only GrepCount allocation"));
     }
 
     #[test]
@@ -4260,7 +4292,26 @@ mod tests {
             selected.module().required_prepare_capabilities(),
             PREPARED_CAPABILITY_ORDERED_NFA_V15
         );
-        authenticate_prepared_v15_grep(&selected).expect("authenticated prepared V15 grep");
+        authenticate_prepared_ordered_nfa_scalar(Model::GrepCount, &selected)
+            .expect("authenticated operation-only prepared V15 grep");
+        assert_eq!(
+            selected.receipt().entry_abi,
+            EntryAbi::PreparedScalarReduceV1
+        );
+        assert_eq!(
+            selected.module().prepared_grep_count_symbol(),
+            Some(selected.module().entry_symbol())
+        );
+        assert_eq!(selected.module().prepared_bulk_strategy(), None);
+        assert_eq!(selected.module().prepared_entry_symbol(), None);
+        assert_eq!(selected.module().prepared_span_fill_symbol(), None);
+        assert!(
+            selected
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4391,6 +4442,14 @@ mod tests {
                 ));
             }
         }
+        assert!(!is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeFused),
+        ));
+        assert!(is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        ));
         for model in [Model::GrepCount, Model::CountCaptures] {
             assert!(!scalar_incumbent_route_shape(
                 model,
@@ -5760,6 +5819,10 @@ mod tests {
                 Some(PreparedAggregateStrategy::NativeFused),
             ));
         }
+        assert!(is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        ));
     }
 
     #[test]

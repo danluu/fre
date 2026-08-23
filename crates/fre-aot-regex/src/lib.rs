@@ -448,7 +448,7 @@ pub enum EntryAbi {
     ExistsSearchV1,
     SelectedEndSearchV1,
     SpanSearchV1,
-    /// One exclusive-handle full-haystack Count or SpanSum transaction.
+    /// One exclusive-handle full-haystack Count, SpanSum, or GrepCount transaction.
     PreparedScalarReduceV1,
 }
 
@@ -1368,11 +1368,11 @@ pub fn compile_with_prepared_ordered_nfa_v15_reported(
     )
 }
 
-/// Compile one exact Count or SpanSum operation through the closed V15
-/// surface. The selected object exports only the scalar reducer as a global
-/// function; the Ordered-NFA search and capability gate remain object-local.
-/// Legacy prepared V15 APIs retain their established public search, SpanFill,
-/// and compatibility topology byte-for-byte.
+/// Compile one exact Count, SpanSum, or GrepCount operation through the closed
+/// V15 surface. The selected object exports only the scalar reducer as a
+/// global function; the Ordered-NFA search and capability gate remain
+/// object-local. Legacy prepared V15 APIs retain their established public
+/// search, SpanFill, and compatibility topology byte-for-byte.
 pub fn compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
     request: CompileRequest,
     export: PreparedAggregateExports,
@@ -1445,6 +1445,7 @@ fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_sur
     if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
         && exports != PreparedAggregateExports::COUNT
         && exports != PreparedAggregateExports::SPAN_SUM
+        && exports != PreparedAggregateExports::GREP_COUNT
     {
         return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
             actual: exports,
@@ -1600,6 +1601,7 @@ fn compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
 ) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
     if export != PreparedAggregateExports::COUNT
         && export != PreparedAggregateExports::SPAN_SUM
+        && export != PreparedAggregateExports::GREP_COUNT
     {
         return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
             actual: export,
@@ -1797,6 +1799,8 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
                 module.prepared_count_symbol()
             } else if exports == PreparedAggregateExports::SPAN_SUM {
                 module.prepared_span_sum_symbol()
+            } else if exports == PreparedAggregateExports::GREP_COUNT {
+                module.prepared_grep_count_symbol()
             } else {
                 None
             };

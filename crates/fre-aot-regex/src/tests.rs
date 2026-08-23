@@ -3454,6 +3454,7 @@ fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
         for export in [
             PreparedAggregateExports::COUNT,
             PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::GREP_COUNT,
         ] {
             let request = || {
                 CompileRequest::new(r"\b\w{12,}\b", target)
@@ -3502,8 +3503,10 @@ fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
             assert!(module.required_runtime_program().is_some());
             let reducer = if export == PreparedAggregateExports::COUNT {
                 module.prepared_count_symbol()
-            } else {
+            } else if export == PreparedAggregateExports::SPAN_SUM {
                 module.prepared_span_sum_symbol()
+            } else {
+                module.prepared_grep_count_symbol()
             };
             assert_eq!(reducer, Some(module.entry_symbol()));
             let global_functions = module
@@ -3532,7 +3535,6 @@ fn prepared_v15_scalar_operation_rejects_every_non_scalar_export_shape() {
     for exports in [
         PreparedAggregateExports::NONE,
         PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
-        PreparedAggregateExports::GREP_COUNT,
         PreparedAggregateExports::ALL,
     ] {
         let error = crate::compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(

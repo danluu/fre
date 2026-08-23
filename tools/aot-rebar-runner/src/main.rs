@@ -2879,10 +2879,21 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if scalar_uniform_capture {
         // The exact per-line or whole-domain route was authenticated above.
     } else if benchmark.model == shared::Model::GrepCount {
-        let direct = authenticate_linked_direct_native_grep();
-        let prepared = authenticate_linked_prepared_v15_grep();
-        if !direct && !prepared {
-            return Err("grep artifact is not bound to an authenticated grep route".to_owned());
+        if native_scalar_reducer {
+            if linked::GREP_ITERATION_STRATEGY != "linked-native-grep-count-reducer-v1"
+                || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
+            {
+                return Err(
+                    "native scalar grep execution boundary disagrees with its reducer receipt"
+                        .to_owned(),
+                );
+            }
+        } else {
+            let direct = authenticate_linked_direct_native_grep();
+            let prepared = authenticate_linked_prepared_v15_grep();
+            if !direct && !prepared {
+                return Err("grep artifact is not bound to an authenticated grep route".to_owned());
+            }
         }
     } else if linked::GREP_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-grep artifact advertises a grep iterator route".to_owned());
@@ -4044,19 +4055,26 @@ fn expected_native_scalar_adapter(
         (true, shared::Model::SpanSum) => {
             Some("general-aot-shared-ordered-many-native-span-sum-v1")
         }
-        (true, _) => None,
         (false, shared::Model::Count | shared::Model::SpanSum) => {
             Some(model.adapter_for_required_capabilities(required_prepare_capabilities))
         }
-        (false, _) => None,
+        (false, shared::Model::GrepCount)
+            if required_prepare_capabilities == PREPARE_CAPABILITY_ORDERED_NFA_V15 =>
+        {
+            Some(model.adapter_for_required_capabilities(required_prepare_capabilities))
+        }
+        _ => None,
     }
 }
 
 fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<bool, String> {
-    let strategy_is_native = matches!(
-        linked::AGGREGATE_STRATEGY,
-        "Some(NativeFused)" | "Some(NativeOrderedNfaFused)"
-    ) && matches!(model, shared::Model::Count | shared::Model::SpanSum);
+    let strategy_is_native = (matches!(model, shared::Model::Count | shared::Model::SpanSum)
+        && matches!(
+            linked::AGGREGATE_STRATEGY,
+            "Some(NativeFused)" | "Some(NativeOrderedNfaFused)"
+        ))
+        || (model == shared::Model::GrepCount
+            && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)");
     if linked::NATIVE_SCALAR_REDUCER != strategy_is_native {
         return Err(
             "native scalar reducer flag disagrees with its exact aggregate strategy".to_owned(),
@@ -4069,6 +4087,7 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
     let prefix = match model {
         shared::Model::Count => "fre_aot_regex_count_exclusive_v1_",
         shared::Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        shared::Model::GrepCount => "fre_aot_regex_grep_count_exclusive_v1_",
         _ => unreachable!("native scalar strategy was restricted to scalar models"),
     };
     let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, prefix)
@@ -4095,7 +4114,10 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
         || linked::PROGRAM_LEN == 0
         || linked::PROGRAM_SHA256 == [0; 32]
         || linked::OBJECT_SHA256 == [0; 32]
-        || linked::PREPARE_OPERATION_FLAGS != model.prepare_operation_flags()
+        || linked::PREPARE_OPERATION_FLAGS
+            != model.prepare_operation_flags_for_required_capabilities(
+                linked::REQUIRED_PREPARE_CAPABILITIES,
+            )
         || Some(linked::ADAPTER)
             != expected_native_scalar_adapter(
                 model,

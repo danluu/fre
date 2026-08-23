@@ -118,7 +118,7 @@ impl fmt::Display for CompileError {
             ),
             Self::PreparedScalarOperationRequiresSingleExport { actual } => write!(
                 formatter,
-                "prepared scalar operation requires exactly one Count or SpanSum export, got {actual:?}"
+                "prepared scalar operation requires exactly one Count, SpanSum, or GrepCount export, got {actual:?}"
             ),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "compiler internal invariant failed: {detail}")
