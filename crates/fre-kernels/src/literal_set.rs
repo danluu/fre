@@ -807,22 +807,6 @@ impl LiteralSetPlan {
     }
 
     #[inline]
-    fn try_exists_window_value(
-        &self,
-        haystack: &[u8],
-        window: Window,
-    ) -> Result<bool, LiteralSetError> {
-        if self.automaton.prefilter().is_some() {
-            return self
-                .try_find_window_value(haystack, window)
-                .map(|matched| matched.is_some());
-        }
-        Ok(self
-            .selected_end_window_value::<true>(haystack, window)
-            .is_some())
-    }
-
-    #[inline]
     fn try_selected_end_window_value(
         &self,
         haystack: &[u8],
@@ -1453,8 +1437,47 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         haystack: &[u8],
         window: Window,
     ) -> Result<bool, LiteralSetError> {
+        self.first_acceptance_window_value(haystack, window)
+            .map(|endpoint| endpoint.is_some())
+    }
+
+    /// Return the first accepting endpoint inside `window` without finite
+    /// accounting or selected-span reconstruction.
+    ///
+    /// A retained prefilter runs the same Aho DFA with earliest-match input.
+    /// A DFA without a prefilter uses its existing direct first-acceptance
+    /// loop. Neither route resolves the later LeftmostFirst selected span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
+    /// the original haystack.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn first_acceptance_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        self.plan.try_exists_window_value(haystack, window)
+        if self.plan.automaton.prefilter().is_some() {
+            let input = Input::new(haystack)
+                .span(window.start()..window.end())
+                .earliest(true);
+            return Ok(self
+                .plan
+                .automaton
+                .as_ref()
+                .try_find(&input)
+                .expect(
+                    "the literal-set DFA supports its construction-selected unanchored input",
+                )
+                .map(|matched| matched.end()));
+        }
+        Ok(self
+            .plan
+            .selected_end_window_value::<true>(haystack, window))
     }
 
     /// Return only the selected span's endpoint without finite-search
@@ -5257,6 +5280,64 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_first_acceptance_is_distinct_from_the_selected_endpoint() {
+        // The prefiltered DFA first accepts `b`/`ab` at end 2, while
+        // LeftmostFirst must retain the earlier-start `abc` through end 3.
+        let patterns = [b"b".to_vec(), b"abc".to_vec(), b"ab".to_vec()];
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(plan.automaton.prefilter().is_some());
+        let ordinary = plan.ordinary_executor().unwrap();
+        let window = Window::new(0, 3);
+        assert_eq!(
+            ordinary.first_acceptance_window_value(b"abc", window),
+            Ok(Some(2)),
+        );
+        assert_eq!(ordinary.exists_window_value(b"abc", window), Ok(true));
+        assert_eq!(
+            ordinary.selected_end_window_value(b"abc", window),
+            Ok(Some(3)),
+        );
+        assert_eq!(
+            ordinary.find_window_value(b"abc", window),
+            Ok(Some((0, 3))),
+        );
+
+        // A dense no-prefilter DFA uses the existing FIRST_ACCEPTANCE loop.
+        // Its shorter duplicate accepts at end 3, while source priority keeps
+        // the four-byte selected span through end 4.
+        let mut dense_patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        dense_patterns[0] = vec![1; 4];
+        let dense = LiteralSetPlan::new(
+            &dense_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(dense.automaton.prefilter().is_none());
+        let ordinary = dense.ordinary_executor().unwrap();
+        let haystack = [1, 1, 1, 1];
+        let window = Window::full(&haystack);
+        assert_eq!(
+            ordinary.first_acceptance_window_value(&haystack, window),
+            Ok(Some(3)),
+        );
+        assert_eq!(
+            ordinary.selected_end_window_value(&haystack, window),
+            Ok(Some(4)),
+        );
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(Some((0, 4))),
+        );
+    }
+
+    #[test]
     fn ordinary_selected_endpoint_matches_checked_dense_dfa_search() {
         let mut patterns = (0_u8..131)
             .map(|byte| vec![byte; 3])
@@ -5355,6 +5436,10 @@ mod tests {
             );
             assert_eq!(
                 ordinary.exists_window_value(b"abcd", window),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(b"abcd", window),
                 Err(expected.clone()),
             );
             assert_eq!(

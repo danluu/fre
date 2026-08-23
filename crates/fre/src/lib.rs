@@ -21347,9 +21347,10 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// K0 executes its endpoint-only engine. An unanchored required-literal
     /// owner selects the first suffix witness without recovering its greedy
-    /// start. Packed and DFA literal sets return the endpoint selected by
-    /// their bound ordinary executors. Other canonical fallback plans use the
-    /// existing value-only shortest-match projection with unlimited limits.
+    /// start. Packed literal sets return the selected endpoint. A nonuniform
+    /// DFA literal set stops at its first accepting endpoint through its bound
+    /// ordinary executor. Other canonical fallback plans use the existing
+    /// value-only shortest-match projection with unlimited limits.
     /// Assertions inspect the complete original haystack and the returned
     /// boundary is relative to it.
     ///
@@ -21379,7 +21380,7 @@ impl<'r> PortableOrdinarySession<'r> {
                 .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
-                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .first_acceptance_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
@@ -26045,7 +26046,7 @@ mod tests {
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
         K0PackedFrontierPlan, K0PooledValue, K0PooledValueExecution, K0PooledValueOperation,
         K0ReverseSuffixSpanAttempt, K0SpanSourceCursor,
-        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError, Match,
+        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError, LiteralWindow, Match,
         OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
         PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
@@ -41620,17 +41621,21 @@ mod tests {
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
         ));
-
         let haystack = b"zzababa";
         for start in 0..=haystack.len() {
             let expected = regex
                 .find_at_value(haystack, start, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
-            assert_eq!(
-                ordinary.first_acceptance_at(haystack, start),
-                Ok(expected.map(|matched| matched.end())),
-            );
+            let first = ordinary.first_acceptance_at(haystack, start).unwrap();
+            assert_eq!(first.is_some(), expected.is_some());
+            if let (Some(first), Some(selected)) = (first, expected) {
+                assert!(first > start);
+                assert!(first <= selected.end());
+            }
+            if start == 0 {
+                assert_eq!(first, Some(3));
+            }
             assert_eq!(ordinary.is_match_at(haystack, start), Ok(expected.is_some()));
 
             let mut expected_spans = Vec::new();
@@ -42030,6 +42035,44 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_nonuniform_literal_set_routes_shortest_to_first_acceptance() {
+        let regex = PortableBuilder::new("b|abc|ab")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let super::PortableOrdinarySessionPlan::LiteralSetDfa { executor } = &ordinary.plan else {
+            panic!("nonuniform literal set did not bind its ordinary executor");
+        };
+        assert_eq!(
+            executor.selected_end_window_value(b"abc", LiteralWindow::new(0, 3)),
+            Ok(Some(3)),
+        );
+
+        assert_eq!(ordinary.first_acceptance_at(b"abc", 0), Ok(Some(2)));
+        assert_eq!(ordinary.shortest_match_at(b"abc", 0), Ok(Some(2)));
+        assert_eq!(ordinary.is_match_at(b"abc", 0), Ok(true));
+        assert_eq!(
+            ordinary.find_at(b"abc", 0),
+            Ok(Some(Match { start: 0, end: 3 })),
+        );
+        assert!(matches!(
+            ordinary.shortest_match_at(b"abc", 4),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::InvalidWindow { .. }
+            )),
+        ));
+    }
+
+    #[test]
     fn ordinary_nonuniform_and_unprefiltered_dfas_never_bind_direct_route() {
         let nonuniform = PortableBuilder::new("ab|a|ba")
             .unicode(false)
@@ -42048,8 +42091,12 @@ mod tests {
             super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
         ));
         super::literal_set_dfa_ordinary_route_probe::reset();
-        assert_eq!(ordinary.first_acceptance_at(b"zzab", 0), Ok(Some(4)));
+        assert_eq!(ordinary.first_acceptance_at(b"zzab", 0), Ok(Some(3)));
         assert_eq!(ordinary.is_match_at(b"zzab", 0), Ok(true));
+        assert_eq!(
+            ordinary.find_at(b"zzab", 0),
+            Ok(Some(Match { start: 2, end: 4 })),
+        );
         assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 0));
 
         let source = (0_u8..=u8::MAX)
