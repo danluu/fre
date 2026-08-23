@@ -16,6 +16,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,25 @@ FROZEN_COMPARATOR_PREFERENCE = (
     "re2-2025-11-05",
     "rust-regex-1.12.4",
 )
+PUBLIC_MANIFEST_SCHEMA = "fre.public-rebar-klv-inventory.v1"
+PUBLIC_KLV_KEYS = {
+    "name",
+    "model",
+    "pattern",
+    "case-insensitive",
+    "unicode",
+    "haystack",
+    "max-iters",
+    "max-warmup-iters",
+    "max-time",
+    "max-warmup-time",
+}
+PUBLIC_REBAR_MODELS = {
+    "compile", "count", "count-spans", "count-captures", "grep",
+    "grep-captures", "regex-redux",
+}
 MAX_NATIVE_ROW_COMPONENTS = 4_096
+MAX_PUBLIC_KLV_BYTES = 64 * 1024 * 1024
 MAX_NATIVE_ROW_OBJECT_BYTES = 256 * 1024 * 1024
 MAX_SERIALIZED_PROGRAM_BYTES = 256 * 1024 * 1024
 PREPARED_V15_MAX_HANDLE_BYTES = 8 * 1024 * 1024
@@ -528,11 +547,41 @@ def relative_public_path(
     return relative.as_posix(), path
 
 
-def git_output(source: pathlib.Path, *arguments: str) -> str:
+def git_output(
+    source: pathlib.Path, *arguments: str, git_executable: str = "git"
+) -> str:
+    environment = {
+        name: os.environ[name]
+        for name in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT")
+        if name in os.environ
+    }
+    environment.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    if "/" in git_executable or (
+        os.altsep is not None and os.altsep in git_executable
+    ):
+        git_path = pathlib.Path(git_executable).resolve(strict=True)
+    else:
+        found = shutil.which(git_executable, path=environment.get("PATH"))
+        if found is None:
+            raise CensusError("git executable is unavailable")
+        git_path = pathlib.Path(found).resolve(strict=True)
+    if not git_path.is_file() or not os.access(git_path, os.X_OK):
+        raise CensusError("git executable is not a regular executable file")
     completed = subprocess.run(
-        ["git", "-C", str(source), *arguments],
+        [
+            str(git_path), "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false", "-C", str(source), *arguments,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=environment,
         check=False,
         timeout=30,
     )
@@ -541,13 +590,22 @@ def git_output(source: pathlib.Path, *arguments: str) -> str:
     return completed.stdout.decode("utf-8", "strict").strip()
 
 
-def source_identity(source: pathlib.Path, commit: str, tree: str) -> dict[str, object]:
+def source_identity(
+    source: pathlib.Path, commit: str, tree: str, git_executable: str = "git"
+) -> dict[str, object]:
     source = source.resolve(strict=True)
-    actual_commit = git_output(source, "rev-parse", "HEAD")
-    actual_tree = git_output(source, "rev-parse", "HEAD^{tree}")
+    actual_commit = git_output(
+        source, "rev-parse", "HEAD", git_executable=git_executable
+    )
+    actual_tree = git_output(
+        source, "rev-parse", "HEAD^{tree}", git_executable=git_executable
+    )
     if actual_commit != commit or actual_tree != tree:
         raise CensusError("candidate source is not the declared commit/tree")
-    if git_output(source, "status", "--porcelain", "--untracked-files=all"):
+    if git_output(
+        source, "status", "--porcelain", "--untracked-files=all",
+        git_executable=git_executable,
+    ):
         raise CensusError("candidate source worktree is not clean")
     lock = source / "Cargo.lock"
     if not lock.is_file():
@@ -575,6 +633,195 @@ def external_schedule(path: pathlib.Path, expected_sha256: str) -> dict[str, obj
     if not isinstance(value.get("points"), list):
         raise CensusError(f"public schedule {path} has no point list")
     return value
+
+
+def parse_public_klv_semantic_identity(
+    path: pathlib.Path, context: str
+) -> dict[str, object]:
+    """Parse a public Rebar KLV without retaining any pattern or haystack bytes."""
+    size = path.stat().st_size
+    if size > MAX_PUBLIC_KLV_BYTES:
+        raise CensusError(f"{context} exceeds the public KLV byte limit")
+    payload = path.read_bytes()
+    fields: list[tuple[str, bytes]] = []
+    cursor = 0
+    while cursor < len(payload):
+        key_end = payload.find(b":", cursor)
+        if key_end < 0:
+            raise CensusError(f"{context} KLV key delimiter is missing")
+        try:
+            key = payload[cursor:key_end].decode("ascii", "strict")
+        except UnicodeDecodeError as error:
+            raise CensusError(f"{context} KLV key is not ASCII") from error
+        if key not in PUBLIC_KLV_KEYS:
+            raise CensusError(f"{context} KLV has unknown key {key!r}")
+        length_start = key_end + 1
+        length_end = payload.find(b":", length_start)
+        if length_end < 0:
+            raise CensusError(f"{context} KLV length delimiter is missing")
+        length_bytes = payload[length_start:length_end]
+        if (
+            not length_bytes
+            or not length_bytes.isdigit()
+            or len(length_bytes) > 20
+            or (len(length_bytes) > 1 and length_bytes.startswith(b"0"))
+        ):
+            raise CensusError(f"{context} KLV length is not canonical decimal")
+        length = int(length_bytes)
+        value_start = length_end + 1
+        value_end = value_start + length
+        if value_end >= len(payload) or payload[value_end] != 0x0A:
+            raise CensusError(f"{context} KLV value is truncated or lacks its newline")
+        fields.append((key, payload[value_start:value_end]))
+        cursor = value_end + 1
+
+    keys = [key for key, _ in fields]
+    patterns = [value for key, value in fields if key == "pattern"]
+    expected_keys = [
+        "name", "model", *("pattern" for _ in patterns),
+        "case-insensitive", "unicode", "haystack", "max-iters",
+        "max-warmup-iters", "max-time", "max-warmup-time",
+    ]
+    if keys != expected_keys:
+        raise CensusError(f"{context} KLV field order or closure is noncanonical")
+    by_key = {key: value for key, value in fields if key != "pattern"}
+    try:
+        benchmark = by_key["name"].decode("utf-8", "strict")
+        model = by_key["model"].decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise CensusError(f"{context} KLV textual identity is not UTF-8") from error
+    if not benchmark or not model:
+        raise CensusError(f"{context} KLV has an empty textual identity")
+    if model not in PUBLIC_REBAR_MODELS:
+        raise CensusError(f"{context} KLV has an unsupported public Rebar model")
+    try:
+        for pattern in patterns:
+            pattern.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise CensusError(f"{context} KLV pattern is not UTF-8") from error
+    if (model == "regex-redux") != (not patterns):
+        raise CensusError(f"{context} KLV pattern cardinality differs from its model")
+
+    boolean_values: dict[str, bool] = {}
+    for key in ("case-insensitive", "unicode"):
+        raw = by_key[key]
+        if raw not in {b"true", b"false"}:
+            raise CensusError(f"{context} KLV {key} is not a canonical boolean")
+        boolean_values[key] = raw == b"true"
+    for key in ("max-iters", "max-warmup-iters", "max-time", "max-warmup-time"):
+        raw = by_key[key]
+        if (
+            not raw
+            or not raw.isdigit()
+            or len(raw) > 20
+            or (len(raw) > 1 and raw.startswith(b"0"))
+            or int(raw) > (1 << 64) - 1
+        ):
+            raise CensusError(f"{context} KLV {key} is not canonical unsigned decimal")
+    if int(by_key["max-iters"]) == 0:
+        raise CensusError(f"{context} KLV max-iters must be nonzero")
+
+    identity = {
+        "benchmark": benchmark,
+        "model": model,
+        "input": {
+            "pattern_sha256": [sha_bytes(pattern) for pattern in patterns],
+            "haystack_sha256": sha_bytes(by_key["haystack"]),
+            "haystack_bytes": len(by_key["haystack"]),
+            "case_insensitive": boolean_values["case-insensitive"],
+            "unicode": boolean_values["unicode"],
+        },
+    }
+    return {
+        "identity": identity,
+        "semantic_identity_sha256": sha_bytes(canonical(identity).encode()),
+    }
+
+
+def external_public_manifest(
+    path: pathlib.Path,
+    expected_sha256: str,
+    public_root: pathlib.Path,
+    recorded_root: str,
+    expected_jobs: int,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    """Authenticate and index the canonical public Rust KLV inventory."""
+    forbidden = forbidden_path_components(path.resolve(strict=True).parts)
+    if forbidden:
+        raise CensusError(f"public manifest path has forbidden components {forbidden!r}")
+    expected_sha256 = require_hex64(expected_sha256, "expected public manifest SHA-256")
+    if sha_file(path) != expected_sha256:
+        raise CensusError(f"public manifest file digest mismatch for {path}")
+    value = load_json(path)
+    if not isinstance(value, dict):
+        raise CensusError("public KLV manifest is not an object")
+    require_exact_keys(value, {"schema", "entries"}, "public KLV manifest")
+    if value["schema"] != PUBLIC_MANIFEST_SCHEMA:
+        raise CensusError("unexpected public KLV manifest schema")
+    entries = value["entries"]
+    if not isinstance(entries, list) or len(entries) != expected_jobs:
+        raise CensusError(
+            f"public KLV manifest has {len(entries) if isinstance(entries, list) else 'invalid'} "
+            f"entries, expected {expected_jobs}"
+        )
+    indexed: dict[str, dict[str, object]] = {}
+    normalized_rows = []
+    seen_klvs: set[tuple[str, str]] = set()
+    for ordinal, raw_entry in enumerate(entries):
+        if not isinstance(raw_entry, dict):
+            raise CensusError(f"public manifest entry {ordinal} is not an object")
+        require_exact_keys(
+            raw_entry, {"path", "sha256", "bytes"},
+            f"public manifest entry {ordinal}",
+        )
+        if (
+            not isinstance(raw_entry["bytes"], int)
+            or isinstance(raw_entry["bytes"], bool)
+            or raw_entry["bytes"] < 0
+        ):
+            raise CensusError(f"public manifest entry {ordinal} byte count is invalid")
+        klv = klv_identity(
+            raw_entry, public_root, recorded_root,
+            f"public manifest entry {ordinal}", True,
+        )
+        if raw_entry["bytes"] != klv["bytes"]:
+            raise CensusError(f"public manifest entry {ordinal} byte count differs")
+        klv_key = (str(klv["path"]), str(klv["sha256"]))
+        if klv_key in seen_klvs:
+            raise CensusError("public KLV manifest repeats an exact KLV identity")
+        seen_klvs.add(klv_key)
+        absolute = (public_root / pathlib.Path(*pathlib.PurePosixPath(
+            str(klv["path"])
+        ).parts)).resolve(strict=True)
+        semantic = parse_public_klv_semantic_identity(
+            absolute, f"public manifest entry {ordinal}"
+        )
+        semantic_sha = str(semantic["semantic_identity_sha256"])
+        if semantic_sha in indexed:
+            raise CensusError(
+                "public KLV manifest repeats a semantic benchmark/model/input identity"
+            )
+        record = {
+            "ordinal": ordinal,
+            "klv": klv,
+            "semantic_identity_sha256": semantic_sha,
+            "identity": semantic["identity"],
+        }
+        indexed[semantic_sha] = record
+        normalized_rows.append({
+            "ordinal": ordinal,
+            "klv": klv,
+            "semantic_identity_sha256": semantic_sha,
+        })
+    manifest_record = {
+        "schema": PUBLIC_MANIFEST_SCHEMA,
+        "file_sha256": expected_sha256,
+        "entry_count": len(entries),
+        "entries_sha256": sha_bytes(canonical(normalized_rows).encode()),
+        "mappings": None,
+        "mapping_sha256": None,
+    }
+    return manifest_record, indexed
 
 
 def klv_identity(
@@ -684,9 +931,29 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
     source = source_identity(
         pathlib.Path(args.source_dir), args.source_commit, args.source_tree
     )
+    raw_public_manifest = getattr(args, "public_manifest", None)
+    raw_public_manifest_sha256 = getattr(args, "public_manifest_sha256", None)
+    if (raw_public_manifest is None) != (raw_public_manifest_sha256 is None):
+        raise CensusError(
+            "--public-manifest and --public-manifest-sha256 must be supplied together"
+        )
+    manifest_record: Optional[dict[str, object]] = None
+    manifest_entries: Optional[dict[str, dict[str, object]]] = None
+    if raw_public_manifest is not None:
+        if args.skip_klv_hashing:
+            raise CensusError("public manifest mode cannot skip KLV hashing")
+        manifest_record, manifest_entries = external_public_manifest(
+            pathlib.Path(raw_public_manifest).resolve(strict=True),
+            raw_public_manifest_sha256,
+            public_root,
+            args.recorded_public_klv_root,
+            args.expected_public_jobs,
+        )
     schedules = []
     raw_points: dict[str, dict[str, object]] = {}
     jobs: dict[str, dict[str, object]] = {}
+    semantic_cache: dict[tuple[str, str], dict[str, object]] = {}
+    manifest_mapping: dict[str, dict[str, object]] = {}
     for raw_path, expected_sha in zip(args.schedule, args.schedule_sha256):
         path = pathlib.Path(raw_path).resolve(strict=True)
         schedule = external_schedule(path, expected_sha)
@@ -713,10 +980,49 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
             )):
                 raise CensusError("public schedule point omits a textual identity field")
             identity = point_input(raw_point)
-            candidate = klv_identity(
+            schedule_candidate = klv_identity(
                 raw_point.get("candidate_klv"), public_root, args.recorded_public_klv_root,
                 f"point {point_id} candidate", not args.skip_klv_hashing,
             )
+            candidate = schedule_candidate
+            if manifest_entries is not None:
+                schedule_key = (
+                    str(schedule_candidate["path"]), str(schedule_candidate["sha256"])
+                )
+                semantic = semantic_cache.get(schedule_key)
+                if semantic is None:
+                    schedule_path = (public_root / pathlib.Path(
+                        *pathlib.PurePosixPath(str(schedule_candidate["path"])).parts
+                    )).resolve(strict=True)
+                    semantic = parse_public_klv_semantic_identity(
+                        schedule_path, f"point {point_id} candidate"
+                    )
+                    semantic_cache[schedule_key] = semantic
+                structured_identity = {
+                    "benchmark": benchmark,
+                    "model": model,
+                    "input": identity,
+                }
+                if semantic["identity"] != structured_identity:
+                    raise CensusError(
+                        f"point {point_id} structured identity differs from its candidate KLV"
+                    )
+                semantic_sha = str(semantic["semantic_identity_sha256"])
+                manifest_entry = manifest_entries.get(semantic_sha)
+                if manifest_entry is None:
+                    raise CensusError(
+                        f"point {point_id} has no semantic match in the public KLV manifest"
+                    )
+                candidate = manifest_entry["klv"]
+                mapping = manifest_mapping.setdefault(semantic_sha, {
+                    "manifest_ordinal": manifest_entry["ordinal"],
+                    "manifest_klv": candidate,
+                    "semantic_identity_sha256": semantic_sha,
+                    "job_ids": set(),
+                    "point_ids": set(),
+                })
+                mapping["job_ids"].add(job_id)
+                mapping["point_ids"].add(point_id)
             reference = klv_identity(
                 raw_point.get("reference_klv"), public_root, args.recorded_public_klv_root,
                 f"point {point_id} reference", not args.skip_klv_hashing,
@@ -777,17 +1083,62 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
         raise CensusError(
             f"compile job count is {len(compile_jobs)}, expected {args.expected_compile_jobs}"
         )
+    if manifest_entries is not None:
+        missing_semantics = sorted(set(manifest_entries) - set(manifest_mapping))
+        extra_semantics = sorted(set(manifest_mapping) - set(manifest_entries))
+        if missing_semantics or extra_semantics:
+            raise CensusError(
+                "public manifest/schedule semantic mapping is incomplete: "
+                f"missing={len(missing_semantics)} extra={len(extra_semantics)}"
+            )
+        normalized_mapping = []
+        for semantic_sha in sorted(manifest_mapping):
+            mapping = manifest_mapping[semantic_sha]
+            job_ids_for_semantic = sorted(mapping["job_ids"])
+            if len(job_ids_for_semantic) != 1:
+                raise CensusError(
+                    "one public manifest semantic identity maps to multiple schedule jobs"
+                )
+            normalized_mapping.append({
+                "manifest_ordinal": mapping["manifest_ordinal"],
+                "manifest_klv": mapping["manifest_klv"],
+                "semantic_identity_sha256": semantic_sha,
+                "job_id": job_ids_for_semantic[0],
+                "point_ids": sorted(mapping["point_ids"]),
+            })
+        if manifest_record is None:
+            raise CensusError("public manifest mapping lost its authenticated manifest")
+        manifest_record["mappings"] = normalized_mapping
+        manifest_record["mapping_sha256"] = sha_bytes(
+            canonical(normalized_mapping).encode()
+        )
     schedule_revisions = sorted({str(row["rebar_revision"]) for row in schedules})
+    expectation_rows = [
+        frozen_job_expectation_record(job, point_rows)
+        for job in job_rows if job["is_runtime"]
+    ]
+    divergent_jobs = [row["job_id"] for row in expectation_rows if row["divergent"]]
+    expected_results = {
+        "authority": "frozen-comparator-first-v1",
+        "preference": list(FROZEN_COMPARATOR_PREFERENCE),
+        "runtime_jobs": expectation_rows,
+        "runtime_jobs_sha256": sha_bytes(canonical(expectation_rows).encode()),
+        "divergent_jobs": id_set(divergent_jobs),
+    }
+    public_corpus = {
+        "label": args.public_corpus_label,
+        "klv_root_recorded": args.recorded_public_klv_root,
+        "privacy_policy": "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes",
+        "rebar_revisions": schedule_revisions,
+        "schedules": sorted(schedules, key=lambda row: row["file_sha256"]),
+        "expected_results": expected_results,
+    }
+    if manifest_record is not None:
+        public_corpus["manifest"] = manifest_record
     plan = {
         "schema": PLAN_SCHEMA,
         "candidate_source": source,
-        "public_corpus": {
-            "label": args.public_corpus_label,
-            "klv_root_recorded": args.recorded_public_klv_root,
-            "privacy_policy": "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes",
-            "rebar_revisions": schedule_revisions,
-            "schedules": sorted(schedules, key=lambda row: row["file_sha256"]),
-        },
+        "public_corpus": public_corpus,
         "target": {
             "triple": args.target,
             "features": "none" if args.features == "" else args.features,
@@ -837,10 +1188,17 @@ def validate_plan(plan: object) -> dict[str, object]:
     require_hex64(plan["candidate_source"]["cargo_lock_sha256"], "plan Cargo.lock")
     if not isinstance(plan["public_corpus"], dict):
         raise CensusError("plan public corpus is not an object")
-    require_exact_keys(plan["public_corpus"], {
+    public_corpus_base_keys = {
         "label", "klv_root_recorded", "privacy_policy", "rebar_revisions", "schedules",
-    }, "plan public corpus")
+    }
     public_corpus = plan["public_corpus"]
+    public_corpus_keys = set(public_corpus)
+    if (
+        not public_corpus_base_keys.issubset(public_corpus_keys)
+        or public_corpus_keys - public_corpus_base_keys
+        not in (set(), {"expected_results"}, {"expected_results", "manifest"})
+    ):
+        raise CensusError("plan public corpus schema keys differ")
     if public_corpus["privacy_policy"] != (
         "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes"
     ):
@@ -850,6 +1208,30 @@ def validate_plan(plan: object) -> dict[str, object]:
         for name in ("label", "klv_root_recorded")
     ):
         raise CensusError("plan public corpus has an invalid textual identity")
+    manifest = public_corpus.get("manifest")
+    if manifest is not None:
+        if not isinstance(manifest, dict):
+            raise CensusError("plan public manifest record is not an object")
+        require_exact_keys(manifest, {
+            "schema", "file_sha256", "entry_count", "entries_sha256",
+            "mappings", "mapping_sha256",
+        }, "plan public manifest record")
+        if manifest["schema"] != PUBLIC_MANIFEST_SCHEMA:
+            raise CensusError("plan public manifest schema differs")
+        require_hex64(manifest["file_sha256"], "plan public manifest file")
+        require_hex64(manifest["entries_sha256"], "plan public manifest entries")
+        require_hex64(manifest["mapping_sha256"], "plan public manifest mapping")
+        if (
+            not isinstance(manifest["entry_count"], int)
+            or isinstance(manifest["entry_count"], bool)
+            or manifest["entry_count"] != EXPECTED_PUBLIC_JOBS
+        ):
+            raise CensusError("plan public manifest does not contain exactly 344 entries")
+        mappings = manifest["mappings"]
+        if not isinstance(mappings, list) or len(mappings) != manifest["entry_count"]:
+            raise CensusError("plan public manifest mapping cardinality differs")
+        if manifest["mapping_sha256"] != sha_bytes(canonical(mappings).encode()):
+            raise CensusError("plan public manifest mapping digest differs")
     if not isinstance(plan["target"], dict):
         raise CensusError("plan target is not an object")
     require_exact_keys(plan["target"], {"triple", "features", "feature_bits"}, "plan target")
@@ -1048,22 +1430,109 @@ def validate_plan(plan: object) -> dict[str, object]:
     for name, values in expected_sets.items():
         if denominators[name] != id_set(values):
             raise CensusError(f"plan denominator {name} differs from its rows")
-    for job in plan["jobs"]:
-        if job["is_runtime"]:
-            frozen_job_expectation(plan, job)
+    expectation_rows = [
+        frozen_job_expectation_record(job, plan["points"])
+        for job in plan["jobs"] if job["is_runtime"]
+    ]
+    expected_results = public_corpus.get("expected_results")
+    if expected_results is not None:
+        divergent_jobs = [
+            row["job_id"] for row in expectation_rows if row["divergent"]
+        ]
+        canonical_expected_results = {
+            "authority": "frozen-comparator-first-v1",
+            "preference": list(FROZEN_COMPARATOR_PREFERENCE),
+            "runtime_jobs": expectation_rows,
+            "runtime_jobs_sha256": sha_bytes(canonical(expectation_rows).encode()),
+            "divergent_jobs": id_set(divergent_jobs),
+        }
+        if expected_results != canonical_expected_results:
+            raise CensusError(
+                "plan comparator-first authority or divergence diagnostics differ"
+            )
+    if manifest is not None:
+        mappings = manifest["mappings"]
+        semantic_ids = []
+        mapped_jobs = []
+        manifest_klvs = []
+        ordinals = []
+        entries_projection = []
+        for index, mapping in enumerate(mappings):
+            if not isinstance(mapping, dict):
+                raise CensusError(f"plan public manifest mapping {index} is not an object")
+            require_exact_keys(mapping, {
+                "manifest_ordinal", "manifest_klv", "semantic_identity_sha256",
+                "job_id", "point_ids",
+            }, f"plan public manifest mapping {index}")
+            ordinal = mapping["manifest_ordinal"]
+            if (
+                not isinstance(ordinal, int)
+                or isinstance(ordinal, bool)
+                or ordinal < 0
+            ):
+                raise CensusError("plan public manifest mapping has an invalid ordinal")
+            validate_recorded_klv(
+                mapping["manifest_klv"], f"plan public manifest mapping {index} KLV"
+            )
+            semantic_sha = require_hex64(
+                mapping["semantic_identity_sha256"],
+                f"plan public manifest mapping {index} semantic identity",
+            )
+            job_id = mapping["job_id"]
+            point_ids_for_mapping = mapping["point_ids"]
+            if not isinstance(job_id, str) or not job_id:
+                raise CensusError("plan public manifest mapping has an invalid job ID")
+            if (
+                not isinstance(point_ids_for_mapping, list)
+                or point_ids_for_mapping != sorted(set(point_ids_for_mapping))
+                or not all(isinstance(value, str) and value for value in point_ids_for_mapping)
+            ):
+                raise CensusError("plan public manifest mapping has invalid point IDs")
+            mapped_job = jobs_by_id.get(job_id)
+            if (
+                mapped_job is None
+                or mapped_job["candidate_klv"] != mapping["manifest_klv"]
+                or mapped_job["point_ids"] != point_ids_for_mapping
+            ):
+                raise CensusError(
+                    "plan public manifest mapping differs from its sealed job topology"
+                )
+            semantic_ids.append(semantic_sha)
+            mapped_jobs.append(job_id)
+            manifest_klvs.append((
+                mapping["manifest_klv"]["path"], mapping["manifest_klv"]["sha256"]
+            ))
+            ordinals.append(ordinal)
+            entries_projection.append({
+                "ordinal": ordinal,
+                "klv": mapping["manifest_klv"],
+                "semantic_identity_sha256": semantic_sha,
+            })
+        if semantic_ids != sorted(set(semantic_ids)):
+            raise CensusError("plan public manifest semantic mappings are not canonical")
+        if sorted(ordinals) != list(range(manifest["entry_count"])):
+            raise CensusError("plan public manifest ordinal topology differs")
+        if len(set(manifest_klvs)) != len(manifest_klvs):
+            raise CensusError("plan public manifest repeats an exact KLV identity")
+        if sorted(mapped_jobs) != job_ids or len(set(mapped_jobs)) != len(mapped_jobs):
+            raise CensusError("plan public manifest does not map every canonical public job")
+        entries_projection.sort(key=lambda row: row["ordinal"])
+        if manifest["entries_sha256"] != sha_bytes(
+            canonical(entries_projection).encode()
+        ):
+            raise CensusError("plan public manifest entries digest differs")
     return plan
 
 
-def frozen_job_expectation(
-    plan: dict[str, object], job: dict[str, object]
-) -> tuple[int, str]:
-    """Select one pre-frozen scalar/comparator without job-specific policy."""
+def frozen_job_expectation_record(
+    job: dict[str, object], all_points: list[dict[str, object]]
+) -> dict[str, object]:
+    """Select comparator authority first and retain cross-comparator diagnostics."""
     point_ids = set(job["point_ids"])
-    points = [point for point in plan["points"] if point["point_id"] in point_ids]
+    points = [point for point in all_points if point["point_id"] in point_ids]
     if len(points) != len(point_ids):
         raise CensusError("runtime job frozen point set is incomplete")
-    expected_values = set()
-    comparators = set()
+    by_comparator: dict[str, dict[str, object]] = {}
     for point in points:
         expected = point["expected"]
         if (
@@ -1072,20 +1541,63 @@ def frozen_job_expectation(
             or not 0 <= expected <= (1 << 64) - 1
         ):
             raise CensusError("runtime job expected value is not a frozen u64")
-        expected_values.add(expected)
         comparator = point["comparator"]
         if comparator not in FROZEN_COMPARATOR_PREFERENCE:
             raise CensusError("runtime job names an unsupported frozen comparator")
-        comparators.add(comparator)
-    if len(expected_values) != 1:
-        raise CensusError("runtime job has conflicting frozen expected values")
+        observation = by_comparator.setdefault(comparator, {
+            "comparator": comparator,
+            "expected_values": set(),
+        })
+        observation["expected_values"].add(expected)
     comparator = next(
-        (name for name in FROZEN_COMPARATOR_PREFERENCE if name in comparators),
+        (name for name in FROZEN_COMPARATOR_PREFERENCE if name in by_comparator),
         None,
     )
     if comparator is None:
         raise CensusError("runtime job has no frozen comparator")
-    return next(iter(expected_values)), comparator
+    selected_values = by_comparator[comparator]["expected_values"]
+    if len(selected_values) != 1:
+        raise CensusError(
+            f"runtime job has conflicting frozen values within selected comparator {comparator}"
+        )
+    selected_expected = next(iter(selected_values))
+    normalized_observations = []
+    for name in FROZEN_COMPARATOR_PREFERENCE:
+        if name not in by_comparator:
+            continue
+        raw = by_comparator[name]
+        values = sorted(raw["expected_values"])
+        normalized_observations.append({
+            "comparator": name,
+            "expected_values": values,
+            "points": sorted(
+                [
+                    {"point_id": point["point_id"], "expected": point["expected"]}
+                    for point in points if point["comparator"] == name
+                ],
+                key=lambda point: point["point_id"],
+            ),
+        })
+    divergent = any(
+        value != selected_expected
+        for row in normalized_observations
+        for value in row["expected_values"]
+    )
+    return {
+        "job_id": job["job_id"],
+        "selected_expected": selected_expected,
+        "selected_comparator": comparator,
+        "divergent": divergent,
+        "observations": normalized_observations,
+    }
+
+
+def frozen_job_expectation(
+    plan: dict[str, object], job: dict[str, object]
+) -> tuple[int, str]:
+    """Return the scalar selected by the first available frozen comparator."""
+    record = frozen_job_expectation_record(job, plan["points"])
+    return record["selected_expected"], record["selected_comparator"]
 
 
 FROZEN_VALIDATION_FIELDS = {
@@ -7482,6 +7994,8 @@ def parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="validate public manifests and seal census plan")
     plan.add_argument("--schedule", action="append", required=True)
     plan.add_argument("--schedule-sha256", action="append", required=True)
+    plan.add_argument("--public-manifest")
+    plan.add_argument("--public-manifest-sha256")
     plan.add_argument("--public-klv-root", required=True)
     plan.add_argument("--recorded-public-klv-root", required=True)
     plan.add_argument("--public-corpus-label", required=True)
@@ -7537,6 +8051,8 @@ def main() -> int:
                     "schema": payload["schema"],
                     "plan_sha256": payload["plan_sha256"],
                     "denominators": payload["denominators"],
+                    "comparator_divergences": payload["public_corpus"]
+                    ["expected_results"]["divergent_jobs"],
                     "wrote_output": False,
                 }, sort_keys=True))
             else:

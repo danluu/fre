@@ -10,6 +10,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("true_native_census.py")
@@ -18,6 +19,32 @@ SPEC = importlib.util.spec_from_file_location("true_native_census", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 CENSUS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CENSUS)
+
+
+def klv_field(key: str, value: bytes) -> bytes:
+    return key.encode("ascii") + b":" + str(len(value)).encode("ascii") + b":" + value + b"\n"
+
+
+def public_klv(
+    name: str,
+    model: str,
+    patterns: list[bytes],
+    haystack: bytes,
+    max_iters: bytes = b"1",
+) -> bytes:
+    fields = [
+        ("name", name.encode()),
+        ("model", model.encode()),
+        *(("pattern", pattern) for pattern in patterns),
+        ("case-insensitive", b"false"),
+        ("unicode", b"true"),
+        ("haystack", haystack),
+        ("max-iters", max_iters),
+        ("max-warmup-iters", b"0"),
+        ("max-time", b"1"),
+        ("max-warmup-time", b"0"),
+    ]
+    return b"".join(klv_field(key, value) for key, value in fields)
 
 
 def frozen_validation_fields() -> dict[str, str]:
@@ -1479,6 +1506,37 @@ def synthetic_single_capture_reducer_qualification_receipt(
 
 
 class TrueNativeCensusTests(unittest.TestCase):
+    def test_git_source_checks_use_a_closed_environment(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"sealed\n", stderr=b"")
+        with (
+            mock.patch.dict(CENSUS.os.environ, {
+                "PATH": "/formal/bin",
+                "HOME": "/formal/home",
+                "GIT_DIR": "/hostile/repository",
+                "GIT_WORK_TREE": "/hostile/worktree",
+                "GIT_INDEX_FILE": "/hostile/index",
+                "GIT_CONFIG_GLOBAL": "/hostile/config",
+            }, clear=True),
+            mock.patch.object(CENSUS.subprocess, "run", return_value=completed) as run,
+        ):
+            self.assertEqual(
+                CENSUS.git_output(
+                    pathlib.Path("/sealed/source"), "rev-parse", "HEAD",
+                    git_executable=CENSUS.sys.executable,
+                ),
+                "sealed",
+            )
+        environment = run.call_args.kwargs["env"]
+        command = run.call_args.args[0]
+        self.assertTrue(pathlib.Path(command[0]).is_absolute())
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn("core.untrackedCache=false", command)
+        self.assertNotIn("GIT_DIR", environment)
+        self.assertNotIn("GIT_WORK_TREE", environment)
+        self.assertNotIn("GIT_INDEX_FILE", environment)
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], CENSUS.os.devnull)
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+
     def test_exact_adapter_includes_ordered_many_grep_and_uniform_capture_rows(self) -> None:
         self.assertTrue(CENSUS.has_exact_adapter("count", 1))
         self.assertTrue(CENSUS.has_exact_adapter("count", 3))
@@ -1516,6 +1574,10 @@ class TrueNativeCensusTests(unittest.TestCase):
     def test_json_schema_names_uniform_capture_proof_and_automaton_surface(self) -> None:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         definitions = schema["$defs"]
+        self.assertEqual(
+            definitions["expectedObservation"]["required"],
+            ["comparator", "expected_values", "points"],
+        )
         self.assertIn("validation", definitions["provenance"]["required"])
         self.assertEqual(
             definitions["frozenValidation"]["properties"]["authority"]["const"],
@@ -1630,6 +1692,22 @@ class TrueNativeCensusTests(unittest.TestCase):
             "shared-ordered-many-v2",
             definitions["provenance"]["properties"]["kind"]["enum"],
         )
+        public_manifest = definitions["publicManifest"]
+        self.assertFalse(public_manifest["additionalProperties"])
+        self.assertEqual(
+            public_manifest["properties"]["schema"]["const"],
+            CENSUS.PUBLIC_MANIFEST_SCHEMA,
+        )
+        self.assertEqual(public_manifest["properties"]["entry_count"]["const"], 344)
+        expected_results = definitions["expectedResults"]
+        self.assertEqual(
+            expected_results["properties"]["preference"]["const"],
+            list(CENSUS.FROZEN_COMPARATOR_PREFERENCE),
+        )
+        public_corpus = definitions["plan"]["properties"]["public_corpus"]
+        self.assertEqual(public_corpus["dependentRequired"], {
+            "manifest": ["expected_results"]
+        })
 
     def test_formal_provenance_requires_closed_frozen_schedule_authority(self) -> None:
         fields = prepared_scalar_grep_provenance_fields()
@@ -1666,7 +1744,7 @@ class TrueNativeCensusTests(unittest.TestCase):
         with self.assertRaises(CENSUS.CensusError):
             CENSUS.validate_provenance_record(normalized, "tampered frozen binding")
 
-    def test_frozen_job_expectation_prefers_re2_and_rejects_conflicts(self) -> None:
+    def test_frozen_job_expectation_is_comparator_first_with_divergence(self) -> None:
         plan = synthetic_plan()
         job = plan["jobs"][33]
         original = next(
@@ -1683,8 +1761,259 @@ class TrueNativeCensusTests(unittest.TestCase):
             (1, "re2-2025-11-05"),
         )
         re2["expected"] = 2
+        self.assertEqual(
+            CENSUS.frozen_job_expectation(plan, job),
+            (2, "re2-2025-11-05"),
+        )
+        diagnostic = CENSUS.frozen_job_expectation_record(job, plan["points"])
+        self.assertTrue(diagnostic["divergent"])
+        self.assertEqual(
+            diagnostic["observations"],
+            [
+                {
+                    "comparator": "re2-2025-11-05",
+                    "expected_values": [2],
+                    "points": [{
+                        "point_id": "point-re2-replica", "expected": 2,
+                    }],
+                },
+                {
+                    "comparator": "rust-regex-1.12.4",
+                    "expected_values": [1],
+                    "points": [{
+                        "point_id": original["point_id"], "expected": 1,
+                    }],
+                },
+            ],
+        )
+        second_re2 = copy.deepcopy(re2)
+        second_re2["point_id"] = "point-re2-conflict"
+        second_re2["expected"] = 3
+        plan["points"].append(second_re2)
+        job["point_ids"].append(second_re2["point_id"])
         with self.assertRaisesRegex(CENSUS.CensusError, "conflicting"):
             CENSUS.frozen_job_expectation(plan, job)
+
+        lower_conflict_plan = synthetic_plan()
+        lower_job = lower_conflict_plan["jobs"][33]
+        lower_original = next(
+            point for point in lower_conflict_plan["points"]
+            if point["point_id"] == lower_job["point_ids"][0]
+        )
+        preferred = copy.deepcopy(lower_original)
+        preferred["point_id"] = "preferred-re2"
+        preferred["comparator"] = "re2-2025-11-05"
+        preferred["expected"] = 2
+        lower_conflict = copy.deepcopy(lower_original)
+        lower_conflict["point_id"] = "lower-rust-conflict"
+        lower_conflict["expected"] = 3
+        lower_conflict_plan["points"].extend([preferred, lower_conflict])
+        lower_job["point_ids"].extend([
+            preferred["point_id"], lower_conflict["point_id"]
+        ])
+        lower_record = CENSUS.frozen_job_expectation_record(
+            lower_job, lower_conflict_plan["points"]
+        )
+        self.assertEqual(lower_record["selected_expected"], 2)
+        self.assertEqual(
+            lower_record["observations"][1]["expected_values"], [1, 3]
+        )
+
+    def test_public_klv_semantic_identity_is_closed_and_ignores_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first = root / "first.klv"
+            second = root / "second.klv"
+            first.write_bytes(public_klv("bench", "count", [b"a"], b"aaa", b"1"))
+            second.write_bytes(public_klv("bench", "count", [b"a"], b"aaa", b"99"))
+            first_identity = CENSUS.parse_public_klv_semantic_identity(first, "first")
+            second_identity = CENSUS.parse_public_klv_semantic_identity(second, "second")
+            self.assertEqual(first_identity, second_identity)
+
+            unknown = root / "unknown.klv"
+            unknown.write_bytes(first.read_bytes() + klv_field("secret-field", b"x"))
+            with self.assertRaisesRegex(CENSUS.CensusError, "unknown key"):
+                CENSUS.parse_public_klv_semantic_identity(unknown, "unknown")
+
+            reordered = root / "reordered.klv"
+            payload = public_klv("bench", "count", [b"a"], b"aaa")
+            name_end = payload.index(b"\n") + 1
+            model_end = payload.index(b"\n", name_end) + 1
+            reordered.write_bytes(
+                payload[name_end:model_end] + payload[:name_end] + payload[model_end:]
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "order or closure"):
+                CENSUS.parse_public_klv_semantic_identity(reordered, "reordered")
+
+            zero_iters = root / "zero-iters.klv"
+            zero_iters.write_bytes(
+                public_klv("bench", "count", [b"a"], b"aaa", b"0")
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "must be nonzero"):
+                CENSUS.parse_public_klv_semantic_identity(zero_iters, "zero")
+
+            oversized_integer = root / "oversized-integer.klv"
+            oversized_integer.write_bytes(
+                public_klv("bench", "count", [b"a"], b"aaa", b"1" * 21)
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "unsigned decimal"):
+                CENSUS.parse_public_klv_semantic_identity(
+                    oversized_integer, "oversized integer"
+                )
+
+    def test_public_manifest_rejects_duplicate_semantic_klvs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first = root / "first.klv"
+            second = root / "second.klv"
+            first.write_bytes(public_klv("same", "count", [b"x"], b"hay", b"1"))
+            second.write_bytes(public_klv("same", "count", [b"x"], b"hay", b"2"))
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "schema": CENSUS.PUBLIC_MANIFEST_SCHEMA,
+                "entries": [
+                    {
+                        "path": first.name,
+                        "sha256": CENSUS.sha_file(first),
+                        "bytes": first.stat().st_size,
+                    },
+                    {
+                        "path": second.name,
+                        "sha256": CENSUS.sha_file(second),
+                        "bytes": second.stat().st_size,
+                    },
+                ],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(CENSUS.CensusError, "semantic"):
+                CENSUS.external_public_manifest(
+                    manifest,
+                    CENSUS.sha_file(manifest),
+                    root,
+                    "public/klv",
+                    2,
+                )
+
+    def test_manifest_plan_maps_all_344_semantic_identities_and_seals_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            public_root = root / "klv"
+            public_root.mkdir()
+            entries = []
+            points = []
+            for ordinal in range(344):
+                model = "compile" if ordinal < 33 else "count"
+                name = f"public-job-{ordinal:03}"
+                pattern = f"pattern-{ordinal:03}".encode()
+                haystack = f"haystack-{ordinal:03}".encode()
+                manifest_path = public_root / f"manifest-{ordinal:03}.klv"
+                schedule_path = public_root / f"schedule-{ordinal:03}.klv"
+                manifest_path.write_bytes(
+                    public_klv(name, model, [pattern], haystack, b"9")
+                )
+                schedule_path.write_bytes(
+                    public_klv(name, model, [pattern], haystack, b"1")
+                )
+                entries.append({
+                    "path": manifest_path.name,
+                    "sha256": CENSUS.sha_file(manifest_path),
+                    "bytes": manifest_path.stat().st_size,
+                })
+                input_identity = {
+                    "pattern_sha256": [CENSUS.sha_bytes(pattern)],
+                    "haystack_sha256": CENSUS.sha_bytes(haystack),
+                    "haystack_bytes": len(haystack),
+                    "case_insensitive": False,
+                    "unicode": True,
+                }
+                schedule_klv = {
+                    "path": schedule_path.name,
+                    "sha256": CENSUS.sha_file(schedule_path),
+                }
+                point = {
+                    "point_id": f"point-{ordinal:03}",
+                    "fre_job_id": f"job-{ordinal:03}",
+                    "benchmark": name,
+                    "model": model,
+                    "boundary": "formal",
+                    "comparator": "rust-regex-1.12.4",
+                    "expected": 1,
+                    "input": input_identity,
+                    "candidate_klv": schedule_klv,
+                    "reference_klv": schedule_klv,
+                }
+                points.append(point)
+                if ordinal == 33:
+                    re2_point = copy.deepcopy(point)
+                    re2_point["point_id"] = "point-033-re2"
+                    re2_point["comparator"] = "re2-2025-11-05"
+                    re2_point["expected"] = 2
+                    points.append(re2_point)
+            manifest_path = root / "public-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "schema": CENSUS.PUBLIC_MANIFEST_SCHEMA,
+                "entries": entries,
+            }), encoding="utf-8")
+            schedule_path = root / "schedule.json"
+            schedule_path.write_text(json.dumps({
+                "schema": CENSUS.SCHEDULE_SCHEMA,
+                "rebar_revision": "6" * 40,
+                "points": points,
+            }), encoding="utf-8")
+            expected_source = {
+                "commit": "1" * 40,
+                "tree": "2" * 40,
+                "cargo_lock_sha256": "3" * 64,
+            }
+            arguments = argparse.Namespace(
+                schedule=[str(schedule_path)],
+                schedule_sha256=[CENSUS.sha_file(schedule_path)],
+                public_manifest=str(manifest_path),
+                public_manifest_sha256=CENSUS.sha_file(manifest_path),
+                public_klv_root=str(public_root),
+                recorded_public_klv_root="public/klv",
+                public_corpus_label="synthetic-public-manifest",
+                source_dir=str(root),
+                source_commit=expected_source["commit"],
+                source_tree=expected_source["tree"],
+                target="aarch64-linux",
+                features="asimd",
+                expected_public_jobs=344,
+                expected_runtime_jobs=311,
+                expected_compile_jobs=33,
+                skip_klv_hashing=False,
+                dry_run=False,
+            )
+            with mock.patch.object(CENSUS, "source_identity", return_value=expected_source):
+                plan = CENSUS.make_plan(arguments)
+            validated = CENSUS.validate_plan(plan)
+            public_manifest = validated["public_corpus"]["manifest"]
+            self.assertEqual(public_manifest["entry_count"], 344)
+            self.assertEqual(len(public_manifest["mappings"]), 344)
+            diagnostics = validated["public_corpus"]["expected_results"]
+            self.assertEqual(diagnostics["divergent_jobs"]["ids"], ["job-033"])
+            job_033 = next(
+                row for row in diagnostics["runtime_jobs"]
+                if row["job_id"] == "job-033"
+            )
+            self.assertEqual(job_033["selected_expected"], 2)
+            self.assertEqual(job_033["selected_comparator"], "re2-2025-11-05")
+            first_job = next(job for job in validated["jobs"] if job["job_id"] == "job-000")
+            self.assertEqual(first_job["candidate_klv"]["path"], "manifest-000.klv")
+
+            forged = copy.deepcopy(validated)
+            forged_mapping = forged["public_corpus"]["manifest"]["mappings"][0]
+            forged_mapping["job_id"] = "job-001"
+            forged["public_corpus"]["manifest"]["mapping_sha256"] = CENSUS.sha_bytes(
+                CENSUS.canonical(
+                    forged["public_corpus"]["manifest"]["mappings"]
+                ).encode()
+            )
+            forged = CENSUS.add_digest(
+                {key: value for key, value in forged.items() if key != "plan_sha256"},
+                "plan_sha256",
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "mapping differs"):
+                CENSUS.validate_plan(forged)
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
         receipt = CENSUS.id_set(["b", "a"])

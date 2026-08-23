@@ -82,6 +82,117 @@
         "point_count": { "type": "integer", "minimum": 1 }
       }
     },
+    "expectedPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["point_id", "expected"],
+      "properties": {
+        "point_id": { "type": "string", "minLength": 1 },
+        "expected": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        }
+      }
+    },
+    "expectedObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparator", "expected_values", "points"],
+      "properties": {
+        "comparator": {
+          "enum": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "expected_values": {
+          "type": "array",
+          "items": {
+            "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+          },
+          "minItems": 1, "uniqueItems": true
+        },
+        "points": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedPoint" },
+          "minItems": 1
+        }
+      }
+    },
+    "expectedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id", "selected_expected", "selected_comparator", "divergent",
+        "observations"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "selected_expected": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "selected_comparator": {
+          "enum": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "divergent": { "type": "boolean" },
+        "observations": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedObservation" },
+          "minItems": 1, "maxItems": 2
+        }
+      }
+    },
+    "expectedResults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority", "preference", "runtime_jobs", "runtime_jobs_sha256",
+        "divergent_jobs"
+      ],
+      "properties": {
+        "authority": { "const": "frozen-comparator-first-v1" },
+        "preference": {
+          "const": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "runtime_jobs": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedResult" },
+          "minItems": 311, "maxItems": 311
+        },
+        "runtime_jobs_sha256": { "$ref": "#/$defs/sha256" },
+        "divergent_jobs": { "$ref": "#/$defs/idSet" }
+      }
+    },
+    "publicManifestMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_ordinal", "manifest_klv", "semantic_identity_sha256",
+        "job_id", "point_ids"
+      ],
+      "properties": {
+        "manifest_ordinal": { "type": "integer", "minimum": 0, "maximum": 343 },
+        "manifest_klv": { "$ref": "#/$defs/klv" },
+        "semantic_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "job_id": { "type": "string", "minLength": 1 },
+        "point_ids": {
+          "type": "array", "items": { "type": "string", "minLength": 1 },
+          "minItems": 1, "uniqueItems": true
+        }
+      }
+    },
+    "publicManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "file_sha256", "entry_count", "entries_sha256",
+        "mappings", "mapping_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "fre.public-rebar-klv-inventory.v1" },
+        "file_sha256": { "$ref": "#/$defs/sha256" },
+        "entry_count": { "const": 344 },
+        "entries_sha256": { "$ref": "#/$defs/sha256" },
+        "mappings": {
+          "type": "array", "items": { "$ref": "#/$defs/publicManifestMapping" },
+          "minItems": 344, "maxItems": 344
+        },
+        "mapping_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "planJob": {
       "type": "object",
       "additionalProperties": false,
@@ -140,6 +251,7 @@
         "public_corpus": {
           "type": "object",
           "additionalProperties": false,
+          "dependentRequired": { "manifest": ["expected_results"] },
           "required": [
             "label", "klv_root_recorded", "privacy_policy", "rebar_revisions", "schedules"
           ],
@@ -148,7 +260,9 @@
             "klv_root_recorded": { "type": "string", "minLength": 1 },
             "privacy_policy": { "const": "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes" },
             "rebar_revisions": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-            "schedules": { "type": "array", "items": { "$ref": "#/$defs/schedule" }, "minItems": 1 }
+            "schedules": { "type": "array", "items": { "$ref": "#/$defs/schedule" }, "minItems": 1 },
+            "expected_results": { "$ref": "#/$defs/expectedResults" },
+            "manifest": { "$ref": "#/$defs/publicManifest" }
           }
         },
         "target": {

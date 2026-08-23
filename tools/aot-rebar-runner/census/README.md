@@ -145,12 +145,42 @@ Each schedule and its expected file digest must be named explicitly. Repeated
 jobs; conflicting IDs fail closed. `--dry-run` validates the source freeze,
 schedule identities, public path containment, KLV hashes, and the 344/33/311
 denominators without writing output, invoking Cargo, building, running a test,
-or executing a benchmark:
+or executing a benchmark.
+
+The preferred sealed mode additionally accepts a closed public KLV inventory:
+
+```json
+{
+  "schema": "fre.public-rebar-klv-inventory.v1",
+  "entries": [
+    {"path": "relative/job.klv", "sha256": "...", "bytes": 123}
+  ]
+}
+```
+
+It must contain exactly 344 entries. Each KLV is parsed in canonical Rebar
+field order with a closed key set; pattern and haystack bytes are immediately
+reduced to hashes and lengths. The semantic join uses benchmark, model,
+ordered pattern hashes, haystack hash/length, and the two regex flags. Timing
+fields are validated but deliberately do not change semantic identity, so the
+canonical manifest KLV can be joined to a schedule KLV with different public
+measurement controls. Every manifest identity must map to exactly one public
+job and all its frozen schedule points. The plan retains both input file
+digests, all 344 normalized mappings, and separate entries/mapping digests.
+Schedule-only invocation remains accepted for existing version-2 plans.
+
+Expected-result authority is comparator-first: the fixed preference is RE2
+2025-11-05, then Rust regex 1.12.4. All points for the selected comparator must
+agree. Different scalars, including internal conflicts, from a lower-priority
+comparator are retained with their point IDs as sealed divergence diagnostics
+instead of preventing qualification or silently changing the selected scalar.
 
 ```sh
 python3 tools/aot-rebar-runner/census/true_native_census.py plan \
   --schedule /public/control/schedule-timing.json \
   --schedule-sha256 EXPECTED_SHA256 \
+  --public-manifest /public/control/public-klv-manifest.json \
+  --public-manifest-sha256 EXPECTED_MANIFEST_SHA256 \
   --public-klv-root /public/corpus/klv \
   --recorded-public-klv-root public-corpus/klv \
   --public-corpus-label public-rebar-CORPUS_ID \
@@ -174,6 +204,47 @@ from the job whose input identity it carries.
 Do not perform these steps while a timing holdout needs an idle machine. They
 are documented so the committed controller is runnable later without another
 design step.
+
+The formal driver performs the complete resumable run on a native host matching
+the plan target. The work and two Cargo target directories must be distinct,
+outside the sealed source checkout, and empty on the first invocation. A sealed
+state file binds the plan, manifest, schedules, source/work paths, canonical
+timeouts, the complete controlled build-environment projection, and byte
+identities of Cargo, `rustc`, Git, `nm`, and the trap library for subsequent
+resumes:
+
+```sh
+python3 tools/aot-rebar-runner/census/formal_qualification.py \
+  --plan census-plan.json \
+  --source-dir /clean/fre-source \
+  --public-klv-root /public/corpus/klv \
+  --work-dir /qualification/formal-census \
+  --primary-target-dir /qualification/target-a \
+  --replica-target-dir /qualification/target-b \
+  --trap-library /control/runtime_symbol_trap.so
+```
+
+For each exact-adapter runtime job it rechecks clean HEAD/tree/Cargo.lock,
+selects the sealed comparator result, and builds release binaries in the two
+independent targets with a closed inherited environment, debuginfo disabled,
+dynamic-symbol export enabled, incremental compilation disabled, and
+`--locked --offline --jobs 1 --target RUSTC_HOST`. Rustup proxies are resolved
+to the actual Cargo and `rustc` binaries, and the exact `rustc` host must map to
+the sealed native plan target. Timed-out Cargo builds run in a driver-created
+session whose exact process group is terminated before work continues. The
+runner and every nonempty provenance-ordered object are copied byte-for-byte
+into a new sealed attempt directory before another job can replace Cargo
+output. Each retained side is recorded in an ordered, receipt-bound artifact
+manifest; every file and every path component is content/type-checked again on
+resume and immediately before and after summary. Existing receipts are
+discovered by their validated contents rather than their filenames. Build,
+provenance, and qualification failures/timeouts use the existing
+privacy-preserving `record-failure` receipt; successful artifacts use the
+existing `qualify-job` logic. Before summary the driver revalidates the complete
+exact-adapter receipt population, accounts for every unsupported row, rechecks
+source state and all bound tool bytes, and requires the summary denominator to
+be exactly 311. It never retains build or process output, only optional byte
+counts and SHA-256 evidence digests.
 
 Build every exact-adapter job twice in independent, empty target directories,
 with the plan's commit/tree, target, feature set, public build KLV, locked
