@@ -511,8 +511,7 @@ pub fn authenticate_native_whole_scalar_reducer(
                 .map(|target| target.name.as_str())
         })
         .collect::<Vec<_>>();
-    let expected_external_targets = Vec::new();
-    if external_targets != expected_external_targets {
+    if !external_targets.is_empty() {
         return Err(format!(
             "native scalar reducer has unexpected unresolved call targets: {external_targets:?}"
         ));
@@ -529,7 +528,7 @@ pub fn authenticate_native_whole_scalar_reducer(
             )
         })
         .collect::<Vec<_>>();
-    if aggregate_helpers != expected_external_targets {
+    if !aggregate_helpers.is_empty() {
         return Err("native scalar reducer has an unexpected aggregate helper surface".to_owned());
     }
     Ok(true)
