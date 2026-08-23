@@ -2508,35 +2508,36 @@ fn select_shared_fragment_dispatch_offset<P: AsRef<[u8]>>(
     }
     let mut best = None;
     let mut best_score = (usize::MAX, usize::MAX, u64::MAX, usize::MAX);
+    let mut bucket_counts = [0_usize; SHARED_FRAGMENT_DISPATCH_GROUPS];
+    let mut touched = [0_u8; SHARED_FRAGMENT_DISPATCH_GROUPS];
     for offset in 0..minimum_pattern_width {
         if (fragment_start..fragment_end).contains(&offset) {
             continue;
         }
-        let mut bucket_counts = [0_usize; 256];
+        let mut touched_len = 0_usize;
+        let mut maximum_bucket = 0_usize;
+        let mut collision_work = 0_usize;
+        let mut frequency_score = 0_u64;
         for pattern in patterns {
             let byte = *pattern.as_ref().get(offset)?;
-            bucket_counts[usize::from(byte)] = bucket_counts[usize::from(byte)].checked_add(1)?;
+            let bucket = &mut bucket_counts[usize::from(byte)];
+            let previous = *bucket;
+            *bucket = previous.checked_add(1)?;
+            maximum_bucket = maximum_bucket.max(*bucket);
+            collision_work = collision_work
+                .checked_add(previous.checked_mul(2)?.checked_add(1)?)?;
+            if previous == 0 {
+                *touched.get_mut(touched_len)? = byte;
+                touched_len = touched_len.checked_add(1)?;
+                frequency_score = frequency_score.checked_add(
+                    u64::from(crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte))
+                        .checked_add(1)?,
+                )?;
+            }
         }
-        let (maximum_bucket, collision_work, frequency_score) =
-            bucket_counts.iter().enumerate().try_fold(
-                (0_usize, 0_usize, 0_u64),
-                |(maximum, collisions, frequency), (byte, &bucket)| {
-                    if bucket == 0 {
-                        return Some((maximum, collisions, frequency));
-                    }
-                    let collisions = collisions.checked_add(bucket.checked_mul(bucket)?)?;
-                    let rank = u64::from(
-                        crate::packed_ordered_literal_aggregate::byte_frequency_rank(
-                            u8::try_from(byte).ok()?,
-                        ),
-                    );
-                    Some((
-                        maximum.max(bucket),
-                        collisions,
-                        frequency.checked_add(rank.checked_add(1)?)?,
-                    ))
-                },
-            )?;
+        for &byte in touched.get(..touched_len)? {
+            bucket_counts[usize::from(byte)] = 0;
+        }
         // Minimize the worst surviving bucket first, then the average
         // source-alternative work under a uniform source-pattern prior. When
         // two columns partition the language equally, prefer the rarer byte
@@ -2913,6 +2914,61 @@ mod tests {
 
     fn pattern_refs(patterns: &[Vec<u8>]) -> Vec<&[u8]> {
         patterns.iter().map(Vec::as_slice).collect()
+    }
+
+    fn reference_shared_fragment_dispatch_offset(
+        patterns: &[&[u8]],
+        minimum_pattern_width: usize,
+        fragment_start: usize,
+        fragment_end: usize,
+    ) -> Option<usize> {
+        if patterns.is_empty() {
+            return None;
+        }
+        let mut best = None;
+        let mut best_score = (usize::MAX, usize::MAX, u64::MAX, usize::MAX);
+        for offset in 0..minimum_pattern_width {
+            if (fragment_start..fragment_end).contains(&offset) {
+                continue;
+            }
+            let mut bucket_counts = [0_usize; super::SHARED_FRAGMENT_DISPATCH_GROUPS];
+            for pattern in patterns {
+                let byte = *pattern.get(offset)?;
+                bucket_counts[usize::from(byte)] =
+                    bucket_counts[usize::from(byte)].checked_add(1)?;
+            }
+            let (maximum_bucket, collision_work, frequency_score) =
+                bucket_counts.iter().enumerate().try_fold(
+                    (0_usize, 0_usize, 0_u64),
+                    |(maximum, collisions, frequency), (byte, &bucket)| {
+                        if bucket == 0 {
+                            return Some((maximum, collisions, frequency));
+                        }
+                        Some((
+                            maximum.max(bucket),
+                            collisions.checked_add(bucket.checked_mul(bucket)?)?,
+                            frequency.checked_add(
+                                u64::from(
+                                    crate::packed_ordered_literal_aggregate::byte_frequency_rank(
+                                        u8::try_from(byte).ok()?,
+                                    ),
+                                )
+                                .checked_add(1)?,
+                            )?,
+                        ))
+                    },
+                )?;
+            let score = (maximum_bucket, collision_work, frequency_score, offset);
+            if score < best_score {
+                best_score = score;
+                best = Some(offset);
+            }
+        }
+        if best_score.0 < patterns.len() {
+            best
+        } else {
+            None
+        }
     }
 
     fn shared_prefix_patterns() -> [&'static [u8]; 8] {
@@ -3861,6 +3917,55 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn shared_fragment_dispatch_incremental_score_matches_reference() {
+        const REPERTOIRE: &[u8] = b"aZ09_:/?[]{}!@#$%^&*+-=xy";
+        for count in [2_usize, 3, 4, 8, 16, 32] {
+            for width in [3_usize, 4, 8, 17, 33] {
+                let patterns = (0..count)
+                    .map(|pattern| {
+                        (0..width + pattern % 3)
+                            .map(|offset| {
+                                if offset % 11 == 0 {
+                                    b'q'
+                                } else {
+                                    let index = pattern
+                                        .checked_mul(29)
+                                        .unwrap()
+                                        .checked_add(offset.checked_mul(17).unwrap())
+                                        .unwrap()
+                                        .checked_add((pattern ^ offset).checked_mul(7).unwrap())
+                                        .unwrap()
+                                        % REPERTOIRE.len();
+                                    REPERTOIRE[index]
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let refs = pattern_refs(&patterns);
+                for fragment_start in [0, width / 3, width.saturating_sub(2)] {
+                    let fragment_end = fragment_start.checked_add(2).unwrap().min(width);
+                    assert_eq!(
+                        super::select_shared_fragment_dispatch_offset(
+                            &refs,
+                            width,
+                            fragment_start,
+                            fragment_end,
+                        ),
+                        reference_shared_fragment_dispatch_offset(
+                            &refs,
+                            width,
+                            fragment_start,
+                            fragment_end,
+                        ),
+                        "count={count}, width={width}, fragment={fragment_start}..{fragment_end}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
