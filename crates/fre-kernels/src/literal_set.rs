@@ -365,7 +365,7 @@ impl<'patterns> LiteralSetFoldAttachment<'patterns> {
         limits: LiteralSetBuildLimits,
     ) -> Result<Self, LiteralSetError> {
         Ok(Self {
-            plan: LiteralSetPlan::new(patterns, limits)?,
+            plan: LiteralSetPlan::new_stable(patterns, limits)?,
             patterns,
         })
     }
@@ -735,7 +735,9 @@ impl LiteralSetPlan {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
-        if self.automaton.prefilter().is_some() {
+        if self.automaton.prefilter().is_some()
+            || self.automaton.match_kind() == MatchKind::Standard
+        {
             return self
                 .try_find_window_value(haystack, window)
                 .map(|matched| matched.map(|(_, end)| end));
@@ -1229,11 +1231,12 @@ impl LiteralSetPlan {
     /// Run the authoritative DFA from a necessary-root continuation without
     /// consulting the DFA's independently retained heuristic prefilter.
     ///
-    /// This mirrors `aho-corasick` 1.1.4's leftmost-first forward loop. The
+    /// This mirrors `aho-corasick` 1.1.4's forward loop for both retained
+    /// construction kinds. A Standard DFA returns its first acceptance;
+    /// LeftmostFirst retains the last delayed match before a dead state. The
     /// DFA was built with an unanchored start state whose special-state set
     /// still includes prefilter restart states, so those starts are explicitly
-    /// ignored while dead and delayed-match states retain their normal
-    /// semantics.
+    /// ignored.
     #[inline(never)]
     fn find_window_incumbent_without_prefilter(
         &self,
@@ -1252,6 +1255,7 @@ impl LiteralSetPlan {
         #[cfg(test)]
         folded_short_stage_probe::record_bounded_verifier();
         let automaton = self.automaton.as_ref();
+        let first_acceptance = automaton.match_kind() == MatchKind::Standard;
         let anchored = Anchored::No;
         let mut state = automaton
             .start_state(anchored)
@@ -1290,6 +1294,9 @@ impl LiteralSetPlan {
                     pattern,
                     relative_start..relative_end,
                 ));
+                if first_acceptance {
+                    break;
+                }
                 continue;
             }
             if !automaton.is_start(state) {
@@ -1769,6 +1776,60 @@ fn checked_mul(
         .ok_or(LiteralSetError::ArithmeticOverflow { computation })
 }
 
+impl LiteralSetPlan {
+    /// Compile stable owned literal alternatives into a DFA.
+    ///
+    /// Unlike the generic [`Self::new`] seam, the `Vec<u8>` values inspected
+    /// here cannot change between preflight and automaton construction. This
+    /// lets equal, positive-width alternatives select standard
+    /// earliest-acceptance construction: for one fixed width, earliest end is
+    /// exactly earliest start, and source priority at that start cannot alter
+    /// the exposed byte span. The construction receipt nevertheless retains
+    /// [`LiteralSetMatchSemantics::LeftmostFirst`] because that remains the
+    /// public span contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new`].
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn new_stable(
+        patterns: &[Vec<u8>],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
+        let semantics = LiteralSetMatchSemantics::LeftmostFirst;
+        let build = preflight(patterns, limits, semantics)?;
+        let uniform_positive = build.minimum_pattern_bytes > 0
+            && build.minimum_pattern_bytes.checked_mul(build.patterns)
+                == Some(build.pattern_bytes);
+        let match_kind = if uniform_positive {
+            MatchKind::Standard
+        } else {
+            MatchKind::LeftmostFirst
+        };
+        let automaton = DFA::builder()
+            .match_kind(match_kind)
+            .build(patterns.iter().map(Vec::as_slice))
+            .map_err(|error| LiteralSetError::AutomatonBuild {
+                detail: error.to_string(),
+            })?;
+        let mut build = build;
+        build.persistent_bytes = automaton.memory_usage();
+        if build.persistent_bytes > limits.max_persistent_bytes {
+            return Err(LiteralSetError::PersistentBytesLimit {
+                needed: build.persistent_bytes,
+                limit: limits.max_persistent_bytes,
+            });
+        }
+        Ok(Self {
+            automaton: Arc::new(automaton),
+            build,
+            folded_long_tail: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod folded_short_stage_probe {
     use std::cell::Cell;
@@ -1827,6 +1888,9 @@ mod folded_short_stage_probe {
 
 #[cfg(test)]
 mod folded_long_tail_tests {
+    use aho_corasick::MatchKind;
+    use aho_corasick::automaton::Automaton;
+
     use crate::folded_literal_trie::{
         BuildAttempt, BuildLimits, FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass,
         RootCandidateOutcome, root_candidate_dispatch_probe,
@@ -1928,6 +1992,86 @@ mod folded_long_tail_tests {
         let (accelerated, attached) = attachment.try_attach(trie, usize::MAX).unwrap();
         assert!(attached);
         (incumbent, accelerated)
+    }
+
+    #[test]
+    fn uniform_standard_folded_attachment_preserves_leftmost_spans() {
+        folded_short_stage_probe::reset();
+        let (incumbent, accelerated) = three_column_plans();
+        assert_eq!(incumbent.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert_eq!(accelerated.automaton.match_kind(), MatchKind::Standard);
+        let tail = accelerated
+            .folded_long_tail
+            .as_deref()
+            .expect("the uniform stable plan retains its folded attachment");
+        let minimum = folded_short_minimum_bytes(tail).unwrap();
+        let input_sizes = [
+            minimum,
+            minimum + 1,
+            64,
+            tail.dfa_prefix_bytes,
+            tail.dfa_prefix_bytes + 1,
+        ];
+        for (size_index, &input_bytes) in input_sizes.iter().enumerate() {
+            if input_sizes[..size_index].contains(&input_bytes) {
+                continue;
+            }
+            for frame in 0..=2 {
+                let window = Window::new(frame, frame + input_bytes);
+                let mut cases = vec![vec![b'!'; window.end() + 4]];
+                if input_bytes >= 3 {
+                    let starts = [
+                        window.start(),
+                        window.start() + input_bytes / 2,
+                        window.end() - 3,
+                    ];
+                    for &start in &starts {
+                        if start + 3 > window.end() {
+                            continue;
+                        }
+                        let mut haystack = vec![b'!'; window.end() + 4];
+                        haystack[start..start + 3].copy_from_slice(b"abc");
+                        cases.push(haystack);
+                    }
+                }
+                if input_bytes >= 8 {
+                    let later = window.start() + input_bytes / 2;
+                    if later + 3 <= window.end() {
+                        let mut false_root = vec![b'!'; window.end() + 4];
+                        false_root[window.start()..window.start() + 3]
+                            .copy_from_slice(b"abz");
+                        false_root[later..later + 3].copy_from_slice(b"abc");
+                        cases.push(false_root);
+                    }
+                }
+                for haystack in cases {
+                    let expected = incumbent
+                        .find_window(
+                            &haystack,
+                            window,
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0;
+                    let actual = accelerated
+                        .find_window(
+                            &haystack,
+                            window,
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        actual, expected,
+                        "input_bytes={input_bytes}, frame={frame}, haystack={haystack:?}",
+                    );
+                }
+            }
+        }
+        assert!(
+            folded_short_stage_probe::bounded_verifiers() > 0,
+            "the Standard manual verifier branch must remain covered",
+        );
     }
 
     fn bounded_shadow_plans() -> (LiteralSetPlan, LiteralSetPlan) {
@@ -3747,9 +3891,196 @@ mod tests {
     use std::sync::Arc;
 
     use aho_corasick::automaton::Automaton;
+    use aho_corasick::dfa::DFA;
+    use aho_corasick::{Input, MatchKind};
 
-    use super::{LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits};
+    use super::{
+        LiteralSetBuildLimits, LiteralSetError, LiteralSetMatchSemantics, LiteralSetPlan,
+        LiteralSetSearchLimits,
+    };
     use crate::Window;
+
+    fn reference_find(
+        automaton: &DFA,
+        haystack: &[u8],
+        window: Window,
+    ) -> Option<(usize, usize)> {
+        let input = Input::new(&haystack[window.start()..window.end()]);
+        automaton.try_find(&input).unwrap().map(|matched| {
+            (
+                window.start() + matched.start(),
+                window.start() + matched.end(),
+            )
+        })
+    }
+
+    fn assert_leftmost_window_differential(
+        patterns: &[Vec<u8>],
+        plan: &LiteralSetPlan,
+        maximum_haystack_bytes: usize,
+    ) {
+        let reference = DFA::builder()
+            .match_kind(MatchKind::LeftmostFirst)
+            .build(patterns.iter().map(Vec::as_slice))
+            .unwrap();
+        let ordinary = plan.ordinary_executor();
+        let alphabet = [b'a', b'b', b'x'];
+        for haystack_len in 0..=maximum_haystack_bytes {
+            let sources = alphabet.len().pow(u32::try_from(haystack_len).unwrap());
+            for encoded in 0..sources {
+                let mut value = encoded;
+                let mut haystack = vec![0_u8; haystack_len];
+                for byte in &mut haystack {
+                    *byte = alphabet[value % alphabet.len()];
+                    value /= alphabet.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = Window::new(start, end);
+                        let expected = reference_find(&reference, &haystack, window);
+                        let actual = plan
+                            .find_window(
+                                &haystack,
+                                window,
+                                LiteralSetSearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0;
+                        assert_eq!(
+                            actual, expected,
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                        let Some(ordinary) = ordinary else {
+                            continue;
+                        };
+                        assert_eq!(
+                            ordinary.find_window_value(&haystack, window),
+                            Ok(expected),
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                        assert_eq!(
+                            ordinary.exists_window_value(&haystack, window),
+                            Ok(expected.is_some()),
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                        assert_eq!(
+                            ordinary.selected_end_window_value(&haystack, window),
+                            Ok(expected.map(|(_, matched_end)| matched_end)),
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+
+                        let mut expected_spans = Vec::new();
+                        let mut cursor = window.start();
+                        while let Some(matched) = reference_find(
+                            &reference,
+                            &haystack,
+                            Window::new(cursor, window.end()),
+                        ) {
+                            assert!(matched.1 > cursor);
+                            cursor = matched.1;
+                            expected_spans.push(matched);
+                        }
+                        let mut actual_spans = Vec::new();
+                        assert_eq!(
+                            ordinary.try_visit_spans_window_value(
+                                &haystack,
+                                window,
+                                |matched| {
+                                    actual_spans.push(matched);
+                                    Ok::<bool, ()>(true)
+                                },
+                            ),
+                            Ok(Ok(())),
+                        );
+                        assert_eq!(
+                            actual_spans, expected_spans,
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_uniform_standard_matches_leftmost_first_exhaustively() {
+        for width in 1..=3 {
+            let word_count = 2_usize.pow(u32::try_from(width).unwrap());
+            let words = (0..word_count)
+                .map(|encoded| {
+                    let mut value = encoded;
+                    let mut word = vec![0_u8; width];
+                    for byte in &mut word {
+                        *byte = if value & 1 == 0 { b'a' } else { b'b' };
+                        value >>= 1;
+                    }
+                    word
+                })
+                .collect::<Vec<_>>();
+            for pattern_count in 1..=2 {
+                let pattern_sets = words
+                    .len()
+                    .pow(u32::try_from(pattern_count).unwrap());
+                for encoded in 0..pattern_sets {
+                    let mut value = encoded;
+                    let mut patterns = Vec::with_capacity(pattern_count);
+                    for _ in 0..pattern_count {
+                        patterns.push(words[value % words.len()].clone());
+                        value /= words.len();
+                    }
+                    let plan = LiteralSetPlan::new_stable(
+                        &patterns,
+                        LiteralSetBuildLimits::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        plan.build_accounting().match_semantics,
+                        LiteralSetMatchSemantics::LeftmostFirst,
+                    );
+                    assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
+                    assert_leftmost_window_differential(&patterns, &plan, 5);
+                }
+            }
+        }
+
+        let nonuniform_controls = [
+            vec![b"a".to_vec(), b"ab".to_vec()],
+            vec![b"ab".to_vec(), b"a".to_vec()],
+            vec![b"b".to_vec(), b"abc".to_vec()],
+            vec![b"aba".to_vec(), b"b".to_vec(), b"aba".to_vec()],
+            vec![Vec::new(), b"a".to_vec()],
+            vec![Vec::new(), Vec::new()],
+        ];
+        for patterns in nonuniform_controls {
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+            assert_leftmost_window_differential(&patterns, &plan, 5);
+        }
+
+        let divergent = LiteralSetPlan::new_stable(
+            &[b"b".to_vec(), b"abc".to_vec()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            divergent
+                .find(b"abc", LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((0, 3)),
+        );
+
+        let generic = LiteralSetPlan::new(
+            &[b"ab".as_slice(), b"cd".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(generic.automaton.match_kind(), MatchKind::LeftmostFirst);
+    }
 
     #[test]
     fn concrete_dfa_owner_preserves_clone_accounting_priority_and_iteration() {
@@ -4229,12 +4560,30 @@ mod tests {
                 limit: 1
             })
         ));
+        let stable_patterns = patterns
+            .iter()
+            .map(|pattern| pattern.to_vec())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            LiteralSetPlan::new_stable(&stable_patterns, limits),
+            Err(LiteralSetError::PatternLimit {
+                needed: 2,
+                limit: 1
+            })
+        ));
         let limits = LiteralSetBuildLimits {
             max_pattern_bytes: 5,
             ..LiteralSetBuildLimits::default()
         };
         assert!(matches!(
             LiteralSetPlan::new(&patterns, limits),
+            Err(LiteralSetError::PatternBytesLimit {
+                needed: 6,
+                limit: 5
+            })
+        ));
+        assert!(matches!(
+            LiteralSetPlan::new_stable(&stable_patterns, limits),
             Err(LiteralSetError::PatternBytesLimit {
                 needed: 6,
                 limit: 5
