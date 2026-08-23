@@ -1812,7 +1812,10 @@ macro_rules! first_acceptance_special_state {
 }
 
 // Keep ordinary find/exists expansion scalar. Count and the isolated span
-// visitor select paired pre-acceptance transitions explicitly.
+// visitor select paired pre-acceptance transitions explicitly. Count binds
+// its already-validated prefix range once so the paired loop carries no
+// source bounds branch per byte; the span visitor retains its established
+// index loop because its surrounding emitting code has different layout.
 macro_rules! first_acceptance_prefix {
     (
         scalar,
@@ -1844,6 +1847,27 @@ macro_rules! first_acceptance_prefix {
         }
         while $at < $end {
             $state = $automaton.next_state($anchored, $state, $haystack[$at]);
+            $at += 1;
+        }
+    };
+    (
+        chunks,
+        $automaton:ident,
+        $anchored:ident,
+        $state:ident,
+        $haystack:ident,
+        $at:ident,
+        $end:ident
+    ) => {
+        let prefix = &$haystack[$at..$end];
+        let mut pairs = prefix.chunks_exact(2);
+        for pair in pairs.by_ref() {
+            $state = $automaton.next_state($anchored, $state, pair[0]);
+            $state = $automaton.next_state($anchored, $state, pair[1]);
+            $at += 2;
+        }
+        for &byte in pairs.remainder() {
+            $state = $automaton.next_state($anchored, $state, byte);
             $at += 1;
         }
     };
@@ -1941,7 +1965,7 @@ fn first_acceptance_end_for_count(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, match_first, pair)
+    first_acceptance_end_body!(plan, haystack, window, match_first, chunks)
 }
 
 #[cfg(test)]
