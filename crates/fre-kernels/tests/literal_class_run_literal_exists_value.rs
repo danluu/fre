@@ -99,6 +99,55 @@ fn ordinary_full_exists_matches_incumbent_for_every_resolved_geometry() {
 }
 
 #[test]
+fn ordinary_full_find_matches_incumbent_for_every_resolved_geometry() {
+    let guarded = LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+        b"",
+        [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')].into_iter(),
+        b"nn",
+        BuildLimits::unlimited(),
+    )
+    .unwrap();
+    let plans = [
+        (plan(b"pp", &[(b'x', b'y')], b"q"), b"pqxy!".as_slice()),
+        (plan(b"p", &[(b'x', b'y')], b"qq"), b"pqxy!".as_slice()),
+        (plan(b"", &[(b'a', b'b')], b"aba"), b"ab!".as_slice()),
+        (guarded, b"an_!".as_slice()),
+    ];
+    for (candidate, alphabet) in plans {
+        for haystack in byte_strings(6, alphabet) {
+            let expected = candidate
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(
+                candidate.find_full_ordinary_value(&haystack).unwrap(),
+                expected,
+                "haystack={haystack:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_full_find_retries_overlapping_general_suffix_after_rejection() {
+    let candidate = plan(b"", &[(b'y', b'y')], b"xyx");
+    let haystack = b"xyxyx";
+    let expected = Some((1, 5));
+
+    assert_eq!(
+        candidate.find_full_ordinary_value(haystack).unwrap(),
+        expected,
+    );
+    assert_eq!(
+        candidate
+            .find(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0,
+        expected,
+    );
+}
+
+#[test]
 fn existence_values_preserve_finite_refusal_invalid_and_fallback_contracts() {
     let candidate = plan(b"aa", &[(b'0', b'1')], b"QZ");
     let haystack = b"!aa0101QZ!aa001QZ!";

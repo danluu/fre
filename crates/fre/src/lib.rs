@@ -10647,6 +10647,27 @@ mod literal_set_dfa_ordinary_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod literal_class_run_literal_ordinary_find_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn snapshot() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -13974,6 +13995,13 @@ impl PortableRegex {
                     })
                     .map_err(SearchError::from),
             },
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                #[cfg(test)]
+                literal_class_run_literal_ordinary_find_probe::record();
+                plan.find_full_ordinary_value(haystack)
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
+            }
             PortablePlan::PackedLiteralSet(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let matched = if let Some(ordinary) =
@@ -40102,6 +40130,195 @@ mod tests {
             accounting,
             SearchAccounting::LiteralClassRunLiteral(_)
         ));
+    }
+
+    #[test]
+    fn literal_class_run_ordinary_find_matches_upstream_exhaustively() {
+        let cases: &[(&str, &[u8])] = &[
+            (r"aa[xy]+b", b"abxy\xff"),
+            (r"a[xy]+bbb", b"abxy\xff"),
+            (r"aa[xy]+", b"axy\xff"),
+            (r"[xy]+bbb", b"bxy\xff"),
+            (r"[ab]+aba", b"ab!"),
+            (r"\b\w+nn\b", b"an_!"),
+        ];
+        for &(pattern, alphabet) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for length in 0_u32..=6 {
+                for mut encoded in 0..alphabet.len().pow(length) {
+                    let mut haystack = vec![0; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[encoded % alphabet.len()];
+                        encoded /= alphabet.len();
+                    }
+                    let expected = upstream.find(&haystack).map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    });
+                    super::literal_class_run_literal_ordinary_find_probe::reset();
+                    assert_eq!(
+                        regex.find(&haystack),
+                        expected,
+                        "pattern={pattern:?}, haystack={haystack:?}",
+                    );
+                    assert_eq!(
+                        super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                        1,
+                    );
+                }
+            }
+        }
+
+        for (pattern, haystack) in [
+            (r"[ab]+aba", b"!aababa!".as_slice()),
+            (r"\b\w+ing\b", b"!testing!".as_slice()),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected = upstream.find(haystack).map(|matched| Match {
+                start: matched.start(),
+                end: matched.end(),
+            });
+            super::literal_class_run_literal_ordinary_find_probe::reset();
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                1,
+                "exceptional geometry still enters only the ordinary facade arm",
+            );
+        }
+    }
+
+    #[test]
+    fn literal_class_run_ordinary_find_rereads_same_address_mutations() {
+        for (pattern, present) in [
+            (r"aa[xy]+b", b"--aaxxyb--".as_slice()),
+            (r"a[xy]+bbbb", b"--axxybbbb--".as_slice()),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut reused = present.to_vec();
+            let address = reused.as_ptr();
+            super::literal_class_run_literal_ordinary_find_probe::reset();
+            for expected_present in [true, false, true] {
+                if expected_present {
+                    reused.copy_from_slice(present);
+                } else {
+                    reused.fill(b'z');
+                }
+                assert_eq!(reused.as_ptr(), address);
+                let expected = upstream.find(&reused).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                assert_eq!(regex.find(&reused), expected);
+                assert_eq!(expected.is_some(), expected_present);
+            }
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                3,
+                "every ordinary call must reread the current borrowed source",
+            );
+        }
+    }
+
+    #[test]
+    fn literal_class_run_ordinary_find_isolated_from_explicit_apis() {
+        let regex = PortableBuilder::new(r"aa[xy]+b")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let haystack = b"--aaxxyb--";
+        let full = SearchWindow::full(haystack);
+        let unlimited = SearchLimits::unlimited();
+        let expected = Some(Match { start: 2, end: 8 });
+
+        super::literal_class_run_literal_ordinary_find_probe::reset();
+        assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+        assert_eq!(regex.find_accounted(haystack, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_at(haystack, 0, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_at_value(haystack, 0, unlimited).unwrap(), expected);
+        assert_eq!(regex.find_window(haystack, full, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_window_value(haystack, full, unlimited).unwrap(), expected);
+
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(matches!(
+            regex.find_value(haystack, refusing),
+            Err(SearchError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralSearchError::WorkLimit { limit: 0, .. }
+            )),
+        ));
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, haystack, unlimited)
+                .unwrap()
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(
+            super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+            0,
+            "finite, accounted, ranged, session, iterator, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(haystack));
+        assert_eq!(
+            super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+            0,
+            "the already-specialized ordinary existence facade is independent",
+        );
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(
+            super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+            1,
+        );
     }
 
     #[test]

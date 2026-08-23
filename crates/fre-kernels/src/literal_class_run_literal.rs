@@ -1516,6 +1516,30 @@ impl LiteralClassRunLiteralPlan {
         }
     }
 
+    /// Return the selected ordinary full-haystack span without retaining
+    /// diagnostic accounting for the two general construction-resolved
+    /// geometries.
+    ///
+    /// Contained-suffix and guarded geometry deliberately retain the
+    /// incumbent checked implementation. Ranged, finite, accounted, session,
+    /// iterator, and reusable value APIs continue to use [`Self::find_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_full_ordinary_value(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        match self.geometry {
+            ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
+                Ok(self.search_general_selected_value(haystack))
+            }
+            ResolvedSearchGeometry::SuffixInsideClass
+            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => self
+                .find(haystack, SearchLimits::unlimited())
+                .map(|(matched, _)| matched),
+        }
+    }
+
     #[inline]
     fn is_match_window_incumbent(
         &self,
@@ -1577,6 +1601,65 @@ impl LiteralClassRunLiteralPlan {
                     debug_assert!(false, "non-general geometry must use incumbent search");
                     return false;
                 }
+            }
+            cursor = anchor_start + 1;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the admitted value route keeps every anchor and run offset within its full-haystack slice"
+    )]
+    fn search_general_selected_value(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        let mut cursor = 0_usize;
+        loop {
+            let relative = self.anchor.find(&haystack[cursor..])?;
+            let anchor_start = cursor + relative;
+            let anchor_end = anchor_start + self.anchor.needle().len();
+            let matched = match self.geometry {
+                ResolvedSearchGeometry::GeneralPrefix => {
+                    scan_class_run_forward_value(
+                        haystack,
+                        self.class,
+                        self.ascii_scanner.as_ref(),
+                        anchor_end,
+                    )
+                    .filter(|&run_end| {
+                        haystack
+                            .get(run_end..)
+                            .is_some_and(|remaining| remaining.starts_with(self.suffix()))
+                    })
+                    .map(|run_end| (anchor_start, run_end + self.suffix().len()))
+                }
+                ResolvedSearchGeometry::GeneralSuffix => {
+                    scan_class_run_backward_value(
+                        haystack,
+                        self.class,
+                        self.ascii_scanner.as_ref(),
+                        anchor_start,
+                    )
+                    .and_then(|run_start| {
+                        if self.prefix().is_empty() {
+                            Some(run_start)
+                        } else {
+                            run_start.checked_sub(self.prefix().len())
+                        }
+                    })
+                    .filter(|&start| {
+                        haystack
+                            .get(start..anchor_start)
+                            .is_some_and(|actual| actual.starts_with(self.prefix()))
+                    })
+                    .map(|start| (start, anchor_end))
+                }
+                ResolvedSearchGeometry::SuffixInsideClass
+                | ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                    debug_assert!(false, "non-general geometry must use incumbent search");
+                    return None;
+                }
+            };
+            if matched.is_some() {
+                return matched;
             }
             cursor = anchor_start + 1;
         }
@@ -10265,12 +10348,20 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_exists_uses_the_construction_resolved_route() {
+    fn ordinary_values_use_the_construction_resolved_route() {
         let direct = plan();
         reset_test_search_preflight_calls();
         assert!(direct
             .is_match_full_ordinary_value(b"!ab \tcd!")
             .unwrap());
+        assert_eq!(test_search_preflight_calls(), 0);
+        reset_test_search_preflight_calls();
+        assert_eq!(
+            direct
+                .find_full_ordinary_value(b"!ab \tcd!")
+                .unwrap(),
+            Some((1, 7)),
+        );
         assert_eq!(test_search_preflight_calls(), 0);
 
         let direct_suffix = LiteralClassRunLiteralPlan::build(
@@ -10285,6 +10376,14 @@ mod tests {
             .is_match_full_ordinary_value(b"!axxxzz!")
             .unwrap());
         assert_eq!(test_search_preflight_calls(), 0);
+        reset_test_search_preflight_calls();
+        assert_eq!(
+            direct_suffix
+                .find_full_ordinary_value(b"!axxxzz!")
+                .unwrap(),
+            Some((1, 7)),
+        );
+        assert_eq!(test_search_preflight_calls(), 0);
 
         let contained = LiteralClassRunLiteralPlan::build(
             b"",
@@ -10298,12 +10397,28 @@ mod tests {
             .is_match_full_ordinary_value(b"!aababa!")
             .unwrap());
         assert_eq!(test_search_preflight_calls(), 1);
+        reset_test_search_preflight_calls();
+        assert_eq!(
+            contained
+                .find_full_ordinary_value(b"!aababa!")
+                .unwrap(),
+            Some((1, 7)),
+        );
+        assert_eq!(test_search_preflight_calls(), 1);
 
         let guarded = complete_ascii_word_run_plan(b"ing");
         reset_test_search_preflight_calls();
         assert!(guarded
             .is_match_full_ordinary_value(b"!testing!")
             .unwrap());
+        assert_eq!(test_search_preflight_calls(), 1);
+        reset_test_search_preflight_calls();
+        assert_eq!(
+            guarded
+                .find_full_ordinary_value(b"!testing!")
+                .unwrap(),
+            Some((1, 8)),
+        );
         assert_eq!(test_search_preflight_calls(), 1);
     }
 

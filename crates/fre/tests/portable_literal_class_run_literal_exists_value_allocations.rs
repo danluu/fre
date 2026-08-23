@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::alloc::System;
+use std::{alloc::System, hint::black_box};
 
 use fre::{PortableBuilder, SearchAccounting, SearchLimits, SearchSessionLimits, SearchWindow};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
@@ -9,7 +9,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 #[test]
-fn literal_class_run_existence_values_allocate_nothing() {
+fn literal_class_run_ordinary_values_allocate_nothing() {
     let regex = PortableBuilder::new(r"aa[01]+QZ")
         .unicode(false)
         .build()
@@ -69,11 +69,32 @@ fn literal_class_run_existence_values_allocate_nothing() {
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
-        assert!(regex.is_match(haystack));
-        assert!(suffix.is_match(suffix_haystack));
-        assert!(!regex.is_match(absent));
-        assert!(inside.is_match(inside_haystack));
-        assert!(guarded.is_match(guarded_haystack));
+        assert!(black_box(regex.is_match(black_box(haystack))));
+        assert_eq!(
+            black_box(regex.find(black_box(haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 9)),
+        );
+        assert!(black_box(suffix.is_match(black_box(suffix_haystack))));
+        assert_eq!(
+            black_box(suffix.find(black_box(suffix_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 13)),
+        );
+        assert!(!black_box(regex.is_match(black_box(absent))));
+        assert_eq!(black_box(regex.find(black_box(absent))), None);
+        assert!(black_box(inside.is_match(black_box(inside_haystack))));
+        assert_eq!(
+            black_box(inside.find(black_box(inside_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 7)),
+        );
+        assert!(black_box(guarded.is_match(black_box(guarded_haystack))));
+        assert_eq!(
+            black_box(guarded.find(black_box(guarded_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 8)),
+        );
         assert!(
             regex
                 .is_match_window_value(haystack, window, SearchLimits::unlimited())
