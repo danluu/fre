@@ -1709,11 +1709,17 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                 let probe_end = cursor
                     .saturating_add(direct_probe_bytes)
                     .min(window.end());
-                let Some(end) = first_acceptance_end_without_prefilter(
-                    self.plan,
-                    haystack,
-                    Window::new(cursor, probe_end),
-                ) else {
+                let direct_window = Window::new(cursor, probe_end);
+                let accepted_end = if RECOMMEND_DIRECT {
+                    first_acceptance_end_without_prefilter(
+                        self.plan,
+                        haystack,
+                        direct_window,
+                    )
+                } else {
+                    first_acceptance_end_for_count(self.plan, haystack, direct_window)
+                };
+                let Some(end) = accepted_end else {
                     if probe_end == window.end() {
                         // The direct scan covered the complete remaining
                         // semantic window. Unlike a miss at an artificial
@@ -1786,6 +1792,70 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     }
 }
 
+macro_rules! first_acceptance_special_state {
+    (dead_first, $automaton:ident, $state:ident, $at:ident) => {
+        if $automaton.is_dead($state) {
+            return None;
+        }
+        if $automaton.is_match($state) {
+            return Some($at);
+        }
+    };
+    (match_first, $automaton:ident, $state:ident, $at:ident) => {
+        if $automaton.is_match($state) {
+            return Some($at);
+        }
+        if $automaton.is_dead($state) {
+            return None;
+        }
+    };
+}
+
+macro_rules! first_acceptance_end_body {
+    ($plan:ident, $haystack:ident, $window:ident, $order:ident) => {{
+        #[cfg(test)]
+        ordinary_direct_probe::record();
+        let automaton = $plan.automaton.as_ref();
+        debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
+        debug_assert!(automaton.prefilter().is_some());
+        debug_assert!($plan.build.minimum_pattern_bytes > 0);
+        let anchored = Anchored::No;
+        let mut state = automaton
+            .start_state(anchored)
+            .expect("the literal-set DFA retains its unanchored start state");
+        let mut at = $window.start();
+        debug_assert!(!automaton.is_match(state));
+        let pattern_bytes = $plan.build.minimum_pattern_bytes;
+        let window_bytes = $window.end() - $window.start();
+        if window_bytes < pattern_bytes {
+            return None;
+        }
+        // A fixed-width literal cannot accept before its Wth consumed byte.
+        // Advance the first W-1 transitions without inspecting special-state
+        // metadata, then begin the ordinary acceptance loop at byte W.
+        let first_acceptance_check = $window.start() + pattern_bytes - 1;
+        while at < first_acceptance_check {
+            state = automaton.next_state(anchored, state, $haystack[at]);
+            at += 1;
+        }
+        while at < $window.end() {
+            state = automaton.next_state(anchored, state, $haystack[at]);
+            at += 1;
+            #[cfg(test)]
+            ordinary_direct_probe::record_special_check();
+            if !automaton.is_special(state) {
+                continue;
+            }
+            first_acceptance_special_state!($order, automaton, state, at);
+            debug_assert!(
+                automaton.is_start(state),
+                "a prefiltered literal-set DFA has no other special states",
+            );
+        }
+        None
+    }};
+}
+
 /// Return the first accepting endpoint while deliberately bypassing a
 /// retained heuristic prefilter.
 ///
@@ -1799,51 +1869,21 @@ fn first_acceptance_end_without_prefilter(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    #[cfg(test)]
-    ordinary_direct_probe::record();
-    let automaton = plan.automaton.as_ref();
-    debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
-    debug_assert!(automaton.prefilter().is_some());
-    debug_assert!(plan.build.minimum_pattern_bytes > 0);
-    let anchored = Anchored::No;
-    let mut state = automaton
-        .start_state(anchored)
-        .expect("the literal-set DFA retains its unanchored start state");
-    let mut at = window.start();
-    debug_assert!(!automaton.is_match(state));
-    let pattern_bytes = plan.build.minimum_pattern_bytes;
-    let window_bytes = window.end() - window.start();
-    if window_bytes < pattern_bytes {
-        return None;
-    }
-    // A fixed-width literal cannot accept before its Wth consumed byte.
-    // Advance the first W-1 transitions without inspecting special-state
-    // metadata, then begin the ordinary acceptance loop at byte W.
-    let first_acceptance_check = window.start() + pattern_bytes - 1;
-    while at < first_acceptance_check {
-        state = automaton.next_state(anchored, state, haystack[at]);
-        at += 1;
-    }
-    while at < window.end() {
-        state = automaton.next_state(anchored, state, haystack[at]);
-        at += 1;
-        #[cfg(test)]
-        ordinary_direct_probe::record_special_check();
-        if !automaton.is_special(state) {
-            continue;
-        }
-        if automaton.is_dead(state) {
-            return None;
-        }
-        if automaton.is_match(state) {
-            return Some(at);
-        }
-        debug_assert!(
-            automaton.is_start(state),
-            "a prefiltered literal-set DFA has no other special states",
-        );
-    }
-    None
+    first_acceptance_end_body!(plan, haystack, window, dead_first)
+}
+
+/// Count-only direct probe with accepting states before the dead-state test.
+///
+/// The caller consumes only ordered endpoints. A dead state cannot accept and
+/// is a sink, so exchanging these two tests preserves the bounded result while
+/// avoiding one classification on every accepting transition.
+#[inline(always)]
+fn first_acceptance_end_for_count(
+    plan: &LiteralSetPlan,
+    haystack: &[u8],
+    window: Window,
+) -> Option<usize> {
+    first_acceptance_end_body!(plan, haystack, window, match_first)
 }
 
 #[cfg(test)]
@@ -4366,7 +4406,8 @@ mod tests {
 
     use super::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetMatchSemantics, LiteralSetPlan,
-        LiteralSetSearchLimits, first_acceptance_end_without_prefilter, ordinary_direct_probe,
+        LiteralSetSearchLimits, first_acceptance_end_for_count,
+        first_acceptance_end_without_prefilter, ordinary_direct_probe,
     };
     use crate::Window;
 
@@ -5172,7 +5213,12 @@ mod tests {
                         let window = Window::new(start, end);
                         let expected = reference_find(&reference, &haystack, window)
                             .map(|(_, matched_end)| matched_end);
-                        let actual = first_acceptance_end_without_prefilter(
+                        let actual = first_acceptance_end_for_count(
+                            &plan,
+                            &haystack,
+                            window,
+                        );
+                        let incumbent = first_acceptance_end_without_prefilter(
                             &plan,
                             &haystack,
                             window,
@@ -5181,6 +5227,7 @@ mod tests {
                             actual, expected,
                             "width={uniform_width}, haystack={haystack:?}, window={window:?}",
                         );
+                        assert_eq!(incumbent, expected);
                     }
                 }
             }
@@ -5188,7 +5235,7 @@ mod tests {
             ordinary_direct_probe::reset();
             let short = vec![b'q'; uniform_width.saturating_sub(1)];
             assert_eq!(
-                first_acceptance_end_without_prefilter(
+                first_acceptance_end_for_count(
                     &plan,
                     &short,
                     Window::full(&short),
@@ -5200,7 +5247,7 @@ mod tests {
 
             ordinary_direct_probe::reset();
             assert_eq!(
-                first_acceptance_end_without_prefilter(
+                first_acceptance_end_for_count(
                     &plan,
                     &q,
                     Window::full(&q),
