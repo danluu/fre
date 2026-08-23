@@ -1573,16 +1573,53 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         haystack: &[u8],
         window: Window,
         initial_direct: bool,
-        mut visitor: F,
+        visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        self.try_visit_spans_window_value_with_direct_recommendation(
+            haystack,
+            window,
+            initial_direct,
+            visitor,
+        )
+        .map(|(outcome, _)| outcome)
+    }
+
+    /// Visit every non-overlapping selected span and return whether one
+    /// bounded direct probe is recommended for the caller's next operation.
+    ///
+    /// A positive recommendation contains no source identity. It is returned
+    /// only after exhaustive success when this call accepted a span and both
+    /// its final selected-end spacing and the remaining terminal gap are
+    /// within two common pattern widths. A stopped callback, callback error,
+    /// search error, or far final acceptance never recommends a successor
+    /// probe. An artificial-edge miss clears prior evidence before canonical
+    /// replay; a later current-call near acceptance may establish fresh
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_visit_spans_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_visit_spans_window_value_with_direct_recommendation<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        initial_direct: bool,
+        mut visitor: F,
+    ) -> Result<(Result<(), E>, bool), LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
         validate_window(window, haystack.len())?;
         let uniform_width = self.pattern_bytes();
+        let promotion_bytes = uniform_width.saturating_mul(2);
         let mut cursor = window.start();
-        let mut direct_probe_bytes = initial_direct
-            .then(|| uniform_width.saturating_mul(8));
+        let mut recent_near = false;
+        let mut direct_probe_bytes = initial_direct.then(|| uniform_width.saturating_mul(8));
         loop {
             let search_start = cursor;
             let matched = if let Some(probe_bytes) = direct_probe_bytes {
@@ -1606,19 +1643,21 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                             // semantic window. Unlike a miss at an artificial
                             // probe edge, no wholly contained match can cross
                             // this boundary, so the miss is authoritative.
-                            return Ok(Ok(()));
+                            let terminal_near =
+                                window.end().saturating_sub(cursor) <= promotion_bytes;
+                            return Ok((Ok(()), recent_near && terminal_near));
                         }
                         // A miss costs at most one bounded direct probe. The
                         // authoritative prefiltered search restarts at the
                         // original cursor so a match crossing the probe edge
-                        // cannot be skipped.
+                        // cannot be skipped. A terminal replay miss returns
+                        // false below instead of consulting prior evidence;
+                        // any replayed match derives fresh evidence.
                         direct_probe_bytes = None;
                         #[cfg(test)]
                         ordinary_direct_probe::record_adaptive_replay();
-                        self.plan.try_find_window_value(
-                            haystack,
-                            Window::new(cursor, window.end()),
-                        )?
+                        self.plan
+                            .try_find_window_value(haystack, Window::new(cursor, window.end()))?
                     }
                 }
             } else {
@@ -1626,24 +1665,25 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                     .try_find_window_value(haystack, Window::new(cursor, window.end()))?
             };
             let Some(matched) = matched else {
-                return Ok(Ok(()));
+                return Ok((Ok(()), false));
             };
             debug_assert!(
                 matched.1 > cursor,
                 "a positive-width literal-set match must advance its search cursor",
             );
+            let matched_near = matched.1.saturating_sub(search_start) <= promotion_bytes;
             cursor = matched.1;
             match visitor(matched) {
                 Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
+                Ok(false) => return Ok((Ok(()), false)),
+                Err(error) => return Ok((Err(error), false)),
             }
+            recent_near = matched_near;
             if direct_probe_bytes.is_none() {
                 // An end within 2W places the selected start in the first W
                 // bytes. Once promoted, bound a mistaken density prediction
                 // to eight pattern widths before authoritative replay.
-                let promotion_bytes = uniform_width.saturating_mul(2);
-                if cursor.saturating_sub(search_start) <= promotion_bytes {
+                if matched_near {
                     direct_probe_bytes = Some(uniform_width.saturating_mul(8));
                 }
             }
@@ -4211,6 +4251,21 @@ mod tests {
         })
     }
 
+    fn expected_direct_recommendation(
+        window: Window,
+        uniform_width: usize,
+        spans: &[(usize, usize)],
+    ) -> bool {
+        let near_bytes = uniform_width.saturating_mul(2);
+        let mut cursor = window.start();
+        let mut recent_near = false;
+        for &(_, end) in spans {
+            recent_near = end.saturating_sub(cursor) <= near_bytes;
+            cursor = end;
+        }
+        recent_near && window.end().saturating_sub(cursor) <= near_bytes
+    }
+
     fn assert_leftmost_window_differential(
         patterns: &[Vec<u8>],
         plan: &LiteralSetPlan,
@@ -4337,6 +4392,35 @@ mod tests {
                                 initially_direct_spans, expected_spans,
                                 "initial direct replay diverged: patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
                             );
+
+                            for initial_direct in [false, true] {
+                                let mut recommended_spans = Vec::new();
+                                let (outcome, next_direct) = uniform
+                                    .try_visit_spans_window_value_with_direct_recommendation(
+                                        &haystack,
+                                        window,
+                                        initial_direct,
+                                        |matched| {
+                                            recommended_spans.push(matched);
+                                            Ok::<bool, ()>(true)
+                                        },
+                                    )
+                                    .unwrap();
+                                assert_eq!(outcome, Ok(()));
+                                assert_eq!(
+                                    recommended_spans, expected_spans,
+                                    "recommended direct replay diverged: patterns={patterns:?}, haystack={haystack:?}, window={window:?}, initial_direct={initial_direct}",
+                                );
+                                assert_eq!(
+                                    next_direct,
+                                    expected_direct_recommendation(
+                                        window,
+                                        uniform.pattern_bytes(),
+                                        &expected_spans,
+                                    ),
+                                    "direct recommendation diverged: patterns={patterns:?}, haystack={haystack:?}, window={window:?}, initial_direct={initial_direct}",
+                                );
+                            }
                         }
                     }
                 }
@@ -4517,8 +4601,8 @@ mod tests {
         crossing[57..65].copy_from_slice(&patterns[0]);
         ordinary_direct_probe::reset();
         let mut crossing_actual = Vec::new();
-        assert_eq!(
-            uniform.try_visit_spans_window_value_with_initial_direct(
+        let (crossing_outcome, crossing_next_direct) = uniform
+            .try_visit_spans_window_value_with_direct_recommendation(
                 &crossing,
                 Window::full(&crossing),
                 true,
@@ -4526,9 +4610,10 @@ mod tests {
                     crossing_actual.push(matched);
                     Ok::<bool, ()>(true)
                 },
-            ),
-            Ok(Ok(())),
-        );
+            )
+            .unwrap();
+        assert_eq!(crossing_outcome, Ok(()));
+        assert!(!crossing_next_direct);
         assert_eq!(crossing_actual, [(57, 65)]);
         assert_eq!(ordinary_direct_probe::calls(), 1);
         assert_eq!(ordinary_direct_probe::adaptive_replays(), 1);
@@ -4544,8 +4629,8 @@ mod tests {
             let covered_window = Window::new(2, 2 + remaining);
             ordinary_direct_probe::reset();
             let mut callback_called = false;
-            assert_eq!(
-                uniform.try_visit_spans_window_value_with_initial_direct(
+            let (covered_outcome, next_direct) = uniform
+                .try_visit_spans_window_value_with_direct_recommendation(
                     &covered,
                     covered_window,
                     true,
@@ -4553,37 +4638,131 @@ mod tests {
                         callback_called = true;
                         Ok::<bool, ()>(true)
                     },
-                ),
-                Ok(Ok(())),
-            );
+                )
+                .unwrap();
+            assert_eq!(covered_outcome, Ok(()));
+            assert!(!next_direct);
             assert!(!callback_called);
             assert_eq!(ordinary_direct_probe::calls(), 1);
             assert_eq!(ordinary_direct_probe::adaptive_replays(), 0);
         }
 
+        let mut truncated_miss = b"PP".to_vec();
+        truncated_miss.extend(core::iter::repeat_n(b'x', 65));
+        truncated_miss.extend_from_slice(b"SS");
         ordinary_direct_probe::reset();
-        assert_eq!(
-            uniform.try_visit_spans_window_value_with_initial_direct(
+        let mut truncated_callback_called = false;
+        let (truncated_outcome, truncated_next_direct) = uniform
+            .try_visit_spans_window_value_with_direct_recommendation(
+                &truncated_miss,
+                Window::new(2, 67),
+                true,
+                |_| {
+                    truncated_callback_called = true;
+                    Ok::<bool, ()>(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(truncated_outcome, Ok(()));
+        assert!(!truncated_next_direct);
+        assert!(!truncated_callback_called);
+        assert_eq!(ordinary_direct_probe::calls(), 1);
+        assert_eq!(ordinary_direct_probe::adaptive_replays(), 1);
+
+        // The final selected-end spacing and terminal gap must both be near.
+        // A later near hit may replace earlier far evidence, while a final far
+        // hit cannot recommend a successor probe merely because little source
+        // remains after it.
+        for terminal_gap in [11_usize, 16, 17] {
+            let mut dense_terminal = Vec::new();
+            dense_terminal.extend_from_slice(&patterns[0]);
+            dense_terminal.push(b'x');
+            dense_terminal.extend_from_slice(&patterns[1]);
+            dense_terminal.extend(core::iter::repeat_n(b'x', terminal_gap));
+            for initial_direct in [false, true] {
+                let mut spans = Vec::new();
+                let (outcome, next_direct) = uniform
+                    .try_visit_spans_window_value_with_direct_recommendation(
+                        &dense_terminal,
+                        Window::full(&dense_terminal),
+                        initial_direct,
+                        |matched| {
+                            spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(outcome, Ok(()));
+                assert_eq!(spans, [(0, 8), (9, 17)]);
+                assert_eq!(next_direct, terminal_gap <= 16);
+            }
+        }
+
+        let mut far_terminal = vec![b'x'; 24];
+        far_terminal.extend_from_slice(&patterns[0]);
+        far_terminal.extend_from_slice(&[b'x'; 8]);
+        let mut far_spans = Vec::new();
+        let (far_outcome, far_next_direct) = uniform
+            .try_visit_spans_window_value_with_direct_recommendation(
+                &far_terminal,
+                Window::full(&far_terminal),
+                true,
+                |matched| {
+                    far_spans.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(far_outcome, Ok(()));
+        assert_eq!(far_spans, [(24, 32)]);
+        assert!(!far_next_direct);
+
+        ordinary_direct_probe::reset();
+        let (stopped_outcome, stopped_next_direct) = uniform
+            .try_visit_spans_window_value_with_direct_recommendation(
                 &far,
                 Window::full(&far),
                 true,
                 |_| Ok::<bool, ()>(false),
-            ),
-            Ok(Ok(())),
-        );
+            )
+            .unwrap();
+        assert_eq!(stopped_outcome, Ok(()));
+        assert!(!stopped_next_direct);
         assert_eq!(ordinary_direct_probe::calls(), 1);
 
         ordinary_direct_probe::reset();
-        assert_eq!(
-            uniform.try_visit_spans_window_value_with_initial_direct(
+        let (error_outcome, error_next_direct) = uniform
+            .try_visit_spans_window_value_with_direct_recommendation(
                 &far,
                 Window::full(&far),
                 true,
                 |_| Err::<bool, _>("callback"),
-            ),
-            Ok(Err("callback")),
-        );
+            )
+            .unwrap();
+        assert_eq!(error_outcome, Err("callback"));
+        assert!(!error_next_direct);
         assert_eq!(ordinary_direct_probe::calls(), 1);
+
+        ordinary_direct_probe::reset();
+        let mut invalid_callback_called = false;
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_direct_recommendation(
+                &far,
+                Window::new(0, far.len() + 1),
+                true,
+                |_| {
+                    invalid_callback_called = true;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Err(LiteralSetError::InvalidWindow {
+                start: 0,
+                end: far.len() + 1,
+                haystack_len: far.len(),
+            }),
+        );
+        assert!(!invalid_callback_called);
+        assert_eq!(ordinary_direct_probe::calls(), 0);
 
         ordinary_direct_probe::reset();
         assert_eq!(

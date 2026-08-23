@@ -14557,7 +14557,10 @@ pub struct PortableSearchSession<'a> {
 /// observed a near acceptance. It retains neither that endpoint nor any source
 /// identity, and a miss, far acceptance, or error clears it. A following
 /// span-iteration or count operation may spend it on one bounded initial tail
-/// probe and always clears it before returning.
+/// probe. Only exhaustive success that accepts a current-call span with near
+/// final selected-end spacing and a near terminal gap may recommend one
+/// bounded probe for the next operation; a miss, callback stop, callback
+/// error, or search error clears the observation.
 #[derive(Debug)]
 pub struct PortableOrdinarySession<'a> {
     plan: PortableOrdinarySessionPlan<'a>,
@@ -20478,14 +20481,22 @@ impl<'r> PortableOrdinarySession<'r> {
             } => {
                 let initial_direct = core::mem::take(direct_next);
                 let mut visitor = visitor;
-                executor.try_visit_spans_window_value_with_initial_direct(
-                    haystack,
-                    LiteralWindow::new(start, haystack.len()),
-                    initial_direct,
-                    |(start, end)| visitor(Match { start, end }),
-                )
-                .map_err(SearchError::from)
-                .map_err(PortableFindIterError::Search)
+                let (outcome, next_direct) = executor
+                    .try_visit_spans_window_value_with_direct_recommendation(
+                        haystack,
+                        LiteralWindow::new(start, haystack.len()),
+                        initial_direct,
+                        |(start, end)| visitor(Match { start, end }),
+                    )
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)?;
+                match outcome {
+                    Ok(()) => {
+                        *direct_next = next_direct;
+                        Ok(Ok(()))
+                    }
+                    Err(error) => Ok(Err(error)),
+                }
             }
         }
     }
@@ -20506,7 +20517,10 @@ impl<'r> PortableOrdinarySession<'r> {
     /// error rather than risking an infinite loop. Packed literal sets use
     /// their bound non-overlapping span iterator. A uniform-standard literal
     /// set consumes any preceding near-acceptance observation on the first
-    /// bounded tail probe and counts through its adaptive span visitor.
+    /// bounded tail probe and counts through its adaptive span visitor. After
+    /// exhaustive success that accepts a current-call span, near final
+    /// selected-end spacing and a near terminal gap may recommend one bounded
+    /// probe for the next session operation.
     ///
     /// # Errors
     ///
@@ -20558,8 +20572,8 @@ impl<'r> PortableOrdinarySession<'r> {
             } => {
                 let initial_direct = core::mem::take(direct_next);
                 let mut count = 0_u64;
-                executor
-                    .try_visit_spans_window_value_with_initial_direct(
+                let (outcome, next_direct) = executor
+                    .try_visit_spans_window_value_with_direct_recommendation(
                         haystack,
                         LiteralWindow::new(start, haystack.len()),
                         initial_direct,
@@ -20572,8 +20586,9 @@ impl<'r> PortableOrdinarySession<'r> {
                             Ok::<bool, LiteralSetError>(true)
                         },
                     )
-                    .map_err(SearchError::from)?
                     .map_err(SearchError::from)?;
+                outcome.map_err(SearchError::from)?;
+                *direct_next = next_direct;
                 Ok(Some(count))
             }
             _ => Ok(None),
@@ -39601,9 +39616,8 @@ mod tests {
         );
         assert!(!direct_next(&ordinary));
 
-        // Span iteration consumes a preceding near observation on its first
-        // bounded tail probe, then clears session-local evidence regardless
-        // of its callback outcome.
+        // Exhaustive span iteration may carry a source-free recommendation
+        // when both its final selected-end spacing and terminal gap are near.
         let seeded_tail = b"p000p001p002";
         assert_eq!(
             ordinary.find_at(seeded_tail, 0),
@@ -39621,6 +39635,18 @@ mod tests {
             Ok(()),
         );
         assert_eq!(seeded_spans, [(4, 8), (8, 12)]);
+        assert!(direct_next(&ordinary));
+
+        // The carried bit is spent on exactly one bounded probe even when the
+        // next operation uses a distinct haystack.
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert_eq!(
+            ordinary.find_at(distinct, 0),
+            Ok(Some(Match { start: 0, end: 4 }))
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 1));
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(miss, 0), Ok(None));
         assert!(!direct_next(&ordinary));
 
         assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
@@ -39635,6 +39661,44 @@ mod tests {
             Ok(()),
         );
         assert_eq!(spans, [(0, 4)]);
+        assert!(direct_next(&ordinary));
+
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert_eq!(ordinary.first_acceptance_at(distinct, 0), Ok(Some(4)));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 1));
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(miss, 0), Ok(None));
+        assert!(!direct_next(&ordinary));
+
+        // A far final acceptance and an artificial-edge miss both discard the
+        // predecessor observation, even if the visitor exhausts its window.
+        let far_iteration = b"zzzzzzzzp000zzzz";
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        let mut far_spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(far_iteration, |matched| {
+                    far_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(far_spans, [(8, 12)]);
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        let mut truncated_callback_called = false;
+        assert_eq!(
+            ordinary
+                .try_visit_spans(&long_miss, |_| {
+                    truncated_callback_called = true;
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert!(!truncated_callback_called);
         assert!(!direct_next(&ordinary));
 
         assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
@@ -39671,8 +39735,8 @@ mod tests {
         assert!(!callback_called);
         assert!(!direct_next(&ordinary));
 
-        // Native count consumes the same seeded tail route and does not ask
-        // the embedding to retry with span iteration.
+        // Native count publishes the same exhaustive terminal recommendation
+        // without asking the embedding to retry with span iteration.
         assert_eq!(
             ordinary.find_at(seeded_tail, 0),
             Ok(Some(Match { start: 0, end: 4 }))
@@ -39682,11 +39746,29 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(seeded_tail, 4),
             Ok(Some(2)),
         );
-        assert!(!direct_next(&ordinary));
+        assert!(direct_next(&ordinary));
+
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert_eq!(ordinary.first_acceptance_at(distinct, 0), Ok(Some(4)));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 1));
+        assert!(direct_next(&ordinary));
+
+        // A match-free call cannot perpetuate an old source-free observation.
         assert_eq!(
             ordinary.count_positive_width_selected_ends_at(seeded_tail, 12),
             Ok(Some(0)),
         );
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(&long_miss, 0),
+            Ok(Some(0)),
+        );
+        assert!(!direct_next(&ordinary));
+
         assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
         assert!(matches!(
             ordinary.count_positive_width_selected_ends_at(near, usize::MAX),
