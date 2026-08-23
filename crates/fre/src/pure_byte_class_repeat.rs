@@ -24,6 +24,35 @@ const RANGE_INSPECTION_WORK: u64 = 1;
 const MEMBER_INSERTION_WORK: u64 = 1;
 const LEAF_SELECTION_WORK: u64 = 1;
 
+#[cfg(test)]
+std::thread_local! {
+    static ORDINARY_FULL_CALLS: core::cell::Cell<(usize, usize)> = const {
+        core::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_ordinary_full_call_counts() {
+    ORDINARY_FULL_CALLS.set((0, 0));
+}
+
+#[cfg(test)]
+pub(crate) fn ordinary_full_call_counts() -> (usize, usize) {
+    ORDINARY_FULL_CALLS.get()
+}
+
+#[cfg(test)]
+fn record_ordinary_full_exists() {
+    let (exists, span) = ORDINARY_FULL_CALLS.get();
+    ORDINARY_FULL_CALLS.set((exists.saturating_add(1), span));
+}
+
+#[cfg(test)]
+fn record_ordinary_full_span() {
+    let (exists, span) = ORDINARY_FULL_CALLS.get();
+    ORDINARY_FULL_CALLS.set((exists, span.saturating_add(1)));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Exists,
@@ -351,6 +380,55 @@ impl Plan {
         core::mem::size_of::<Self>()
             .checked_add(core::mem::size_of::<Owner>())
             .expect("the fixed pure byte-class repeat layouts fit usize")
+    }
+
+    /// Search the complete haystack for the ordinary existence facade after
+    /// that facade has selected unlimited, report-free execution.
+    #[must_use]
+    #[inline]
+    pub(crate) fn ordinary_is_match_full_unmetered(&self, haystack: &[u8]) -> bool {
+        #[cfg(test)]
+        record_ordinary_full_exists();
+        let owner = self.owner();
+        owner
+            .member_seek
+            .seek_unmetered(haystack, 0, haystack.len(), owner.classifier.as_ref())
+            .is_some()
+    }
+
+    /// Return the selected complete-haystack span for the ordinary facade
+    /// without constructing a window, work meter, or accounting projection.
+    #[must_use]
+    #[inline]
+    pub(crate) fn ordinary_find_full_unmetered(&self, haystack: &[u8]) -> Option<Match> {
+        #[cfg(test)]
+        record_ordinary_full_span();
+        let owner = self.owner();
+        let start = owner.member_seek.seek_unmetered(
+            haystack,
+            0,
+            haystack.len(),
+            owner.classifier.as_ref(),
+        )?;
+        let minimum_end = start
+            .checked_add(1)
+            .expect("a full-haystack member before the end can advance once");
+        if !owner.greedy {
+            return Some(Match {
+                start,
+                end: minimum_end,
+            });
+        }
+        let end = owner
+            .run_end_seek
+            .seek_unmetered(
+                haystack,
+                minimum_end,
+                haystack.len(),
+                owner.classifier.as_ref(),
+            )
+            .unwrap_or(haystack.len());
+        Some(Match { start, end })
     }
 
     pub(crate) fn is_match_window(
@@ -1087,8 +1165,10 @@ mod tests {
     use crate::{
         BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
         PortablePlan, PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError,
-        SearchLimits, SearchWindow,
+        SearchLimits, SearchSessionLimits, SearchWindow,
     };
+    #[cfg(not(feature = "static-dispatch"))]
+    use fre_kernels::DispatchPolicy;
     use fre_kernels::{ByteSet256, ByteSetClassifier};
 
     fn build(pattern: &str) -> crate::PortableRegex {
@@ -1647,7 +1727,21 @@ mod tests {
                         }
                     }
 
-                    let expected_end = oracle.find(&haystack).map(|matched| matched.end());
+                    let expected_full = oracle
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        fre.is_match(&haystack),
+                        expected_full.is_some(),
+                        "ordinary exists: {pattern:?} {haystack:?}",
+                    );
+                    assert_eq!(
+                        span(fre.find(&haystack)),
+                        expected_full,
+                        "ordinary span: {pattern:?} {haystack:?}",
+                    );
+
+                    let expected_end = expected_full.map(|(_, end)| end);
                     let (selected_end, selected_accounting) = fre
                         .selected_end(&haystack, SearchLimits::unlimited())
                         .unwrap();
@@ -1675,6 +1769,411 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_full_scans_preserve_malformed_bytes_and_block_edges() {
+        let patterns = [
+            "(?s-u:.)+",
+            "(?s-u:.)+?",
+            "a+",
+            "a+?",
+            "(?-u:[ac])+",
+            "(?-u:[ace])+",
+            "(?-u:[a-f])+",
+            "(?-u:[a-f])+?",
+            "(?-u:[^a-f])+",
+            "(?-u:[aceg])+",
+            "(?-u:[aceg])+?",
+            "(?-u:[^aceg])+",
+            "(?-u:[\\x80-\\xff])+",
+            "(?-u:[^\\x80-\\xff])+",
+        ];
+        let alphabet = [0xff_u8, b'a', b'a', b'c', b'e', b'g', b'g', 0x80, b'z', 0];
+        for pattern in patterns {
+            let fre = build(pattern);
+            assert!(matches!(&fre.plan, PortablePlan::PureByteClassRepeat(_)));
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for length in [0_usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49] {
+                for phase in 0..alphabet.len() {
+                    let haystack = (0..length)
+                        .map(|index| alphabet[(index + phase) % alphabet.len()])
+                        .collect::<Vec<_>>();
+                    let expected = oracle
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        fre.is_match(&haystack),
+                        expected.is_some(),
+                        "exists pattern={pattern:?} length={length} phase={phase}",
+                    );
+                    assert_eq!(
+                        span(fre.find(&haystack)),
+                        expected,
+                        "span pattern={pattern:?} length={length} phase={phase}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_full_admits_empty_byte_classes_for_both_preferences() {
+        let haystacks = [
+            &b""[..],
+            &b"a"[..],
+            &b"\0\x80\xff"[..],
+            &b"aaaaaaaaaaaaaaaaa"[..],
+            &b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"[..],
+        ];
+        for pattern in [r"(?-u:[^\x00-\xFF])+", r"(?-u:[^\x00-\xFF])+?"] {
+            let fre = build(pattern);
+            let PortablePlan::PureByteClassRepeat(plan) = &fre.plan else {
+                panic!("the empty byte class should retain the pure repeat plan");
+            };
+            let owner = plan.owner();
+            assert_eq!(owner.member_seek, SetSeek::Constant(false));
+            assert_eq!(owner.run_end_seek, SetSeek::Constant(true));
+            assert!(owner.classifier.is_none());
+
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            super::reset_ordinary_full_call_counts();
+            for haystack in haystacks {
+                assert_eq!(fre.is_match(haystack), oracle.is_match(haystack));
+                assert_eq!(span(fre.find(haystack)), None);
+                assert!(oracle.find(haystack).is_none());
+            }
+            assert_eq!(
+                super::ordinary_full_call_counts(),
+                (haystacks.len(), haystacks.len()),
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_full_long_runs_and_late_hits_cross_every_block_edge() {
+        for pattern in ["(?-u:[aceg])+", "(?-u:[aceg])+?"] {
+            let fre = build(pattern);
+            assert!(matches!(&fre.plan, PortablePlan::PureByteClassRepeat(_)));
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let greedy = !pattern.ends_with('?');
+
+            for boundary in [15_usize, 16, 17, 31, 32, 33] {
+                let mut homogeneous = vec![b'a'; boundary];
+                homogeneous.push(0xff);
+                let expected_homogeneous = Some((0, if greedy { boundary } else { 1 }));
+                assert_eq!(
+                    oracle
+                        .find(&homogeneous)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected_homogeneous,
+                );
+                assert!(fre.is_match(&homogeneous));
+                assert_eq!(span(fre.find(&homogeneous)), expected_homogeneous);
+
+                let mut late_hit = vec![0xff; boundary];
+                late_hit.extend_from_slice(b"aa\xff");
+                let late_end = boundary
+                    .checked_add(if greedy { 2 } else { 1 })
+                    .expect("the small boundary has room for the admitted run");
+                let expected_late = Some((boundary, late_end));
+                assert_eq!(
+                    oracle
+                        .find(&late_hit)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected_late,
+                );
+                assert!(fre.is_match(&late_hit));
+                assert_eq!(span(fre.find(&late_hit)), expected_late);
+
+                let full_miss = vec![0xff; boundary];
+                assert!(!oracle.is_match(&full_miss));
+                assert!(!fre.is_match(&full_miss));
+                assert_eq!(fre.find(&full_miss), None);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn ordinary_full_retained_dispatch_matches_forced_scalar() {
+        fn find_with_classifier(
+            plan: &super::Plan,
+            classifier: &ByteSetClassifier,
+            haystack: &[u8],
+        ) -> Option<crate::Match> {
+            let owner = plan.owner();
+            let start =
+                owner
+                    .member_seek
+                    .seek_unmetered(haystack, 0, haystack.len(), Some(classifier))?;
+            let minimum_end = start
+                .checked_add(1)
+                .expect("a selected byte before the slice end can advance once");
+            if !owner.greedy {
+                return Some(crate::Match {
+                    start,
+                    end: minimum_end,
+                });
+            }
+            let end = owner
+                .run_end_seek
+                .seek_unmetered(haystack, minimum_end, haystack.len(), Some(classifier))
+                .unwrap_or(haystack.len());
+            Some(crate::Match { start, end })
+        }
+
+        let haystacks = [
+            &b""[..],
+            &b"!!!!!!!!acegg!!!!!!!!"[..],
+            &b"\xff\x80\0aceg\xff"[..],
+            &b"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!aacegg\xff"[..],
+            &b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"[..],
+        ];
+        for pattern in ["(?-u:[aceg])+", "(?-u:[aceg])+?"] {
+            let fre = build(pattern);
+            let PortablePlan::PureByteClassRepeat(plan) = &fre.plan else {
+                panic!("the holey byte class should retain the pure repeat plan");
+            };
+            let retained = plan
+                .owner()
+                .classifier
+                .as_ref()
+                .expect("the holey byte class retains its dispatched classifier");
+            assert_eq!(retained.selection().policy, DispatchPolicy::Auto);
+            let scalar = ByteSetClassifier::with_policy(retained.set(), DispatchPolicy::Portable)
+                .expect("the portable scalar fallback is always available");
+            assert_eq!(scalar.selection().policy, DispatchPolicy::Portable);
+            assert_eq!(scalar.selection().variant_id, "byte-set.mask16.scalar.v1");
+
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for haystack in haystacks {
+                let expected = oracle
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let retained_find = plan.ordinary_find_full_unmetered(haystack);
+                let scalar_find = find_with_classifier(plan, &scalar, haystack);
+                let scalar_exists = plan
+                    .owner()
+                    .member_seek
+                    .seek_unmetered(haystack, 0, haystack.len(), Some(&scalar))
+                    .is_some();
+                assert_eq!(span(retained_find), expected);
+                assert_eq!(span(scalar_find), expected);
+                assert_eq!(
+                    plan.ordinary_is_match_full_unmetered(haystack),
+                    expected.is_some(),
+                );
+                assert_eq!(scalar_exists, expected.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn assertion_bearing_repeats_do_not_enter_the_ordinary_pure_route() {
+        let cases = [
+            (r"\A(?-u:[a-z])+", &b"abc!"[..]),
+            (r"(?-u:[a-z])+\z", &b"!abc"[..]),
+            (r"(?-u:\b[a-z]+\b)", &b"!abc!"[..]),
+        ];
+        super::reset_ordinary_full_call_counts();
+        for (pattern, haystack) in cases {
+            let fre = build(pattern);
+            assert!(
+                !matches!(&fre.plan, PortablePlan::PureByteClassRepeat(_)),
+                "assertions must make the pure repeat inspector ineligible: {pattern:?}",
+            );
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected = oracle
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(fre.is_match(haystack), expected.is_some());
+            assert_eq!(span(fre.find(haystack)), expected);
+        }
+        assert_eq!(
+            super::ordinary_full_call_counts(),
+            (0, 0),
+            "assertion-bearing plans retain their own ordinary routes",
+        );
+    }
+
+    #[test]
+    fn ordinary_full_route_is_strictly_contained() {
+        let regex = build("(?-u:[aceg])+");
+        assert!(matches!(&regex.plan, PortablePlan::PureByteClassRepeat(_)));
+        let haystack = b"!!acegg!!a!!";
+        let full = SearchWindow::full(haystack);
+        let unlimited = SearchLimits::unlimited();
+        let expected = Some(crate::Match { start: 2, end: 7 });
+
+        super::reset_ordinary_full_call_counts();
+        assert!(regex.is_match_value(haystack, unlimited).unwrap());
+        assert!(regex.is_match_accounted(haystack, unlimited).unwrap().0);
+        assert!(
+            regex
+                .is_match_window_value(haystack, full, unlimited)
+                .unwrap()
+        );
+        assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+        assert_eq!(
+            regex.find_accounted(haystack, unlimited).unwrap().0,
+            expected
+        );
+        assert_eq!(
+            regex.find_at_value(haystack, 0, unlimited).unwrap(),
+            expected
+        );
+        assert_eq!(regex.find_at(haystack, 0, unlimited).unwrap().0, expected);
+        assert_eq!(
+            regex.find_window_value(haystack, full, unlimited).unwrap(),
+            expected,
+        );
+        assert_eq!(
+            regex.find_window(haystack, full, unlimited).unwrap().0,
+            expected
+        );
+
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(regex.is_match_value(haystack, refusing).is_err());
+        assert!(regex.find_value(haystack, refusing).is_err());
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        assert!(
+            session
+                .is_match_window_value(haystack, full, unlimited)
+                .unwrap()
+        );
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+
+        assert_eq!(
+            regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, haystack, unlimited)
+                .unwrap()
+                .map(|matched| crate::Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(
+            super::ordinary_full_call_counts(),
+            (0, 0),
+            "finite, accounted, windowed, session, iterator, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(haystack));
+        assert_eq!(super::ordinary_full_call_counts(), (1, 0));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(super::ordinary_full_call_counts(), (1, 1));
+
+        let bounded = build("(?-u:[aceg]){2,5}");
+        assert!(matches!(
+            &bounded.plan,
+            PortablePlan::BoundedByteClassRepeat(_)
+        ));
+        assert!(bounded.is_match(haystack));
+        assert_eq!(bounded.find(haystack), expected);
+
+        let forced = PortableBuilder::new("(?-u:[aceg])+")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(forced.is_match(haystack));
+        assert_eq!(forced.find(haystack), expected);
+        assert_eq!(
+            super::ordinary_full_call_counts(),
+            (1, 1),
+            "bounded and forced-K0 ordinary calls retain their own routes",
+        );
+    }
+
+    #[test]
+    fn ordinary_full_explicit_capture_refusal_is_contained() {
+        let haystack = b"!!acegg!!";
+        let expected = Some(crate::Match { start: 2, end: 7 });
+        let unlimited = SearchLimits::unlimited();
+        let cases = [
+            ("((?-u:[aceg])+)", 2_usize),
+            ("((?-u:[aceg]))+", 2),
+            ("(?P<run>(?P<byte>(?-u:[aceg]))+)", 3),
+        ];
+
+        for (pattern, captures_len) in cases {
+            let regex = build(pattern);
+            assert!(matches!(&regex.plan, PortablePlan::PureByteClassRepeat(_)));
+            assert_eq!(regex.captures_len(), captures_len);
+
+            super::reset_ordinary_full_call_counts();
+            assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+            let mut locations = regex.capture_locations();
+            let explicit_captures = captures_len
+                .checked_sub(1)
+                .expect("the whole-match capture is always present");
+            assert!(matches!(
+                regex.captures_read_value(&mut locations, haystack, unlimited),
+                Err(crate::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == explicit_captures,
+            ));
+            assert!(matches!(
+                regex.captures_read(&mut locations, haystack, unlimited),
+                Err(crate::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == explicit_captures,
+            ));
+            for group in 0..captures_len {
+                assert_eq!(locations.get(group), None);
+            }
+            assert_eq!(
+                super::ordinary_full_call_counts(),
+                (0, 0),
+                "finite values and explicit-capture refusal stay canonical: {pattern:?}",
+            );
+
+            assert!(regex.is_match(haystack));
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(super::ordinary_full_call_counts(), (1, 1));
         }
     }
 

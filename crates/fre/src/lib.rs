@@ -12715,6 +12715,9 @@ impl PortableRegex {
                     plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
                 })
                 .map_err(SearchError::NullableOptionalChain),
+            PortablePlan::PureByteClassRepeat(plan) => {
+                Ok(plan.ordinary_is_match_full_unmetered(haystack))
+            }
             _ => self.is_match_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
@@ -14269,6 +14272,9 @@ impl PortableRegex {
                     )
                     .map(|matched| matched.map(|(start, end)| Match { start, end }))
                     .map_err(SearchError::from)
+            }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                Ok(plan.ordinary_find_full_unmetered(haystack))
             }
             _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
         }
