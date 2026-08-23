@@ -1711,7 +1711,7 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                     .min(window.end());
                 let direct_window = Window::new(cursor, probe_end);
                 let accepted_end = if RECOMMEND_DIRECT {
-                    first_acceptance_end_without_prefilter(
+                    first_acceptance_end_for_span_visit(
                         self.plan,
                         haystack,
                         direct_window,
@@ -1865,6 +1865,20 @@ macro_rules! first_acceptance_end_body {
 /// ignored by this direct loop.
 #[inline]
 fn first_acceptance_end_without_prefilter(
+    plan: &LiteralSetPlan,
+    haystack: &[u8],
+    window: Window,
+) -> Option<usize> {
+    first_acceptance_end_body!(plan, haystack, window, dead_first)
+}
+
+/// Span-visitor direct probe with its scanner forced into the emitting loop.
+///
+/// Dense iteration invokes this once per selected span. Keeping the stronger
+/// inline request local to that loop avoids changing the ordinary find and
+/// existence call sites that share the same scanner body.
+#[inline(always)]
+fn first_acceptance_end_for_span_visit(
     plan: &LiteralSetPlan,
     haystack: &[u8],
     window: Window,
