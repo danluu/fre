@@ -10411,6 +10411,33 @@ mod required_literal_ordinary_find_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod bounded_required_literal_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 // Contextual ordinary value projections occupy only the one-block margin
 // immediately below the incumbent 4,096-byte metered warm path. Longer
 // searches retain contextual loop-skip economics; shorter searches retain the
@@ -12532,6 +12559,34 @@ impl PortableRegex {
                     )
                     .map_err(SearchError::from)
             }
+            PortablePlan::BoundedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                #[cfg(test)]
+                bounded_required_literal_ordinary_facade_probe::record_exists();
+                required
+                    .find_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|matched| matched.is_some())
+                    .map_err(SearchError::from)
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                #[cfg(test)]
+                bounded_required_literal_ordinary_facade_probe::record_exists();
+                required
+                    .find_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|matched| matched.is_some())
+                    .map_err(SearchError::from)
+            }
             PortablePlan::NullableOptionalChain(plan) => plan
                 .is_match_full_unlimited_value(haystack)
                 .unwrap_or_else(|| {
@@ -14066,6 +14121,34 @@ impl PortableRegex {
             }
             PortablePlan::UnicodeWordRun(plan) => Ok(plan.find_full_prepared(haystack)),
             PortablePlan::AsciiWordRun(plan) => Ok(plan.find_full_prepared(haystack)),
+            PortablePlan::BoundedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                #[cfg(test)]
+                bounded_required_literal_ordinary_facade_probe::record_span();
+                required
+                    .find_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required)
+                if !required.anchors().start && !required.anchors().end =>
+            {
+                #[cfg(test)]
+                bounded_required_literal_ordinary_facade_probe::record_span();
+                required
+                    .find_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        required_literal_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
+            }
             _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
@@ -46552,6 +46635,176 @@ mod tests {
             3,
             "anchored, bounded, and unrelated ordinary find calls retain their routes",
         );
+    }
+
+    #[test]
+    fn bounded_required_literal_ordinary_facades_are_strictly_contained() {
+        let ascii = PortableBuilder::new(r"(?-u:[a-z]{2,4}ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let scalar = PortableBuilder::new(r"(?-u:[\x00\x02\x04\x80\xFF]{2,4}Z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &ascii.plan,
+            PortablePlan::BoundedRequiredLiteral(_)
+                | PortablePlan::DispatchedBoundedRequiredLiteral(_)
+        ));
+        assert!(matches!(&scalar.plan, PortablePlan::BoundedRequiredLiteral(_)));
+
+        let haystack = b"!ZQ!aaaaaZQ";
+        let expected = Some(Match { start: 5, end: 11 });
+        let full = SearchWindow::full(haystack);
+        super::bounded_required_literal_ordinary_facade_probe::reset();
+        assert_eq!(
+            ascii
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            ascii
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+        assert_eq!(
+            ascii
+                .find_window_value(haystack, full, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            ascii
+                .find_window(haystack, full, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+        let mut session = ascii
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        let mut ordinary = ascii.ordinary_session().unwrap();
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        let expected_iter = vec![(5, 11)];
+        let accounted_iter = ascii
+            .find_iter(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accounted_iter, expected_iter);
+        let value_iter = ascii
+            .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_iter, expected_iter);
+        let mut locations = ascii.capture_locations();
+        assert_eq!(
+            ascii
+                .captures_read_value(
+                    &mut locations,
+                    haystack,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((5, 11)),
+        );
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, windowed, session, and capture APIs stay canonical",
+        );
+
+        assert!(ascii.is_match(haystack));
+        assert!(!ascii.is_match(b"!ZQ!aZQ"));
+        assert_eq!(ascii.find(haystack), expected);
+        assert_eq!(ascii.find(b"!ZQ!aZQ"), None);
+        let scalar_haystack = [b'!', 0x80, 0xff, 0x80, b'Z'];
+        assert_eq!(
+            scalar.find(&scalar_haystack),
+            Some(Match { start: 1, end: 5 }),
+        );
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (2, 3),
+            "only anchor-free ordinary boolean/span calls enter the bounded route",
+        );
+
+        let anchored = PortableBuilder::new(r"(?-u:\A[a-z]{2,4}ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let unbounded = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(anchored.is_match(b"aaaaZQ"));
+        assert_eq!(anchored.find(b"aaaaZQ"), Some(Match { start: 0, end: 6 }));
+        assert!(unbounded.is_match(b"aaaaZQ"));
+        assert_eq!(unbounded.find(b"aaaaZQ"), Some(Match { start: 0, end: 6 }));
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (2, 3),
+            "anchored bounded and unbounded plans retain their existing routes",
+        );
+
+        let text = PortableTextBuilder::new(r"(?-u:[a-z]{2,4}ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert_eq!(text.build_report().portable.plan, PlanKind::RequiredLiteral);
+        super::bounded_required_literal_ordinary_facade_probe::reset();
+        assert!(text.is_match("!ZQ!aaaaaZQ"));
+        assert_eq!(text.find("!ZQ!aaaaaZQ"), expected);
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (1, 1),
+            "text ordinary calls delegate to the same bounded byte route",
+        );
+
+        let mut dense = Vec::new();
+        for _ in 0..512 {
+            dense.extend_from_slice(b"!ZQ");
+        }
+        for _ in 0..128 {
+            dense.extend_from_slice(b"!aZQ");
+        }
+        dense.extend_from_slice(b"!aaaaaZQ");
+        let dense_expected = Some(Match {
+            start: dense.len().checked_sub(6).unwrap(),
+            end: dense.len(),
+        });
+        super::bounded_required_literal_ordinary_facade_probe::reset();
+        assert!(ascii.is_match(&dense));
+        assert_eq!(ascii.find(&dense), dense_expected);
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (1, 1),
+            "dense ordinary boolean/span calls both retain one bounded candidate iterator",
+        );
+        super::bounded_required_literal_ordinary_facade_probe::reset();
     }
 
     #[test]

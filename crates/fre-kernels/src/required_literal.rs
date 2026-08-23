@@ -1406,6 +1406,67 @@ impl BoundedRequiredLiteralPlan {
         self.find_window_with_run_scanner(haystack, window, limits, None)
     }
 
+    /// Find the selected bounded span without retaining actual-event
+    /// accounting.
+    ///
+    /// Anchor-free plans preserve the incumbent preflight envelope and
+    /// candidate order, but omit counter updates while confirming each
+    /// bounded class run. Anchored plans retain the established accounted
+    /// search because absolute anchor validation participates in selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.find_window_value_with_run_scanner(haystack, window, limits, None)
+    }
+
+    #[inline]
+    fn find_window_value_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        debug_assert!(backward_scanner.is_none() || self.class().is_ascii());
+        if self.anchors() != Anchors::default() {
+            return self
+                .find_window_with_run_scanner(haystack, window, limits, backward_scanner)
+                .map(|(matched, _)| matched);
+        }
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        check_search_scratch(0, limits.max_scratch_bytes)?;
+        self.preflight(window, limits, backward_scanner)?;
+        let slice = &haystack[window.start()..window.end()];
+        for relative in self.plan.finder.find_iter(slice) {
+            let candidate = window.start().checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "absolute bounded value-only suffix candidate",
+                },
+            )?;
+            if let Some(matched) =
+                self.confirm_candidate_value(haystack, window, candidate, backward_scanner)?
+            {
+                return Ok(Some(matched));
+            }
+        }
+        Ok(None)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the bounded one-byte, direct-first, and continuation paths stay explicit around one shared candidate confirmation"
@@ -1647,6 +1708,57 @@ impl BoundedRequiredLiteralPlan {
         Ok(Some((run_start, end)))
     }
 
+    #[allow(
+        clippy::inline_always,
+        reason = "bounded value confirmation folds into the first and continuation candidate loops"
+    )]
+    #[inline(always)]
+    fn confirm_candidate_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        candidate: usize,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if candidate == window.start() {
+            return Ok(None);
+        }
+        let previous = candidate
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "candidate predecessor",
+            })?;
+        if !self.class().contains(haystack[previous]) {
+            return Ok(None);
+        }
+
+        let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
+            candidate.saturating_sub(max).max(window.start())
+        });
+        let run_start = backward_class_run_start_value(
+            haystack,
+            confirmation_start,
+            candidate,
+            self.class(),
+            backward_scanner,
+        )?;
+        let run_len = candidate
+            .checked_sub(run_start)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "confirmed class run length",
+            })?;
+        if run_len < self.repeat.min {
+            return Ok(None);
+        }
+        let end =
+            candidate
+                .checked_add(self.suffix().len())
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "selected match end",
+                })?;
+        Ok(Some((run_start, end)))
+    }
+
     fn preflight(
         &self,
         window: Window,
@@ -1816,6 +1928,31 @@ impl DispatchedBoundedRequiredLiteralPlan {
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
         self.plan.find_window_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            self.backward_scanner.as_ref(),
+        )
+    }
+
+    /// Find the selected bounded span without retaining actual-event
+    /// accounting.
+    ///
+    /// Anchor-free plans use the retained dispatched backward scanner;
+    /// anchored plans retain the established accounted search.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.plan.find_window_value_with_run_scanner(
             haystack,
             window,
             limits,
@@ -3323,6 +3460,370 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded matrix keeps scalar/dispatched spans, windows, anchors, and refusal order aligned"
+    )]
+    fn bounded_find_window_value_matches_accounted_search() {
+        let class = ByteClass::from_bytes(b"a");
+        let repeat = ClassRepeat {
+            min: 2,
+            max: Some(3),
+        };
+        let dispatch = SimdDispatchContext::capture();
+        for (case, suffix, body) in [
+            (
+                "one-byte-continuation",
+                b"Z".as_slice(),
+                b"!Z!aaZ".as_slice(),
+            ),
+            (
+                "multi-byte-continuation",
+                b"ZQ".as_slice(),
+                b"!ZQ!aaZQ".as_slice(),
+            ),
+            ("greedy-maximum", b"ZQ".as_slice(), b"aaaaaZQ".as_slice()),
+            (
+                "short-then-valid",
+                b"ZQ".as_slice(),
+                b"aZQ!aaaZQ".as_slice(),
+            ),
+            ("miss", b"ZQ".as_slice(), b"!ZQ!none".as_slice()),
+        ] {
+            let scalar = BoundedRequiredLiteralPlan::build(
+                class,
+                repeat,
+                suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched = BoundedRequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                repeat,
+                suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+            for (haystack, window) in [
+                (body.to_vec(), Window::full(body)),
+                (
+                    {
+                        let mut wrapped = b"<>".to_vec();
+                        wrapped.extend_from_slice(body);
+                        wrapped.extend_from_slice(b"[]");
+                        wrapped
+                    },
+                    Window::new(2, body.len() + 2),
+                ),
+            ] {
+                let scalar_expected = scalar
+                    .find_window(&haystack, window, SearchLimits::unlimited())
+                    .unwrap();
+                let dispatched_expected = dispatched
+                    .find_window(&haystack, window, SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(scalar_expected.0, dispatched_expected.0, "case={case}");
+                assert_eq!(
+                    scalar.find_window_value(&haystack, window, SearchLimits::unlimited()),
+                    Ok(scalar_expected.0),
+                    "scalar case={case}",
+                );
+                assert_eq!(
+                    dispatched.find_window_value(&haystack, window, SearchLimits::unlimited(),),
+                    Ok(dispatched_expected.0),
+                    "dispatched case={case}",
+                );
+            }
+        }
+
+        let haystack = b"!ZQ!aaaaZQ";
+        let window = Window::full(haystack);
+        let scalar = BoundedRequiredLiteralPlan::build(
+            class,
+            ClassRepeat {
+                min: 2,
+                max: Some(4),
+            },
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedRequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            class,
+            ClassRepeat {
+                min: 2,
+                max: Some(4),
+            },
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        macro_rules! assert_preflight {
+            ($plan:expr, $owner:literal) => {{
+                let expected = $plan
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap();
+                let exact = SearchLimits {
+                    max_work_upper_bound: expected.1.work_upper_bound,
+                    max_candidate_visits: expected.1.candidate_visits_upper_bound,
+                    max_scratch_bytes: expected.1.scratch_bytes,
+                };
+                assert_eq!(
+                    $plan.find_window_value(haystack, window, exact),
+                    Ok(expected.0),
+                    "{} exact preflight",
+                    $owner,
+                );
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits {
+                            max_candidate_visits: exact.max_candidate_visits - 1,
+                            ..exact
+                        },
+                    ),
+                    Err(SearchError::CandidateLimit { .. })
+                ));
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits {
+                            max_work_upper_bound: exact.max_work_upper_bound - 1,
+                            ..exact
+                        },
+                    ),
+                    Err(SearchError::WorkLimit { .. })
+                ));
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        Window::new(2, 1),
+                        SearchLimits {
+                            max_work_upper_bound: 0,
+                            max_candidate_visits: 0,
+                            max_scratch_bytes: 0,
+                        },
+                    ),
+                    Err(SearchError::InvalidWindow { .. })
+                ));
+            }};
+        }
+        assert_preflight!(scalar, "scalar");
+        assert_preflight!(dispatched, "dispatched");
+
+        for anchors in [
+            Anchors {
+                start: true,
+                end: false,
+            },
+            Anchors {
+                start: false,
+                end: true,
+            },
+            Anchors {
+                start: true,
+                end: true,
+            },
+        ] {
+            let anchored = BoundedRequiredLiteralPlan::build(
+                class,
+                repeat,
+                b"ZQ",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            for anchored_haystack in [b"aaaZQ".as_slice(), b"!aaaZQ", b"aaaZQ!"] {
+                let anchored_window = Window::full(anchored_haystack);
+                let expected = anchored
+                    .find_window(
+                        anchored_haystack,
+                        anchored_window,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    anchored.find_window_value(
+                        anchored_haystack,
+                        anchored_window,
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(expected),
+                    "anchors={anchors:?} haystack={anchored_haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the bounded base-five corpus has at most five bytes"
+    )]
+    fn bounded_value_matches_independent_reference_for_multi_byte_suffixes() {
+        let class = ByteClass::from_bytes(b"ab");
+        let dispatch = SimdDispatchContext::capture();
+        let alphabet = [b'a', b'b', b'Z', b'Q', b'!'];
+        for suffix in [b"ZQ".as_slice(), b"ZQQ".as_slice()] {
+            for repeat in [
+                ClassRepeat {
+                    min: 1,
+                    max: Some(3),
+                },
+                ClassRepeat { min: 2, max: None },
+            ] {
+                let scalar = BoundedRequiredLiteralPlan::build(
+                    class,
+                    repeat,
+                    suffix,
+                    Anchors::default(),
+                    BuildLimits::default(),
+                )
+                .unwrap();
+                let dispatched = BoundedRequiredLiteralPlan::build_with_dispatch(
+                    dispatch,
+                    class,
+                    repeat,
+                    suffix,
+                    Anchors::default(),
+                    BuildLimits::default(),
+                )
+                .unwrap();
+                for len in 0_u32..=5 {
+                    for mut encoded in 0..alphabet.len().pow(len) {
+                        let mut haystack = vec![0_u8; usize::try_from(len).unwrap()];
+                        for byte in &mut haystack {
+                            *byte = alphabet[encoded % alphabet.len()];
+                            encoded /= alphabet.len();
+                        }
+                        for start in 0..=haystack.len() {
+                            for end in start..=haystack.len() {
+                                let window = Window::new(start, end);
+                                let expected = reference_repeated_find(
+                                    &haystack,
+                                    window,
+                                    class,
+                                    repeat,
+                                    suffix,
+                                    Anchors::default(),
+                                );
+                                assert_eq!(
+                                    scalar.find_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                    Ok(expected),
+                                    "scalar suffix={suffix:?} repeat={repeat:?} haystack={haystack:?} window={start}..{end}",
+                                );
+                                assert_eq!(
+                                    dispatched.find_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                    Ok(expected),
+                                    "dispatched suffix={suffix:?} repeat={repeat:?} haystack={haystack:?} window={start}..{end}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_value_persistent_iterator_handles_dense_negative_decoys() {
+        const SEPARATOR_DECOYS: usize = 1_024;
+        const SHORT_RUN_DECOYS: usize = 256;
+        const EXPECTED_CANDIDATES: usize = 1_281;
+
+        let class = ByteClass::from_bytes(b"ab");
+        let repeat = ClassRepeat {
+            min: 2,
+            max: Some(4),
+        };
+        let suffix = b"ZQ";
+        let scalar = BoundedRequiredLiteralPlan::build(
+            class,
+            repeat,
+            suffix,
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedRequiredLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            class,
+            repeat,
+            suffix,
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+
+        let mut haystack = b"ZQ<".to_vec();
+        let start = haystack.len();
+        for _ in 0..SEPARATOR_DECOYS {
+            haystack.extend_from_slice(b"!ZQ");
+        }
+        for _ in 0..SHORT_RUN_DECOYS {
+            haystack.extend_from_slice(b"!aZQ");
+        }
+        haystack.extend_from_slice(b"!aaaaaZQ");
+        let end = haystack.len();
+        haystack.extend_from_slice(b">ZQ");
+        let window = Window::new(start, end);
+        let suffix_candidate = end.checked_sub(suffix.len()).unwrap();
+        let expected = Some((
+            suffix_candidate.checked_sub(repeat.max.unwrap()).unwrap(),
+            end,
+        ));
+
+        assert_eq!(
+            scalar.plan.finder.find_iter(&haystack[start..end]).count(),
+            EXPECTED_CANDIDATES,
+            "the bounded value route sees every rejected decoy before the valid suffix",
+        );
+        assert_eq!(
+            reference_repeated_find(
+                &haystack,
+                window,
+                class,
+                repeat,
+                suffix,
+                Anchors::default(),
+            ),
+            expected,
+        );
+        assert_eq!(
+            scalar.find_window_value(&haystack, window, SearchLimits::unlimited()),
+            Ok(expected),
+        );
+        assert_eq!(
+            dispatched.find_window_value(&haystack, window, SearchLimits::unlimited()),
+            Ok(expected),
+        );
+        assert_eq!(
+            scalar
+                .find_window(&haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+    }
+
+    #[test]
     fn value_projections_resume_at_the_proved_nonoverlapping_boundary() {
         let class = ByteClass::from_bytes(b"a");
         for suffix_len in [1_usize, 2, 3, 8, 17] {
@@ -3529,6 +4030,15 @@ mod tests {
                                 assert_eq!(
                                     actual, expected,
                                     "repeat={repeat:?} anchors={anchors:?} haystack={haystack:?} window={start}..{end}"
+                                );
+                                assert_eq!(
+                                    plan.find_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                    Ok(expected),
+                                    "value repeat={repeat:?} anchors={anchors:?} haystack={haystack:?} window={start}..{end}"
                                 );
                             }
                         }
@@ -3898,7 +4408,16 @@ mod tests {
                 Some(&scanner),
             )
             .unwrap();
+        let accelerated_bounded_value = bounded
+            .find_window_value_with_run_scanner(
+                &long_run,
+                Window::full(&long_run),
+                SearchLimits::unlimited(),
+                Some(&scanner),
+            )
+            .unwrap();
         assert_eq!(accelerated_bounded.0, scalar_bounded.0);
+        assert_eq!(accelerated_bounded_value, scalar_bounded.0);
         assert_eq!(
             accelerated_bounded.0,
             Some((long_run.len() - 1 - bounded_repeat.max.unwrap(), long_run.len()))
