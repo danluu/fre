@@ -1495,6 +1495,86 @@ pub(crate) fn extract_with_singleton_literal_handoff(
         guarded_limits,
     ))
 }
+
+/// Materialize one independently authenticated flat literal alternation
+/// directly into its final finite-language owner.
+///
+/// The direct-HIR integration seam has already bounded and inspected every
+/// branch, but this function does not trust that provenance as a substitute
+/// for a value check: it revalidates the exact root/leaf shape and the finite
+/// limits before allocating. Unlike the generic task machine, it never
+/// creates one temporary single-word language per branch and therefore moves
+/// each literal byte into retained storage exactly once.
+pub(crate) fn extract_authenticated_flat_literal_set(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+    initial_work: u64,
+    work_limit: u64,
+) -> FiniteOutcome {
+    let context = FiniteExtractionContext::new(initial_work, work_limit);
+    let result = (|| -> Result<Result<Vec<Vec<u8>>, ()>, BuildError> {
+        context.charge(1)?;
+        let HirKind::Alternation(branches) = hir.kind() else {
+            return Err(BuildError::InternalInvariant(
+                "flat literal-set receipt reached another HIR root",
+            ));
+        };
+        if branches.len() < 2 {
+            return Err(BuildError::InternalInvariant(
+                "flat literal-set receipt reached a singleton alternation",
+            ));
+        }
+        let mut total_bytes = 0_usize;
+        for branch in branches {
+            context.charge(1)?;
+            let HirKind::Literal(literal) = branch.kind() else {
+                return Err(BuildError::InternalInvariant(
+                    "flat literal-set receipt reached a non-literal branch",
+                ));
+            };
+            if literal.0.is_empty() {
+                return Err(BuildError::InternalInvariant(
+                    "flat literal-set receipt reached an empty branch",
+                ));
+            }
+            total_bytes = total_bytes.checked_add(literal.0.len()).ok_or(
+                BuildError::InternalInvariant("flat literal-set byte total overflowed usize"),
+            )?;
+        }
+        if branches.len() > max_words || total_bytes > max_bytes {
+            return Ok(Err(()));
+        }
+
+        let mut language = Language::empty(&context, total_bytes);
+        language.reserve_words(branches.len(), "flat finite-language words")?;
+        for branch in branches {
+            let HirKind::Literal(literal) = branch.kind() else {
+                unreachable!("flat literal branches were revalidated above");
+            };
+            let mut word = AccountedVec::new(&context, FiniteStorage::Persistent);
+            word.reserve_planner(literal.0.len(), "flat finite-language literal bytes")?;
+            word.extend_reserved(literal.0.iter().copied(), literal.0.len())?;
+            language.push_word(word)?;
+        }
+        Ok(Ok(language.into_words()))
+    })();
+
+    match result {
+        Ok(Ok(words)) => FiniteOutcome::Fits {
+            words,
+            receipt: context.close(FiniteExtractionTerminal::Fits),
+        },
+        Ok(Err(())) => FiniteOutcome::TooLargeFixedSequence {
+            receipt: context.close(FiniteExtractionTerminal::TooLargeFixedSequence),
+        },
+        Err(error) => FiniteOutcome::ResourceFailure {
+            error,
+            receipt: context.close(FiniteExtractionTerminal::ResourceFailure),
+        },
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the iterative task machine keeps every HIR case and early resource refusal visible"
@@ -4396,6 +4476,121 @@ mod tests {
                 &identity.packed_bytes[start..end]
             })
             .collect()
+    }
+
+    fn flat_literal_hir() -> regex_syntax::hir::Hir {
+        regex_syntax::hir::Hir::alternation(vec![
+            regex_syntax::hir::Hir::literal(b"ab".to_vec()),
+            regex_syntax::hir::Hir::literal(b"cde".to_vec()),
+            regex_syntax::hir::Hir::literal(b"f".to_vec()),
+        ])
+    }
+
+    #[test]
+    fn authenticated_flat_literal_set_materializes_one_closed_owner() {
+        let outcome = super::extract_authenticated_flat_literal_set(
+            &flat_literal_hir(),
+            3,
+            6,
+            7,
+            u64::MAX,
+        );
+        assert!(outcome.has_closed_receipt());
+        assert_eq!(outcome.work(), 20);
+        let FiniteOutcome::Fits { words, receipt } = outcome else {
+            panic!("flat literal set did not fit");
+        };
+        assert_eq!(words, [b"ab".as_slice(), b"cde".as_slice(), b"f".as_slice()]);
+        let actual = receipt.actual.local;
+        assert_eq!(actual.allocations, 4);
+        assert_eq!(actual.reallocations, 0);
+        assert_eq!(actual.live_scratch_bytes, 0);
+        assert_eq!(actual.released_scratch_bytes, 0);
+        assert_eq!(actual.released_persistent_bytes, 0);
+        assert_eq!(actual.live_persistent_bytes, actual.allocated_bytes);
+        assert_eq!(actual.high_water_bytes, actual.live_persistent_bytes);
+        assert_eq!(actual.copied_bytes, 6);
+        assert_eq!(
+            actual.initialized_bytes,
+            3 * core::mem::size_of::<Vec<u8>>() + 6
+        );
+    }
+
+    #[test]
+    fn authenticated_flat_literal_set_limits_and_partial_failures_close() {
+        let hir = flat_literal_hir();
+        for (max_words, max_bytes) in [(2, 6), (3, 5)] {
+            let outcome = super::extract_authenticated_flat_literal_set(
+                &hir,
+                max_words,
+                max_bytes,
+                0,
+                u64::MAX,
+            );
+            assert!(outcome.has_closed_receipt());
+            assert!(matches!(outcome, FiniteOutcome::TooLargeFixedSequence { .. }));
+        }
+
+        for work_limit in [6, 8, 11] {
+            let outcome = super::extract_authenticated_flat_literal_set(
+                &hir,
+                3,
+                6,
+                0,
+                work_limit,
+            );
+            assert!(outcome.has_closed_receipt(), "limit={work_limit}");
+            let FiniteOutcome::ResourceFailure { error, receipt } = outcome else {
+                panic!("limit={work_limit}: expected resource failure");
+            };
+            assert!(matches!(error, BuildError::PlannerWorkLimit { .. }));
+            let actual = receipt.actual.local;
+            assert_eq!(actual.live_persistent_bytes, 0, "limit={work_limit}");
+            assert_eq!(actual.live_scratch_bytes, 0, "limit={work_limit}");
+            assert_eq!(
+                actual.released_persistent_bytes,
+                actual.allocated_bytes,
+                "limit={work_limit}",
+            );
+            match work_limit {
+                6 => assert_eq!(actual.allocations, 0),
+                8 => {
+                    assert_eq!(actual.allocations, 1);
+                    assert!(actual.released_persistent_bytes > 0);
+                }
+                11 => {
+                    assert_eq!(actual.allocations, 2);
+                    assert_eq!(actual.copied_bytes, 2);
+                    assert_eq!(
+                        actual.initialized_bytes,
+                        core::mem::size_of::<Vec<u8>>() + 2
+                    );
+                }
+                _ => unreachable!("the test enumerates every work limit"),
+            }
+        }
+
+        let malformed = regex_syntax::hir::Hir::alternation(vec![
+            regex_syntax::hir::Hir::literal(b"too-large".to_vec()),
+            regex_syntax::hir::Hir::empty(),
+        ]);
+        let outcome = super::extract_authenticated_flat_literal_set(
+            &malformed,
+            1,
+            0,
+            0,
+            u64::MAX,
+        );
+        assert!(outcome.has_closed_receipt());
+        assert!(matches!(
+            outcome,
+            FiniteOutcome::ResourceFailure {
+                error: BuildError::InternalInvariant(
+                    "flat literal-set receipt reached a non-literal branch"
+                ),
+                ..
+            }
+        ));
     }
 
     #[test]

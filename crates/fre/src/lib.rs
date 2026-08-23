@@ -4818,6 +4818,22 @@ fn capture_name_metadata(
     })
 }
 
+fn capture_free_name_metadata() -> Result<CaptureNameMetadata, BuildError> {
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(1)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "capture-name slots",
+            additional: 1,
+        })?;
+    names.push(None);
+    Ok(CaptureNameMetadata {
+        names: names.into_boxed_slice(),
+        captures_len: 1,
+        storage_bytes: core::mem::size_of::<Option<Box<str>>>(),
+    })
+}
+
 /// Per-search accounting with the selected plan kept explicit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SearchAccounting {
@@ -5698,6 +5714,19 @@ struct PortableParsedBuildContext {
     admission: AdmissionStatus,
     syntax: ParseSummary,
     rust: fre_syntax::RustParsed,
+    provenance: ParsedBuildProvenance,
+}
+
+/// Provenance for planning one owned parsed HIR.
+///
+/// The ripgrep variant is minted only after the direct-HIR seam has checked
+/// the complete flat literal shape and its capture-free HIR properties. It is
+/// moved beside that same HIR into `PortableParsedBuildContext`. It authorizes
+/// both capture-free metadata publication and the exact flat-literal planner
+/// route; generic parsed construction cannot claim either shortcut.
+enum ParsedBuildProvenance {
+    Canonical,
+    RipgrepFlatLiteral,
 }
 
 /// Result of consuming ripgrep's ordinary literal HIR construction candidate.
@@ -5727,6 +5756,7 @@ impl RipgrepStandardLiteralContext {
             admission: self.admission,
             syntax: self.syntax,
             rust: fre_syntax::RustParsed { hir },
+            provenance: ParsedBuildProvenance::RipgrepFlatLiteral,
         }
     }
 }
@@ -5787,6 +5817,7 @@ impl PortableParsedBuildContext {
             admission: parsed.admission_status,
             syntax: parsed.summary,
             rust,
+            provenance: ParsedBuildProvenance::Canonical,
         })
     }
 }
@@ -6544,6 +6575,7 @@ impl PortableBuilder {
             admission,
             syntax,
             rust,
+            provenance,
         } = context;
         let source_storage_bytes = source.len();
         let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
@@ -6564,11 +6596,39 @@ impl PortableBuilder {
                 ))
             })
             .transpose()?;
+        let ripgrep_flat_literal = matches!(
+            &provenance,
+            ParsedBuildProvenance::RipgrepFlatLiteral
+        );
+        if ripgrep_flat_literal {
+            let has_flat_literal_shape = match rust.hir.kind() {
+                HirKind::Literal(_) => true,
+                HirKind::Alternation(branches) => branches.len() >= 2,
+                _ => false,
+            };
+            if !has_flat_literal_shape {
+                return Err(BuildError::InternalInvariant(
+                    "ripgrep flat-literal provenance reached another HIR shape",
+                ));
+            }
+        }
         let CaptureNameMetadata {
             names: capture_names,
             captures_len,
             storage_bytes: capture_name_storage_bytes,
-        } = capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?;
+        } = match provenance {
+            ParsedBuildProvenance::Canonical => {
+                capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?
+            }
+            ParsedBuildProvenance::RipgrepFlatLiteral => {
+                if explicit_captures != 0 || static_captures_len != Some(1) {
+                    return Err(BuildError::InternalInvariant(
+                        "ripgrep capture-free receipt differs from HIR properties",
+                    ));
+                }
+                capture_free_name_metadata()?
+            }
+        };
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         let k0_absolute_end_proof =
             K0AbsoluteEndProof::from_hir(&rust.hir, minimum_match_bytes);
@@ -6646,6 +6706,7 @@ impl PortableBuilder {
             });
         }
         if self.selection == PlanSelection::Auto
+            && !ripgrep_flat_literal
             && let Some(plan) = unicode_word_run::extract(&rust.hir)
         {
             let planner_work = u64::try_from(plan.portable_build_work()).map_err(|_| {
@@ -6711,7 +6772,7 @@ impl PortableBuilder {
             });
         }
         let mut planner_work = 0_u64;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !ripgrep_flat_literal {
             let inspection = bounded_word_class::inspect(
                 &rust.hir,
                 SimdDispatchContext::capture(),
@@ -6778,10 +6839,12 @@ impl PortableBuilder {
                 });
             }
         }
-        if matches!(
-            self.selection,
-            PlanSelection::Auto | PlanSelection::ForceForwardAnchored
-        ) {
+        if !ripgrep_flat_literal
+            && matches!(
+                self.selection,
+                PlanSelection::Auto | PlanSelection::ForceForwardAnchored
+            )
+        {
             let forward =
                 forward_anchored::extract(&rust.hir, planner_work, self.limits.max_planner_work)?;
             planner_work = forward.work;
@@ -6896,10 +6959,15 @@ impl PortableBuilder {
                 return Err(BuildError::ForwardAnchoredShape);
             }
         }
-        let required =
-            required_literal::extract(&rust.hir, planner_work, self.limits.max_planner_work)?;
-        let required_work = required.work;
-        if let Some(shape) = required.shape {
+        let mut required_work = planner_work;
+        if !ripgrep_flat_literal {
+            let required = required_literal::extract(
+                &rust.hir,
+                planner_work,
+                self.limits.max_planner_work,
+            )?;
+            required_work = required.work;
+            if let Some(shape) = required.shape {
             let default_allowed = !(shape.anchors.start && shape.anchors.end);
             if self.selection == PlanSelection::ForceRequiredLiteral || default_allowed {
                 let dispatch = SimdDispatchContext::capture();
@@ -6997,12 +7065,13 @@ impl PortableBuilder {
                     Err(error) => return Err(BuildError::RequiredLiteral(error)),
                 }
             }
-        } else if self.selection == PlanSelection::ForceRequiredLiteral {
-            return Err(BuildError::RequiredLiteralShape);
+            } else if self.selection == PlanSelection::ForceRequiredLiteral {
+                return Err(BuildError::RequiredLiteralShape);
+            }
         }
         let mut literal_class_run_work = required_work;
         let mut deferred_bounded_literal_class_run = None;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !ripgrep_flat_literal {
             let remaining = self
                 .limits
                 .max_planner_work
@@ -7151,7 +7220,7 @@ impl PortableBuilder {
             }
         }
         let mut reverse_inner_work = literal_class_run_work;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !ripgrep_flat_literal {
             let remaining = self
                 .limits
                 .max_planner_work
@@ -7243,7 +7312,7 @@ impl PortableBuilder {
             }
         }
         let mut prefix_class_alternation_work = reverse_inner_work;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !ripgrep_flat_literal {
             let remaining = self
                 .limits
                 .max_planner_work
@@ -7429,7 +7498,10 @@ impl PortableBuilder {
             }
         }
         let mut pure_byte_class_repeat_work = prefix_class_alternation_work;
-        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
+        if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && !ripgrep_flat_literal
+        {
             let inspection = pure_byte_class_repeat::inspect(
                 &rust.hir,
                 prefix_class_alternation_work,
@@ -7506,7 +7578,10 @@ impl PortableBuilder {
             }
         }
         let mut bounded_byte_class_repeat_work = pure_byte_class_repeat_work;
-        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
+        if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && !ripgrep_flat_literal
+        {
             let inspection = bounded_byte_class_repeat::inspect(
                 &rust.hir,
                 pure_byte_class_repeat_work,
@@ -7633,7 +7708,10 @@ impl PortableBuilder {
             });
         }
         let mut nullable_optional_chain_work = fixed_predicate_work;
-        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
+        if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && !ripgrep_flat_literal
+        {
             let inspection = nullable_optional_chain::inspect(
                 &rust.hir,
                 fixed_predicate_work,
@@ -7705,7 +7783,10 @@ impl PortableBuilder {
             }
         }
         let mut nullable_finite_token_repeat_work = nullable_optional_chain_work;
-        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
+        if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && !ripgrep_flat_literal
+        {
             let inspection = nullable_finite_token_repeat::inspect(
                 &rust.hir,
                 nullable_optional_chain_work,
@@ -7795,8 +7876,18 @@ impl PortableBuilder {
             && has_guarded_ascii_left
             && has_guarded_ascii_right;
         let mut singleton_literal_handoff = None;
-        let (finite_words, guarded_dictionary, mut finite_work) =
-            match finite::extract_with_singleton_literal_handoff(
+        let finite_extraction = if ripgrep_flat_literal
+            && matches!(rust.hir.kind(), HirKind::Alternation(_))
+        {
+            Err(finite::extract_authenticated_flat_literal_set(
+                &rust.hir,
+                self.limits.literal_set.max_patterns,
+                self.limits.literal_set.max_pattern_bytes,
+                nullable_finite_token_repeat_work,
+                self.limits.max_planner_work,
+            ))
+        } else {
+            finite::extract_with_singleton_literal_handoff(
                 &rust.hir,
                 self.limits.literal_set.max_patterns,
                 self.limits.literal_set.max_pattern_bytes,
@@ -7807,7 +7898,10 @@ impl PortableBuilder {
                     self.limits.packed_literal_set,
                     guarded_plan_persistent_bytes,
                 ),
-            ) {
+            )
+        };
+        let (finite_words, guarded_dictionary, mut finite_work) =
+            match finite_extraction {
                 Ok(handoff) => {
                     if !handoff.has_closed_receipt() {
                         return Err(BuildError::InternalInvariant(
@@ -26248,6 +26342,70 @@ mod tests {
     }
 
     #[test]
+    fn ripgrep_owned_flat_literal_handoff_preserves_ownership_and_fallback() {
+        let hir = Hir::alternation(vec![
+            Hir::literal(b"needle".to_vec()),
+            Hir::literal(b"thread".to_vec()),
+            Hir::literal(b"fiber".to_vec()),
+        ]);
+        let built = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX)
+            .expect("owned direct construction completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(regex) = built else {
+            panic!("owned flat literal alternation was refused");
+        };
+        assert!(matches!(
+            regex.build_report().plan,
+            PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
+        ));
+        assert_eq!(
+            regex.find(b"a fiber then needle"),
+            Some(Match { start: 2, end: 7 })
+        );
+
+        let refused = Hir::concat(vec![
+            Hir::literal(b"a".to_vec()),
+            Hir::look(regex_syntax::hir::Look::End),
+        ]);
+        let returned = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(refused.clone(), usize::MAX)
+            .expect("shape refusal is not a construction error");
+        let super::RipgrepStandardLiteralHirBuild::Refused(returned) = returned else {
+            panic!("non-flat owned HIR was accepted");
+        };
+        assert_eq!(returned, refused);
+
+        let fallback_hir = Hir::alternation(vec![
+            Hir::literal(b"a".to_vec()),
+            Hir::literal(b"bb".to_vec()),
+            Hir::literal(b"ccc".to_vec()),
+        ]);
+        let mut fallback_limits = BuildLimits::default();
+        fallback_limits.literal_set.max_patterns = 2;
+        let borrowed = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(fallback_limits)
+            .build_ripgrep_standard_literal_hir(&fallback_hir, usize::MAX)
+            .expect("borrowed finite-limit fallback completes")
+            .expect("borrowed flat HIR remains admitted");
+        assert_eq!(borrowed.build_report().plan, PlanKind::K0);
+        assert_eq!(borrowed.find(b"xxccc"), Some(Match { start: 2, end: 5 }));
+        let owned = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(fallback_limits)
+            .build_ripgrep_standard_literal_hir_owned(fallback_hir, usize::MAX)
+            .expect("owned finite-limit fallback completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+            panic!("owned finite-limit fallback was refused");
+        };
+        assert_eq!(owned.build_report().plan, PlanKind::K0);
+        assert_eq!(owned.find(b"xxccc"), borrowed.find(b"xxccc"));
+    }
+
+    #[test]
     fn ripgrep_standard_literal_hir_skips_impossible_folded_tail_inspection() {
         let hir = Hir::alternation(
             (0..256_u16)
@@ -26271,10 +26429,45 @@ mod tests {
         let report = regex.build_report();
         assert_eq!(report.plan, PlanKind::LiteralSetDfa);
         assert_eq!(report.syntax.class_ranges, 0);
-        // The finite planner closes at 5,649 work. The formerly attempted
-        // folded inspection charged another 257 HIR-node visits even though
-        // a class-free HIR cannot have the required non-ASCII folded roots.
-        assert_eq!(report.planner_work, 5_649);
+        assert_eq!(regex.captures_len(), 1);
+        assert_eq!(regex.static_captures_len(), Some(1));
+        assert_eq!(regex.capture_names().collect::<Vec<_>>(), vec![None]);
+        assert_eq!(
+            report.capture_name_storage_bytes,
+            core::mem::size_of::<Option<Box<str>>>()
+        );
+        // The authenticated flat handoff closes at 2,563 work while retaining
+        // the same final words. Generic construction still uses the canonical
+        // two-pass finite task machine, and a class-free HIR also skips the
+        // impossible folded-tail inspection.
+        assert_eq!(report.planner_work, 2_563);
+        let exact = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .limits(BuildLimits {
+                max_planner_work: report.planner_work,
+                ..BuildLimits::default()
+            })
+            .build_ripgrep_standard_literal_hir(&hir, usize::MAX)
+            .expect("exact flat-handoff work closes")
+            .expect("the direct HIR remains admitted");
+        assert_eq!(exact.build_report().planner_work, report.planner_work);
+        let one_below = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .limits(BuildLimits {
+                max_planner_work: report.planner_work - 1,
+                ..BuildLimits::default()
+            })
+            .build_ripgrep_standard_literal_hir(&hir, usize::MAX)
+            .expect_err("one-below flat-handoff work must fail closed");
+        assert!(matches!(
+            one_below,
+            BuildError::PlannerWorkLimit {
+                needed,
+                limit
+            } if needed == report.planner_work && limit == report.planner_work - 1
+        ));
         assert_eq!(
             regex.find(b"xxqzqzzqzqyy"),
             Some(Match { start: 2, end: 10 }),
