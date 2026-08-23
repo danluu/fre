@@ -830,6 +830,68 @@ impl AbsoluteEndFixedPlan {
         self.find_window(haystack, Window::full(haystack), limits)
     }
 
+    /// Test the full haystack without publishing search accounting.
+    ///
+    /// This is reserved for an ordinary unlimited facade. `None` declines to
+    /// the canonical path when its exact source-free arithmetic envelope is
+    /// not representable.
+    #[inline]
+    pub fn ordinary_is_match_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<bool, SearchError>> {
+        self.ordinary_find_full_unmetered(haystack)
+            .map(|result| result.map(|matched| matched.is_some()))
+    }
+
+    /// Return the selected full-haystack span without publishing search
+    /// accounting. See [`Self::ordinary_is_match_full_unmetered`].
+    #[inline]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<Option<(usize, usize)>, SearchError>> {
+        let haystack_len = haystack.len();
+        let suffix_len = self.suffix.len();
+        if haystack_len <= suffix_len {
+            return Some(Ok(None));
+        }
+        if !self.ordinary_full_envelope_fits(haystack_len) {
+            return None;
+        }
+        let prefix_len = haystack_len.checked_sub(suffix_len)?;
+        Some(self.search_fixed_full_unmetered(haystack, prefix_len))
+    }
+
+    fn search_fixed_full_unmetered(
+        &self,
+        haystack: &[u8],
+        prefix_len: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let haystack_len = haystack.len();
+        let fixed_suffix = haystack.get(prefix_len..haystack_len).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "fixed-end suffix partition",
+            },
+        )?;
+        let suffix_matches = if let [expected] = self.suffix() {
+            fixed_suffix.first() == Some(expected)
+        } else {
+            fixed_suffix == self.suffix()
+        };
+        if !suffix_matches {
+            return Ok(None);
+        }
+
+        let prefix = haystack
+            .get(..prefix_len)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "fixed-end prefix partition",
+            })?;
+        let (boundary, _) = scan_fixed_class_prefix(prefix, self.class, self.implementation)?;
+        Ok((boundary == prefix_len).then_some((0, haystack_len)))
+    }
+
     /// Verify the fixed split while anchors retain original-haystack meaning.
     ///
     /// # Errors
@@ -963,6 +1025,25 @@ impl AbsoluteEndFixedPlan {
             prefix_bytes_examined: 0,
             suffix_confirmation_attempted: false,
         })
+    }
+
+    fn ordinary_full_envelope_fits(&self, haystack_len: usize) -> bool {
+        let suffix_len = self.suffix.len();
+        if haystack_len <= suffix_len {
+            return true;
+        }
+        let prefix_len = haystack_len - suffix_len;
+        let block_scanner = !matches!(self.implementation, ClassImplementation::Bitset);
+        let rescan_margin = if block_scanner && prefix_len >= RANGE_BLOCK {
+            RANGE_BLOCK
+        } else {
+            0
+        };
+        prefix_len
+            .checked_add(rescan_margin)
+            .and_then(|value| value.checked_add(suffix_len))
+            .and_then(|value| u64::try_from(value).ok())
+            .is_some()
     }
 }
 
@@ -4159,6 +4240,91 @@ mod tests {
                 fixed(ByteClass::from_bytes(class), b"Z").implementation(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn fixed_ordinary_full_values_match_counted_across_implementations_and_boundaries() {
+        let fixtures: [(&[u8], &[u8], u8); 7] = [
+            (b"a", b"a", b'Z'),
+            (b"abcdefghijklmnopqrstuvwxyz", b"az", b'Z'),
+            (b"ac", b"ac", b'Z'),
+            (b"ace", b"ace", b'Z'),
+            (b"aceg", b"aceg", b'Z'),
+            (b"acegi", b"acegi", b'Z'),
+            (
+                &[0x00, 0x02, 0x04, 0x06, 0x80, 0xFF],
+                &[0x00, 0x80],
+                0x7F,
+            ),
+        ];
+        let lengths = [
+            0_usize, 1, 31, 32, 63, 64, 65, 127, 128, 129, 4_095, 4_096, 4_097,
+        ];
+
+        for (class_bytes, members, suffix) in fixtures {
+            let plan = fixed(ByteClass::from_bytes(class_bytes), &[suffix]);
+            for prefix_len in lengths {
+                let prefix: Vec<u8> = members
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(prefix_len)
+                    .collect();
+                let mut hit = prefix.clone();
+                hit.push(suffix);
+                let mut suffix_miss = hit.clone();
+                *suffix_miss.last_mut().unwrap() = suffix.wrapping_add(1);
+                let mut cases = vec![hit, prefix, suffix_miss];
+                if prefix_len != 0 {
+                    let mut prefix_miss = cases[0].clone();
+                    prefix_miss[prefix_len / 2] = suffix;
+                    cases.push(prefix_miss);
+                }
+
+                for haystack in cases {
+                    let counted = plan
+                        .find(&haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        plan.ordinary_find_full_unmetered(&haystack)
+                            .expect("representable fixture envelope")
+                            .unwrap(),
+                        counted,
+                        "implementation={:?} prefix_len={prefix_len} haystack_len={}",
+                        plan.implementation(),
+                        haystack.len(),
+                    );
+                    assert_eq!(
+                        plan.ordinary_is_match_full_unmetered(&haystack)
+                            .expect("representable fixture envelope")
+                            .unwrap(),
+                        counted.is_some(),
+                        "implementation={:?} prefix_len={prefix_len} haystack_len={}",
+                        plan.implementation(),
+                        haystack.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_ordinary_full_envelope_has_exact_source_free_boundaries() {
+        let largest_work = usize::try_from(u64::MAX).unwrap_or(usize::MAX);
+        let range = fixed(ByteClass::inclusive(b'a', b'z'), b"Z");
+        let largest_range = largest_work.checked_sub(RANGE_BLOCK).unwrap();
+        assert!(range.ordinary_full_envelope_fits(largest_range));
+        if let Some(one_above) = largest_range.checked_add(1) {
+            assert!(!range.ordinary_full_envelope_fits(one_above));
+        }
+
+        let bitset = fixed(ByteClass::from_bytes(&[0, 2, 4, 6, 0x80, 0xFF]), b"Z");
+        assert_eq!(bitset.implementation(), ClassImplementation::Bitset);
+        assert!(bitset.ordinary_full_envelope_fits(largest_work));
+        if let Some(one_above) = largest_work.checked_add(1) {
+            assert!(!bitset.ordinary_full_envelope_fits(one_above));
         }
     }
 

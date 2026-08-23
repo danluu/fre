@@ -435,13 +435,20 @@ fn fixed_facade_matches_pinned_rust_bytes_for_greedy_lazy_and_captures() {
                                 .0,
                             expected.map(|(_, end)| end)
                         );
+                        assert_eq!(
+                            fre.find(haystack)
+                                .map(|matched| (matched.start(), matched.end())),
+                            expected,
+                            "ordinary pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        assert_eq!(fre.is_match(haystack), expected.is_some());
                         span_comparisons += 1;
-                        projection_comparisons += 3;
+                        projection_comparisons += 5;
                     }
                 }
             }
         }
     }
     assert_eq!(span_comparisons, 52_416);
-    assert_eq!(projection_comparisons, 157_248);
+    assert_eq!(projection_comparisons, 262_080);
 }

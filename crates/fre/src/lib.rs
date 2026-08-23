@@ -12709,8 +12709,15 @@ impl PortableRegex {
                     return result.map_err(SearchError::from);
                 }
             }
-            // The separately proved `ForwardEndFixed` owner and every other
-            // family deliberately keep their existing ordinary fallbacks.
+            PortablePlan::ForwardEndFixed(plan) => {
+                if let Some(result) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_exists();
+                    return result.map_err(SearchError::from);
+                }
+            }
+            // Every other family deliberately keeps its existing ordinary
+            // fallback.
             _ => {}
         }
         let window = SearchWindow::full(haystack);
@@ -14388,8 +14395,17 @@ impl PortableRegex {
                         .map_err(SearchError::from);
                 }
             }
-            // The separately proved `ForwardEndFixed` owner and every other
-            // family deliberately keep their existing ordinary fallbacks.
+            PortablePlan::ForwardEndFixed(plan) => {
+                if let Some(result) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_span();
+                    return result
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from);
+                }
+            }
+            // Every other family deliberately keeps its existing ordinary
+            // fallback.
             _ => {}
         }
         let window = SearchWindow::full(haystack);
@@ -49856,6 +49872,11 @@ mod tests {
         assert!(matches!(&fixed.plan, PortablePlan::ForwardEndFixed(_)));
         assert!(fixed.is_match(haystack));
         assert_eq!(fixed.find(haystack), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (2, 2),
+            "fixed-end ordinary values use only their full-window projection",
+        );
 
         let unrelated = PortableBuilder::new(r"(?-u:[ab]+Z)")
             .unicode(false)
@@ -49867,8 +49888,8 @@ mod tests {
         assert_eq!(unrelated.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (1, 1),
-            "fixed-end and unrelated owners cannot enter the forward ordinary route",
+            (2, 2),
+            "unrelated owners cannot enter the forward ordinary route",
         );
     }
 
