@@ -12,6 +12,7 @@ const ES8I_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32
 fn forced(pattern: &str) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
         .unicode(false)
+        .limits(BuildLimits::default())
         .plan_selection(PlanSelection::ForceForwardAnchored)
         .build()
         .unwrap()
@@ -211,6 +212,7 @@ fn red_cache_key_equality_retains_every_required_field() {
     let profile_key = PortableBuilder::new(r"\A[aceg]+ZQ\z")
         .profile(alternate_profile)
         .unicode(false)
+        .limits(BuildLimits::default())
         .plan_selection(PlanSelection::ForceForwardAnchored)
         .build()
         .unwrap()
@@ -235,6 +237,7 @@ fn red_cache_key_equality_retains_every_required_field() {
         profile.options.unicode = false;
         let alternate = PortableBuilder::new(r"(?-ix:\A[aceg]+ZQ\z)")
             .profile(profile)
+            .limits(BuildLimits::default())
             .plan_selection(PlanSelection::ForceForwardAnchored)
             .build()
             .unwrap()
