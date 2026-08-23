@@ -682,6 +682,31 @@ impl RequiredLiteralPlan {
         self.find_window_with_run_scanner(haystack, window, limits, None)
     }
 
+    /// Find the selected span without retaining actual-event accounting.
+    ///
+    /// An unanchored `CLASS+ SUFFIX` plan first selects the same ordered
+    /// suffix witness as [`Self::find_window`], then recovers the greedy class
+    /// start with the construction-selected scalar implementation. Anchored
+    /// plans retain the established accounted span search because absolute
+    /// anchor validation is part of candidate selection.
+    ///
+    /// This preserves the complete incumbent preflight envelope and its error
+    /// order. Only actual-event counter updates are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.find_window_value_with_run_scanner(haystack, window, limits, None)
+    }
+
     /// Return whether an unanchored `CLASS+ SUFFIX` match exists wholly
     /// within `window`, together with the incumbent search envelope.
     ///
@@ -903,6 +928,44 @@ impl RequiredLiteralPlan {
                 },
             )?;
         }
+    }
+
+    #[inline]
+    fn find_window_value_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        debug_assert!(backward_scanner.is_none() || self.class.is_ascii());
+        if self.anchors != Anchors::default() {
+            return self
+                .find_window_with_run_scanner(haystack, window, limits, backward_scanner)
+                .map(|(matched, _)| matched);
+        }
+        let Some(end) = self.first_acceptance_window_value_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            backward_scanner,
+        )?
+        else {
+            return Ok(None);
+        };
+        let candidate = end.checked_sub(self.suffix().len()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "value-only accepted suffix candidate",
+            },
+        )?;
+        let start = backward_class_run_start_value(
+            haystack,
+            window.start(),
+            candidate,
+            self.class,
+            backward_scanner,
+        )?;
+        Ok(Some((start, end)))
     }
 
     #[allow(
@@ -1833,6 +1896,31 @@ impl DispatchedRequiredLiteralPlan {
         )
     }
 
+    /// Find the selected span without retaining actual-event accounting.
+    ///
+    /// Unanchored plans use the retained dispatched backward scanner after
+    /// selecting the first accepting suffix witness. Anchored plans retain
+    /// the established accounted span search.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range/resource failure, in the same preflight
+    /// order, as [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.plan.find_window_value_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            self.backward_scanner.as_ref(),
+        )
+    }
+
     /// Return whether an unanchored `CLASS+ SUFFIX` match exists wholly
     /// within `window`, together with the incumbent dispatched envelope.
     /// Anchored plans retain their established span search.
@@ -1963,6 +2051,54 @@ fn backward_class_run_start(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "actual backward vector examinations",
         })?;
+    start
+        .checked_sub(backward.member_run_len())
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "backward vector confirmation start",
+        })
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "the accounting-free ordinary span projection keeps the same scalar tail in its candidate path"
+)]
+#[inline(always)]
+fn backward_class_run_start_value(
+    haystack: &[u8],
+    confirmation_start: usize,
+    candidate: usize,
+    class: ByteClass,
+    backward_scanner: Option<&AsciiByteSetRunScanner>,
+) -> Result<usize, SearchError> {
+    let scalar_floor = backward_scanner.map_or(confirmation_start, |_| {
+        candidate
+            .saturating_sub(SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES)
+            .max(confirmation_start)
+    });
+    let mut start = candidate;
+    while start > scalar_floor {
+        let previous = start
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "backward confirmation position",
+            })?;
+        if !class.contains(haystack[previous]) {
+            return Ok(start);
+        }
+        start = previous;
+    }
+    let Some(scanner) = backward_scanner else {
+        return Ok(start);
+    };
+    if start == confirmation_start {
+        return Ok(start);
+    }
+
+    let backward = scanner.scan_backward(haystack.get(confirmation_start..start).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "backward vector confirmation slice",
+        },
+    )?);
     start
         .checked_sub(backward.member_run_len())
         .ok_or(SearchError::ArithmeticOverflow {
@@ -2957,6 +3093,233 @@ mod tests {
                 "anchored endpoint anchors={anchors:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps scalar/dispatched witnesses, windows, long runs, and anchor delegation aligned"
+    )]
+    fn find_window_value_matches_accounted_spans_across_suffixes_and_windows() {
+        let class = ByteClass::from_bytes(b"a");
+        let dispatch = SimdDispatchContext::capture();
+        for suffix_len in [1_usize, 2, 3, 8, 17] {
+            let suffix = unbordered_suffix(suffix_len);
+            let scalar = RequiredLiteralPlan::build(
+                class,
+                &suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched = RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                &suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let mut cases = first_probe_cases(&suffix);
+            let mut long_run = vec![b'a'; 513];
+            long_run.extend_from_slice(&suffix);
+            cases.push(("long-run", long_run, 1, 1));
+
+            for (case, body, _, _) in cases {
+                let full = Window::full(&body);
+                let scalar_expected = scalar
+                    .find_window(&body, full, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                let dispatched_expected = dispatched
+                    .find_window(&body, full, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(scalar_expected, dispatched_expected);
+                assert_eq!(
+                    scalar.find_window_value(&body, full, SearchLimits::unlimited()),
+                    Ok(scalar_expected),
+                    "scalar full case={case} suffix_len={suffix_len}",
+                );
+                assert_eq!(
+                    dispatched.find_window_value(&body, full, SearchLimits::unlimited()),
+                    Ok(dispatched_expected),
+                    "dispatched full case={case} suffix_len={suffix_len}",
+                );
+
+                let mut wrapped = b"<>".to_vec();
+                let start = wrapped.len();
+                wrapped.extend_from_slice(&body);
+                let end = wrapped.len();
+                wrapped.extend_from_slice(b"[]");
+                let window = Window::new(start, end);
+                let scalar_window_expected = scalar
+                    .find_window(&wrapped, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                let dispatched_window_expected = dispatched
+                    .find_window(&wrapped, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(scalar_window_expected, dispatched_window_expected);
+                assert_eq!(
+                    scalar.find_window_value(
+                        &wrapped,
+                        window,
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(scalar_window_expected),
+                    "scalar window case={case} suffix_len={suffix_len}",
+                );
+                assert_eq!(
+                    dispatched.find_window_value(
+                        &wrapped,
+                        window,
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(dispatched_window_expected),
+                    "dispatched window case={case} suffix_len={suffix_len}",
+                );
+            }
+        }
+
+        for anchors in [
+            Anchors {
+                start: true,
+                end: false,
+            },
+            Anchors {
+                start: false,
+                end: true,
+            },
+            Anchors {
+                start: true,
+                end: true,
+            },
+        ] {
+            let scalar = RequiredLiteralPlan::build(
+                class,
+                b"ZQ",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched = RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"ZQ",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            for haystack in [b"aaaaZQ".as_slice(), b"!aaaaZQ", b"aaaaZQ!"] {
+                let window = Window::full(haystack);
+                let scalar_expected = scalar
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                let dispatched_expected = dispatched
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    scalar.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(scalar_expected),
+                    "scalar anchors={anchors:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    dispatched.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(dispatched_expected),
+                    "dispatched anchors={anchors:?} haystack={haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn find_window_value_preserves_preflight_refusal_order_before_search() {
+        let class = ByteClass::from_bytes(b"a");
+        let scalar = RequiredLiteralPlan::build(
+            class,
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = RequiredLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            class,
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"!ZQ!aaaaZQ";
+        let window = Window::full(haystack);
+
+        macro_rules! assert_preflight {
+            ($plan:expr, $owner:literal) => {{
+                let expected = $plan
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap();
+                let exact = SearchLimits {
+                    max_work_upper_bound: expected.1.work_upper_bound,
+                    max_candidate_visits: expected.1.candidate_visits_upper_bound,
+                    max_scratch_bytes: expected.1.scratch_bytes,
+                };
+                assert_eq!(
+                    $plan.find_window_value(haystack, window, exact),
+                    Ok(expected.0),
+                    "{} exact preflight",
+                    $owner,
+                );
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits {
+                            max_candidate_visits: exact.max_candidate_visits - 1,
+                            ..exact
+                        },
+                    ),
+                    Err(SearchError::CandidateLimit { .. })
+                ));
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        window,
+                        SearchLimits {
+                            max_work_upper_bound: exact.max_work_upper_bound - 1,
+                            ..exact
+                        },
+                    ),
+                    Err(SearchError::WorkLimit { .. })
+                ));
+                assert!(matches!(
+                    $plan.find_window_value(
+                        haystack,
+                        Window::new(2, 1),
+                        SearchLimits {
+                            max_work_upper_bound: 0,
+                            max_candidate_visits: 0,
+                            max_scratch_bytes: 0,
+                        },
+                    ),
+                    Err(SearchError::InvalidWindow { .. })
+                ));
+            }};
+        }
+
+        assert_preflight!(scalar, "scalar");
+        assert_preflight!(dispatched, "dispatched");
     }
 
     #[test]
