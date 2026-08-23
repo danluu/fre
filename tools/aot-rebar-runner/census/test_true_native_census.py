@@ -1019,6 +1019,163 @@ class TrueNativeCensusTests(unittest.TestCase):
             ([fill], "linked-span-fill"),
         )
 
+    def test_every_operation_route_has_a_closed_boundary_classification(self) -> None:
+        expected = {
+            "linked-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-span-sum-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-span-fill": (
+                True,
+                False,
+                "native-span-fill-core-with-checked-rust-reduction-adapter-loop",
+            ),
+            "linked-direct-entry-adapter-loop": (
+                True, False, "native-search-core-with-adapter-outer-loop"
+            ),
+            "linked-prepared-span-fill-grep-adapter-loop": (
+                True,
+                False,
+                "native-prepared-span-fill-core-with-per-line-adapter-loop",
+            ),
+            "linked-fixed-composite-adapter-loop": (
+                True, False, "native-search-core-with-adapter-outer-loop"
+            ),
+            "linked-native-row-adapter-loop": (
+                True, False, "native-search-core-with-adapter-outer-loop"
+            ),
+            "linked-uniform-capture-row-adapter-loop": (
+                True,
+                False,
+                "native-search-core-with-static-uniform-capture-adapter-loop",
+            ),
+            "linked-exact-span-participation-adapter-loop": (
+                True,
+                False,
+                "native-search-capture-core-with-exact-span-replay-adapter-loop",
+            ),
+            "linked-strict-capture-next-adapter-loop": (
+                True,
+                False,
+                "native-search-capture-core-with-checked-rust-adapter-loop",
+            ),
+            "linked-selector-negative-certificate-adapter-loop": (
+                True,
+                False,
+                "native-negative-certificate-with-unused-stock-capture-fallback",
+            ),
+        }
+        self.assertEqual(set(CENSUS.OPERATION_ROUTE_POLICIES), set(expected))
+        receipt = synthetic_qualification_receipt(synthetic_plan())
+        entries = receipt["route"]["operation_entry_symbols"]
+        phases = receipt["phases"]
+        for route, (adapter, whole, reason) in expected.items():
+            with self.subTest(route=route):
+                classification = CENSUS.classification_from_qualification_evidence(
+                    True, entries, route, [], phases, "aarch64"
+                )
+                self.assertTrue(
+                    classification["native_search_core_authenticated"]
+                )
+                self.assertEqual(classification["adapter_outer_loop"], adapter)
+                self.assertEqual(
+                    classification["whole_operation_native_authenticated"], whole
+                )
+                self.assertEqual(classification["reason"], reason)
+
+    def test_span_fill_is_a_checked_rust_reduction_adapter(self) -> None:
+        receipt = synthetic_qualification_receipt(synthetic_plan())
+        classification = CENSUS.classification_from_qualification_evidence(
+            True,
+            receipt["route"]["operation_entry_symbols"],
+            "linked-span-fill",
+            [],
+            receipt["phases"],
+            "aarch64",
+        )
+        self.assertTrue(classification["native_search_core_authenticated"])
+        self.assertTrue(classification["adapter_outer_loop"])
+        self.assertFalse(
+            classification["whole_operation_native_authenticated"]
+        )
+
+    def test_unknown_operation_route_fails_closed_even_with_adapter_suffix(self) -> None:
+        receipt = synthetic_qualification_receipt(synthetic_plan())
+        with self.assertRaisesRegex(CENSUS.CensusError, "unknown operation route"):
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                receipt["route"]["operation_entry_symbols"],
+                "linked-future-native-adapter-loop",
+                [],
+                receipt["phases"],
+                "aarch64",
+            )
+
+    def test_only_exact_native_span_sum_strategy_selects_whole_reducer(self) -> None:
+        suffix = "a" * 64
+        reducer = f"fre_aot_regex_span_sum_exclusive_v1_{suffix}"
+        span_fill = f"fre_aot_regex_fill_spans_exclusive_v1_{suffix}"
+        normalized = {
+            "kind": "scalar-v2",
+            "components": [],
+            "model": "count-spans",
+            "aggregate_strategy": "Some(NativeFused)",
+            "span_iteration_strategy": "linked-native-span-sum-reducer",
+            "reducer_symbol": reducer,
+            "span_fill_symbol": span_fill,
+            "entry_symbol": f"fre_aot_regex_search_v1_{suffix}",
+        }
+        for strategy in (
+            "Some(NativeFused)",
+            "Some(NativeOrderedNfaFused)",
+        ):
+            with self.subTest(strategy=strategy):
+                provenance = {**normalized, "aggregate_strategy": strategy}
+                self.assertEqual(
+                    CENSUS.operation_route_from_provenance_record(provenance),
+                    ([reducer], "linked-span-sum-reducer"),
+                )
+                self.assertEqual(
+                    CENSUS.selected_operation_entries(
+                        {**provenance, "schema": "fre.aot.rebar-runner.v2"}
+                    ),
+                    ([reducer], "linked-span-sum-reducer"),
+                )
+
+        span_fill_route = {
+            **normalized,
+            "span_iteration_strategy": "linked-prepared-span-fill-64::Some(NativeDfaLoop)",
+        }
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(span_fill_route),
+            ([span_fill], "linked-span-fill"),
+        )
+
+    def test_helper_or_unknown_span_sum_reducer_strategy_fails_closed(self) -> None:
+        suffix = "b" * 64
+        provenance = {
+            "kind": "scalar-v2",
+            "components": [],
+            "model": "count-spans",
+            "span_iteration_strategy": "linked-native-span-sum-reducer",
+            "reducer_symbol": f"fre_aot_regex_span_sum_exclusive_v1_{suffix}",
+            "span_fill_symbol": f"fre_aot_regex_fill_spans_exclusive_v1_{suffix}",
+            "entry_symbol": f"fre_aot_regex_search_v1_{suffix}",
+        }
+        for strategy in (
+            "Some(NativeFusedWithRuntimeHelper)",
+            "Some(FutureNativeFused)",
+        ):
+            with self.subTest(strategy=strategy):
+                with self.assertRaisesRegex(
+                    CENSUS.CensusError, "helper-backed or unknown"
+                ):
+                    CENSUS.operation_route_from_provenance_record(
+                        {**provenance, "aggregate_strategy": strategy}
+                    )
+
     def test_composite_v3_requires_and_returns_every_component_entry(self) -> None:
         fields = {
             "schema": "fre.aot.rebar-runner.v3",

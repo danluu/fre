@@ -27,10 +27,10 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - native search cores / successfully executed jobs (diagnostic only); and
 - the raw runtime schedule-point denominator for comparison with older runs.
 
-`count-spans` direct-entry iteration, per-line `grep`, the static uniform
-capture multiplier route, the helper-free exact-span participation route, the
-selector-negative/stock-positive capture route, and the strict native
-`capture_next` route can
+`count-spans` direct-entry or Span-fill iteration, per-line `grep`, the static
+uniform capture multiplier route, the helper-free exact-span participation
+route, the selector-negative/stock-positive capture route, and the strict
+native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. The uniform route is labelled separately from both a fused capture
@@ -57,6 +57,15 @@ allocation, resource, emission,
 authentication, multi-source, or remaining semantic decline fails the
 all-or-nothing build and must receive a `record-failure` receipt. It remains in
 the 311-job denominator as nonnative rather than disappearing as unsupported.
+
+The strict whole-operation boundary is a closed route classification, not a
+route-name suffix convention. A scalar `count-spans` artifact receives that
+classification only when its exact `Some(NativeFused)` or
+`Some(NativeOrderedNfaFused)` receipt is selected through
+`linked-native-span-sum-reducer`. A Span-fill entry still leaves refill,
+validation, and reduction in Rust and therefore remains an adapter-loop route.
+An unknown route, or a helper-backed or unknown aggregate strategy claiming
+the native SpanSum reducer iteration, is rejected rather than inferred native.
 
 ## Privacy boundary and static dry run
 

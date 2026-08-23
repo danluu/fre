@@ -20,7 +20,8 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from typing import Optional
+from enum import Enum
+from typing import NamedTuple, Optional
 
 
 PLAN_SCHEMA = "fre.aot-rebar.true-native-plan.v2"
@@ -86,6 +87,9 @@ NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL = re.compile(
 NATIVE_COUNT_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_count_exclusive_v1_[0-9a-f]{64}$"
 )
+NATIVE_SPAN_SUM_ENTRY_SYMBOL = re.compile(
+    r"^fre_aot_regex_span_sum_exclusive_v1_[0-9a-f]{64}$"
+)
 NATIVE_SPAN_FILL_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
 )
@@ -139,6 +143,87 @@ TRAP_PATCHES = {"x86_64": "0f0b", "aarch64": "000020d4"}
 
 class CensusError(RuntimeError):
     """A fail-closed census validation error."""
+
+
+class OperationBoundary(Enum):
+    """Closed distinction between a native result and native search glue."""
+
+    WHOLE_OPERATION = "whole-operation"
+    RUST_ADAPTER_LOOP = "rust-adapter-loop"
+
+
+class OperationRoutePolicy(NamedTuple):
+    boundary: OperationBoundary
+    success_reason: str
+
+
+OPERATION_ROUTE_POLICIES = {
+    "linked-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
+    "linked-span-sum-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
+    "linked-span-fill": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-span-fill-core-with-checked-rust-reduction-adapter-loop",
+    ),
+    "linked-direct-entry-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-core-with-adapter-outer-loop",
+    ),
+    "linked-prepared-span-fill-grep-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-prepared-span-fill-core-with-per-line-adapter-loop",
+    ),
+    "linked-fixed-composite-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-core-with-adapter-outer-loop",
+    ),
+    "linked-native-row-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-core-with-adapter-outer-loop",
+    ),
+    "linked-uniform-capture-row-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-core-with-static-uniform-capture-adapter-loop",
+    ),
+    "linked-exact-span-participation-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-capture-core-with-exact-span-replay-adapter-loop",
+    ),
+    "linked-strict-capture-next-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-search-capture-core-with-checked-rust-adapter-loop",
+    ),
+    "linked-selector-negative-certificate-adapter-loop": OperationRoutePolicy(
+        OperationBoundary.RUST_ADAPTER_LOOP,
+        "native-negative-certificate-with-unused-stock-capture-fallback",
+    ),
+}
+NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES = {
+    "Some(NativeFused)",
+    "Some(NativeOrderedNfaFused)",
+}
+NATIVE_SPAN_SUM_ITERATION_STRATEGY = "linked-native-span-sum-reducer"
+
+
+def selects_native_span_sum_reducer(provenance: dict[str, object]) -> bool:
+    """Authenticate the exact scalar SpanSum operation route or fail closed."""
+    if (
+        provenance.get("model") != "count-spans"
+        or provenance.get("span_iteration_strategy")
+        != NATIVE_SPAN_SUM_ITERATION_STRATEGY
+    ):
+        return False
+    strategy = provenance.get("aggregate_strategy")
+    if strategy not in NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES:
+        raise CensusError(
+            "native SpanSum reducer has a helper-backed or unknown aggregate strategy"
+        )
+    return True
 
 
 def has_exact_adapter(model: str, pattern_count: int) -> bool:
@@ -2243,6 +2328,8 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         raise CensusError(f"unknown composite operation route for model {model!r}")
     if model == "count":
         return [provenance["reducer_symbol"]], "linked-reducer"
+    if selects_native_span_sum_reducer(provenance):
+        return [provenance["reducer_symbol"]], "linked-span-sum-reducer"
     if model == "count-spans" and provenance["span_fill_symbol"]:
         return [provenance["span_fill_symbol"]], "linked-span-fill"
     if (
@@ -2660,6 +2747,10 @@ def operation_route_from_provenance_record(
         entries = [provenance["reducer_symbol"]]
         route = "linked-reducer"
         expected_symbol = NATIVE_COUNT_ENTRY_SYMBOL
+    elif selects_native_span_sum_reducer(provenance):
+        entries = [provenance["reducer_symbol"]]
+        route = "linked-span-sum-reducer"
+        expected_symbol = NATIVE_SPAN_SUM_ENTRY_SYMBOL
     elif model == "count-spans" and provenance["span_fill_symbol"]:
         entries = [provenance["span_fill_symbol"]]
         route = "linked-span-fill"
@@ -2766,6 +2857,12 @@ def classification_from_qualification_evidence(
     phases: dict[str, object],
     expected_architecture: str,
 ) -> dict[str, object]:
+    try:
+        route_policy = OPERATION_ROUTE_POLICIES[adapter_route]
+    except KeyError as error:
+        raise CensusError(
+            f"qualification names unknown operation route {adapter_route!r}"
+        ) from error
     unmodified = phases["unmodified_oracle"]
     helper = phases["semantic_helper_trap"]
     helper_phase = helper["process"]
@@ -2779,8 +2876,12 @@ def classification_from_qualification_evidence(
         entries, controls, expected_architecture
     )
     core_native = reproducible and executed and helper_pass and negative_pass
-    adapter_outer_loop = adapter_route.endswith("-adapter-loop")
-    whole_native = core_native and not adapter_outer_loop
+    adapter_outer_loop = (
+        route_policy.boundary is OperationBoundary.RUST_ADAPTER_LOOP
+    )
+    whole_native = (
+        core_native and route_policy.boundary is OperationBoundary.WHOLE_OPERATION
+    )
     if not reproducible:
         reason = "non-reproducible-build"
     elif unmodified["outcome"] == "timeout":
@@ -2795,20 +2896,8 @@ def classification_from_qualification_evidence(
         reason = "helper-trap-control-failure"
     elif not negative_pass:
         reason = "claimed-entry-negative-control-failure"
-    elif adapter_route == "linked-uniform-capture-row-adapter-loop":
-        reason = "native-search-core-with-static-uniform-capture-adapter-loop"
-    elif adapter_route == "linked-strict-capture-next-adapter-loop":
-        reason = "native-search-capture-core-with-checked-rust-adapter-loop"
-    elif adapter_route == "linked-exact-span-participation-adapter-loop":
-        reason = "native-search-capture-core-with-exact-span-replay-adapter-loop"
-    elif adapter_route == "linked-selector-negative-certificate-adapter-loop":
-        reason = "native-negative-certificate-with-unused-stock-capture-fallback"
-    elif adapter_route == "linked-prepared-span-fill-grep-adapter-loop":
-        reason = "native-prepared-span-fill-core-with-per-line-adapter-loop"
-    elif adapter_outer_loop:
-        reason = "native-search-core-with-adapter-outer-loop"
     else:
-        reason = "whole-operation-native-authenticated"
+        reason = route_policy.success_reason
     return {
         "built_reproducibly": reproducible,
         "executed_oracle_correct": executed,
