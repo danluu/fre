@@ -1104,6 +1104,10 @@ impl PackedLiteralSetPlan {
     fn new_with_retained_iter<P: AsRef<[u8]>>(
         patterns: &[P],
         limits: PackedLiteralSetBuildLimits,
+        #[cfg_attr(
+            feature = "static-dispatch",
+            allow(unused_variables, reason = "retained native iteration is unavailable")
+        )]
         max_additional_build_work: Option<usize>,
     ) -> Result<Self, PackedLiteralSetError> {
         let mut build = preflight(patterns, limits)?;
@@ -2295,6 +2299,10 @@ fn select_shared_fragment<P: AsRef<[u8]>>(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "shared-fragment selection keeps one bounded scoring and allocation transaction"
+)]
 fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
     patterns: &[P],
     native_minimum_haystack_bytes: usize,
