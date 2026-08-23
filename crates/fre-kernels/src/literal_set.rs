@@ -1573,18 +1573,81 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         haystack: &[u8],
         window: Window,
         initial_direct: bool,
-        visitor: F,
+        mut visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
-        self.try_visit_spans_window_value_with_direct_recommendation(
-            haystack,
-            window,
-            initial_direct,
-            visitor,
-        )
-        .map(|(outcome, _)| outcome)
+        validate_window(window, haystack.len())?;
+        let uniform_width = self.pattern_bytes();
+        let mut cursor = window.start();
+        let mut direct_probe_bytes = initial_direct
+            .then(|| uniform_width.saturating_mul(8));
+        loop {
+            let search_start = cursor;
+            let matched = if let Some(probe_bytes) = direct_probe_bytes {
+                let probe_end = cursor.saturating_add(probe_bytes).min(window.end());
+                match first_acceptance_end_without_prefilter(
+                    self.plan,
+                    haystack,
+                    Window::new(cursor, probe_end),
+                ) {
+                    Some(end) => {
+                        debug_assert!(
+                            end.checked_sub(uniform_width)
+                                .is_some_and(|matched_start| matched_start >= cursor),
+                            "a selected fixed-width literal must begin within its search window",
+                        );
+                        Some((end - uniform_width, end))
+                    }
+                    None => {
+                        if probe_end == window.end() {
+                            // The direct scan covered the complete remaining
+                            // semantic window. Unlike a miss at an artificial
+                            // probe edge, no wholly contained match can cross
+                            // this boundary, so the miss is authoritative.
+                            return Ok(Ok(()));
+                        }
+                        // A miss costs at most one bounded direct probe. The
+                        // authoritative prefiltered search restarts at the
+                        // original cursor so a match crossing the probe edge
+                        // cannot be skipped.
+                        direct_probe_bytes = None;
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_adaptive_replay();
+                        self.plan.try_find_window_value(
+                            haystack,
+                            Window::new(cursor, window.end()),
+                        )?
+                    }
+                }
+            } else {
+                self.plan
+                    .try_find_window_value(haystack, Window::new(cursor, window.end()))?
+            };
+            let Some(matched) = matched else {
+                return Ok(Ok(()));
+            };
+            debug_assert!(
+                matched.1 > cursor,
+                "a positive-width literal-set match must advance its search cursor",
+            );
+            cursor = matched.1;
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+            if direct_probe_bytes.is_none() {
+                // An end within 2W places the selected start in the first W
+                // bytes. Once promoted, bound a mistaken density prediction
+                // to eight pattern widths before authoritative replay.
+                let promotion_bytes = uniform_width.saturating_mul(2);
+                if cursor.saturating_sub(search_start) <= promotion_bytes {
+                    direct_probe_bytes = Some(uniform_width.saturating_mul(8));
+                }
+            }
+        }
     }
 
     /// Visit every non-overlapping selected span and return whether one
@@ -1614,79 +1677,40 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
-        validate_window(window, haystack.len())?;
-        let uniform_width = self.pattern_bytes();
-        let promotion_bytes = uniform_width.saturating_mul(2);
-        let mut cursor = window.start();
-        let mut recent_near = false;
-        let mut direct_probe_bytes = initial_direct.then(|| uniform_width.saturating_mul(8));
-        loop {
-            let search_start = cursor;
-            let matched = if let Some(probe_bytes) = direct_probe_bytes {
-                let probe_end = cursor.saturating_add(probe_bytes).min(window.end());
-                match first_acceptance_end_without_prefilter(
-                    self.plan,
-                    haystack,
-                    Window::new(cursor, probe_end),
-                ) {
-                    Some(end) => {
-                        debug_assert!(
-                            end.checked_sub(uniform_width)
-                                .is_some_and(|matched_start| matched_start >= cursor),
-                            "a selected fixed-width literal must begin within its search window",
-                        );
-                        Some((end - uniform_width, end))
+        let promotion_bytes = self.pattern_bytes().saturating_mul(2);
+        let start = window.start();
+        let mut penultimate_end = start;
+        let mut previous_end = start;
+        let mut exhausted = true;
+        let outcome = self.try_visit_spans_window_value_with_initial_direct(
+            haystack,
+            window,
+            initial_direct,
+            |matched| {
+                penultimate_end = previous_end;
+                previous_end = matched.1;
+                match visitor(matched) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        exhausted = false;
+                        Ok(false)
                     }
-                    None => {
-                        if probe_end == window.end() {
-                            // The direct scan covered the complete remaining
-                            // semantic window. Unlike a miss at an artificial
-                            // probe edge, no wholly contained match can cross
-                            // this boundary, so the miss is authoritative.
-                            let terminal_near =
-                                window.end().saturating_sub(cursor) <= promotion_bytes;
-                            return Ok((Ok(()), recent_near && terminal_near));
-                        }
-                        // A miss costs at most one bounded direct probe. The
-                        // authoritative prefiltered search restarts at the
-                        // original cursor so a match crossing the probe edge
-                        // cannot be skipped. A terminal replay miss returns
-                        // false below instead of consulting prior evidence;
-                        // any replayed match derives fresh evidence.
-                        direct_probe_bytes = None;
-                        #[cfg(test)]
-                        ordinary_direct_probe::record_adaptive_replay();
-                        self.plan
-                            .try_find_window_value(haystack, Window::new(cursor, window.end()))?
+                    Err(error) => {
+                        exhausted = false;
+                        Err(error)
                     }
                 }
-            } else {
-                self.plan
-                    .try_find_window_value(haystack, Window::new(cursor, window.end()))?
-            };
-            let Some(matched) = matched else {
-                return Ok((Ok(()), false));
-            };
-            debug_assert!(
-                matched.1 > cursor,
-                "a positive-width literal-set match must advance its search cursor",
-            );
-            let matched_near = matched.1.saturating_sub(search_start) <= promotion_bytes;
-            cursor = matched.1;
-            match visitor(matched) {
-                Ok(true) => {}
-                Ok(false) => return Ok((Ok(()), false)),
-                Err(error) => return Ok((Err(error), false)),
+            },
+        )?;
+        match outcome {
+            Ok(()) => {
+                let next_direct = exhausted
+                    && previous_end != start
+                    && previous_end.saturating_sub(penultimate_end) <= promotion_bytes
+                    && window.end().saturating_sub(previous_end) <= promotion_bytes;
+                Ok((Ok(()), next_direct))
             }
-            recent_near = matched_near;
-            if direct_probe_bytes.is_none() {
-                // An end within 2W places the selected start in the first W
-                // bytes. Once promoted, bound a mistaken density prediction
-                // to eight pattern widths before authoritative replay.
-                if matched_near {
-                    direct_probe_bytes = Some(uniform_width.saturating_mul(8));
-                }
-            }
+            Err(error) => Ok((Err(error), false)),
         }
     }
 }
@@ -4257,13 +4281,15 @@ mod tests {
         spans: &[(usize, usize)],
     ) -> bool {
         let near_bytes = uniform_width.saturating_mul(2);
-        let mut cursor = window.start();
-        let mut recent_near = false;
+        let mut penultimate_end = window.start();
+        let mut previous_end = window.start();
         for &(_, end) in spans {
-            recent_near = end.saturating_sub(cursor) <= near_bytes;
-            cursor = end;
+            penultimate_end = previous_end;
+            previous_end = end;
         }
-        recent_near && window.end().saturating_sub(cursor) <= near_bytes
+        previous_end != window.start()
+            && previous_end.saturating_sub(penultimate_end) <= near_bytes
+            && window.end().saturating_sub(previous_end) <= near_bytes
     }
 
     fn assert_leftmost_window_differential(
@@ -4601,8 +4627,8 @@ mod tests {
         crossing[57..65].copy_from_slice(&patterns[0]);
         ordinary_direct_probe::reset();
         let mut crossing_actual = Vec::new();
-        let (crossing_outcome, crossing_next_direct) = uniform
-            .try_visit_spans_window_value_with_direct_recommendation(
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
                 &crossing,
                 Window::full(&crossing),
                 true,
@@ -4610,10 +4636,9 @@ mod tests {
                     crossing_actual.push(matched);
                     Ok::<bool, ()>(true)
                 },
-            )
-            .unwrap();
-        assert_eq!(crossing_outcome, Ok(()));
-        assert!(!crossing_next_direct);
+            ),
+            Ok(Ok(())),
+        );
         assert_eq!(crossing_actual, [(57, 65)]);
         assert_eq!(ordinary_direct_probe::calls(), 1);
         assert_eq!(ordinary_direct_probe::adaptive_replays(), 1);
@@ -4629,8 +4654,8 @@ mod tests {
             let covered_window = Window::new(2, 2 + remaining);
             ordinary_direct_probe::reset();
             let mut callback_called = false;
-            let (covered_outcome, next_direct) = uniform
-                .try_visit_spans_window_value_with_direct_recommendation(
+            assert_eq!(
+                uniform.try_visit_spans_window_value_with_initial_direct(
                     &covered,
                     covered_window,
                     true,
@@ -4638,10 +4663,9 @@ mod tests {
                         callback_called = true;
                         Ok::<bool, ()>(true)
                     },
-                )
-                .unwrap();
-            assert_eq!(covered_outcome, Ok(()));
-            assert!(!next_direct);
+                ),
+                Ok(Ok(())),
+            );
             assert!(!callback_called);
             assert_eq!(ordinary_direct_probe::calls(), 1);
             assert_eq!(ordinary_direct_probe::adaptive_replays(), 0);
@@ -4763,6 +4787,30 @@ mod tests {
         );
         assert!(!invalid_callback_called);
         assert_eq!(ordinary_direct_probe::calls(), 0);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
+                &far,
+                Window::full(&far),
+                true,
+                |_| Ok::<bool, ()>(false),
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 1);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
+                &far,
+                Window::full(&far),
+                true,
+                |_| Err::<bool, _>("callback"),
+            ),
+            Ok(Err("callback")),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 1);
 
         ordinary_direct_probe::reset();
         assert_eq!(

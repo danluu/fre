@@ -21116,23 +21116,46 @@ impl<'r> PortableOrdinarySession<'r> {
                 direct_next,
             } => {
                 let initial_direct = core::mem::take(direct_next);
+                let promotion_bytes = executor.pattern_bytes().saturating_mul(2);
+                let mut penultimate_end = start;
+                let mut previous_end = start;
+                let mut exhausted = true;
                 let mut visitor = visitor;
-                let (outcome, next_direct) = executor
-                    .try_visit_spans_window_value_with_direct_recommendation(
+                let outcome = executor
+                    .try_visit_spans_window_value_with_initial_direct(
                         haystack,
                         LiteralWindow::new(start, haystack.len()),
                         initial_direct,
-                        |(start, end)| visitor(Match { start, end }),
+                        |(matched_start, end)| {
+                            penultimate_end = previous_end;
+                            previous_end = end;
+                            match visitor(Match {
+                                start: matched_start,
+                                end,
+                            }) {
+                                Ok(true) => Ok(true),
+                                Ok(false) => {
+                                    exhausted = false;
+                                    Ok(false)
+                                }
+                                Err(error) => {
+                                    exhausted = false;
+                                    Err(error)
+                                }
+                            }
+                        },
                     )
                     .map_err(SearchError::from)
                     .map_err(PortableFindIterError::Search)?;
-                match outcome {
-                    Ok(()) => {
-                        *direct_next = next_direct;
-                        Ok(Ok(()))
-                    }
-                    Err(error) => Ok(Err(error)),
+                if exhausted
+                    && outcome.is_ok()
+                    && previous_end != start
+                    && previous_end.saturating_sub(penultimate_end) <= promotion_bytes
+                    && haystack.len().saturating_sub(previous_end) <= promotion_bytes
+                {
+                    *direct_next = true;
                 }
+                Ok(outcome)
             }
         }
     }
@@ -21207,13 +21230,18 @@ impl<'r> PortableOrdinarySession<'r> {
                 direct_next,
             } => {
                 let initial_direct = core::mem::take(direct_next);
+                let promotion_bytes = executor.pattern_bytes().saturating_mul(2);
+                let mut penultimate_end = start;
+                let mut previous_end = start;
                 let mut count = 0_u64;
-                let (outcome, next_direct) = executor
-                    .try_visit_spans_window_value_with_direct_recommendation(
+                let outcome = executor
+                    .try_visit_spans_window_value_with_initial_direct(
                         haystack,
                         LiteralWindow::new(start, haystack.len()),
                         initial_direct,
-                        |_| {
+                        |(_, end)| {
+                            penultimate_end = previous_end;
+                            previous_end = end;
                             count = count.checked_add(1).ok_or(
                                 LiteralSetError::ArithmeticOverflow {
                                     computation: "positive-width literal-set match count",
@@ -21224,7 +21252,12 @@ impl<'r> PortableOrdinarySession<'r> {
                     )
                     .map_err(SearchError::from)?;
                 outcome.map_err(SearchError::from)?;
-                *direct_next = next_direct;
+                if previous_end != start
+                    && previous_end.saturating_sub(penultimate_end) <= promotion_bytes
+                    && haystack.len().saturating_sub(previous_end) <= promotion_bytes
+                {
+                    *direct_next = true;
+                }
                 Ok(Some(count))
             }
             _ => Ok(None),
@@ -40519,6 +40552,7 @@ mod tests {
         let distinct = b"p002yyyy";
         let miss = b"zzzzzzzz";
         let far = b"zzzzzzzzp000";
+        let seeded_tail = b"p000p001p002";
         let mut exact_probe_edge = vec![b'z'; 36];
         exact_probe_edge[28..32].copy_from_slice(b"p003");
         let mut crossing_probe_edge = vec![b'z'; 36];
@@ -40531,6 +40565,26 @@ mod tests {
 
         super::literal_set_dfa_ordinary_route_probe::reset();
         assert!(!direct_next(&ordinary));
+
+        // An exhaustive dense span call learns the next-call route even when
+        // it starts cold. This is the first-line case for an embedding that
+        // retains one ordinary session across successive lines.
+        let mut cold_spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(seeded_tail, |matched| {
+                    cold_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(cold_spans, [(0, 4), (4, 8), (8, 12)]);
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(miss, 0), Ok(None));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 1));
+        assert!(!direct_next(&ordinary));
+        super::literal_set_dfa_ordinary_route_probe::reset();
 
         // A first near result is prefiltered and promotes exactly its
         // successor. Another near result may re-promote the following call.
@@ -40626,7 +40680,6 @@ mod tests {
 
         // Exhaustive span iteration may carry a source-free recommendation
         // when both its final selected-end spacing and terminal gap are near.
-        let seeded_tail = b"p000p001p002";
         assert_eq!(
             ordinary.find_at(seeded_tail, 0),
             Ok(Some(Match { start: 0, end: 4 }))
@@ -40743,8 +40796,18 @@ mod tests {
         assert!(!callback_called);
         assert!(!direct_next(&ordinary));
 
-        // Native count publishes the same exhaustive terminal recommendation
-        // without asking the embedding to retry with span iteration.
+        // Native count also learns the next-call route from a cold exhaustive
+        // dense call, without asking the embedding to retry with spans.
+        assert!(!direct_next(&ordinary));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(seeded_tail, 0),
+            Ok(Some(3)),
+        );
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(miss, 0), Ok(None));
+        assert!(!direct_next(&ordinary));
+
+        // A seeded tail count publishes the same exhaustive recommendation.
         assert_eq!(
             ordinary.find_at(seeded_tail, 0),
             Ok(Some(Match { start: 0, end: 4 }))
