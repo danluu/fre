@@ -5331,6 +5331,39 @@ impl CompiledModule {
         } else {
             (None, None)
         };
+        if ordered_nfa_operation_only {
+            // Ordered-NFA relocation records and the public compatibility
+            // layout deliberately keep their established symbol ordinals.
+            // Fill the two runtime-only ordinals with defined local program
+            // aliases for the closed surface: this preserves every legacy
+            // ordinal without publishing a runtime symbol or dependency.
+            if symbols.len() != RUNTIME_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "operation-only Ordered-NFA symbol prefix is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_operation_program_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+            if symbols.len() != RUNTIME_PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "operation-only Ordered-NFA symbol padding is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_operation_identity_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+        }
         if let Some(table) = slow_partial_table {
             if symbols.len() != SLOW_PARTIAL_TABLE_SYMBOL {
                 return Err(ObjectError::InvalidModule(
