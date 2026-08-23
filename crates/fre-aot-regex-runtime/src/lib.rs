@@ -5542,10 +5542,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_is_match_batch_exclusive_v1(
 /// Authenticate one compiler-owned static native prefix search.
 ///
 /// This compiler-private entry validates the ordinary exclusive-search
-/// boundary and binds generated code to the exact prepared artifact. It does
-/// not inspect or mutate executor workspace state: on success the caller may
-/// run its immutable native prefix over the unchanged search window. A native
-/// hole must leave generated code and complete the same whole search through
+/// boundary and binds generated code to the exact prepared artifact. The
+/// authenticated preflight may return a complete whole-window proof, or it may
+/// complete an exact ordinary variable-width Span when the prepared workspace
+/// lacks reverse-only recovery. Otherwise it admits the immutable native
+/// prefix over the unchanged search window. A later native hole still leaves
+/// generated code and completes the same whole search through
 /// [`fre_aot_regex_runtime_search_exclusive_v1`].
 ///
 /// The helper is deliberately independent of serialized retained-DFA rows.
@@ -5600,17 +5602,46 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     }
 
     // SAFETY: the caller guarantees one live exclusively owned allocation and
-    // every readable/writable extent documented above. Reading the immutable
-    // header does not claim executor workspace state. Cross-version private
-    // capabilities were retired above before every outcome.
+    // every readable/writable extent documented above. Cross-version private
+    // capabilities were retired above before every outcome. The ordinary
+    // program preflight may complete a variable-width Span here when this
+    // handle has no authenticated reverse-only recovery; in that case it owns
+    // the same exclusive workspace and publishes the result transactionally.
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        let prepared = &*handle.0.cast::<PreparedAotRegex>();
         let expected_artifact_identity = expected_artifact_identity_ptr
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         if expected_artifact_identity != *prepared.frozen_header.artifact_identity() {
             return STATUS_RUNTIME_FAILURE;
         }
+        let Ok(may_search) = prepared
+            .program
+            .compiler_private_static_prefix_preflight_may_search_with_workspace(
+                &prepared.workspace,
+                window_end.saturating_sub(window_start),
+            )
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        if !may_search {
+            return STATUS_PARTIAL_PREFLIGHT_ENTER;
+        }
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let window = SearchWindow::new(window_start, window_end);
+        let Ok(preflight) = prepared.preflight_static_prefix_complete_proofs(
+            haystack,
+            window,
+            expected_artifact_identity,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        if let RetainedPartialPreflight::Complete(found) = preflight {
+            let (status, result) = encode_match_result(found);
+            result_ptr.write(result);
+            return status;
+        }
+        debug_assert_eq!(preflight, RetainedPartialPreflight::Enter(window));
         STATUS_PARTIAL_PREFLIGHT_ENTER
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
@@ -5619,13 +5650,13 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
 /// Authenticate one compiler-owned static-prefix object and admit one
 /// synchronous native search window.
 ///
-/// Unlike ABI-V1, this preflight can first run graph-derived complete suffix/cut
-/// proofs when the ordinary retained-row crossover admits their fixed cost.
-/// An inconclusive proof retains the descriptor address with the exact
-/// haystack and window, but does not read the descriptor, bind its frontiers,
-/// or fill K0 caches. Those costs remain deferred until native code reaches a
-/// hole. Generated code must consume the ticket through either the matching
-/// continuation or Span postflight.
+/// Like ABI-V1, this preflight can first run graph-derived complete suffix/cut
+/// proofs or finish an uncertified variable-width Span through ordinary exact
+/// execution. Unlike ABI-V1, an inconclusive proof retains the descriptor
+/// address with the exact haystack and window, but does not read the
+/// descriptor, bind its frontiers, or fill K0 caches. Those costs remain
+/// deferred until native code reaches a hole. Generated code must consume the
+/// ticket through either the matching continuation or Span postflight.
 ///
 /// This private object/runtime seam is intentionally absent from the public C
 /// header. The descriptor is object data, not stable serialized-program data.
@@ -15003,6 +15034,87 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             STATUS_MATCH
         );
         assert_eq!(result, FreAotRegexResultV1 { start: 2, end: 7 });
+
+        // SAFETY: this test owns the unique live handle and no operation
+        // overlaps destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn static_prefix_v1_complete_proofs_use_the_retained_row_crossover() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let compiled = compile(
+            CompileRequest::new("(?:x|yz)7[A-Za-z]{1,2}", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Span),
+        )
+        .expect("compile static-prefix V1 proof fixture");
+        assert!(!compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(255));
+        assert!(compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(256));
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let short = vec![b'x'; 255];
+        let long = vec![b'x'; 256];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 0x80;
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                &long,
+                0,
+                long.len(),
+                &mut result,
+                &wrong_identity,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                &short,
+                0,
+                short.len(),
+                &mut result,
+                &identity,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                &long,
+                0,
+                long.len(),
+                &mut result,
+                &identity,
+            ),
+            STATUS_NO_MATCH
+        );
+        assert_eq!(result, FreAotRegexResultV1::default());
+        assert!(!exclusive_frozen_header_is_active(handle));
 
         // SAFETY: this test owns the unique live handle and no operation
         // overlaps destruction.
