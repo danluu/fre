@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterError,
-    PortableFindIterLimits, PortableFindIterRunLimits, SearchAccounting, SearchError, SearchLimits,
-    SearchSessionLimits, SearchWindow,
+    BuildError, BuildLimits, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, PlanKind,
+    PlanSelection, PortableBuilder, PortableCapturesReadError, PortableFindIterError,
+    PortableFindIterLimits, PortableFindIterRunLimits, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 use fre_kernels::{
     DispatchedPrefixClassAlternationPlan as KernelDispatchedPlan,
@@ -71,6 +72,13 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
     );
     assert_eq!(
         actual
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end())),
+        expected_find,
+        "ordinary find haystack={haystack:?}",
+    );
+    assert_eq!(
+        actual
             .is_match_accounted(haystack, SearchLimits::unlimited())
             .expect("accounted is_match")
             .0,
@@ -81,6 +89,11 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
             .is_match_value(haystack, SearchLimits::unlimited())
             .expect("value is_match"),
         expected.is_match(haystack),
+    );
+    assert_eq!(
+        actual.is_match(haystack),
+        expected.is_match(haystack),
+        "ordinary is_match haystack={haystack:?}",
     );
     assert_eq!(
         actual
@@ -172,6 +185,100 @@ fn source_priority_dense_rejections_and_long_runs_match_oracle() {
     ];
     for (pattern, haystack) in cases {
         assert_differential(&automatic(pattern), &oracle(pattern), haystack);
+    }
+}
+
+#[test]
+fn ordinary_facades_cover_dense_handoff_run_cutpoints_and_malformed_bytes() {
+    let actual = automatic(PATTERN);
+    let expected = oracle(PATTERN);
+    for false_anchors in [15_usize, 16, 17, 31, 32, 33] {
+        let mut haystack = b"a!".repeat(false_anchors);
+        haystack.extend_from_slice(b"ab777!");
+        assert_differential(&actual, &expected, &haystack);
+    }
+    for run_len in [15_usize, 16, 17, 31, 32, 33] {
+        let mut haystack = b"\xffab".to_vec();
+        haystack.extend(std::iter::repeat_n(b'7', run_len));
+        haystack.extend_from_slice(b"!\x80");
+        assert_differential(&actual, &expected, &haystack);
+    }
+
+    let scalar_pattern = r"(?:ab[\x80-\xFF]+|cd[A-Z]+)";
+    let scalar = automatic(scalar_pattern);
+    let scalar_oracle = oracle(scalar_pattern);
+    for haystack in [
+        b"\xffab\x80\xff!".as_slice(),
+        b"\x80abab!cdQ\xff",
+        b"ab\xff\x80",
+        b"\xff\x80missing",
+    ] {
+        assert_differential(&scalar, &scalar_oracle, haystack);
+    }
+}
+
+#[test]
+fn ordinary_facades_preserve_proper_prefix_priority_and_dense_retry() {
+    let pattern = r"(?:(?P<long>abcd)[x-z]+|(?P<short>ab)[c-e]+)";
+    let actual = automatic(pattern);
+    let expected = oracle(pattern);
+
+    for false_anchors in [0_usize, 15, 16, 17, 31, 32, 33] {
+        let mut priority = b"a!".repeat(false_anchors);
+        priority.extend_from_slice(b"abcdxxx!");
+        assert_differential(&actual, &expected, &priority);
+
+        let mut retry = b"a!".repeat(false_anchors);
+        retry.extend_from_slice(b"abcd!");
+        assert_differential(&actual, &expected, &retry);
+    }
+}
+
+#[test]
+fn scalar_and_conditional_dispatched_runtime_identities_are_exact() {
+    let scalar = automatic(r"(?:ab[\x80-\xFF]+|cd[A-Z]+)");
+    assert_eq!(scalar.runtime_implementation_id(), PREFIX_CLASS_ALTERNATION_PLAN_ID);
+
+    let ascii = automatic(PATTERN);
+    let expected = if KernelPlan::run_scanners_usable(SimdDispatchContext::capture()) {
+        DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
+    } else {
+        PREFIX_CLASS_ALTERNATION_PLAN_ID
+    };
+    assert_eq!(ascii.runtime_implementation_id(), expected);
+}
+
+#[test]
+fn named_nested_capture_metadata_and_explicit_capture_refusal_are_isolated() {
+    let pattern = r"(?P<outer>(?:(?P<left>ab)[0-9]+|(?P<right>cd)[A-Z]+))";
+    let actual = automatic(pattern);
+    let expected = oracle(pattern);
+    let haystack = b"!cdAZ!ab123!";
+    assert_differential(&actual, &expected, haystack);
+    assert_eq!(actual.captures_len(), 4);
+    assert_eq!(
+        actual.capture_names().collect::<Vec<_>>(),
+        vec![None, Some("outer"), Some("left"), Some("right")],
+    );
+
+    let mut locations = actual.capture_locations();
+    assert!(matches!(
+        actual.captures_read(&mut locations, haystack, SearchLimits::unlimited()),
+        Err(PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 3 })
+    ));
+    for index in 0..actual.captures_len() {
+        assert_eq!(locations.get(index), None);
+    }
+    assert!(matches!(
+        actual.captures_read_value(
+            &mut locations,
+            haystack,
+            SearchLimits::unlimited(),
+        ),
+        Err(PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 3 })
+    ));
+    for index in 0..actual.captures_len() {
+        assert_eq!(locations.get(index), None);
     }
 }
 
@@ -302,6 +409,8 @@ fn force_k0_bypasses_prefix_class_route() {
                 .find_value(haystack, SearchLimits::unlimited())
                 .unwrap(),
         );
+        assert_eq!(auto.find(haystack), forced.find(haystack));
+        assert_eq!(auto.is_match(haystack), forced.is_match(haystack));
     }
 }
 

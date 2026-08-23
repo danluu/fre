@@ -10908,6 +10908,33 @@ mod unicode_scalar_run_ordinary_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod prefix_class_alternation_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -12830,6 +12857,36 @@ impl PortableRegex {
                     .map(|matched| matched.is_some())
                     .map_err(SearchError::from)
             }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                if let Some(matched) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    prefix_class_alternation_ordinary_facade_probe::record_exists();
+                    Ok(matched)
+                } else {
+                    plan.is_match_in(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        prefix_class_alternation_search_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|(matched, _)| matched)
+                    .map_err(SearchError::from)
+                }
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                if let Some(matched) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    prefix_class_alternation_ordinary_facade_probe::record_exists();
+                    Ok(matched)
+                } else {
+                    plan.is_match_in(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        prefix_class_alternation_search_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|(matched, _)| matched)
+                    .map_err(SearchError::from)
+                }
+            }
             PortablePlan::NullableOptionalChain(plan) => plan
                 .is_match_full_unlimited_value(haystack)
                 .unwrap_or_else(|| {
@@ -14450,6 +14507,40 @@ impl PortableRegex {
                     )
                     .map(|matched| matched.map(|(start, end)| Match { start, end }))
                     .map_err(SearchError::from)
+            }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                if let Some(matched) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    prefix_class_alternation_ordinary_facade_probe::record_span();
+                    Ok(matched.map(|(start, end)| Match { start, end }))
+                } else {
+                    plan.find_in(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        prefix_class_alternation_search_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|(matched, _)| {
+                        matched.map(|(start, end)| Match { start, end })
+                    })
+                    .map_err(SearchError::from)
+                }
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                if let Some(matched) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    prefix_class_alternation_ordinary_facade_probe::record_span();
+                    Ok(matched.map(|(start, end)| Match { start, end }))
+                } else {
+                    plan.find_in(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                        prefix_class_alternation_search_limits(SearchLimits::unlimited()),
+                    )
+                    .map(|(matched, _)| {
+                        matched.map(|(start, end)| Match { start, end })
+                    })
+                    .map_err(SearchError::from)
+                }
             }
             PortablePlan::PureByteClassRepeat(plan) => {
                 Ok(plan.ordinary_find_full_unmetered(haystack))
@@ -26470,6 +26561,104 @@ mod tests {
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    #[test]
+    fn prefix_class_ordinary_facades_are_full_window_only() {
+        let regex = PortableBuilder::new(r"(?:ab[0-9]+|cd[A-Z]+)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::PrefixClassAlternation);
+        let haystack = b"!cdAZ!ab123!";
+        let full = SearchWindow::full(haystack);
+        let expected = Some(Match { start: 1, end: 5 });
+
+        super::prefix_class_alternation_ordinary_facade_probe::reset();
+        assert!(regex.is_match(haystack));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(
+            super::prefix_class_alternation_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+
+        assert!(
+            regex
+                .is_match_window_value(haystack, full, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            regex
+                .find_window_value(haystack, full, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_with_limits(haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            regex
+                .find_with_limits(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        assert_eq!(
+            regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(
+            session
+                .is_match_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![
+                Match { start: 1, end: 5 },
+                Match { start: 6, end: 11 },
+            ],
+        );
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(
+                    &mut locations,
+                    haystack,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 5)),
+        );
+        assert_eq!(
+            super::prefix_class_alternation_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+    }
 
     #[test]
     fn composed_ordinary_routes_remain_plan_local() {

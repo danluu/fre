@@ -531,6 +531,46 @@ fn derive_reduce_upper_bounds(
     })
 }
 
+/// Prove that unlimited full-window search cannot reach one of the canonical
+/// preflight's checked-arithmetic failures. This deliberately repeats those
+/// expressions in their canonical order without constructing an upper-bound
+/// receipt. A failed proof is only a pre-source decline to accounted search.
+fn ordinary_search_envelope_fits(
+    shape_units: usize,
+    haystack_len: usize,
+    max_classification_overhead: usize,
+) -> bool {
+    if haystack_len.checked_mul(2).is_none() {
+        return false;
+    }
+    let Some(scanner_overhead) =
+        haystack_len.checked_mul(max_classification_overhead)
+    else {
+        return false;
+    };
+    if haystack_len
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(scanner_overhead))
+        .is_none()
+    {
+        return false;
+    }
+    if haystack_len
+        .checked_mul(16)
+        .and_then(|work| {
+            shape_units
+                .checked_mul(8)
+                .and_then(|shape| work.checked_add(shape))
+        })
+        .and_then(|work| work.checked_add(64))
+        .and_then(|work| work.checked_add(scanner_overhead))
+        .is_none()
+    {
+        return false;
+    }
+    u64::try_from(haystack_len).is_ok()
+}
+
 fn max_run_scanner_classification_overhead(
     scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
 ) -> usize {
@@ -1793,6 +1833,17 @@ impl PrefixClassAlternationPlan {
         )
     }
 
+    /// Complete an ordinary unlimited full-haystack selected search without
+    /// constructing exact counters or a diagnostic receipt. A source-free
+    /// arithmetic decline leaves the caller responsible for canonical search.
+    #[must_use]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Option<(usize, usize)>> {
+        self.ordinary_find_full_with_run_scanners(haystack, [None, None])
+    }
+
     /// Report whether a match exists in the complete haystack.
     pub fn is_match(
         &self,
@@ -1818,6 +1869,24 @@ impl PrefixClassAlternationPlan {
             self.exists_identity(),
         )?;
         Ok((matched.is_some(), accounting))
+    }
+
+    /// Complete an ordinary unlimited full-haystack existence search without
+    /// constructing exact counters or a diagnostic receipt. As in canonical
+    /// endpoint search, dispatched class-run scanners never participate.
+    #[must_use]
+    pub fn ordinary_is_match_full_unmetered(&self, haystack: &[u8]) -> Option<bool> {
+        if !ordinary_search_envelope_fits(self.build.shape_units, haystack.len(), 0) {
+            return None;
+        }
+        Some(
+            self.execute_union_search_value::<false>(
+                haystack,
+                Window::full(haystack),
+                [None, None],
+            )
+            .is_some(),
+        )
     }
 
     /// Return the first accepting end offset in the complete haystack.
@@ -1905,6 +1974,27 @@ impl PrefixClassAlternationPlan {
                 upper_bounds,
                 actual,
             },
+        ))
+    }
+
+    fn ordinary_find_full_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Option<Option<(usize, usize)>> {
+        let max_classification_overhead =
+            max_run_scanner_classification_overhead(run_scanners);
+        if !ordinary_search_envelope_fits(
+            self.build.shape_units,
+            haystack.len(),
+            max_classification_overhead,
+        ) {
+            return None;
+        }
+        Some(self.execute_union_search_value::<true>(
+            haystack,
+            Window::full(haystack),
+            run_scanners,
         ))
     }
 
@@ -2222,6 +2312,192 @@ impl PrefixClassAlternationPlan {
             ReduceResource::Scratch,
         )?;
         Ok(upper_bounds)
+    }
+
+    /// Report-free counterpart of `execute_union_search` for the two ordinary
+    /// full-window projections. Keep its first-byte arbitration, branch order
+    /// and dense-handoff cursor synchronized with the accounted executor.
+    #[inline(always)]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the fixed two alternatives preserve source priority at equal candidate starts"
+    )]
+    fn execute_union_search_value<const SELECTED: bool>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Option<(usize, usize)> {
+        let bounded_haystack = haystack
+            .get(..window.end())
+            .expect("the ordinary source-free proof uses a valid full or suffix window");
+        let first_bytes = [
+            *self.alternatives[0]
+                .finder
+                .needle()
+                .first()
+                .expect("construction rejects an empty first prefix"),
+            *self.alternatives[1]
+                .finder
+                .needle()
+                .first()
+                .expect("construction rejects an empty second prefix"),
+        ];
+        let mut cursor = window.start();
+        let mut anchor_candidates = 0_usize;
+        loop {
+            if cursor >= window.end() {
+                return None;
+            }
+            let searched = haystack
+                .get(cursor..window.end())
+                .expect("the ordinary union cursor stays inside its window");
+            let relative = if first_bytes[0] == first_bytes[1] {
+                memchr(first_bytes[0], searched)
+            } else {
+                memchr2(first_bytes[0], first_bytes[1], searched)
+            };
+            let relative = relative?;
+            let start = cursor
+                .checked_add(relative)
+                .expect("a relative position in the suffix fits the source index");
+            cursor = start
+                .checked_add(1)
+                .expect("a first-byte hit precedes the validated window end");
+            anchor_candidates = anchor_candidates
+                .checked_add(1)
+                .expect("the direct union hands off at its fixed candidate budget");
+            let first_byte = *haystack
+                .get(start)
+                .expect("the selected first-byte hit is inside the window");
+            for alternative in 0..2 {
+                if first_bytes[alternative] != first_byte {
+                    continue;
+                }
+                let prefix = self.alternatives[alternative].finder.needle();
+                let prefix_end = start
+                    .checked_add(prefix.len())
+                    .expect("an authentic prefix cannot overflow a source position");
+                if prefix_end > window.end() {
+                    continue;
+                }
+                let candidate = haystack
+                    .get(start..prefix_end)
+                    .expect("the checked prefix extent is inside the window");
+                if candidate != prefix || prefix_end == window.end() {
+                    continue;
+                }
+                let first_class_byte = *haystack
+                    .get(prefix_end)
+                    .expect("a prefix ending before the window has a following byte");
+                if !self.alternatives[alternative]
+                    .class
+                    .contains(first_class_byte)
+                {
+                    continue;
+                }
+                let accepting_end = prefix_end
+                    .checked_add(1)
+                    .expect("the first class byte precedes the window end");
+                if !SELECTED {
+                    return Some((start, accepting_end));
+                }
+                let extension = extend_greedy_class(
+                    bounded_haystack,
+                    accepting_end,
+                    self.alternatives[alternative].class,
+                    run_scanners[alternative],
+                );
+                return Some((start, extension.end));
+            }
+            if anchor_candidates >= DIRECT_UNION_FALSE_ANCHOR_BUDGET {
+                return self.execute_search_value::<SELECTED>(
+                    haystack,
+                    Window::new(cursor, window.end()),
+                    run_scanners,
+                );
+            }
+        }
+    }
+
+    /// Report-free exact-Finder merge entered only from the ordinary union's
+    /// fixed dense-anchor handoff. Branch zero retains equal-start priority.
+    #[inline(always)]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the fixed two alternatives preserve source priority at equal candidate starts"
+    )]
+    fn execute_search_value<const SELECTED: bool>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Option<(usize, usize)> {
+        let input = haystack
+            .get(window.start()..window.end())
+            .expect("the ordinary dense handoff retains a valid suffix window");
+        let bounded_haystack = haystack
+            .get(..window.end())
+            .expect("the ordinary dense handoff retains the original end");
+        let mut streams = [
+            self.alternatives[0].finder.find_iter(input),
+            self.alternatives[1].finder.find_iter(input),
+        ];
+        let mut next = [None; 2];
+        for alternative in 0..2 {
+            next[alternative] = streams[alternative].next().map(|relative| {
+                window
+                    .start()
+                    .checked_add(relative)
+                    .expect("a relative Finder result fits the source index")
+            });
+        }
+
+        loop {
+            let alternative = match (next[0], next[1]) {
+                (None, None) => return None,
+                (Some(_), None) => 0,
+                (None, Some(_)) => 1,
+                // Branch zero retains source priority on an equal start.
+                (Some(left), Some(right)) => usize::from(right < left),
+            };
+            let start = next[alternative]
+                .expect("the selected ordinary prefix stream has one candidate");
+            next[alternative] = streams[alternative].next().map(|relative| {
+                window
+                    .start()
+                    .checked_add(relative)
+                    .expect("the next relative Finder result fits the source index")
+            });
+            let prefix_end = start
+                .checked_add(self.alternatives[alternative].finder.needle().len())
+                .expect("an authentic Finder result cannot overflow its input");
+            if prefix_end >= window.end() {
+                continue;
+            }
+            let first_class_byte = *haystack
+                .get(prefix_end)
+                .expect("a prefix ending before the window has a following byte");
+            if !self.alternatives[alternative]
+                .class
+                .contains(first_class_byte)
+            {
+                continue;
+            }
+            let accepting_end = prefix_end
+                .checked_add(1)
+                .expect("the first class byte precedes the window end");
+            if !SELECTED {
+                return Some((start, accepting_end));
+            }
+            let extension = extend_greedy_class(
+                bounded_haystack,
+                accepting_end,
+                self.alternatives[alternative].class,
+                run_scanners[alternative],
+            );
+            return Some((start, extension.end));
+        }
     }
 
     /// Search the union of both first-byte streams once, then authenticate
@@ -3737,6 +4013,17 @@ impl DispatchedPrefixClassAlternationPlan {
         )
     }
 
+    /// Complete an ordinary unlimited full-haystack selected search with the
+    /// retained dispatched class scanners and without diagnostic accounting.
+    #[must_use]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Option<(usize, usize)>> {
+        self.plan()
+            .ordinary_find_full_with_run_scanners(haystack, self.scanner_refs())
+    }
+
     pub fn span_sum(
         &self,
         haystack: &[u8],
@@ -3825,6 +4112,14 @@ impl DispatchedPrefixClassAlternationPlan {
             self.exists_identity(),
         )?;
         Ok((matched.is_some(), accounting))
+    }
+
+    /// Complete an ordinary unlimited full-haystack existence search without
+    /// accounting. This intentionally retains canonical endpoint behavior,
+    /// which does not invoke the selected-span run scanners.
+    #[must_use]
+    pub fn ordinary_is_match_full_unmetered(&self, haystack: &[u8]) -> Option<bool> {
+        self.plan().ordinary_is_match_full_unmetered(haystack)
     }
 
     pub fn shortest(
@@ -4644,6 +4939,69 @@ mod tests {
         .unwrap()
     }
 
+    fn largest_ordinary_envelope_length(
+        shape_units: usize,
+        max_classification_overhead: usize,
+    ) -> usize {
+        let mut admitted = 0_usize;
+        let mut ceiling = usize::MAX;
+        while admitted < ceiling {
+            let distance = ceiling - admitted;
+            let candidate = admitted + distance / 2 + distance % 2;
+            if ordinary_search_envelope_fits(
+                shape_units,
+                candidate,
+                max_classification_overhead,
+            ) {
+                admitted = candidate;
+            } else {
+                ceiling = candidate - 1;
+            }
+        }
+        admitted
+    }
+
+    #[test]
+    fn ordinary_search_envelope_has_exact_source_free_boundaries() {
+        let build = plan().build_accounting();
+        for max_classification_overhead in [0_usize, 1, 15, 31] {
+            let largest =
+                largest_ordinary_envelope_length(build.shape_units, max_classification_overhead);
+            let implementation = if max_classification_overhead == 0 {
+                ReduceImplementation::Scalar
+            } else {
+                ReduceImplementation::DispatchedRunScanners {
+                    max_classification_overhead,
+                }
+            };
+            assert!(ordinary_search_envelope_fits(
+                build.shape_units,
+                largest,
+                max_classification_overhead,
+            ));
+            assert!(
+                derive_reduce_upper_bounds(build, largest, implementation, Operation::Search)
+                    .is_ok()
+            );
+            if let Some(first_rejected) = largest.checked_add(1) {
+                assert!(!ordinary_search_envelope_fits(
+                    build.shape_units,
+                    first_rejected,
+                    max_classification_overhead,
+                ));
+                assert!(
+                    derive_reduce_upper_bounds(
+                        build,
+                        first_rejected,
+                        implementation,
+                        Operation::Search,
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
     #[test]
     fn build_attempt_reports_exact_success_and_partial_validation_failure() {
         let attempt = PrefixClassAlternationPlan::build_attempt(
@@ -4987,6 +5345,30 @@ mod tests {
                     }
                 }
             }
+            let full = Window::full(haystack);
+            assert_eq!(
+                plan.ordinary_find_full_unmetered(haystack),
+                Some(reference_union_search(
+                    plan,
+                    haystack,
+                    full,
+                    SearchProjection::Selected,
+                )),
+                "ordinary selected haystack={haystack:?}",
+            );
+            assert_eq!(
+                plan.ordinary_is_match_full_unmetered(haystack),
+                Some(
+                    reference_union_search(
+                        plan,
+                        haystack,
+                        full,
+                        SearchProjection::Exists,
+                    )
+                    .is_some(),
+                ),
+                "ordinary exists haystack={haystack:?}",
+            );
             if depth == 4 {
                 return;
             }
@@ -5140,6 +5522,62 @@ mod tests {
                     "false_anchors={false_anchors} projection={projection:?}",
                 );
             }
+            assert_eq!(
+                plan.ordinary_find_full_unmetered(&haystack),
+                Some(reference_union_search(
+                    &plan,
+                    &haystack,
+                    window,
+                    SearchProjection::Selected,
+                )),
+                "ordinary selected false_anchors={false_anchors}",
+            );
+            assert_eq!(
+                plan.ordinary_is_match_full_unmetered(&haystack),
+                Some(
+                    reference_union_search(
+                        &plan,
+                        &haystack,
+                        window,
+                        SearchProjection::Exists,
+                    )
+                    .is_some(),
+                ),
+                "ordinary exists false_anchors={false_anchors}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_selected_preserves_greedy_run_cutpoints_and_terminal_misses() {
+        let class = [(b'0', b'9')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        for run_len in [15_usize, 16, 17, 31, 32, 33] {
+            let mut haystack = b"!ab".to_vec();
+            haystack.extend(std::iter::repeat_n(b'7', run_len));
+            haystack.push(b'!');
+            assert_eq!(
+                plan.ordinary_find_full_unmetered(&haystack),
+                Some(Some((1, 3 + run_len))),
+                "run_len={run_len}",
+            );
+            assert_eq!(
+                plan.ordinary_is_match_full_unmetered(&haystack),
+                Some(true),
+                "run_len={run_len}",
+            );
+        }
+        for haystack in [b"".as_slice(), b"a", b"ab", b"!xy", b"!ab!"] {
+            assert_eq!(plan.ordinary_find_full_unmetered(haystack), Some(None));
+            assert_eq!(
+                plan.ordinary_is_match_full_unmetered(haystack),
+                Some(false)
+            );
         }
     }
 
@@ -5160,6 +5598,14 @@ mod tests {
             .unwrap();
         let rejected_start = 2 * (DIRECT_UNION_FALSE_ANCHOR_BUDGET - 1);
         assert_eq!(Some((rejected_start + 1, rejected_start + 4)), matched);
+        assert_eq!(
+            plan.ordinary_find_full_unmetered(&haystack),
+            Some(Some((rejected_start + 1, rejected_start + 4))),
+        );
+        assert_eq!(
+            plan.ordinary_is_match_full_unmetered(&haystack),
+            Some(true),
+        );
         assert_eq!(2, accounting.actual.prefix_candidates);
         assert_eq!(2, accounting.actual.class_bytes);
     }
@@ -5543,6 +5989,8 @@ mod tests {
             Some((6, 9)),
             letters.find(&haystack, SearchLimits::unlimited()).unwrap().0,
         );
+        assert_eq!(digits.ordinary_find_full_unmetered(&haystack), Some(Some((1, 5))));
+        assert_eq!(letters.ordinary_find_full_unmetered(&haystack), Some(Some((6, 9))));
         {
             let mut digit_cursor = digits.search_cursor(&haystack);
             let mut letter_cursor = letters.search_cursor(&haystack);
@@ -5562,6 +6010,8 @@ mod tests {
             Some((1, 5)),
             letters.find(&haystack, SearchLimits::unlimited()).unwrap().0,
         );
+        assert_eq!(digits.ordinary_find_full_unmetered(&haystack), Some(Some((6, 9))));
+        assert_eq!(letters.ordinary_find_full_unmetered(&haystack), Some(Some((1, 5))));
         let mut digit_cursor = digits.search_cursor(&haystack);
         let mut letter_cursor = letters.search_cursor(&haystack);
         assert_eq!(Some((6, 9)), digit_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
@@ -5661,6 +6111,11 @@ mod tests {
                 "selected false_anchors={false_anchors}",
             );
             assert_eq!(
+                scalar.ordinary_find_full_unmetered(&haystack),
+                dispatched.ordinary_find_full_unmetered(&haystack),
+                "ordinary selected false_anchors={false_anchors}",
+            );
+            assert_eq!(
                 scalar_selected.1.actual.prefix_candidates,
                 dispatched_selected.1.actual.prefix_candidates,
                 "selected false_anchors={false_anchors}",
@@ -5689,6 +6144,11 @@ mod tests {
                 "exists false_anchors={false_anchors}",
             );
             assert_eq!(
+                scalar.ordinary_is_match_full_unmetered(&haystack),
+                dispatched.ordinary_is_match_full_unmetered(&haystack),
+                "ordinary exists false_anchors={false_anchors}",
+            );
+            assert_eq!(
                 scalar_exists.1.actual, dispatched_exists.1.actual,
                 "exists accounting false_anchors={false_anchors}",
             );
@@ -5705,6 +6165,22 @@ mod tests {
             assert_eq!(
                 scalar_shortest.1.actual, dispatched_shortest.1.actual,
                 "earliest-end accounting false_anchors={false_anchors}",
+            );
+        }
+
+        for run_len in [15_usize, 16, 17, 31, 32, 33] {
+            let mut haystack = b"ab".to_vec();
+            haystack.extend(std::iter::repeat_n(b'7', run_len));
+            haystack.push(b'!');
+            assert_eq!(
+                scalar.ordinary_find_full_unmetered(&haystack),
+                dispatched.ordinary_find_full_unmetered(&haystack),
+                "ordinary dispatched run_len={run_len}",
+            );
+            assert_eq!(
+                scalar.ordinary_is_match_full_unmetered(&haystack),
+                dispatched.ordinary_is_match_full_unmetered(&haystack),
+                "ordinary dispatched exists run_len={run_len}",
             );
         }
     }
