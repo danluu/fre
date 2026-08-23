@@ -928,3 +928,16 @@ fn enforce_scratch(needed: usize, limits: SearchLimits) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod ordinary_exists_value_tests {
+    use super::ordinary_exists_work_is_representable;
+
+    #[test]
+    fn admission_matches_the_canonical_literal_bound_at_address_space_edges() {
+        assert!(ordinary_exists_work_is_representable(0, 1).is_some());
+        assert!(ordinary_exists_work_is_representable(4096, 8).is_some());
+        assert!(ordinary_exists_work_is_representable(usize::MAX - 1, 1).is_some());
+        assert!(ordinary_exists_work_is_representable(usize::MAX, 1).is_none());
+    }
+}
