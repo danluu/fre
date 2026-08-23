@@ -1,5 +1,5 @@
 //! Generated, holdout-independent comparison of general optimizing AOT search
-//! against the workspace-pinned upstream `regex` crate.
+//! against portable FRE and the workspace-pinned upstream `regex` crate.
 //!
 //! The fixed matrix has 24 distinct structural patterns. Its first ten form a
 //! reverse-pair qualification suite: three complete correlated controls, four
@@ -80,6 +80,7 @@ use std::{
     time::Instant,
 };
 
+use fre::{PortableRegex, SearchLimits as FreSearchLimits};
 use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
     DeterminizationStage, EngineKind, EngineSelectionReason, FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
@@ -138,9 +139,17 @@ OPTIONS:
                          non-slow runtime-backed object publishes a prepared
                          entry; ordinary routes remain available when auditing
                          legacy objects.
-  --measurement-order O  Timed engine order: upstream-native (default) or
-                         native-upstream. All build/link/runtime preparation
-                         completes before either timed phase.
+  --measurement-order O  Timed engine order. The six explicit permutations
+                         are upstream-portable-fre-native,
+                         upstream-native-portable-fre,
+                         portable-fre-upstream-native,
+                         portable-fre-native-upstream,
+                         native-upstream-portable-fre, and
+                         native-portable-fre-upstream. The legacy spellings
+                         upstream-native (default) and native-upstream remain
+                         literal receipt-preserving aliases for the first and
+                         last permutations. All build/link/runtime preparation
+                         completes before timing.
   --output-matrix        Compile every generated regex source under Span,
                          Exists, and SelectedEnd. By default each source keeps
                          its single deterministically assigned contract.
@@ -207,9 +216,10 @@ OPTIONS:
   -h, --help             Show this text.
 
 OUTPUT:
-  Joined TSV rows with absolute upstream/native latency and speedup. Upstream
-  Regex values and native AOT objects are reused. Compilation, linking, and
-  prepared-runtime setup are outside timing. All inputs are generated."
+  Joined TSV rows with absolute upstream/portable-FRE/native latency and
+  pairwise speedups. Compiled regex values and native AOT objects are reused.
+  Compilation, linking, and prepared-runtime setup are outside timing. All
+  inputs are generated."
 }
 
 #[derive(Clone, Debug)]
@@ -561,27 +571,46 @@ fn parse_retained_helper_policy(value: &str) -> Result<RetainedHelperPolicy, Str
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum MeasurementOrder {
+    UpstreamPortableFreNative,
+    UpstreamNativePortableFre,
+    PortableFreUpstreamNative,
+    PortableFreNativeUpstream,
+    NativeUpstreamPortableFre,
+    NativePortableFreUpstream,
+    // Keep these as distinct variants so the legacy runner and scorer see
+    // their exact two-arm receipt literals even though portable FRE now runs
+    // between the two historical phases.
     #[default]
-    UpstreamNative,
-    NativeUpstream,
+    LegacyUpstreamNative,
+    LegacyNativeUpstream,
 }
 
 impl MeasurementOrder {
     const fn name(self) -> &'static str {
         match self {
-            Self::UpstreamNative => "upstream-native",
-            Self::NativeUpstream => "native-upstream",
+            Self::UpstreamPortableFreNative => "upstream-portable-fre-native",
+            Self::UpstreamNativePortableFre => "upstream-native-portable-fre",
+            Self::PortableFreUpstreamNative => "portable-fre-upstream-native",
+            Self::PortableFreNativeUpstream => "portable-fre-native-upstream",
+            Self::NativeUpstreamPortableFre => "native-upstream-portable-fre",
+            Self::NativePortableFreUpstream => "native-portable-fre-upstream",
+            Self::LegacyUpstreamNative => "upstream-native",
+            Self::LegacyNativeUpstream => "native-upstream",
         }
     }
 }
 
 fn parse_measurement_order(value: &str) -> Result<MeasurementOrder, String> {
     match value {
-        "upstream-native" => Ok(MeasurementOrder::UpstreamNative),
-        "native-upstream" => Ok(MeasurementOrder::NativeUpstream),
-        _ => Err(format!(
-            "--measurement-order must be upstream-native or native-upstream, got {value:?}"
-        )),
+        "upstream-native" => Ok(MeasurementOrder::LegacyUpstreamNative),
+        "upstream-portable-fre-native" => Ok(MeasurementOrder::UpstreamPortableFreNative),
+        "upstream-native-portable-fre" => Ok(MeasurementOrder::UpstreamNativePortableFre),
+        "portable-fre-upstream-native" => Ok(MeasurementOrder::PortableFreUpstreamNative),
+        "portable-fre-native-upstream" => Ok(MeasurementOrder::PortableFreNativeUpstream),
+        "native-upstream-portable-fre" => Ok(MeasurementOrder::NativeUpstreamPortableFre),
+        "native-upstream" => Ok(MeasurementOrder::LegacyNativeUpstream),
+        "native-portable-fre-upstream" => Ok(MeasurementOrder::NativePortableFreUpstream),
+        _ => Err(format!("unknown --measurement-order permutation {value:?}")),
     }
 }
 
@@ -2573,6 +2602,7 @@ impl AbiResult {
 struct CompiledShape {
     spec: SeededPatternSpec,
     upstream: Regex,
+    portable_fre: PortableRegex,
     aot: CompiledRegex,
     runtime_program: Option<(String, usize)>,
     partial_dfa: Option<PartialDfaStats>,
@@ -3384,6 +3414,9 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 );
             let upstream = Regex::new(&spec.pattern)
                 .map_err(|error| format!("{} upstream compilation failed: {error}", spec.name))?;
+            let portable_fre = PortableRegex::new(&spec.pattern).map_err(|error| {
+                format!("{} portable FRE compilation failed: {error}", spec.name)
+            })?;
             let (aot, retained_limit_derivation, retained_census) =
                 match forced_mode {
                     ForcedFallbackMode::RetainedRows => {
@@ -3471,6 +3504,8 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             let force_ordinary_fallback = spec.force_fallback
                 || forced_mode == ForcedFallbackMode::ZeroRows && !has_context_assertions;
             let witness_upstream = upstream_search(&upstream, spec.output, &spec.fixture);
+            let witness_portable_fre =
+                portable_fre_search(&portable_fre, spec.output, &spec.fixture)?;
             let witness_aot = AbiResult::from_aot(
                 aot.search(&spec.fixture, SearchWindow::full(&spec.fixture))
                     .map_err(|error| {
@@ -3478,9 +3513,12 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     })?,
                 spec.output,
             )?;
-            if witness_upstream.status == 0 || witness_upstream != witness_aot {
+            if witness_upstream.status == 0
+                || witness_upstream != witness_portable_fre
+                || witness_upstream != witness_aot
+            {
                 return Err(format!(
-                    "{} generated witness failed: upstream {witness_upstream:?}, AOT {witness_aot:?}",
+                    "{} generated witness failed: upstream {witness_upstream:?}, portable FRE {witness_portable_fre:?}, AOT {witness_aot:?}",
                     spec.name
                 ));
             }
@@ -3646,6 +3684,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             Ok(CompiledShape {
                 spec,
                 upstream,
+                portable_fre,
                 aot,
                 runtime_program,
                 partial_dfa,
@@ -4062,6 +4101,35 @@ fn upstream_search(regex: &Regex, output: OutputKind, haystack: &[u8]) -> AbiRes
     }
 }
 
+fn portable_fre_search(
+    regex: &PortableRegex,
+    output: OutputKind,
+    haystack: &[u8],
+) -> Result<AbiResult, String> {
+    match output {
+        OutputKind::Span => Ok(regex.find(haystack).map_or(NO_MATCH, |matched| AbiResult {
+            status: 1,
+            start: matched.start(),
+            end: matched.end(),
+        })),
+        OutputKind::Exists => Ok(AbiResult {
+            status: u32::from(regex.is_match(haystack)),
+            start: 0,
+            end: 0,
+        }),
+        OutputKind::SelectedEnd => regex
+            .selected_end_value(haystack, FreSearchLimits::unlimited())
+            .map(|matched| {
+                matched.map_or(NO_MATCH, |end| AbiResult {
+                    status: 1,
+                    start: end,
+                    end,
+                })
+            })
+            .map_err(|error| format!("portable FRE selected-end search failed: {error}")),
+    }
+}
+
 fn checksum_step(checksum: u64, result: AbiResult, iteration: u64) -> u64 {
     let start = u64::try_from(result.start).expect("supported targets use at most 64-bit size_t");
     let end = u64::try_from(result.end).expect("supported targets use at most 64-bit size_t");
@@ -4205,6 +4273,8 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                     for (rotation, haystack) in haystacks.iter().enumerate() {
                         let upstream =
                             upstream_search(&shape.upstream, shape.spec.output, haystack);
+                        let portable_fre =
+                            portable_fre_search(&shape.portable_fre, shape.spec.output, haystack)?;
                         let aot = AbiResult::from_aot(
                             shape
                                 .aot
@@ -4217,7 +4287,8 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                                 })?,
                             shape.spec.output,
                         )?;
-                        if upstream != aot
+                        if upstream != portable_fre
+                            || upstream != aot
                             || !generated_insertion_is_valid(
                                 config.nested_grammar
                                     || config.atomic_choice_grammar
@@ -4229,7 +4300,7 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                             )
                         {
                             return Err(format!(
-                                "{} validation failed for {size}/{}/{}/rotation {rotation}: upstream oracle {upstream:?}, AOT {aot:?}, generated insertion {intended:?}",
+                                "{} validation failed for {size}/{}/{}/rotation {rotation}: upstream oracle {upstream:?}, portable FRE {portable_fre:?}, AOT {aot:?}, generated insertion {intended:?}",
                                 shape.spec.name,
                                 position.name(),
                                 density.name,
@@ -4310,7 +4381,7 @@ fn validate_reverse_pair_qualification_scenarios(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Measurement {
     searches: usize,
     min_elapsed_ns: f64,
@@ -4318,6 +4389,7 @@ struct Measurement {
     min_ns_per_search: f64,
     median_ns_per_search: f64,
     checksum: u64,
+    samples_elapsed_ns: Vec<u128>,
 }
 
 fn expected_checksum(scenario: &Scenario, searches: usize, trial: usize) -> u64 {
@@ -4435,27 +4507,162 @@ fn measure_upstream(
                 min_ns_per_search: minimum / searches as f64,
                 median_ns_per_search: med / searches as f64,
                 checksum: last_checksum,
+                samples_elapsed_ns: samples,
             },
         );
     }
     Ok(measurements)
 }
 
-fn measure_in_order<Upstream, Native, Error>(
+fn portable_fre_batch(
+    shape: &CompiledShape,
+    haystacks: &[Vec<u8>; ROTATIONS],
+    searches: usize,
+    trial: usize,
+) -> Result<(u128, u64), String> {
+    let mut checksum = 0_u64;
+    let before = Instant::now();
+    for iteration in 0..searches {
+        let rotation = (iteration + trial) % ROTATIONS;
+        let result = portable_fre_search(
+            &shape.portable_fre,
+            shape.spec.output,
+            black_box(&haystacks[rotation]),
+        )?;
+        checksum = checksum_step(checksum, result, iteration as u64);
+    }
+    Ok((before.elapsed().as_nanos(), checksum))
+}
+
+fn measure_portable_fre(
+    config: &Config,
+    shapes: &[CompiledShape],
+    scenarios: &[Scenario],
+) -> Result<BTreeMap<String, Measurement>, String> {
+    let mut measurements = BTreeMap::new();
+    for scenario in scenarios {
+        let shape = &shapes[scenario.shape_index];
+        let haystacks: [Vec<u8>; ROTATIONS] = std::array::from_fn(|rotation| {
+            generated_haystack(
+                shape.spec.generation_id,
+                &shape.spec,
+                scenario.size,
+                scenario.density,
+                scenario.position,
+                rotation,
+            )
+        });
+        for round in 0..config.warmup_rounds * ROTATIONS {
+            black_box(portable_fre_search(
+                &shape.portable_fre,
+                shape.spec.output,
+                black_box(&haystacks[round % ROTATIONS]),
+            )?);
+        }
+        let mut searches = scenario.searches;
+        loop {
+            let (elapsed, checksum) = portable_fre_batch(shape, &haystacks, searches, 0)?;
+            if checksum != expected_checksum(scenario, searches, 0) {
+                return Err(format!(
+                    "{} portable FRE calibration checksum changed",
+                    scenario.case_name
+                ));
+            }
+            black_box(checksum);
+            if elapsed >= config.min_trial_ns as u128 {
+                break;
+            }
+            searches = searches.checked_mul(2).ok_or_else(|| {
+                format!("{} portable FRE calibration overflow", scenario.case_name)
+            })?;
+        }
+        let (samples, last_checksum) = loop {
+            let mut samples = Vec::with_capacity(config.trials);
+            let mut last_checksum = 0;
+            for trial in 0..config.trials {
+                let (elapsed, checksum) =
+                    portable_fre_batch(shape, &haystacks, searches, trial)?;
+                samples.push(elapsed);
+                if checksum != expected_checksum(scenario, searches, trial) {
+                    return Err(format!(
+                        "{} portable FRE timed checksum changed",
+                        scenario.case_name
+                    ));
+                }
+                last_checksum = checksum;
+                black_box(checksum);
+            }
+            samples.sort_unstable();
+            if samples[0] >= config.min_trial_ns as u128 {
+                break (samples, last_checksum);
+            }
+            searches = searches.checked_mul(2).ok_or_else(|| {
+                format!(
+                    "{} portable FRE retry calibration overflow",
+                    scenario.case_name
+                )
+            })?;
+        };
+        let minimum = samples[0] as f64;
+        let med = median(&samples);
+        measurements.insert(
+            scenario.case_name.clone(),
+            Measurement {
+                searches,
+                min_elapsed_ns: minimum,
+                median_elapsed_ns: med,
+                min_ns_per_search: minimum / searches as f64,
+                median_ns_per_search: med / searches as f64,
+                checksum: last_checksum,
+                samples_elapsed_ns: samples,
+            },
+        );
+    }
+    Ok(measurements)
+}
+
+fn measure_in_order<Upstream, PortableFre, Native, Error>(
     order: MeasurementOrder,
     upstream: impl FnOnce() -> Result<Upstream, Error>,
+    portable_fre: impl FnOnce() -> Result<PortableFre, Error>,
     native: impl FnOnce() -> Result<Native, Error>,
-) -> Result<(Upstream, Native), Error> {
+) -> Result<(Upstream, PortableFre, Native), Error> {
     match order {
-        MeasurementOrder::UpstreamNative => {
+        MeasurementOrder::UpstreamPortableFreNative | MeasurementOrder::LegacyUpstreamNative => {
             let upstream = upstream()?;
+            let portable_fre = portable_fre()?;
             let native = native()?;
-            Ok((upstream, native))
+            Ok((upstream, portable_fre, native))
         }
-        MeasurementOrder::NativeUpstream => {
+        MeasurementOrder::UpstreamNativePortableFre => {
+            let upstream = upstream()?;
+            let native = native()?;
+            let portable_fre = portable_fre()?;
+            Ok((upstream, portable_fre, native))
+        }
+        MeasurementOrder::PortableFreUpstreamNative => {
+            let portable_fre = portable_fre()?;
+            let upstream = upstream()?;
+            let native = native()?;
+            Ok((upstream, portable_fre, native))
+        }
+        MeasurementOrder::PortableFreNativeUpstream => {
+            let portable_fre = portable_fre()?;
             let native = native()?;
             let upstream = upstream()?;
-            Ok((upstream, native))
+            Ok((upstream, portable_fre, native))
+        }
+        MeasurementOrder::NativeUpstreamPortableFre => {
+            let native = native()?;
+            let upstream = upstream()?;
+            let portable_fre = portable_fre()?;
+            Ok((upstream, portable_fre, native))
+        }
+        MeasurementOrder::NativePortableFreUpstream | MeasurementOrder::LegacyNativeUpstream => {
+            let native = native()?;
+            let portable_fre = portable_fre()?;
+            let upstream = upstream()?;
+            Ok((upstream, portable_fre, native))
         }
     }
 }
@@ -4823,9 +5030,12 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
              measured_searches *= UINT64_C(2); goto measure_trials;\n\
            }}\n\
            double minimum = (double)samples[0], med = median_u64(samples, trials);\n\
-           printf(\"native\\t%s\\t%\" PRIu64 \"\\t%.1f\\t%.1f\\t%.6f\\t%.6f\\t%\" PRIu64 \"\\tok\\n\",\n\
+           printf(\"native\\t%s\\t%\" PRIu64 \"\\t%.1f\\t%.1f\\t%.6f\\t%.6f\\t%\" PRIu64 \"\\t\",\n\
                   scenario->name, measured_searches, minimum, med, minimum / (double)measured_searches,\n\
                   med / (double)measured_searches, last_checksum);\n\
+           for (size_t trial = 0; trial < trials; ++trial)\n\
+             printf(\"%s%\" PRIu64, trial == 0U ? \"\" : \",\", samples[trial]);\n\
+           fputs(\"\\tok\\n\", stdout);\n\
            free(samples); free(storage); return 0;\n\
          }}\n\n\
          int main(void) {{\n\
@@ -5099,7 +5309,7 @@ fn execute_native_harness(
     let mut measurements = BTreeMap::new();
     for line in stdout.lines() {
         let columns = line.split('\t').collect::<Vec<_>>();
-        if columns.len() != 9 || columns[0] != "native" || columns[8] != "ok" {
+        if columns.len() != 10 || columns[0] != "native" || columns[9] != "ok" {
             return Err(format!("malformed native row: {line}"));
         }
         let parse_float = |column: usize| {
@@ -5113,6 +5323,14 @@ fn execute_native_harness(
         let checksum = columns[7]
             .parse::<u64>()
             .map_err(|error| format!("malformed native checksum in {line}: {error}"))?;
+        let samples_elapsed_ns = columns[8]
+            .split(',')
+            .map(|sample| {
+                sample
+                    .parse::<u128>()
+                    .map_err(|error| format!("malformed native sample in {line}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let previous = measurements.insert(
             columns[1].to_owned(),
             Measurement {
@@ -5122,6 +5340,7 @@ fn execute_native_harness(
                 min_ns_per_search: parse_float(5)?,
                 median_ns_per_search: parse_float(6)?,
                 checksum,
+                samples_elapsed_ns,
             },
         );
         if previous.is_some() {
@@ -5224,27 +5443,46 @@ fn print_joined_rows(
     shapes: &[CompiledShape],
     scenarios: &[Scenario],
     upstream: &BTreeMap<String, Measurement>,
+    portable_fre: &BTreeMap<String, Measurement>,
     native: &BTreeMap<String, Measurement>,
 ) -> Result<(), String> {
     println!(
         "comparison\tcase\tpattern_name\tfamily\tseed\tsource_kind\treverse_pair_qualification\treverse_pair_restart_class\tpreflight_observation\tpattern\toutput\tupstream_operation\tnative_route\tengine\tselection_reason\ttarget\tfeature_bits\tstart_accelerator\taarch64_sve_code_profile\tprefix_graph_bytes\tprefix_selective_positions\tprefix_filter_bytes\twindow_bytes\tmatch_position\tcandidate_density\trotations\tinitial_searches\tmin_trial_ns\ttrials\twarmup_rounds\tupstream_searches_per_trial\tupstream_min_elapsed_ns\tupstream_median_elapsed_ns\tupstream_min_ns_per_search\tupstream_median_ns_per_search\tnative_searches_per_trial\tnative_min_elapsed_ns\tnative_median_elapsed_ns\tnative_min_ns_per_search\tnative_median_ns_per_search\tspeedup_at_min\tspeedup_at_median\tupstream_checksum\tnative_checksum\tstatus"
     );
+    println!(
+        "#tri_comparison\tcase\tpattern_name\tfamily\toutput\tnative_route\tportable_fre_route\twindow_bytes\tmatch_position\tcandidate_density\tupstream_median_ns_per_search\tportable_fre_median_ns_per_search\tnative_median_ns_per_search\tupstream_over_native\tportable_fre_over_native\tupstream_over_portable_fre\tstatus"
+    );
+    println!(
+        "#timing_sample\tcase\tengine\tsample_index\tsearches\telapsed_ns\tns_per_search\tstatus"
+    );
     let mut aggregates: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut tri_aggregates: BTreeMap<(String, String, String), Vec<f64>> = BTreeMap::new();
     let mut family_regimes: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     for scenario in scenarios {
         let shape = &shapes[scenario.shape_index];
         let upstream = upstream
             .get(&scenario.case_name)
             .ok_or_else(|| format!("missing upstream row for {}", scenario.case_name))?;
+        let portable_fre = portable_fre
+            .get(&scenario.case_name)
+            .ok_or_else(|| format!("missing portable FRE row for {}", scenario.case_name))?;
         let native = native
             .get(&scenario.case_name)
             .ok_or_else(|| format!("missing native row for {}", scenario.case_name))?;
         let speedup_at_min = upstream.min_ns_per_search / native.min_ns_per_search;
         let speedup_at_median = upstream.median_ns_per_search / native.median_ns_per_search;
+        let portable_fre_over_native =
+            portable_fre.median_ns_per_search / native.median_ns_per_search;
+        let upstream_over_portable_fre =
+            upstream.median_ns_per_search / portable_fre.median_ns_per_search;
         if !speedup_at_min.is_finite()
             || speedup_at_min <= 0.0
             || !speedup_at_median.is_finite()
             || speedup_at_median <= 0.0
+            || !portable_fre_over_native.is_finite()
+            || portable_fre_over_native <= 0.0
+            || !upstream_over_portable_fre.is_finite()
+            || upstream_over_portable_fre <= 0.0
         {
             return Err(format!(
                 "{} produced a non-positive or non-finite speedup",
@@ -5303,8 +5541,31 @@ fn print_joined_rows(
                 accelerator_name(receipt.start_accelerator).to_owned(),
             ),
         ];
-        for group in groups {
-            aggregates.entry(group).or_default().push(speedup_at_median);
+        for (group, value) in groups {
+            aggregates
+                .entry((group.clone(), value.clone()))
+                .or_default()
+                .push(speedup_at_median);
+            tri_aggregates
+                .entry((
+                    "upstream_over_native".to_owned(),
+                    group.clone(),
+                    value.clone(),
+                ))
+                .or_default()
+                .push(speedup_at_median);
+            tri_aggregates
+                .entry((
+                    "portable_fre_over_native".to_owned(),
+                    group.clone(),
+                    value.clone(),
+                ))
+                .or_default()
+                .push(portable_fre_over_native);
+            tri_aggregates
+                .entry(("upstream_over_portable_fre".to_owned(), group, value))
+                .or_default()
+                .push(upstream_over_portable_fre);
         }
         if compiled_primary {
             for selected_regime in ["all", regime] {
@@ -5359,6 +5620,58 @@ fn print_joined_rows(
             speedup_at_median,
             upstream.checksum,
             native.checksum,
+        );
+        println!(
+            "tri_comparison\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\tok",
+            scenario.case_name,
+            shape.spec.base_name,
+            shape.spec.family,
+            shape.spec.output.name(),
+            shape.route(),
+            shape.portable_fre.runtime_implementation_id(),
+            scenario.size,
+            scenario.position.name(),
+            scenario.density.name,
+            upstream.median_ns_per_search,
+            portable_fre.median_ns_per_search,
+            native.median_ns_per_search,
+            speedup_at_median,
+            portable_fre_over_native,
+            upstream_over_portable_fre,
+        );
+        for (engine, measurement) in [
+            ("upstream", upstream),
+            ("portable_fre", portable_fre),
+            ("native", native),
+        ] {
+            for (sample_index, &elapsed_ns) in measurement.samples_elapsed_ns.iter().enumerate() {
+                println!(
+                    "timing_sample\t{}\t{}\t{}\t{}\t{}\t{:.6}\tok",
+                    scenario.case_name,
+                    engine,
+                    sample_index,
+                    measurement.searches,
+                    elapsed_ns,
+                    elapsed_ns as f64 / measurement.searches as f64,
+                );
+            }
+        }
+    }
+    println!(
+        "#tri_aggregate\tcomparison\tgroup\tvalue\tmetric\tcells\tgeomean\tp10\tp50\tp90\twins\tstatus"
+    );
+    for ((comparison, group, value), mut samples) in tri_aggregates {
+        samples.sort_by(f64::total_cmp);
+        let count = samples.len();
+        let quantile = |percent: usize| samples[(count - 1) * percent / 100];
+        let geometric_mean =
+            (samples.iter().map(|sample| sample.ln()).sum::<f64>() / count as f64).exp();
+        let wins = samples.iter().filter(|&&sample| sample > 1.0).count();
+        println!(
+            "tri_aggregate\t{comparison}\t{group}\t{value}\tmedian_ns_per_search_ratio\t{count}\t{geometric_mean:.6}\t{:.6}\t{:.6}\t{:.6}\t{wins}\tok",
+            quantile(10),
+            quantile(50),
+            quantile(90),
         );
     }
     println!("#aggregate\tgroup\tvalue\tmetric\tcells\tgeomean\tp10\tp50\tp90\twins\tstatus");
@@ -5979,12 +6292,20 @@ fn run(config: &Config) -> Result<(), String> {
     let scratch = ScratchDirectory::create()?;
     let executable = compile_native_harness(&scratch.0, config, &shapes, &scenarios, &runtime)?;
     let prepared_native = prepare_native_harness(&executable, &scratch.0)?;
-    let (upstream, native) = measure_in_order(
+    let (upstream, portable_fre, native) = measure_in_order(
         config.measurement_order,
         || measure_upstream(config, &shapes, &scenarios),
+        || measure_portable_fre(config, &shapes, &scenarios),
         || execute_native_harness(prepared_native, scenarios.len()),
     )?;
-    print_joined_rows(config, &shapes, &scenarios, &upstream, &native)?;
+    print_joined_rows(
+        config,
+        &shapes,
+        &scenarios,
+        &upstream,
+        &portable_fre,
+        &native,
+    )?;
     eprintln!("validated and measured {} generated cells", scenarios.len());
     Ok(())
 }
@@ -6296,8 +6617,10 @@ mod tests {
         let partial_dfa = retained_partial_stats(&aot).expect("test partial statistics");
         let prepared_capability_format =
             prepared_capability_format(&aot).expect("test prepared capability");
+        let portable_fre = PortableRegex::new(&spec.pattern).expect("test portable FRE regex");
         CompiledShape {
             upstream: Regex::new(&spec.pattern).expect("test upstream regex"),
+            portable_fre,
             spec,
             aot,
             runtime_program,
@@ -6345,22 +6668,85 @@ mod tests {
 
         assert_eq!(
             parse_measurement_order("upstream-native"),
-            Ok(MeasurementOrder::UpstreamNative)
+            Ok(MeasurementOrder::LegacyUpstreamNative)
         );
         assert_eq!(
             parse_measurement_order("native-upstream"),
-            Ok(MeasurementOrder::NativeUpstream)
+            Ok(MeasurementOrder::LegacyNativeUpstream)
+        );
+        assert_eq!(
+            parse_measurement_order("upstream-portable-fre-native"),
+            Ok(MeasurementOrder::UpstreamPortableFreNative)
+        );
+        assert_eq!(
+            parse_measurement_order("upstream-native-portable-fre"),
+            Ok(MeasurementOrder::UpstreamNativePortableFre)
+        );
+        assert_eq!(
+            parse_measurement_order("portable-fre-upstream-native"),
+            Ok(MeasurementOrder::PortableFreUpstreamNative)
+        );
+        assert_eq!(
+            parse_measurement_order("portable-fre-native-upstream"),
+            Ok(MeasurementOrder::PortableFreNativeUpstream)
+        );
+        assert_eq!(
+            parse_measurement_order("native-upstream-portable-fre"),
+            Ok(MeasurementOrder::NativeUpstreamPortableFre)
+        );
+        assert_eq!(
+            parse_measurement_order("native-portable-fre-upstream"),
+            Ok(MeasurementOrder::NativePortableFreUpstream)
         );
         assert!(parse_measurement_order("alternating").is_err());
         assert_eq!(
             MeasurementOrder::default(),
-            MeasurementOrder::UpstreamNative
+            MeasurementOrder::LegacyUpstreamNative
         );
 
-        for (order, expected) in [
-            (MeasurementOrder::UpstreamNative, vec!["upstream", "native"]),
-            (MeasurementOrder::NativeUpstream, vec!["native", "upstream"]),
+        for (order, receipt, expected) in [
+            (
+                MeasurementOrder::UpstreamPortableFreNative,
+                "upstream-portable-fre-native",
+                vec!["upstream", "portable_fre", "native"],
+            ),
+            (
+                MeasurementOrder::UpstreamNativePortableFre,
+                "upstream-native-portable-fre",
+                vec!["upstream", "native", "portable_fre"],
+            ),
+            (
+                MeasurementOrder::PortableFreUpstreamNative,
+                "portable-fre-upstream-native",
+                vec!["portable_fre", "upstream", "native"],
+            ),
+            (
+                MeasurementOrder::PortableFreNativeUpstream,
+                "portable-fre-native-upstream",
+                vec!["portable_fre", "native", "upstream"],
+            ),
+            (
+                MeasurementOrder::NativeUpstreamPortableFre,
+                "native-upstream-portable-fre",
+                vec!["native", "upstream", "portable_fre"],
+            ),
+            (
+                MeasurementOrder::NativePortableFreUpstream,
+                "native-portable-fre-upstream",
+                vec!["native", "portable_fre", "upstream"],
+            ),
+            (
+                MeasurementOrder::LegacyUpstreamNative,
+                "upstream-native",
+                vec!["upstream", "portable_fre", "native"],
+            ),
+            (
+                MeasurementOrder::LegacyNativeUpstream,
+                "native-upstream",
+                vec!["native", "portable_fre", "upstream"],
+            ),
         ] {
+            assert_eq!(order.name(), receipt);
             let events = RefCell::new(Vec::new());
             let measured = measure_in_order(
                 order,
@@ -6369,12 +6755,16 @@ mod tests {
                     Ok::<_, ()>(11)
                 },
                 || {
+                    events.borrow_mut().push("portable_fre");
+                    Ok::<_, ()>(13)
+                },
+                || {
                     events.borrow_mut().push("native");
                     Ok::<_, ()>(7)
                 },
             )
             .unwrap();
-            assert_eq!(measured, (11, 7));
+            assert_eq!(measured, (11, 13, 7));
             assert_eq!(events.into_inner(), expected);
         }
 
@@ -6653,6 +7043,7 @@ mod tests {
                 .next()
                 .expect("grammar shape"),
             upstream: Regex::new("[ab]x").unwrap(),
+            portable_fre: PortableRegex::new("[ab]x").unwrap(),
             aot,
             runtime_program: None,
             partial_dfa: None,
@@ -6731,9 +7122,11 @@ mod tests {
         spec.candidates = b"a".to_vec();
         spec.output = OutputKind::Span;
         spec.force_fallback = true;
+        let portable_fre = PortableRegex::new(&spec.pattern).unwrap();
         let shape = CompiledShape {
             spec,
             upstream,
+            portable_fre,
             aot,
             runtime_program,
             partial_dfa: None,
@@ -6822,9 +7215,11 @@ mod tests {
         spec.candidates = b"x".to_vec();
         spec.output = OutputKind::Span;
         spec.force_fallback = true;
+        let portable_fre = PortableRegex::new(&spec.pattern).unwrap();
         let shape = CompiledShape {
             spec,
             upstream,
+            portable_fre,
             aot,
             runtime_program: Some((runtime_symbol.clone(), runtime_bytes)),
             partial_dfa: None,
@@ -6950,6 +7345,7 @@ mod tests {
             let shape = CompiledShape {
                 spec,
                 upstream: Regex::new(pattern).unwrap(),
+                portable_fre: PortableRegex::new(pattern).unwrap(),
                 prepared_capability_format: prepared_capability_format(&aot).unwrap(),
                 aot,
                 runtime_program,
@@ -7014,6 +7410,7 @@ mod tests {
         let shape = CompiledShape {
             spec,
             upstream: Regex::new(pattern).unwrap(),
+            portable_fre: PortableRegex::new(pattern).unwrap(),
             aot,
             runtime_program,
             partial_dfa,
