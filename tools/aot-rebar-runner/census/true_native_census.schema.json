@@ -377,11 +377,85 @@
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "scalarNativeReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256"
+      ],
+      "properties": {
+        "route_variant": {
+          "enum": ["direct-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
+        "prepare_operation_flags": { "enum": [2, 4] },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "entry_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "program_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "span_fill_identity_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "direct-v2" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "ordered-v15" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "span_fill_identity_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          },
+          "else": {
+            "properties": {
+              "span_fill_identity_sha256": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
     "sharedOrderedManyProvenance": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "receipt_schema_version", "source_pattern_count",
+        "route_variant", "receipt_schema_version", "source_pattern_count",
         "ordered_sources_sha256", "required_prepare_capabilities",
         "prepare_config_version", "prepare_operation_flags",
         "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
@@ -389,23 +463,52 @@
         "reducer_identity_sha256"
       ],
       "properties": {
+        "route_variant": {
+          "enum": ["native-fused-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
         "receipt_schema_version": { "const": 1 },
         "source_pattern_count": {
           "type": "integer", "minimum": 2, "maximum": 4096
         },
         "ordered_sources_sha256": { "$ref": "#/$defs/sha256" },
-        "required_prepare_capabilities": { "const": 1 },
-        "prepare_config_version": { "const": 3 },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
         "prepare_operation_flags": { "enum": [2, 4] },
-        "max_handle_bytes": { "const": 8388608 },
-        "max_scratch_bytes": { "const": 8388608 },
-        "max_setup_work": { "const": 2000000 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
         "runtime_program_len": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
         "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "native-fused-v2" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
     },
     "uniformCaptureProvenance": {
       "type": "object",
@@ -457,6 +560,64 @@
         }
       }
     },
+    "uniformCaptureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256"
+      ],
+      "properties": {
+        "route_variant": {
+          "enum": ["direct-v1", "ordered-v15", "ordered-v15-operation-only"]
+        },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
+        "prepare_operation_flags": { "const": 2 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "entry_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "program_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "span_fill_identity_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "direct-v1" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
+    },
     "strictCaptureProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -499,7 +660,11 @@
         "participation_strategy", "participation_semantic_runtime_calls",
         "participation_assertions", "participation_assertion_signatures",
         "participation_byte_classes", "participation_dfa_states",
-        "participation_transition_cells", "participation_build_work",
+        "participation_transition_cells", "participation_ordered_nfa_states",
+        "participation_ordered_nfa_byte_ranges",
+        "participation_dfa_fallback_resource",
+        "participation_dfa_fallback_required",
+        "participation_dfa_fallback_limit", "participation_build_work",
         "participation_scratch_bytes", "participation_plan_bytes",
         "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
         "selector_object_sha256", "participation_bundle_sha256",
@@ -529,6 +694,21 @@
         },
         "participation_transition_cells": {
           "type": "integer", "minimum": 1, "maximum": 16777216
+        },
+        "participation_ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_dfa_fallback_resource": {
+          "type": "integer", "minimum": 0, "maximum": 2
+        },
+        "participation_dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "participation_dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
         },
         "participation_build_work": {
           "type": "integer", "minimum": 1, "maximum": 268435456
@@ -564,29 +744,50 @@
       "additionalProperties": false,
       "required": [
         "algorithm_id", "strategy", "assertions", "assertion_signatures",
-        "byte_classes", "dfa_states", "transition_cells", "build_work",
+        "byte_classes", "dfa_states", "transition_cells",
+        "ordered_nfa_states", "ordered_nfa_byte_ranges",
+        "dfa_fallback_resource", "dfa_fallback_required",
+        "dfa_fallback_limit", "build_work",
         "scratch_bytes", "plan_bytes", "selector_object_sha256",
         "bundle_sha256", "export_identity_sha256", "bundle_symbol",
         "selector_symbol", "entry_symbol"
       ],
       "properties": {
         "algorithm_id": {
-          "const": "fre-aot-regex.exact-span-participation-dfa.v1"
+          "enum": [
+            "fre-aot-regex.exact-span-participation-dfa.v1",
+            "fre-aot-regex.exact-span-participation-ordered-nfa.v1"
+          ]
         },
-        "strategy": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "strategy": { "enum": [1, 2, 4, 5] },
         "assertions": { "type": "integer", "minimum": 0, "maximum": 64 },
         "assertion_signatures": {
-          "type": "integer", "minimum": 1, "maximum": 256
+          "type": "integer", "minimum": 0, "maximum": 256
         },
-        "byte_classes": { "type": "integer", "minimum": 1, "maximum": 256 },
-        "dfa_states": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "byte_classes": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "dfa_states": { "type": "integer", "minimum": 0, "maximum": 131072 },
         "transition_cells": {
-          "type": "integer", "minimum": 1, "maximum": 16777216
+          "type": "integer", "minimum": 0, "maximum": 16777216
+        },
+        "ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "dfa_fallback_resource": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
         },
         "build_work": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
-        "scratch_bytes": { "const": 16 },
+        "scratch_bytes": {
+          "type": "integer", "minimum": 16, "maximum": 8388608
+        },
         "plan_bytes": {
           "type": "integer", "minimum": 256, "maximum": 268435456
         },
@@ -639,6 +840,7 @@
         "source_bytes", "source_pattern_sha256", "source_sha256", "group_count",
         "can_match_empty",
         "empty_progress", "semantic_runtime_calls",
+        "caller_scratch_bytes",
         "private_participation_scratch_bytes", "private_iterator_state_bytes",
         "private_result_slot_count", "private_result_slot_bytes",
         "selector_sha256", "capture_sha256",
@@ -663,6 +865,9 @@
         "can_match_empty": { "type": "boolean" },
         "empty_progress": { "const": "byte" },
         "semantic_runtime_calls": { "const": 0 },
+        "caller_scratch_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 8388608
+        },
         "private_participation_scratch_bytes": {
           "type": "integer", "minimum": 0, "maximum": 16
         },
@@ -683,7 +888,9 @@
           "type": "string",
           "oneOf": [
             { "pattern": "^fre_aot_regex_count_captures_v1_[0-9a-f]{64}$" },
-            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" }
+            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_count_captures_scratch_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_grep_captures_scratch_v1_[0-9a-f]{64}$" }
           ]
         },
         "reducer_symbol_sha256": { "$ref": "#/$defs/nonzeroSha256" },
@@ -720,7 +927,6 @@
                 "$ref": "#/$defs/captureReducerParticipationSource"
               },
               "capture_next_source": { "type": "null" },
-              "private_participation_scratch_bytes": { "const": 16 },
               "private_iterator_state_bytes": { "const": 0 },
               "private_result_slot_count": { "const": 0 },
               "private_result_slot_bytes": { "const": 0 }
@@ -733,6 +939,7 @@
                 "$ref": "#/$defs/captureReducerCaptureNextSource"
               },
               "group_count": { "maximum": 16 },
+              "caller_scratch_bytes": { "const": 0 },
               "private_participation_scratch_bytes": { "const": 0 },
               "private_iterator_state_bytes": { "const": 24 }
             }
@@ -811,6 +1018,29 @@
         }
       }
     },
+    "frozenValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority", "expected_value", "expected_comparator",
+        "schedule_klv_sha256", "schedule_binding_sha256", "stock_comparator",
+        "stock_divergence_policy"
+      ],
+      "properties": {
+        "authority": { "const": "frozen-public-schedule-v1" },
+        "expected_value": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "expected_comparator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/+:\\-]{0,127}$"
+        },
+        "schedule_klv_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "schedule_binding_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "stock_comparator": { "const": "rust-regex-1.12.4" },
+        "stock_divergence_policy": { "const": "report-only" }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -821,7 +1051,8 @@
         "aggregate_strategy", "uniform_capture", "shared_ordered_many",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
-        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
+        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
+        "entry_abi", "validation"
       ],
       "properties": {
         "schema": {
@@ -837,6 +1068,12 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
+        "entry_abi": {
+          "enum": [
+            null, "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+          ]
+        },
+        "validation": { "$ref": "#/$defs/frozenValidation" },
         "kind": {
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
@@ -866,6 +1103,7 @@
         "uniform_capture": {
           "anyOf": [
             { "$ref": "#/$defs/uniformCaptureProvenance" },
+            { "$ref": "#/$defs/uniformCaptureReducerProvenance" },
             { "type": "null" }
           ]
         },
@@ -885,6 +1123,9 @@
         },
         "regex_redux": { "$ref": "#/$defs/regexReduxProvenance" },
         "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
+        "scalar_native_reducer": {
+          "$ref": "#/$defs/scalarNativeReducerProvenance"
+        },
         "prepared_v15_limits": { "$ref": "#/$defs/preparedV15LimitsProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
@@ -903,6 +1144,22 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": { "schema": { "const": "fre.aot.rebar-runner.v2" } },
+            "required": ["schema"]
+          },
+          "then": {
+            "properties": {
+              "entry_abi": {
+                "enum": [
+                  "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+                ]
+              }
+            }
+          },
+          "else": { "properties": { "entry_abi": { "type": "null" } } }
+        },
         {
           "if": {
             "properties": {
@@ -981,6 +1238,31 @@
           },
           "then": { "required": ["prepared_grep_v15"] },
           "else": { "not": { "required": ["prepared_grep_v15"] } }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "kind": { "const": "scalar-v2" },
+                  "model": { "const": "count" }
+                },
+                "required": ["kind", "model"]
+              },
+              {
+                "properties": {
+                  "kind": { "const": "scalar-v2" },
+                  "model": { "const": "count-spans" },
+                  "span_iteration_strategy": {
+                    "const": "linked-native-span-sum-reducer"
+                  }
+                },
+                "required": ["kind", "model", "span_iteration_strategy"]
+              }
+            ]
+          },
+          "then": { "required": ["scalar_native_reducer"] },
+          "else": { "not": { "required": ["scalar_native_reducer"] } }
         },
         {
           "if": {

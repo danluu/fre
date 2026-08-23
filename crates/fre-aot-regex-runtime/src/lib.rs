@@ -603,14 +603,25 @@ pub type FreAotRegexCaptureNextV1 = unsafe extern "C" fn(
 pub type FreAotRegexCaptureReducerV1 =
     unsafe extern "C" fn(*const u8, usize, *mut u64) -> u32;
 
+/// Identity-suffixed whole-operation capture-participation scalar with exact
+/// receipt-sized caller-owned scratch. The scratch and output extents must be
+/// writable, naturally aligned, nonoverlapping, and disjoint from a nonempty
+/// haystack. Entries publish `value_out` only on [`STATUS_SUCCESS`] and never
+/// retain the scratch pointer after return.
+pub type FreAotRegexCaptureReducerScratchV1 =
+    unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut u64) -> u32;
+
 /// Complete request for an object-local exact-span participation replay.
 ///
 /// `bundle` must be the paired identity-suffixed bundle symbol from the same
 /// linked object as the entry. The exact span must have been returned by that
 /// object's ordinary full-window Span selector. Selected entries require
-/// exactly 16 bytes of naturally aligned caller-owned reserved storage. The
-/// native scratch channel is validated but never read or written. Selected
-/// entries publish `count_out` only on [`STATUS_MATCH`].
+/// naturally aligned caller-owned scratch of the exact extent in the paired
+/// receipt. DFA entries require 16 reserved bytes and do not read or write
+/// them. Ordered-NFA entries use their larger receipt-sized extent as
+/// transient replay state and may overwrite it. No selected entry retains the
+/// pointer after return. Selected entries publish `count_out` only on
+/// [`STATUS_MATCH`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct FreAotRegexParticipationRequestV1 {
@@ -10568,9 +10579,16 @@ mod tests {
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureMaterializeV1"));
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureNextV1"));
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureReducerV1"));
+        assert!(
+            C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureReducerScratchV1")
+        );
         assert_eq!(size_of::<FreAotRegexCaptureMaterializeV1>(), size_of::<usize>());
         assert_eq!(size_of::<FreAotRegexCaptureNextV1>(), size_of::<usize>());
         assert_eq!(size_of::<FreAotRegexCaptureReducerV1>(), size_of::<usize>());
+        assert_eq!(
+            size_of::<FreAotRegexCaptureReducerScratchV1>(),
+            size_of::<usize>()
+        );
         assert!(
             C_API_NATIVE_PARTICIPATION_V1_HEADER
                 .contains("FRE_AOT_REGEX_STATUS_NATIVE_PARTICIPATION_UNAVAILABLE 10u")

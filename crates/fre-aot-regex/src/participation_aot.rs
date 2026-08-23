@@ -1,10 +1,12 @@
 //! Helper-free exact-span capture-participation AOT construction.
 //!
 //! The ordinary Span selector remains authoritative for leftmost-first match
-//! selection. This module determinizes only the capture-participation quotient
-//! for replay of that independently selected span. Capture offsets never enter
-//! the machine: each ordered thread carries `(pc, open, participated)`, and
-//! first arrival at an original Thompson `pc` remains the priority rule.
+//! selection. This module first tries to determinize only the capture-
+//! participation quotient for replay of that independently selected span. An
+//! exact DFA state/work envelope exhaustion selects a bounded ordered-NFA plan
+//! over the same authenticated projection. Capture offsets never enter either
+//! machine: each ordered thread carries `(pc, open, participated)`, and first
+//! arrival at an original Thompson `pc` remains the priority rule.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -17,6 +19,8 @@ use std::collections::HashMap;
 #[cfg(test)]
 use fre_automata::{EdgeKind, UnicodeLookMatcher};
 use fre_capture_lab::{
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_BYTES, EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_ALIGN,
+    EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES,
     ExactSpanParticipationNativeAssertionV1 as Assertion,
     ExactSpanParticipationNativeStateV1 as State, ExactSpanParticipationNativeV1Limits,
     ExactSpanParticipationNativeV1View,
@@ -35,10 +39,15 @@ const NO_ACCEPT: u8 = u8::MAX;
 /// Stable identity of the prioritized participation determinization.
 pub const NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID: &str =
     "fre-aot-regex.exact-span-participation-dfa.v1";
+/// Stable identity of the prioritized ordered-NFA participation fallback.
+pub const NATIVE_PARTICIPATION_ORDERED_NFA_V1_ALGORITHM_ID: &str =
+    "fre-aot-regex.exact-span-participation-ordered-nfa.v1";
 
 pub const NATIVE_PARTICIPATION_AOT_V1_MAGIC: [u8; 8] = *b"FREPAR1\0";
 pub const NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION: u16 = 1;
 pub const NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES: usize = 256;
+/// Fixed caller scratch for DFA plans. Ordered-NFA plans publish their exact
+/// source-sized caller scratch in the same wire field and receipt.
 pub const NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES: usize = 16;
 pub const NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN: usize = 8;
 pub const NATIVE_PARTICIPATION_AOT_V1_READY_SEAL: u64 = 0x71ce_9d40_16b5_4a2f;
@@ -50,9 +59,34 @@ const PLAN_DIGEST_OFFSET: usize = 224;
 const DIGEST_BYTES: usize = 32;
 const PLAN_FLAG_SELECTED: u32 = 1;
 const PLAN_FLAG_START_END_ASSERTIONS: u32 = 1 << 1;
-const PLAN_KNOWN_FLAGS: u32 = PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS;
+const PLAN_FLAG_ORDERED_NFA: u32 = 1 << 2;
+const PLAN_KNOWN_FLAGS: u32 =
+    PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS | PLAN_FLAG_ORDERED_NFA;
 const BUNDLE_SYMBOL_PREFIX: &str = "fre_aot_regex_participation_bundle_v1_";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_participation_exact_v1_";
+
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC: [u8; 8] = *b"FREPNF1\0";
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION: u16 = 1;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES: usize = 112;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES: usize = 16;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES: usize = 2;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_OPCODE_OFFSET: usize = 0;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_AUX0_OFFSET: usize = 1;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_AUX1_OFFSET: usize = 2;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_TARGET0_OFFSET: usize = 4;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_TARGET1_OFFSET: usize = 8;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_RANGE_COUNT_OFFSET: usize = 12;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_PC_OFFSET: usize = 0;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_OPEN_OFFSET: usize = 8;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_PARTICIPATED_OFFSET: usize = 16;
+
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE: u8 = 1;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT: u8 = 2;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE: u8 = 3;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT: u8 = 4;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON: u8 = 5;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH: u8 = 6;
+pub(crate) const NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL: u8 = 7;
 
 /// Architecture-specific helper-free leaf or explicit unavailable entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +95,8 @@ pub enum NativeParticipationAotStrategyV1 {
     DfaX86_64 = 1,
     DfaAarch64 = 2,
     NegativeEntry = 3,
+    OrderedNfaX86_64 = 4,
+    OrderedNfaAarch64 = 5,
 }
 
 /// Stable semantic reason carried by a negative entry.
@@ -85,6 +121,12 @@ pub struct NativeParticipationAotReceiptV1 {
     pub byte_classes: usize,
     pub dfa_states: usize,
     pub transition_cells: usize,
+    pub ordered_nfa_states: usize,
+    pub ordered_nfa_byte_ranges: usize,
+    /// Exact typed DFA envelope that authorized the ordered-NFA route.
+    pub dfa_fallback_resource: Option<NativeParticipationAotResourceV1>,
+    pub dfa_fallback_required: usize,
+    pub dfa_fallback_limit: usize,
     pub build_work: usize,
     pub scratch_bytes: usize,
     pub plan_bytes: usize,
@@ -165,6 +207,8 @@ pub struct NativeParticipationAotLimitsV1 {
     pub max_dfa_states: usize,
     pub max_transition_cells: usize,
     pub max_build_work: usize,
+    /// Exact caller-owned replay scratch ceiling for the ordered-NFA fallback.
+    pub max_ordered_nfa_scratch_bytes: usize,
     pub max_plan_bytes: usize,
     pub max_object_bytes: usize,
 }
@@ -179,6 +223,7 @@ impl Default for NativeParticipationAotLimitsV1 {
             max_dfa_states: 65_536,
             max_transition_cells: 16 * 1_024 * 1_024,
             max_build_work: 128 * 1_024 * 1_024,
+            max_ordered_nfa_scratch_bytes: 8 * 1_024 * 1_024,
             max_plan_bytes: 256 * 1_024 * 1_024,
             max_object_bytes: 512 * 1_024 * 1_024,
         }
@@ -194,6 +239,7 @@ pub enum NativeParticipationAotResourceV1 {
     DfaStates,
     TransitionCells,
     BuildWork,
+    OrderedNfaScratchBytes,
     PlanBytes,
     ObjectBytes,
 }
@@ -546,7 +592,14 @@ impl NativeParticipationDfaV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeParticipationPlanKindV1 {
+    Dfa,
+    OrderedNfa,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeParticipationPlanGeometryV1 {
+    pub kind: NativeParticipationPlanKindV1,
     pub total_bytes: usize,
     pub build_work: usize,
     pub assertions_offset: usize,
@@ -562,6 +615,19 @@ pub(crate) struct NativeParticipationPlanGeometryV1 {
     pub alphabet_len: usize,
     pub state_count: usize,
     pub transition_count: usize,
+    pub ordered_nfa_metadata_offset: usize,
+    pub ordered_nfa_states_offset: usize,
+    pub ordered_nfa_byte_ranges_offset: usize,
+    pub ordered_nfa_byte_range_count: usize,
+    pub ordered_nfa_start_state: u32,
+    pub replay_current_offset: usize,
+    pub replay_next_offset: usize,
+    pub replay_stack_offset: usize,
+    pub replay_seen_offset: usize,
+    pub replay_scratch_bytes: usize,
+    pub dfa_fallback_resource: Option<NativeParticipationAotResourceV1>,
+    pub dfa_fallback_required: usize,
+    pub dfa_fallback_limit: usize,
 }
 
 pub(crate) fn emit_native_participation_aot_v1(
@@ -589,10 +655,7 @@ pub(crate) fn emit_native_participation_aot_v1(
     )?;
 
     let selector_module = compiled.selector().module();
-    let selector_requires_runtime = selector_module
-        .required_runtime_symbols()
-        .next()
-        .is_some()
+    let selector_requires_runtime = selector_module.required_runtime_symbols().next().is_some()
         || selector_module.required_runtime_program().is_some();
     let (strategy, decline, bundle, geometry, build_work) = if selector_requires_runtime {
         let strategy = NativeParticipationAotStrategyV1::NegativeEntry;
@@ -633,21 +696,50 @@ pub(crate) fn emit_native_participation_aot_v1(
                 0,
             )
         } else {
-            let dfa = NativeParticipationDfaV1::build(view, limits)?;
-            let strategy = match target.architecture {
-                Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
-                Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
-            };
-            let build_work = dfa.build_work();
-            let (bundle, geometry) = encode_selected_bundle(
-                compiled,
-                target,
-                selector_object_sha256,
-                strategy,
-                &dfa,
-                limits.max_plan_bytes,
-            )?;
-            (strategy, None, bundle, Some(geometry), build_work)
+            match NativeParticipationDfaV1::build(view, limits) {
+                Ok(dfa) => {
+                    let strategy = match target.architecture {
+                        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
+                        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+                    };
+                    let build_work = dfa.build_work();
+                    let (bundle, geometry) = encode_selected_dfa_bundle(
+                        compiled,
+                        target,
+                        selector_object_sha256,
+                        strategy,
+                        &dfa,
+                        limits.max_plan_bytes,
+                    )?;
+                    (strategy, None, bundle, Some(geometry), build_work)
+                }
+                Err(error) => {
+                    let Some((resource, required, limit)) =
+                        exact_dfa_fallback_envelope(&error, limits)
+                    else {
+                        return Err(error);
+                    };
+                    let strategy = match target.architecture {
+                        Architecture::X86_64 => NativeParticipationAotStrategyV1::OrderedNfaX86_64,
+                        Architecture::Aarch64 => {
+                            NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                        }
+                    };
+                    let (bundle, geometry) = encode_selected_ordered_nfa_bundle(
+                        compiled,
+                        target,
+                        selector_object_sha256,
+                        strategy,
+                        view,
+                        resource,
+                        required,
+                        limit,
+                        limits,
+                    )?;
+                    let build_work = geometry.build_work;
+                    (strategy, None, bundle, Some(geometry), build_work)
+                }
+            }
         }
     } else {
         let strategy = NativeParticipationAotStrategyV1::NegativeEntry;
@@ -715,12 +807,41 @@ pub(crate) fn emit_native_participation_aot_v1(
         semantic_runtime_calls: 0,
         groups: identity.groups(),
         assertions: geometry.map_or(0, |shape| shape.assertion_count),
-        assertion_signatures: geometry.map_or(0, |shape| shape.signature_count),
-        byte_classes: geometry.map_or(0, |shape| shape.alphabet_len),
-        dfa_states: geometry.map_or(0, |shape| shape.state_count),
-        transition_cells: geometry.map_or(0, |shape| shape.transition_count),
+        assertion_signatures: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::Dfa)
+                .then_some(shape.signature_count)
+                .unwrap_or(0)
+        }),
+        byte_classes: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::Dfa)
+                .then_some(shape.alphabet_len)
+                .unwrap_or(0)
+        }),
+        dfa_states: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::Dfa)
+                .then_some(shape.state_count)
+                .unwrap_or(0)
+        }),
+        transition_cells: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::Dfa)
+                .then_some(shape.transition_count)
+                .unwrap_or(0)
+        }),
+        ordered_nfa_states: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::OrderedNfa)
+                .then_some(shape.state_count)
+                .unwrap_or(0)
+        }),
+        ordered_nfa_byte_ranges: geometry.map_or(0, |shape| {
+            (shape.kind == NativeParticipationPlanKindV1::OrderedNfa)
+                .then_some(shape.ordered_nfa_byte_range_count)
+                .unwrap_or(0)
+        }),
+        dfa_fallback_resource: geometry.and_then(|shape| shape.dfa_fallback_resource),
+        dfa_fallback_required: geometry.map_or(0, |shape| shape.dfa_fallback_required),
+        dfa_fallback_limit: geometry.map_or(0, |shape| shape.dfa_fallback_limit),
         build_work,
-        scratch_bytes: geometry.map_or(0, |_| NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES),
+        scratch_bytes: geometry.map_or(0, |shape| shape.replay_scratch_bytes),
         plan_bytes: bundle.len(),
         capture_sha256: identity.capture_sha256(),
         selector_sha256: identity.selector_sha256(),
@@ -759,7 +880,7 @@ fn native_assertions_supported(view: ExactSpanParticipationNativeV1View<'_>) -> 
     })
 }
 
-fn encode_selected_bundle(
+fn encode_selected_dfa_bundle(
     compiled: &CompiledCaptureRegex,
     target: Target,
     selector_object_sha256: [u8; DIGEST_BYTES],
@@ -855,6 +976,7 @@ fn encode_selected_bundle(
         start_states_offset,
         transitions_offset,
         accept_counts_offset,
+        NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES,
         identity.capture_sha256(),
         identity.selector_sha256(),
         selector_object_sha256,
@@ -885,6 +1007,7 @@ fn encode_selected_bundle(
     Ok((
         bytes,
         NativeParticipationPlanGeometryV1 {
+            kind: NativeParticipationPlanKindV1::Dfa,
             total_bytes,
             build_work: dfa.build_work(),
             assertions_offset,
@@ -900,8 +1023,417 @@ fn encode_selected_bundle(
             alphabet_len: dfa.alphabet_len(),
             state_count: dfa.state_count(),
             transition_count: dfa.transition_count(),
+            ordered_nfa_metadata_offset: 0,
+            ordered_nfa_states_offset: 0,
+            ordered_nfa_byte_ranges_offset: 0,
+            ordered_nfa_byte_range_count: 0,
+            ordered_nfa_start_state: 0,
+            replay_current_offset: 0,
+            replay_next_offset: 0,
+            replay_stack_offset: 0,
+            replay_seen_offset: 0,
+            replay_scratch_bytes: NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES,
+            dfa_fallback_resource: None,
+            dfa_fallback_required: 0,
+            dfa_fallback_limit: 0,
         },
     ))
+}
+
+fn exact_dfa_fallback_envelope(
+    error: &NativeParticipationAotErrorV1,
+    limits: NativeParticipationAotLimitsV1,
+) -> Option<(NativeParticipationAotResourceV1, usize, usize)> {
+    let NativeParticipationAotErrorV1::Resource {
+        resource,
+        required,
+        limit,
+    } = error
+    else {
+        return None;
+    };
+    let configured = match resource {
+        NativeParticipationAotResourceV1::DfaStates => limits.max_dfa_states,
+        NativeParticipationAotResourceV1::BuildWork => limits.max_build_work,
+        _ => return None,
+    };
+    (*limit == configured && limit.checked_add(1) == Some(*required))
+        .then_some((*resource, *required, *limit))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ordered-NFA bundle binds the incumbent identities and exact typed DFA exhaustion"
+)]
+fn encode_selected_ordered_nfa_bundle(
+    compiled: &CompiledCaptureRegex,
+    target: Target,
+    selector_object_sha256: [u8; DIGEST_BYTES],
+    strategy: NativeParticipationAotStrategyV1,
+    view: ExactSpanParticipationNativeV1View<'_>,
+    dfa_fallback_resource: NativeParticipationAotResourceV1,
+    dfa_fallback_required: usize,
+    dfa_fallback_limit: usize,
+    limits: NativeParticipationAotLimitsV1,
+) -> Result<(Vec<u8>, NativeParticipationPlanGeometryV1), NativeParticipationAotErrorV1> {
+    let configured_fallback_limit = match dfa_fallback_resource {
+        NativeParticipationAotResourceV1::DfaStates => limits.max_dfa_states,
+        NativeParticipationAotResourceV1::BuildWork => limits.max_build_work,
+        _ => {
+            return Err(NativeParticipationAotErrorV1::InvalidProgram(
+                "ordered-NFA fallback resource",
+            ));
+        }
+    };
+    let strategy_matches_target = matches!(
+        (strategy, target.architecture),
+        (
+            NativeParticipationAotStrategyV1::OrderedNfaX86_64,
+            Architecture::X86_64,
+        ) | (
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64,
+            Architecture::Aarch64,
+        )
+    );
+    if !strategy_matches_target
+        || dfa_fallback_limit != configured_fallback_limit
+        || dfa_fallback_limit.checked_add(1) != Some(dfa_fallback_required)
+    {
+        return Err(NativeParticipationAotErrorV1::InvalidProgram(
+            "ordered-NFA fallback envelope",
+        ));
+    }
+    let layout = view.layout();
+    let state_count = layout.state_count();
+    if state_count == 0 {
+        return Err(NativeParticipationAotErrorV1::InvalidProgram(
+            "ordered-NFA state cardinality",
+        ));
+    }
+    let byte_range_count = layout.byte_range_count();
+    let scratch_limit = limits
+        .max_ordered_nfa_scratch_bytes
+        .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
+    enforce(
+        NativeParticipationAotResourceV1::OrderedNfaScratchBytes,
+        layout.scratch_bytes(),
+        scratch_limit,
+    )?;
+
+    let metadata_offset = NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES;
+    let states_offset = align8(
+        metadata_offset
+            .checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+            .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                NativeParticipationAotResourceV1::PlanBytes,
+            ))?,
+    )?;
+    let states_bytes = state_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+        .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+            NativeParticipationAotResourceV1::PlanBytes,
+        ))?;
+    let byte_ranges_offset = align8(states_offset.checked_add(states_bytes).ok_or(
+        NativeParticipationAotErrorV1::ArithmeticOverflow(
+            NativeParticipationAotResourceV1::PlanBytes,
+        ),
+    )?)?;
+    let byte_ranges_bytes = byte_range_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+        .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+            NativeParticipationAotResourceV1::PlanBytes,
+        ))?;
+    let total_bytes = byte_ranges_offset.checked_add(byte_ranges_bytes).ok_or(
+        NativeParticipationAotErrorV1::ArithmeticOverflow(
+            NativeParticipationAotResourceV1::PlanBytes,
+        ),
+    )?;
+    enforce(
+        NativeParticipationAotResourceV1::PlanBytes,
+        total_bytes,
+        limits.max_plan_bytes,
+    )?;
+
+    let assertion_count = ordered_nfa_assertion_count(view)?;
+    let identity = compiled.receipt().identity;
+    let mut bytes = Vec::new();
+    reserve_exact(&mut bytes, total_bytes, "ordered-NFA participation bundle")?;
+    bytes.resize(total_bytes, 0);
+    encode_header(
+        &mut bytes,
+        target,
+        strategy,
+        None,
+        PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS | PLAN_FLAG_ORDERED_NFA,
+        total_bytes,
+        layout.lowering_work(),
+        layout.group_count(),
+        assertion_count,
+        0,
+        0,
+        state_count,
+        byte_range_count,
+        metadata_offset,
+        states_offset,
+        byte_ranges_offset,
+        layout.current_offset(),
+        layout.next_offset(),
+        layout.stack_offset(),
+        layout.scratch_bytes(),
+        identity.capture_sha256(),
+        identity.selector_sha256(),
+        selector_object_sha256,
+    )?;
+    encode_ordered_nfa_metadata(
+        &mut bytes,
+        metadata_offset,
+        dfa_fallback_resource,
+        dfa_fallback_required,
+        dfa_fallback_limit,
+        view,
+        states_offset,
+        byte_ranges_offset,
+    )?;
+    encode_ordered_nfa_states(&mut bytes, states_offset, byte_ranges_offset, view)?;
+    seal_bundle(&mut bytes)?;
+
+    Ok((
+        bytes,
+        NativeParticipationPlanGeometryV1 {
+            kind: NativeParticipationPlanKindV1::OrderedNfa,
+            total_bytes,
+            build_work: layout.lowering_work(),
+            assertions_offset: 0,
+            signatures_offset: 0,
+            byte_classes_offset: 0,
+            boundary_map_offset: 0,
+            start_states_offset: 0,
+            transitions_offset: 0,
+            accept_counts_offset: 0,
+            group_count: layout.group_count(),
+            assertion_count,
+            signature_count: 0,
+            alphabet_len: 0,
+            state_count,
+            transition_count: 0,
+            ordered_nfa_metadata_offset: metadata_offset,
+            ordered_nfa_states_offset: states_offset,
+            ordered_nfa_byte_ranges_offset: byte_ranges_offset,
+            ordered_nfa_byte_range_count: byte_range_count,
+            ordered_nfa_start_state: view.start_state(),
+            replay_current_offset: layout.current_offset(),
+            replay_next_offset: layout.next_offset(),
+            replay_stack_offset: layout.stack_offset(),
+            replay_seen_offset: layout.seen_offset(),
+            replay_scratch_bytes: layout.scratch_bytes(),
+            dfa_fallback_resource: Some(dfa_fallback_resource),
+            dfa_fallback_required,
+            dfa_fallback_limit,
+        },
+    ))
+}
+
+fn ordered_nfa_assertion_count(
+    view: ExactSpanParticipationNativeV1View<'_>,
+) -> Result<usize, NativeParticipationAotErrorV1> {
+    let mut mask = 0_u8;
+    for state in view.states() {
+        if let State::Assert { assertion, .. } = state {
+            let bit = match assertion.kind() as u8 {
+                1 => 1,
+                2 => 2,
+                _ => {
+                    return Err(NativeParticipationAotErrorV1::InvalidProgram(
+                        "ordered-NFA assertion kind",
+                    ));
+                }
+            };
+            mask |= bit;
+        }
+    }
+    Ok(usize::try_from(mask.count_ones()).unwrap_or(usize::MAX))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixed metadata record binds every ordered-NFA table and replay-scratch extent"
+)]
+fn encode_ordered_nfa_metadata(
+    bytes: &mut [u8],
+    offset: usize,
+    dfa_fallback_resource: NativeParticipationAotResourceV1,
+    dfa_fallback_required: usize,
+    dfa_fallback_limit: usize,
+    view: ExactSpanParticipationNativeV1View<'_>,
+    states_offset: usize,
+    byte_ranges_offset: usize,
+) -> Result<(), NativeParticipationAotErrorV1> {
+    let end = offset
+        .checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+        .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+            NativeParticipationAotResourceV1::PlanBytes,
+        ))?;
+    let metadata =
+        bytes
+            .get_mut(offset..end)
+            .ok_or(NativeParticipationAotErrorV1::InvalidProgram(
+                "ordered-NFA metadata extent",
+            ))?;
+    metadata[..8].copy_from_slice(&NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC);
+    write_u16(
+        metadata,
+        8,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION,
+    )?;
+    write_u16(
+        metadata,
+        10,
+        usize_u16(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)?,
+    )?;
+    write_u16(
+        metadata,
+        12,
+        usize_u16(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)?,
+    )?;
+    write_u16(
+        metadata,
+        14,
+        usize_u16(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)?,
+    )?;
+    write_u16(
+        metadata,
+        16,
+        dfa_fallback_resource_wire(dfa_fallback_resource).ok_or(
+            NativeParticipationAotErrorV1::InvalidProgram("ordered-NFA fallback resource"),
+        )?,
+    )?;
+    write_u64(metadata, 24, usize_u64(dfa_fallback_required)?)?;
+    write_u64(metadata, 32, usize_u64(dfa_fallback_limit)?)?;
+    let layout = view.layout();
+    write_u32(metadata, 40, view.start_state())?;
+    write_u32(metadata, 44, usize_u32(layout.state_count())?)?;
+    write_u32(metadata, 48, usize_u32(layout.byte_range_count())?)?;
+    write_u32(metadata, 52, usize_u32(layout.group_count())?)?;
+    for (field, value) in [
+        (56, states_offset),
+        (64, byte_ranges_offset),
+        (72, layout.current_offset()),
+        (80, layout.next_offset()),
+        (88, layout.stack_offset()),
+        (96, layout.seen_offset()),
+        (104, layout.scratch_bytes()),
+    ] {
+        write_u64(metadata, field, usize_u64(value)?)?;
+    }
+    Ok(())
+}
+
+fn encode_ordered_nfa_states(
+    bytes: &mut [u8],
+    states_offset: usize,
+    byte_ranges_offset: usize,
+    view: ExactSpanParticipationNativeV1View<'_>,
+) -> Result<(), NativeParticipationAotErrorV1> {
+    let mut byte_range_index = 0_usize;
+    for (index, state) in view.states().enumerate() {
+        let record_offset = states_offset
+            .checked_add(
+                index
+                    .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+                    .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                        NativeParticipationAotResourceV1::PlanBytes,
+                    ))?,
+            )
+            .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                NativeParticipationAotResourceV1::PlanBytes,
+            ))?;
+        let record_end = record_offset
+            .checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                NativeParticipationAotResourceV1::PlanBytes,
+            ))?;
+        let record = bytes.get_mut(record_offset..record_end).ok_or(
+            NativeParticipationAotErrorV1::InvalidProgram("ordered-NFA state extent"),
+        )?;
+        match state {
+            State::Byte { ranges, next } => {
+                record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE;
+                write_u32(record, 4, next)?;
+                write_u32(record, 8, usize_u32(byte_range_index)?)?;
+                write_u32(record, 12, usize_u32(ranges.len())?)?;
+                for &(lo, hi) in ranges {
+                    if lo > hi {
+                        return Err(NativeParticipationAotErrorV1::InvalidProgram(
+                            "ordered-NFA byte range",
+                        ));
+                    }
+                    let range_offset = byte_ranges_offset
+                        .checked_add(
+                            byte_range_index
+                                .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+                                .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                                    NativeParticipationAotResourceV1::PlanBytes,
+                                ))?,
+                        )
+                        .ok_or(NativeParticipationAotErrorV1::ArithmeticOverflow(
+                            NativeParticipationAotResourceV1::PlanBytes,
+                        ))?;
+                    let range_end = range_offset.checked_add(2).ok_or(
+                        NativeParticipationAotErrorV1::ArithmeticOverflow(
+                            NativeParticipationAotResourceV1::PlanBytes,
+                        ),
+                    )?;
+                    let range = bytes.get_mut(range_offset..range_end).ok_or(
+                        NativeParticipationAotErrorV1::InvalidProgram(
+                            "ordered-NFA byte-range extent",
+                        ),
+                    )?;
+                    range.copy_from_slice(&[lo, hi]);
+                    byte_range_index = byte_range_index.checked_add(1).ok_or(
+                        NativeParticipationAotErrorV1::ArithmeticOverflow(
+                            NativeParticipationAotResourceV1::PlanBytes,
+                        ),
+                    )?;
+                }
+            }
+            State::Split { first, second } => {
+                record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT;
+                write_u32(record, 4, first)?;
+                write_u32(record, 8, second)?;
+            }
+            State::Save { slot, next } => {
+                record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE;
+                record[1] = slot;
+                write_u32(record, 4, next)?;
+            }
+            State::Assert { assertion, next } => {
+                record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT;
+                record[1] = assertion.kind() as u8;
+                record[2] = assertion.data();
+                write_u32(record, 4, next)?;
+            }
+            State::Epsilon { next } => {
+                record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON;
+                write_u32(record, 4, next)?;
+            }
+            State::Match => record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+            State::Fail => record[0] = NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL,
+        }
+    }
+    if byte_range_index != view.layout().byte_range_count() {
+        return Err(NativeParticipationAotErrorV1::InvalidProgram(
+            "ordered-NFA byte-range cardinality",
+        ));
+    }
+    Ok(())
+}
+
+const fn dfa_fallback_resource_wire(resource: NativeParticipationAotResourceV1) -> Option<u16> {
+    match resource {
+        NativeParticipationAotResourceV1::DfaStates => Some(1),
+        NativeParticipationAotResourceV1::BuildWork => Some(2),
+        _ => None,
+    }
 }
 
 fn encode_negative_bundle(
@@ -946,6 +1478,7 @@ fn encode_negative_bundle(
         0,
         0,
         0,
+        0,
         identity.capture_sha256(),
         identity.selector_sha256(),
         selector_object_sha256,
@@ -978,6 +1511,7 @@ fn encode_header(
     start_states_offset: usize,
     transitions_offset: usize,
     accept_counts_offset: usize,
+    scratch_bytes: usize,
     capture_sha256: [u8; DIGEST_BYTES],
     selector_sha256: [u8; DIGEST_BYTES],
     selector_object_sha256: [u8; DIGEST_BYTES],
@@ -1022,7 +1556,7 @@ fn encode_header(
         bytes,
         44,
         if flags & PLAN_FLAG_SELECTED != 0 {
-            usize_u32(NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)?
+            usize_u32(scratch_bytes)?
         } else {
             0
         },
@@ -1113,6 +1647,8 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         1 => Some(NativeParticipationAotStrategyV1::DfaX86_64),
         2 => Some(NativeParticipationAotStrategyV1::DfaAarch64),
         3 => Some(NativeParticipationAotStrategyV1::NegativeEntry),
+        4 => Some(NativeParticipationAotStrategyV1::OrderedNfaX86_64),
+        5 => Some(NativeParticipationAotStrategyV1::OrderedNfaAarch64),
         _ => None,
     }) else {
         return false;
@@ -1128,15 +1664,38 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
     }) else {
         return false;
     };
-    let selected = matches!(
+    let dfa = matches!(
         strategy,
         NativeParticipationAotStrategyV1::DfaX86_64 | NativeParticipationAotStrategyV1::DfaAarch64
     );
+    let ordered_nfa = matches!(
+        strategy,
+        NativeParticipationAotStrategyV1::OrderedNfaX86_64
+            | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+    );
+    let selected = dfa || ordered_nfa;
+    let wire_state_count = if ordered_nfa {
+        receipt.ordered_nfa_states
+    } else {
+        receipt.dfa_states
+    };
+    let wire_cell_count = if ordered_nfa {
+        receipt.ordered_nfa_byte_ranges
+    } else {
+        receipt.transition_cells
+    };
     let header_closes = artifact.bundle.get(..8) == Some(&NATIVE_PARTICIPATION_AOT_V1_MAGIC)
         && read_wire_u16(&artifact.bundle, 8) == Some(NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION)
         && read_wire_u16(&artifact.bundle, 10)
             == u16::try_from(NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES).ok()
-        && read_wire_u32(&artifact.bundle, 12) == Some(if selected { 3 } else { 0 })
+        && read_wire_u32(&artifact.bundle, 12)
+            == Some(if ordered_nfa {
+                PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS | PLAN_FLAG_ORDERED_NFA
+            } else if selected {
+                PLAN_FLAG_SELECTED | PLAN_FLAG_START_END_ASSERTIONS
+            } else {
+                0
+            })
         && read_wire_usize(&artifact.bundle, 16) == Some(artifact.bundle.len())
         && read_wire_u64(&artifact.bundle, 24) == Some(NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
         && artifact.bundle.get(32).copied() == Some(target_byte(receipt.target.architecture))
@@ -1146,18 +1705,13 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         && artifact.bundle.get(35).copied() == Some(0)
         && read_wire_u32(&artifact.bundle, 36)
             == u32::try_from(receipt.target.features.bits()).ok()
-        && read_wire_usize_u32(&artifact.bundle, 44)
-            == Some(if selected {
-                NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
-            } else {
-                0
-            })
+        && read_wire_usize_u32(&artifact.bundle, 44) == Some(receipt.scratch_bytes)
         && read_wire_usize_u32(&artifact.bundle, 48) == Some(receipt.groups)
         && read_wire_usize_u32(&artifact.bundle, 52) == Some(receipt.assertions)
         && read_wire_usize_u32(&artifact.bundle, 56) == Some(receipt.assertion_signatures)
         && read_wire_usize_u32(&artifact.bundle, 60) == Some(receipt.byte_classes)
-        && read_wire_usize_u32(&artifact.bundle, 64) == Some(receipt.dfa_states)
-        && read_wire_usize_u32(&artifact.bundle, 68) == Some(receipt.transition_cells)
+        && read_wire_usize_u32(&artifact.bundle, 64) == Some(wire_state_count)
+        && read_wire_usize_u32(&artifact.bundle, 68) == Some(wire_cell_count)
         && read_wire_usize(&artifact.bundle, 72) == Some(receipt.build_work)
         && read_wire_digest(&artifact.bundle, 128) == Some(receipt.capture_sha256)
         && read_wire_digest(&artifact.bundle, 160) == Some(receipt.selector_sha256)
@@ -1165,35 +1719,49 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         && receipt.strategy == strategy
         && receipt.decline == decline
         && receipt.semantic_runtime_calls == 0
-        && receipt.scratch_bytes
-            == if selected {
-                NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
-            } else {
-                0
-            }
+        && (!selected || receipt.scratch_bytes != 0)
+        && (selected || receipt.scratch_bytes == 0)
         && receipt.plan_bytes == artifact.bundle.len()
         && if selected {
             decline.is_none()
-                && artifact
-                    .module
-                    .required_runtime_symbols()
-                    .next()
-                    .is_none()
+                && artifact.module.required_runtime_symbols().next().is_none()
                 && artifact.module.required_runtime_program().is_none()
                 && receipt.groups != 0
-                && receipt.assertion_signatures != 0
-                && receipt.byte_classes != 0
-                && receipt.dfa_states != 0
-                && receipt.transition_cells != 0
-                && read_wire_usize(&artifact.bundle, 88).is_some()
-                && read_wire_usize(&artifact.bundle, 96).is_some()
-                && read_wire_usize(&artifact.bundle, 104).is_some()
-                && read_wire_usize(&artifact.bundle, 112).is_some()
-                && read_wire_usize(&artifact.bundle, 120).is_some()
+                && receipt.groups <= MAX_MASK_BITS
                 && match (strategy, receipt.target.architecture) {
                     (NativeParticipationAotStrategyV1::DfaX86_64, Architecture::X86_64)
-                    | (NativeParticipationAotStrategyV1::DfaAarch64, Architecture::Aarch64) => true,
+                    | (NativeParticipationAotStrategyV1::DfaAarch64, Architecture::Aarch64)
+                    | (NativeParticipationAotStrategyV1::OrderedNfaX86_64, Architecture::X86_64)
+                    | (
+                        NativeParticipationAotStrategyV1::OrderedNfaAarch64,
+                        Architecture::Aarch64,
+                    ) => true,
                     _ => false,
+                }
+                && if dfa {
+                    receipt.assertion_signatures != 0
+                        && receipt.byte_classes != 0
+                        && receipt.dfa_states != 0
+                        && receipt.transition_cells != 0
+                        && receipt.ordered_nfa_states == 0
+                        && receipt.ordered_nfa_byte_ranges == 0
+                        && receipt.dfa_fallback_resource.is_none()
+                        && receipt.dfa_fallback_required == 0
+                        && receipt.dfa_fallback_limit == 0
+                        && receipt.scratch_bytes == NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                        && read_wire_usize(&artifact.bundle, 88).is_some()
+                        && read_wire_usize(&artifact.bundle, 96).is_some()
+                        && read_wire_usize(&artifact.bundle, 104).is_some()
+                        && read_wire_usize(&artifact.bundle, 112).is_some()
+                        && read_wire_usize(&artifact.bundle, 120).is_some()
+                } else {
+                    receipt.assertions <= 2
+                        && receipt.assertion_signatures == 0
+                        && receipt.byte_classes == 0
+                        && receipt.dfa_states == 0
+                        && receipt.transition_cells == 0
+                        && receipt.ordered_nfa_states != 0
+                        && ordered_nfa_bundle_authenticates(&artifact.bundle, receipt)
                 }
         } else {
             decline.is_some()
@@ -1202,6 +1770,11 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
                 && receipt.byte_classes == 0
                 && receipt.dfa_states == 0
                 && receipt.transition_cells == 0
+                && receipt.ordered_nfa_states == 0
+                && receipt.ordered_nfa_byte_ranges == 0
+                && receipt.dfa_fallback_resource.is_none()
+                && receipt.dfa_fallback_required == 0
+                && receipt.dfa_fallback_limit == 0
                 && receipt.build_work == 0
                 && (72..=120)
                     .step_by(8)
@@ -1249,6 +1822,278 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
             .any(|symbol| symbol.name == artifact.participation_entry_symbol)
 }
 
+fn ordered_nfa_bundle_authenticates(
+    bundle: &[u8],
+    receipt: NativeParticipationAotReceiptV1,
+) -> bool {
+    let Some(metadata_offset) = read_wire_usize(bundle, 80) else {
+        return false;
+    };
+    let Some(metadata_end) =
+        metadata_offset.checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+    else {
+        return false;
+    };
+    let Some(metadata) = bundle.get(metadata_offset..metadata_end) else {
+        return false;
+    };
+    let Some(dfa_fallback_resource) = read_wire_u16(metadata, 16).and_then(|wire| match wire {
+        1 => Some(NativeParticipationAotResourceV1::DfaStates),
+        2 => Some(NativeParticipationAotResourceV1::BuildWork),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some(states_offset) = read_wire_usize(metadata, 56) else {
+        return false;
+    };
+    let Some(byte_ranges_offset) = read_wire_usize(metadata, 64) else {
+        return false;
+    };
+    let state_count = receipt.ordered_nfa_states;
+    let byte_range_count = receipt.ordered_nfa_byte_ranges;
+    let Some(expected_build_work) = state_count.checked_add(byte_range_count) else {
+        return false;
+    };
+    let Some(states_bytes) =
+        state_count.checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+    else {
+        return false;
+    };
+    let Some(expected_byte_ranges_offset) = states_offset
+        .checked_add(states_bytes)
+        .and_then(checked_align8)
+    else {
+        return false;
+    };
+    let Some(byte_ranges_bytes) =
+        byte_range_count.checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+    else {
+        return false;
+    };
+    let Some(expected_total_bytes) = byte_ranges_offset.checked_add(byte_ranges_bytes) else {
+        return false;
+    };
+    let Some(frontier_bytes) =
+        state_count.checked_mul(EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+    else {
+        return false;
+    };
+    let current_offset = 0_usize;
+    let next_offset = frontier_bytes;
+    let Some(stack_offset) = next_offset.checked_add(frontier_bytes) else {
+        return false;
+    };
+    let Some(seen_offset) = stack_offset.checked_add(frontier_bytes) else {
+        return false;
+    };
+    let Some(seen_bytes) = state_count.checked_mul(EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_BYTES)
+    else {
+        return false;
+    };
+    let Some(scratch_bytes) = seen_offset.checked_add(seen_bytes).and_then(checked_align8) else {
+        return false;
+    };
+    let fallback_closes = receipt.dfa_fallback_resource == Some(dfa_fallback_resource)
+        && read_wire_usize(metadata, 24) == Some(receipt.dfa_fallback_required)
+        && read_wire_usize(metadata, 32) == Some(receipt.dfa_fallback_limit)
+        && receipt.dfa_fallback_limit.checked_add(1) == Some(receipt.dfa_fallback_required);
+    let fixed_geometry_closes = metadata_offset == NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        && metadata.get(..8) == Some(&NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC)
+        && read_wire_u16(metadata, 8) == Some(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION)
+        && read_wire_usize_u16(metadata, 10)
+            == Some(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+        && read_wire_usize_u16(metadata, 12)
+            == Some(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+        && read_wire_usize_u16(metadata, 14)
+            == Some(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+        && read_wire_u16(metadata, 18) == Some(0)
+        && read_wire_u32(metadata, 20) == Some(0)
+        && read_wire_usize_u32(metadata, 40).is_some_and(|start| start < state_count)
+        && read_wire_usize_u32(metadata, 44) == Some(state_count)
+        && read_wire_usize_u32(metadata, 48) == Some(byte_range_count)
+        && read_wire_usize_u32(metadata, 52) == Some(receipt.groups)
+        && states_offset == metadata_end
+        && byte_ranges_offset == expected_byte_ranges_offset
+        && read_wire_usize(metadata, 72) == Some(current_offset)
+        && read_wire_usize(metadata, 80) == Some(next_offset)
+        && read_wire_usize(metadata, 88) == Some(stack_offset)
+        && read_wire_usize(metadata, 96) == Some(seen_offset)
+        && read_wire_usize(metadata, 104) == Some(scratch_bytes)
+        && read_wire_usize(bundle, 88) == Some(states_offset)
+        && read_wire_usize(bundle, 96) == Some(byte_ranges_offset)
+        && read_wire_usize(bundle, 104) == Some(current_offset)
+        && read_wire_usize(bundle, 112) == Some(next_offset)
+        && read_wire_usize(bundle, 120) == Some(stack_offset)
+        && read_wire_usize_u32(bundle, 64) == Some(state_count)
+        && read_wire_usize_u32(bundle, 68) == Some(byte_range_count)
+        && receipt.scratch_bytes == scratch_bytes
+        && receipt.build_work == expected_build_work
+        && expected_total_bytes == bundle.len();
+    fallback_closes
+        && fixed_geometry_closes
+        && ordered_nfa_state_records_authenticate(
+            bundle,
+            states_offset,
+            byte_ranges_offset,
+            state_count,
+            byte_range_count,
+            receipt.groups,
+            receipt.assertions,
+        )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all fixed ordered-NFA table extents are explicit authentication inputs"
+)]
+fn ordered_nfa_state_records_authenticate(
+    bundle: &[u8],
+    states_offset: usize,
+    byte_ranges_offset: usize,
+    state_count: usize,
+    byte_range_count: usize,
+    group_count: usize,
+    assertion_count: usize,
+) -> bool {
+    let Some(slot_count) = group_count.checked_mul(2) else {
+        return false;
+    };
+    let mut next_byte_range = 0_usize;
+    let mut assertion_mask = 0_u8;
+    for state in 0..state_count {
+        let Some(record_offset) = state
+            .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .and_then(|offset| states_offset.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(record_end) =
+            record_offset.checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+        else {
+            return false;
+        };
+        let Some(record) = bundle.get(record_offset..record_end) else {
+            return false;
+        };
+        let target = || read_wire_usize_u32(record, 4).is_some_and(|pc| pc < state_count);
+        let trailing_zero =
+            || read_wire_u32(record, 8) == Some(0) && read_wire_u32(record, 12) == Some(0);
+        match record[0] {
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE => {
+                let Some(range_start) = read_wire_usize_u32(record, 8) else {
+                    return false;
+                };
+                let Some(range_count) = read_wire_usize_u32(record, 12) else {
+                    return false;
+                };
+                let Some(range_end) = range_start.checked_add(range_count) else {
+                    return false;
+                };
+                if record[1..4] != [0; 3]
+                    || !target()
+                    || range_start != next_byte_range
+                    || range_count == 0
+                    || range_end > byte_range_count
+                    || !ordered_nfa_ranges_authenticate(
+                        bundle,
+                        byte_ranges_offset,
+                        range_start,
+                        range_count,
+                    )
+                {
+                    return false;
+                }
+                next_byte_range = range_end;
+            }
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT => {
+                if record[1..4] != [0; 3]
+                    || !target()
+                    || !read_wire_usize_u32(record, 8).is_some_and(|pc| pc < state_count)
+                    || read_wire_u32(record, 12) != Some(0)
+                {
+                    return false;
+                }
+            }
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE => {
+                if record[2..4] != [0; 2]
+                    || usize::from(record[1]) >= slot_count
+                    || !target()
+                    || !trailing_zero()
+                {
+                    return false;
+                }
+            }
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT => {
+                let bit = match record[1] {
+                    1 => 1,
+                    2 => 2,
+                    _ => return false,
+                };
+                assertion_mask |= bit;
+                if record[2] != 0 || record[3] != 0 || !target() || !trailing_zero() {
+                    return false;
+                }
+            }
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON => {
+                if record[1..4] != [0; 3] || !target() || !trailing_zero() {
+                    return false;
+                }
+            }
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH
+            | NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL => {
+                if record[1..] != [0; NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES - 1] {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    next_byte_range == byte_range_count
+        && usize::try_from(assertion_mask.count_ones()).ok() == Some(assertion_count)
+}
+
+fn ordered_nfa_ranges_authenticate(
+    bundle: &[u8],
+    byte_ranges_offset: usize,
+    range_start: usize,
+    range_count: usize,
+) -> bool {
+    let Some(range_end) = range_start.checked_add(range_count) else {
+        return false;
+    };
+    let mut previous_end = None;
+    for index in range_start..range_end {
+        let Some(offset) = index
+            .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+            .and_then(|offset| byte_ranges_offset.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(end_offset) = offset.checked_add(2) else {
+            return false;
+        };
+        let Some(range) = bundle.get(offset..end_offset) else {
+            return false;
+        };
+        let [start, end] = range else {
+            return false;
+        };
+        if start > end || previous_end.is_some_and(|previous| *start <= previous) {
+            return false;
+        }
+        previous_end = Some(*end);
+    }
+    true
+}
+
+const fn checked_align8(value: usize) -> Option<usize> {
+    match value.checked_add(EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_ALIGN - 1) {
+        Some(rounded) => Some(rounded & !(EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_ALIGN - 1)),
+        None => None,
+    }
+}
+
 fn identity_symbol_matches(name: &str, prefix: &str, digest: &[u8]) -> bool {
     let Some(hex_bytes) = digest.len().checked_mul(2) else {
         return false;
@@ -1287,6 +2132,10 @@ fn read_wire_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 
 fn read_wire_usize(bytes: &[u8], offset: usize) -> Option<usize> {
     usize::try_from(read_wire_u64(bytes, offset)?).ok()
+}
+
+fn read_wire_usize_u16(bytes: &[u8], offset: usize) -> Option<usize> {
+    Some(usize::from(read_wire_u16(bytes, offset)?))
 }
 
 fn read_wire_usize_u32(bytes: &[u8], offset: usize) -> Option<usize> {
@@ -1976,10 +2825,7 @@ fn reserve_exact<T>(
         .map_err(|_| NativeParticipationAotErrorV1::Allocation(label))
 }
 
-fn owned_string(
-    value: &str,
-    label: &'static str,
-) -> Result<String, NativeParticipationAotErrorV1> {
+fn owned_string(value: &str, label: &'static str) -> Result<String, NativeParticipationAotErrorV1> {
     let mut owned = String::new();
     owned
         .try_reserve_exact(value.len())
@@ -2125,6 +2971,142 @@ mod tests {
                 resource: NativeParticipationAotResourceV1::Assertions,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn ordered_nfa_fallback_requires_exact_typed_dfa_envelope() {
+        let limits = NativeParticipationAotLimitsV1::default();
+        for (resource, limit) in [
+            (
+                NativeParticipationAotResourceV1::DfaStates,
+                limits.max_dfa_states,
+            ),
+            (
+                NativeParticipationAotResourceV1::BuildWork,
+                limits.max_build_work,
+            ),
+        ] {
+            let required = limit.checked_add(1).unwrap();
+            let error = NativeParticipationAotErrorV1::Resource {
+                resource,
+                required,
+                limit,
+            };
+            assert_eq!(
+                exact_dfa_fallback_envelope(&error, limits),
+                Some((resource, required, limit))
+            );
+            let inexact = NativeParticipationAotErrorV1::Resource {
+                resource,
+                required: required + 1,
+                limit,
+            };
+            assert_eq!(exact_dfa_fallback_envelope(&inexact, limits), None);
+        }
+        let wrong_resource = NativeParticipationAotErrorV1::Resource {
+            resource: NativeParticipationAotResourceV1::TransitionCells,
+            required: limits.max_transition_cells + 1,
+            limit: limits.max_transition_cells,
+        };
+        assert_eq!(exact_dfa_fallback_envelope(&wrong_resource, limits), None);
+        assert_eq!(
+            exact_dfa_fallback_envelope(
+                &NativeParticipationAotErrorV1::Allocation("DFA fixture"),
+                limits,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ordered_nfa_bundle_carries_exact_view_and_scratch_geometry() {
+        let (compiled, _) = plan(r"^((?:ab)+)(c)?$");
+        let limits = NativeParticipationAotLimitsV1::default();
+        let view = compiled
+            .capture_program()
+            .exact_span_participation_native_v1_view(limits.view)
+            .unwrap()
+            .unwrap();
+        let layout = view.layout();
+        let target = compiled.selector().module().target();
+        let selector_object_sha256: [u8; DIGEST_BYTES] =
+            Sha256::digest(compiled.selector().object()).into();
+        let fallback_limit = limits.max_dfa_states;
+        let fallback_required = fallback_limit + 1;
+        let (bundle, geometry) = encode_selected_ordered_nfa_bundle(
+            &compiled,
+            target,
+            selector_object_sha256,
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64,
+            view,
+            NativeParticipationAotResourceV1::DfaStates,
+            fallback_required,
+            fallback_limit,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(geometry.kind, NativeParticipationPlanKindV1::OrderedNfa);
+        assert_eq!(geometry.state_count, layout.state_count());
+        assert_eq!(
+            geometry.ordered_nfa_byte_range_count,
+            layout.byte_range_count()
+        );
+        assert_eq!(geometry.replay_current_offset, layout.current_offset());
+        assert_eq!(geometry.replay_next_offset, layout.next_offset());
+        assert_eq!(geometry.replay_stack_offset, layout.stack_offset());
+        assert_eq!(geometry.replay_seen_offset, layout.seen_offset());
+        assert_eq!(geometry.replay_scratch_bytes, layout.scratch_bytes());
+        assert_eq!(
+            read_wire_usize_u32(&bundle, 44),
+            Some(layout.scratch_bytes())
+        );
+        assert_eq!(
+            read_wire_usize(&bundle, 80),
+            Some(geometry.ordered_nfa_metadata_offset)
+        );
+        assert!(bundle_digest(&bundle).is_ok());
+        let assertion_record = (0..geometry.state_count)
+            .map(|state| {
+                geometry.ordered_nfa_states_offset
+                    + state * NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES
+            })
+            .find(|&offset| bundle[offset] == NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT)
+            .expect("anchored fixture has an assertion record");
+        let mut poisoned = bundle.clone();
+        poisoned[assertion_record + NATIVE_PARTICIPATION_ORDERED_NFA_STATE_AUX1_OFFSET] = 1;
+        assert!(!ordered_nfa_state_records_authenticate(
+            &poisoned,
+            geometry.ordered_nfa_states_offset,
+            geometry.ordered_nfa_byte_ranges_offset,
+            geometry.state_count,
+            geometry.ordered_nfa_byte_range_count,
+            geometry.group_count,
+            geometry.assertion_count,
+        ));
+
+        let error = encode_selected_ordered_nfa_bundle(
+            &compiled,
+            target,
+            selector_object_sha256,
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64,
+            view,
+            NativeParticipationAotResourceV1::DfaStates,
+            fallback_required,
+            fallback_limit,
+            NativeParticipationAotLimitsV1 {
+                max_ordered_nfa_scratch_bytes: layout.scratch_bytes() - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NativeParticipationAotErrorV1::Resource {
+                resource: NativeParticipationAotResourceV1::OrderedNfaScratchBytes,
+                required,
+                limit,
+            } if required == layout.scratch_bytes() && limit + 1 == required
         ));
     }
 

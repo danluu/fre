@@ -1,10 +1,10 @@
 use fre_aot_regex::{
-    CompileResource, NativeParticipationAotDeclineV1, NativeParticipationAotLimitsV1, ObjectError,
-    RebarSingleCaptureAotRequestV1, RebarSingleCaptureReducerAotErrorV1,
-    RebarSingleCaptureReducerDomainV1, RebarSingleCaptureReducerOperationV1,
-    RebarSingleCaptureReducerSourceArtifactV1, RebarSingleCaptureReducerSourceRouteV1, Target,
-    compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
-    compile_rebar_single_capture_reducer_aot_v1,
+    CompileResource, NativeParticipationAotDeclineV1, NativeParticipationAotLimitsV1,
+    NativeParticipationAotStrategyV1, ObjectError, RebarSingleCaptureAotRequestV1,
+    RebarSingleCaptureReducerAotErrorV1, RebarSingleCaptureReducerDomainV1,
+    RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    RebarSingleCaptureReducerSourceRouteV1, Target, compile_rebar_single_capture_aot_v1,
+    compile_rebar_single_capture_participation_aot_v1, compile_rebar_single_capture_reducer_aot_v1,
 };
 
 const MAX_OBJECT_BYTES: usize = 512 * 1_024 * 1_024;
@@ -29,6 +29,23 @@ fn capture_next_source(pattern: &str, target: Target) -> RebarSingleCaptureReduc
     compile_rebar_single_capture_aot_v1(request(pattern, target))
         .expect("compile strict capture-next source")
         .into()
+}
+
+fn ordered_participation_source(
+    pattern: &str,
+    target: Target,
+) -> RebarSingleCaptureReducerSourceArtifactV1 {
+    let mut limits = NativeParticipationAotLimitsV1::default();
+    limits.max_dfa_states = 1;
+    let artifact =
+        compile_rebar_single_capture_participation_aot_v1(request(pattern, target), limits)
+            .expect("compile ordered-NFA exact-span participation source");
+    assert!(matches!(
+        artifact.native_receipt().strategy,
+        NativeParticipationAotStrategyV1::OrderedNfaX86_64
+            | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+    ));
+    artifact.into()
 }
 
 #[test]
@@ -76,12 +93,14 @@ fn both_nonuniform_routes_publish_distinct_authenticated_one_call_receipts_cross
                 assert!(artifact.module().required_runtime_program().is_none());
                 match route {
                     RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1 => {
+                        assert_eq!(receipt.caller_scratch_bytes(), 0);
                         assert_eq!(receipt.private_participation_scratch_bytes(), 16);
                         assert_eq!(receipt.private_iterator_state_bytes(), 0);
                         assert_eq!(receipt.private_result_slot_count(), 0);
                         assert_eq!(receipt.private_result_slot_bytes(), 0);
                     }
                     RebarSingleCaptureReducerSourceRouteV1::CaptureNextV1 => {
+                        assert_eq!(receipt.caller_scratch_bytes(), 0);
                         assert_eq!(receipt.private_participation_scratch_bytes(), 0);
                         assert_eq!(receipt.private_iterator_state_bytes(), 24);
                         assert_eq!(receipt.private_result_slot_count(), receipt.group_count(),);
@@ -92,16 +111,64 @@ fn both_nonuniform_routes_publish_distinct_authenticated_one_call_receipts_cross
                     }
                 }
                 match operation {
-                    RebarSingleCaptureReducerOperationV1::CountCaptures => assert_eq!(
-                        receipt.domain(),
-                        RebarSingleCaptureReducerDomainV1::WholeHaystack,
-                    ),
-                    RebarSingleCaptureReducerOperationV1::GrepCaptures => assert_eq!(
-                        receipt.domain(),
-                        RebarSingleCaptureReducerDomainV1::ByteSliceLinesLfCrLf,
-                    ),
+                    RebarSingleCaptureReducerOperationV1::CountCaptures => {
+                        assert_eq!(
+                            receipt.domain(),
+                            RebarSingleCaptureReducerDomainV1::WholeHaystack,
+                        );
+                        assert!(
+                            artifact
+                                .reducer_symbol()
+                                .starts_with("fre_aot_regex_count_captures_v1_")
+                        );
+                    }
+                    RebarSingleCaptureReducerOperationV1::GrepCaptures => {
+                        assert_eq!(
+                            receipt.domain(),
+                            RebarSingleCaptureReducerDomainV1::ByteSliceLinesLfCrLf,
+                        );
+                        assert!(
+                            artifact
+                                .reducer_symbol()
+                                .starts_with("fre_aot_regex_grep_captures_v1_")
+                        );
+                    }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn ordered_participation_reducer_uses_additive_exact_caller_scratch_abi_cross_target() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        for operation in [
+            RebarSingleCaptureReducerOperationV1::CountCaptures,
+            RebarSingleCaptureReducerOperationV1::GrepCaptures,
+        ] {
+            let artifact = compile_rebar_single_capture_reducer_aot_v1(
+                ordered_participation_source(r"(?:(a)|(ab))(b)?", target),
+                operation,
+                MAX_OBJECT_BYTES,
+            )
+            .expect("compile ordered-NFA whole-operation capture reducer");
+            let receipt = artifact.receipt();
+            assert!(artifact.authenticates_receipt());
+            assert!(receipt.caller_scratch_bytes() > 16);
+            assert!(receipt.caller_scratch_bytes().is_multiple_of(8));
+            assert_eq!(receipt.private_participation_scratch_bytes(), 0);
+            assert_eq!(receipt.private_iterator_state_bytes(), 0);
+            assert_eq!(receipt.private_result_slot_count(), 0);
+            assert_eq!(receipt.private_result_slot_bytes(), 0);
+            let prefix = match operation {
+                RebarSingleCaptureReducerOperationV1::CountCaptures => {
+                    "fre_aot_regex_count_captures_scratch_v1_"
+                }
+                RebarSingleCaptureReducerOperationV1::GrepCaptures => {
+                    "fre_aot_regex_grep_captures_scratch_v1_"
+                }
+            };
+            assert!(artifact.reducer_symbol().starts_with(prefix));
         }
     }
 }
@@ -166,7 +233,7 @@ fn linked_host_nonuniform_reducers_match_count_and_exact_lf_crlf_line_semantics(
         &str,
         &[u8],
         u64,
-    ); 6] = [
+    ); 8] = [
         (
             participation_source,
             RebarSingleCaptureReducerOperationV1::CountCaptures,
@@ -208,6 +275,20 @@ fn linked_host_nonuniform_reducers_match_count_and_exact_lf_crlf_line_semantics(
             r"(a*)",
             b"\n\r\n",
             4,
+        ),
+        (
+            ordered_participation_source,
+            RebarSingleCaptureReducerOperationV1::CountCaptures,
+            r"((((((((((((((((a))))))))))))))))",
+            b"a a",
+            34,
+        ),
+        (
+            ordered_participation_source,
+            RebarSingleCaptureReducerOperationV1::GrepCaptures,
+            r"((((((((((((((((a))))))))))))))))",
+            b"a\nx\na",
+            34,
         ),
     ];
     let nonce = SystemTime::now()
@@ -241,8 +322,10 @@ fn linked_host_nonuniform_reducers_match_count_and_exact_lf_crlf_line_semantics(
             .collect::<Vec<_>>()
             .join(",");
         let symbol = artifact.reducer_symbol();
-        let c_source = format!(
-            r#"#include <stddef.h>
+        let caller_scratch_bytes = artifact.receipt().caller_scratch_bytes();
+        let c_source = if caller_scratch_bytes == 0 {
+            format!(
+                r#"#include <stddef.h>
 #include <stdint.h>
 extern uint32_t {symbol}(const unsigned char*,size_t,uint64_t*);
 static const unsigned char haystack[]={{{bytes}}};
@@ -258,7 +341,32 @@ int main(void){{
   return 0;
 }}
 "#,
-        );
+            )
+        } else {
+            format!(
+                r#"#include <stddef.h>
+#include <stdint.h>
+extern uint32_t {symbol}(const unsigned char*,size_t,unsigned char*,size_t,uint64_t*);
+static const unsigned char haystack[]={{{bytes}}};
+_Alignas(8) static unsigned char scratch[{caller_scratch_bytes}];
+int main(void){{
+  uint64_t out=UINT64_C(0x1122334455667788);unsigned char raw[24]={{0}};
+  if({symbol}(haystack,sizeof(haystack),scratch,sizeof(scratch),&out)!=0U||out!=UINT64_C({expected}))return 1;
+  out=UINT64_C(0x1122334455667788);
+  if({symbol}(haystack,0,scratch,sizeof(scratch),&out)!=0U||out!=UINT64_C(0))return 2;
+  out=UINT64_C(0x1122334455667788);
+  if({symbol}(0,sizeof(haystack),scratch,sizeof(scratch),&out)!=2U||out!=UINT64_C(0x1122334455667788))return 3;
+  if({symbol}((const unsigned char*)(uintptr_t)1,(size_t)-1,scratch,sizeof(scratch),&out)!=2U||out!=UINT64_C(0x1122334455667788))return 4;
+  if({symbol}(haystack,sizeof(haystack),scratch,sizeof(scratch),(uint64_t*)(void*)(raw+1))!=2U)return 5;
+  out=UINT64_C(0x1122334455667788);
+  if({symbol}(haystack,sizeof(haystack),0,sizeof(scratch),&out)!=2U||out!=UINT64_C(0x1122334455667788))return 6;
+  if({symbol}(haystack,sizeof(haystack),scratch,sizeof(scratch)-1U,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 7;
+  if({symbol}(haystack,sizeof(haystack),scratch+1,sizeof(scratch),&out)!=2U||out!=UINT64_C(0x1122334455667788))return 8;
+  return 0;
+}}
+"#,
+            )
+        };
         let object_path = directory.join(format!("reducer-{index}.o"));
         let source_path = directory.join(format!("reducer-{index}.c"));
         let executable_path = directory.join(format!("reducer-{index}"));

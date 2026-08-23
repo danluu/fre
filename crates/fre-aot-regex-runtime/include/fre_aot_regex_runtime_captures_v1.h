@@ -83,6 +83,20 @@ typedef uint32_t (*FreAotRegexCaptureReducerV1)(
     size_t haystack_len,
     uint64_t *value_out);
 
+/*
+ * Additive caller-scratch reducer ABI used only by identity-suffixed entries
+ * whose receipt advertises a nonzero exact scratch extent. Scratch and output
+ * must be writable, naturally aligned, nonoverlapping, and disjoint from a
+ * nonempty haystack. The entry may overwrite scratch during the call but does
+ * not retain it. SUCCESS alone publishes value_out.
+ */
+typedef uint32_t (*FreAotRegexCaptureReducerScratchV1)(
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint8_t *scratch,
+    size_t scratch_len,
+    uint64_t *value_out);
+
 #ifdef __cplusplus
 }
 #endif

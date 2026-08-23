@@ -18,6 +18,15 @@ and first/steady replication produces a larger raw schedule-point population;
 the plan seals those exact point IDs and their hash separately and never uses
 that raw count in place of 311.
 
+Every runtime job also has one frozen scalar authority. The controller rejects
+conflicting values across its replicated points and chooses
+`re2-2025-11-05` when that comparator is present, otherwise the pinned
+`rust-regex-1.12.4`; no benchmark-specific exception is allowed. Formal
+provenance must be `frozen-public-schedule-v1`, carry that exact scalar and
+comparator, and seal the byte-for-byte candidate KLV SHA-256 in a nonzero
+combined binding. Ordinary `stock-rust-unsealed-v1` builds remain supported by
+the runner for compatibility, but are categorically census-ineligible.
+
 Every runtime job remains in the headline denominator. Unsupported models,
 build/link failures, timeouts, missing receipts, wrong answers, helper-backed
 execution, and failed controls are nonnative outcomes. The summary reports:
@@ -74,13 +83,53 @@ Once either source route is selected, reducer construction and authentication
 are terminal: a reducer error never authorizes switching source routes.
 
 The strict whole-operation boundary is a closed route classification, not a
-route-name suffix convention. A scalar `count-spans` artifact receives that
-classification only when its exact `Some(NativeFused)` or
-`Some(NativeOrderedNfaFused)` receipt is selected through
-`linked-native-span-sum-reducer`. A Span-fill entry still leaves refill,
-validation, and reduction in Rust and therefore remains an adapter-loop route.
-An unknown route, or a helper-backed or unknown aggregate strategy claiming
-the native SpanSum reducer iteration, is rejected rather than inferred native.
+route-name suffix convention. Scalar `count` and `count-spans` artifacts receive
+that classification only when an exact `Some(NativeFused)` receipt also proves
+an empty runtime-symbol set, zero prepare capability, and no prepared bulk
+route, or when the exact operation-only V15 topology is authenticated. The
+latter must carry `entry_abi=PreparedScalarReduceV1`,
+`Some(NativeOrderedNfaFused)`, the V15 capability and resource caps, no bulk or
+SpanFill entry, no runtime symbols, the reducer as the public entry, and one
+shared reducer/runtime-program identity. It maps to the same strict Count or
+SpanSum whole-operation policy as the direct reducer.
+
+The legacy `entry_abi=SpanSearchV1` V15 envelope is deliberately separate: its
+ordinary search/SpanFill entries and model-specific compatibility helper remain
+trap-visible, and the distinct
+`linked-native-count-helper-backed-reducer` or
+`linked-native-span-sum-helper-backed-reducer` route is classified
+semantic-helper-backed.
+A Span-fill entry used by the Rust adapter still leaves refill, validation, and
+reduction in Rust. Unknown, mixed, or mismatched scalar reducer envelopes are
+rejected rather than inferred native.
+
+Single-source uniform CountCaptures and GrepCaptures use the same distinction.
+Their `PreparedScalarReduceV1` form is strict only when COUNT is the entry, the
+multiplier wrapper is a distinct operation symbol, bulk/SpanFill/prepared entry
+and runtime symbols are absent, and the exact V15 capability and caps are
+sealed. A typed unsupported, native-data, or object-byte decline may retain the
+legacy prepared-SpanFill compatibility form; no compiler or authentication
+error authorizes that fallback.
+
+Shared ordered-many Count and SpanSum use the same ABI distinction. A
+`PreparedScalarReduceV1` receipt is strict only when `bulk=None`, the entry is
+exactly the reducer, the runtime-symbol and SpanFill surfaces are empty, and
+the reducer/program identities agree. A legacy `SpanSearchV1` V15 receipt
+retains its semantic-helper-backed classification; the ordinary NativeFused
+`SpanSearchV1` receipt retains its independently authenticated helper-free
+classification. The normalized receipt preserves the entry ABI and route
+variant so neither topology can be reclassified after raw provenance parsing.
+
+Shared `count-captures` and `grep-captures` reuse that closed shared receipt,
+but the final selected entry is a distinct native capture reducer whose only
+semantic child is the authenticated local Count function. Direct
+`NativeFused` and `PreparedScalarReduceV1` V15 forms must both have no bulk
+entry, SpanFill symbol, or semantic runtime symbol. The latter binds the Count
+entry (not the outer capture reducer) to the serialized-program identity.
+Both map to `linked-shared-ordered-many-helper-free-reducer`; the selected-entry
+negative trap targets the outer capture reducer, while runner startup
+independently reconstructs the ordered source digest and every uniform-proof
+binding before provenance can be emitted.
 
 ## Privacy boundary and static dry run
 
@@ -128,7 +177,10 @@ design step.
 
 Build every exact-adapter job twice in independent, empty target directories,
 with the plan's commit/tree, target, feature set, public build KLV, locked
-dependencies, and `CARGO_INCREMENTAL=0`. The final runner must export its
+dependencies, `CARGO_INCREMENTAL=0`, and both
+`FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` selected
+from the sealed plan. Setting only one value or omitting the frozen authority
+must fail qualification. The final runner must export its
 symbols to the dynamic symbol table (`-Wl,--export-dynamic` on ELF;
 `-Wl,-export_dynamic` on Mach-O), because inability to arm a symbol is a failed
 qualification, not permission to omit it. Preserve each runner and
