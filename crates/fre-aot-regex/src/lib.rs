@@ -41,6 +41,7 @@ mod prefix_predicate;
 mod prefix_relation;
 mod program;
 mod regex_set;
+mod regex_redux_aot;
 mod rebar_single_capture;
 mod required_literals;
 mod seeded_reverse;
@@ -310,6 +311,19 @@ pub use regex_set::{
     RegexSetCompileRequest, RegexSetFillReport, RegexSetOutputError, RegexSetPatternIds,
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
+};
+pub use regex_redux_aot::{
+    NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,
+    NATIVE_REGEX_REDUX_AOT_V1_IDENTITY_DOMAIN, NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES,
+    NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES, NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_RUNTIME_FAILURE,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_SUCCESS,
+    NATIVE_REGEX_REDUX_FLATTEN_V1, NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1,
+    NATIVE_REGEX_REDUX_VARIANTS_V1,
+    NativeRegexReduxAotArtifactV1, NativeRegexReduxAotErrorV1, NativeRegexReduxAotLimitsV1,
+    NativeRegexReduxAotReceiptV1, NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
+    compile_native_regex_redux_aot_v1,
 };
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,

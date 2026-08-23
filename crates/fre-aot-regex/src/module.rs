@@ -26432,6 +26432,187 @@ fn pad_native_packed_row(
     Ok(())
 }
 
+const REGEX_REDUX_TEXT_SECTION: usize = 0;
+const REGEX_REDUX_DATA_SECTION: usize = 1;
+const REGEX_REDUX_ENTRY_SYMBOL: usize = 0;
+const REGEX_REDUX_DATA_SYMBOL: usize = 1;
+const REGEX_REDUX_COMPONENT_SYMBOL_BASE: usize = 2;
+
+#[derive(Clone, Debug)]
+struct NativeRegexReduxDataLayout {
+    bytes: Vec<u8>,
+    variant_prefixes: Vec<(usize, usize)>,
+    replacements: Vec<(usize, usize)>,
+}
+
+fn native_regex_redux_data_layout(
+    identity: [u8; 32],
+    variants: &[&str; 9],
+    substitutions: &[(&str, &[u8]); 5],
+) -> Result<NativeRegexReduxDataLayout, ObjectError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(1024)
+        .map_err(|_| ObjectError::Allocation("regex-redux native data"))?;
+    bytes.extend_from_slice(&identity);
+    let mut variant_prefixes = Vec::new();
+    variant_prefixes
+        .try_reserve_exact(variants.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux report prefixes"))?;
+    for variant in variants {
+        let offset = bytes.len();
+        bytes.extend_from_slice(variant.as_bytes());
+        bytes.push(b' ');
+        variant_prefixes.push((offset, bytes.len() - offset));
+    }
+    let mut replacements = Vec::new();
+    replacements
+        .try_reserve_exact(substitutions.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux replacements"))?;
+    for (_, replacement) in substitutions {
+        let offset = bytes.len();
+        bytes.extend_from_slice(replacement);
+        replacements.push((offset, replacement.len()));
+    }
+    Ok(NativeRegexReduxDataLayout {
+        bytes,
+        variant_prefixes,
+        replacements,
+    })
+}
+
+fn native_regex_redux_module(
+    target: Target,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    data: Vec<u8>,
+    component_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+) -> Result<CompiledModule, ObjectError> {
+    let entry_name = identity_symbol("fre_aot_regex_rebar_regex_redux_v1_", &identity)?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(REGEX_REDUX_COMPONENT_SYMBOL_BASE + component_entries.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: entry_name,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(REGEX_REDUX_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux text extent"))?,
+    });
+    symbols.push(ModuleSymbol {
+        name: ".Lfre_aot_regex_rebar_regex_redux_data_v1".to_owned(),
+        binding: SymbolBinding::Local,
+        kind: SymbolKind::Object,
+        section: Some(REGEX_REDUX_DATA_SECTION),
+        offset: 0,
+        size: u64::try_from(data.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux data extent"))?,
+    });
+    for entry in component_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: if target.architecture == Architecture::X86_64 {
+                    16
+                } else {
+                    4
+                },
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-redux",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_REDUX_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+pub(crate) fn lower_native_regex_redux_operation_v1(
+    target: Target,
+    identity: [u8; 32],
+    component_entries: &[String],
+    variants: &[&str; 9],
+    substitutions: &[(&str, &[u8]); 5],
+) -> Result<CompiledModule, ObjectError> {
+    if component_entries.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux target or component closure",
+        ));
+    }
+    let data = native_regex_redux_data_layout(identity, variants, substitutions)?;
+    let (code, relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_regex_redux_v1(identity, &data)?,
+        Architecture::Aarch64 => lower_aarch64_native_regex_redux_v1(identity, &data)?,
+    };
+    native_regex_redux_module(
+        target,
+        identity,
+        code,
+        data.bytes,
+        component_entries,
+        relocations,
+    )
+}
+
 type X86Label = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -28994,6 +29175,1731 @@ impl X86Assembler {
     fn finish(self) -> Result<Vec<u8>, ObjectError> {
         Ok(self.finish_with_label_offsets()?.code)
     }
+}
+
+// The regex-redux entry has one public pointer argument. Its fixed request is
+// nine native words: haystack pointer/length, two scratch pointer/capacity
+// pairs, report pointer/capacity, and the receipt pointer. The frame keeps all
+// untrusted request words and stage scalars away from the 1 KiB private report
+// transaction. Six callee-saved pushes leave entry RSP at 8 (mod 16), so this
+// 8 (mod 16) frame aligns every ordinary Span call.
+const X86_REGEX_REDUX_FRAME_BYTES: u32 = 1_352;
+const X86_REGEX_REDUX_SPAN_OFFSET: usize = 0;
+const X86_REGEX_REDUX_HAYSTACK_OFFSET: usize = 32;
+const X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET: usize = 40;
+const X86_REGEX_REDUX_SCRATCH_A_OFFSET: usize = 48;
+const X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET: usize = 56;
+const X86_REGEX_REDUX_SCRATCH_B_OFFSET: usize = 64;
+const X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET: usize = 72;
+const X86_REGEX_REDUX_REPORT_OFFSET: usize = 80;
+const X86_REGEX_REDUX_REPORT_CAP_OFFSET: usize = 88;
+const X86_REGEX_REDUX_RECEIPT_OFFSET: usize = 96;
+const X86_REGEX_REDUX_START_OFFSET: usize = 104;
+const X86_REGEX_REDUX_COPIED_OFFSET: usize = 112;
+const X86_REGEX_REDUX_DEST_LEN_OFFSET: usize = 120;
+const X86_REGEX_REDUX_CLEAN_LEN_OFFSET: usize = 128;
+const X86_REGEX_REDUX_COUNTS_OFFSET: usize = 136;
+const X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET: usize = 208;
+const X86_REGEX_REDUX_REQUEST_OFFSET: usize = 248;
+const X86_REGEX_REDUX_REQUEST_END_OFFSET: usize = 256;
+const X86_REGEX_REDUX_HAYSTACK_END_OFFSET: usize = 264;
+const X86_REGEX_REDUX_SCRATCH_A_END_OFFSET: usize = 272;
+const X86_REGEX_REDUX_SCRATCH_B_END_OFFSET: usize = 280;
+const X86_REGEX_REDUX_REPORT_END_OFFSET: usize = 288;
+const X86_REGEX_REDUX_RECEIPT_END_OFFSET: usize = 296;
+const X86_REGEX_REDUX_REPORT_TEMP_OFFSET: usize = 320;
+
+fn x86_regex_redux_rsp_load(
+    assembler: &mut X86Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux stack load register",
+        ));
+    }
+    let offset = u32::try_from(offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack load"))?;
+    let mut instruction = vec![0x48, 0x8b, 0x84 | register << 3, 0x24];
+    instruction.extend_from_slice(&offset.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    Ok(())
+}
+
+fn x86_regex_redux_rsp_store(
+    assembler: &mut X86Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux stack store register",
+        ));
+    }
+    let offset = u32::try_from(offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack store"))?;
+    let mut instruction = vec![0x48, 0x89, 0x84 | register << 3, 0x24];
+    instruction.extend_from_slice(&offset.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    Ok(())
+}
+
+fn x86_regex_redux_rsp_zero(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(&[0x31, 0xc0])?;
+    x86_regex_redux_rsp_store(assembler, 0, offset)
+}
+
+fn x86_regex_redux_load_request_word(
+    assembler: &mut X86Assembler,
+    request_offset: u8,
+    stack_offset: usize,
+) -> Result<(), ObjectError> {
+    if request_offset == 0 {
+        assembler.instruction(&[0x48, 0x8b, 0x07])?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x47, request_offset])?;
+    }
+    x86_regex_redux_rsp_store(assembler, 0, stack_offset)
+}
+
+fn x86_regex_redux_pointer_end(
+    assembler: &mut X86Assembler,
+    base_offset: usize,
+    length_offset: usize,
+    end_offset: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, base_offset)?;
+    x86_regex_redux_rsp_load(assembler, 1, length_offset)?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?; // add rcx, rax
+    assembler.branch(&[0x0f, 0x82], invalid)?; // carry
+    x86_regex_redux_rsp_store(assembler, 0, end_offset)
+}
+
+fn x86_regex_redux_fixed_pointer_end(
+    assembler: &mut X86Assembler,
+    base_offset: usize,
+    bytes: u32,
+    end_offset: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, base_offset)?;
+    let mut add = vec![0x48, 0x05];
+    add.extend_from_slice(&bytes.to_le_bytes());
+    assembler.instruction(&add)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    x86_regex_redux_rsp_store(assembler, 0, end_offset)
+}
+
+/// Require two complete caller-declared ranges to be disjoint. Empty ranges
+/// naturally pass because either end is equal to its base.
+fn x86_regex_redux_disjoint(
+    assembler: &mut X86Assembler,
+    first_base: usize,
+    first_end: usize,
+    second_base: usize,
+    second_end: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    let disjoint = assembler.label()?;
+    x86_regex_redux_rsp_load(assembler, 0, first_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, first_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // first_end - first_base
+    assembler.branch(&[0x0f, 0x84], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, second_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, second_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // second_end - second_base
+    assembler.branch(&[0x0f, 0x84], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, first_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, second_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // first_end - second_base
+    assembler.branch(&[0x0f, 0x86], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, second_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, first_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // second_end - first_base
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.bind(disjoint)
+}
+
+fn x86_regex_redux_component_call(
+    assembler: &mut X86Assembler,
+    component: usize,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    if component >= crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux component call index",
+        ));
+    }
+    assembler.instruction(&[0x4c, 0x89, 0xf7])?; // rdi = source
+    assembler.instruction(&[0x4c, 0x89, 0xfe])?; // rsi = source length
+    x86_regex_redux_rsp_load(assembler, 2, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(&[0x4c, 0x89, 0xf9])?; // rcx = source length
+    assembler.instruction(&[0x4c, 0x8d, 0x84, 0x24])?; // r8 = result
+    push_bytes(
+        &mut assembler.code,
+        &u32::try_from(X86_REGEX_REDUX_SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux result offset"))?
+            .to_le_bytes(),
+    )?;
+    assembler.instruction(&[0xe8])?;
+    let displacement = assembler.label()?;
+    assembler.bind(displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    call_displacements.push((component, displacement));
+    Ok(())
+}
+
+fn x86_regex_redux_validate_span(
+    assembler: &mut X86Assembler,
+    runtime_failure: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // start - requested start
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 2, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    assembler.instruction(&[0x48, 0x39, 0xc2])?; // end - start
+    assembler.branch(&[0x0f, 0x86], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x39, 0xfa])?; // end - source length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    Ok(())
+}
+
+fn x86_regex_redux_emit_count(
+    assembler: &mut X86Assembler,
+    component: usize,
+    output_offset: usize,
+    runtime_failure: X86Label,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    x86_regex_redux_component_call(assembler, component, call_displacements)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], runtime_failure)?;
+
+    assembler.bind(matched)?;
+    x86_regex_redux_validate_span(assembler, runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_START_OFFSET)?;
+    let mut increment = vec![0x48, 0xff, 0x84, 0x24];
+    increment.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_DEST_LEN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux count offset"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&increment)?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?; // u64 overflow wraps through zero
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    x86_regex_redux_rsp_store(assembler, 0, output_offset)
+}
+
+fn x86_regex_redux_emit_copy(
+    assembler: &mut X86Assembler,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    source_count_in_r9: bool,
+    replacement: Option<(usize, usize)>,
+    runtime_failure: X86Label,
+) -> Result<(), ObjectError> {
+    if !source_count_in_r9 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux copy count register",
+        ));
+    }
+    let replacement_len = replacement.map_or(0, |(_, len)| len);
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc0])?; // r8 = old destination length
+    assembler.instruction(&[0x48, 0x89, 0xc3])?; // rbx = prospective length
+    assembler.instruction(&[0x4c, 0x01, 0xcb])?; // add unmatched bytes
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    if replacement_len != 0 {
+        let replacement_len = u8::try_from(replacement_len)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?;
+        assembler.instruction(&[0x48, 0x83, 0xc3, replacement_len])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    }
+    x86_regex_redux_rsp_load(assembler, 0, destination_capacity_offset)?;
+    assembler.instruction(&[0x48, 0x39, 0xc3])?; // prospective - capacity
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    x86_regex_redux_rsp_load(assembler, 7, destination_offset)?;
+    assembler.instruction(&[0x4c, 0x01, 0xc7])?; // destination += old length
+    assembler.instruction(&[0x4c, 0x89, 0xf6])?; // source = current sequence
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x48, 0x01, 0xce])?; // source += copied
+    assembler.instruction(&[0x4c, 0x89, 0xc9])?; // count = unmatched bytes
+    assembler.instruction(&[0xf3, 0xa4])?;
+
+    if let Some((replacement_offset, replacement_len)) = replacement
+        && replacement_len != 0
+    {
+        let replacement_offset = u32::try_from(replacement_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement offset"))?;
+        let mut address = vec![0x49, 0x8d, 0xb5]; // rsi = data + replacement offset
+        address.extend_from_slice(&replacement_offset.to_le_bytes());
+        assembler.instruction(&address)?;
+        let replacement_len = u32::try_from(replacement_len)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?;
+        let mut count = vec![0xb9];
+        count.extend_from_slice(&replacement_len.to_le_bytes());
+        assembler.instruction(&count)?;
+        assembler.instruction(&[0xf3, 0xa4])?;
+    }
+    x86_regex_redux_rsp_store(assembler, 3, X86_REGEX_REDUX_DEST_LEN_OFFSET)
+}
+
+fn x86_regex_redux_emit_replacement(
+    assembler: &mut X86Assembler,
+    component: usize,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    stage_length_offset: usize,
+    runtime_failure: X86Label,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let tail = assembler.label()?;
+    let finished = assembler.label()?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    x86_regex_redux_component_call(assembler, component, call_displacements)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], tail)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], runtime_failure)?;
+
+    assembler.bind(matched)?;
+    x86_regex_redux_validate_span(assembler, runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // match start - copied
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x29, 0xc8])?; // unmatched length
+    assembler.instruction(&[0x49, 0x89, 0xc1])?; // r9 = unmatched length
+    x86_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        true,
+        replacement,
+        runtime_failure,
+    )?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(tail)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x4c, 0x39, 0xf9])?; // copied - source length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf9])?; // r9 = source length
+    assembler.instruction(&[0x49, 0x29, 0xc9])?; // r9 -= copied
+    x86_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        true,
+        None,
+        runtime_failure,
+    )?;
+    assembler.bind(finished)?;
+    x86_regex_redux_rsp_load(assembler, 0, destination_offset)?;
+    assembler.instruction(&[0x49, 0x89, 0xc6])?; // r14 = new source
+    assembler.instruction(&[0x49, 0x89, 0xdf])?; // r15 = new length
+    x86_regex_redux_rsp_store(assembler, 3, stage_length_offset)
+}
+
+fn x86_regex_redux_report_byte(assembler: &mut X86Assembler, byte: u8) -> Result<(), ObjectError> {
+    let mut instruction = vec![0xc6, 0x84, 0x1c]; // [rsp + rbx + report temporary]
+    instruction.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    instruction.push(byte);
+    assembler.instruction(&instruction)?;
+    assembler.instruction(&[0x48, 0xff, 0xc3])?; // report length += 1
+    Ok(())
+}
+
+fn x86_regex_redux_report_prefix(
+    assembler: &mut X86Assembler,
+    data_offset: usize,
+    bytes: usize,
+) -> Result<(), ObjectError> {
+    let data_offset = u32::try_from(data_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix offset"))?;
+    let bytes = u32::try_from(bytes)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix length"))?;
+    let mut source = vec![0x49, 0x8d, 0xb5]; // rsi = immutable data + offset
+    source.extend_from_slice(&data_offset.to_le_bytes());
+    assembler.instruction(&source)?;
+    let mut destination = vec![0x48, 0x8d, 0xbc, 0x1c]; // rdi = rsp + rbx + temporary
+    destination.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&destination)?;
+    let mut count = vec![0xb9];
+    count.extend_from_slice(&bytes.to_le_bytes());
+    assembler.instruction(&count)?;
+    assembler.instruction(&[0xf3, 0xa4])?;
+    if bytes <= u32::from(i8::MAX.cast_unsigned()) {
+        assembler.instruction(&[
+            0x48,
+            0x83,
+            0xc3,
+            u8::try_from(bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+        ])?;
+    } else {
+        let mut add = vec![0x48, 0x81, 0xc3];
+        add.extend_from_slice(&bytes.to_le_bytes());
+        assembler.instruction(&add)?;
+    }
+    Ok(())
+}
+
+/// Append the unsigned value in RAX to the private report transaction. At
+/// most twenty reversed digits occupy the 32-byte scratch prefix containing
+/// the now-dead Span result.
+fn x86_regex_redux_report_u64(assembler: &mut X86Assembler) -> Result<(), ObjectError> {
+    let nonzero = assembler.label()?;
+    let divide = assembler.label()?;
+    let reverse = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], nonzero)?;
+    x86_regex_redux_report_byte(assembler, b'0')?;
+    assembler.branch(&[0xe9], finished)?;
+
+    assembler.bind(nonzero)?;
+    assembler.instruction(&[0x45, 0x31, 0xd2])?; // r10 = digit count
+    assembler.bind(divide)?;
+    assembler.instruction(&[0x31, 0xd2])?; // high dividend = 0
+    assembler.instruction(&[0xb9, 10, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xf7, 0xf1])?; // div rcx
+    assembler.instruction(&[0x80, 0xc2, b'0'])?;
+    assembler.instruction(&[0x42, 0x88, 0x14, 0x14])?; // [rsp+r10] = digit
+    assembler.instruction(&[0x49, 0xff, 0xc2])?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], divide)?;
+
+    assembler.bind(reverse)?;
+    assembler.instruction(&[0x49, 0xff, 0xca])?;
+    assembler.instruction(&[0x42, 0x8a, 0x14, 0x14])?;
+    let mut store = vec![0x88, 0x94, 0x1c];
+    store.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&store)?;
+    assembler.instruction(&[0x48, 0xff, 0xc3])?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], reverse)?;
+    assembler.bind(finished)
+}
+
+fn x86_regex_redux_publish_receipt(assembler: &mut X86Assembler) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 7, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    let sources = [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 8,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 16,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 24,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 32,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 40,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 48,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 56,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 64,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 8,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 16,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 24,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 32,
+    ];
+    for (word, source) in sources.into_iter().enumerate() {
+        x86_regex_redux_rsp_load(assembler, 0, source)?;
+        let offset = u32::try_from(
+            word.checked_mul(8)
+                .ok_or(ObjectError::ArithmeticOverflow("regex-redux receipt word"))?,
+        )
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt offset"))?;
+        let mut store = vec![0x48, 0x89, 0x87];
+        store.extend_from_slice(&offset.to_le_bytes());
+        assembler.instruction(&store)?;
+    }
+    assembler.instruction(&[0x4c, 0x89, 0xf8])?; // final length
+    assembler.instruction(&[0x48, 0x89, 0x87, 0x80, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x89, 0x9f, 0x88, 0, 0, 0])?; // report length
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validated request, fifteen fixed semantic loops, canonical formatting, and transactional publication form one native operation"
+)]
+fn lower_x86_64_native_regex_redux_v1(
+    identity: [u8; 32],
+    data: &NativeRegexReduxDataLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    if data.bytes.get(..identity.len()) != Some(identity.as_slice())
+        || data.variant_prefixes.len() != 9
+        || data.replacements.len() != 5
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux immutable data layout",
+        ));
+    }
+    let mut maximum_report_bytes = 1_usize; // blank line before terminal lengths
+    for &(offset, bytes) in &data.variant_prefixes {
+        if bytes == 0
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux report prefix layout",
+            ));
+        }
+        maximum_report_bytes = maximum_report_bytes
+            .checked_add(bytes)
+            .and_then(|total| total.checked_add(21)) // u64 decimal and newline
+            .ok_or(ObjectError::ArithmeticOverflow("regex-redux report bound"))?;
+    }
+    maximum_report_bytes =
+        maximum_report_bytes
+            .checked_add(3 * 21)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux terminal report bound",
+            ))?;
+    if maximum_report_bytes > crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES {
+        return Err(ObjectError::InvalidModule("regex-redux report bound"));
+    }
+    for &(offset, bytes) in &data.replacements {
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule("regex-redux replacement layout"));
+        }
+    }
+
+    let mut assembler = X86Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let mut call_displacements = Vec::new();
+    call_displacements
+        .try_reserve_exact(crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS)
+        .map_err(|_| ObjectError::Allocation("regex-redux call relocations"))?;
+
+    // Authenticate the single-pointer request before changing RSP. The
+    // complete fixed request must be aligned and addressable.
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_before_frame)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid_before_frame)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 72])?;
+    assembler.branch(&[0x0f, 0x82], invalid_before_frame)?;
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&X86_REGEX_REDUX_FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    x86_regex_redux_rsp_store(&mut assembler, 7, X86_REGEX_REDUX_REQUEST_OFFSET)?;
+    for (request_offset, stack_offset) in [
+        (0, X86_REGEX_REDUX_HAYSTACK_OFFSET),
+        (8, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET),
+        (16, X86_REGEX_REDUX_SCRATCH_A_OFFSET),
+        (24, X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET),
+        (32, X86_REGEX_REDUX_SCRATCH_B_OFFSET),
+        (40, X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET),
+        (48, X86_REGEX_REDUX_REPORT_OFFSET),
+        (56, X86_REGEX_REDUX_REPORT_CAP_OFFSET),
+        (64, X86_REGEX_REDUX_RECEIPT_OFFSET),
+    ] {
+        x86_regex_redux_load_request_word(&mut assembler, request_offset, stack_offset)?;
+    }
+
+    assembler.instruction(&[0x4c, 0x8d, 0x2d])?; // r13 = immutable data
+    let data_displacement = assembler.label()?;
+    assembler.bind(data_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    for pointer_offset in [
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 0, pointer_offset)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+    }
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    assembler.instruction(&[0xa8, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    for length_offset in [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 0, length_offset)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x88], invalid)?;
+    }
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_REPORT_CAP_OFFSET)?;
+    let mut report_capacity = vec![0x48, 0x3d];
+    report_capacity.extend_from_slice(
+        &u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report capacity"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_capacity)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+
+    // The third substitution can expand every disjoint `BY` pair from two
+    // bytes to three. No other fixed stage expands, so n + floor(n/2) is an
+    // exact all-input capacity envelope for both ping-pong buffers.
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(&[0x48, 0x89, 0xc1])?;
+    assembler.instruction(&[0x48, 0xd1, 0xe9])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    for capacity_offset in [
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 2, capacity_offset)?;
+        assembler.instruction(&[0x48, 0x39, 0xc2])?;
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+    }
+
+    x86_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REQUEST_OFFSET,
+        u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+        X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+        u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt extent"))?,
+        X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        invalid,
+    )?;
+    let ranges = [
+        (
+            X86_REGEX_REDUX_REQUEST_OFFSET,
+            X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_HAYSTACK_OFFSET,
+            X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_REPORT_OFFSET,
+            X86_REGEX_REDUX_REPORT_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_RECEIPT_OFFSET,
+            X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        ),
+    ];
+    for first in 0..ranges.len() {
+        for second in first + 1..ranges.len() {
+            x86_regex_redux_disjoint(
+                &mut assembler,
+                ranges[first].0,
+                ranges[first].1,
+                ranges[second].0,
+                ranges[second].1,
+                invalid,
+            )?;
+        }
+    }
+
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc6])?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc7])?;
+
+    x86_regex_redux_emit_replacement(
+        &mut assembler,
+        0,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        None,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        runtime_failure,
+        &mut call_displacements,
+    )?;
+    for variant in 0..data.variant_prefixes.len() {
+        x86_regex_redux_emit_count(
+            &mut assembler,
+            variant + 1,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+            runtime_failure,
+            &mut call_displacements,
+        )?;
+    }
+    for substitution in 0..data.replacements.len() {
+        let destination_is_b = substitution.is_multiple_of(2);
+        x86_regex_redux_emit_replacement(
+            &mut assembler,
+            10 + substitution,
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_OFFSET
+            },
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET
+            },
+            Some(data.replacements[substitution]),
+            X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + substitution * 8,
+            runtime_failure,
+            &mut call_displacements,
+        )?;
+    }
+
+    // Format the exact Rebar report privately. No caller-visible report or
+    // receipt byte is touched until every semantic stage has succeeded.
+    assembler.instruction(&[0x31, 0xdb])?; // report length = 0
+    for (variant, &(offset, bytes)) in data.variant_prefixes.iter().enumerate() {
+        x86_regex_redux_report_prefix(&mut assembler, offset, bytes)?;
+        x86_regex_redux_rsp_load(
+            &mut assembler,
+            0,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+        )?;
+        x86_regex_redux_report_u64(&mut assembler)?;
+        x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    }
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_CLEAN_LEN_OFFSET)?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(&[0x4c, 0x89, 0xf8])?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    let mut report_bound = vec![0x48, 0x81, 0xfb];
+    report_bound.extend_from_slice(
+        &u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report bound"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    x86_regex_redux_rsp_load(&mut assembler, 7, X86_REGEX_REDUX_REPORT_OFFSET)?;
+    let mut report_source = vec![0x48, 0x8d, 0xb4, 0x24];
+    report_source.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_source)?;
+    assembler.instruction(&[0x48, 0x89, 0xd9])?;
+    assembler.instruction(&[0xf3, 0xa4])?;
+    x86_regex_redux_publish_receipt(&mut assembler)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&X86_REGEX_REDUX_FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&release)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    if call_displacements.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || call_displacements
+            .iter()
+            .enumerate()
+            .any(|(expected, &(component, _))| component != expected)
+    {
+        return Err(ObjectError::InvalidModule("regex-redux call closure"));
+    }
+    let finished = assembler.finish_with_label_offsets()?;
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(1 + call_displacements.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux relocations"))?;
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(
+            finished.label_offset(data_displacement)?,
+            "regex-redux data relocation",
+        )?,
+        kind: RelocationKind::X86PcRelative32,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: -4,
+    });
+    for (component, displacement) in call_displacements {
+        relocations.push(ModuleRelocation {
+            section: REGEX_REDUX_TEXT_SECTION,
+            offset: offset_u64(
+                finished.label_offset(displacement)?,
+                "regex-redux component relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: REGEX_REDUX_COMPONENT_SYMBOL_BASE + component,
+            addend: -4,
+        });
+    }
+    Ok((finished.code, relocations))
+}
+
+// AAPCS64 keeps SP 16-byte aligned at every call. The semantic workspace uses
+// the same offsets as the x86-64 lowering; the extra tail preserves X19..X24,
+// FP, and LR without encroaching on the 1 KiB private report transaction.
+const AARCH64_REGEX_REDUX_FRAME_BYTES: u16 = 1_408;
+const AARCH64_REGEX_REDUX_SAVED_OFFSET: u16 = 1_344;
+
+fn aarch64_regex_redux_stack_load(
+    assembler: &mut Aarch64Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_x_imm(
+        register,
+        31,
+        u16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack load"))?,
+    )?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_stack_store(
+    assembler: &mut Aarch64Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_store_x(
+        register,
+        31,
+        u16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack store"))?,
+    )?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_stack_zero(
+    assembler: &mut Aarch64Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    aarch64_regex_redux_stack_store(assembler, 9, offset)
+}
+
+fn aarch64_regex_redux_adds_x_reg(
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<u32, ObjectError> {
+    Ok(
+        0xab00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_regex_redux_store_byte_reg(source: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(0x3820_6800 | aarch64_reg(index, 16)? | aarch64_reg(base, 5)? | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_regex_redux_load_x_reg(
+    destination: u8,
+    base: u8,
+    index: u8,
+) -> Result<u32, ObjectError> {
+    Ok(
+        0xf860_6800
+            | aarch64_reg(index, 16)?
+            | aarch64_reg(base, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_regex_redux_store_x_reg(source: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(0xf820_6800 | aarch64_reg(index, 16)? | aarch64_reg(base, 5)? | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_regex_redux_pointer_end(
+    assembler: &mut Aarch64Assembler,
+    base_offset: usize,
+    length_offset: usize,
+    end_offset: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, base_offset)?;
+    aarch64_regex_redux_stack_load(assembler, 10, length_offset)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(9, 9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    aarch64_regex_redux_stack_store(assembler, 9, end_offset)
+}
+
+fn aarch64_regex_redux_fixed_pointer_end(
+    assembler: &mut Aarch64Assembler,
+    base_offset: usize,
+    bytes: u16,
+    end_offset: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, base_offset)?;
+    assembler.instruction(aarch64_adds_x_imm(9, 9, bytes)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    aarch64_regex_redux_stack_store(assembler, 9, end_offset)
+}
+
+fn aarch64_regex_redux_disjoint(
+    assembler: &mut Aarch64Assembler,
+    first_base: usize,
+    first_end: usize,
+    second_base: usize,
+    second_end: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let disjoint = assembler.label()?;
+    aarch64_regex_redux_stack_load(assembler, 9, first_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, first_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, second_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, second_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, first_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, second_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LS, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, second_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, first_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.bind(disjoint)
+}
+
+fn aarch64_regex_redux_component_call(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    if component >= crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 component call index",
+        ));
+    }
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    aarch64_regex_redux_stack_load(assembler, 2, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        4,
+        31,
+        u16::try_from(X86_REGEX_REDUX_SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux Span result"))?,
+    )?)?;
+    let call = assembler.instruction(0x9400_0000)?;
+    call_offsets
+        .try_reserve(1)
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 calls"))?;
+    call_offsets.push((component, call));
+    Ok(())
+}
+
+fn aarch64_regex_redux_validate_span(
+    assembler: &mut Aarch64Assembler,
+    runtime_failure: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 11, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    assembler.instruction(aarch64_cmp_x(11, 9)?)?;
+    assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(11, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_emit_count(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    output_offset: usize,
+    runtime_failure: Aarch64Label,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    aarch64_regex_redux_component_call(assembler, component, call_offsets)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(runtime_failure)?;
+
+    assembler.bind(matched)?;
+    aarch64_regex_redux_validate_span(assembler, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(aarch64_adds_x_imm(9, 9, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 9, output_offset)
+}
+
+/// Append X9 bytes from `source + copied` to the selected destination and then
+/// append the fixed replacement, if any. The prospective length is committed
+/// only to the private frame until the complete operation succeeds.
+fn aarch64_regex_redux_emit_copy(
+    assembler: &mut Aarch64Assembler,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    runtime_failure: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let bulk_check = assembler.label()?;
+    let byte_check = assembler.label()?;
+    let byte_loop = assembler.label()?;
+    let copied = assembler.label()?;
+    let replacement_len = replacement.map_or(0, |(_, bytes)| bytes);
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(11, 10, 9)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    if replacement_len != 0 {
+        assembler.instruction(aarch64_adds_x_imm(
+            11,
+            11,
+            u16::try_from(replacement_len)
+                .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    }
+    aarch64_regex_redux_stack_load(assembler, 12, destination_capacity_offset)?;
+    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    aarch64_regex_redux_stack_store(assembler, 11, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    aarch64_regex_redux_stack_load(assembler, 12, destination_offset)?;
+    assembler.instruction(aarch64_add_x_reg(12, 12, 10)?)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_add_x_reg(11, 19, 10)?)?;
+    assembler.instruction(aarch64_movz_x(10, 0, 0)?)?;
+    assembler.bind(bulk_check)?;
+    assembler.instruction(aarch64_sub_x_reg(14, 9, 10)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(14, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, byte_check)?;
+    assembler.instruction(aarch64_regex_redux_load_x_reg(13, 11, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_x_reg(13, 12, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 8)?)?;
+    assembler.branch(bulk_check)?;
+    assembler.bind(byte_check)?;
+    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_HS, copied)?;
+    assembler.bind(byte_loop)?;
+    assembler.instruction(aarch64_load_byte_reg(13, 11, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 12, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, byte_loop)?;
+    assembler.bind(copied)?;
+
+    if let Some((replacement_offset, replacement_len)) = replacement {
+        assembler.instruction(aarch64_add_x_reg(12, 12, 9)?)?;
+        for byte in 0..replacement_len {
+            let source_offset = replacement_offset
+                .checked_add(byte)
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "regex-redux replacement offset",
+                ))?;
+            assembler.instruction(aarch64_load_byte_imm(13, 21, source_offset)?)?;
+            assembler.instruction(aarch64_store_byte(
+                13,
+                12,
+                u16::try_from(byte)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement byte"))?,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_regex_redux_emit_replacement(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    stage_length_offset: usize,
+    runtime_failure: Aarch64Label,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let tail = assembler.label()?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    aarch64_regex_redux_component_call(assembler, component, call_offsets)?;
+    assembler.branch_zero_w(0, tail)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(runtime_failure)?;
+
+    assembler.bind(matched)?;
+    aarch64_regex_redux_validate_span(assembler, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_sub_x_reg(9, 9, 10)?)?;
+    aarch64_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        replacement,
+        runtime_failure,
+    )?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(tail)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(10, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_sub_x_reg(9, 20, 10)?)?;
+    aarch64_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        None,
+        runtime_failure,
+    )?;
+    aarch64_regex_redux_stack_load(assembler, 19, destination_offset)?;
+    aarch64_regex_redux_stack_load(assembler, 20, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 20, stage_length_offset)
+}
+
+fn aarch64_regex_redux_report_byte(
+    assembler: &mut Aarch64Assembler,
+    byte: u8,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_movz_w(9, u16::from(byte))?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(9, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_report_prefix(
+    assembler: &mut Aarch64Assembler,
+    data_offset: usize,
+    bytes: usize,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(
+        11,
+        21,
+        u16::try_from(data_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+    )?)?;
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        9,
+        u16::try_from(bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 11, 9)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(10, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(loop_head)?;
+    assembler.bind(finished)
+}
+
+/// Append the unsigned value in X9 to the private report. At most twenty
+/// reversed digits occupy the 32-byte scratch prefix at SP containing the
+/// now-dead Span result.
+fn aarch64_regex_redux_report_u64(assembler: &mut Aarch64Assembler) -> Result<(), ObjectError> {
+    let nonzero = assembler.label()?;
+    let divide = assembler.label()?;
+    let reverse = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.branch_nonzero_x(9, nonzero)?;
+    aarch64_regex_redux_report_byte(assembler, b'0')?;
+    assembler.branch(finished)?;
+
+    assembler.bind(nonzero)?;
+    assembler.instruction(aarch64_movz_x(10, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(12, 10, 0)?)?;
+    assembler.bind(divide)?;
+    assembler.instruction(aarch64_udiv_x(11, 9, 12)?)?;
+    assembler.instruction(aarch64_msub_x(13, 11, 12, 9)?)?;
+    assembler.instruction(aarch64_add_x_imm(13, 13, u16::from(b'0'))?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 31, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_mov_x(9, 11)?)?;
+    assembler.branch_nonzero_x(9, divide)?;
+
+    assembler.bind(reverse)?;
+    assembler.instruction(aarch64_sub_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(13, 31, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch_nonzero_x(10, reverse)?;
+    assembler.bind(finished)
+}
+
+fn aarch64_regex_redux_publish_receipt(
+    assembler: &mut Aarch64Assembler,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    let sources = [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 8,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 16,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 24,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 32,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 40,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 48,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 56,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 64,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 8,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 16,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 24,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 32,
+    ];
+    for (word, source) in sources.into_iter().enumerate() {
+        aarch64_regex_redux_stack_load(assembler, 10, source)?;
+        assembler.instruction(aarch64_store_x(
+            10,
+            9,
+            u16::try_from(
+                word.checked_mul(8)
+                    .ok_or(ObjectError::ArithmeticOverflow("regex-redux receipt word"))?,
+            )
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt offset"))?,
+        )?)?;
+    }
+    assembler.instruction(aarch64_store_x(20, 9, 128)?)?;
+    assembler.instruction(aarch64_store_x(23, 9, 136)?)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the AAPCS64 operation mirrors the complete validated x86-64 transaction"
+)]
+fn lower_aarch64_native_regex_redux_v1(
+    identity: [u8; 32],
+    data: &NativeRegexReduxDataLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    if data.bytes.get(..identity.len()) != Some(identity.as_slice())
+        || data.variant_prefixes.len() != 9
+        || data.replacements.len() != 5
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 immutable data layout",
+        ));
+    }
+    let mut maximum_report_bytes = 1_usize;
+    for &(offset, bytes) in &data.variant_prefixes {
+        if bytes == 0
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 report prefix layout",
+            ));
+        }
+        maximum_report_bytes = maximum_report_bytes
+            .checked_add(bytes)
+            .and_then(|total| total.checked_add(21))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux AArch64 report bound",
+            ))?;
+    }
+    maximum_report_bytes =
+        maximum_report_bytes
+            .checked_add(3 * 21)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux AArch64 terminal report bound",
+            ))?;
+    if maximum_report_bytes > crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 report bound",
+        ));
+    }
+    for &(offset, bytes) in &data.replacements {
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 replacement layout",
+            ));
+        }
+    }
+
+    let mut assembler = Aarch64Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS)
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 calls"))?;
+
+    assembler.branch_zero_x(0, invalid_before_frame)?;
+    assembler.instruction(aarch64_and_low_x(9, 0, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid_before_frame)?;
+    assembler.instruction(aarch64_adds_x_imm(
+        9,
+        0,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_HS, invalid_before_frame)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, AARCH64_REGEX_REDUX_FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 31, AARCH64_REGEX_REDUX_SAVED_OFFSET)?)?;
+    for (first, second, offset) in [(19, 20, 0), (21, 22, 16), (23, 24, 32), (29, 30, 48)] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 9, offset)?)?;
+    }
+    aarch64_regex_redux_stack_store(&mut assembler, 0, X86_REGEX_REDUX_REQUEST_OFFSET)?;
+    for (request_offset, stack_offset) in [
+        (0, X86_REGEX_REDUX_HAYSTACK_OFFSET),
+        (8, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET),
+        (16, X86_REGEX_REDUX_SCRATCH_A_OFFSET),
+        (24, X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET),
+        (32, X86_REGEX_REDUX_SCRATCH_B_OFFSET),
+        (40, X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET),
+        (48, X86_REGEX_REDUX_REPORT_OFFSET),
+        (56, X86_REGEX_REDUX_REPORT_CAP_OFFSET),
+        (64, X86_REGEX_REDUX_RECEIPT_OFFSET),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(9, 0, request_offset)?)?;
+        aarch64_regex_redux_stack_store(&mut assembler, 9, stack_offset)?;
+    }
+
+    let data_page = assembler.instruction(0x9000_0015)?; // adrp x21, immutable data
+    let data_page_offset = assembler.instruction(aarch64_add_x_imm(21, 21, 0)?)?;
+
+    for pointer_offset in [
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 9, pointer_offset)?;
+        assembler.branch_zero_x(9, invalid)?;
+    }
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    assembler.instruction(aarch64_and_low_x(9, 9, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid)?;
+    for length_offset in [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 9, length_offset)?;
+        assembler.branch_bit_set_x(9, 63, invalid)?;
+    }
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_REPORT_CAP_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        9,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report capacity"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(aarch64_lsr_x_imm(10, 9, 1)?)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(11, 9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.branch_bit_set_x(11, 63, invalid)?;
+    for capacity_offset in [
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 12, capacity_offset)?;
+        assembler.instruction(aarch64_cmp_x(12, 11)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid)?;
+    }
+
+    aarch64_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REQUEST_OFFSET,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+        X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt extent"))?,
+        X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        invalid,
+    )?;
+    let ranges = [
+        (
+            X86_REGEX_REDUX_REQUEST_OFFSET,
+            X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_HAYSTACK_OFFSET,
+            X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_REPORT_OFFSET,
+            X86_REGEX_REDUX_REPORT_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_RECEIPT_OFFSET,
+            X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        ),
+    ];
+    for first in 0..ranges.len() {
+        for second in first + 1..ranges.len() {
+            aarch64_regex_redux_disjoint(
+                &mut assembler,
+                ranges[first].0,
+                ranges[first].1,
+                ranges[second].0,
+                ranges[second].1,
+                invalid,
+            )?;
+        }
+    }
+
+    aarch64_regex_redux_stack_load(&mut assembler, 19, X86_REGEX_REDUX_HAYSTACK_OFFSET)?;
+    aarch64_regex_redux_stack_load(&mut assembler, 20, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    aarch64_regex_redux_emit_replacement(
+        &mut assembler,
+        0,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        None,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        runtime_failure,
+        &mut call_offsets,
+    )?;
+    for variant in 0..data.variant_prefixes.len() {
+        aarch64_regex_redux_emit_count(
+            &mut assembler,
+            variant + 1,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+            runtime_failure,
+            &mut call_offsets,
+        )?;
+    }
+    for substitution in 0..data.replacements.len() {
+        let destination_is_b = substitution.is_multiple_of(2);
+        aarch64_regex_redux_emit_replacement(
+            &mut assembler,
+            10 + substitution,
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_OFFSET
+            },
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET
+            },
+            Some(data.replacements[substitution]),
+            X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + substitution * 8,
+            runtime_failure,
+            &mut call_offsets,
+        )?;
+    }
+
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        24,
+        31,
+        u16::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?,
+    )?)?;
+    for (variant, &(offset, bytes)) in data.variant_prefixes.iter().enumerate() {
+        aarch64_regex_redux_report_prefix(&mut assembler, offset, bytes)?;
+        aarch64_regex_redux_stack_load(
+            &mut assembler,
+            9,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+        )?;
+        aarch64_regex_redux_report_u64(&mut assembler)?;
+        aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    }
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_CLEAN_LEN_OFFSET)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(aarch64_mov_x(9, 20)?)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        23,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report bound"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+
+    aarch64_regex_redux_stack_load(&mut assembler, 11, X86_REGEX_REDUX_REPORT_OFFSET)?;
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    let report_copy = assembler.label()?;
+    let report_copied = assembler.label()?;
+    assembler.branch_zero_x(23, report_copied)?;
+    assembler.bind(report_copy)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 24, 9)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(10, 11, 9)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 23)?)?;
+    assembler.branch_cond(AARCH64_LO, report_copy)?;
+    assembler.bind(report_copied)?;
+    aarch64_regex_redux_publish_receipt(&mut assembler)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_add_x_imm(9, 31, AARCH64_REGEX_REDUX_SAVED_OFFSET)?)?;
+    for (first, second, offset) in [(19, 20, 0), (21, 22, 16), (23, 24, 32), (29, 30, 48)] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 9, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, AARCH64_REGEX_REDUX_FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    if call_offsets.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || call_offsets
+            .iter()
+            .enumerate()
+            .any(|(expected, &(component, _))| component != expected)
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 call closure",
+        ));
+    }
+    let mut relocation_offsets = Vec::new();
+    relocation_offsets
+        .try_reserve_exact(2 + call_offsets.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 relocation offsets"))?;
+    relocation_offsets.extend([data_page, data_page_offset]);
+    relocation_offsets.extend(call_offsets.iter().map(|&(_, offset)| offset));
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(relocation_offsets.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 relocations"))?;
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(relocation_offsets[0], "regex-redux AArch64 data page")?,
+        kind: RelocationKind::Aarch64Page21,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: 0,
+    });
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(
+            relocation_offsets[1],
+            "regex-redux AArch64 data page offset",
+        )?,
+        kind: RelocationKind::Aarch64PageOff12,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: 0,
+    });
+    for (component, &(expected, _)) in call_offsets.iter().enumerate() {
+        if component != expected {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 relocation closure",
+            ));
+        }
+        relocations.push(ModuleRelocation {
+            section: REGEX_REDUX_TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[component + 2],
+                "regex-redux AArch64 component",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: REGEX_REDUX_COMPONENT_SYMBOL_BASE + component,
+            addend: 0,
+        });
+    }
+    Ok((code, relocations))
 }
 
 /// Emit Intel-recommended NOP encodings into unreachable post-return space.
