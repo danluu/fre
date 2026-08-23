@@ -277,11 +277,13 @@ mod ordinary_direct_probe {
     std::thread_local! {
         static CALLS: Cell<usize> = const { Cell::new(0) };
         static SPECIAL_CHECKS: Cell<usize> = const { Cell::new(0) };
+        static ADAPTIVE_REPLAYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
         CALLS.set(0);
         SPECIAL_CHECKS.set(0);
+        ADAPTIVE_REPLAYS.set(0);
     }
 
     pub(super) fn record() {
@@ -298,6 +300,14 @@ mod ordinary_direct_probe {
 
     pub(super) fn special_checks() -> usize {
         SPECIAL_CHECKS.get()
+    }
+
+    pub(super) fn record_adaptive_replay() {
+        ADAPTIVE_REPLAYS.set(ADAPTIVE_REPLAYS.get().saturating_add(1));
+    }
+
+    pub(super) fn adaptive_replays() -> usize {
+        ADAPTIVE_REPLAYS.get()
     }
 }
 
@@ -1516,8 +1526,10 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     /// Visit every non-overlapping selected span with one bounded direct probe
     /// after an early prefiltered acceptance.
     ///
-    /// A direct miss replays the authoritative prefiltered search from the
-    /// original cursor, preserving matches that cross the probe boundary.
+    /// A direct miss at an artificial probe edge replays the authoritative
+    /// prefiltered search from the original cursor, preserving matches that
+    /// cross that boundary. A probe covering the complete remaining window
+    /// needs no replay.
     ///
     /// # Errors
     ///
@@ -1546,9 +1558,10 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     /// caller-authenticated near-acceptance observation on the first bounded
     /// direct probe.
     ///
-    /// The observation affects only performance. A direct miss replays the
-    /// authoritative prefiltered search from the original cursor, exactly as
-    /// later locally promoted probes do.
+    /// The observation affects only performance. A direct miss at an
+    /// artificial probe edge replays the authoritative prefiltered search
+    /// from the original cursor, exactly as later locally promoted probes do.
+    /// A probe covering the complete remaining window needs no replay.
     ///
     /// # Errors
     ///
@@ -1588,11 +1601,20 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                         Some((end - uniform_width, end))
                     }
                     None => {
+                        if probe_end == window.end() {
+                            // The direct scan covered the complete remaining
+                            // semantic window. Unlike a miss at an artificial
+                            // probe edge, no wholly contained match can cross
+                            // this boundary, so the miss is authoritative.
+                            return Ok(Ok(()));
+                        }
                         // A miss costs at most one bounded direct probe. The
                         // authoritative prefiltered search restarts at the
                         // original cursor so a match crossing the probe edge
                         // cannot be skipped.
                         direct_probe_bytes = None;
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_adaptive_replay();
                         self.plan.try_find_window_value(
                             haystack,
                             Window::new(cursor, window.end()),
@@ -4509,6 +4531,35 @@ mod tests {
         );
         assert_eq!(crossing_actual, [(57, 65)]);
         assert_eq!(ordinary_direct_probe::calls(), 1);
+        assert_eq!(ordinary_direct_probe::adaptive_replays(), 1);
+
+        // A direct miss covering the complete remaining window is already
+        // authoritative. In particular, the dense ripgrep tail shape may
+        // end with fewer than 8W bytes after its last selected match; do not
+        // restart the prefiltered matcher over those same bytes.
+        for remaining in [11_usize, 64] {
+            let mut covered = b"PP".to_vec();
+            covered.extend(core::iter::repeat_n(b'x', remaining));
+            covered.extend_from_slice(b"SS");
+            let covered_window = Window::new(2, 2 + remaining);
+            ordinary_direct_probe::reset();
+            let mut callback_called = false;
+            assert_eq!(
+                uniform.try_visit_spans_window_value_with_initial_direct(
+                    &covered,
+                    covered_window,
+                    true,
+                    |_| {
+                        callback_called = true;
+                        Ok::<bool, ()>(true)
+                    },
+                ),
+                Ok(Ok(())),
+            );
+            assert!(!callback_called);
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::adaptive_replays(), 0);
+        }
 
         ordinary_direct_probe::reset();
         assert_eq!(
