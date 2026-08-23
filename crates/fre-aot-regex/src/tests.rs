@@ -3323,7 +3323,7 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
                 Some(if grep_count {
                     PreparedAggregateStrategy::RuntimeHelper
                 } else {
-                    PreparedAggregateStrategy::NativeFused
+                    PreparedAggregateStrategy::NativeFusedWithRuntimeHelper
                 }),
             );
             assert_eq!(
@@ -3492,7 +3492,7 @@ fn native_prepared_aggregate_object_limit_has_exact_boundary() {
     .expect("native aggregate exact resource baseline");
     assert_eq!(
         baseline.receipt().prepared_aggregate_strategy,
-        Some(PreparedAggregateStrategy::NativeFused),
+        Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
     );
     let exact_limits = CompileLimitsV1 {
         max_object_bytes: baseline.object().len(),

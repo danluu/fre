@@ -1575,13 +1575,13 @@ pub enum PreparedAggregateStrategy {
     /// runtime reducer while retaining the same exclusive prepared handle.
     RuntimeHelper,
     /// Count and `SpanSum` stay in one generated iterator frame and locally
-    /// call an artifact-specific native prepared target or self-contained
-    /// ordinary entry. `GrepCount` likewise owns LF/CRLF splitting when a
-    /// local ordinary target is available. No requested aggregate export uses
-    /// a runtime reducer.
+    /// call a self-contained ordinary entry. `GrepCount` likewise owns LF/CRLF
+    /// splitting when a local ordinary target is available. No requested
+    /// aggregate export or transitive search target uses a runtime helper.
     NativeFused,
-    /// Some requested reducers use generated native loops while another
-    /// requested export retains its authenticated runtime helper.
+    /// Some requested reducers use generated native loops while either their
+    /// prepared search target or another requested export retains an
+    /// authenticated runtime helper.
     NativeFusedWithRuntimeHelper,
     /// Count and `SpanSum` classify one prepared capability before any
     /// operation state is initialized. Exact V15 owners stay in the generated
@@ -6683,8 +6683,18 @@ impl CompiledModule {
                 == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
         let native_grep_reducer = grep_reducer_requested
             && (direct_search_target.is_some() || ordered_nfa_reducers);
+        // A prepared target is locally called but not self-contained: its
+        // public/private entry may transitively enter authenticated semantic
+        // preflight, recovery, retirement, or fallback helpers. Keep that
+        // distinct from a direct ordinary entry whose complete unresolved
+        // function surface was rejected above. `NativeFused` is therefore a
+        // closed helper-free operation claim, not merely a statement that the
+        // outer reduction loop happens to be generated text.
+        let prepared_scalar_target_retains_runtime =
+            prepared_search_target.is_some() && !ordered_nfa_reducers;
         let aggregate_runtime_helper = (grep_reducer_requested && !native_grep_reducer)
-            || (span_reducers_requested && !native_span_reducers);
+            || (span_reducers_requested && !native_span_reducers)
+            || prepared_scalar_target_retains_runtime;
         let any_native_reducer = native_span_reducers || native_grep_reducer;
         // Only exhaustive scalar reducers may spend unbounded work finding a
         // final candidate. A selected absolute-width gate already owns the
@@ -68624,7 +68634,7 @@ mod tests {
     }
 
     #[test]
-    fn native_prepared_aggregates_authenticate_inline_before_the_span_fill_target() {
+    fn native_prepared_aggregates_are_transitively_helper_backed_and_authenticate_inline() {
         let exports = PreparedAggregateExports::COUNT
             .union(PreparedAggregateExports::SPAN_SUM);
         for target in [
@@ -68655,11 +68665,11 @@ mod tests {
             );
             assert_eq!(
                 module.prepared_aggregate_strategy(),
-                Some(PreparedAggregateStrategy::NativeFused),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
             );
             assert_eq!(
                 compiled.receipt().prepared_aggregate_strategy,
-                Some(PreparedAggregateStrategy::NativeFused),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
             );
             let fill_target = prepared_span_fill_local_target(module);
             assert_eq!(
@@ -68872,7 +68882,7 @@ mod tests {
                 target,
                 compiled.program().artifact_identity(),
                 exports,
-                PreparedAggregateStrategy::NativeFused,
+                PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
                 module.sections()[TEXT_SECTION].bytes(),
                 module.sections()[PROGRAM_SECTION].bytes(),
                 module.symbols(),

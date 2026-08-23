@@ -357,9 +357,9 @@ pub const fn is_native_whole_scalar_reducer(
 /// The aggregate strategy is only the first gate. This also closes the export
 /// set, prepared capability/bulk shape, canonical program/reducer identity,
 /// defined-text extent, and every unresolved aggregate relocation. Other
-/// unresolved symbols owned by the ordinary search object do not make the
-/// selected reducer a helper; only an edge originating inside that reducer is
-/// relevant to the operation boundary.
+/// For `NativeFused`, the compiler strategy has already closed the reducer's
+/// transitive local-call target as an ordinary helper-free entry. V15 has its
+/// own exact capability and helper-backed compatibility envelope below.
 pub fn authenticate_native_whole_scalar_reducer(
     model: Model,
     compiled: &CompiledRegex,
@@ -400,12 +400,11 @@ pub fn authenticate_native_whole_scalar_reducer(
             && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
             && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
     } else {
-        matches!(
-            module.prepared_bulk_strategy(),
-            None | Some(
-                PreparedBulkStrategy::NativePreparedLoop | PreparedBulkStrategy::NativeFrozenLoop
-            )
-        ) && receipt.required_prepare_capabilities == 0
+        module.prepared_bulk_strategy().is_none()
+            && module.prepared_entry_symbol().is_none()
+            && module.prepared_span_fill_symbol().is_none()
+            && module.required_runtime_symbols().next().is_none()
+            && receipt.required_prepare_capabilities == 0
     };
     if receipt.mode != CompileMode::Optimizing
         || receipt.output != OutputContract::Span
@@ -413,6 +412,7 @@ pub fn authenticate_native_whole_scalar_reducer(
         || module.prepared_aggregate_exports() != model.exports()
         || module.prepared_aggregate_strategy() != strategy
         || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
+        || receipt.runtime_helper_required != ordered_nfa
         || !bulk_shape_is_exact
         || reducer_name == program_name
         || program_len == 0
@@ -804,24 +804,28 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
             slow_aot_limits,
         )
     };
-    let (compiled, selected_limits, recovered_lower_work) =
+    let (compiled, selected_limits) =
         match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
-            Ok(compiled) => (compiled, CompileLimitsV1::default(), false),
+            Ok(compiled) => (compiled, CompileLimitsV1::default()),
             Err(error) if is_lower_work_limit(&error) => {
                 let limits = rebar_recovery_compile_limits();
                 let compiled = compile_with_limits(limits, rebar_recovery_slow_aot_limits())
                     .map_err(|error| format!("general AOT recovery compilation failed: {error}"))?;
-                (compiled, limits, true)
+                (compiled, limits)
             }
             Err(error) => return Err(format!("general AOT compilation failed: {error}")),
         };
-    if recovered_lower_work
-        && recovered_scalar_requires_prepared_ordered_nfa(benchmark.model, &compiled)
-    {
-        let recovered_stats = compiled
+    // A cap-zero prepared scalar loop may own its outer reduction in generated
+    // text while its local search target still enters semantic runtime edges.
+    // Give that exact closed topology one bounded chance to replace the
+    // transitive target with the object-local prepared Ordered-TNFA. Typed
+    // unsupported/resource decline preserves the incumbent byte-for-byte;
+    // construction or authentication failure remains terminal.
+    if scalar_incumbent_requires_prepared_ordered_nfa(benchmark.model, &compiled) {
+        let incumbent_stats = compiled
             .program()
             .stats()
-            .map_err(|error| format!("general AOT recovery stats failed: {error}"))?;
+            .map_err(|error| format!("general AOT scalar incumbent stats failed: {error}"))?;
         let disposition = compile_with_prepared_ordered_nfa_v15_reported(
             CompileRequest::new(benchmark.pattern(), target)
                 .profile(profile)
@@ -833,11 +837,11 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         .map_err(|error| {
             format!(
                 "general AOT explicit prepared Ordered-NFA compilation failed for {} states/{} edges: {error}",
-                recovered_stats.thompson_states, recovered_stats.thompson_edges,
+                incumbent_stats.thompson_states, incumbent_stats.thompson_edges,
             )
         })?;
         let selected =
-            select_prepared_ordered_nfa_v15_or_recovered(benchmark.model, compiled, disposition)?;
+            select_prepared_ordered_nfa_v15_or_incumbent(benchmark.model, compiled, disposition)?;
         authenticate_native_whole_scalar_reducer(benchmark.model, &selected)?;
         return Ok(selected);
     }
@@ -865,9 +869,9 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
     select_prepared_v15_grep_or_incumbent(compiled, disposition)
 }
 
-fn select_prepared_ordered_nfa_v15_or_recovered(
+fn select_prepared_ordered_nfa_v15_or_incumbent(
     model: Model,
-    recovered: CompiledRegex,
+    incumbent: CompiledRegex,
     disposition: PreparedOrderedNfaV15CompileDisposition,
 ) -> Result<CompiledRegex, String> {
     match disposition {
@@ -875,12 +879,15 @@ fn select_prepared_ordered_nfa_v15_or_recovered(
             authenticate_prepared_ordered_nfa_scalar(model, &selected)?;
             Ok(selected)
         }
-        PreparedOrderedNfaV15CompileDisposition::Declined(_) => Ok(recovered),
+        PreparedOrderedNfaV15CompileDisposition::Declined(_) => Ok(incumbent),
     }
 }
 
-fn recovered_scalar_requires_prepared_ordered_nfa(model: Model, compiled: &CompiledRegex) -> bool {
-    recovered_scalar_route_shape(
+fn scalar_incumbent_requires_prepared_ordered_nfa(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> bool {
+    scalar_incumbent_route_shape(
         model,
         compiled.receipt().engine,
         compiled.module().prepared_bulk_strategy(),
@@ -889,20 +896,33 @@ fn recovered_scalar_requires_prepared_ordered_nfa(model: Model, compiled: &Compi
     )
 }
 
-const fn recovered_scalar_route_shape(
+const fn scalar_incumbent_route_shape(
     model: Model,
     engine: EngineKind,
     bulk: Option<PreparedBulkStrategy>,
     aggregate: Option<PreparedAggregateStrategy>,
     required_prepare_capabilities: u64,
 ) -> bool {
+    let recovered_runtime_bulk = matches!(
+        (bulk, aggregate),
+        (
+            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+        )
+    );
+    let transitive_prepared_loop = matches!(
+        (bulk, aggregate),
+        (
+            Some(
+                PreparedBulkStrategy::NativePreparedLoop
+                    | PreparedBulkStrategy::NativeFrozenLoop,
+            ),
+            Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+        )
+    );
     matches!(model, Model::Count | Model::SpanSum)
         && matches!(engine, EngineKind::OrderedNfa)
-        && matches!(
-            bulk,
-            Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk)
-        )
-        && matches!(aggregate, Some(PreparedAggregateStrategy::RuntimeHelper))
+        && (recovered_runtime_bulk || transitive_prepared_loop)
         && required_prepare_capabilities == 0
 }
 
@@ -3282,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_v15_declines_return_the_recovered_incumbent_byte_for_byte() {
+    fn safe_v15_declines_return_the_incumbent_byte_for_byte() {
         use fre_aot_regex::{compile, PreparedOrderedNfaV15CompileDecline};
 
         let target = target_from_parts(
@@ -3291,15 +3311,15 @@ mod tests {
             FeatureSet::EMPTY.bits(),
         )
         .expect("host target");
-        let recovered = compile(
+        let incumbent = compile(
             CompileRequest::new("ab", target)
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Span),
         )
-        .expect("recovered incumbent fixture");
-        let expected_program = recovered.program().serialize().unwrap();
-        let expected_object = recovered.object().to_vec();
-        let expected_receipt = recovered.receipt().clone();
+        .expect("incumbent fixture");
+        let expected_program = incumbent.program().serialize().unwrap();
+        let expected_object = incumbent.object().to_vec();
+        let expected_receipt = incumbent.receipt().clone();
         let declines = [
             PreparedOrderedNfaV15CompileDecline::Unsupported,
             PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
@@ -3312,9 +3332,9 @@ mod tests {
             },
         ];
         for decline in declines {
-            let selected = select_prepared_ordered_nfa_v15_or_recovered(
+            let selected = select_prepared_ordered_nfa_v15_or_incumbent(
                 Model::Count,
-                recovered.clone(),
+                incumbent.clone(),
                 PreparedOrderedNfaV15CompileDisposition::Declined(decline),
             )
             .expect("safe V15 decline");
@@ -3642,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_runtime_bulk_shape_has_one_authenticated_prepared_ordered_nfa_replacement() {
+    fn helper_backed_scalar_incumbents_have_one_authenticated_ordered_nfa_replacement() {
         let mut benchmark = Benchmark::parse(&fixture("count", br"\p{L}+", b" aa"))
             .expect("assertion-bearing count fixture");
         benchmark.unicode = true;
@@ -3655,7 +3675,7 @@ mod tests {
         let mut profile = RustProfile::rebar_1_12_4();
         profile.options.unicode = benchmark.unicode;
         profile.options.case_insensitive = benchmark.case_insensitive;
-        let recovered = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        let incumbent = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             CompileRequest::new(benchmark.pattern(), target)
                 .profile(profile.clone())
                 .output(benchmark.model.output())
@@ -3664,44 +3684,70 @@ mod tests {
             benchmark.model.exports(),
             rebar_recovery_slow_aot_limits(),
         )
-        .expect("runtime-bulk incumbent");
+        .expect("helper-backed scalar incumbent");
         assert!(
-            !recovered_scalar_requires_prepared_ordered_nfa(benchmark.model, &recovered),
-            "the small fixture is already native: engine={:?} aggregate={:?} bulk={:?} capabilities={:#x}",
-            recovered.receipt().engine,
-            recovered.module().prepared_aggregate_strategy(),
-            recovered.module().prepared_bulk_strategy(),
-            recovered.module().required_prepare_capabilities()
+            scalar_incumbent_requires_prepared_ordered_nfa(benchmark.model, &incumbent),
+            "the fixture did not produce an upgradeable scalar incumbent: engine={:?} aggregate={:?} bulk={:?} capabilities={:#x}",
+            incumbent.receipt().engine,
+            incumbent.module().prepared_aggregate_strategy(),
+            incumbent.module().prepared_bulk_strategy(),
+            incumbent.module().required_prepare_capabilities()
         );
-        assert!(recovered_scalar_route_shape(
+        assert!(scalar_incumbent_route_shape(
             Model::Count,
             EngineKind::OrderedNfa,
             Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
             Some(PreparedAggregateStrategy::RuntimeHelper),
             0,
         ));
-        assert!(recovered_scalar_route_shape(
+        assert!(scalar_incumbent_route_shape(
             Model::SpanSum,
             EngineKind::OrderedNfa,
             Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
             Some(PreparedAggregateStrategy::RuntimeHelper),
             0,
         ));
-        assert!(!recovered_scalar_route_shape(
+        for bulk in [
+            PreparedBulkStrategy::NativePreparedLoop,
+            PreparedBulkStrategy::NativeFrozenLoop,
+        ] {
+            assert!(scalar_incumbent_route_shape(
+                Model::Count,
+                EngineKind::OrderedNfa,
+                Some(bulk),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+                0,
+            ));
+            assert!(scalar_incumbent_route_shape(
+                Model::SpanSum,
+                EngineKind::OrderedNfa,
+                Some(bulk),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+                0,
+            ));
+            assert!(!scalar_incumbent_route_shape(
+                Model::Count,
+                EngineKind::OrderedNfa,
+                Some(bulk),
+                Some(PreparedAggregateStrategy::NativeFused),
+                0,
+            ));
+        }
+        assert!(!scalar_incumbent_route_shape(
             Model::GrepCount,
             EngineKind::OrderedNfa,
             Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
             Some(PreparedAggregateStrategy::RuntimeHelper),
             0,
         ));
-        assert!(!recovered_scalar_route_shape(
+        assert!(!scalar_incumbent_route_shape(
             Model::CountCaptures,
             EngineKind::OrderedNfa,
             Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
             Some(PreparedAggregateStrategy::RuntimeHelper),
             0,
         ));
-        assert!(!recovered_scalar_route_shape(
+        assert!(!scalar_incumbent_route_shape(
             Model::Count,
             EngineKind::OrderedNfa,
             Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
