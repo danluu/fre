@@ -5749,6 +5749,80 @@ struct RipgrepStandardLiteralContext {
     syntax: ParseSummary,
 }
 
+/// Already-derived facade fields moved only into the authenticated large flat
+/// literal-set terminal. Keeping this terminal outlined avoids adding another
+/// publication body to the general construction planner.
+struct RipgrepFlatLiteralPublication {
+    source: Box<str>,
+    capture_names: Box<[Option<Box<str>>]>,
+    line_total_grep_plan: Option<line_total_grep::Plan>,
+    profile: CompatibilityProfile,
+    admission: AdmissionStatus,
+    syntax: ParseSummary,
+    source_storage_bytes: usize,
+    capture_name_storage_bytes: usize,
+    captures_len: usize,
+    static_captures_len: Option<usize>,
+    minimum_match_bytes: Option<usize>,
+}
+
+/// Publish the class-free large flat-literal plan from bytes still owned by the
+/// authenticated HIR. Above the packed engine's certified cardinality ceiling,
+/// the incumbent always reaches this same stable DFA construction.
+#[cold]
+#[inline(never)]
+fn build_ripgrep_flat_literal_handoff(
+    builder: &PortableBuilder,
+    handoff: &finite::FlatLiteralSetHandoff<'_>,
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+) -> Result<PortableRegex, BuildError> {
+    if builder.selection != PlanSelection::Auto
+        || handoff.patterns().len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        || publication.syntax.class_ranges != 0
+    {
+        return Err(BuildError::InternalInvariant(
+            "borrowed ripgrep literal set reached another planner terminal",
+        ));
+    }
+    let literal_set = LiteralSetPlan::new_stable_borrowed(
+        handoff.patterns(),
+        builder.limits.literal_set,
+    )?;
+    let storage = literal_set.build_accounting().persistent_bytes;
+    Ok(PortableRegex {
+        source: publication.source,
+        capture_names: publication.capture_names,
+        line_total_grep_plan: publication.line_total_grep_plan,
+        plan: PortablePlan::LiteralSetDfa(literal_set),
+        profile: publication.profile.clone(),
+        limits: builder.limits,
+        selection: builder.selection,
+        report: BuildReport {
+            profile: publication.profile,
+            admission: publication.admission,
+            syntax: publication.syntax,
+            plan: PlanKind::LiteralSetDfa,
+            planner_work,
+            lowering: None,
+            states: 0,
+            edges: 0,
+            plan_storage_bytes: storage,
+            source_storage_bytes: publication.source_storage_bytes,
+            capture_name_storage_bytes: publication.capture_name_storage_bytes,
+            charged_persistent_bytes: 0,
+            persistent_byte_limit: 0,
+            captures_len: publication.captures_len,
+            static_captures_len: publication.static_captures_len,
+            minimum_match_bytes: publication.minimum_match_bytes,
+            required_literal: None,
+            literal_class_run_literal: None,
+            forward_anchored: None,
+        }
+        .enforce_persistent_limit(builder.limits.max_persistent_bytes)?,
+    })
+}
+
 impl RipgrepStandardLiteralContext {
     fn with_hir(self, hir: Hir) -> PortableParsedBuildContext {
         PortableParsedBuildContext {
@@ -7876,7 +7950,49 @@ impl PortableBuilder {
             && has_guarded_ascii_left
             && has_guarded_ascii_right;
         let mut singleton_literal_handoff = None;
-        let finite_extraction = if ripgrep_flat_literal
+        let ripgrep_large_flat_literal = ripgrep_flat_literal
+            && matches!(
+                rust.hir.kind(),
+                HirKind::Alternation(branches)
+                    if branches.len() > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+            );
+        let finite_extraction = if ripgrep_large_flat_literal {
+            match finite::extract_authenticated_flat_literal_set_handoff(
+                &rust.hir,
+                self.limits.literal_set.max_patterns,
+                self.limits.literal_set.max_pattern_bytes,
+                nullable_finite_token_repeat_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(handoff) => {
+                    if !handoff.has_closed_receipt() {
+                        return Err(BuildError::InternalInvariant(
+                            "flat literal-set handoff lost its extraction-attempt closure",
+                        ));
+                    }
+                    let planner_work = handoff.work();
+                    return build_ripgrep_flat_literal_handoff(
+                        &self,
+                        &handoff,
+                        planner_work,
+                        RipgrepFlatLiteralPublication {
+                            source,
+                            capture_names,
+                            line_total_grep_plan,
+                            profile,
+                            admission,
+                            syntax,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                        },
+                    );
+                }
+                Err(finite_outcome) => Err(finite_outcome),
+            }
+        } else if ripgrep_flat_literal
             && matches!(rust.hir.kind(), HirKind::Alternation(_))
         {
             Err(finite::extract_authenticated_flat_literal_set(
@@ -26720,12 +26836,14 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let regex = PortableBuilder::new("")
+        let built = PortableBuilder::new("")
             .multi_line(true)
             .retained_find_iter(true)
-            .build_ripgrep_standard_literal_hir(&hir, usize::MAX)
-            .expect("direct construction completes")
-            .expect("class-free literal HIR is admitted");
+            .build_ripgrep_standard_literal_hir_owned(hir.clone(), usize::MAX)
+            .expect("owned direct construction completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(regex) = built else {
+            panic!("owned class-free literal HIR was refused");
+        };
         let report = regex.build_report();
         assert_eq!(report.plan, PlanKind::LiteralSetDfa);
         assert_eq!(report.syntax.class_ranges, 0);

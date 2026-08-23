@@ -2208,6 +2208,16 @@ fn checked_mul(
         .ok_or(LiteralSetError::ArithmeticOverflow { computation })
 }
 
+// Stable construction may use only pattern carriers whose bytes cannot
+// change between preflight and DFA construction. Keep this trait private so
+// an arbitrary `AsRef<[u8]>` provider cannot opt into that authority.
+mod stable_pattern {
+    pub(super) trait Sealed: AsRef<[u8]> {}
+
+    impl Sealed for Vec<u8> {}
+    impl Sealed for &[u8] {}
+}
+
 impl LiteralSetPlan {
     /// Compile stable owned literal alternatives into a DFA.
     ///
@@ -2230,6 +2240,34 @@ impl LiteralSetPlan {
         patterns: &[Vec<u8>],
         limits: LiteralSetBuildLimits,
     ) -> Result<Self, LiteralSetError> {
+        Self::new_stable_patterns(patterns, limits)
+    }
+
+    /// Compile stable borrowed literal alternatives into a DFA.
+    ///
+    /// The shared byte slices inspected here remain immutable for this call,
+    /// so they carry the same construction authority as the owned values
+    /// accepted by [`Self::new_stable`]. Equal, positive-width alternatives
+    /// may therefore use standard earliest-acceptance construction while the
+    /// receipt and exposed spans retain leftmost-first semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::new_stable`].
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn new_stable_borrowed(
+        patterns: &[&[u8]],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
+        Self::new_stable_patterns(patterns, limits)
+    }
+
+    fn new_stable_patterns<P: stable_pattern::Sealed>(
+        patterns: &[P],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
         let semantics = LiteralSetMatchSemantics::LeftmostFirst;
         let build = preflight(patterns, limits, semantics)?;
         let uniform_positive = build.minimum_pattern_bytes > 0
@@ -2242,7 +2280,7 @@ impl LiteralSetPlan {
         };
         let automaton = DFA::builder()
             .match_kind(match_kind)
-            .build(patterns.iter().map(Vec::as_slice))
+            .build(patterns.iter().map(AsRef::as_ref))
             .map_err(|error| LiteralSetError::AutomatonBuild {
                 detail: error.to_string(),
             })?;
@@ -4606,7 +4644,29 @@ mod tests {
     }
 
     #[test]
-    fn uniform_standard_span_iteration_bounds_direct_dense_probes() {
+    fn stable_borrowed_matches_owned_semantics_and_accounting() {
+        let pattern_sets = [
+            vec![b"aa".to_vec(), b"bb".to_vec(), b"aa".to_vec()],
+            vec![b"a".to_vec(), b"ab".to_vec(), b"b".to_vec()],
+            vec![Vec::new(), b"a".to_vec()],
+        ];
+        for patterns in pattern_sets {
+            let borrowed_patterns = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let owned =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let borrowed = LiteralSetPlan::new_stable_borrowed(
+                &borrowed_patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(borrowed.build_accounting(), owned.build_accounting());
+            assert_eq!(borrowed.automaton.match_kind(), owned.automaton.match_kind());
+            assert_leftmost_window_differential(&patterns, &borrowed, 5);
+        }
+    }
+
+    #[test]
+    fn borrowed_uniform_standard_span_iteration_bounds_direct_dense_probes() {
         let patterns = (0_u16..256)
             .map(|id| {
                 vec![
@@ -4621,8 +4681,19 @@ mod tests {
                 ]
             })
             .collect::<Vec<_>>();
-        let plan = LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default())
-            .expect("uniform plan");
+        let borrowed_patterns = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new_stable_borrowed(
+            &borrowed_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .expect("borrowed uniform plan");
+        assert_eq!(plan.build_accounting().patterns, 256);
+        assert_eq!(plan.build_accounting().pattern_bytes, 256 * 8);
+        assert_eq!(plan.build_accounting().minimum_pattern_bytes, 8);
+        assert_eq!(
+            plan.build_accounting().match_semantics,
+            LiteralSetMatchSemantics::LeftmostFirst,
+        );
         assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
         assert!(plan.automaton.prefilter().is_some());
         let ordinary = plan.ordinary_executor().expect("ordinary executor");
@@ -5669,6 +5740,10 @@ mod tests {
             LiteralSetPlan::new::<&[u8]>(&[], LiteralSetBuildLimits::default()),
             Err(LiteralSetError::EmptyPatternSet)
         ));
+        assert!(matches!(
+            LiteralSetPlan::new_stable_borrowed(&[], LiteralSetBuildLimits::default()),
+            Err(LiteralSetError::EmptyPatternSet)
+        ));
         let patterns = [b"abc".as_slice(), b"def".as_slice()];
         let limits = LiteralSetBuildLimits {
             max_patterns: 1,
@@ -5692,6 +5767,17 @@ mod tests {
                 limit: 1
             })
         ));
+        let borrowed_patterns = stable_patterns
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            LiteralSetPlan::new_stable_borrowed(&borrowed_patterns, limits),
+            Err(LiteralSetError::PatternLimit {
+                needed: 2,
+                limit: 1
+            })
+        ));
         let limits = LiteralSetBuildLimits {
             max_pattern_bytes: 5,
             ..LiteralSetBuildLimits::default()
@@ -5710,6 +5796,37 @@ mod tests {
                 limit: 5
             })
         ));
+        assert!(matches!(
+            LiteralSetPlan::new_stable_borrowed(&borrowed_patterns, limits),
+            Err(LiteralSetError::PatternBytesLimit {
+                needed: 6,
+                limit: 5
+            })
+        ));
+
+        let admitted =
+            LiteralSetPlan::new_stable(&stable_patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .build_accounting();
+        for limits in [
+            LiteralSetBuildLimits {
+                max_build_work: admitted.build_work_upper_bound - 1,
+                ..LiteralSetBuildLimits::default()
+            },
+            LiteralSetBuildLimits {
+                max_build_bytes: admitted.build_bytes_upper_bound - 1,
+                ..LiteralSetBuildLimits::default()
+            },
+            LiteralSetBuildLimits {
+                max_persistent_bytes: admitted.persistent_bytes - 1,
+                ..LiteralSetBuildLimits::default()
+            },
+        ] {
+            assert_eq!(
+                LiteralSetPlan::new_stable_borrowed(&borrowed_patterns, limits).unwrap_err(),
+                LiteralSetPlan::new_stable(&stable_patterns, limits).unwrap_err(),
+            );
+        }
     }
 
     #[test]

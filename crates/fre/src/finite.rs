@@ -1416,6 +1416,39 @@ impl<'hir> SingletonLiteralHandoff<'hir> {
     }
 }
 
+/// One independently authenticated flat literal alternation borrowed directly
+/// from its retained HIR owner.
+///
+/// The slice table is the only finite-language storage allocated by this
+/// handoff. Literal bytes remain in the immutable HIR until the selected plan
+/// has copied them into its final owner. Planner work deliberately replays the
+/// incumbent materializer even though no literal bytes are copied here.
+pub(crate) struct FlatLiteralSetHandoff<'hir> {
+    patterns: Vec<&'hir [u8]>,
+    receipt: FiniteExtractionAttemptReceipt,
+}
+
+impl<'hir> FlatLiteralSetHandoff<'hir> {
+    pub(crate) fn patterns(&self) -> &[&'hir [u8]] {
+        self.patterns.as_slice()
+    }
+
+    pub(crate) const fn work(&self) -> u64 {
+        self.receipt.actual.work
+    }
+
+    pub(crate) fn has_closed_receipt(&self) -> bool {
+        self.receipt.has_basic_closure()
+            && self.receipt.terminal == FiniteExtractionTerminal::Fits
+            && self.receipt.actual.guarded.is_none()
+            && self
+                .patterns
+                .capacity()
+                .checked_mul(size_of::<&[u8]>())
+                == Some(self.receipt.actual.local.live_persistent_bytes)
+    }
+}
+
 /// Return the borrowed leaf and the incumbent extractor's exact additional
 /// work for a capture-transparent singleton.
 ///
@@ -1494,6 +1527,112 @@ pub(crate) fn extract_with_singleton_literal_handoff(
         derive_guarded_dictionary,
         guarded_limits,
     ))
+}
+
+/// Return the immutable flat-literal branches and the successful incumbent
+/// extractor's exact additional work.
+///
+/// The incumbent direct materializer charges one root inspection, one
+/// inspection and one outer publication per branch, and one unit per literal
+/// byte. This allocation-free preflight is used only to decide whether the
+/// complete fast path fits. Any malformed value, finite-limit refusal or work
+/// refusal runs the unchanged materializer so its partial effects and error
+/// chronology remain authoritative.
+fn flat_literal_set_payload_and_work(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+) -> Option<(&[Hir], u64)> {
+    let HirKind::Alternation(branches) = hir.kind() else {
+        return None;
+    };
+    if branches.len() < 2 {
+        return None;
+    }
+    let mut total_bytes = 0_usize;
+    for branch in branches {
+        let HirKind::Literal(literal) = branch.kind() else {
+            return None;
+        };
+        if literal.0.is_empty() {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(literal.0.len())?;
+    }
+    if branches.len() > max_words || total_bytes > max_bytes {
+        return None;
+    }
+    let branch_work = u64::try_from(branches.len()).ok()?.checked_mul(2)?;
+    let byte_work = u64::try_from(total_bytes).ok()?;
+    let additional_work = branch_work.checked_add(byte_work)?.checked_add(1)?;
+    Some((branches, additional_work))
+}
+
+/// Prefer a borrowed flat-literal table only after the complete incumbent work
+/// is pre-admitted. The canonical materializing extractor remains the fallback
+/// for every value or resource refusal.
+pub(crate) fn extract_authenticated_flat_literal_set_handoff(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+    initial_work: u64,
+    work_limit: u64,
+) -> Result<FlatLiteralSetHandoff<'_>, FiniteOutcome> {
+    let Some((branches, additional_work)) =
+        flat_literal_set_payload_and_work(hir, max_words, max_bytes)
+    else {
+        return Err(extract_authenticated_flat_literal_set(
+            hir,
+            max_words,
+            max_bytes,
+            initial_work,
+            work_limit,
+        ));
+    };
+    if initial_work
+        .checked_add(additional_work)
+        .is_none_or(|work| work > work_limit)
+    {
+        return Err(extract_authenticated_flat_literal_set(
+            hir,
+            max_words,
+            max_bytes,
+            initial_work,
+            work_limit,
+        ));
+    }
+
+    let context = FiniteExtractionContext::new(initial_work, work_limit);
+    let result = (|| -> Result<Vec<&[u8]>, BuildError> {
+        context.charge(1)?;
+        context.charge(u64::try_from(branches.len()).unwrap_or(u64::MAX))?;
+
+        let mut patterns = AccountedVec::new(&context, FiniteStorage::Persistent);
+        patterns.reserve_planner(branches.len(), "flat finite-language borrowed patterns")?;
+        for branch in branches {
+            let HirKind::Literal(literal) = branch.kind() else {
+                unreachable!("flat literal branches were revalidated above");
+            };
+            context.charge(u64::try_from(literal.0.len()).unwrap_or(u64::MAX))?;
+            patterns.push_reserved(literal.0.as_ref())?;
+        }
+        Ok(patterns.into_inner_kept())
+    })();
+
+    match result {
+        Ok(patterns) => {
+            let handoff = FlatLiteralSetHandoff {
+                patterns,
+                receipt: context.close(FiniteExtractionTerminal::Fits),
+            };
+            debug_assert!(handoff.has_closed_receipt());
+            Ok(handoff)
+        }
+        Err(error) => Err(FiniteOutcome::ResourceFailure {
+            error,
+            receipt: context.close(FiniteExtractionTerminal::ResourceFailure),
+        }),
+    }
 }
 
 /// Materialize one independently authenticated flat literal alternation
@@ -4514,6 +4653,115 @@ mod tests {
             actual.initialized_bytes,
             3 * core::mem::size_of::<Vec<u8>>() + 6
         );
+    }
+
+    #[test]
+    fn authenticated_flat_literal_set_handoff_borrows_one_closed_table() {
+        let hir = flat_literal_hir();
+        let incumbent = super::extract_authenticated_flat_literal_set(
+            &hir,
+            3,
+            6,
+            7,
+            u64::MAX,
+        );
+        assert!(incumbent.has_closed_receipt());
+        let incumbent_work = incumbent.work();
+
+        let handoff = super::extract_authenticated_flat_literal_set_handoff(
+            &hir,
+            3,
+            6,
+            7,
+            u64::MAX,
+        )
+        .unwrap_or_else(|_| panic!("eligible flat literal handoff was declined"));
+        assert!(handoff.has_closed_receipt());
+        assert_eq!(handoff.work(), incumbent_work);
+        assert_eq!(handoff.work(), 20);
+        assert_eq!(
+            handoff.patterns(),
+            [b"ab".as_slice(), b"cde".as_slice(), b"f".as_slice()],
+        );
+
+        let actual = handoff.receipt.actual.local;
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.reallocations, 0);
+        assert_eq!(actual.copied_bytes, 0);
+        assert_eq!(
+            actual.initialized_bytes,
+            3 * core::mem::size_of::<&[u8]>(),
+        );
+        assert_eq!(actual.live_scratch_bytes, 0);
+        assert_eq!(actual.released_scratch_bytes, 0);
+        assert_eq!(actual.released_persistent_bytes, 0);
+        assert_eq!(actual.live_persistent_bytes, actual.allocated_bytes);
+        assert_eq!(actual.high_water_bytes, actual.live_persistent_bytes);
+    }
+
+    #[test]
+    fn authenticated_flat_literal_set_handoff_preserves_every_refusal() {
+        let hir = flat_literal_hir();
+        for (max_words, max_bytes, initial_work, work_limit) in [
+            (2, 6, 0, u64::MAX),
+            (3, 5, 0, u64::MAX),
+            (3, 6, 7, 19),
+        ] {
+            let incumbent = super::extract_authenticated_flat_literal_set(
+                &hir,
+                max_words,
+                max_bytes,
+                initial_work,
+                work_limit,
+            );
+            let fallback = super::extract_authenticated_flat_literal_set_handoff(
+                &hir,
+                max_words,
+                max_bytes,
+                initial_work,
+                work_limit,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("refused flat literal handoff unexpectedly succeeded"));
+            assert!(incumbent.has_closed_receipt());
+            assert!(fallback.has_closed_receipt());
+            assert_eq!(fallback.receipt(), incumbent.receipt());
+        }
+
+        let exact = super::extract_authenticated_flat_literal_set_handoff(&hir, 3, 6, 7, 20)
+            .unwrap_or_else(|_| panic!("exact-work flat literal handoff was declined"));
+        assert_eq!(exact.work(), 20);
+
+        let malformed = regex_syntax::hir::Hir::alternation(vec![
+            regex_syntax::hir::Hir::literal(b"too-large".to_vec()),
+            regex_syntax::hir::Hir::empty(),
+        ]);
+        let incumbent = super::extract_authenticated_flat_literal_set(
+            &malformed,
+            1,
+            0,
+            0,
+            u64::MAX,
+        );
+        let fallback = super::extract_authenticated_flat_literal_set_handoff(
+            &malformed,
+            1,
+            0,
+            0,
+            u64::MAX,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("malformed flat literal handoff unexpectedly succeeded"));
+        assert!(matches!(
+            &fallback,
+            FiniteOutcome::ResourceFailure {
+                error: BuildError::InternalInvariant(
+                    "flat literal-set receipt reached a non-literal branch"
+                ),
+                ..
+            }
+        ));
+        assert_eq!(fallback.receipt(), incumbent.receipt());
     }
 
     #[test]
