@@ -4188,6 +4188,46 @@ mod tests {
     }
 
     #[test]
+    fn helper_backed_uniform_capture_jobs_select_closed_v15_count_children() {
+        let pattern = br"\b(?:([\w&&\p{Cyrillic}]{6})|([\w&&\p{Cyrillic}]{5}))\b";
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model in ["count-captures", "grep-captures"] {
+            let mut benchmark = Benchmark::parse(&fixture(model, pattern, b"words"))
+                .expect("helper-backed uniform capture fixture");
+            benchmark.unicode = true;
+            let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
+                .expect("operation-only uniform capture reducer");
+            let selected = disposition
+                .selected()
+                .expect("uniform fixture proves one multiplier");
+            selected.authenticate().expect("operation-only reducer seal");
+            let compiled = selected.compiled();
+            let module = compiled.module();
+            assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+            );
+            assert_eq!(
+                module.required_prepare_capabilities(),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            );
+            assert_eq!(module.prepared_bulk_strategy(), None);
+            assert_eq!(module.prepared_entry_symbol(), None);
+            assert_eq!(module.prepared_span_fill_symbol(), None);
+            assert!(module.required_runtime_symbols().next().is_none());
+            assert_eq!(module.prepared_count_symbol(), Some(module.entry_symbol()));
+            assert_ne!(selected.reducer_symbol(), module.entry_symbol());
+        }
+    }
+
+    #[test]
     fn nonuniform_capture_job_declines_before_adapter_selection() {
         let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab b"))
             .expect("nonuniform capture fixture");
@@ -4611,7 +4651,7 @@ mod tests {
     }
 
     #[test]
-    fn uniform_capture_runtime_dependency_selects_exact_prepared_span_fill() {
+    fn legacy_uniform_capture_bridge_still_selects_exact_prepared_span_fill() {
         let pattern = br"\b(?:([\w&&\p{Cyrillic}]{6})|([\w&&\p{Cyrillic}]{5}))\b";
         let mut benchmark = Benchmark::parse(&fixture("count-captures", pattern, b"words"))
             .expect("prepared uniform-capture fixture");
@@ -4624,9 +4664,9 @@ mod tests {
         .expect("host target");
         let UniformCaptureBridgeDisposition::Prepared(bridge) =
             try_compile_uniform_capture_bridge(&benchmark, target)
-                .expect("typed runtime dependency selects prepared route")
+                .expect("legacy bridge selects its prepared compatibility route")
         else {
-            panic!("uniform runtime dependency did not select prepared SpanFill");
+            panic!("legacy uniform bridge did not select prepared SpanFill");
         };
         bridge
             .receipt

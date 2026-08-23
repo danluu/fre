@@ -1,8 +1,10 @@
 use fre_aot_regex::{
-    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, Target, UniformCaptureCompileRequest,
-    UniformCaptureReducerCompileDisposition, UniformCaptureReducerDomain,
-    UniformCaptureReducerOperation, compile_uniform_capture_reducer,
+    CompileError, CompileResource, EntryAbi, ObjectError, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, SlowAotLimits,
+    Target, UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileError,
+    UniformCaptureReducerCompileDisposition, UniformCaptureReducerCompileError,
+    UniformCaptureReducerDomain, UniformCaptureReducerOperation,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
 };
 use fre_lower::UniformCaptureParticipationDecline;
 use fre_syntax::{
@@ -73,7 +75,14 @@ fn direct_uniform_capture_reducers_are_one_authenticated_native_operation_cross_
                 selected.compiled().module().prepared_aggregate_exports(),
                 PreparedAggregateExports::COUNT,
             );
-            assert!(selected.compiled().module().prepared_count_symbol().is_some());
+            let count = selected
+                .compiled()
+                .module()
+                .prepared_count_symbol()
+                .expect("direct uniform capture Count child");
+            assert_ne!(count, selected.compiled().module().entry_symbol());
+            assert_ne!(count, selected.reducer_symbol());
+            assert_eq!(selected.compiled().receipt().entry_abi, EntryAbi::SpanSearchV1);
             assert_eq!(selected.compiled().module().prepared_span_sum_symbol(), None);
             assert_eq!(selected.compiled().module().prepared_grep_count_symbol(), None);
             assert_eq!(selected.compiled().module().prepared_bulk_strategy(), None);
@@ -82,7 +91,7 @@ fn direct_uniform_capture_reducers_are_one_authenticated_native_operation_cross_
 }
 
 #[test]
-fn runtime_backed_ordinary_selector_upgrades_only_to_exact_prepared_v15() {
+fn runtime_backed_ordinary_selector_upgrades_to_closed_operation_only_v15() {
     let parsed = parse_rebar(PUBLIC_PREPARED_FIXTURE);
     for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
         let disposition = compile_uniform_capture_reducer(
@@ -108,7 +117,97 @@ fn runtime_backed_ordinary_selector_upgrades_only_to_exact_prepared_v15() {
         );
         assert_eq!(
             selected.compiled().module().prepared_bulk_strategy(),
+            None,
+        );
+        let compiled = selected.compiled();
+        let module = compiled.module();
+        let count = module
+            .prepared_count_symbol()
+            .expect("operation-only uniform capture Count child");
+        assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+        assert_eq!(count, module.entry_symbol());
+        assert_ne!(count, selected.reducer_symbol());
+        assert_eq!(module.prepared_entry_symbol(), None);
+        assert_eq!(module.prepared_span_fill_symbol(), None);
+        assert!(module.required_runtime_symbols().next().is_none());
+        assert!(module.required_runtime_program().is_some());
+        assert!(!compiled.receipt().runtime_helper_required);
+        let global_functions = module
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.binding == fre_aot_regex::SymbolBinding::Global
+                    && symbol.kind == fre_aot_regex::SymbolKind::Function
+                    && symbol.section.is_some()
+            })
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(global_functions, [count, selected.reducer_symbol()]);
+    }
+}
+
+#[test]
+fn typed_native_data_decline_resumes_the_legacy_span_fill_compiler() {
+    let parsed = parse_rebar(PUBLIC_PREPARED_FIXTURE);
+    let mut slow_limits = SlowAotLimits::default();
+    slow_limits.max_native_data_bytes = 0;
+    let error = compile_uniform_capture_reducer(
+        &parsed,
+        request(PUBLIC_PREPARED_FIXTURE.len(), Target::x86_64_linux())
+            .selector_slow_aot_limits(slow_limits),
+        UniformCaptureReducerOperation::CountCaptures,
+    )
+    .expect_err("zero native-data cap must refuse both V15 representations");
+    assert!(matches!(
+        error,
+        UniformCaptureReducerCompileError::Prepared(
+            UniformCapturePreparedSpanFillCompileError::Selector(CompileError::Object(
+                ObjectError::Resource {
+                    resource: CompileResource::ProgramBytes,
+                    limit: 0,
+                    required,
+                }
+            ))
+        ) if required > 0
+    ));
+}
+
+#[test]
+fn legacy_uniform_capture_compatibility_compiler_remains_exact_span_fill_v15() {
+    let parsed = parse_rebar(PUBLIC_PREPARED_FIXTURE);
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let selected = compile_uniform_capture_prepared_span_fill_selector(
+            &parsed,
+            request(PUBLIC_PREPARED_FIXTURE.len(), target),
+        )
+        .unwrap_or_else(|error| panic!("legacy SpanFill compile failed for {target:?}: {error}"))
+        .into_selected()
+        .unwrap_or_else(|| panic!("positive legacy fixture declined for {target:?}"));
+        selected
+            .authenticate()
+            .unwrap_or_else(|error| panic!("legacy SpanFill receipt failed: {error}"));
+        let compiled = selected.selector();
+        let module = compiled.module();
+        assert_eq!(compiled.receipt().entry_abi, EntryAbi::SpanSearchV1);
+        assert_eq!(
+            module.prepared_bulk_strategy(),
             Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+        );
+        assert_eq!(
+            module.required_prepare_capabilities(),
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
+        assert!(module.prepared_entry_symbol().is_some());
+        assert!(module.prepared_span_fill_symbol().is_some());
+        assert_eq!(module.prepared_aggregate_exports(), PreparedAggregateExports::NONE);
+        assert!(module.prepared_count_symbol().is_none());
+        assert_eq!(
+            module.required_runtime_symbols().collect::<Vec<_>>(),
+            [
+                "fre_aot_regex_runtime_search_v1",
+                "fre_aot_regex_runtime_search_exclusive_v1",
+                "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+            ],
         );
     }
 }

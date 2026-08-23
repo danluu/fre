@@ -1260,10 +1260,13 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         raise CensusError("Exists search ABI is attached to another scalar route")
     if fields["entry_abi"] == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
         fields.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
-        and fields.get("model") in {"count", "count-spans"}
+        and fields.get("model") in {
+            "count", "count-spans", "count-captures", "grep-captures",
+        }
         and (
             fields.get("shared_ordered_many") == "true"
             or fields.get("model") == "count"
+            or fields.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
             or fields.get("span_iteration_strategy")
             == NATIVE_SPAN_SUM_ITERATION_STRATEGY
         )
@@ -1626,9 +1629,10 @@ def scalar_native_uniform_capture_proof(
         grep_iteration = "linked-native-uniform-capture-reducer-v1"
     else:
         raise CensusError("uniform-capture reducer has a non-capture model")
+    entry_abi = fields.get("entry_abi")
+    operation_only = entry_abi == PREPARED_SCALAR_REDUCE_ENTRY_ABI
     if (
         fields.get("adapter") != adapter
-        or fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or fields.get("span_iteration_strategy") != "not-applicable"
         or fields.get("grep_iteration_strategy") != grep_iteration
         or fields.get("prepare_operation_flags")
@@ -1639,7 +1643,12 @@ def scalar_native_uniform_capture_proof(
     program = fields["program_symbol"]
     reducer = fields["reducer_symbol"]
     entry_identity = symbol_identity_suffix(
-        entry, NATIVE_SEARCH_ENTRY_SYMBOL, "uniform capture entry"
+        entry,
+        NATIVE_COUNT_ENTRY_SYMBOL if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        (
+            "operation-only uniform capture Count child"
+            if operation_only else "uniform capture search child"
+        ),
     )
     program_identity = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, "uniform capture program"
@@ -1654,7 +1663,8 @@ def scalar_native_uniform_capture_proof(
     runtime_symbols = sorted(filter(None, fields["required_runtime_symbols"].split(",")))
     if direct:
         if (
-            fields.get("boundary") != "single-call-native-uniform-capture-reducer"
+            entry_abi != SPAN_SEARCH_ENTRY_ABI
+            or fields.get("boundary") != "single-call-native-uniform-capture-reducer"
             or fields.get("prepare_config_version") != "2"
             or fields.get("required_prepare_capabilities") != f"{0:016x}"
             or fields.get("prepared_bulk_strategy") != "None"
@@ -1669,6 +1679,30 @@ def scalar_native_uniform_capture_proof(
             raise CensusError("helper-free uniform-capture reducer route differs")
         route_variant = "direct-v1"
         span_fill_identity = None
+    elif ordered and operation_only:
+        if (
+            fields.get("boundary") != "single-call-native-uniform-capture-reducer"
+            or fields.get("engine") != "OrderedNfa"
+            or fields.get("prepare_config_version")
+            != str(PREPARED_V15_CONFIG_VERSION)
+            or fields.get("required_prepare_capabilities")
+            != f"{PREPARED_V15_CAPABILITY:016x}"
+            or fields.get("prepared_bulk_strategy") != "None"
+            or fields.get("span_fill_symbol") != ""
+            or runtime_symbols
+            or fields.get("max_handle_bytes") != str(PREPARED_V15_MAX_HANDLE_BYTES)
+            or fields.get("max_ordered_nfa_scratch_bytes")
+            != str(PREPARED_V15_MAX_SCRATCH_BYTES)
+            or fields.get("max_ordered_nfa_setup_work")
+            != str(PREPARED_V15_MAX_SETUP_WORK)
+            or fields.get("max_start_filter_setup_work") != "100000000"
+            or fields.get("max_grep_count_workspace_bytes") != "67108864"
+            or entry_identity != program_identity
+            or reducer_identity == entry_identity
+        ):
+            raise CensusError("operation-only uniform-capture V15 route differs")
+        route_variant = "ordered-v15-operation-only"
+        span_fill_identity = None
     elif ordered:
         span_fill_identity = symbol_identity_suffix(
             fields["span_fill_symbol"],
@@ -1676,7 +1710,8 @@ def scalar_native_uniform_capture_proof(
             "uniform capture SpanFill entry",
         )
         if (
-            fields.get("boundary")
+            entry_abi != SPAN_SEARCH_ENTRY_ABI
+            or fields.get("boundary")
             != "single-call-native-uniform-capture-helper-backed-reducer"
             or fields.get("engine") != "OrderedNfa"
             or fields.get("prepare_config_version")
@@ -5596,13 +5631,19 @@ def validate_normalized_uniform_capture_reducer(
     reducer = provenance.get("reducer_symbol")
     if not all(isinstance(value, str) for value in (entry, program, reducer)):
         raise CensusError(f"{context} uniform-capture symbols are malformed")
-    entry_identity = symbol_identity_suffix(entry, NATIVE_SEARCH_ENTRY_SYMBOL, context)
+    operation_only = proof.get("route_variant") == "ordered-v15-operation-only"
+    entry_identity = symbol_identity_suffix(
+        entry,
+        NATIVE_COUNT_ENTRY_SYMBOL if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        context,
+    )
     program_identity = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context
     )
     reducer_identity = symbol_identity_suffix(reducer, reducer_pattern, context)
     direct = proof.get("route_variant") == "direct-v1"
     ordered = proof.get("route_variant") == "ordered-v15"
+    operation_only = proof.get("route_variant") == "ordered-v15-operation-only"
     if direct:
         expected = {
             "boundary": "single-call-native-uniform-capture-reducer",
@@ -5617,6 +5658,23 @@ def validate_normalized_uniform_capture_reducer(
             "max_setup_work": 0,
             "span_fill_identity_sha256": None,
         }
+    elif operation_only:
+        expected = {
+            "entry_abi": PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+            "boundary": "single-call-native-uniform-capture-reducer",
+            "aggregate_strategy": "Some(NativeOrderedNfaFused)",
+            "prepared_bulk_strategy": "None",
+            "required_runtime_symbols": [],
+            "span_fill_symbol": "",
+            "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
+            "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
+            "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
+            "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
+            "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
+            "span_fill_identity_sha256": None,
+        }
+        if provenance.get("engine") != "OrderedNfa":
+            raise CensusError(f"{context} uniform-capture operation-only engine differs")
     elif ordered:
         span_fill = provenance.get("span_fill_symbol")
         if not isinstance(span_fill, str):
@@ -5645,7 +5703,8 @@ def validate_normalized_uniform_capture_reducer(
         raise CensusError(f"{context} uniform-capture route variant differs")
     if (
         provenance.get("adapter") != adapter
-        or provenance.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
+        or provenance.get("entry_abi")
+        != expected.get("entry_abi", SPAN_SEARCH_ENTRY_ABI)
         or provenance.get("boundary") != expected["boundary"]
         or provenance.get("aggregate_strategy") != expected["aggregate_strategy"]
         or provenance.get("prepared_bulk_strategy")
@@ -5673,6 +5732,8 @@ def validate_normalized_uniform_capture_reducer(
         or isinstance(proof.get("runtime_program_len"), bool)
         or not 1 <= proof["runtime_program_len"] <= MAX_SERIALIZED_PROGRAM_BYTES
         or len({entry, program, reducer}) != 3
+        or (operation_only and entry_identity != program_identity)
+        or (operation_only and reducer_identity == entry_identity)
     ):
         raise CensusError(f"{context} uniform-capture route differs")
 
@@ -6374,10 +6435,13 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             raise CensusError(f"{context} Exists search ABI is attached to another route")
         if provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
             provenance.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
-            and provenance.get("model") in {"count", "count-spans"}
+            and provenance.get("model") in {
+                "count", "count-spans", "count-captures", "grep-captures",
+            }
             and (
                 provenance.get("kind") == "shared-ordered-many-v2"
                 or provenance.get("model") == "count"
+                or provenance.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
                 or provenance.get("span_iteration_strategy")
                 == NATIVE_SPAN_SUM_ITERATION_STRATEGY
             )

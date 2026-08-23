@@ -8039,6 +8039,21 @@ impl CompiledModule {
         let count = self.symbols.get(count_index).ok_or(
             ObjectError::InvalidModule("uniform capture Count symbol index is invalid"),
         )?;
+        let ordered = self.prepared_aggregate_strategy
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+        let operation_only = ordered
+            && self.entry_symbol_index == count_index
+            && self.prepared_bulk_strategy.is_none();
+        if operation_only
+            && (self.prepared_entry_symbol_index.is_some()
+                || self.prepared_span_fill_symbol_index.is_some()
+                || self.required_runtime_symbols().next().is_some()
+                || self.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15)
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture operation-only Count child is not closed",
+            ));
+        }
         let count_offset = usize::try_from(count.offset).map_err(|_| {
             ObjectError::ArithmeticOverflow("uniform capture Count symbol offset")
         })?;
@@ -8347,6 +8362,9 @@ impl CompiledModule {
         }
         let ordered = self.prepared_aggregate_strategy
             == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+        let operation_only = ordered
+            && count_name == self.entry_symbol()
+            && self.prepared_bulk_strategy.is_none();
         let external = self
             .relocations
             .iter()
@@ -8362,13 +8380,33 @@ impl CompiledModule {
                     .map(|symbol| symbol.name.as_str())
             })
             .collect::<Vec<_>>();
-        let expected_external = if ordered {
+        let expected_external = if ordered && !operation_only {
             vec![PREPARED_COUNT_RUNTIME_SYMBOL_NAME]
         } else {
             Vec::new()
         };
+        let operation_only_global_functions_are_exact = !operation_only
+            || {
+                let mut functions = self.symbols.iter().filter(|symbol| {
+                    symbol.binding == SymbolBinding::Global
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.section.is_some()
+                });
+                functions.next().map(|symbol| symbol.name.as_str()) == Some(count_name)
+                    && functions.next().map(|symbol| symbol.name.as_str()) == Some(reducer_name)
+                    && functions.next().is_none()
+            };
         if external != expected_external
+            || !operation_only_global_functions_are_exact
+            || (operation_only
+                && (self.prepared_entry_symbol_index.is_some()
+                    || self.prepared_span_fill_symbol_index.is_some()
+                    || self.required_runtime_symbols().next().is_some()
+                    || self.required_runtime_program().is_none()
+                    || self.required_prepare_capabilities
+                        != PREPARED_CAPABILITY_ORDERED_NFA_V15))
             || (ordered
+                && !operation_only
                 && (self.prepared_bulk_strategy
                     != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
                     || self.required_prepare_capabilities

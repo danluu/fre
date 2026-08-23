@@ -694,16 +694,37 @@ fn configured_source(
     let native_scalar_reducer =
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
             .expect("compiled native scalar reducer failed build-time authentication");
-    let scalar_operation_only = native_scalar_reducer
+    let native_uniform_capture_operation_only = native_uniform_capture
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
+    let scalar_operation_only = (native_scalar_reducer || native_uniform_capture_operation_only)
+        && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
+    let scalar_entry_symbol = match benchmark.model {
+        shared::Model::SpanSum => compiled.module().prepared_span_sum_symbol(),
+        _ => compiled.module().prepared_count_symbol(),
+    };
     assert_eq!(
         scalar_operation_only,
-        reducer_symbol == Some(entry_symbol)
-            && required_prepare_capabilities
-                == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+        required_prepare_capabilities == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+            && scalar_entry_symbol == Some(entry_symbol)
+            && compiled.module().prepared_bulk_strategy().is_none()
+            && compiled.module().prepared_entry_symbol().is_none()
             && span_fill_symbol.is_none(),
         "scalar operation-only ABI disagrees with the linked symbol topology",
     );
+    if native_uniform_capture_operation_only {
+        let uniform = uniform_capture_reducer_receipt
+            .expect("operation-only uniform capture has no compiler receipt");
+        assert_eq!(
+            uniform.aggregate_strategy(),
+            fre_aot_regex::PreparedAggregateStrategy::NativeOrderedNfaFused
+        );
+        assert_eq!(uniform.required_prepare_capabilities(), required_prepare_capabilities);
+        assert_ne!(reducer_symbol, Some(entry_symbol));
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(!receipt.runtime_helper_required);
+    } else if scalar_operation_only {
+        assert_eq!(reducer_symbol, Some(entry_symbol));
+    }
     let span_iteration_strategy = if native_uniform_capture {
         "not-applicable".to_owned()
     } else if shared_ordered_many && benchmark.model == shared::Model::SpanSum {

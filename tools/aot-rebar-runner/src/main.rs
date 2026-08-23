@@ -2648,15 +2648,25 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         } else {
             "not-applicable"
         };
-        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
-            .ok_or_else(|| "native uniform-capture selector symbol is not canonical".to_owned())?;
-        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
-            .ok_or_else(|| "native uniform-capture program symbol is not canonical".to_owned())?;
-        native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix)
-            .ok_or_else(|| "native uniform-capture reducer symbol is not canonical".to_owned())?;
         let ordered = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
         let direct = linked::AGGREGATE_STRATEGY == "Some(NativeFused)";
+        let operation_only = ordered && linked::ENTRY_ABI == "PreparedScalarReduceV1";
+        let entry_prefix = if operation_only {
+            "fre_aot_regex_count_exclusive_v1_"
+        } else {
+            "fre_aot_regex_search_v1_"
+        };
+        let entry_identity = native_symbol_identity(linked::ENTRY_SYMBOL, entry_prefix)
+            .ok_or_else(|| "native uniform-capture Count/search child is not canonical".to_owned())?;
+        let program_identity = native_symbol_identity(
+            linked::PROGRAM_SYMBOL,
+            "fre_aot_regex_runtime_program_v1_",
+        )
+        .ok_or_else(|| "native uniform-capture program symbol is not canonical".to_owned())?;
+        native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix)
+            .ok_or_else(|| "native uniform-capture reducer symbol is not canonical".to_owned())?;
         let ordered_span_fill_is_canonical = ordered
+            && !operation_only
             && native_symbol_identity(
                 linked::SPAN_FILL_SYMBOL,
                 "fre_aot_regex_fill_spans_exclusive_v1_",
@@ -2674,6 +2684,33 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
+        let direct_route_is_exact = direct
+            && linked::ENTRY_ABI == "SpanSearchV1"
+            && linked::REQUIRED_PREPARE_CAPABILITIES == 0
+            && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V2_VERSION
+            && linked::PREPARED_BULK_STRATEGY == "None"
+            && !linked::HAS_SPAN_FILL
+            && linked::SPAN_FILL_SYMBOL.is_empty()
+            && runtime_symbols.is_empty();
+        let compatibility_v15_is_exact = ordered
+            && !operation_only
+            && linked::ENTRY_ABI == "SpanSearchV1"
+            && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
+            && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
+            && linked::ENGINE == "OrderedNfa"
+            && linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)"
+            && linked::HAS_SPAN_FILL
+            && ordered_span_fill_is_canonical
+            && runtime_symbols == expected_ordered_symbols;
+        let operation_only_v15_is_exact = operation_only
+            && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
+            && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
+            && linked::ENGINE == "OrderedNfa"
+            && linked::PREPARED_BULK_STRATEGY == "None"
+            && !linked::HAS_SPAN_FILL
+            && linked::SPAN_FILL_SYMBOL.is_empty()
+            && runtime_symbols.is_empty()
+            && entry_identity == program_identity;
         if benchmark.patterns.len() != 1
             || linked::ADAPTER != expected_adapter
             || linked::NATIVE_SCALAR_REDUCER
@@ -2710,22 +2747,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
                 != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
             || linked::REDUCER_SYMBOL == linked::ENTRY_SYMBOL
             || linked::REDUCER_SYMBOL == linked::PROGRAM_SYMBOL
-            || (direct
-                && (linked::REQUIRED_PREPARE_CAPABILITIES != 0
-                    || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V2_VERSION
-                    || linked::PREPARED_BULK_STRATEGY != "None"
-                    || linked::HAS_SPAN_FILL
-                    || !linked::SPAN_FILL_SYMBOL.is_empty()
-                    || !runtime_symbols.is_empty()))
-            || (ordered
-                && (linked::REQUIRED_PREPARE_CAPABILITIES != PREPARE_CAPABILITY_ORDERED_NFA_V15
-                    || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION
-                    || linked::ENGINE != "OrderedNfa"
-                    || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
-                    || !linked::HAS_SPAN_FILL
-                    || !ordered_span_fill_is_canonical
-                    || runtime_symbols != expected_ordered_symbols))
-            || !(direct || ordered)
+            || (!direct_route_is_exact
+                && !compatibility_v15_is_exact
+                && !operation_only_v15_is_exact)
         {
             return Err(
                 "native uniform-capture reducer identity closure is inconsistent".to_owned(),
@@ -2827,13 +2851,18 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     let ordered_nfa_route = linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)";
     let ordered_nfa_required =
         linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15;
-    let ordered_nfa_scalar_operation = linked::NATIVE_SCALAR_REDUCER
+    let ordered_nfa_scalar_operation = (linked::NATIVE_SCALAR_REDUCER
+        || native_uniform_capture)
         && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
         && linked::ENTRY_ABI == "PreparedScalarReduceV1"
         && linked::PREPARED_BULK_STRATEGY == "None"
         && !linked::HAS_SPAN_FILL
         && linked::SPAN_FILL_SYMBOL.is_empty()
-        && linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
+        && if native_uniform_capture {
+            linked::ENTRY_SYMBOL != linked::REDUCER_SYMBOL
+        } else {
+            linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
+        }
         && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty();
     if linked::REQUIRED_PREPARE_CAPABILITIES & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0
         || (ordered_nfa_route || ordered_nfa_scalar_operation) != ordered_nfa_required

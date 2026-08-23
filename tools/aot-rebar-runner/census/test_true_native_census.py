@@ -521,7 +521,10 @@ def scalar_native_reducer_provenance_fields(
 
 def native_uniform_capture_provenance_fields(
     model: str = "grep-captures", ordered: bool = False,
+    operation_only: bool = False,
 ) -> dict[str, str]:
+    if operation_only and not ordered:
+        raise AssertionError("operation-only uniform capture requires Ordered-NFA V15")
     fields = prepared_scalar_grep_provenance_fields()
     entry_identity = "d" * 64
     program_identity = "e" * 64
@@ -540,6 +543,8 @@ def native_uniform_capture_provenance_fields(
         grep_iteration = "linked-native-uniform-capture-reducer-v1"
     else:
         raise AssertionError(f"unsupported synthetic capture model {model!r}")
+    if operation_only:
+        entry_identity = program_identity
     fields.update({
         "adapter": adapter,
         "model": model,
@@ -549,7 +554,8 @@ def native_uniform_capture_provenance_fields(
             "Some(NativeOrderedNfaFused)" if ordered else "Some(NativeFused)"
         ),
         "prepared_bulk_strategy": (
-            "Some(NativeOrderedNfaLoop)" if ordered else "None"
+            "Some(NativeOrderedNfaLoop)"
+            if ordered and not operation_only else "None"
         ),
         "span_iteration_strategy": "not-applicable",
         "grep_iteration_strategy": grep_iteration,
@@ -574,19 +580,28 @@ def native_uniform_capture_provenance_fields(
             f"fre_aot_regex_runtime_program_v1_{program_identity}"
         ),
         "program_len": "512",
-        "entry_symbol": f"fre_aot_regex_search_v1_{entry_identity}",
+        "entry_symbol": (
+            f"fre_aot_regex_count_exclusive_v1_{entry_identity}"
+            if operation_only
+            else f"fre_aot_regex_search_v1_{entry_identity}"
+        ),
+        "entry_abi": (
+            CENSUS.PREPARED_SCALAR_REDUCE_ENTRY_ABI
+            if operation_only else CENSUS.SPAN_SEARCH_ENTRY_ABI
+        ),
         "reducer_symbol": reducer,
         "span_fill_symbol": (
             f"fre_aot_regex_fill_spans_exclusive_v1_{entry_identity}"
-            if ordered else ""
+            if ordered and not operation_only else ""
         ),
         "required_runtime_symbols": (
             ",".join(CENSUS.PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS)
-            if ordered else ""
+            if ordered and not operation_only else ""
         ),
         "boundary": (
             "single-call-native-uniform-capture-helper-backed-reducer"
-            if ordered else "single-call-native-uniform-capture-reducer"
+            if ordered and not operation_only
+            else "single-call-native-uniform-capture-reducer"
         ),
     })
     return fields
@@ -1487,6 +1502,12 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(
             proof["properties"]["capture_resolution"]["const"],
             "static-uniform-multiplier",
+        )
+        reducer_proof = definitions["uniformCaptureReducerProvenance"]
+        self.assertFalse(reducer_proof["additionalProperties"])
+        self.assertEqual(
+            reducer_proof["properties"]["route_variant"]["enum"],
+            ["direct-v1", "ordered-v15", "ordered-v15-operation-only"],
         )
         strict = definitions["strictCaptureProvenance"]
         self.assertFalse(strict["additionalProperties"])
@@ -2450,10 +2471,12 @@ class TrueNativeCensusTests(unittest.TestCase):
 
     def test_native_uniform_capture_closes_single_call_route(self) -> None:
         for model in ("count-captures", "grep-captures"):
-            for ordered in (False, True):
-                with self.subTest(model=model, ordered=ordered):
+            for ordered, operation_only in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    model=model, ordered=ordered, operation_only=operation_only
+                ):
                     fields = native_uniform_capture_provenance_fields(
-                        model, ordered
+                        model, ordered, operation_only
                     )
                     parsed = CENSUS.parse_provenance(
                         " ".join(
@@ -2466,13 +2489,15 @@ class TrueNativeCensusTests(unittest.TestCase):
                     )
                     route = (
                         "linked-native-uniform-capture-helper-backed-reducer"
-                        if ordered
+                        if ordered and not operation_only
                         else "linked-native-uniform-capture-reducer"
                     )
                     self.assertEqual(receipt["kind"], "scalar-v2")
                     self.assertEqual(
                         receipt["uniform_capture"]["route_variant"],
-                        "ordered-v15" if ordered else "direct-v1",
+                        "ordered-v15-operation-only"
+                        if operation_only
+                        else "ordered-v15" if ordered else "direct-v1",
                     )
                     self.assertEqual(
                         CENSUS.selected_operation_entries(parsed),
@@ -2485,7 +2510,7 @@ class TrueNativeCensusTests(unittest.TestCase):
                     identity_symbols = [
                         fields["entry_symbol"], fields["program_symbol"]
                     ]
-                    if ordered:
+                    if ordered and not operation_only:
                         identity_symbols.append(fields["span_fill_symbol"])
                     self.assertEqual(
                         CENSUS.identity_defined_symbols_from_provenance(receipt),

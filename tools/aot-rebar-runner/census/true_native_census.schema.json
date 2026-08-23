@@ -560,6 +560,64 @@
         }
       }
     },
+    "uniformCaptureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256"
+      ],
+      "properties": {
+        "route_variant": {
+          "enum": ["direct-v1", "ordered-v15", "ordered-v15-operation-only"]
+        },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
+        "prepare_operation_flags": { "const": 2 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "entry_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "program_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "span_fill_identity_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "direct-v1" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
+    },
     "strictCaptureProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -1045,6 +1103,7 @@
         "uniform_capture": {
           "anyOf": [
             { "$ref": "#/$defs/uniformCaptureProvenance" },
+            { "$ref": "#/$defs/uniformCaptureReducerProvenance" },
             { "type": "null" }
           ]
         },

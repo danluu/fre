@@ -103,6 +103,14 @@ A Span-fill entry used by the Rust adapter still leaves refill, validation, and
 reduction in Rust. Unknown, mixed, or mismatched scalar reducer envelopes are
 rejected rather than inferred native.
 
+Single-source uniform CountCaptures and GrepCaptures use the same distinction.
+Their `PreparedScalarReduceV1` form is strict only when COUNT is the entry, the
+multiplier wrapper is a distinct operation symbol, bulk/SpanFill/prepared entry
+and runtime symbols are absent, and the exact V15 capability and caps are
+sealed. A typed unsupported, native-data, or object-byte decline may retain the
+legacy prepared-SpanFill compatibility form; no compiler or authentication
+error authorizes that fallback.
+
 Shared ordered-many Count and SpanSum use the same ABI distinction. A
 `PreparedScalarReduceV1` receipt is strict only when `bulk=None`, the entry is
 exactly the reducer, the runtime-symbol and SpanFill surfaces are empty, and

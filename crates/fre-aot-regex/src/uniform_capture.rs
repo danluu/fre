@@ -20,10 +20,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, CompileLimitsV1, CompileMode, CompileReceipt, CompiledModule, CompiledProgram,
-    CompiledRegex, EngineKind, ObjectFormat, OutputContract,
+    CompiledRegex, EngineKind, EntryAbi, ObjectFormat, OutputContract,
     PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, SectionKind, SlowAotLimits, SymbolBinding, SymbolKind, Target,
-    emit_object, rust_profile_compiled_size_limit,
+    PreparedBulkStrategy, PreparedOrderedNfaV15CompileDecline,
+    PreparedOrderedNfaV15CompileDisposition, SectionKind, SlowAotLimits, SymbolBinding, SymbolKind,
+    Target, emit_object, rust_profile_compiled_size_limit,
     set_rust_profile_compiled_size_limit,
 };
 
@@ -1151,6 +1152,37 @@ impl UniformCaptureReducerCompileReceipt {
         }
         let ordered = self.aggregate_strategy
             == PreparedAggregateStrategy::NativeOrderedNfaFused;
+        let operation_only = ordered && compiler.entry_abi == EntryAbi::PreparedScalarReduceV1;
+        let aggregate_route_is_exact = if operation_only {
+            !compiler.runtime_helper_required
+                && module.prepared_bulk_strategy().is_none()
+                && module.prepared_entry_symbol().is_none()
+                && module.prepared_span_fill_symbol().is_none()
+                && module.required_runtime_symbols().next().is_none()
+                && self.required_prepare_capabilities
+                    == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        } else if ordered {
+            compiler.entry_abi == EntryAbi::SpanSearchV1
+                && compiler.runtime_helper_required
+                && module.prepared_bulk_strategy()
+                    == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                && module.prepared_entry_symbol().is_some()
+                && module.prepared_span_fill_symbol().is_some()
+                && has_exact_runtime_symbol_closure(
+                    module,
+                    &ORDERED_NFA_UNIFORM_COUNT_COMPATIBILITY_RUNTIME_SYMBOLS,
+                )
+                && self.required_prepare_capabilities
+                    == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        } else {
+            compiler.entry_abi == EntryAbi::SpanSearchV1
+                && !compiler.runtime_helper_required
+                && module.prepared_bulk_strategy().is_none()
+                && module.prepared_entry_symbol().is_none()
+                && module.prepared_span_fill_symbol().is_none()
+                && module.required_runtime_symbols().next().is_none()
+                && self.required_prepare_capabilities == 0
+        };
         if !matches!(
             self.aggregate_strategy,
             PreparedAggregateStrategy::NativeFused
@@ -1161,15 +1193,11 @@ impl UniformCaptureReducerCompileReceipt {
             || module.prepared_aggregate_strategy() != Some(self.aggregate_strategy)
             || compiler.required_prepare_capabilities != self.required_prepare_capabilities
             || module.required_prepare_capabilities() != self.required_prepare_capabilities
-            || (ordered
-                && (compiler.engine != EngineKind::OrderedNfa
-                    || module.prepared_bulk_strategy()
-                        != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
-                    || self.required_prepare_capabilities
-                        != PREPARED_CAPABILITY_ORDERED_NFA_V15))
-            || (!ordered
-                && (module.prepared_bulk_strategy().is_some()
-                    || self.required_prepare_capabilities != 0))
+            || (ordered && compiler.engine != EngineKind::OrderedNfa)
+            || !aggregate_route_is_exact
+            || module.prepared_span_sum_symbol().is_some()
+            || module.prepared_grep_count_symbol().is_some()
+            || module.required_runtime_program().is_none()
         {
             return Err(UniformCaptureReducerAuthenticationError::AggregateRoute);
         }
@@ -1177,6 +1205,12 @@ impl UniformCaptureReducerCompileReceipt {
             .prepared_count_symbol()
             .ok_or(UniformCaptureReducerAuthenticationError::CountSymbol)?;
         if sha256(count_symbol.as_bytes()) != self.count_symbol_sha256 {
+            return Err(UniformCaptureReducerAuthenticationError::CountSymbol);
+        }
+        if (operation_only && count_symbol != module.entry_symbol())
+            || count_symbol == reducer_symbol
+            || module.entry_symbol() == reducer_symbol
+        {
             return Err(UniformCaptureReducerAuthenticationError::CountSymbol);
         }
         if sha256(reducer_symbol.as_bytes()) != self.reducer_symbol_sha256 {
@@ -1192,6 +1226,22 @@ impl UniformCaptureReducerCompileReceipt {
             )
             .map_err(|_| UniformCaptureReducerAuthenticationError::NativeClosure)
     }
+}
+
+const ORDERED_NFA_UNIFORM_COUNT_COMPATIBILITY_RUNTIME_SYMBOLS: [&str; 4] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+];
+
+fn has_exact_runtime_symbol_closure(module: &CompiledModule, expected: &[&str]) -> bool {
+    module.required_runtime_symbols().count() == expected.len()
+        && expected.iter().all(|expected| {
+            module
+                .required_runtime_symbols()
+                .any(|actual| actual == *expected)
+        })
 }
 
 /// One exact native selector/Count closure and its capture reducer.
@@ -1278,6 +1328,7 @@ impl UniformCaptureReducerCompileDisposition {
 pub enum UniformCaptureReducerCompileError {
     Participation(UniformCaptureParticipationError),
     Ordinary(UniformCaptureCompileError),
+    OperationOnly(CompileError),
     Prepared(UniformCapturePreparedSpanFillCompileError),
     Finalization(CompileError),
     Authentication(UniformCaptureReducerAuthenticationError),
@@ -1288,6 +1339,9 @@ impl fmt::Display for UniformCaptureReducerCompileError {
         match self {
             Self::Participation(source) => source.fmt(formatter),
             Self::Ordinary(source) => source.fmt(formatter),
+            Self::OperationOnly(source) => {
+                write!(formatter, "uniform capture operation-only V15 failed: {source}")
+            }
             Self::Prepared(source) => source.fmt(formatter),
             Self::Finalization(source) => {
                 write!(formatter, "uniform capture reducer finalization failed: {source}")
@@ -1302,6 +1356,7 @@ impl std::error::Error for UniformCaptureReducerCompileError {
         match self {
             Self::Participation(source) => Some(source),
             Self::Ordinary(source) => Some(source),
+            Self::OperationOnly(source) => Some(source),
             Self::Prepared(source) => Some(source),
             Self::Finalization(source) => Some(source),
             Self::Authentication(source) => Some(source),
@@ -1331,7 +1386,7 @@ pub fn compile_uniform_capture_reducer(
     };
     let max_object_bytes = request.selector_limits.max_object_bytes;
     let ordinary = compile_uniform_capture_selector(parsed, request.clone());
-    let (compiled, participation) = match ordinary {
+    let (compiled, participation, count_is_already_appended) = match ordinary {
         Ok(compiled) => {
             compiled
                 .authenticate()
@@ -1356,30 +1411,64 @@ pub fn compile_uniform_capture_reducer(
                         UniformCaptureReducerAuthenticationError::ProofIdentity,
                     )
                 })?;
-            (selector, proof.participation())
+            (selector, proof.participation(), false)
         }
         Err(UniformCaptureCompileError::Authentication(
             UniformCaptureAuthenticationError::RuntimeDependency,
         )) => {
-            let prepared = compile_uniform_capture_prepared_span_fill_selector(parsed, request)
-                .map_err(UniformCaptureReducerCompileError::Prepared)?;
-            let selected = match prepared {
-                UniformCapturePreparedSpanFillCompileDisposition::Selected(selected) => selected,
-                UniformCapturePreparedSpanFillCompileDisposition::Declined(_) => {
-                    return Err(UniformCaptureReducerCompileError::Authentication(
-                        UniformCaptureReducerAuthenticationError::ProofIdentity,
-                    ));
+            let lowered = lower_raw_general(
+                parsed,
+                OperationSemantics::CaptureFree,
+                request.selector_limits.lower,
+            )
+            .map_err(UniformCaptureCompileError::Lower)
+            .map_err(UniformCaptureReducerCompileError::Ordinary)?;
+            if prospective.canonical_capture_annotations() != lowered.stats().erased_captures() {
+                return Err(UniformCaptureReducerCompileError::Authentication(
+                    UniformCaptureReducerAuthenticationError::ProofIdentity,
+                ));
+            }
+            let operation_only =
+                super::compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
+                    request.source_bytes,
+                    lowered.into_plan(),
+                    request.profile.options.line_terminator,
+                    OutputContract::Span,
+                    request.target,
+                    request.mode,
+                    request.selector_limits,
+                    PreparedAggregateExports::COUNT,
+                    request.selector_slow_aot_limits.max_native_data_bytes,
+                );
+            match classify_uniform_capture_operation_only_attempt(operation_only)? {
+                UniformCaptureOperationOnlyAttempt::Compiled(count) => {
+                    authenticate_operation_only_uniform_capture_count(&count)
+                        .map_err(UniformCaptureReducerCompileError::Authentication)?;
+                    (count, prospective, true)
                 }
-            };
-            selected
-                .authenticate()
-                .map_err(|_| {
-                    UniformCaptureReducerCompileError::Authentication(
-                        UniformCaptureReducerAuthenticationError::NativeClosure,
-                    )
-                })?;
-            let (selector, receipt) = selected.into_parts();
-            (selector, receipt.participation())
+                UniformCaptureOperationOnlyAttempt::ResumePreparedSpanFill(_decline) => {
+                    let prepared =
+                        compile_uniform_capture_prepared_span_fill_selector(parsed, request)
+                            .map_err(UniformCaptureReducerCompileError::Prepared)?;
+                    let selected = match prepared {
+                        UniformCapturePreparedSpanFillCompileDisposition::Selected(selected) => {
+                            selected
+                        }
+                        UniformCapturePreparedSpanFillCompileDisposition::Declined(_) => {
+                            return Err(UniformCaptureReducerCompileError::Authentication(
+                                UniformCaptureReducerAuthenticationError::ProofIdentity,
+                            ));
+                        }
+                    };
+                    selected.authenticate().map_err(|_| {
+                        UniformCaptureReducerCompileError::Authentication(
+                            UniformCaptureReducerAuthenticationError::NativeClosure,
+                        )
+                    })?;
+                    let (selector, receipt) = selected.into_parts();
+                    (selector, receipt.participation(), false)
+                }
+            }
         }
         Err(error) => return Err(UniformCaptureReducerCompileError::Ordinary(error)),
     };
@@ -1388,13 +1477,123 @@ pub fn compile_uniform_capture_reducer(
             UniformCaptureReducerAuthenticationError::ProofIdentity,
         ));
     }
-    finalize_uniform_capture_reducer(
-        compiled,
-        participation,
-        operation,
-        max_object_bytes,
-    )
+    if count_is_already_appended {
+        finalize_uniform_capture_reducer_from_count_aggregate(
+            compiled,
+            participation,
+            operation,
+            max_object_bytes,
+        )
+    } else {
+        finalize_uniform_capture_reducer(
+            compiled,
+            participation,
+            operation,
+            max_object_bytes,
+        )
+    }
     .map(UniformCaptureReducerCompileDisposition::Selected)
+}
+
+#[derive(Debug)]
+enum UniformCaptureOperationOnlyAttempt {
+    Compiled(CompiledRegex),
+    ResumePreparedSpanFill(PreparedOrderedNfaV15CompileDecline),
+}
+
+fn classify_uniform_capture_operation_only_attempt(
+    attempt: Result<PreparedOrderedNfaV15CompileDisposition, CompileError>,
+) -> Result<UniformCaptureOperationOnlyAttempt, UniformCaptureReducerCompileError> {
+    match attempt {
+        Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => {
+            Ok(UniformCaptureOperationOnlyAttempt::Compiled(compiled))
+        }
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+            decline @ (PreparedOrderedNfaV15CompileDecline::Unsupported
+            | PreparedOrderedNfaV15CompileDecline::NativeDataBytes { .. }
+            | PreparedOrderedNfaV15CompileDecline::ObjectBytes { .. }),
+        )) => Ok(UniformCaptureOperationOnlyAttempt::ResumePreparedSpanFill(
+            decline,
+        )),
+        Err(error) => Err(UniformCaptureReducerCompileError::OperationOnly(error)),
+    }
+}
+
+#[cfg(test)]
+mod operation_only_fallback_policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_typed_declines_resume_span_fill_and_allocation_is_terminal() {
+        let declines = [
+            PreparedOrderedNfaV15CompileDecline::Unsupported,
+            PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                limit: 7,
+                required: 8,
+            },
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes {
+                limit: 11,
+                required: 12,
+            },
+        ];
+        for decline in declines {
+            let selected = classify_uniform_capture_operation_only_attempt(Ok(
+                PreparedOrderedNfaV15CompileDisposition::Declined(decline),
+            ))
+            .expect("typed operation-only decline");
+            assert!(matches!(
+                selected,
+                UniformCaptureOperationOnlyAttempt::ResumePreparedSpanFill(actual)
+                    if actual == decline
+            ));
+        }
+
+        let terminal = classify_uniform_capture_operation_only_attempt(Err(
+            CompileError::Object(crate::ObjectError::Allocation(
+                "injected uniform-capture operation-only allocation",
+            )),
+        ));
+        assert!(matches!(
+            terminal,
+            Err(UniformCaptureReducerCompileError::OperationOnly(
+                CompileError::Object(crate::ObjectError::Allocation(
+                    "injected uniform-capture operation-only allocation"
+                ))
+            ))
+        ));
+    }
+}
+
+fn authenticate_operation_only_uniform_capture_count(
+    compiled: &CompiledRegex,
+) -> Result<(), UniformCaptureReducerAuthenticationError> {
+    let receipt = compiled.receipt();
+    let module = compiled.module();
+    let count = module
+        .prepared_count_symbol()
+        .ok_or(UniformCaptureReducerAuthenticationError::CountSymbol)?;
+    if receipt.output != OutputContract::Span
+        || receipt.engine != EngineKind::OrderedNfa
+        || receipt.entry_abi != EntryAbi::PreparedScalarReduceV1
+        || receipt.prepared_aggregate_exports != PreparedAggregateExports::COUNT
+        || receipt.prepared_aggregate_strategy
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        || receipt.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || receipt.runtime_helper_required
+        || module.prepared_aggregate_exports() != PreparedAggregateExports::COUNT
+        || module.prepared_aggregate_strategy()
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.prepared_bulk_strategy().is_some()
+        || module.prepared_entry_symbol().is_some()
+        || module.prepared_span_fill_symbol().is_some()
+        || module.required_runtime_symbols().next().is_some()
+        || module.required_runtime_program().is_none()
+        || count != module.entry_symbol()
+    {
+        return Err(UniformCaptureReducerAuthenticationError::AggregateRoute);
+    }
+    Ok(())
 }
 
 fn finalize_uniform_capture_reducer(
@@ -1443,6 +1642,55 @@ fn finalize_uniform_capture_reducer(
         proof_identity,
         max_object_bytes,
     )?;
+    seal_finalized_uniform_capture_reducer(
+        finalized,
+        participation,
+        operation,
+        multiplier,
+        proof_identity,
+    )
+}
+
+fn finalize_uniform_capture_reducer_from_count_aggregate(
+    compiled: CompiledRegex,
+    participation: UniformCaptureParticipationReceipt,
+    operation: UniformCaptureReducerOperation,
+    max_object_bytes: usize,
+) -> Result<CompiledUniformCaptureReducer, UniformCaptureReducerCompileError> {
+    let multiplier = u64::try_from(participation.participating_groups_per_match().get())
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or(UniformCaptureReducerCompileError::Authentication(
+            UniformCaptureReducerAuthenticationError::ProofMultiplier,
+        ))?;
+    let proof_identity = uniform_capture_proof_identity(
+        participation,
+        compiled.program().artifact_identity(),
+    )
+    .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    let finalized = append_native_uniform_capture_reducer_to_count_aggregate(
+        compiled,
+        operation,
+        multiplier,
+        proof_identity,
+        max_object_bytes,
+    )?;
+    seal_finalized_uniform_capture_reducer(
+        finalized,
+        participation,
+        operation,
+        multiplier,
+        proof_identity,
+    )
+}
+
+fn seal_finalized_uniform_capture_reducer(
+    finalized: FinalizedNativeUniformCaptureReducer,
+    participation: UniformCaptureParticipationReceipt,
+    operation: UniformCaptureReducerOperation,
+    multiplier: NonZeroU64,
+    proof_identity: [u8; 32],
+) -> Result<CompiledUniformCaptureReducer, UniformCaptureReducerCompileError> {
     let compiled = finalized.compiled;
     let reducer_symbol = finalized.reducer_symbol;
     let compiler = compiled.receipt();

@@ -138,8 +138,13 @@ timing belongs to a separately named compiler-stage benchmark.
   program/object identities, preparation caps, and dependency surface before
   the call. A helper-free `NativeFused` reducer has no Rust adapter loop and is
   admitted to the strict whole-operation-native census numerator. An ordered
-  V15 reducer also removes the Rust loop, but its declared semantic helpers
-  keep it out of that strict numerator. Typed semantic or exact lower-work
+  V15 operation-only reducer likewise enters that numerator only with
+  `PreparedScalarReduceV1`, one COUNT child equal to the module entry, no bulk,
+  SpanFill, prepared-search, or runtime-symbol surface, the exact V15 caps,
+  and a distinct multiplier wrapper. The compatibility prepared-SpanFill
+  reducer remains available only after a typed V15 unsupported, native-data,
+  or object-byte decline and keeps its declared semantic helpers. Typed
+  semantic or exact lower-work
   decline alone may continue into the pre-existing capture portfolio; parse,
   allocation, emission, authentication, and unrelated resource failures are
   terminal. The independent stock Rust captures oracle remains authoritative
