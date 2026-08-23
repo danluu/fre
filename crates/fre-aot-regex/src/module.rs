@@ -7649,6 +7649,416 @@ impl CompiledModule {
         Ok(self)
     }
 
+    /// Append one compiler-generated uniform-capture whole-operation reducer.
+    ///
+    /// The existing native Count entry is the sole semantic child. The new
+    /// entry either scales its full-haystack result or owns exact LF/CRLF line
+    /// splitting and scales each exhaustive per-line Count. Every local call
+    /// is patched in-object, so the capture entry adds no unresolved edge.
+    pub(crate) fn append_native_uniform_capture_reducer(
+        mut self,
+        domain: NativeUniformCaptureReducerDomain,
+        multiplier: u64,
+        artifact_identity: [u8; 32],
+        proof_identity: [u8; 32],
+    ) -> Result<(Self, String), ObjectError> {
+        if multiplier == 0
+            || self.prepared_aggregate_exports != PreparedAggregateExports::COUNT
+            || !matches!(
+                self.prepared_aggregate_strategy,
+                Some(
+                    PreparedAggregateStrategy::NativeFused
+                        | PreparedAggregateStrategy::NativeOrderedNfaFused
+                )
+            )
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer has no exact native Count child",
+            ));
+        }
+        let count_index = self.prepared_count_symbol_index.ok_or(
+            ObjectError::InvalidModule("uniform capture reducer has no Count symbol"),
+        )?;
+        let count = self.symbols.get(count_index).ok_or(
+            ObjectError::InvalidModule("uniform capture Count symbol index is invalid"),
+        )?;
+        let count_offset = usize::try_from(count.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("uniform capture Count symbol offset")
+        })?;
+        let count_size = usize::try_from(count.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("uniform capture Count symbol size")
+        })?;
+        let count_end = count_offset.checked_add(count_size).ok_or(
+            ObjectError::ArithmeticOverflow("uniform capture Count symbol extent"),
+        )?;
+        if count.binding != SymbolBinding::Global
+            || count.kind != SymbolKind::Function
+            || count.section != Some(TEXT_SECTION)
+            || count_size == 0
+            || count_end > self.sections[TEXT_SECTION].data.len()
+            || !count.name.starts_with(PREPARED_COUNT_SYMBOL_PREFIX)
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture Count child is not a canonical text function",
+            ));
+        }
+        let prefix = domain.symbol_prefix();
+        if self
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name.starts_with(prefix))
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer was appended more than once",
+            ));
+        }
+        let wrapper = match (self.target.architecture, domain) {
+            (Architecture::X86_64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+                lower_x86_64_uniform_capture_count(multiplier)?
+            }
+            (Architecture::X86_64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+                lower_x86_64_uniform_capture_grep(multiplier)?
+            }
+            (Architecture::Aarch64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+                lower_aarch64_uniform_capture_count(multiplier)?
+            }
+            (Architecture::Aarch64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+                lower_aarch64_uniform_capture_grep(multiplier)?
+            }
+        };
+        let architecture = self.target.architecture;
+        let target = self.target;
+        let strategy = self.prepared_aggregate_strategy.ok_or(
+            ObjectError::InvalidModule("uniform capture reducer lost aggregate strategy"),
+        )?;
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        let alignment_mask = match architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let reducer_offset = text
+            .len()
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "uniform capture reducer alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = reducer_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("uniform capture reducer extent"),
+        )?;
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("uniform capture reducer text"))?;
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("uniform capture reducer symbol"))?;
+        match architecture {
+            Architecture::X86_64 => text.resize(reducer_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < reducer_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        for &call in &wrapper.count_call_offsets {
+            let call = reducer_offset.checked_add(call).ok_or(
+                ObjectError::ArithmeticOverflow("uniform capture Count call offset"),
+            )?;
+            match architecture {
+                Architecture::X86_64 => patch_x86_64_local_call(&mut text, call, count_offset)?,
+                Architecture::Aarch64 => patch_aarch64_local_call(&mut text, call, count_offset)?,
+            }
+        }
+        let reducer_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(prefix, "uniform capture reducer symbol prefix")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: offset_u64(reducer_offset, "uniform capture reducer offset")?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("uniform capture reducer size")
+            })?,
+        });
+        let canonical = [(reducer_index, prefix)];
+        let module_digest = prepared_aggregate_module_digest(
+            target,
+            artifact_identity,
+            PreparedAggregateExports::COUNT,
+            strategy,
+            &text,
+            sections[PROGRAM_SECTION].bytes(),
+            &symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"fre-aot-regex/uniform-capture-reducer/v1\0");
+        digest.update([domain.identity_tag()]);
+        digest.update(multiplier.to_le_bytes());
+        digest.update(proof_identity);
+        digest.update(module_digest);
+        let reducer_symbol = identity_symbol(prefix, &digest.finalize())?;
+        symbols[reducer_index].name = reducer_symbol.clone();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        }
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report_v2.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_v2_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
+        }
+        Ok((self, reducer_symbol))
+    }
+
+    /// Recompute the emitted capture wrapper and close its local Count call
+    /// and unresolved-relocation surfaces independently of source spelling.
+    pub(crate) fn authenticate_native_uniform_capture_reducer(
+        &self,
+        domain: NativeUniformCaptureReducerDomain,
+        multiplier: u64,
+        artifact_identity: [u8; 32],
+        proof_identity: [u8; 32],
+        reducer_name: &str,
+    ) -> Result<(), ObjectError> {
+        if multiplier == 0
+            || self.prepared_aggregate_exports != PreparedAggregateExports::COUNT
+            || !matches!(
+                self.prepared_aggregate_strategy,
+                Some(
+                    PreparedAggregateStrategy::NativeFused
+                        | PreparedAggregateStrategy::NativeOrderedNfaFused
+                )
+            )
+            || !reducer_name.starts_with(domain.symbol_prefix())
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer receipt has the wrong operation shape",
+            ));
+        }
+        let count_name = self.prepared_count_symbol().ok_or(
+            ObjectError::InvalidModule("uniform capture reducer lost its Count child"),
+        )?;
+        let unique_function = |name: &str| -> Result<&ModuleSymbol, ObjectError> {
+            let mut matches = self.symbols.iter().filter(|symbol| symbol.name == name);
+            let symbol = matches.next().ok_or(ObjectError::InvalidModule(
+                "uniform capture reducer symbol is absent",
+            ))?;
+            if matches.next().is_some()
+                || symbol.binding != SymbolBinding::Global
+                || symbol.kind != SymbolKind::Function
+                || symbol.section != Some(TEXT_SECTION)
+                || symbol.size == 0
+            {
+                return Err(ObjectError::InvalidModule(
+                    "uniform capture reducer symbol is not one text function",
+                ));
+            }
+            Ok(symbol)
+        };
+        let count = unique_function(count_name)?;
+        let reducer = unique_function(reducer_name)?;
+        let count_start = usize::try_from(count.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("uniform capture Count authentication offset")
+        })?;
+        let count_end = count.offset.checked_add(count.size).ok_or(
+            ObjectError::ArithmeticOverflow("uniform capture Count authentication extent"),
+        )?;
+        let reducer_start = usize::try_from(reducer.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("uniform capture reducer authentication offset")
+        })?;
+        let reducer_size = usize::try_from(reducer.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("uniform capture reducer authentication size")
+        })?;
+        let reducer_end = reducer_start.checked_add(reducer_size).ok_or(
+            ObjectError::ArithmeticOverflow("uniform capture reducer authentication extent"),
+        )?;
+        if count_end > reducer.offset || reducer_end > self.sections[TEXT_SECTION].data.len() {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer overlaps or escapes its Count child",
+            ));
+        }
+        let wrapper = match (self.target.architecture, domain) {
+            (Architecture::X86_64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+                lower_x86_64_uniform_capture_count(multiplier)?
+            }
+            (Architecture::X86_64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+                lower_x86_64_uniform_capture_grep(multiplier)?
+            }
+            (Architecture::Aarch64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+                lower_aarch64_uniform_capture_count(multiplier)?
+            }
+            (Architecture::Aarch64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+                lower_aarch64_uniform_capture_grep(multiplier)?
+            }
+        };
+        if reducer_size != wrapper.code.len()
+            || self.relocations.iter().any(|relocation| {
+                relocation.section == TEXT_SECTION
+                    && relocation.offset >= reducer.offset
+                    && relocation.offset < reducer.offset.saturating_add(reducer.size)
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer code or relocation extent disagrees",
+            ));
+        }
+        let actual = &self.sections[TEXT_SECTION].data[reducer_start..reducer_end];
+        let mut cursor = 0_usize;
+        for &call in &wrapper.count_call_offsets {
+            let call_end = call.checked_add(4).ok_or(ObjectError::ArithmeticOverflow(
+                "uniform capture authentication call extent",
+            ))?;
+            if call < cursor
+                || call_end > actual.len()
+                || actual[cursor..call] != wrapper.code[cursor..call]
+            {
+                return Err(ObjectError::InvalidModule(
+                    "uniform capture reducer bytes disagree before a local call",
+                ));
+            }
+            let target = match self.target.architecture {
+                Architecture::X86_64 => {
+                    let displacement = i32::from_le_bytes(
+                        actual[call..call_end].try_into().map_err(|_| {
+                            ObjectError::InvalidModule("x86 uniform capture call bytes")
+                        })?,
+                    );
+                    i64::try_from(reducer_start)
+                        .ok()
+                        .and_then(|start| start.checked_add(i64::try_from(call_end).ok()?))
+                        .and_then(|source| source.checked_add(i64::from(displacement)))
+                }
+                Architecture::Aarch64 => {
+                    let instruction = u32::from_le_bytes(
+                        actual[call..call_end].try_into().map_err(|_| {
+                            ObjectError::InvalidModule("AArch64 uniform capture call bytes")
+                        })?,
+                    );
+                    if instruction & 0xfc00_0000 != 0x9400_0000 {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 uniform capture call is not BL",
+                        ));
+                    }
+                    let immediate = i32::from_le_bytes(
+                        ((instruction & 0x03ff_ffff) << 6).to_le_bytes(),
+                    ) >> 6;
+                    i64::try_from(reducer_start)
+                        .ok()
+                        .and_then(|start| start.checked_add(i64::try_from(call).ok()?))
+                        .and_then(|source| {
+                            source.checked_add(i64::from(immediate).checked_mul(4)?)
+                        })
+                }
+            };
+            if target != i64::try_from(count_start).ok() {
+                return Err(ObjectError::InvalidModule(
+                    "uniform capture reducer local call escaped Count",
+                ));
+            }
+            cursor = call_end;
+        }
+        if actual[cursor..] != wrapper.code[cursor..] {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer bytes disagree after its local calls",
+            ));
+        }
+        let ordered = self.prepared_aggregate_strategy
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+        let external = self
+            .relocations
+            .iter()
+            .filter(|relocation| {
+                relocation.section == TEXT_SECTION
+                    && relocation.offset >= count.offset
+                    && relocation.offset < count_end
+            })
+            .filter_map(|relocation| {
+                self.symbols
+                    .get(relocation.symbol)
+                    .filter(|symbol| symbol.section.is_none())
+                    .map(|symbol| symbol.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let expected_external = if ordered {
+            vec![PREPARED_COUNT_RUNTIME_SYMBOL_NAME]
+        } else {
+            Vec::new()
+        };
+        if external != expected_external
+            || (ordered
+                && (self.prepared_bulk_strategy
+                    != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                    || self.required_prepare_capabilities
+                        != PREPARED_CAPABILITY_ORDERED_NFA_V15))
+            || (!ordered
+                && (self.prepared_bulk_strategy.is_some()
+                    || self.required_prepare_capabilities != 0))
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer Count closure is not exact",
+            ));
+        }
+        let reducer_index = self
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == reducer_name)
+            .ok_or(ObjectError::InvalidModule(
+                "uniform capture reducer identity symbol is absent",
+            ))?;
+        let canonical = [(reducer_index, domain.symbol_prefix())];
+        let module_digest = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            PreparedAggregateExports::COUNT,
+            self.prepared_aggregate_strategy.ok_or(ObjectError::InvalidModule(
+                "uniform capture reducer identity lost aggregate strategy",
+            ))?,
+            self.sections[TEXT_SECTION].bytes(),
+            self.sections[PROGRAM_SECTION].bytes(),
+            &self.symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"fre-aot-regex/uniform-capture-reducer/v1\0");
+        digest.update([domain.identity_tag()]);
+        digest.update(multiplier.to_le_bytes());
+        digest.update(proof_identity);
+        digest.update(module_digest);
+        if reducer_name != identity_symbol(domain.symbol_prefix(), &digest.finalize())? {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture reducer identity suffix disagrees",
+            ));
+        }
+        Ok(())
+    }
+
     /// Append one authenticated capture bundle and its two additive entries
     /// without changing any existing entry or compiler receipt field.
     pub(crate) fn append_native_capture_exports_v1(
@@ -8405,6 +8815,33 @@ struct NativePreparedBulkWrapper {
     bulk_runtime_fallback_offset: Option<usize>,
     compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeUniformCaptureReducerDomain {
+    WholeHaystack,
+    ByteSliceLines,
+}
+
+impl NativeUniformCaptureReducerDomain {
+    const fn symbol_prefix(self) -> &'static str {
+        match self {
+            Self::WholeHaystack => "fre_aot_regex_count_captures_exclusive_v1_",
+            Self::ByteSliceLines => "fre_aot_regex_grep_captures_exclusive_v1_",
+        }
+    }
+
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::WholeHaystack => 1,
+            Self::ByteSliceLines => 2,
+        }
+    }
+}
+
+struct NativeUniformCaptureReducerWrapper {
+    code: Vec<u8>,
+    count_call_offsets: Box<[usize]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36030,6 +36467,227 @@ fn lower_x86_64_prepared_grep_count(
     })
 }
 
+/// Scale one transactional native Count result by a compiler-proved uniform
+/// participating-group count. The local Count entry remains authoritative for
+/// handle identity, source-domain validation, and exhaustive empty progress.
+fn lower_x86_64_uniform_capture_count(
+    multiplier: u64,
+) -> Result<NativeUniformCaptureReducerWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 24;
+    if multiplier == 0 {
+        return Err(ObjectError::InvalidModule(
+            "uniform capture multiplier is zero",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?; // output alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x08])?; // caller output
+    assembler.instruction(&[0x48, 0x8d, 0x0c, 0x24])?; // private Count output
+    assembler.instruction(&[0xe8])?;
+    let count_call = assembler.label()?;
+    assembler.bind(count_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    let mut load_multiplier = vec![0x49, 0xba]; // movabs multiplier, r10
+    load_multiplier.extend_from_slice(&multiplier.to_le_bytes());
+    assembler.instruction(&load_multiplier)?;
+    assembler.instruction(&[0x49, 0xf7, 0xe2])?; // mul r10 -> rdx:rax
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], overflow)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x89, 0x01])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeUniformCaptureReducerWrapper {
+        count_call_offsets: vec![finished.label_offset(count_call)?].into_boxed_slice(),
+        code: finished.code,
+    })
+}
+
+/// Own exact `ByteSlice::lines` splitting and run exhaustive native Count in
+/// each LF/CRLF line domain. The empty-window preflight authenticates the
+/// handle before this wrapper inspects even one source byte.
+#[allow(
+    clippy::too_many_lines,
+    reason = "preflight, line splitting, checked scaling, and publication form one native leaf"
+)]
+fn lower_x86_64_uniform_capture_grep(
+    multiplier: u64,
+) -> Result<NativeUniformCaptureReducerWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 32;
+    const TOTAL_OFFSET: u8 = 8;
+    const LINE_START_OFFSET: u8 = 16;
+    if multiplier == 0 {
+        return Err(ObjectError::InvalidModule(
+            "uniform capture multiplier is zero",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished_lines = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // handle
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // haystack base
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xcf])?; // caller output
+    assembler.instruction(&[0x4d, 0x31, 0xf6])?; // cursor
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, TOTAL_OFFSET, 0, 0, 0, 0])?;
+
+    // Authenticate through the exact Count operation before source access.
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x8d, 0x0c, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let preflight_call = assembler.label()?;
+    assembler.bind(preflight_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished_lines)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x4c, 0x89, 0x74, 0x24, LINE_START_OFFSET])?;
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x34, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf2])?; // line end before LF
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x43, 0x80, 0x7c, 0x14, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x49, 0x83, 0xea, 0x01])?;
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf2])?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x29, 0xda])?; // line length
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4b, 0x8d, 0x34, 0x1c])?; // line pointer
+    assembler.instruction(&[0x4c, 0x89, 0xd2])?;
+    assembler.instruction(&[0x48, 0x8d, 0x0c, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let line_count_call = assembler.label()?;
+    assembler.bind(line_count_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    let mut load_multiplier = vec![0x49, 0xba];
+    load_multiplier.extend_from_slice(&multiplier.to_le_bytes());
+    assembler.instruction(&load_multiplier)?;
+    assembler.instruction(&[0x49, 0xf7, 0xe2])?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], overflow)?;
+    assembler.instruction(&[0x48, 0x01, 0x44, 0x24, TOTAL_OFFSET])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished_lines)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished_lines)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, TOTAL_OFFSET])?;
+    assembler.instruction(&[0x49, 0x89, 0x07])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeUniformCaptureReducerWrapper {
+        count_call_offsets: vec![
+            finished.label_offset(preflight_call)?,
+            finished.label_offset(line_count_call)?,
+        ]
+        .into_boxed_slice(),
+        code: finished.code,
+    })
+}
+
 fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 48;
     let mut assembler = X86Assembler::new();
@@ -37094,6 +37752,192 @@ fn lower_aarch64_prepared_grep_count(
                 page_offset: offsets[2],
             },
         ),
+    })
+}
+
+fn lower_aarch64_uniform_capture_count(
+    multiplier: u64,
+) -> Result<NativeUniformCaptureReducerWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 32;
+    if multiplier == 0 {
+        return Err(ObjectError::InvalidModule(
+            "uniform capture multiplier is zero",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_mov_x(19, 3)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 31, 0)?)?;
+    let count_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 9, multiplier)?;
+    assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
+    assembler.branch_nonzero_x(10, overflow)?;
+    assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    assembler.instruction(aarch64_store_x(8, 19, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [count_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeUniformCaptureReducerWrapper {
+        code,
+        count_call_offsets: offsets.into(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "preflight, line splitting, checked scaling, and publication form one native leaf"
+)]
+fn lower_aarch64_uniform_capture_grep(
+    multiplier: u64,
+) -> Result<NativeUniformCaptureReducerWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    if multiplier == 0 {
+        return Err(ObjectError::InvalidModule(
+            "uniform capture multiplier is zero",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(25, 0, 0)?)?;
+
+    // Authenticate the Count closure before reading the source line scanner.
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 31, 0)?)?;
+    let preflight_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.branch_zero_x(21, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(24, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 20, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(26, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(26, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(8, 26, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(9, 20, 8)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(26, 26, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(26, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_sub_x_reg(26, 26, 24)?)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_add_x_reg(1, 20, 24)?)?;
+    assembler.instruction(aarch64_mov_x(2, 26)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 31, 0)?)?;
+    let line_count_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 9, multiplier)?;
+    assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
+    assembler.branch_nonzero_x(10, overflow)?;
+    assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    assembler.instruction(aarch64_adds_x_reg(25, 25, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(25, 22, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [preflight_call, line_count_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeUniformCaptureReducerWrapper {
+        code,
+        count_call_offsets: offsets.into(),
     })
 }
 
@@ -46193,6 +47037,15 @@ fn aarch64_add_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, Object
     )
 }
 
+fn aarch64_adds_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xab00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_add_x_lsl(
     destination: u8,
     left: u8,
@@ -46350,6 +47203,13 @@ fn aarch64_msub_x(
 
 fn aarch64_mul_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0x9b00_7c00
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_umulh_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0x9bc0_7c00
         | aarch64_reg(right, 16)?
         | aarch64_reg(left, 5)?
         | aarch64_reg(destination, 0)?)
