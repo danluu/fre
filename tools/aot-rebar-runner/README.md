@@ -216,11 +216,14 @@ the strict whole-operation-native numerator only after the ordinary oracle,
 semantic-helper traps, and selected-entry trap all agree.
 
 If the ordinary optimizer does not publish that exact helper-free reducer, the
-same semantic plan may retain the prepared V15 route. Its one-call reducer
-deliberately retains compatibility semantic helpers, so provenance continues
-to name it `linked-shared-ordered-many-helper-backed-reducer` and the census
-keeps its boundary `semantic-helper-backed`. Typed V15 unsupported and byte-
-limit declines retain the independent-row incumbent; allocation, invariant,
+same semantic plan may select the additive scalar-operation-only V15 route.
+That object has `entry_abi=PreparedScalarReduceV1`: the sole global function is
+the Count or SpanSum reducer, its search and required-capability gate are local,
+and its runtime-function surface is empty. A legacy or wrongly prepared handle
+fails closed instead of entering a compatibility reducer. The older prepared
+V15 search API and its entry/SpanFill/helper topology remain unchanged for row,
+grep, and capture consumers. Typed V15 unsupported and byte-limit declines
+retain the independent-row incumbent byte-for-byte; allocation, invariant,
 emission, semantic-identity, and authentication failures remain terminal. An
 ordinary program/object representation cap may consult that same reported V15
 transaction, whose success, typed decline, or terminal error remains
@@ -257,13 +260,14 @@ helper path.
 
 The `fre.aot.rebar-runner.v2` provenance record separates the compiler's real
 aggregate strategy from the physical `count-spans` iteration route and binds
-`prepare_config_version`, `required_prepare_capabilities`, and every V3 cap.
+`entry_abi`, `prepare_config_version`, `required_prepare_capabilities`, and
+every V3 cap.
 For a V2 object the Ordered-NFA handle, scratch, and setup-work cap fields are
 zero (not applicable). For a required V3 object they are the actual generic
 defaults used to construct the config: 8 MiB whole handle, 8 MiB scratch, and
 2,000,000 setup-work units. `required_runtime_symbols` remains an honest link
-surface: compatibility helpers may be unresolved even though a successfully
-prepared required-V15 benchmark operation cannot invoke them.
+surface. Legacy V15 search objects report their compatibility helpers; a
+scalar-operation-only V15 object must report an empty surface.
 
 The independent Rust oracle is deliberately constructed only after all AOT
 samples so it cannot warm the candidate's first-call path. It is fatal and

@@ -1417,6 +1417,9 @@ fn compile_error_code(error: &CompileError) -> String {
         CompileError::Search(_) => "compile.fault.search",
         CompileError::InvalidWindow { .. } => "compile.fault.invalid-window",
         CompileError::PreparedAggregateRequiresSpan { .. } => "compile.fault.output-contract",
+        CompileError::PreparedScalarOperationRequiresSingleExport { .. } => {
+            "compile.fault.output-contract"
+        }
         CompileError::InternalInvariant(_) => "compile.fault.internal-invariant",
     }
     .to_string()

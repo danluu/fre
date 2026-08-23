@@ -694,6 +694,16 @@ fn configured_source(
     let native_scalar_reducer =
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
             .expect("compiled native scalar reducer failed build-time authentication");
+    let scalar_operation_only = native_scalar_reducer
+        && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
+    assert_eq!(
+        scalar_operation_only,
+        reducer_symbol == Some(entry_symbol)
+            && required_prepare_capabilities
+                == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+            && span_fill_symbol.is_none(),
+        "scalar operation-only ABI disagrees with the linked symbol topology",
+    );
     let span_iteration_strategy = if native_uniform_capture {
         "not-applicable".to_owned()
     } else if shared_ordered_many && benchmark.model == shared::Model::SpanSum {
@@ -795,6 +805,12 @@ fn configured_source(
         source,
         "pub const EXPECTED_MODEL: &str = {:?};",
         benchmark.model.name()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ENTRY_ABI: &str = {:?};",
+        format!("{:?}", receipt.entry_abi),
     )
     .unwrap();
     writeln!(
@@ -1100,10 +1116,12 @@ fn configured_source(
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {program_symbol:?}]").unwrap();
     source.push_str("    static LINKED_PROGRAM_START: u8;\n");
-    writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
-    source.push_str(
-        "    fn LINKED_ENTRY(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
-    );
+    if !scalar_operation_only {
+        writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
+        source.push_str(
+            "    fn LINKED_ENTRY(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
+        );
+    }
     if let Some(reducer_symbol) = reducer_symbol {
         writeln!(source, "    #[link_name = {reducer_symbol:?}]").unwrap();
         source.push_str(
@@ -1129,12 +1147,21 @@ fn configured_source(
             "pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
         );
     }
-    source.push_str(
-        "pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
-    );
-    source.push_str(
-        "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    if row != 0 { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; }\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
-    );
+    if scalar_operation_only {
+        source.push_str(
+            "pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+        );
+        source.push_str(
+            "pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+        );
+    } else {
+        source.push_str(
+            "pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+        );
+        source.push_str(
+            "pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    if row != 0 { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; }\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+        );
+    }
     if span_fill_symbol.is_some() {
         source.push_str(
             "pub unsafe fn fill_spans(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, capacity: usize, written_out: *mut usize) -> u32 {\n    unsafe { LINKED_SPAN_FILL(handle, haystack, haystack_len, state, results, capacity, written_out) }\n}\n",
@@ -1328,6 +1355,7 @@ fn configured_regex_redux_source(
     )
     .unwrap();
     source.push_str("pub const EXPECTED_MODEL: &str = \"regex-redux\";\n");
+    source.push_str("pub const ENTRY_ABI: &str = \"NotApplicable\";\n");
     source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
     source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 2;\n");
     source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
@@ -1630,6 +1658,7 @@ fn configured_participation_capture_source(
         benchmark.model.name()
     )
     .unwrap();
+    source.push_str("pub const ENTRY_ABI: &str = \"NotApplicable\";\n");
     source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
     source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 0;\n");
     source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
@@ -1919,6 +1948,7 @@ fn configured_strict_capture_source(
         benchmark.model.name()
     )
     .unwrap();
+    source.push_str("pub const ENTRY_ABI: &str = \"NotApplicable\";\n");
     source.push_str("pub const PREPARE_OPERATION_FLAGS: u64 = 0;\n");
     source.push_str("pub const PREPARE_CONFIG_VERSION: u32 = 0;\n");
     source.push_str("pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;\n");
@@ -2502,6 +2532,7 @@ fn configured_native_row_source(
         benchmark.model.name()
     )
     .unwrap();
+    source.push_str("pub const ENTRY_ABI: &str = \"NotApplicable\";\n");
     writeln!(source, "pub const PREPARE_OPERATION_FLAGS: u64 = 0;").unwrap();
     writeln!(source, "pub const PREPARE_CONFIG_VERSION: u32 = 0;").unwrap();
     writeln!(source, "pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;").unwrap();
@@ -3149,6 +3180,7 @@ pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = 0;
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
+pub const ENTRY_ABI: &str = "NotApplicable";
 pub const VALIDATION_AUTHORITY: &str = "stock-rust-unsealed-v1";
 pub const EXPECTED_VALUE_SEALED: bool = false;
 pub const EXPECTED_VALUE: u64 = 0;

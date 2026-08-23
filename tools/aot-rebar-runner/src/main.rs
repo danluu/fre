@@ -1824,7 +1824,7 @@ fn print_provenance() {
             "single-call-native-uniform-capture-helper-backed-reducer"
         }
     } else if linked::SHARED_ORDERED_MANY_AGGREGATE
-        && linked::AGGREGATE_STRATEGY == "Some(NativeFused)"
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
     {
         "single-call-shared-ordered-many-helper-free-native-reducer"
     } else if linked::SHARED_ORDERED_MANY_AGGREGATE {
@@ -1833,7 +1833,7 @@ fn print_provenance() {
         "runtime-klv-warmup-schedule"
     };
     println!(
-        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators={required_comparators} {validation_binding}",
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} entry_abi={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators={required_comparators} {validation_binding}",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -1846,6 +1846,7 @@ fn print_provenance() {
         linked::COMPILER_VERSION,
         linked::OPTIMIZER_VERSION,
         linked::ENGINE,
+        linked::ENTRY_ABI,
         linked::AGGREGATE_STRATEGY,
         linked::PREPARED_BULK_STRATEGY,
         linked::SPAN_ITERATION_STRATEGY,
@@ -2699,8 +2700,16 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     let ordered_nfa_route = linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)";
     let ordered_nfa_required =
         linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15;
+    let ordered_nfa_scalar_operation = linked::NATIVE_SCALAR_REDUCER
+        && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
+        && linked::ENTRY_ABI == "PreparedScalarReduceV1"
+        && linked::PREPARED_BULK_STRATEGY == "None"
+        && !linked::HAS_SPAN_FILL
+        && linked::SPAN_FILL_SYMBOL.is_empty()
+        && linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty();
     if linked::REQUIRED_PREPARE_CAPABILITIES & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0
-        || ordered_nfa_route != ordered_nfa_required
+        || (ordered_nfa_route || ordered_nfa_scalar_operation) != ordered_nfa_required
     {
         return Err(
             "linked Ordered-TNFA route disagrees with its required prepare capability".to_owned(),
@@ -2756,6 +2765,7 @@ fn authenticate_linked_direct_native_grep() -> bool {
         return false;
     };
     linked::ADAPTER == "general-aot-linked-native-grep-count-reducer-prepared-v2"
+        && linked::ENTRY_ABI == "ExistsSearchV1"
         && linked::AGGREGATE_STRATEGY == "Some(NativeFused)"
         && linked::GREP_ITERATION_STRATEGY == "linked-native-grep-count-reducer-v1"
         && linked::SPAN_ITERATION_STRATEGY == "not-applicable"
@@ -2800,6 +2810,7 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
     linked::ADAPTER
         == "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
         && linked::ENGINE == "OrderedNfa"
+        && linked::ENTRY_ABI == "SpanSearchV1"
         && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
         && linked::GREP_ITERATION_STRATEGY == "linked-native-grep-count-reducer-v1"
         && linked::SPAN_ITERATION_STRATEGY == "not-applicable"
@@ -2818,19 +2829,15 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
 }
 
 fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Result<(), String> {
-    const COUNT_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
-    const SPAN_SUM_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
-    let (adapter, reducer_prefix, v15_runtime_symbols, span_iteration) = match benchmark.model {
+    let (adapter, reducer_prefix, span_iteration) = match benchmark.model {
         shared::Model::Count => (
             "general-aot-shared-ordered-many-native-count-v1",
             "fre_aot_regex_count_exclusive_v1_",
-            COUNT_RUNTIME_SYMBOLS,
             "not-applicable",
         ),
         shared::Model::SpanSum => (
             "general-aot-shared-ordered-many-native-span-sum-v1",
             "fre_aot_regex_span_sum_exclusive_v1_",
-            SPAN_SUM_RUNTIME_SYMBOLS,
             "linked-shared-ordered-many-native-span-sum-reducer-v1",
         ),
         _ => {
@@ -2866,18 +2873,21 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
         && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V2_VERSION
         && linked::REQUIRED_PREPARE_CAPABILITIES == 0
         && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        && entry_identity.is_some()
+        && entry_identity != reducer_identity
         && native_fused_bulk_shape;
     let prepared_v15 = linked::ENGINE == "OrderedNfa"
         && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
-        && linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)"
+        && linked::ENTRY_ABI == "PreparedScalarReduceV1"
+        && linked::PREPARED_BULK_STRATEGY == "None"
         && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
         && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
-        && linked::HAS_SPAN_FILL
-        && linked::REQUIRED_RUNTIME_SYMBOLS == v15_runtime_symbols
-        && entry_identity.is_some()
-        && entry_identity == prepared_identity
-        && entry_identity == program_identity
-        && entry_identity != reducer_identity;
+        && !linked::HAS_SPAN_FILL
+        && linked::SPAN_FILL_SYMBOL.is_empty()
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        && linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
+        && reducer_identity.is_some()
+        && reducer_identity == program_identity;
     if sources < 2
         || sources > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         || linked::NATIVE_ROW_BRIDGE
@@ -2901,7 +2911,6 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
         || linked::SPAN_ITERATION_STRATEGY != span_iteration
         || linked::GREP_ITERATION_STRATEGY != "not-applicable"
         || reducer_identity.is_none()
-        || entry_identity.is_none()
         || program_identity.is_none()
         || (!helper_free_native_fused && !prepared_v15)
         || linked::ROW_REQUIRED_PREPARE_CAPABILITIES != [0]
@@ -3548,15 +3557,12 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
         shared::Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
         _ => unreachable!("native scalar strategy was restricted to scalar models"),
     };
-    native_symbol_identity(linked::REDUCER_SYMBOL, prefix)
+    let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, prefix)
         .ok_or_else(|| "native scalar reducer has no canonical identity symbol".to_owned())?;
-    native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
+    let program_identity =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
         .ok_or_else(|| "native scalar reducer has no canonical program identity".to_owned())?;
-    let compatibility_helper = match model {
-        shared::Model::Count => "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
-        shared::Model::SpanSum => "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
-        _ => unreachable!("native scalar strategy was restricted to scalar models"),
-    };
+    let ordered_nfa = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
     let aggregate_helpers = linked::REQUIRED_RUNTIME_SYMBOLS
         .split(',')
         .filter(|symbol| {
@@ -3568,7 +3574,7 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
             )
         })
         .collect::<Vec<_>>();
-    if linked::REDUCER_SYMBOL == linked::ENTRY_SYMBOL
+    if (linked::REDUCER_SYMBOL == linked::ENTRY_SYMBOL) != ordered_nfa
         || linked::REDUCER_SYMBOL == linked::PROGRAM_SYMBOL
         || (!linked::SPAN_FILL_SYMBOL.is_empty()
             && linked::REDUCER_SYMBOL == linked::SPAN_FILL_SYMBOL)
@@ -3588,15 +3594,19 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
         );
     }
 
-    let ordered_nfa = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
     if ordered_nfa != (linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15)
         || (ordered_nfa
             && (linked::ENGINE != "OrderedNfa"
-                || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
-                || !linked::HAS_SPAN_FILL
-                || aggregate_helpers != [compatibility_helper]))
+                || linked::ENTRY_ABI != "PreparedScalarReduceV1"
+                || linked::PREPARED_BULK_STRATEGY != "None"
+                || linked::HAS_SPAN_FILL
+                || !linked::SPAN_FILL_SYMBOL.is_empty()
+                || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+                || reducer_identity != program_identity
+                || !aggregate_helpers.is_empty()))
         || (!ordered_nfa
-            && (linked::REQUIRED_PREPARE_CAPABILITIES != 0
+            && (linked::ENTRY_ABI == "PreparedScalarReduceV1"
+                || linked::REQUIRED_PREPARE_CAPABILITIES != 0
                 || !matches!(
                     linked::PREPARED_BULK_STRATEGY,
                     "None" | "Some(NativePreparedLoop)" | "Some(NativeFrozenLoop)"

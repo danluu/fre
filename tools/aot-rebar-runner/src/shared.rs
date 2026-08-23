@@ -7,9 +7,10 @@ use fre_aot_regex::{
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
     compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
-    compile_with_prepared_ordered_nfa_v15_reported, compile_with_slow_aot_limits, Architecture,
-    CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1, CompileMode,
-    CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, FeatureSet,
+    compile_with_prepared_ordered_nfa_v15_reported,
+    compile_with_prepared_ordered_nfa_v15_scalar_operation_reported, compile_with_slow_aot_limits,
+    Architecture, CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1,
+    CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, EntryAbi, FeatureSet,
     NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
     NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1, OperatingSystem,
     OrderedManyAotArtifact, OrderedManyAotCompileDecline, OrderedManyAotCompileDisposition,
@@ -367,10 +368,12 @@ pub const fn is_native_whole_scalar_reducer(
 ///
 /// The aggregate strategy is only the first gate. This also closes the export
 /// set, prepared capability/bulk shape, canonical program/reducer identity,
-/// defined-text extent, and every unresolved aggregate relocation. Other
-/// For `NativeFused`, the compiler strategy has already closed the reducer's
-/// transitive local-call target as an ordinary helper-free entry. V15 has its
-/// own exact capability and helper-backed compatibility envelope below.
+/// defined-text extent, and every unresolved aggregate relocation. For
+/// `NativeFused`, the compiler strategy has already closed the reducer's
+/// transitive local-call target as an ordinary helper-free entry. The scalar
+/// V15 surface instead exports only its reducer; its search and required
+/// capability classifier are object-local and every capability miss is
+/// terminal.
 pub fn authenticate_native_whole_scalar_reducer(
     model: Model,
     compiled: &CompiledRegex,
@@ -382,33 +385,38 @@ pub fn authenticate_native_whole_scalar_reducer(
         return Ok(false);
     }
 
-    let (reducer_name, reducer_prefix, compatibility_helper) = match model {
+    let (reducer_name, reducer_prefix) = match model {
         Model::Count => (
             module.prepared_count_symbol(),
             "fre_aot_regex_count_exclusive_v1_",
-            "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
         ),
         Model::SpanSum => (
             module.prepared_span_sum_symbol(),
             "fre_aot_regex_span_sum_exclusive_v1_",
-            "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
         ),
         _ => unreachable!("native whole scalar reducer is restricted to Count and SpanSum"),
     };
     let reducer_name = reducer_name
         .ok_or_else(|| "native scalar strategy has no model-specific reducer symbol".to_owned())?;
-    canonical_symbol_identity(reducer_name, reducer_prefix)
+    let reducer_identity = canonical_symbol_identity(reducer_name, reducer_prefix)
         .ok_or_else(|| "native scalar reducer symbol is not canonical".to_owned())?;
     let (program_name, program_len) = module
         .required_runtime_program()
         .ok_or_else(|| "native scalar reducer has no preparation program".to_owned())?;
-    canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_")
+    let program_identity =
+        canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_")
         .ok_or_else(|| "native scalar preparation program symbol is not canonical".to_owned())?;
 
     let ordered_nfa = strategy == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
     let bulk_shape_is_exact = if ordered_nfa {
         receipt.engine == EngineKind::OrderedNfa
-            && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+            && receipt.entry_abi == EntryAbi::PreparedScalarReduceV1
+            && module.entry_symbol() == reducer_name
+            && module.prepared_bulk_strategy().is_none()
+            && module.prepared_entry_symbol().is_none()
+            && module.prepared_span_fill_symbol().is_none()
+            && module.required_runtime_symbols().next().is_none()
+            && reducer_identity == program_identity
             && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
     } else {
         module.prepared_bulk_strategy().is_none()
@@ -423,7 +431,7 @@ pub fn authenticate_native_whole_scalar_reducer(
         || module.prepared_aggregate_exports() != model.exports()
         || module.prepared_aggregate_strategy() != strategy
         || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
-        || receipt.runtime_helper_required != ordered_nfa
+        || receipt.runtime_helper_required
         || !bulk_shape_is_exact
         || reducer_name == program_name
         || program_len == 0
@@ -448,6 +456,22 @@ pub fn authenticate_native_whole_scalar_reducer(
         || reducer.size == 0
     {
         return Err("native scalar reducer is not one unique defined function".to_owned());
+    }
+    if ordered_nfa {
+        let global_functions = module
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && symbol.section.is_some()
+            })
+            .collect::<Vec<_>>();
+        if global_functions.len() != 1 || global_functions[0].name != reducer_name {
+            return Err(
+                "Ordered-NFA scalar operation exports another defined function".to_owned(),
+            );
+        }
     }
     let section_index = reducer
         .section
@@ -487,11 +511,7 @@ pub fn authenticate_native_whole_scalar_reducer(
                 .map(|target| target.name.as_str())
         })
         .collect::<Vec<_>>();
-    let expected_external_targets = if ordered_nfa {
-        vec![compatibility_helper]
-    } else {
-        Vec::new()
-    };
+    let expected_external_targets = Vec::new();
     if external_targets != expected_external_targets {
         return Err(format!(
             "native scalar reducer has unexpected unresolved call targets: {external_targets:?}"
@@ -914,7 +934,7 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
             .program()
             .stats()
             .map_err(|error| format!("general AOT scalar incumbent stats failed: {error}"))?;
-        let disposition = compile_with_prepared_ordered_nfa_v15_reported(
+        let disposition = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
             CompileRequest::new(benchmark.pattern(), target)
                 .profile(profile)
                 .output(OutputContract::Span)
@@ -1027,6 +1047,7 @@ fn authenticate_prepared_ordered_nfa_scalar(
     };
     if receipt.mode != CompileMode::Optimizing
         || receipt.output != OutputContract::Span
+        || receipt.entry_abi != EntryAbi::PreparedScalarReduceV1
         || receipt.engine != EngineKind::OrderedNfa
         || receipt.prepared_aggregate_exports != model.exports()
         || receipt.prepared_aggregate_strategy
@@ -1035,12 +1056,19 @@ fn authenticate_prepared_ordered_nfa_scalar(
         || module.prepared_aggregate_exports() != model.exports()
         || module.prepared_aggregate_strategy()
             != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
-        || module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        || receipt.runtime_helper_required
+        || module.prepared_bulk_strategy().is_some()
         || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
-        || module.prepared_entry_symbol().is_none()
-        || module.prepared_span_fill_symbol().is_none()
+        || module.prepared_entry_symbol().is_some()
+        || module.prepared_span_fill_symbol().is_some()
+        || module.required_runtime_symbols().next().is_some()
         || module.required_runtime_program().is_none()
         || !reducer_is_present
+        || match model {
+            Model::Count => module.prepared_count_symbol() != Some(module.entry_symbol()),
+            Model::SpanSum => module.prepared_span_sum_symbol() != Some(module.entry_symbol()),
+            _ => true,
+        }
         || compiled.object().is_empty()
         || compiled.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
     {
@@ -1052,6 +1080,11 @@ fn authenticate_prepared_ordered_nfa_scalar(
             module.prepared_bulk_strategy(),
             module.required_prepare_capabilities(),
         ));
+    }
+    if !authenticate_native_whole_scalar_reducer(model, compiled)? {
+        return Err(
+            "explicit prepared Ordered-NFA scalar route is not whole-operation native".to_owned(),
+        );
     }
     Ok(())
 }
@@ -1084,18 +1117,6 @@ const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_v1",
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
-];
-const PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS: [&str; 4] = [
-    "fre_aot_regex_runtime_search_v1",
-    "fre_aot_regex_runtime_search_exclusive_v1",
-    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
-    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
-];
-const PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS: [&str; 4] = [
-    "fre_aot_regex_runtime_search_v1",
-    "fre_aot_regex_runtime_search_exclusive_v1",
-    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
-    "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
 ];
 const FROZEN_LOOP_RUNTIME_SYMBOL: &str = "fre_aot_regex_runtime_scan_frozen_loop_v2";
 
@@ -1328,27 +1349,9 @@ fn direct_native_grep_symbol_identities_are_closed(
 
 fn shared_ordered_many_v15_symbol_identities_are_closed(
     model: Model,
-    ordinary_entry: &str,
-    prepared_entry: &str,
-    span_fill: &str,
     reducer: &str,
     program: &str,
 ) -> bool {
-    let Some(ordinary_identity) =
-        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
-    else {
-        return false;
-    };
-    let Some(prepared_identity) =
-        native_symbol_identity(prepared_entry, "fre_aot_regex_search_exclusive_v1_")
-    else {
-        return false;
-    };
-    let Some(span_fill_identity) =
-        native_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
-    else {
-        return false;
-    };
     let reducer_prefix = match model {
         Model::Count => "fre_aot_regex_count_exclusive_v1_",
         Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
@@ -1362,10 +1365,7 @@ fn shared_ordered_many_v15_symbol_identities_are_closed(
     else {
         return false;
     };
-    ordinary_identity == prepared_identity
-        && ordinary_identity == span_fill_identity
-        && ordinary_identity == program_identity
-        && reducer_identity != ordinary_identity
+    reducer_identity == program_identity && reducer != program
 }
 
 fn shared_ordered_many_native_fused_symbol_identities_are_closed(
@@ -1823,6 +1823,8 @@ fn authenticate_shared_ordered_many_aggregate(
     let receipt = compiled.receipt();
     let shared_receipt = artifact.receipt();
     let strategy = module.prepared_aggregate_strategy();
+    let whole_scalar_is_authenticated =
+        authenticate_native_whole_scalar_reducer(benchmark.model, compiled)?;
     let reducer = match benchmark.model {
         Model::Count => module.prepared_count_symbol(),
         Model::SpanSum => module.prepared_span_sum_symbol(),
@@ -1884,26 +1886,20 @@ fn authenticate_shared_ordered_many_aggregate(
                 )
         }
         Some(PreparedAggregateStrategy::NativeOrderedNfaFused) => {
-            let expected = match benchmark.model {
-                Model::Count => &PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS[..],
-                Model::SpanSum => &PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS[..],
-                _ => &[][..],
-            };
             receipt.engine == EngineKind::OrderedNfa
-                && module.prepared_bulk_strategy()
-                    == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
-                && module.required_prepare_capabilities()
+                && receipt.entry_abi == EntryAbi::PreparedScalarReduceV1
+                && module.prepared_bulk_strategy().is_none()
+                && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                && receipt.required_prepare_capabilities
                     == PREPARED_CAPABILITY_ORDERED_NFA_V15
-                && receipt.runtime_helper_required
-                && has_exact_runtime_symbol_closure(compiled, expected)
-                && prepared_entry.is_some_and(|symbol| {
-                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
-                })
-                && span_fill.is_some_and(|symbol| {
-                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
-                })
+                && !receipt.runtime_helper_required
+                && has_exact_runtime_symbol_closure(compiled, &[])
+                && prepared_entry.is_none()
+                && span_fill.is_none()
                 && reducer.is_some_and(|symbol| {
-                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                    symbol == module.entry_symbol()
+                        && has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                        && defined_function_has_no_unresolved_relocations(compiled, symbol)
                 })
                 && program.is_some_and(|(symbol, len)| {
                     len != 0
@@ -1914,28 +1910,13 @@ fn authenticate_shared_ordered_many_aggregate(
                             Some(len),
                         )
                 })
-                && prepared_entry
-                    .zip(span_fill)
-                    .zip(reducer)
-                    .zip(program)
-                    .is_some_and(
-                        |(((prepared_entry, span_fill), reducer), (program, _))| {
-                            shared_ordered_many_v15_symbol_identities_are_closed(
-                                benchmark.model,
-                                module.entry_symbol(),
-                                prepared_entry,
-                                span_fill,
-                                reducer,
-                                program,
-                            )
-                        },
+                && reducer.zip(program).is_some_and(|(reducer, (program, _))| {
+                    shared_ordered_many_v15_symbol_identities_are_closed(
+                        benchmark.model,
+                        reducer,
+                        program,
                     )
-                && has_defined_symbol(
-                    compiled,
-                    module.entry_symbol(),
-                    SymbolKind::Function,
-                    None,
-                )
+                })
         }
         _ => false,
     };
@@ -1948,6 +1929,7 @@ fn authenticate_shared_ordered_many_aggregate(
         || module.prepared_aggregate_exports() != benchmark.model.exports()
         || program.is_none()
         || reducer.is_none()
+        || !whole_scalar_is_authenticated
         || !symbol_surface_closed
         || shared_receipt.rows != benchmark.patterns.len()
         || shared_receipt.pattern_bytes
@@ -3906,7 +3888,7 @@ mod tests {
             PREPARED_CAPABILITY_ORDERED_NFA_V15,
         ));
 
-        let selected = compile_with_prepared_ordered_nfa_v15_reported(
+        let selected = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
             CompileRequest::new(benchmark.pattern(), target)
                 .profile(profile)
                 .output(OutputContract::Span)
@@ -3922,6 +3904,15 @@ mod tests {
         assert!(
             authenticate_native_whole_scalar_reducer(benchmark.model, &selected)
                 .expect("whole Ordered-NFA scalar authentication")
+        );
+        assert_eq!(selected.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+        assert_eq!(selected.module().prepared_bulk_strategy(), None);
+        assert_eq!(selected.module().prepared_entry_symbol(), None);
+        assert_eq!(selected.module().prepared_span_fill_symbol(), None);
+        assert!(selected.module().required_runtime_symbols().next().is_none());
+        assert_eq!(
+            selected.module().prepared_count_symbol(),
+            Some(selected.module().entry_symbol()),
         );
     }
 
