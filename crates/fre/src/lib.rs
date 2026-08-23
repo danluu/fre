@@ -14014,6 +14014,11 @@ impl PortableRegex {
 
     #[inline]
     fn try_find_ordinary(&self, haystack: &[u8]) -> Result<Option<Match>, SearchError> {
+        if let PortablePlan::BoundedWordClass(plan) = &self.plan
+            && let Some(matched) = plan.ordinary_find_full_unmetered(haystack)
+        {
+            return Ok(matched);
+        }
         let window = SearchWindow::full(haystack);
         match &self.plan {
             PortablePlan::ExactLiteral(literal) => {

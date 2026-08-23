@@ -98,6 +98,34 @@ pub(crate) mod ordinary_is_match_probe {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod ordinary_find_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(crate) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record_call() {
+        CALLS.with(|calls| {
+            calls.set(
+                calls
+                    .get()
+                    .checked_add(1)
+                    .expect("ordinary find probe fits"),
+            );
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryMode {
     Ascii,
@@ -550,7 +578,7 @@ impl CandidateScanner {
     /// admitted the complete ordinary full-window envelope. Unicode plans do
     /// not retain the ASCII nonmember run scanner, so their canonical order is
     /// exactly scalar prefix, wide blocks, narrow block, scalar tail.
-    fn next_unicode_unmetered(
+    fn next_unicode_unmetered<const RECORD_PROBE: bool>(
         &self,
         haystack: &[u8],
         mut position: usize,
@@ -558,8 +586,9 @@ impl CandidateScanner {
     ) -> Option<ScannedCandidate> {
         debug_assert_eq!(self.mode, CandidateMode::UnicodeAsciiMemberOrNonAscii);
         #[cfg(test)]
-        ordinary_is_match_probe::record_candidate_scan();
-
+        if RECORD_PROBE {
+            ordinary_is_match_probe::record_candidate_scan();
+        }
         let prefix_end = position
             .checked_add(
                 end.saturating_sub(position)
@@ -917,27 +946,45 @@ impl Plan {
         }
     }
 
+    fn ordinary_unicode_unbounded_full_plan(
+        &self,
+        haystack_len: usize,
+    ) -> Option<&EstablishedPlan> {
+        let Self::Established(plan) = self else {
+            return None;
+        };
+        (plan.mode == BoundaryMode::Unicode
+            && plan.maximum_units.is_none()
+            && matches!(&plan.class, ClassMatcher::Unicode { .. })
+            && plan
+                .candidate_scanner
+                .as_ref()
+                .is_some_and(|scanner| scanner.mode == CandidateMode::UnicodeAsciiMemberOrNonAscii)
+            && ordinary_unmetered_envelope_fits(haystack_len))
+        .then_some(plan)
+    }
+
     /// Complete an ordinary unlimited full-window existence call for the
     /// Unicode unbounded owner, or decline without inspecting source bytes.
     /// Every other owner and operation retains the canonical accounted path.
     #[must_use]
     pub(crate) fn ordinary_is_match_full_unmetered(&self, haystack: &[u8]) -> Option<bool> {
-        let Self::Established(plan) = self else {
-            return None;
-        };
-        if plan.mode != BoundaryMode::Unicode
-            || plan.maximum_units.is_some()
-            || !matches!(&plan.class, ClassMatcher::Unicode { .. })
-            || !plan.candidate_scanner.as_ref().is_some_and(|scanner| {
-                scanner.mode == CandidateMode::UnicodeAsciiMemberOrNonAscii
-            })
-            || !ordinary_unmetered_envelope_fits(haystack.len())
-        {
-            return None;
-        }
+        let plan = self.ordinary_unicode_unbounded_full_plan(haystack.len())?;
         #[cfg(test)]
         ordinary_is_match_probe::record_call();
         Some(plan.is_match_unicode_unbounded_full_unmetered(haystack))
+    }
+
+    /// Complete an ordinary unlimited full-window span call for the same
+    /// Unicode unbounded owner as the Boolean projection, or decline without
+    /// inspecting source bytes. Explicit finite and windowed operations retain
+    /// the canonical accounted path.
+    #[must_use]
+    pub(crate) fn ordinary_find_full_unmetered(&self, haystack: &[u8]) -> Option<Option<Match>> {
+        let plan = self.ordinary_unicode_unbounded_full_plan(haystack.len())?;
+        #[cfg(test)]
+        ordinary_find_probe::record_call();
+        Some(plan.find_unicode_unbounded_full_unmetered(haystack))
     }
 
     pub(crate) fn find_window(
@@ -966,14 +1013,14 @@ impl Plan {
 }
 
 impl EstablishedPlan {
-    fn is_match_unicode_unbounded_full_unmetered(&self, haystack: &[u8]) -> bool {
+    fn find_unicode_unbounded_full_unmetered(&self, haystack: &[u8]) -> Option<Match> {
         debug_assert_eq!(self.mode, BoundaryMode::Unicode);
         debug_assert!(self.maximum_units.is_none());
         let end = haystack.len();
         let mut position = 0_usize;
         while position < end {
             let Some((run_start, mut width, run_word)) =
-                self.next_unicode_member_unmetered(haystack, position, end)
+                self.next_unicode_member_unmetered::<false>(haystack, position, end)
             else {
                 break;
             };
@@ -991,7 +1038,55 @@ impl EstablishedPlan {
                     break;
                 }
                 let (next_admitted, next_width, next_word) =
-                    self.classify_unicode_unit_unmetered(haystack, position, end);
+                    self.classify_unicode_unit_unmetered::<false>(haystack, position, end);
+                if !next_admitted {
+                    break;
+                }
+                homogeneous_wordness &= next_word == run_word;
+                width = next_width;
+            }
+
+            if run_units >= self.minimum_units
+                && let Some(matched) = self.unbounded_class_run_find_unmetered(
+                    haystack,
+                    run_start,
+                    position,
+                    run_units,
+                    homogeneous_wordness,
+                )
+            {
+                return Some(matched);
+            }
+        }
+        None
+    }
+
+    fn is_match_unicode_unbounded_full_unmetered(&self, haystack: &[u8]) -> bool {
+        debug_assert_eq!(self.mode, BoundaryMode::Unicode);
+        debug_assert!(self.maximum_units.is_none());
+        let end = haystack.len();
+        let mut position = 0_usize;
+        while position < end {
+            let Some((run_start, mut width, run_word)) =
+                self.next_unicode_member_unmetered::<true>(haystack, position, end)
+            else {
+                break;
+            };
+            position = run_start;
+            let mut run_units = 0_usize;
+            let mut homogeneous_wordness = true;
+            loop {
+                run_units = run_units
+                    .checked_add(1)
+                    .expect("a source cannot contain more scalars than bytes");
+                position = position
+                    .checked_add(width)
+                    .expect("a decoded scalar within the source can advance");
+                if position >= end {
+                    break;
+                }
+                let (next_admitted, next_width, next_word) =
+                    self.classify_unicode_unit_unmetered::<true>(haystack, position, end);
                 if !next_admitted {
                     break;
                 }
@@ -1014,7 +1109,7 @@ impl EstablishedPlan {
         false
     }
 
-    fn next_unicode_member_unmetered(
+    fn next_unicode_member_unmetered<const RECORD_PROBE: bool>(
         &self,
         haystack: &[u8],
         mut position: usize,
@@ -1025,7 +1120,8 @@ impl EstablishedPlan {
             .as_ref()
             .expect("the Unicode path retains its candidate classifier");
         loop {
-            let candidate = scanner.next_unicode_unmetered(haystack, position, end)?;
+            let candidate =
+                scanner.next_unicode_unmetered::<RECORD_PROBE>(haystack, position, end)?;
             match candidate {
                 ScannedCandidate::AsciiMember { position, byte } => {
                     return Some((position, 1, is_ascii_word(byte)));
@@ -1033,8 +1129,8 @@ impl EstablishedPlan {
                 ScannedCandidate::NonAscii {
                     position: candidate,
                 } => {
-                    let (admitted, width, word) =
-                        self.classify_unicode_unit_unmetered(haystack, candidate, end);
+                    let (admitted, width, word) = self
+                        .classify_unicode_unit_unmetered::<RECORD_PROBE>(haystack, candidate, end);
                     if admitted {
                         return Some((candidate, width, word));
                     }
@@ -1091,14 +1187,66 @@ impl EstablishedPlan {
         false
     }
 
-    fn classify_unicode_unit_unmetered(
+    fn unbounded_class_run_find_unmetered(
+        &self,
+        haystack: &[u8],
+        run_start: usize,
+        run_end: usize,
+        run_units: usize,
+        homogeneous_wordness: bool,
+    ) -> Option<Match> {
+        if homogeneous_wordness {
+            return (self.is_word_boundary(haystack, run_start)
+                && self.is_word_boundary(haystack, run_end))
+            .then_some(Match {
+                start: run_start,
+                end: run_end,
+            });
+        }
+
+        // The canonical greedy cursor selects the earliest boundary start
+        // that can reach the minimum and then the final reachable boundary.
+        // Retain those two byte positions while visiting the same decoded
+        // class boundaries once.
+        let mut earliest_start = None;
+        let mut selected_end = None;
+        let mut position = run_start;
+        let mut units = 0_usize;
+        loop {
+            if self.is_word_boundary(haystack, position) {
+                if earliest_start.is_none() && units < run_units {
+                    earliest_start = Some((position, units));
+                }
+                if earliest_start.is_some_and(|(_, start_units)| {
+                    units.saturating_sub(start_units) >= self.minimum_units
+                }) {
+                    selected_end = Some(position);
+                }
+            }
+            if position == run_end {
+                break;
+            }
+            let width = self.known_member_width(haystack, position, run_end);
+            position = position
+                .checked_add(width)
+                .expect("a retained class scalar remains inside its run");
+            units = units
+                .checked_add(1)
+                .expect("a source cannot contain more scalars than bytes");
+        }
+        earliest_start.and_then(|(start, _)| selected_end.map(|end| Match { start, end }))
+    }
+
+    fn classify_unicode_unit_unmetered<const RECORD_PROBE: bool>(
         &self,
         haystack: &[u8],
         position: usize,
         end: usize,
     ) -> (bool, usize, bool) {
         #[cfg(test)]
-        ordinary_is_match_probe::record_unit_classification();
+        if RECORD_PROBE {
+            ordinary_is_match_probe::record_unit_classification();
+        }
         let ClassMatcher::Unicode {
             ascii_words,
             ranges,
@@ -1110,8 +1258,8 @@ impl EstablishedPlan {
             return (false, 1, false);
         };
         let admitted = if scalar.is_ascii() {
-            let byte = u8::try_from(u32::from(scalar))
-                .expect("an ASCII scalar fits exactly in one byte");
+            let byte =
+                u8::try_from(u32::from(scalar)).expect("an ASCII scalar fits exactly in one byte");
             ascii_set_contains(*ascii_words, byte)
         } else {
             unicode_ranges_contain(ranges, scalar)
@@ -2235,11 +2383,13 @@ mod tests {
     use super::{
         ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, BULK_SKIP_MIN_BYTES,
         BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSetClassifier, CandidateMode, CandidateScanner,
-        InspectionError, InspectionOutcome, PLAN_ID, inspect, ordinary_is_match_probe,
+        InspectionError, InspectionOutcome, PLAN_ID, inspect, ordinary_find_probe,
+        ordinary_is_match_probe,
     };
     use crate::{
-        BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchError, SearchLimits,
-        SearchSessionLimits, SearchWindow, UnicodeWordRunError,
+        BuildError, BuildLimits, PlanSelection, PortableBuilder, PortableCapturesReadError,
+        PortableFindIterLimits, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
+        UnicodeWordRunError,
     };
 
     fn generated_background(length: usize, seed: u64) -> Vec<u8> {
@@ -2277,6 +2427,26 @@ mod tests {
             panic!("eligible shape");
         };
         inspection.build().expect("plan build")
+    }
+
+    #[test]
+    fn ordinary_unmetered_envelope_has_an_exact_nonallocating_boundary() {
+        let usize_ceiling = (usize::MAX - super::ORDINARY_UNMETERED_FIXED_WORK)
+            / super::ORDINARY_UNMETERED_WORK_FACTOR;
+        let u64_ceiling = u64::MAX
+            .checked_sub(u64::try_from(super::ORDINARY_UNMETERED_FIXED_WORK).unwrap())
+            .map(|work| {
+                work / u64::try_from(super::ORDINARY_UNMETERED_WORK_FACTOR).unwrap()
+            })
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(usize::MAX);
+        let largest_admitted = usize_ceiling.min(u64_ceiling);
+
+        assert!(super::ordinary_unmetered_envelope_fits(0));
+        assert!(super::ordinary_unmetered_envelope_fits(largest_admitted));
+        if let Some(first_rejected) = largest_admitted.checked_add(1) {
+            assert!(!super::ordinary_unmetered_envelope_fits(first_rejected));
+        }
     }
 
     #[test]
@@ -2883,6 +3053,217 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_unmetered_find_matches_exact_unicode_greek_late_case() {
+        const PATTERN: &str = r"\b\p{Greek}+\b";
+        let suffix = " Ωμέγα ".as_bytes();
+        let haystack = generated_with_suffix(4_093, 0x9999_aaaa_bbbb_cccc, suffix);
+        let expected = Some((haystack.len() - suffix.len() + 1, haystack.len() - 1));
+        let plan = plan(PATTERN, true);
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .expect("canonical Greek benchmark search")
+            .0
+            .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            plan.ordinary_find_full_unmetered(&haystack)
+                .expect("the Unicode unbounded owner is eligible")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("the public benchmark regex builds");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        ordinary_find_probe::reset();
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(ordinary_find_probe::calls(), 1);
+    }
+
+    #[test]
+    fn ordinary_unmetered_find_handles_homogeneous_unicode_nonword_runs() {
+        const PATTERN: &str = r"\b[♥☀]{2,}\b";
+        assert!(!super::is_unicode_word('♥'));
+        assert!(!super::is_unicode_word('☀'));
+        let plan = plan(PATTERN, true);
+        let oracle = BytesRegexBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("Unicode bytes-regex oracle");
+        for haystack in ["a♥☀♥b".as_bytes(), "!♥☀♥!".as_bytes()] {
+            let expected = oracle
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let canonical = plan
+                .find_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .expect("canonical homogeneous-nonword search")
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            let ordinary = plan
+                .ordinary_find_full_unmetered(haystack)
+                .expect("the Unicode unbounded owner is eligible")
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(canonical, expected, "canonical haystack={haystack:?}");
+            assert_eq!(ordinary, expected, "ordinary haystack={haystack:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_unmetered_find_decodes_wide_and_mixed_unicode_word_members() {
+        const PATTERN: &str =
+            r"\b[\x{4E2D}\x{10400}\x{0301}\x{203F}\x{2665}]{2,}\b";
+        let combining = '\u{0301}';
+        let connector = '\u{203F}';
+        let nonword = '\u{2665}';
+        assert_eq!('中'.len_utf8(), 3);
+        assert_eq!('𐐀'.len_utf8(), 4);
+        assert!(super::is_unicode_word('中'));
+        assert!(super::is_unicode_word('𐐀'));
+        assert!(super::is_unicode_word(combining));
+        assert!(super::is_unicode_word(connector));
+        assert!(!super::is_unicode_word(nonword));
+
+        let haystack = format!("!中{combining}{connector}{nonword}𐐀!").into_bytes();
+        let expected = Some((1, haystack.len() - 1));
+        let plan = plan(PATTERN, true);
+        let oracle = BytesRegexBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("Unicode bytes-regex oracle");
+        assert_eq!(
+            oracle
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .expect("canonical wide-scalar search")
+            .0
+            .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            plan.ordinary_find_full_unmetered(&haystack)
+                .expect("the Unicode unbounded owner is eligible")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+    }
+
+    #[test]
+    fn ordinary_unmetered_find_handles_alternating_wordness_for_multiple_minimums() {
+        let left_clipped = "aα♥β♥γ!";
+        let right_clipped = "!α♥β♥γz";
+        let cases = [
+            (r"\b[\p{Greek}\x{2665}]+\b", true),
+            (r"\b[\p{Greek}\x{2665}]{2,}\b", true),
+            (r"\b[\p{Greek}\x{2665}]{4,}\b", true),
+            (r"\b[\p{Greek}\x{2665}]{5,}\b", false),
+        ];
+        for (pattern, present) in cases {
+            let plan = plan(pattern, true);
+            let oracle = BytesRegexBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .expect("Unicode bytes-regex oracle");
+            let expected = [
+                present.then_some((
+                    left_clipped.find('♥').expect("left internal boundary"),
+                    left_clipped.len() - 1,
+                )),
+                present.then_some((
+                    1,
+                    right_clipped.rfind('γ').expect("right internal boundary"),
+                )),
+            ];
+            for (haystack, expected) in [left_clipped, right_clipped].into_iter().zip(expected) {
+                let haystack = haystack.as_bytes();
+                assert_eq!(
+                    oracle
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "upstream pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    plan.find_window(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .expect("canonical alternating-wordness search")
+                    .0
+                    .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "canonical pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    plan.ordinary_find_full_unmetered(haystack)
+                        .expect("the Unicode unbounded owner is eligible")
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "ordinary pattern={pattern:?} haystack={haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_unmetered_find_preserves_malformed_context_and_greedy_boundaries() {
+        const PATTERN: &str = r"\b[\p{Greek}_/]{2,}\b";
+        let plan = plan(PATTERN, true);
+        let cases = [
+            "!α/β_γ!".as_bytes().to_vec(),
+            [vec![0xff], "α/β".as_bytes().to_vec(), vec![0xff]].concat(),
+            [vec![0xce, b'!'], "α/β".as_bytes().to_vec(), vec![0xb1]].concat(),
+            [
+                "a".as_bytes().to_vec(),
+                "α/β".as_bytes().to_vec(),
+                vec![b'!'],
+            ]
+            .concat(),
+            b"plain ASCII only".to_vec(),
+        ];
+        for haystack in cases {
+            let expected = plan
+                .find_window(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .expect("canonical malformed-context search")
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = plan
+                .ordinary_find_full_unmetered(&haystack)
+                .expect("the Unicode unbounded owner is eligible")
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(actual, expected, "haystack={haystack:?}");
+        }
+    }
+
+    #[test]
     fn ordinary_unmetered_boolean_preserves_boundaries_and_malformed_bytes() {
         const PATTERN: &str = r"\b\p{Greek}{2,}\b";
         let plan = plan(PATTERN, true);
@@ -2920,13 +3301,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_unmetered_boolean_differentially_exhausts_short_byte_sources() {
+    fn ordinary_unmetered_values_differentially_exhaust_short_byte_sources() {
         let patterns = [
             r"\b\p{Greek}+\b",
             r"\b\p{L}{2,}\b",
             r"\b[\p{Greek}_/]+\b",
         ];
-        let alphabet = [b'A', b'_', b'/', b'!', 0xff, 0xce, 0xb1];
+        let alphabet = [b'A', b'_', b'/', b'!', 0xff, 0xce, 0xb1, 0xb2];
         for pattern in patterns {
             let plan = plan(pattern, true);
             let oracle = BytesRegexBuilder::new(pattern)
@@ -2950,11 +3331,19 @@ mod tests {
                         )
                         .expect("canonical exhaustive search")
                         .0
-                        .is_some();
+                        .map(|matched| (matched.start(), matched.end()));
+                    let ordinary = plan
+                        .ordinary_find_full_unmetered(&haystack)
+                        .expect("the Unicode unbounded owner is eligible")
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        ordinary, canonical,
+                        "ordinary span pattern={pattern:?} haystack={haystack:?}",
+                    );
                     assert_eq!(
                         plan.ordinary_is_match_full_unmetered(&haystack),
-                        Some(canonical),
-                        "ordinary pattern={pattern:?} haystack={haystack:?}",
+                        Some(canonical.is_some()),
+                        "ordinary existence pattern={pattern:?} haystack={haystack:?}",
                     );
                     // The incumbent and regex::bytes intentionally diverge on
                     // some malformed Unicode-boundary contexts. That inherited
@@ -2963,7 +3352,9 @@ mod tests {
                     if core::str::from_utf8(&haystack).is_ok() {
                         assert_eq!(
                             canonical,
-                            oracle.is_match(&haystack),
+                            oracle
+                                .find(&haystack)
+                                .map(|matched| (matched.start(), matched.end())),
                             "canonical pattern={pattern:?} haystack={haystack:?}",
                         );
                     }
@@ -3064,5 +3455,194 @@ mod tests {
         assert_eq!(bounded.runtime_implementation_id(), PLAN_ID);
         assert!(bounded.is_match(hit));
         assert_eq!(ordinary_is_match_probe::snapshot(), ordinary);
+    }
+
+    #[test]
+    fn only_public_ordinary_find_enters_the_unmetered_span_route() {
+        const PATTERN: &str = r"\b\p{Greek}+\b";
+        let hit = "!Ωμέγα!".as_bytes();
+        let miss = b"plain ASCII";
+        let expected = Some((1, hit.len() - 1));
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .expect("bounded Unicode word-class facade");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+
+        ordinary_find_probe::reset();
+        assert_eq!(
+            regex
+                .find(hit)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(regex.find(miss), None);
+        let ordinary_calls = ordinary_find_probe::calls();
+        assert_eq!(ordinary_calls, 2);
+
+        assert!(regex.is_match(hit));
+        assert_eq!(
+            regex
+                .find_value(hit, SearchLimits::unlimited())
+                .expect("finite value span")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_accounted(hit, SearchLimits::unlimited())
+                .expect("accounted span")
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_at_value(hit, 0, SearchLimits::unlimited())
+                .expect("ranged value span")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_window_value(hit, SearchWindow::full(hit), SearchLimits::unlimited(),)
+                .expect("windowed value span")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_window(hit, SearchWindow::full(hit), SearchLimits::unlimited(),)
+                .expect("windowed accounted span")
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("native session");
+        assert_eq!(
+            session
+                .find_value(hit, SearchLimits::unlimited())
+                .expect("session value span")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        let mut ordinary = regex.ordinary_session().expect("ordinary session");
+        assert_eq!(
+            ordinary
+                .find_at(hit, 0)
+                .expect("ordinary-session span")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        let expected_iter = vec![expected.expect("hit span")];
+        let accounted_iter = regex
+            .find_iter(hit, PortableFindIterLimits::unlimited())
+            .expect("accounted iterator")
+            .map(|matched| {
+                let matched = matched.expect("accounted iterator item");
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accounted_iter, expected_iter);
+        let value_iter = regex
+            .find_iter_value(hit, PortableFindIterLimits::unlimited())
+            .expect("value iterator")
+            .map(|matched| {
+                let matched = matched.expect("value iterator item");
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_iter, expected_iter);
+
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, hit, SearchLimits::unlimited())
+                .expect("capture-free locations")
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(matches!(
+            regex.find_value(
+                hit,
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::UnicodeWordRun(
+                UnicodeWordRunError::WorkLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            ordinary_find_probe::calls(),
+            ordinary_calls,
+            "finite, windowed, session, iterator, capture, and boolean APIs stay canonical",
+        );
+
+        let bounded_plan = plan(r"\b\p{Greek}{2,8}\b", true);
+        assert_eq!(bounded_plan.ordinary_find_full_unmetered(hit), None);
+        let ascii_plan = plan(r"(?-u:\b[A-Z]+\b)", false);
+        assert_eq!(ascii_plan.ordinary_find_full_unmetered(b"ABC"), None);
+        let exact_bytes = plan(r"(?-u:\b[\x80-\x81]+\b)", false);
+        assert_eq!(exact_bytes.ordinary_find_full_unmetered(&[0x80]), None);
+
+        let bounded = PortableBuilder::new(r"\b\p{Greek}{2,8}\b")
+            .unicode(true)
+            .build()
+            .expect("bounded maximum fallback fixture");
+        assert_eq!(bounded.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(
+            bounded
+                .find(hit)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(ordinary_find_probe::calls(), ordinary_calls);
+    }
+
+    #[test]
+    fn explicit_capture_apis_do_not_enter_the_ordinary_find_route() {
+        let regex = PortableBuilder::new(r"(\b\p{Greek}+\b)")
+            .unicode(true)
+            .build()
+            .expect("captured bounded Unicode word-class facade");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(regex.captures_len(), 2);
+        let haystack = "!Ωμέγα!".as_bytes();
+        let mut locations = regex.capture_locations();
+
+        ordinary_find_probe::reset();
+        assert!(matches!(
+            regex.captures_read(
+                &mut locations,
+                haystack,
+                SearchLimits::unlimited(),
+            ),
+            Err(PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 1 })
+        ));
+        assert!(matches!(
+            regex.captures_read_value(
+                &mut locations,
+                haystack,
+                SearchLimits::unlimited(),
+            ),
+            Err(PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 1 })
+        ));
+        assert_eq!(locations.get(0), None);
+        assert_eq!(locations.get(1), None);
+        assert_eq!(ordinary_find_probe::calls(), 0);
+
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, haystack.len() - 1)),
+        );
+        assert_eq!(ordinary_find_probe::calls(), 1);
     }
 }
