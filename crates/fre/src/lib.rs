@@ -12152,6 +12152,18 @@ impl PortableRegex {
                     )
                     .map_err(SearchError::from)
             }
+            PortablePlan::NullableOptionalChain(plan) => plan
+                .is_match_full_unlimited_value(haystack)
+                .unwrap_or_else(|| {
+                    plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                })
+                .map_err(SearchError::NullableOptionalChain),
+            PortablePlan::NullableFiniteTokenRepeat(plan) => plan
+                .is_match_full_unlimited_value(haystack)
+                .unwrap_or_else(|| {
+                    plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                })
+                .map_err(SearchError::NullableOptionalChain),
             _ => self.is_match_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }

@@ -149,6 +149,27 @@ impl Plan {
         )
     }
 
+    /// Try the Rust-compatible full-input existence projection without
+    /// constructing the facade's diagnostic execution counters.
+    ///
+    /// The outer `Option` declines before source access whenever the
+    /// canonical literal-only work expression is not representable. The
+    /// ordinary facade then replays the unchanged checked path and preserves
+    /// its exact error chronology.
+    #[inline]
+    pub(crate) fn is_match_full_unlimited_value(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<bool, Error>> {
+        ordinary_exists_work_is_representable(haystack.len(), self.tail.needle().len())?;
+        Some(
+            self.tail
+                .find(haystack, LiteralSearchLimits::unlimited())
+                .map(|(matched, _)| matched.is_some())
+                .map_err(Error::from),
+        )
+    }
+
     pub(crate) fn is_match_window(
         &self,
         haystack: &[u8],
@@ -874,6 +895,11 @@ fn low_count_mask(maximum: usize) -> u64 {
     } else {
         (1_u64 << (maximum + 1)).saturating_sub(1)
     }
+}
+
+fn ordinary_exists_work_is_representable(input_bytes: usize, tail_bytes: usize) -> Option<()> {
+    let finder_terms = input_bytes.checked_add(tail_bytes)?;
+    u64::try_from(finder_terms).ok().map(|_| ())
 }
 
 fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
