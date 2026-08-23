@@ -5766,56 +5766,26 @@ struct RipgrepFlatLiteralPublication {
     minimum_match_bytes: Option<usize>,
 }
 
-/// Publish the class-free large flat-literal plan from bytes still owned by the
-/// authenticated HIR. Above the packed engine's certified cardinality ceiling,
-/// the incumbent always reaches this same stable DFA construction.
 #[cold]
 #[inline(never)]
-fn build_ripgrep_flat_literal_handoff(
+fn publish_ripgrep_borrowed_flat_literal_set(
     builder: &PortableBuilder,
-    handoff: &finite::FlatLiteralSetHandoff<'_>,
+    patterns: &[&[u8]],
     planner_work: u64,
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<PortableRegex, BuildError> {
     if builder.selection != PlanSelection::Auto
-        || handoff.pattern_count() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        || patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
         || publication.syntax.class_ranges != 0
     {
         return Err(BuildError::InternalInvariant(
             "borrowed ripgrep literal set reached another planner terminal",
         ));
     }
-    let literal_set = match handoff.storage() {
-        finite::FlatLiteralSetHandoffStorage::StackEligible(branches) => {
-            if branches.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS {
-                return Err(BuildError::InternalInvariant(
-                    "stack-eligible flat literal set exceeded its fixed table",
-                ));
-            }
-            let mut patterns: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
-                [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
-            for (pattern, branch) in patterns.iter_mut().zip(branches.iter()) {
-                let HirKind::Literal(literal) = branch.kind() else {
-                    return Err(BuildError::InternalInvariant(
-                        "authenticated flat literal handoff reached another HIR leaf",
-                    ));
-                };
-                if literal.0.is_empty() {
-                    return Err(BuildError::InternalInvariant(
-                        "authenticated flat literal handoff reached an empty leaf",
-                    ));
-                }
-                *pattern = literal.0.as_ref();
-            }
-            LiteralSetPlan::new_stable_borrowed(
-                &patterns[..branches.len()],
-                builder.limits.literal_set,
-            )?
-        }
-        finite::FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => {
-            LiteralSetPlan::new_stable_borrowed(patterns, builder.limits.literal_set)?
-        }
-    };
+    let literal_set = LiteralSetPlan::new_stable_borrowed(
+        patterns,
+        builder.limits.literal_set,
+    )?;
     let storage = literal_set.build_accounting().persistent_bytes;
     Ok(PortableRegex {
         source: publication.source,
@@ -5848,6 +5818,57 @@ fn build_ripgrep_flat_literal_handoff(
         }
         .enforce_persistent_limit(builder.limits.max_persistent_bytes)?,
     })
+}
+
+/// Publish the class-free large flat-literal plan from bytes still owned by the
+/// authenticated HIR. Above the packed engine's certified cardinality ceiling,
+/// the incumbent always reaches this same stable DFA construction.
+#[cold]
+#[inline(never)]
+fn build_ripgrep_flat_literal_handoff(
+    builder: &PortableBuilder,
+    handoff: &finite::FlatLiteralSetHandoff<'_>,
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+) -> Result<PortableRegex, BuildError> {
+    match handoff.storage() {
+        finite::FlatLiteralSetHandoffStorage::StackEligible(branches) => {
+            if branches.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS {
+                return Err(BuildError::InternalInvariant(
+                    "stack-eligible flat literal set exceeded its fixed table",
+                ));
+            }
+            let mut patterns: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
+                [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
+            for (pattern, branch) in patterns.iter_mut().zip(branches.iter()) {
+                let HirKind::Literal(literal) = branch.kind() else {
+                    return Err(BuildError::InternalInvariant(
+                        "authenticated flat literal handoff reached another HIR leaf",
+                    ));
+                };
+                if literal.0.is_empty() {
+                    return Err(BuildError::InternalInvariant(
+                        "authenticated flat literal handoff reached an empty leaf",
+                    ));
+                }
+                *pattern = literal.0.as_ref();
+            }
+            publish_ripgrep_borrowed_flat_literal_set(
+                builder,
+                &patterns[..branches.len()],
+                planner_work,
+                publication,
+            )
+        }
+        finite::FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => {
+            publish_ripgrep_borrowed_flat_literal_set(
+                builder,
+                patterns,
+                planner_work,
+                publication,
+            )
+        }
+    }
 }
 
 impl RipgrepStandardLiteralContext {
@@ -5933,12 +5954,9 @@ impl PortableParsedBuildContext {
 /// multiline mode was inert. The pinned HIR Printer's exact source spelling
 /// is derived here so cloning a published matcher and every source/resource
 /// envelope still replay ordinary construction exactly.
-fn append_ripgrep_literal_source(source: &mut String, node: &Hir) {
-    let HirKind::Literal(literal) = node.kind() else {
-        unreachable!("literal HIR handoff was authenticated above");
-    };
-    let text = core::str::from_utf8(literal.0.as_ref())
-        .expect("literal HIR handoff authenticated UTF-8 above");
+fn append_ripgrep_literal_bytes_source(source: &mut String, bytes: &[u8]) {
+    let text = core::str::from_utf8(bytes)
+        .expect("ripgrep literal handoff authenticated UTF-8 above");
     let grouped = text.chars().nth(1).is_some();
     if grouped {
         source.push_str("(?:");
@@ -5949,23 +5967,22 @@ fn append_ripgrep_literal_source(source: &mut String, node: &Hir) {
     }
 }
 
-fn ripgrep_standard_literal_context(
-    hir: &Hir,
+fn ripgrep_standard_literal_bytes_context<'literal>(
+    pattern_count: usize,
+    literal_at: impl Fn(usize) -> Option<&'literal [u8]>,
     limits: BuildLimits,
     canonical_source_limit: usize,
+    reject_meta_characters: bool,
 ) -> Option<RipgrepStandardLiteralContext> {
-    let (branches, hir_nodes, max_depth, traversal_stack) = match hir.kind() {
-        HirKind::Literal(_) => (None, 1_u64, 0_u64, 1_u64),
-        HirKind::Alternation(branches) if branches.len() >= 2 => {
-            let branch_count = u64::try_from(branches.len()).ok()?;
-            (
-                Some(branches.as_slice()),
-                branch_count.checked_add(1)?,
-                1,
-                branch_count,
-            )
-        }
-        _ => return None,
+    let pattern_count_u64 = u64::try_from(pattern_count).ok()?;
+    let (hir_nodes, max_depth, traversal_stack) = match pattern_count {
+        0 => return None,
+        1 => (1_u64, 0_u64, 1_u64),
+        _ => (
+            pattern_count_u64.checked_add(1)?,
+            1_u64,
+            pattern_count_u64,
+        ),
     };
 
     let safety = limits.syntax_safety;
@@ -5988,15 +6005,12 @@ fn ripgrep_standard_literal_context(
         traversal_stack,
         safety.max_traversal_stack,
         quota.map(|quota| quota.max_traversal_stack),
-    ) || !hir.properties().is_utf8()
-        || hir.properties().explicit_captures_len() != 0
-        || !matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0)
-    {
+    ) {
         return None;
     }
 
     let mut literal_bytes = 0_u64;
-    let mut source_bytes = if branches.is_some() {
+    let mut source_bytes = if pattern_count >= 2 {
         // The pinned HIR Printer wraps every alternation in `(?:...)` and
         // places one `|` between branches. Since `hir_nodes` is the branch
         // count plus the root, this is exactly four grouping bytes plus
@@ -6027,14 +6041,13 @@ fn ripgrep_standard_literal_context(
     if !within_source_and_work(source_bytes, literal_bytes) {
         return None;
     }
-    let mut inspect_literal = |node: &Hir| -> Option<()> {
-        let HirKind::Literal(literal) = node.kind() else {
-            return None;
-        };
-        if literal.0.is_empty() {
+    let mut all_single_character = true;
+    for index in 0..pattern_count {
+        let literal = literal_at(index)?;
+        if literal.is_empty() {
             return None;
         }
-        let bytes = u64::try_from(literal.0.len()).ok()?;
+        let bytes = u64::try_from(literal.len()).ok()?;
         let next_literal_bytes = literal_bytes.checked_add(bytes)?;
         let unescaped_source_bytes = source_bytes.checked_add(bytes)?;
         // Bound every byte scan by the already authenticated source/work
@@ -6043,7 +6056,7 @@ fn ripgrep_standard_literal_context(
         if !within_source_and_work(unescaped_source_bytes, next_literal_bytes) {
             return None;
         }
-        let text = core::str::from_utf8(literal.0.as_ref()).ok()?;
+        let text = core::str::from_utf8(literal).ok()?;
         let mut escapes = 0_u64;
         let mut saw_character = false;
         let mut grouped = false;
@@ -6054,10 +6067,14 @@ fn ripgrep_standard_literal_context(
                 return None;
             }
             if regex_syntax::is_meta_character(character) {
+                if reject_meta_characters {
+                    return None;
+                }
                 escapes = escapes.checked_add(1)?;
             }
         }
         debug_assert!(saw_character);
+        all_single_character &= !grouped;
         let group_bytes = if grouped { 4 } else { 0 };
         let escaped_source_bytes = unescaped_source_bytes
             .checked_add(escapes)?
@@ -6067,14 +6084,11 @@ fn ripgrep_standard_literal_context(
         }
         literal_bytes = next_literal_bytes;
         source_bytes = escaped_source_bytes;
-        Some(())
-    };
-    if let Some(branches) = branches {
-        for branch in branches {
-            inspect_literal(branch)?;
-        }
-    } else {
-        inspect_literal(hir)?;
+    }
+    if reject_meta_characters && all_single_character {
+        // The pinned HIR smart constructor collapses this shape into one
+        // Unicode class, so it is not the incumbent flat-literal terminal.
+        return None;
     }
 
     let source_bytes_usize = usize::try_from(source_bytes).ok()?;
@@ -6084,17 +6098,17 @@ fn ripgrep_standard_literal_context(
     debug_assert!(within_source_and_work(source_bytes, literal_bytes));
 
     let mut source = String::with_capacity(source_bytes_usize);
-    if let Some(branches) = branches {
+    if pattern_count >= 2 {
         source.push_str("(?:");
-        for (index, branch) in branches.iter().enumerate() {
+        for index in 0..pattern_count {
             if index != 0 {
                 source.push('|');
             }
-            append_ripgrep_literal_source(&mut source, branch);
+            append_ripgrep_literal_bytes_source(&mut source, literal_at(index)?);
         }
         source.push(')');
     } else {
-        append_ripgrep_literal_source(&mut source, hir);
+        append_ripgrep_literal_bytes_source(&mut source, literal_at(0)?);
     }
     debug_assert_eq!(source.len(), source_bytes_usize);
 
@@ -6116,6 +6130,43 @@ fn ripgrep_standard_literal_context(
             guarantees_valid_utf8_nonempty: true,
         },
     })
+}
+
+fn ripgrep_standard_literal_context(
+    hir: &Hir,
+    limits: BuildLimits,
+    canonical_source_limit: usize,
+) -> Option<RipgrepStandardLiteralContext> {
+    if !hir.properties().is_utf8()
+        || hir.properties().explicit_captures_len() != 0
+        || !matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0)
+    {
+        return None;
+    }
+    match hir.kind() {
+        HirKind::Literal(literal) => ripgrep_standard_literal_bytes_context(
+            1,
+            |index| (index == 0).then_some(literal.0.as_ref()),
+            limits,
+            canonical_source_limit,
+            false,
+        ),
+        HirKind::Alternation(branches) if branches.len() >= 2 => {
+            ripgrep_standard_literal_bytes_context(
+                branches.len(),
+                |index| {
+                    let HirKind::Literal(literal) = branches.get(index)?.kind() else {
+                        return None;
+                    };
+                    Some(literal.0.as_ref())
+                },
+                limits,
+                canonical_source_limit,
+                false,
+            )
+        }
+        _ => None,
+    }
 }
 
 fn is_ripgrep_standard_literal_profile(profile: &RustProfile) -> bool {
@@ -6642,6 +6693,110 @@ impl PortableBuilder {
         };
         self.build_from_parsed_context(context.with_hir(hir))
             .map(RipgrepStandardLiteralHirBuild::Built)
+    }
+
+    /// Build ripgrep's bounded ordinary literal set from original bytes.
+    ///
+    /// This construction-only seam is narrower than the HIR handoff: it
+    /// accepts only the large literal-set range whose incumbent terminal is
+    /// the stable DFA, and only metacharacter-free, positive-width UTF-8
+    /// strings under ripgrep's exact standard profile. The borrowed slice
+    /// table must contain the original source order. FRE independently
+    /// derives the canonical source, syntax accounting, finite-planner work
+    /// and minimum width before publishing the same terminal as the HIR path.
+    ///
+    /// `Ok(None)` preserves the caller's configured-HIR fallback for every
+    /// option, value or resource boundary outside this exact successful lane.
+    #[doc(hidden)]
+    pub fn build_ripgrep_standard_literals(
+        self,
+        patterns: &[&str],
+        canonical_source_limit: usize,
+    ) -> Result<Option<PortableRegex>, BuildError> {
+        if patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+            || patterns.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
+        {
+            return Ok(None);
+        }
+        let mut borrowed: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
+            [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
+        for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
+            *slot = pattern.as_bytes();
+        }
+        self.build_ripgrep_standard_literal_bytes(
+            &borrowed[..patterns.len()],
+            canonical_source_limit,
+        )
+    }
+
+    fn build_ripgrep_standard_literal_bytes(
+        self,
+        patterns: &[&[u8]],
+        canonical_source_limit: usize,
+    ) -> Result<Option<PortableRegex>, BuildError> {
+        if !self.accepts_ripgrep_standard_literal_hir() {
+            return Ok(None);
+        }
+        let Some(context) = ripgrep_standard_literal_bytes_context(
+            patterns.len(),
+            |index| patterns.get(index).copied(),
+            self.limits,
+            canonical_source_limit,
+            true,
+        ) else {
+            return Ok(None);
+        };
+        let literal_bytes = usize::try_from(context.syntax.literal_bytes).map_err(|_| {
+            BuildError::InternalInvariant("ripgrep literal bytes do not fit usize")
+        })?;
+        if patterns.len() > self.limits.literal_set.max_patterns
+            || literal_bytes > self.limits.literal_set.max_pattern_bytes
+        {
+            return Ok(None);
+        }
+        // A flat alternation first spends two units declining the fixed-word
+        // predicate, then the finite extractor charges one root, two units per
+        // branch and one unit per literal byte. This is the exact incumbent
+        // receipt reproduced by the HIR handoff.
+        let planner_work = u64::try_from(patterns.len())
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|work| work.checked_add(context.syntax.literal_bytes))
+            .and_then(|work| work.checked_add(3));
+        let Some(planner_work) = planner_work else {
+            return Ok(None);
+        };
+        if planner_work > self.limits.max_planner_work {
+            return Ok(None);
+        }
+        let minimum_match_bytes = patterns.iter().map(|pattern| pattern.len()).min();
+        let source_storage_bytes = context.source.len();
+        let CaptureNameMetadata {
+            names: capture_names,
+            captures_len,
+            storage_bytes: capture_name_storage_bytes,
+        } = capture_free_name_metadata()?;
+        let profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        let publication = RipgrepFlatLiteralPublication {
+            source: context.source,
+            capture_names,
+            line_total_grep_plan: None,
+            profile,
+            admission: context.admission,
+            syntax: context.syntax,
+            source_storage_bytes,
+            capture_name_storage_bytes,
+            captures_len,
+            static_captures_len: Some(1),
+            minimum_match_bytes,
+        };
+        publish_ripgrep_borrowed_flat_literal_set(
+            &self,
+            patterns,
+            planner_work,
+            publication,
+        )
+        .map(Some)
     }
 
     fn accepts_ripgrep_standard_literal_hir(&self) -> bool {
@@ -27477,17 +27632,23 @@ mod tests {
 
     #[test]
     fn ripgrep_standard_literal_hir_skips_impossible_folded_tail_inspection() {
+        let patterns = (0..256_u16)
+            .map(|bits| {
+                String::from_utf8(
+                    (0..8)
+                        .map(|shift| {
+                            if bits & (1 << shift) == 0 { b'q' } else { b'z' }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("focused literals are UTF-8")
+            })
+            .collect::<Vec<_>>();
+        let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
         let hir = Hir::alternation(
-            (0..256_u16)
-                .map(|bits| {
-                    Hir::literal(
-                        (0..8)
-                            .map(|shift| {
-                                if bits & (1 << shift) == 0 { b'q' } else { b'z' }
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
+            patterns
+                .iter()
+                .map(|pattern| Hir::literal(pattern.as_bytes()))
                 .collect::<Vec<_>>(),
         );
         let built = PortableBuilder::new("")
@@ -27513,6 +27674,16 @@ mod tests {
         // two-pass finite task machine, and a class-free HIR also skips the
         // impossible folded-tail inspection.
         assert_eq!(report.planner_work, 2_563);
+        let raw = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literals(&pattern_refs, usize::MAX)
+            .expect("borrowed literal construction completes")
+            .expect("bounded standard literals are admitted");
+        assert_eq!(raw.as_str(), regex.as_str());
+        assert_eq!(raw.build_report(), regex.build_report());
+        assert_eq!(raw.find(b"xxqzqzzqzqyy"), regex.find(b"xxqzqzzqzqyy"));
+        assert_eq!(raw.find(b"xxxxxxxx"), regex.find(b"xxxxxxxx"));
         let exact = PortableBuilder::new("")
             .multi_line(true)
             .retained_find_iter(true)
@@ -27545,6 +27716,88 @@ mod tests {
             Some(Match { start: 2, end: 10 }),
         );
         assert_eq!(regex.find(b"xxxxxxxx"), None);
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_bytes_refuse_every_nonterminal_boundary() {
+        fn refs(patterns: &[String]) -> Vec<&str> {
+            patterns.iter().map(String::as_str).collect()
+        }
+
+        let standard = (0..129)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals(&refs(&standard[..128]), usize::MAX)
+                .expect("small-set refusal completes")
+                .is_none()
+        );
+        let oversized = (0..257)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals(&refs(&oversized), usize::MAX)
+                .expect("oversized-set refusal completes")
+                .is_none()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals(&vec!["x"; 129], usize::MAX)
+                .expect("smart-class refusal completes")
+                .is_none()
+        );
+
+        for replacement in ["", "meta.value", "line\nvalue"] {
+            let mut refused = standard.clone();
+            refused[17] = replacement.to_owned();
+            assert!(
+                PortableBuilder::new("")
+                    .multi_line(true)
+                    .build_ripgrep_standard_literals(&refs(&refused), usize::MAX)
+                    .expect("literal-value refusal completes")
+                    .is_none()
+            );
+        }
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .unicode(false)
+                .build_ripgrep_standard_literals(&refs(&standard), usize::MAX)
+                .expect("profile refusal completes")
+                .is_none()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals(&refs(&standard), 1)
+                .expect("source-limit refusal completes")
+                .is_none()
+        );
+        let mut finite_limits = BuildLimits::default();
+        finite_limits.literal_set.max_patterns = 128;
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(finite_limits)
+                .build_ripgrep_standard_literals(&refs(&standard), usize::MAX)
+                .expect("finite-limit refusal completes")
+                .is_none()
+        );
+        let mut planner_limits = BuildLimits::default();
+        planner_limits.max_planner_work = 0;
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(planner_limits)
+                .build_ripgrep_standard_literals(&refs(&standard), usize::MAX)
+                .expect("planner-limit refusal completes")
+                .is_none()
+        );
     }
 
     #[test]

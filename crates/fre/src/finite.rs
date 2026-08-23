@@ -1445,13 +1445,6 @@ impl<'hir> FlatLiteralSetHandoff<'hir> {
         &self.storage
     }
 
-    pub(crate) fn pattern_count(&self) -> usize {
-        match &self.storage {
-            FlatLiteralSetHandoffStorage::StackEligible(branches) => branches.len(),
-            FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => patterns.len(),
-        }
-    }
-
     pub(crate) const fn work(&self) -> u64 {
         self.receipt.actual.work
     }
