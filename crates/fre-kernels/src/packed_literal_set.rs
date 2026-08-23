@@ -2390,24 +2390,28 @@ fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
         .checked_add(native_start_budget)?;
 
     let fragment_end = best_offset.checked_add(best_width)?;
-    let selected_dispatch_offset = select_shared_fragment_dispatch_offset(
-        patterns,
-        minimum_pattern_width,
-        best_offset,
-        fragment_end,
-    );
-    let mut retained = Vec::with_capacity(retained_pattern_bytes);
-    for pattern in patterns {
-        let pattern = pattern.as_ref();
-        retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
-        retained.extend_from_slice(pattern);
-    }
     let incumbent_sidecar_bytes = size_of::<SharedFragment>()
         .checked_add(retained_pattern_bytes)?
         .checked_add(best_width)?;
     let dispatch_sidecar_bytes =
         incumbent_sidecar_bytes.checked_add(SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)?;
     let dispatch_fits = dispatch_sidecar_bytes <= maximum_sidecar_bytes;
+    let selected_dispatch_offset = if dispatch_fits {
+        select_shared_fragment_dispatch_offset(
+            patterns,
+            minimum_pattern_width,
+            best_offset,
+            fragment_end,
+        )
+    } else {
+        None
+    };
+    let mut retained = Vec::with_capacity(retained_pattern_bytes);
+    for pattern in patterns {
+        let pattern = pattern.as_ref();
+        retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
+        retained.extend_from_slice(pattern);
+    }
     let mut retained_dispatch = false;
     let mut maximum_dispatch_candidate_verification_work = 0_usize;
     let mut retained_dispatch_candidate_budget = 0_usize;
@@ -2497,6 +2501,8 @@ fn select_shared_fragment_dispatch_offset<P: AsRef<[u8]>>(
     fragment_start: usize,
     fragment_end: usize,
 ) -> Option<usize> {
+    #[cfg(test)]
+    shared_fragment_dispatch_selection_probe::record();
     if patterns.is_empty() {
         return None;
     }
@@ -2822,6 +2828,27 @@ mod shared_fragment_dispatch_allocation_probe {
 }
 
 #[cfg(test)]
+mod shared_fragment_dispatch_selection_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        CALLS.with(|calls| calls.set(calls.get().checked_add(1).unwrap()));
+    }
+
+    pub(super) fn reset() {
+        CALLS.with(|calls| calls.set(0));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BUILD_FACTOR, LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
@@ -2833,7 +2860,7 @@ mod tests {
         find_bounded_long_shared_fragment,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         search_work_upper_bound, select_shared_fragment, select_sparse_anchor,
-        shared_fragment_dispatch_allocation_probe,
+        shared_fragment_dispatch_allocation_probe, shared_fragment_dispatch_selection_probe,
         shared_fragment_native_start_budget,
     };
     #[cfg(not(feature = "static-dispatch"))]
@@ -5147,6 +5174,7 @@ mod tests {
         let incumbent_persistent = persistent
             .checked_sub(super::SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)
             .unwrap();
+        shared_fragment_dispatch_selection_probe::reset();
         let downgraded = PackedLiteralSetPlan::new(
             &patterns,
             PackedLiteralSetBuildLimits {
@@ -5175,6 +5203,8 @@ mod tests {
             downgraded.build_accounting().persistent_bytes,
             incumbent_persistent
         );
+        assert_eq!(shared_fragment_dispatch_selection_probe::calls(), 0);
+        shared_fragment_dispatch_selection_probe::reset();
         assert_eq!(
             PackedLiteralSetPlan::new(
                 &patterns,
@@ -5188,6 +5218,7 @@ mod tests {
             .persistent_bytes,
             incumbent_persistent
         );
+        assert_eq!(shared_fragment_dispatch_selection_probe::calls(), 0);
         assert!(matches!(
             PackedLiteralSetPlan::new(
                 &patterns,
