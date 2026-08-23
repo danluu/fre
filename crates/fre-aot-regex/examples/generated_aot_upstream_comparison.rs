@@ -4491,6 +4491,17 @@ fn option_byte(value: Option<u8>) -> i16 {
     value.map_or(-1, i16::from)
 }
 
+fn c_generation_flags(source_kind: &str) -> (u8, u8) {
+    (
+        match source_kind {
+            "nested_grammar_generated" => 1,
+            "atomic_choice_generated" => 2,
+            _ => 0,
+        },
+        u8::from(source_kind == "reverse_pair_generated"),
+    )
+}
+
 fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scenario]) -> String {
     let mut source = String::from(
         "#define _POSIX_C_SOURCE 200809L\n\
@@ -4513,6 +4524,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            exclusive_handle prepared; const unsigned char *fixture; size_t fixture_len;\n\
            const unsigned char *candidates; size_t candidate_len; int guard_before; int guard_after;\n\
            uint64_t seed; size_t generation_id; unsigned generated_distribution;\n\
+           unsigned reverse_pair_generated;\n\
          } shape_spec;\n\
          typedef struct {\n\
            const char *name; size_t shape; size_t length; size_t stride; unsigned near_miss; unsigned position;\n\
@@ -4552,6 +4564,8 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
     }
     source.push_str("\nstatic shape_spec shapes[] = {\n");
     for (index, shape) in shapes.iter().enumerate() {
+        let (generated_distribution, reverse_pair_generated) =
+            c_generation_flags(shape.spec.source_kind);
         let prepared_entry = shape.aot.module().prepared_entry_symbol();
         let direct = shape.aot.module().entry_symbol();
         let prepared_direct = prepared_entry.unwrap_or("NULL");
@@ -4561,14 +4575,10 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
             .map_or(("NULL", 0), |(symbol, bytes)| (symbol.as_str(), *bytes));
         writeln!(
             &mut source,
-            "  {{\"{}\", {direct}, {prepared_direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}}},",
+            "  {{\"{}\", {direct}, {prepared_direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}, {}}},",
             c_string(&shape.spec.name), option_byte(shape.spec.guard_before), option_byte(shape.spec.guard_after),
             shape.spec.seed, shape.spec.generation_id,
-            match shape.spec.source_kind {
-                "nested_grammar_generated" => 1_u8,
-                "atomic_choice_generated" => 2_u8,
-                _ => 0_u8,
-            },
+            generated_distribution, reverse_pair_generated,
         ).unwrap();
     }
     source.push_str("};\n\nstatic const scenario_spec scenarios[] = {\n");
@@ -4689,7 +4699,23 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
                haystack[index] = safe_bytes[safe_index];\n\
              }\n\
            }\n\
-           if (scenario->near_miss != 0U) {\n\
+           if (shape->reverse_pair_generated != 0U && scenario->near_miss != 0U) {\n\
+             size_t phase = (rotation * (17U + seed_component(shape->seed, 4U) % 16U) +\n\
+                 shape->generation_id * (23U + seed_component(shape->seed, 20U) % 16U) +\n\
+                 seed_component(shape->seed, 16U)) % scenario->stride;\n\
+             size_t step = scenario->stride > shape->candidate_len ? scenario->stride : shape->candidate_len;\n\
+             if (shape->candidate_len <= scenario->length)\n\
+               for (size_t index = phase; index <= scenario->length - shape->candidate_len; index += step)\n\
+                 memcpy(haystack + index, shape->candidates, shape->candidate_len);\n\
+           } else if (shape->reverse_pair_generated != 0U && scenario->stride != 0U) {\n\
+             size_t phase = (rotation * (17U + seed_component(shape->seed, 4U) % 16U) +\n\
+                 shape->generation_id * (23U + seed_component(shape->seed, 20U) % 16U) +\n\
+                 seed_component(shape->seed, 16U)) % scenario->stride;\n\
+             for (size_t index = phase; index < scenario->length; index += scenario->stride) {\n\
+               haystack[index] = shape->candidates[0];\n\
+               if (index + 1U < scenario->length) haystack[index + 1U] = (unsigned char)'~';\n\
+             }\n\
+           } else if (scenario->near_miss != 0U) {\n\
              size_t phase = (rotation * (17U + seed_component(shape->seed, 4U) % 16U) +\n\
                  shape->generation_id * (23U + seed_component(shape->seed, 20U) % 16U) +\n\
                  seed_component(shape->seed, 16U)) % scenario->stride;\n\
@@ -5989,6 +6015,25 @@ mod tests {
     use fre_aot_regex::compile;
 
     const UNSEEN_TEST_SEED: u64 = 0x510e_527f_ade6_82d1;
+
+    #[test]
+    fn c_harness_generation_kinds_cover_reverse_pair_density_rules() {
+        assert_eq!(c_generation_flags("nested_grammar_generated"), (1, 0));
+        assert_eq!(c_generation_flags("atomic_choice_generated"), (2, 0));
+        assert_eq!(c_generation_flags("reverse_pair_generated"), (0, 1));
+        assert_eq!(c_generation_flags("static"), (0, 0));
+
+        let source = build_c_harness(&flat_grammar_config(None), &[], &[]);
+        assert!(source.contains("unsigned reverse_pair_generated;"));
+        assert!(
+            source.contains("shape->reverse_pair_generated != 0U && scenario->near_miss != 0U")
+        );
+        assert!(source.contains("shape->reverse_pair_generated != 0U && scenario->stride != 0U"));
+        assert!(
+            source.contains("memcpy(haystack + index, shape->candidates, shape->candidate_len);")
+        );
+        assert!(source.contains("haystack[index + 1U] = (unsigned char)'~';"));
+    }
 
     #[test]
     fn reverse_pair_partition_and_restart_geometry_are_frozen() {
