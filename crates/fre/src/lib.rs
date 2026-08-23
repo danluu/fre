@@ -14504,8 +14504,9 @@ pub struct PortableSearchSession<'a> {
 /// uniform-standard literal-set owner retains one performance-only boolean
 /// saying that the immediately preceding endpoint or selected-span call
 /// observed a near acceptance. It retains neither that endpoint nor any source
-/// identity, and a miss, far acceptance, error, or span-iteration operation
-/// clears it.
+/// identity, and a miss, far acceptance, or error clears it. A following
+/// span-iteration or count operation may spend it on one bounded initial tail
+/// probe and always clears it before returning.
 #[derive(Debug)]
 pub struct PortableOrdinarySession<'a> {
     plan: PortableOrdinarySessionPlan<'a>,
@@ -20424,11 +20425,12 @@ impl<'r> PortableOrdinarySession<'r> {
                 executor,
                 direct_next,
             } => {
-                *direct_next = false;
+                let initial_direct = core::mem::take(direct_next);
                 let mut visitor = visitor;
-                executor.try_visit_spans_window_value(
+                executor.try_visit_spans_window_value_with_initial_direct(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
+                    initial_direct,
                     |(start, end)| visitor(Match { start, end }),
                 )
                 .map_err(SearchError::from)
@@ -20440,8 +20442,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Count selected positive-width matches at or after `start` using only
     /// their ordered endpoints.
     ///
-    /// `Ok(Some(count))` is returned for a positive-width K0 plan or a packed
-    /// literal-set plan, whose construction admits only nonempty literals.
+    /// `Ok(Some(count))` is returned for a positive-width K0 plan, a packed
+    /// literal-set plan, or a uniform-standard literal-set plan, whose
+    /// constructions admit only nonempty literals.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -20450,7 +20453,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Each successful search resumes at the selected endpoint. K0 reports a
     /// failure to advance despite its positive-width proof as an invariant
     /// error rather than risking an infinite loop. Packed literal sets use
-    /// their bound non-overlapping span iterator.
+    /// their bound non-overlapping span iterator. A uniform-standard literal
+    /// set consumes any preceding near-acceptance observation on the first
+    /// bounded tail probe and counts through its adaptive span visitor.
     ///
     /// # Errors
     ///
@@ -20497,10 +20502,28 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(Some)
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
-                direct_next, ..
+                executor,
+                direct_next,
             } => {
-                *direct_next = false;
-                Ok(None)
+                let initial_direct = core::mem::take(direct_next);
+                let mut count = 0_u64;
+                executor
+                    .try_visit_spans_window_value_with_initial_direct(
+                        haystack,
+                        LiteralWindow::new(start, haystack.len()),
+                        initial_direct,
+                        |_| {
+                            count = count.checked_add(1).ok_or(
+                                LiteralSetError::ArithmeticOverflow {
+                                    computation: "positive-width literal-set match count",
+                                },
+                            )?;
+                            Ok::<bool, LiteralSetError>(true)
+                        },
+                    )
+                    .map_err(SearchError::from)?
+                    .map_err(SearchError::from)?;
+                Ok(Some(count))
             }
             _ => Ok(None),
         }
@@ -39352,8 +39375,28 @@ mod tests {
         );
         assert!(!direct_next(&ordinary));
 
-        // Explicit span iteration and unsupported count projection clear the
-        // endpoint/one-span route observation before returning.
+        // Span iteration consumes a preceding near observation on its first
+        // bounded tail probe, then clears session-local evidence regardless
+        // of its callback outcome.
+        let seeded_tail = b"p000p001p002";
+        assert_eq!(
+            ordinary.find_at(seeded_tail, 0),
+            Ok(Some(Match { start: 0, end: 4 }))
+        );
+        assert!(direct_next(&ordinary));
+        let mut seeded_spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans_at(seeded_tail, 4, |matched| {
+                    seeded_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(seeded_spans, [(4, 8), (8, 12)]);
+        assert!(!direct_next(&ordinary));
+
         assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
         let mut spans = Vec::new();
         assert_eq!(
@@ -39402,11 +39445,29 @@ mod tests {
         assert!(!callback_called);
         assert!(!direct_next(&ordinary));
 
-        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        // Native count consumes the same seeded tail route and does not ask
+        // the embedding to retry with span iteration.
         assert_eq!(
-            ordinary.count_positive_width_selected_ends_at(near, usize::MAX),
-            Ok(None),
+            ordinary.find_at(seeded_tail, 0),
+            Ok(Some(Match { start: 0, end: 4 }))
         );
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(seeded_tail, 4),
+            Ok(Some(2)),
+        );
+        assert!(!direct_next(&ordinary));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(seeded_tail, 12),
+            Ok(Some(0)),
+        );
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(matches!(
+            ordinary.count_positive_width_selected_ends_at(near, usize::MAX),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::InvalidWindow { .. }
+            )),
+        ));
         assert!(!direct_next(&ordinary));
     }
 

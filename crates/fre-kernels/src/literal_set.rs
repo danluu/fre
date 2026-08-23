@@ -1529,6 +1529,37 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         &self,
         haystack: &[u8],
         window: Window,
+        visitor: F,
+    ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        self.try_visit_spans_window_value_with_initial_direct(
+            haystack,
+            window,
+            false,
+            visitor,
+        )
+    }
+
+    /// Visit every non-overlapping selected span, optionally spending a
+    /// caller-authenticated near-acceptance observation on the first bounded
+    /// direct probe.
+    ///
+    /// The observation affects only performance. A direct miss replays the
+    /// authoritative prefiltered search from the original cursor, exactly as
+    /// later locally promoted probes do.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_visit_spans_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_visit_spans_window_value_with_initial_direct<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        initial_direct: bool,
         mut visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
     where
@@ -1537,7 +1568,8 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         validate_window(window, haystack.len())?;
         let uniform_width = self.pattern_bytes();
         let mut cursor = window.start();
-        let mut direct_probe_bytes = None;
+        let mut direct_probe_bytes = initial_direct
+            .then(|| uniform_width.saturating_mul(8));
         loop {
             let search_start = cursor;
             let matched = if let Some(probe_bytes) = direct_probe_bytes {
@@ -4265,6 +4297,24 @@ mod tests {
                                 uniform_spans, expected_spans,
                                 "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
                             );
+
+                            let mut initially_direct_spans = Vec::new();
+                            assert_eq!(
+                                uniform.try_visit_spans_window_value_with_initial_direct(
+                                    &haystack,
+                                    window,
+                                    true,
+                                    |matched| {
+                                        initially_direct_spans.push(matched);
+                                        Ok::<bool, ()>(true)
+                                    },
+                                ),
+                                Ok(Ok(())),
+                            );
+                            assert_eq!(
+                                initially_direct_spans, expected_spans,
+                                "initial direct replay diverged: patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                            );
                         }
                     }
                 }
@@ -4437,6 +4487,52 @@ mod tests {
             Ok(Ok(())),
         );
         assert_eq!(ordinary_direct_probe::calls(), 0);
+
+        // An externally authenticated near predecessor may promote the first
+        // tail probe. A match crossing the 8W edge is recovered by canonical
+        // replay from the original tail cursor.
+        let mut crossing = vec![b'x'; 72];
+        crossing[57..65].copy_from_slice(&patterns[0]);
+        ordinary_direct_probe::reset();
+        let mut crossing_actual = Vec::new();
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
+                &crossing,
+                Window::full(&crossing),
+                true,
+                |matched| {
+                    crossing_actual.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(crossing_actual, [(57, 65)]);
+        assert_eq!(ordinary_direct_probe::calls(), 1);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
+                &far,
+                Window::full(&far),
+                true,
+                |_| Ok::<bool, ()>(false),
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 1);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value_with_initial_direct(
+                &far,
+                Window::full(&far),
+                true,
+                |_| Err::<bool, _>("callback"),
+            ),
+            Ok(Err("callback")),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 1);
 
         ordinary_direct_probe::reset();
         assert_eq!(
