@@ -183,15 +183,25 @@ checked state and are published only after the complete traversal.
 Count and SpanSum first attempt an additive shared ordered-many route for
 2..=4,096 rows. That route independently parses every source, preserves source
 order in one ordered-NFA program, and invokes one generated Count or SpanSum
-reducer per benchmark operation. It therefore removes the Rust per-row outer
-loop, but its V15 reducer deliberately retains semantic runtime helpers for
-prepared search, span fill, and scalar reduction. Provenance names this the
-`linked-shared-ordered-many-helper-backed-reducer` route. The census gives it a
-closed `semantic-helper-backed` boundary: it is useful integration plumbing,
-but it cannot enter the strict helper-free whole-operation-native numerator.
-Typed unsupported and byte-limit declines retain the independent-row
-incumbent; allocation, invariant, emission, and authentication failures remain
-terminal.
+reducer per benchmark operation. The exact combined raw plan first runs through
+the full ordinary optimizing portfolio. An authenticated `NativeFused`
+incumbent has zero required prepare capabilities and no unresolved relocation
+from the selected reducer or unresolved runtime symbol anywhere in the object;
+provenance names it
+`linked-shared-ordered-many-helper-free-reducer`, and the census admits it to
+the strict whole-operation-native numerator only after the ordinary oracle,
+semantic-helper traps, and selected-entry trap all agree.
+
+If the ordinary optimizer does not publish that exact helper-free reducer, the
+same semantic plan may retain the prepared V15 route. Its one-call reducer
+deliberately retains compatibility semantic helpers, so provenance continues
+to name it `linked-shared-ordered-many-helper-backed-reducer` and the census
+keeps its boundary `semantic-helper-backed`. Typed V15 unsupported and byte-
+limit declines retain the independent-row incumbent; allocation, invariant,
+emission, semantic-identity, and authentication failures remain terminal. An
+ordinary program/object representation cap may consult that same reported V15
+transaction, whose success, typed decline, or terminal error remains
+authoritative.
 
 The mixed bridge admits a prepared row only after exact receipt and linked
 symbol authentication: Ordered-NFA engine, native loop strategy, V15

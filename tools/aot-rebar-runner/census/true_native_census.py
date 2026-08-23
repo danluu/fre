@@ -39,6 +39,7 @@ PREPARED_V15_MAX_HANDLE_BYTES = 8 * 1024 * 1024
 PREPARED_V15_MAX_SCRATCH_BYTES = 8 * 1024 * 1024
 PREPARED_V15_MAX_SETUP_WORK = 2_000_000
 PREPARED_V15_CAPABILITY = 1
+PREPARED_V2_CONFIG_VERSION = 2
 PREPARED_V15_CONFIG_VERSION = 3
 PREPARED_V15_SPAN_OPERATION_FLAGS = 1 << 1
 PREPARED_V15_SPAN_SUM_OPERATION_FLAGS = 1 << 2
@@ -231,6 +232,10 @@ OPERATION_ROUTE_POLICIES = {
     "linked-shared-ordered-many-helper-backed-reducer": OperationRoutePolicy(
         OperationBoundary.SEMANTIC_HELPER_BACKED,
         "single-call-native-reducer-retains-semantic-runtime-helpers",
+    ),
+    "linked-shared-ordered-many-helper-free-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
     ),
 }
 NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES = {
@@ -1148,7 +1153,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
     ):
         raise CensusError("scalar provenance runtime symbol list is malformed")
     if fields["shared_ordered_many"] == "true":
-        shared_ordered_many_v15_proof(fields)
+        shared_ordered_many_proof(fields)
     else:
         source_count = parse_canonical_decimal(
             fields["source_pattern_count"], "scalar source_pattern_count", 1, 1
@@ -1399,6 +1404,104 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     }
 
 
+def shared_ordered_many_native_fused_proof(
+    fields: dict[str, str],
+) -> dict[str, object]:
+    """Authenticate one helper-free ordinary shared Count/SpanSum reducer."""
+    route = {
+        "count": (
+            "general-aot-shared-ordered-many-native-count-v1",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            "not-applicable",
+        ),
+        "count-spans": (
+            "general-aot-shared-ordered-many-native-span-sum-v1",
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
+            "linked-shared-ordered-many-native-span-sum-reducer-v1",
+        ),
+    }.get(fields.get("model"))
+    if route is None:
+        raise CensusError("shared NativeFused provenance has an unsupported model")
+    adapter, reducer_pattern, operation_flags, span_iteration = route
+    source_count = parse_canonical_decimal(
+        fields.get("source_pattern_count"),
+        "shared NativeFused source_pattern_count",
+        2,
+        MAX_NATIVE_ROW_COMPONENTS,
+    )
+    receipt_schema = parse_canonical_decimal(
+        fields.get("ordered_many_receipt_schema"),
+        "shared NativeFused receipt schema",
+        ORDERED_MANY_RECEIPT_VERSION,
+        ORDERED_MANY_RECEIPT_VERSION,
+    )
+    ordered_sources = fields.get("ordered_many_sources_sha256", "")
+    require_hex64(ordered_sources, "shared NativeFused source digest")
+    if ordered_sources == "0" * 64:
+        raise CensusError("shared NativeFused source digest is zero")
+    if (
+        fields.get("shared_ordered_many") != "true"
+        or fields.get("adapter") != adapter
+        or fields.get("aggregate_strategy") != "Some(NativeFused)"
+        or fields.get("span_iteration_strategy") != span_iteration
+        or fields.get("grep_iteration_strategy") != "not-applicable"
+        or fields.get("prepare_config_version") != str(PREPARED_V2_CONFIG_VERSION)
+        or fields.get("prepare_operation_flags") != f"{operation_flags:016x}"
+        or fields.get("required_prepare_capabilities") != f"{0:016x}"
+        or fields.get("max_start_filter_setup_work") != "100000000"
+        or fields.get("max_grep_count_workspace_bytes") != "67108864"
+        or fields.get("max_handle_bytes") != "0"
+        or fields.get("max_ordered_nfa_scratch_bytes") != "0"
+        or fields.get("max_ordered_nfa_setup_work") != "0"
+        or fields.get("required_runtime_symbols") != ""
+        or fields.get("boundary")
+        != "single-call-shared-ordered-many-helper-free-native-reducer"
+    ):
+        raise CensusError("shared NativeFused provenance has a noncanonical route or cap")
+    entry_suffix = symbol_identity_suffix(
+        fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
+        "shared NativeFused ordinary entry",
+    )
+    program_suffix = symbol_identity_suffix(
+        fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
+        "shared NativeFused runtime program",
+    )
+    reducer_suffix = symbol_identity_suffix(
+        fields["reducer_symbol"], reducer_pattern,
+        "shared NativeFused reducer",
+    )
+    bulk = fields.get("prepared_bulk_strategy")
+    span_fill = fields.get("span_fill_symbol", "")
+    if bulk == "None":
+        if span_fill:
+            raise CensusError("direct shared NativeFused route retains SpanFill")
+    elif bulk in {"Some(NativePreparedLoop)", "Some(NativeFrozenLoop)"}:
+        span_fill_suffix = symbol_identity_suffix(
+            span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+            "shared NativeFused SpanFill entry",
+        )
+        if len({entry_suffix, span_fill_suffix, program_suffix}) != 1:
+            raise CensusError("prepared shared NativeFused identities disagree")
+    else:
+        raise CensusError("shared NativeFused route has a non-native bulk strategy")
+    return {
+        "receipt_schema_version": receipt_schema,
+        "source_pattern_count": source_count,
+        "ordered_sources_sha256": ordered_sources,
+        "required_prepare_capabilities": 0,
+        "prepare_config_version": PREPARED_V2_CONFIG_VERSION,
+        "prepare_operation_flags": operation_flags,
+        "max_handle_bytes": 0,
+        "max_scratch_bytes": 0,
+        "max_setup_work": 0,
+        "runtime_program_len": int(fields["program_len"], 10),
+        "artifact_identity_sha256": entry_suffix,
+        "reducer_identity_sha256": reducer_suffix,
+    }
+
+
 def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     """Authenticate one combined multi-source native Count/SpanSum reducer."""
     route = {
@@ -1499,6 +1602,16 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         "artifact_identity_sha256": entry_suffix,
         "reducer_identity_sha256": reducer_suffix,
     }
+
+
+def shared_ordered_many_proof(fields: dict[str, str]) -> dict[str, object]:
+    """Authenticate the exact ordinary or V15 shared reducer variant."""
+    strategy = fields.get("aggregate_strategy")
+    if strategy == "Some(NativeFused)":
+        return shared_ordered_many_native_fused_proof(fields)
+    if strategy == "Some(NativeOrderedNfaFused)":
+        return shared_ordered_many_v15_proof(fields)
+    raise CensusError("shared ordered-many provenance has an unknown aggregate strategy")
 
 
 def component_field(fields: dict[str, str], index: int, suffixes: tuple[str, ...]) -> str:
@@ -2576,10 +2689,13 @@ def run_nm(nm: str, binary: pathlib.Path) -> tuple[set[str], set[str], set[str],
 def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], str]:
     model = provenance["model"]
     if provenance.get("shared_ordered_many") == "true":
-        shared_ordered_many_v15_proof(provenance)
-        return [provenance["reducer_symbol"]], (
-            "linked-shared-ordered-many-helper-backed-reducer"
+        shared_ordered_many_proof(provenance)
+        route = (
+            "linked-shared-ordered-many-helper-free-reducer"
+            if provenance.get("aggregate_strategy") == "Some(NativeFused)"
+            else "linked-shared-ordered-many-helper-backed-reducer"
         )
+        return [provenance["reducer_symbol"]], route
     components = components_from_provenance(provenance)
     if components:
         entries = [str(component["entry_symbol"]) for component in components]
@@ -2840,7 +2956,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             else None
         )
         shared_proof = (
-            shared_ordered_many_v15_proof(fields) if shared_ordered_many else None
+            shared_ordered_many_proof(fields) if shared_ordered_many else None
         )
         source_pattern_count = (
             int(fields["source_pattern_count"], 10) if shared_ordered_many else None
@@ -3009,7 +3125,12 @@ def operation_route_from_provenance_record(
         reducer = provenance.get("reducer_symbol")
         if not isinstance(reducer, str):
             raise CensusError("normalized shared ordered-many reducer is absent")
-        return [reducer], "linked-shared-ordered-many-helper-backed-reducer"
+        route = (
+            "linked-shared-ordered-many-helper-free-reducer"
+            if provenance.get("aggregate_strategy") == "Some(NativeFused)"
+            else "linked-shared-ordered-many-helper-backed-reducer"
+        )
+        return [reducer], route
     components = provenance["components"]
     if components:
         entries = [component["entry_symbol"] for component in components]
@@ -3159,6 +3280,7 @@ def identity_defined_symbols_from_provenance(
             provenance.get("entry_symbol"), provenance.get("span_fill_symbol"),
             provenance.get("program_symbol"),
         ]
+        symbols = [symbol for symbol in symbols if symbol]
         if not all(isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in symbols):
             raise CensusError("shared ordered-many identity symbol set is malformed")
         return sorted(symbols)
@@ -4175,6 +4297,28 @@ def validate_normalized_shared_ordered_many(
     if route is None:
         raise CensusError(f"{context} has an unsupported shared model")
     adapter, span_iteration, operation_flags, runtime_symbols, reducer_pattern = route
+    native_fused = provenance.get("aggregate_strategy") == "Some(NativeFused)"
+    if native_fused:
+        bulk = provenance.get("prepared_bulk_strategy")
+        variant_topology = (
+            provenance.get("boundary")
+            == "single-call-shared-ordered-many-helper-free-native-reducer"
+            and provenance.get("required_runtime_symbols") == []
+            and bulk in {
+                "None", "Some(NativePreparedLoop)", "Some(NativeFrozenLoop)",
+            }
+        )
+    else:
+        variant_topology = (
+            provenance.get("boundary")
+            == "single-call-shared-ordered-many-helper-backed-reducer"
+            and provenance.get("engine") == "OrderedNfa"
+            and provenance.get("aggregate_strategy")
+            == "Some(NativeOrderedNfaFused)"
+            and provenance.get("prepared_bulk_strategy")
+            == "Some(NativeOrderedNfaLoop)"
+            and provenance.get("required_runtime_symbols") == list(runtime_symbols)
+        )
     source_count = proof.get("source_pattern_count")
     source_map = provenance.get("source_to_artifact")
     if (
@@ -4183,13 +4327,7 @@ def validate_normalized_shared_ordered_many(
         or provenance.get("composite_kind")
         != "shared-ordered-many-native-reducer-v1"
         or provenance.get("adapter") != adapter
-        or provenance.get("boundary")
-        != "single-call-shared-ordered-many-helper-backed-reducer"
-        or provenance.get("engine") != "OrderedNfa"
-        or provenance.get("aggregate_strategy")
-        != "Some(NativeOrderedNfaFused)"
-        or provenance.get("prepared_bulk_strategy")
-        != "Some(NativeOrderedNfaLoop)"
+        or not variant_topology
         or provenance.get("span_iteration_strategy") != span_iteration
         or provenance.get("grep_iteration_strategy") != "not-applicable"
         or not isinstance(source_count, int)
@@ -4200,7 +4338,6 @@ def validate_normalized_shared_ordered_many(
         or provenance.get("row_total_object_bytes") is not None
         or provenance.get("uniform_capture") is not None
         or provenance.get("components") != []
-        or provenance.get("required_runtime_symbols") != list(runtime_symbols)
     ):
         raise CensusError(f"{context} shared ordered-many topology differs")
     entry = provenance.get("entry_symbol")
@@ -4210,35 +4347,48 @@ def validate_normalized_shared_ordered_many(
     if not all(isinstance(value, str) for value in (entry, span_fill, program, reducer)):
         raise CensusError(f"{context} shared ordered-many symbols are malformed")
     entry_suffix = symbol_identity_suffix(entry, NATIVE_SEARCH_ENTRY_SYMBOL, context)
-    span_fill_suffix = symbol_identity_suffix(
-        span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context
-    )
     program_suffix = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context
     )
     reducer_suffix = symbol_identity_suffix(reducer, reducer_pattern, context)
+    if native_fused and provenance.get("prepared_bulk_strategy") == "None":
+        symbol_shape_is_exact = span_fill == ""
+    else:
+        span_fill_suffix = symbol_identity_suffix(
+            span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context
+        )
+        symbol_shape_is_exact = (
+            len({entry_suffix, span_fill_suffix, program_suffix}) == 1
+            and (native_fused or reducer_suffix != entry_suffix)
+        )
     for field in ("ordered_sources_sha256", "artifact_identity_sha256", "reducer_identity_sha256"):
         value = proof.get(field)
         if not isinstance(value, str):
             raise CensusError(f"{context} {field} is malformed")
         require_hex64(value, f"{context} {field}")
     runtime_program_len = proof.get("runtime_program_len")
+    expected_capabilities = 0 if native_fused else PREPARED_V15_CAPABILITY
+    expected_config = (
+        PREPARED_V2_CONFIG_VERSION if native_fused else PREPARED_V15_CONFIG_VERSION
+    )
+    expected_handle = 0 if native_fused else PREPARED_V15_MAX_HANDLE_BYTES
+    expected_scratch = 0 if native_fused else PREPARED_V15_MAX_SCRATCH_BYTES
+    expected_setup = 0 if native_fused else PREPARED_V15_MAX_SETUP_WORK
     if (
         proof.get("receipt_schema_version") != ORDERED_MANY_RECEIPT_VERSION
-        or proof.get("required_prepare_capabilities") != PREPARED_V15_CAPABILITY
-        or proof.get("prepare_config_version") != PREPARED_V15_CONFIG_VERSION
+        or proof.get("required_prepare_capabilities") != expected_capabilities
+        or proof.get("prepare_config_version") != expected_config
         or proof.get("prepare_operation_flags") != operation_flags
-        or proof.get("max_handle_bytes") != PREPARED_V15_MAX_HANDLE_BYTES
-        or proof.get("max_scratch_bytes") != PREPARED_V15_MAX_SCRATCH_BYTES
-        or proof.get("max_setup_work") != PREPARED_V15_MAX_SETUP_WORK
+        or proof.get("max_handle_bytes") != expected_handle
+        or proof.get("max_scratch_bytes") != expected_scratch
+        or proof.get("max_setup_work") != expected_setup
         or proof.get("ordered_sources_sha256") == "0" * 64
         or not isinstance(runtime_program_len, int)
         or isinstance(runtime_program_len, bool)
         or not 1 <= runtime_program_len <= MAX_SERIALIZED_PROGRAM_BYTES
         or proof.get("artifact_identity_sha256") != entry_suffix
         or proof.get("reducer_identity_sha256") != reducer_suffix
-        or len({entry_suffix, span_fill_suffix, program_suffix}) != 1
-        or reducer_suffix == entry_suffix
+        or not symbol_shape_is_exact
     ):
         raise CensusError(f"{context} shared ordered-many proof differs")
 

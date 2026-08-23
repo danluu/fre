@@ -467,6 +467,7 @@ def native_uniform_capture_provenance_fields(
 
 def shared_ordered_many_provenance_fields(
     model: str = "count",
+    native_fused: bool = False,
 ) -> dict[str, str]:
     native_identity = "a" * 64
     aggregate_identity = "b" * 64
@@ -486,6 +487,33 @@ def shared_ordered_many_provenance_fields(
         )
     else:
         raise AssertionError(f"unsupported synthetic shared model {model!r}")
+    if native_fused:
+        engine = "OrderedDfa"
+        aggregate_strategy = "Some(NativeFused)"
+        prepared_bulk_strategy = "None"
+        prepare_config_version = CENSUS.PREPARED_V2_CONFIG_VERSION
+        required_prepare_capabilities = 0
+        max_handle_bytes = 0
+        max_scratch_bytes = 0
+        max_setup_work = 0
+        span_fill_symbol = ""
+        runtime_symbols = ()
+        boundary = (
+            "single-call-shared-ordered-many-helper-free-native-reducer"
+        )
+    else:
+        engine = "OrderedNfa"
+        aggregate_strategy = "Some(NativeOrderedNfaFused)"
+        prepared_bulk_strategy = "Some(NativeOrderedNfaLoop)"
+        prepare_config_version = CENSUS.PREPARED_V15_CONFIG_VERSION
+        required_prepare_capabilities = CENSUS.PREPARED_V15_CAPABILITY
+        max_handle_bytes = CENSUS.PREPARED_V15_MAX_HANDLE_BYTES
+        max_scratch_bytes = CENSUS.PREPARED_V15_MAX_SCRATCH_BYTES
+        max_setup_work = CENSUS.PREPARED_V15_MAX_SETUP_WORK
+        span_fill_symbol = (
+            f"fre_aot_regex_fill_spans_exclusive_v1_{native_identity}"
+        )
+        boundary = "single-call-shared-ordered-many-helper-backed-reducer"
     return {
         "schema": "fre.aot.rebar-runner.v2",
         "disposition": "executed",
@@ -499,31 +527,27 @@ def shared_ordered_many_provenance_fields(
         "feature_bits": "0000000100000000",
         "compiler_version": "1",
         "optimizer_version": "1",
-        "engine": "OrderedNfa",
-        "aggregate_strategy": "Some(NativeOrderedNfaFused)",
-        "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+        "engine": engine,
+        "aggregate_strategy": aggregate_strategy,
+        "prepared_bulk_strategy": prepared_bulk_strategy,
         "span_iteration_strategy": span_iteration,
         "grep_iteration_strategy": "not-applicable",
         "shared_ordered_many": "true",
         "source_pattern_count": "3",
         "ordered_many_receipt_schema": str(CENSUS.ORDERED_MANY_RECEIPT_VERSION),
         "ordered_many_sources_sha256": "c" * 64,
-        "prepare_config_version": str(CENSUS.PREPARED_V15_CONFIG_VERSION),
+        "prepare_config_version": str(prepare_config_version),
         "prepare_operation_flags": f"{operation_flags:016x}",
         "required_prepare_capabilities": (
-            f"{CENSUS.PREPARED_V15_CAPABILITY:016x}"
+            f"{required_prepare_capabilities:016x}"
         ),
         "prepare_scope": "runtime-handle-state",
         "object_descriptor_setup": "authenticated-v3-when-required",
         "max_start_filter_setup_work": "100000000",
         "max_grep_count_workspace_bytes": "67108864",
-        "max_handle_bytes": str(CENSUS.PREPARED_V15_MAX_HANDLE_BYTES),
-        "max_ordered_nfa_scratch_bytes": str(
-            CENSUS.PREPARED_V15_MAX_SCRATCH_BYTES
-        ),
-        "max_ordered_nfa_setup_work": str(
-            CENSUS.PREPARED_V15_MAX_SETUP_WORK
-        ),
+        "max_handle_bytes": str(max_handle_bytes),
+        "max_ordered_nfa_scratch_bytes": str(max_scratch_bytes),
+        "max_ordered_nfa_setup_work": str(max_setup_work),
         "program_sha256": "d" * 64,
         "object_sha256": "e" * 64,
         "program_symbol": (
@@ -532,11 +556,9 @@ def shared_ordered_many_provenance_fields(
         "program_len": "4096",
         "entry_symbol": f"fre_aot_regex_search_v1_{native_identity}",
         "reducer_symbol": reducer,
-        "span_fill_symbol": (
-            f"fre_aot_regex_fill_spans_exclusive_v1_{native_identity}"
-        ),
+        "span_fill_symbol": span_fill_symbol,
         "required_runtime_symbols": ",".join(runtime_symbols),
-        "boundary": "single-call-shared-ordered-many-helper-backed-reducer",
+        "boundary": boundary,
         "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
     }
 
@@ -1732,8 +1754,10 @@ class TrueNativeCensusTests(unittest.TestCase):
 
     def test_shared_ordered_many_closes_one_reducer_route_and_receipt(self) -> None:
         for model in ("count", "count-spans"):
-            with self.subTest(model=model):
-                fields = shared_ordered_many_provenance_fields(model)
+            for native_fused in (False, True):
+                fields = shared_ordered_many_provenance_fields(
+                    model, native_fused=native_fused
+                )
                 encoded = " ".join(
                     f"{key}={value}" for key, value in fields.items()
                 ).encode()
@@ -1749,36 +1773,42 @@ class TrueNativeCensusTests(unittest.TestCase):
                 )
                 self.assertEqual(receipt["source_pattern_count"], 3)
                 self.assertEqual(receipt["source_to_artifact"], [0, 0, 0])
+                expected_route = (
+                    "linked-shared-ordered-many-helper-free-reducer"
+                    if native_fused
+                    else "linked-shared-ordered-many-helper-backed-reducer"
+                )
                 self.assertEqual(
                     CENSUS.operation_route_from_provenance_record(receipt),
-                    (
-                        [fields["reducer_symbol"]],
-                        "linked-shared-ordered-many-helper-backed-reducer",
-                    ),
+                    ([fields["reducer_symbol"]], expected_route),
                 )
+                identity_symbols = [
+                    fields["entry_symbol"], fields["program_symbol"],
+                ]
+                if fields["span_fill_symbol"]:
+                    identity_symbols.append(fields["span_fill_symbol"])
                 self.assertEqual(
                     CENSUS.identity_defined_symbols_from_provenance(receipt),
-                    sorted([
-                        fields["entry_symbol"], fields["span_fill_symbol"],
-                        fields["program_symbol"],
-                    ]),
+                    sorted(identity_symbols),
                 )
-                # This is a one-call route, but the V15 compatibility surface
-                # remains subject to the independent semantic-helper trap. A
-                # dedicated route name does not waive that phase.
                 helpers = CENSUS.semantic_helper_symbols(
                     set(receipt["required_runtime_symbols"])
                 )
-                self.assertTrue(helpers)
-                self.assertIn(
-                    "fre_aot_regex_runtime_search_exclusive_v1", helpers
-                )
+                if native_fused:
+                    self.assertEqual(helpers, [])
+                else:
+                    # V15 remains subject to the independent semantic-helper
+                    # trap even though its reducer is called only once.
+                    self.assertTrue(helpers)
+                    self.assertIn(
+                        "fre_aot_regex_runtime_search_exclusive_v1", helpers
+                    )
 
                 synthetic = synthetic_qualification_receipt(synthetic_plan())
                 classification = CENSUS.classification_from_qualification_evidence(
                     True,
                     synthetic["route"]["operation_entry_symbols"],
-                    "linked-shared-ordered-many-helper-backed-reducer",
+                    expected_route,
                     [],
                     synthetic["phases"],
                     "aarch64",
@@ -1787,12 +1817,17 @@ class TrueNativeCensusTests(unittest.TestCase):
                     classification["native_search_core_authenticated"]
                 )
                 self.assertFalse(classification["adapter_outer_loop"])
-                self.assertFalse(
-                    classification["whole_operation_native_authenticated"]
+                self.assertEqual(
+                    classification["whole_operation_native_authenticated"],
+                    native_fused,
                 )
                 self.assertEqual(
                     classification["reason"],
-                    "single-call-native-reducer-retains-semantic-runtime-helpers",
+                    (
+                        "whole-operation-native-authenticated"
+                        if native_fused
+                        else "single-call-native-reducer-retains-semantic-runtime-helpers"
+                    ),
                 )
 
         fields = shared_ordered_many_provenance_fields("count")
@@ -1829,6 +1864,41 @@ class TrueNativeCensusTests(unittest.TestCase):
                 receipt["phases"],
                 "aarch64",
             )
+
+    def test_helper_free_shared_route_rejects_helpers_and_accepts_prepared_bulk(self) -> None:
+        helper_free = shared_ordered_many_provenance_fields(
+            "count", native_fused=True
+        )
+        helper_free["required_runtime_symbols"] = (
+            "fre_aot_regex_runtime_search_v1"
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in helper_free.items()
+                ).encode()
+            )
+
+        prepared_helper_free = shared_ordered_many_provenance_fields(
+            "count-spans", native_fused=True
+        )
+        prepared_helper_free["prepared_bulk_strategy"] = (
+            "Some(NativePreparedLoop)"
+        )
+        prepared_helper_free["span_fill_symbol"] = (
+            f"fre_aot_regex_fill_spans_exclusive_v1_{'a' * 64}"
+        )
+        prepared_receipt = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}"
+                    for key, value in prepared_helper_free.items()
+                ).encode()
+            )
+        )
+        CENSUS.validate_provenance_record(
+            prepared_receipt, "synthetic prepared helper-free shared route"
+        )
 
     def test_mixed_prepared_v15_rows_close_each_component_and_engine(self) -> None:
         fields = mixed_prepared_grep_provenance_fields()
