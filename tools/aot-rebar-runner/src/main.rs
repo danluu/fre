@@ -873,21 +873,59 @@ fn strict_uniform_capture_reduce(model: shared::Model, haystack: &[u8]) -> Resul
     unsafe_code,
     reason = "the generated whole-operation reducer is the exact authenticated statically linked C ABI boundary"
 )]
-fn strict_single_capture_reducer_reduce(haystack: &[u8]) -> Result<u64, String> {
-    strict_single_capture_reducer_reduce_with(haystack, |haystack, haystack_len, value_out| {
-        // SAFETY: the caller establishes the linked ABI's readable haystack
-        // and writable output obligations for this one invocation.
-        unsafe { linked::capture_reduce(haystack, haystack_len, value_out) }
-    })
+fn strict_single_capture_reducer_reduce(
+    haystack: &[u8],
+    scratch: &mut [u64],
+) -> Result<u64, String> {
+    strict_single_capture_reducer_reduce_with(
+        haystack,
+        scratch,
+        linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES,
+        |haystack, haystack_len, scratch, scratch_len, value_out| {
+            // SAFETY: the caller establishes the linked ABI's readable haystack
+            // plus exact writable scratch/output obligations for this invocation.
+            unsafe {
+                linked::capture_reduce(
+                    haystack,
+                    haystack_len,
+                    scratch,
+                    scratch_len,
+                    value_out,
+                )
+            }
+        },
+    )
 }
 
 fn strict_single_capture_reducer_reduce_with(
     haystack: &[u8],
-    invoke: impl FnOnce(*const u8, usize, *mut u64) -> u32,
+    scratch: &mut [u64],
+    caller_scratch_bytes: usize,
+    invoke: impl FnOnce(*const u8, usize, *mut u8, usize, *mut u64) -> u32,
 ) -> Result<u64, String> {
     const TRANSACTION_SENTINEL: u64 = 0x7265_6261_722d_7231;
+    let scratch_len = scratch
+        .len()
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or_else(|| "single-capture reducer scratch extent overflowed".to_owned())?;
+    if caller_scratch_bytes % fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN != 0
+        || scratch_len != caller_scratch_bytes
+    {
+        return Err("single-capture reducer caller scratch disagrees with its receipt".to_owned());
+    }
+    let scratch_pointer = if scratch.is_empty() {
+        core::ptr::null_mut()
+    } else {
+        scratch.as_mut_ptr().cast::<u8>()
+    };
     let mut value = TRANSACTION_SENTINEL;
-    let status = invoke(haystack.as_ptr(), haystack.len(), &raw mut value);
+    let status = invoke(
+        haystack.as_ptr(),
+        haystack.len(),
+        scratch_pointer,
+        scratch_len,
+        &raw mut value,
+    );
     if status != STATUS_SUCCESS {
         if value != TRANSACTION_SENTINEL {
             return Err(format!(
@@ -1495,7 +1533,7 @@ fn print_provenance() {
         let mut provenance = String::new();
         write!(
             &mut provenance,
-            "schema=fre.aot.rebar-runner.v5 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=false capture_reducer_bridge=true source_pattern_count={} operation={} domain={} source_route={} source_cardinality={} source_bytes={} source_pattern_sha256={} source_sha256={} group_count={} can_match_empty={} empty_progress=byte semantic_runtime_calls={} private_participation_scratch_bytes={} private_iterator_state_bytes={} private_result_slot_count={} private_result_slot_bytes={} selector_sha256={} capture_sha256={} source_artifact_identity_sha256={} source_object_sha256={} reducer_symbol={} reducer_symbol_sha256={} object_sha256={} object_bytes={} max_object_bytes={} artifact_identity_sha256={} required_runtime_symbols= operation_entry_symbol={}",
+            "schema=fre.aot.rebar-runner.v5 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=false capture_reducer_bridge=true source_pattern_count={} operation={} domain={} source_route={} source_cardinality={} source_bytes={} source_pattern_sha256={} source_sha256={} group_count={} can_match_empty={} empty_progress=byte semantic_runtime_calls={} caller_scratch_bytes={} private_participation_scratch_bytes={} private_iterator_state_bytes={} private_result_slot_count={} private_result_slot_bytes={} selector_sha256={} capture_sha256={} source_artifact_identity_sha256={} source_object_sha256={} reducer_symbol={} reducer_symbol_sha256={} object_sha256={} object_bytes={} max_object_bytes={} artifact_identity_sha256={} required_runtime_symbols= operation_entry_symbol={}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1520,6 +1558,7 @@ fn print_provenance() {
             linked::SINGLE_CAPTURE_REDUCER_GROUP_COUNT,
             linked::SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY,
             linked::SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS,
+            linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES,
             linked::SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES,
             linked::SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES,
             linked::SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT,
@@ -1540,7 +1579,7 @@ fn print_provenance() {
         match linked::SINGLE_CAPTURE_REDUCER_SOURCE_ROUTE {
             1 => write!(
                 &mut provenance,
-                " participation_algorithm_id={} participation_strategy={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} participation_selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_bundle_symbol={} participation_selector_symbol={} participation_entry_symbol={}",
+                " participation_algorithm_id={} participation_strategy={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_ordered_nfa_states={} participation_ordered_nfa_byte_ranges={} participation_dfa_fallback_resource={} participation_dfa_fallback_required={} participation_dfa_fallback_limit={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} participation_selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_bundle_symbol={} participation_selector_symbol={} participation_entry_symbol={}",
                 linked::PARTICIPATION_ALGORITHM_ID,
                 linked::PARTICIPATION_STRATEGY,
                 linked::PARTICIPATION_ASSERTIONS,
@@ -1548,6 +1587,11 @@ fn print_provenance() {
                 linked::PARTICIPATION_BYTE_CLASSES,
                 linked::PARTICIPATION_DFA_STATES,
                 linked::PARTICIPATION_TRANSITION_CELLS,
+                linked::PARTICIPATION_ORDERED_NFA_STATES,
+                linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES,
+                linked::PARTICIPATION_DFA_FALLBACK_RESOURCE,
+                linked::PARTICIPATION_DFA_FALLBACK_REQUIRED,
+                linked::PARTICIPATION_DFA_FALLBACK_LIMIT,
                 linked::PARTICIPATION_BUILD_WORK,
                 linked::PARTICIPATION_SCRATCH_BYTES,
                 linked::PARTICIPATION_PLAN_BYTES,
@@ -1604,8 +1648,13 @@ fn print_provenance() {
         return;
     }
     if linked::PARTICIPATION_CAPTURE_BRIDGE {
+        let capture_resolution = if matches!(linked::PARTICIPATION_STRATEGY, 4 | 5) {
+            "native-exact-span-participation-ordered-nfa-v1"
+        } else {
+            "native-exact-span-participation-dfa-v1"
+        };
         println!(
-            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-exact-span-participation-dfa-v1 capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators={required_comparators} {validation_binding}",
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution={} capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_ordered_nfa_states={} participation_ordered_nfa_byte_ranges={} participation_dfa_fallback_resource={} participation_dfa_fallback_required={} participation_dfa_fallback_limit={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators={required_comparators} {validation_binding}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1623,6 +1672,7 @@ fn print_provenance() {
             linked::PARTICIPATION_SELECTOR_SYMBOL,
             hex(&linked::PARTICIPATION_CAPTURE_SHA256),
             hex(&linked::PARTICIPATION_OBJECT_SHA256),
+            capture_resolution,
             linked::PARTICIPATION_GROUP_COUNT,
             linked::PARTICIPATION_ALGORITHM_ID,
             linked::PARTICIPATION_STRATEGY,
@@ -1632,6 +1682,11 @@ fn print_provenance() {
             linked::PARTICIPATION_BYTE_CLASSES,
             linked::PARTICIPATION_DFA_STATES,
             linked::PARTICIPATION_TRANSITION_CELLS,
+            linked::PARTICIPATION_ORDERED_NFA_STATES,
+            linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES,
+            linked::PARTICIPATION_DFA_FALLBACK_RESOURCE,
+            linked::PARTICIPATION_DFA_FALLBACK_REQUIRED,
+            linked::PARTICIPATION_DFA_FALLBACK_LIMIT,
             linked::PARTICIPATION_BUILD_WORK,
             linked::PARTICIPATION_SCRATCH_BYTES,
             linked::PARTICIPATION_PLAN_BYTES,
@@ -1976,6 +2031,11 @@ fn participation_capture_source_provenance_is_empty() -> bool {
         && linked::PARTICIPATION_BYTE_CLASSES == 0
         && linked::PARTICIPATION_DFA_STATES == 0
         && linked::PARTICIPATION_TRANSITION_CELLS == 0
+        && linked::PARTICIPATION_ORDERED_NFA_STATES == 0
+        && linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES == 0
+        && linked::PARTICIPATION_DFA_FALLBACK_RESOURCE == 0
+        && linked::PARTICIPATION_DFA_FALLBACK_REQUIRED == 0
+        && linked::PARTICIPATION_DFA_FALLBACK_LIMIT == 0
         && linked::PARTICIPATION_BUILD_WORK == 0
         && linked::PARTICIPATION_SCRATCH_BYTES == 0
         && linked::PARTICIPATION_PLAN_BYTES == 0
@@ -2002,6 +2062,7 @@ fn single_capture_reducer_provenance_is_empty() -> bool {
         && linked::SINGLE_CAPTURE_REDUCER_GROUP_COUNT == 0
         && !linked::SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY
         && linked::SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS == 0
+        && linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES == 0
         && linked::SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES == 0
         && linked::SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES == 0
         && linked::SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT == 0
@@ -2030,12 +2091,20 @@ fn authenticate_linked_single_capture_reducer_route(
         return Ok(false);
     }
 
+    let ordered_participation = matches!(linked::PARTICIPATION_STRATEGY, 4 | 5);
     let (operation, domain, reducer_prefix, adapter) = match benchmark.model {
         shared::Model::CountCaptures => (
             1_u8,
             1_u8,
-            "fre_aot_regex_count_captures_v1_",
+            if ordered_participation {
+                "fre_aot_regex_count_captures_scratch_v1_"
+            } else {
+                "fre_aot_regex_count_captures_v1_"
+            },
             match linked::SINGLE_CAPTURE_REDUCER_SOURCE_ROUTE {
+                1 if ordered_participation => {
+                    "general-aot-native-exact-span-ordered-nfa-participation-count-reducer-v1"
+                }
                 1 => "general-aot-native-exact-span-participation-count-reducer-v1",
                 2 => "general-aot-native-single-capture-next-count-reducer-v1",
                 _ => {
@@ -2048,8 +2117,15 @@ fn authenticate_linked_single_capture_reducer_route(
         shared::Model::GrepCaptures => (
             2_u8,
             2_u8,
-            "fre_aot_regex_grep_captures_v1_",
+            if ordered_participation {
+                "fre_aot_regex_grep_captures_scratch_v1_"
+            } else {
+                "fre_aot_regex_grep_captures_v1_"
+            },
             match linked::SINGLE_CAPTURE_REDUCER_SOURCE_ROUTE {
+                1 if ordered_participation => {
+                    "general-aot-native-exact-span-ordered-nfa-participation-grep-reducer-v1"
+                }
                 1 => "general-aot-native-exact-span-participation-grep-reducer-v1",
                 2 => "general-aot-native-single-capture-next-grep-reducer-v1",
                 _ => {
@@ -2123,6 +2199,9 @@ fn authenticate_linked_single_capture_reducer_route(
         || linked::SINGLE_CAPTURE_REDUCER_GROUP_COUNT == 0
         || linked::SINGLE_CAPTURE_REDUCER_GROUP_COUNT > shared::MAX_STRICT_CAPTURE_GROUPS
         || linked::SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS != 0
+        || !linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES.is_multiple_of(
+            fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
+        )
         || linked::SINGLE_CAPTURE_REDUCER_OBJECT_BYTES == 0
         || linked::SINGLE_CAPTURE_REDUCER_MAX_OBJECT_BYTES
             != shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
@@ -2189,10 +2268,64 @@ fn authenticate_linked_single_capture_reducer_route(
 }
 
 fn authenticate_linked_participation_reducer_source() -> Result<(), String> {
-    let expected_strategy = match linked::TARGET_ARCH {
-        "x86_64" => 1,
-        "aarch64" => 2,
+    let ordered_nfa = match (linked::TARGET_ARCH, linked::PARTICIPATION_STRATEGY) {
+        ("x86_64", 1) | ("aarch64", 2) => false,
+        ("x86_64", 4) | ("aarch64", 5) => true,
+        ("x86_64" | "aarch64", _) => {
+            return Err("participation reducer strategy disagrees with its target".to_owned());
+        }
         _ => return Err("participation reducer has an unsupported architecture".to_owned()),
+    };
+    let expected_algorithm = if ordered_nfa {
+        fre_aot_regex::NATIVE_PARTICIPATION_ORDERED_NFA_V1_ALGORITHM_ID
+    } else {
+        fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
+    };
+    let expected_engine = if ordered_nfa {
+        "NativeExactSpanParticipationOrderedNfaV1"
+    } else {
+        "NativeExactSpanParticipationDfaV1"
+    };
+    let expected_aggregate = if ordered_nfa {
+        "native-exact-span-participation-ordered-nfa-whole-operation-reducer-v1"
+    } else {
+        "native-exact-span-participation-whole-operation-reducer-v1"
+    };
+    let expected_caller_scratch = if ordered_nfa {
+        linked::PARTICIPATION_SCRATCH_BYTES
+    } else {
+        0
+    };
+    let expected_private_scratch = if ordered_nfa {
+        0
+    } else {
+        fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+    };
+    let geometry_is_valid = if ordered_nfa {
+        linked::PARTICIPATION_ASSERTION_SIGNATURES == 0
+            && linked::PARTICIPATION_BYTE_CLASSES == 0
+            && linked::PARTICIPATION_DFA_STATES == 0
+            && linked::PARTICIPATION_TRANSITION_CELLS == 0
+            && linked::PARTICIPATION_ORDERED_NFA_STATES != 0
+            && matches!(linked::PARTICIPATION_DFA_FALLBACK_RESOURCE, 1 | 2)
+            && linked::PARTICIPATION_DFA_FALLBACK_LIMIT
+                .checked_add(1)
+                == Some(linked::PARTICIPATION_DFA_FALLBACK_REQUIRED)
+            && linked::PARTICIPATION_SCRATCH_BYTES != 0
+            && linked::PARTICIPATION_SCRATCH_BYTES
+                .is_multiple_of(fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN)
+    } else {
+        linked::PARTICIPATION_ASSERTION_SIGNATURES != 0
+            && linked::PARTICIPATION_BYTE_CLASSES != 0
+            && linked::PARTICIPATION_DFA_STATES != 0
+            && linked::PARTICIPATION_TRANSITION_CELLS != 0
+            && linked::PARTICIPATION_ORDERED_NFA_STATES == 0
+            && linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES == 0
+            && linked::PARTICIPATION_DFA_FALLBACK_RESOURCE == 0
+            && linked::PARTICIPATION_DFA_FALLBACK_REQUIRED == 0
+            && linked::PARTICIPATION_DFA_FALLBACK_LIMIT == 0
+            && linked::PARTICIPATION_SCRATCH_BYTES
+                == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
     };
     let symbols = [
         linked::PARTICIPATION_BUNDLE_SYMBOL,
@@ -2210,27 +2343,21 @@ fn authenticate_linked_participation_reducer_source() -> Result<(), String> {
         linked::PARTICIPATION_ARTIFACT_IDENTITY_SHA256,
     ];
     if !strict_capture_source_provenance_is_empty()
-        || linked::PARTICIPATION_ALGORITHM_ID
-            != fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
-        || linked::PARTICIPATION_STRATEGY != expected_strategy
+        || linked::PARTICIPATION_ALGORITHM_ID != expected_algorithm
         || linked::PARTICIPATION_DECLINE != 0
         || linked::PARTICIPATION_SEMANTIC_RUNTIME_CALLS != 0
         || linked::PARTICIPATION_GROUP_COUNT != linked::SINGLE_CAPTURE_REDUCER_GROUP_COUNT
         || linked::PARTICIPATION_GROUP_COUNT > 64
         || linked::PARTICIPATION_CAN_MATCH_EMPTY
             != linked::SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY
-        || linked::PARTICIPATION_ASSERTION_SIGNATURES == 0
-        || linked::PARTICIPATION_BYTE_CLASSES == 0
-        || linked::PARTICIPATION_DFA_STATES == 0
-        || linked::PARTICIPATION_TRANSITION_CELLS == 0
+        || !geometry_is_valid
         || linked::PARTICIPATION_BUILD_WORK == 0
-        || linked::PARTICIPATION_SCRATCH_BYTES
-            != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
         || linked::PARTICIPATION_PLAN_BYTES
             < fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
         || source_digests.contains(&[0; 32])
+        || linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES != expected_caller_scratch
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES
-            != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+            != expected_private_scratch
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES != 0
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT != 0
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_BYTES != 0
@@ -2249,9 +2376,8 @@ fn authenticate_linked_participation_reducer_source() -> Result<(), String> {
         || symbols[0] == symbols[1]
         || symbols[0] == symbols[2]
         || symbols[1] == symbols[2]
-        || linked::AGGREGATE_STRATEGY
-            != "native-exact-span-participation-whole-operation-reducer-v1"
-        || linked::ENGINE != "NativeExactSpanParticipationDfaV1"
+        || linked::AGGREGATE_STRATEGY != expected_aggregate
+        || linked::ENGINE != expected_engine
     {
         return Err(
             "single-capture reducer exact-span participation source is inconsistent".to_owned(),
@@ -2297,6 +2423,7 @@ fn authenticate_linked_capture_next_reducer_source() -> Result<(), String> {
         || linked::STRICT_CAPTURE_OBJECT_SHA256
             != linked::SINGLE_CAPTURE_REDUCER_SOURCE_OBJECT_SHA256
         || source_digests.contains(&[0; 32])
+        || linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES != 0
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES != 0
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES != state_bytes
         || linked::SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT
@@ -3261,6 +3388,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
             || linked::PARTICIPATION_BYTE_CLASSES == 0
             || linked::PARTICIPATION_DFA_STATES == 0
             || linked::PARTICIPATION_TRANSITION_CELLS == 0
+            || linked::PARTICIPATION_ORDERED_NFA_STATES != 0
+            || linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES != 0
+            || linked::PARTICIPATION_DFA_FALLBACK_RESOURCE != 0
+            || linked::PARTICIPATION_DFA_FALLBACK_REQUIRED != 0
+            || linked::PARTICIPATION_DFA_FALLBACK_LIMIT != 0
             || linked::PARTICIPATION_BUILD_WORK == 0
             || linked::PARTICIPATION_SCRATCH_BYTES
                 != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
@@ -3296,6 +3428,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::PARTICIPATION_BYTE_CLASSES != 0
         || linked::PARTICIPATION_DFA_STATES != 0
         || linked::PARTICIPATION_TRANSITION_CELLS != 0
+        || linked::PARTICIPATION_ORDERED_NFA_STATES != 0
+        || linked::PARTICIPATION_ORDERED_NFA_BYTE_RANGES != 0
+        || linked::PARTICIPATION_DFA_FALLBACK_RESOURCE != 0
+        || linked::PARTICIPATION_DFA_FALLBACK_REQUIRED != 0
+        || linked::PARTICIPATION_DFA_FALLBACK_LIMIT != 0
         || linked::PARTICIPATION_BUILD_WORK != 0
         || linked::PARTICIPATION_SCRATCH_BYTES != 0
         || linked::PARTICIPATION_PLAN_BYTES != 0
@@ -3989,9 +4126,23 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
 fn run_single_capture_reducer_operation(
     benchmark: &shared::Benchmark,
 ) -> Result<Vec<Sample>, String> {
+    const SCRATCH_POISON: u64 = 0xa55a_c33c_f00f_9669;
+    let scratch_bytes = linked::SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES;
+    if !scratch_bytes.is_multiple_of(core::mem::size_of::<u64>()) {
+        return Err("single-capture reducer caller scratch is not u64-aligned".to_owned());
+    }
+    let scratch_words = scratch_bytes / core::mem::size_of::<u64>();
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(scratch_words)
+        .map_err(|_| "single-capture reducer caller scratch allocation failed".to_owned())?;
+    scratch.resize(scratch_words, SCRATCH_POISON);
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
-        let actual = strict_single_capture_reducer_reduce(black_box(&benchmark.haystack))?;
+        let actual = strict_single_capture_reducer_reduce(
+            black_box(&benchmark.haystack),
+            black_box(&mut scratch),
+        )?;
         black_box(actual);
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
             break;
@@ -4005,7 +4156,10 @@ fn run_single_capture_reducer_operation(
     let run_start = Instant::now();
     for _ in 0..benchmark.max_iters {
         let sample_start = Instant::now();
-        let actual = strict_single_capture_reducer_reduce(black_box(&benchmark.haystack))?;
+        let actual = strict_single_capture_reducer_reduce(
+            black_box(&benchmark.haystack),
+            black_box(&mut scratch),
+        )?;
         let duration = sample_start.elapsed();
         samples.push(Sample {
             duration,
@@ -4428,12 +4582,19 @@ mod tests {
     fn single_capture_reducer_wrapper_calls_once_and_enforces_transactional_errors() {
         let calls = std::cell::Cell::new(0_usize);
         let haystack = b"b\r\nab\n";
+        let mut scratch = [0x1111_2222_3333_4444_u64, 0xaaaa_bbbb_cccc_dddd];
         let value = strict_single_capture_reducer_reduce_with(
             haystack,
-            |pointer, length, value_out| {
+            &mut scratch,
+            16,
+            |pointer, length, scratch_pointer, scratch_len, value_out| {
                 calls.set(calls.get().saturating_add(1));
                 assert_eq!(pointer, haystack.as_ptr());
                 assert_eq!(length, haystack.len());
+                assert!(!scratch_pointer.is_null());
+                assert_eq!(scratch_len, 16);
+                // SAFETY: the wrapper supplies exactly two live scratch words.
+                unsafe { scratch_pointer.cast::<u64>().write(0x5555_6666_7777_8888) };
                 // SAFETY: the wrapper supplies one aligned live `u64` output.
                 unsafe { value_out.write(7) };
                 STATUS_SUCCESS
@@ -4444,14 +4605,18 @@ mod tests {
 
         let status_error = strict_single_capture_reducer_reduce_with(
             haystack,
-            |_, _, _| STATUS_INVALID_ARGUMENT,
+            &mut scratch,
+            16,
+            |_, _, _, _, _| STATUS_INVALID_ARGUMENT,
         )
         .expect_err("non-success reducer status");
         assert!(status_error.contains("returned status"), "{status_error}");
 
         let missing_publication = strict_single_capture_reducer_reduce_with(
             haystack,
-            |_, _, _| STATUS_SUCCESS,
+            &mut scratch,
+            16,
+            |_, _, _, _, _| STATUS_SUCCESS,
         )
         .expect_err("successful reducer must publish");
         assert!(
@@ -4461,7 +4626,9 @@ mod tests {
 
         let publication_error = strict_single_capture_reducer_reduce_with(
             haystack,
-            |_, _, value_out| {
+            &mut scratch,
+            16,
+            |_, _, _, _, value_out| {
                 // SAFETY: the wrapper supplies one aligned live `u64` output.
                 unsafe { value_out.write(9) };
                 STATUS_INVALID_ARGUMENT
@@ -4472,6 +4639,15 @@ mod tests {
             publication_error.contains("transactional output"),
             "{publication_error}"
         );
+
+        let wrong_scratch = strict_single_capture_reducer_reduce_with(
+            haystack,
+            &mut scratch[..1],
+            16,
+            |_, _, _, _, _| panic!("scratch mismatch must fail before the native call"),
+        )
+        .expect_err("wrong scratch extent");
+        assert!(wrong_scratch.contains("scratch disagrees"), "{wrong_scratch}");
     }
 
     #[test]

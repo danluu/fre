@@ -602,7 +602,11 @@
         "participation_strategy", "participation_semantic_runtime_calls",
         "participation_assertions", "participation_assertion_signatures",
         "participation_byte_classes", "participation_dfa_states",
-        "participation_transition_cells", "participation_build_work",
+        "participation_transition_cells", "participation_ordered_nfa_states",
+        "participation_ordered_nfa_byte_ranges",
+        "participation_dfa_fallback_resource",
+        "participation_dfa_fallback_required",
+        "participation_dfa_fallback_limit", "participation_build_work",
         "participation_scratch_bytes", "participation_plan_bytes",
         "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
         "selector_object_sha256", "participation_bundle_sha256",
@@ -632,6 +636,21 @@
         },
         "participation_transition_cells": {
           "type": "integer", "minimum": 1, "maximum": 16777216
+        },
+        "participation_ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_dfa_fallback_resource": {
+          "type": "integer", "minimum": 0, "maximum": 2
+        },
+        "participation_dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "participation_dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
         },
         "participation_build_work": {
           "type": "integer", "minimum": 1, "maximum": 268435456
@@ -667,29 +686,50 @@
       "additionalProperties": false,
       "required": [
         "algorithm_id", "strategy", "assertions", "assertion_signatures",
-        "byte_classes", "dfa_states", "transition_cells", "build_work",
+        "byte_classes", "dfa_states", "transition_cells",
+        "ordered_nfa_states", "ordered_nfa_byte_ranges",
+        "dfa_fallback_resource", "dfa_fallback_required",
+        "dfa_fallback_limit", "build_work",
         "scratch_bytes", "plan_bytes", "selector_object_sha256",
         "bundle_sha256", "export_identity_sha256", "bundle_symbol",
         "selector_symbol", "entry_symbol"
       ],
       "properties": {
         "algorithm_id": {
-          "const": "fre-aot-regex.exact-span-participation-dfa.v1"
+          "enum": [
+            "fre-aot-regex.exact-span-participation-dfa.v1",
+            "fre-aot-regex.exact-span-participation-ordered-nfa.v1"
+          ]
         },
-        "strategy": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "strategy": { "enum": [1, 2, 4, 5] },
         "assertions": { "type": "integer", "minimum": 0, "maximum": 64 },
         "assertion_signatures": {
-          "type": "integer", "minimum": 1, "maximum": 256
+          "type": "integer", "minimum": 0, "maximum": 256
         },
-        "byte_classes": { "type": "integer", "minimum": 1, "maximum": 256 },
-        "dfa_states": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "byte_classes": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "dfa_states": { "type": "integer", "minimum": 0, "maximum": 131072 },
         "transition_cells": {
-          "type": "integer", "minimum": 1, "maximum": 16777216
+          "type": "integer", "minimum": 0, "maximum": 16777216
+        },
+        "ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "dfa_fallback_resource": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
         },
         "build_work": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
-        "scratch_bytes": { "const": 16 },
+        "scratch_bytes": {
+          "type": "integer", "minimum": 16, "maximum": 8388608
+        },
         "plan_bytes": {
           "type": "integer", "minimum": 256, "maximum": 268435456
         },
@@ -742,6 +782,7 @@
         "source_bytes", "source_pattern_sha256", "source_sha256", "group_count",
         "can_match_empty",
         "empty_progress", "semantic_runtime_calls",
+        "caller_scratch_bytes",
         "private_participation_scratch_bytes", "private_iterator_state_bytes",
         "private_result_slot_count", "private_result_slot_bytes",
         "selector_sha256", "capture_sha256",
@@ -766,6 +807,9 @@
         "can_match_empty": { "type": "boolean" },
         "empty_progress": { "const": "byte" },
         "semantic_runtime_calls": { "const": 0 },
+        "caller_scratch_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 8388608
+        },
         "private_participation_scratch_bytes": {
           "type": "integer", "minimum": 0, "maximum": 16
         },
@@ -786,7 +830,9 @@
           "type": "string",
           "oneOf": [
             { "pattern": "^fre_aot_regex_count_captures_v1_[0-9a-f]{64}$" },
-            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" }
+            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_count_captures_scratch_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_grep_captures_scratch_v1_[0-9a-f]{64}$" }
           ]
         },
         "reducer_symbol_sha256": { "$ref": "#/$defs/nonzeroSha256" },
@@ -823,7 +869,6 @@
                 "$ref": "#/$defs/captureReducerParticipationSource"
               },
               "capture_next_source": { "type": "null" },
-              "private_participation_scratch_bytes": { "const": 16 },
               "private_iterator_state_bytes": { "const": 0 },
               "private_result_slot_count": { "const": 0 },
               "private_result_slot_bytes": { "const": 0 }
@@ -836,6 +881,7 @@
                 "$ref": "#/$defs/captureReducerCaptureNextSource"
               },
               "group_count": { "maximum": 16 },
+              "caller_scratch_bytes": { "const": 0 },
               "private_participation_scratch_bytes": { "const": 0 },
               "private_iterator_state_bytes": { "const": 24 }
             }

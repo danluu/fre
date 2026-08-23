@@ -126,6 +126,12 @@ NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL = re.compile(
 NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL = re.compile(
     r"^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$"
 )
+NATIVE_SINGLE_CAPTURE_COUNT_SCRATCH_REDUCER_SYMBOL = re.compile(
+    r"^fre_aot_regex_count_captures_scratch_v1_[0-9a-f]{64}$"
+)
+NATIVE_SINGLE_CAPTURE_GREP_SCRATCH_REDUCER_SYMBOL = re.compile(
+    r"^fre_aot_regex_grep_captures_scratch_v1_[0-9a-f]{64}$"
+)
 NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
 )
@@ -144,8 +150,17 @@ NATIVE_PARTICIPATION_BUNDLE_SYMBOL = re.compile(
 NATIVE_PARTICIPATION_ALGORITHM_ID = (
     "fre-aot-regex.exact-span-participation-dfa.v1"
 )
+NATIVE_PARTICIPATION_ORDERED_NFA_ALGORITHM_ID = (
+    "fre-aot-regex.exact-span-participation-ordered-nfa.v1"
+)
 NATIVE_PARTICIPATION_SCRATCH_BYTES = 16
 NATIVE_PARTICIPATION_HEADER_BYTES = 256
+NATIVE_PARTICIPATION_ORDERED_NFA_METADATA_BYTES = 112
+NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTES = 16
+NATIVE_PARTICIPATION_ORDERED_NFA_RANGE_BYTES = 2
+NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_BYTES = 24
+NATIVE_PARTICIPATION_ORDERED_NFA_SEEN_BYTES = 4
+NATIVE_PARTICIPATION_MAX_ORDERED_NFA_SCRATCH_BYTES = 8 * 1_048_576
 NATIVE_CAPTURE_ITERATOR_STATE_BYTES = 24
 NATIVE_CAPTURE_RESULT_SLOT_BYTES = 16
 NATIVE_CAPTURE_MAX_GROUPS = 16
@@ -1173,7 +1188,8 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "source_cardinality", "source_bytes", "source_pattern_sha256",
             "source_sha256", "group_count",
             "can_match_empty", "empty_progress", "semantic_runtime_calls",
-            "private_participation_scratch_bytes", "private_iterator_state_bytes",
+            "caller_scratch_bytes", "private_participation_scratch_bytes",
+            "private_iterator_state_bytes",
             "private_result_slot_count", "private_result_slot_bytes",
             "selector_sha256", "capture_sha256",
             "source_artifact_identity_sha256", "source_object_sha256",
@@ -2489,13 +2505,19 @@ def participation_capture_proof_from_provenance(
         raise CensusError(
             "exact-span participation object differs from its component"
         )
+    ordered_nfa = fields.get("participation_strategy") in {"4", "5"}
     algorithm_id = fields.get("participation_algorithm_id")
-    if algorithm_id != NATIVE_PARTICIPATION_ALGORITHM_ID:
+    expected_algorithm = (
+        NATIVE_PARTICIPATION_ORDERED_NFA_ALGORITHM_ID
+        if ordered_nfa else NATIVE_PARTICIPATION_ALGORITHM_ID
+    )
+    if algorithm_id != expected_algorithm:
         raise CensusError("exact-span participation algorithm identity differs")
-    expected_strategy = {
-        "x86_64": 1,
-        "aarch64": 2,
-    }[target_architecture(fields.get("target", ""))]
+    architecture = target_architecture(fields.get("target", ""))
+    expected_strategy = (
+        {"x86_64": 4, "aarch64": 5}[architecture]
+        if ordered_nfa else {"x86_64": 1, "aarch64": 2}[architecture]
+    )
     strategy = parse_canonical_decimal(
         fields.get("participation_strategy"),
         "exact-span participation strategy",
@@ -2508,57 +2530,103 @@ def participation_capture_proof_from_provenance(
         0,
         0,
     )
-    scratch_bytes = parse_canonical_decimal(
-        fields.get("participation_scratch_bytes"),
-        "exact-span participation scratch bytes",
-        NATIVE_PARTICIPATION_SCRATCH_BYTES,
-        NATIVE_PARTICIPATION_SCRATCH_BYTES,
-    )
     assertions = parse_canonical_decimal(
         fields.get("participation_assertions"),
         "exact-span participation assertions",
         0,
         NATIVE_PARTICIPATION_MAX_ASSERTIONS,
     )
+    lower = 0 if ordered_nfa else 1
     assertion_signatures = parse_canonical_decimal(
         fields.get("participation_assertion_signatures"),
         "exact-span participation assertion signatures",
-        1,
-        NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
+        lower, 0 if ordered_nfa else NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
     )
     byte_classes = parse_canonical_decimal(
         fields.get("participation_byte_classes"),
         "exact-span participation byte classes",
-        1,
-        NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
+        lower, 0 if ordered_nfa else NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
     )
     dfa_states = parse_canonical_decimal(
         fields.get("participation_dfa_states"),
         "exact-span participation DFA states",
-        1,
-        NATIVE_PARTICIPATION_MAX_DFA_STATES,
+        lower, 0 if ordered_nfa else NATIVE_PARTICIPATION_MAX_DFA_STATES,
     )
     transition_cells = parse_canonical_decimal(
         fields.get("participation_transition_cells"),
         "exact-span participation transition cells",
-        1,
-        NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
+        lower, 0 if ordered_nfa else NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
+    )
+    ordered_nfa_states = parse_canonical_decimal(
+        fields.get("participation_ordered_nfa_states"),
+        "exact-span participation ordered-NFA states", 1 if ordered_nfa else 0,
+        NATIVE_PARTICIPATION_MAX_PLAN_BYTES if ordered_nfa else 0,
+    )
+    ordered_nfa_byte_ranges = parse_canonical_decimal(
+        fields.get("participation_ordered_nfa_byte_ranges"),
+        "exact-span participation ordered-NFA byte ranges", 0,
+        NATIVE_PARTICIPATION_MAX_PLAN_BYTES if ordered_nfa else 0,
+    )
+    fallback_resource = parse_canonical_decimal(
+        fields.get("participation_dfa_fallback_resource"),
+        "exact-span participation fallback resource", 1 if ordered_nfa else 0,
+        2 if ordered_nfa else 0,
+    )
+    fallback_required = parse_canonical_decimal(
+        fields.get("participation_dfa_fallback_required"),
+        "exact-span participation fallback required", 1 if ordered_nfa else 0,
+        (1 << 32) - 1 if ordered_nfa else 0,
+    )
+    fallback_limit = parse_canonical_decimal(
+        fields.get("participation_dfa_fallback_limit"),
+        "exact-span participation fallback limit", 0,
+        (1 << 32) - 1 if ordered_nfa else 0,
     )
     expected_transition_cells = dfa_states * byte_classes * assertion_signatures
-    if transition_cells != expected_transition_cells:
+    if not ordered_nfa and transition_cells != expected_transition_cells:
         raise CensusError(
             "exact-span participation transition geometry does not close"
         )
+    if ordered_nfa and fallback_required != fallback_limit + 1:
+        raise CensusError("exact-span participation fallback envelope does not close")
     plan_bytes = parse_canonical_decimal(
         fields.get("participation_plan_bytes"),
         "exact-span participation plan bytes",
         NATIVE_PARTICIPATION_HEADER_BYTES,
         NATIVE_PARTICIPATION_MAX_PLAN_BYTES,
     )
-    if plan_bytes != participation_plan_bytes(
-        assertions, assertion_signatures, dfa_states, transition_cells
-    ):
+    if ordered_nfa:
+        states_offset = (
+            NATIVE_PARTICIPATION_HEADER_BYTES
+            + NATIVE_PARTICIPATION_ORDERED_NFA_METADATA_BYTES + 7
+        ) & ~7
+        ranges_offset = (
+            states_offset
+            + ordered_nfa_states * NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTES
+            + 7
+        ) & ~7
+        expected_plan_bytes = (
+            ranges_offset
+            + ordered_nfa_byte_ranges * NATIVE_PARTICIPATION_ORDERED_NFA_RANGE_BYTES
+        )
+        expected_scratch_bytes = (
+            ordered_nfa_states
+            * (3 * NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_BYTES
+               + NATIVE_PARTICIPATION_ORDERED_NFA_SEEN_BYTES)
+            + 7
+        ) & ~7
+    else:
+        expected_plan_bytes = participation_plan_bytes(
+            assertions, assertion_signatures, dfa_states, transition_cells
+        )
+        expected_scratch_bytes = NATIVE_PARTICIPATION_SCRATCH_BYTES
+    if plan_bytes != expected_plan_bytes:
         raise CensusError("exact-span participation plan extent does not close")
+    scratch_bytes = parse_canonical_decimal(
+        fields.get("participation_scratch_bytes"),
+        "exact-span participation scratch bytes",
+        expected_scratch_bytes, expected_scratch_bytes,
+    )
     return {
         "capture_resolution": fields.get("capture_resolution"),
         "capture_group_count": parse_canonical_decimal(
@@ -2575,6 +2643,11 @@ def participation_capture_proof_from_provenance(
         "participation_byte_classes": byte_classes,
         "participation_dfa_states": dfa_states,
         "participation_transition_cells": transition_cells,
+        "participation_ordered_nfa_states": ordered_nfa_states,
+        "participation_ordered_nfa_byte_ranges": ordered_nfa_byte_ranges,
+        "participation_dfa_fallback_resource": fallback_resource,
+        "participation_dfa_fallback_required": fallback_required,
+        "participation_dfa_fallback_limit": fallback_limit,
         "participation_build_work": parse_canonical_decimal(
             fields.get("participation_build_work"),
             "exact-span participation build work",
@@ -3072,7 +3145,11 @@ def validate_v4_provenance(
             "participation_strategy", "participation_semantic_runtime_calls",
             "participation_assertions", "participation_assertion_signatures",
             "participation_byte_classes", "participation_dfa_states",
-            "participation_transition_cells", "participation_build_work",
+            "participation_transition_cells", "participation_ordered_nfa_states",
+            "participation_ordered_nfa_byte_ranges",
+            "participation_dfa_fallback_resource",
+            "participation_dfa_fallback_required",
+            "participation_dfa_fallback_limit", "participation_build_work",
             "participation_scratch_bytes", "participation_plan_bytes",
             "selector_object_sha256", "participation_bundle_sha256",
             "participation_export_identity_sha256", "participation_object_sha256",
@@ -3133,15 +3210,17 @@ def single_capture_reducer_proof_from_provenance(
         "count-captures": (
             "count-captures", "whole-haystack",
             NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL,
+            NATIVE_SINGLE_CAPTURE_COUNT_SCRATCH_REDUCER_SYMBOL,
         ),
         "grep-captures": (
             "grep-captures", "byte-slice-lines-lf-crlf",
             NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL,
+            NATIVE_SINGLE_CAPTURE_GREP_SCRATCH_REDUCER_SYMBOL,
         ),
     }.get(model)
     if operation_contract is None:
         raise CensusError("single-capture reducer has an unsupported model")
-    operation, domain, reducer_pattern = operation_contract
+    operation, domain, legacy_reducer_pattern, scratch_reducer_pattern = operation_contract
     if fields.get("operation") != operation or fields.get("domain") != domain:
         raise CensusError("single-capture reducer operation/domain differs from its model")
     source_route = fields.get("source_route")
@@ -3182,6 +3261,11 @@ def single_capture_reducer_proof_from_provenance(
         fields.get("semantic_runtime_calls"),
         "single-capture reducer semantic runtime calls", 0, 0,
     )
+    caller_scratch_bytes = parse_canonical_decimal(
+        fields.get("caller_scratch_bytes"),
+        "single-capture reducer caller scratch bytes", 0,
+        NATIVE_PARTICIPATION_MAX_ORDERED_NFA_SCRATCH_BYTES,
+    )
     private_participation_scratch_bytes = parse_canonical_decimal(
         fields.get("private_participation_scratch_bytes"),
         "single-capture reducer private participation scratch bytes", 0,
@@ -3202,7 +3286,13 @@ def single_capture_reducer_proof_from_provenance(
         "single-capture reducer private result slot bytes", 0,
         NATIVE_CAPTURE_MAX_GROUPS * NATIVE_CAPTURE_RESULT_SLOT_BYTES,
     )
-    if source_route == "exact-span-participation-v1":
+    ordered_participation = fields.get("participation_strategy") in {"4", "5"}
+    reducer_pattern = (
+        scratch_reducer_pattern if ordered_participation else legacy_reducer_pattern
+    )
+    if source_route == "exact-span-participation-v1" and ordered_participation:
+        expected_private = (0, 0, 0, 0)
+    elif source_route == "exact-span-participation-v1":
         expected_private = (NATIVE_PARTICIPATION_SCRATCH_BYTES, 0, 0, 0)
     else:
         expected_private = (
@@ -3215,6 +3305,10 @@ def single_capture_reducer_proof_from_provenance(
     ) != expected_private:
         raise CensusError(
             "single-capture reducer private schema differs from its source route"
+        )
+    if not ordered_participation and caller_scratch_bytes != 0:
+        raise CensusError(
+            "legacy single-capture reducer unexpectedly requires caller scratch"
         )
     digest_fields = {
         name: require_nonzero_hex64(
@@ -3298,9 +3392,12 @@ def single_capture_reducer_proof_from_provenance(
             raise CensusError(
                 "single-capture participation export identity does not authenticate its inputs"
             )
-        expected_strategy = {"x86_64": 1, "aarch64": 2}[
-            target_architecture(fields.get("target", ""))
-        ]
+        architecture = target_architecture(fields.get("target", ""))
+        expected_strategy = (
+            {"x86_64": 4, "aarch64": 5}[architecture]
+            if ordered_participation
+            else {"x86_64": 1, "aarch64": 2}[architecture]
+        )
         strategy = parse_canonical_decimal(
             fields.get("participation_strategy"),
             "single-capture participation strategy",
@@ -3311,43 +3408,106 @@ def single_capture_reducer_proof_from_provenance(
             "single-capture participation assertions",
             0, NATIVE_PARTICIPATION_MAX_ASSERTIONS,
         )
+        lower = 0 if ordered_participation else 1
         assertion_signatures = parse_canonical_decimal(
             fields.get("participation_assertion_signatures"),
-            "single-capture participation assertion signatures",
-            1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
+            "single-capture participation assertion signatures", lower,
+            0 if ordered_participation else NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
         )
         byte_classes = parse_canonical_decimal(
             fields.get("participation_byte_classes"),
-            "single-capture participation byte classes",
-            1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
+            "single-capture participation byte classes", lower,
+            0 if ordered_participation else NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
         )
         dfa_states = parse_canonical_decimal(
             fields.get("participation_dfa_states"),
-            "single-capture participation DFA states",
-            1, NATIVE_PARTICIPATION_MAX_DFA_STATES,
+            "single-capture participation DFA states", lower,
+            0 if ordered_participation else NATIVE_PARTICIPATION_MAX_DFA_STATES,
         )
         transition_cells = parse_canonical_decimal(
             fields.get("participation_transition_cells"),
-            "single-capture participation transition cells",
-            1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
+            "single-capture participation transition cells", lower,
+            0 if ordered_participation else NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
         )
-        if transition_cells != dfa_states * byte_classes * assertion_signatures:
+        ordered_nfa_states = parse_canonical_decimal(
+            fields.get("participation_ordered_nfa_states"),
+            "single-capture participation ordered-NFA states",
+            1 if ordered_participation else 0,
+            NATIVE_PARTICIPATION_MAX_PLAN_BYTES if ordered_participation else 0,
+        )
+        ordered_nfa_byte_ranges = parse_canonical_decimal(
+            fields.get("participation_ordered_nfa_byte_ranges"),
+            "single-capture participation ordered-NFA byte ranges", 0,
+            NATIVE_PARTICIPATION_MAX_PLAN_BYTES if ordered_participation else 0,
+        )
+        fallback_resource = parse_canonical_decimal(
+            fields.get("participation_dfa_fallback_resource"),
+            "single-capture participation DFA fallback resource",
+            1 if ordered_participation else 0,
+            2 if ordered_participation else 0,
+        )
+        fallback_required = parse_canonical_decimal(
+            fields.get("participation_dfa_fallback_required"),
+            "single-capture participation DFA fallback required",
+            1 if ordered_participation else 0,
+            (1 << 32) - 1 if ordered_participation else 0,
+        )
+        fallback_limit = parse_canonical_decimal(
+            fields.get("participation_dfa_fallback_limit"),
+            "single-capture participation DFA fallback limit",
+            0, (1 << 32) - 1 if ordered_participation else 0,
+        )
+        if ordered_participation:
+            if fallback_required != fallback_limit + 1:
+                raise CensusError(
+                    "single-capture ordered-NFA fallback envelope does not close"
+                )
+        elif transition_cells != dfa_states * byte_classes * assertion_signatures:
             raise CensusError("single-capture participation transition geometry does not close")
         plan_bytes = parse_canonical_decimal(
             fields.get("participation_plan_bytes"),
             "single-capture participation plan bytes",
             NATIVE_PARTICIPATION_HEADER_BYTES, NATIVE_PARTICIPATION_MAX_PLAN_BYTES,
         )
-        if plan_bytes != participation_plan_bytes(
-            assertions, assertion_signatures, dfa_states, transition_cells
-        ):
+        if ordered_participation:
+            states_offset = (
+                NATIVE_PARTICIPATION_HEADER_BYTES
+                + NATIVE_PARTICIPATION_ORDERED_NFA_METADATA_BYTES + 7
+            ) & ~7
+            ranges_offset = (
+                states_offset
+                + ordered_nfa_states * NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTES
+                + 7
+            ) & ~7
+            expected_plan_bytes = (
+                ranges_offset
+                + ordered_nfa_byte_ranges
+                * NATIVE_PARTICIPATION_ORDERED_NFA_RANGE_BYTES
+            )
+            expected_scratch_bytes = (
+                ordered_nfa_states
+                * (
+                    3 * NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_BYTES
+                    + NATIVE_PARTICIPATION_ORDERED_NFA_SEEN_BYTES
+                )
+                + 7
+            ) & ~7
+        else:
+            expected_plan_bytes = participation_plan_bytes(
+                assertions, assertion_signatures, dfa_states, transition_cells
+            )
+            expected_scratch_bytes = NATIVE_PARTICIPATION_SCRATCH_BYTES
+        if plan_bytes != expected_plan_bytes:
             raise CensusError("single-capture participation plan extent does not close")
         scratch_bytes = parse_canonical_decimal(
             fields.get("participation_scratch_bytes"),
             "single-capture participation scratch bytes",
-            NATIVE_PARTICIPATION_SCRATCH_BYTES,
-            NATIVE_PARTICIPATION_SCRATCH_BYTES,
+            expected_scratch_bytes, expected_scratch_bytes,
         )
+        if ordered_participation and caller_scratch_bytes != scratch_bytes:
+            raise CensusError(
+                "single-capture ordered-NFA caller scratch differs from its receipt"
+            )
         participation_source = {
             "algorithm_id": fields.get("participation_algorithm_id"),
             "strategy": strategy,
@@ -3356,6 +3516,11 @@ def single_capture_reducer_proof_from_provenance(
             "byte_classes": byte_classes,
             "dfa_states": dfa_states,
             "transition_cells": transition_cells,
+            "ordered_nfa_states": ordered_nfa_states,
+            "ordered_nfa_byte_ranges": ordered_nfa_byte_ranges,
+            "dfa_fallback_resource": fallback_resource,
+            "dfa_fallback_required": fallback_required,
+            "dfa_fallback_limit": fallback_limit,
             "build_work": parse_canonical_decimal(
                 fields.get("participation_build_work"),
                 "single-capture participation build work",
@@ -3370,7 +3535,11 @@ def single_capture_reducer_proof_from_provenance(
             "selector_symbol": selector_symbol,
             "entry_symbol": entry_symbol,
         }
-        if participation_source["algorithm_id"] != NATIVE_PARTICIPATION_ALGORITHM_ID:
+        expected_algorithm = (
+            NATIVE_PARTICIPATION_ORDERED_NFA_ALGORITHM_ID
+            if ordered_participation else NATIVE_PARTICIPATION_ALGORITHM_ID
+        )
+        if participation_source["algorithm_id"] != expected_algorithm:
             raise CensusError("single-capture participation algorithm identity differs")
     else:
         plan_sha256 = require_nonzero_hex64(
@@ -3413,6 +3582,7 @@ def single_capture_reducer_proof_from_provenance(
         "can_match_empty": can_match_empty_text == "true",
         "empty_progress": "byte",
         "semantic_runtime_calls": semantic_runtime_calls,
+        "caller_scratch_bytes": caller_scratch_bytes,
         "private_participation_scratch_bytes": private_participation_scratch_bytes,
         "private_iterator_state_bytes": private_iterator_state_bytes,
         "private_result_slot_count": private_result_slot_count,
@@ -3445,6 +3615,11 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
             1, (1 << 32) - 1,
         )
     proof = single_capture_reducer_proof_from_provenance(fields)
+    ordered_participation = (
+        proof["source_route"] == "exact-span-participation-v1"
+        and proof["participation_source"] is not None
+        and proof["participation_source"]["strategy"] in {4, 5}
+    )
     expected_adapter = {
         ("count-captures", "exact-span-participation-v1"):
             "general-aot-native-exact-span-participation-count-reducer-v1",
@@ -3455,6 +3630,15 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
         ("grep-captures", "capture-next-v1"):
             "general-aot-native-single-capture-next-grep-reducer-v1",
     }[(fields["model"], proof["source_route"])]
+    if ordered_participation:
+        expected_adapter = {
+            "count-captures": (
+                "general-aot-native-exact-span-ordered-nfa-participation-count-reducer-v1"
+            ),
+            "grep-captures": (
+                "general-aot-native-exact-span-ordered-nfa-participation-grep-reducer-v1"
+            ),
+        }[fields["model"]]
     expected_engine, expected_strategy = {
         "exact-span-participation-v1": (
             "NativeExactSpanParticipationDfaV1",
@@ -3465,6 +3649,11 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
             "native-single-capture-next-whole-operation-reducer-v1",
         ),
     }[proof["source_route"]]
+    if ordered_participation:
+        expected_engine = "NativeExactSpanParticipationOrderedNfaV1"
+        expected_strategy = (
+            "native-exact-span-participation-ordered-nfa-whole-operation-reducer-v1"
+        )
     if (
         fields.get("adapter") != expected_adapter
         or fields.get("engine") != expected_engine
@@ -3484,7 +3673,8 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
         "operation", "domain", "source_route", "source_cardinality", "source_bytes",
         "source_pattern_sha256", "source_sha256", "group_count", "can_match_empty",
         "empty_progress",
-        "semantic_runtime_calls", "private_participation_scratch_bytes",
+        "semantic_runtime_calls", "caller_scratch_bytes",
+        "private_participation_scratch_bytes",
         "private_iterator_state_bytes", "private_result_slot_count",
         "private_result_slot_bytes", "selector_sha256", "capture_sha256",
         "source_artifact_identity_sha256", "source_object_sha256", "reducer_symbol",
@@ -3497,7 +3687,11 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
             "participation_algorithm_id", "participation_strategy",
             "participation_assertions", "participation_assertion_signatures",
             "participation_byte_classes", "participation_dfa_states",
-            "participation_transition_cells", "participation_build_work",
+            "participation_transition_cells", "participation_ordered_nfa_states",
+            "participation_ordered_nfa_byte_ranges",
+            "participation_dfa_fallback_resource",
+            "participation_dfa_fallback_required",
+            "participation_dfa_fallback_limit", "participation_build_work",
             "participation_scratch_bytes", "participation_plan_bytes",
             "participation_selector_object_sha256", "participation_bundle_sha256",
             "participation_export_identity_sha256", "participation_bundle_symbol",
@@ -4959,6 +5153,11 @@ def validate_normalized_participation_capture(
         "participation_transition_cells": (
             1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS
         ),
+        "participation_ordered_nfa_states": (0, 0),
+        "participation_ordered_nfa_byte_ranges": (0, 0),
+        "participation_dfa_fallback_resource": (0, 0),
+        "participation_dfa_fallback_required": (0, 0),
+        "participation_dfa_fallback_limit": (0, 0),
         "participation_build_work": (1, NATIVE_PARTICIPATION_MAX_BUILD_WORK),
         "participation_scratch_bytes": (
             NATIVE_PARTICIPATION_SCRATCH_BYTES,
@@ -5719,7 +5918,8 @@ def validate_normalized_single_capture_reducer(
         "operation", "domain", "source_route", "source_cardinality", "source_bytes",
         "source_pattern_sha256", "source_sha256", "group_count",
         "can_match_empty", "empty_progress",
-        "semantic_runtime_calls", "private_participation_scratch_bytes",
+        "semantic_runtime_calls", "caller_scratch_bytes",
+        "private_participation_scratch_bytes",
         "private_iterator_state_bytes", "private_result_slot_count",
         "private_result_slot_bytes", "selector_sha256", "capture_sha256",
         "source_artifact_identity_sha256", "source_object_sha256", "reducer_symbol",
@@ -5732,18 +5932,34 @@ def validate_normalized_single_capture_reducer(
         "count-captures": (
             "count-captures", "whole-haystack",
             NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL,
+            NATIVE_SINGLE_CAPTURE_COUNT_SCRATCH_REDUCER_SYMBOL,
         ),
         "grep-captures": (
             "grep-captures", "byte-slice-lines-lf-crlf",
             NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL,
+            NATIVE_SINGLE_CAPTURE_GREP_SCRATCH_REDUCER_SYMBOL,
         ),
     }.get(provenance.get("model"))
     if operation_contract is None:
         raise CensusError(f"{context} single-capture reducer model differs")
-    operation, domain, reducer_pattern = operation_contract
+    operation, domain, legacy_reducer_pattern, scratch_reducer_pattern = (
+        operation_contract
+    )
     route = proof["source_route"]
     if route not in {"exact-span-participation-v1", "capture-next-v1"}:
         raise CensusError(f"{context} single-capture reducer source route differs")
+    participation_child = (
+        proof["participation_source"]
+        if route == "exact-span-participation-v1" else None
+    )
+    ordered_participation = (
+        isinstance(participation_child, dict)
+        and participation_child.get("strategy") in {4, 5}
+    )
+    reducer_pattern = (
+        scratch_reducer_pattern
+        if ordered_participation else legacy_reducer_pattern
+    )
     group_maximum = (
         NATIVE_PARTICIPATION_MAX_ASSERTIONS
         if route == "exact-span-participation-v1"
@@ -5754,6 +5970,9 @@ def validate_normalized_single_capture_reducer(
         "source_bytes": (0, (1 << 64) - 1),
         "group_count": (1, group_maximum),
         "semantic_runtime_calls": (0, 0),
+        "caller_scratch_bytes": (
+            0, NATIVE_PARTICIPATION_MAX_ORDERED_NFA_SCRATCH_BYTES
+        ),
         "private_participation_scratch_bytes": (0, NATIVE_PARTICIPATION_SCRATCH_BYTES),
         "private_iterator_state_bytes": (0, NATIVE_CAPTURE_ITERATOR_STATE_BYTES),
         "private_result_slot_count": (0, NATIVE_CAPTURE_MAX_GROUPS),
@@ -5771,9 +5990,10 @@ def validate_normalized_single_capture_reducer(
         ):
             raise CensusError(f"{context} single-capture reducer {field} differs")
     expected_private = (
-        (NATIVE_PARTICIPATION_SCRATCH_BYTES, 0, 0, 0)
-        if route == "exact-span-participation-v1"
-        else (
+        (0, 0, 0, 0)
+        if route == "exact-span-participation-v1" and ordered_participation
+        else (NATIVE_PARTICIPATION_SCRATCH_BYTES, 0, 0, 0)
+        if route == "exact-span-participation-v1" else (
             0, NATIVE_CAPTURE_ITERATOR_STATE_BYTES, proof["group_count"],
             proof["group_count"] * NATIVE_CAPTURE_RESULT_SLOT_BYTES,
         )
@@ -5786,6 +6006,11 @@ def validate_normalized_single_capture_reducer(
     ) != expected_private:
         raise CensusError(
             f"{context} single-capture reducer private schema differs from source route"
+        )
+    if not ordered_participation and proof["caller_scratch_bytes"] != 0:
+        raise CensusError(
+            f"{context} legacy single-capture reducer unexpectedly requires "
+            "caller scratch"
         )
     if (
         proof["operation"] != operation
@@ -5826,6 +6051,17 @@ def validate_normalized_single_capture_reducer(
         ("grep-captures", "capture-next-v1"):
             "general-aot-native-single-capture-next-grep-reducer-v1",
     }[(provenance["model"], route)]
+    if ordered_participation:
+        expected_adapter = {
+            "count-captures": (
+                "general-aot-native-exact-span-ordered-nfa-participation-"
+                "count-reducer-v1"
+            ),
+            "grep-captures": (
+                "general-aot-native-exact-span-ordered-nfa-participation-"
+                "grep-reducer-v1"
+            ),
+        }[provenance["model"]]
     expected_engine, expected_strategy = {
         "exact-span-participation-v1": (
             "NativeExactSpanParticipationDfaV1",
@@ -5836,6 +6072,12 @@ def validate_normalized_single_capture_reducer(
             "native-single-capture-next-whole-operation-reducer-v1",
         ),
     }[route]
+    if ordered_participation:
+        expected_engine = "NativeExactSpanParticipationOrderedNfaV1"
+        expected_strategy = (
+            "native-exact-span-participation-ordered-nfa-whole-operation-"
+            "reducer-v1"
+        )
     if (
         provenance.get("schema") != "fre.aot.rebar-runner.v5"
         or provenance.get("kind") != "single-capture-reducer-v5"
@@ -5871,20 +6113,51 @@ def validate_normalized_single_capture_reducer(
         raise CensusError(f"{context} single-capture reducer retains scalar state")
 
     if route == "exact-span-participation-v1":
-        child = proof["participation_source"]
+        child = participation_child
         if not isinstance(child, dict) or proof["capture_next_source"] is not None:
             raise CensusError(f"{context} participation source proof topology differs")
         numeric_ranges = {
-            "strategy": (1, 2),
+            "strategy": (4, 5) if ordered_participation else (1, 2),
             "assertions": (0, NATIVE_PARTICIPATION_MAX_ASSERTIONS),
-            "assertion_signatures": (1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES),
-            "byte_classes": (1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES),
-            "dfa_states": (1, NATIVE_PARTICIPATION_MAX_DFA_STATES),
-            "transition_cells": (1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS),
+            "assertion_signatures": (
+                (0, 0) if ordered_participation else
+                (1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES)
+            ),
+            "byte_classes": (
+                (0, 0) if ordered_participation else
+                (1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES)
+            ),
+            "dfa_states": (
+                (0, 0) if ordered_participation else
+                (1, NATIVE_PARTICIPATION_MAX_DFA_STATES)
+            ),
+            "transition_cells": (
+                (0, 0) if ordered_participation else
+                (1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS)
+            ),
+            "ordered_nfa_states": (
+                (1, NATIVE_PARTICIPATION_MAX_PLAN_BYTES)
+                if ordered_participation else (0, 0)
+            ),
+            "ordered_nfa_byte_ranges": (
+                (0, NATIVE_PARTICIPATION_MAX_PLAN_BYTES)
+                if ordered_participation else (0, 0)
+            ),
+            "dfa_fallback_resource": (
+                (1, 2) if ordered_participation else (0, 0)
+            ),
+            "dfa_fallback_required": (
+                (1, (1 << 32) - 1) if ordered_participation else (0, 0)
+            ),
+            "dfa_fallback_limit": (
+                (0, (1 << 32) - 1) if ordered_participation else (0, 0)
+            ),
             "build_work": (1, NATIVE_PARTICIPATION_MAX_BUILD_WORK),
             "scratch_bytes": (
-                NATIVE_PARTICIPATION_SCRATCH_BYTES,
-                NATIVE_PARTICIPATION_SCRATCH_BYTES,
+                (1, NATIVE_PARTICIPATION_MAX_ORDERED_NFA_SCRATCH_BYTES)
+                if ordered_participation else
+                (NATIVE_PARTICIPATION_SCRATCH_BYTES,
+                 NATIVE_PARTICIPATION_SCRATCH_BYTES)
             ),
             "plan_bytes": (
                 NATIVE_PARTICIPATION_HEADER_BYTES, NATIVE_PARTICIPATION_MAX_PLAN_BYTES
@@ -5905,14 +6178,63 @@ def validate_normalized_single_capture_reducer(
         expected_strategy_number = {"x86_64": 1, "aarch64": 2}[
             target_architecture(str(provenance.get("target", "")))
         ]
-        if (
-            child["algorithm_id"] != NATIVE_PARTICIPATION_ALGORITHM_ID
-            or child["strategy"] != expected_strategy_number
-            or child["transition_cells"]
-            != child["dfa_states"] * child["byte_classes"] * child["assertion_signatures"]
-            or child["plan_bytes"] != participation_plan_bytes(
+        if ordered_participation:
+            expected_strategy_number = {"x86_64": 4, "aarch64": 5}[
+                target_architecture(str(provenance.get("target", "")))
+            ]
+        expected_algorithm = (
+            NATIVE_PARTICIPATION_ORDERED_NFA_ALGORITHM_ID
+            if ordered_participation else NATIVE_PARTICIPATION_ALGORITHM_ID
+        )
+        if ordered_participation:
+            states_offset = (
+                NATIVE_PARTICIPATION_HEADER_BYTES
+                + NATIVE_PARTICIPATION_ORDERED_NFA_METADATA_BYTES + 7
+            ) & ~7
+            ranges_offset = (
+                states_offset
+                + child["ordered_nfa_states"]
+                * NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTES
+                + 7
+            ) & ~7
+            expected_plan_bytes = (
+                ranges_offset
+                + child["ordered_nfa_byte_ranges"]
+                * NATIVE_PARTICIPATION_ORDERED_NFA_RANGE_BYTES
+            )
+            expected_scratch_bytes = (
+                child["ordered_nfa_states"]
+                * (
+                    3 * NATIVE_PARTICIPATION_ORDERED_NFA_THREAD_BYTES
+                    + NATIVE_PARTICIPATION_ORDERED_NFA_SEEN_BYTES
+                )
+                + 7
+            ) & ~7
+        else:
+            expected_plan_bytes = participation_plan_bytes(
                 child["assertions"], child["assertion_signatures"],
                 child["dfa_states"], child["transition_cells"],
+            )
+            expected_scratch_bytes = NATIVE_PARTICIPATION_SCRATCH_BYTES
+        if (
+            child["algorithm_id"] != expected_algorithm
+            or child["strategy"] != expected_strategy_number
+            or (
+                not ordered_participation
+                and child["transition_cells"]
+                != child["dfa_states"] * child["byte_classes"]
+                * child["assertion_signatures"]
+            )
+            or (
+                ordered_participation
+                and child["dfa_fallback_required"]
+                != child["dfa_fallback_limit"] + 1
+            )
+            or child["plan_bytes"] != expected_plan_bytes
+            or child["scratch_bytes"] != expected_scratch_bytes
+            or (
+                ordered_participation
+                and proof["caller_scratch_bytes"] != child["scratch_bytes"]
             )
         ):
             raise CensusError(f"{context} participation source geometry differs")

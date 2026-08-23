@@ -894,6 +894,11 @@ def participation_capture_provenance_fields() -> dict[str, str]:
         "participation_byte_classes": "8",
         "participation_dfa_states": "17",
         "participation_transition_cells": "136",
+        "participation_ordered_nfa_states": "0",
+        "participation_ordered_nfa_byte_ranges": "0",
+        "participation_dfa_fallback_resource": "0",
+        "participation_dfa_fallback_required": "0",
+        "participation_dfa_fallback_limit": "0",
         "participation_build_work": "999",
         "participation_scratch_bytes": "16",
         "participation_plan_bytes": "1093",
@@ -1206,6 +1211,7 @@ def synthetic_strict_capture_qualification_receipt(
 def single_capture_reducer_provenance_fields(
     source_route: str = "exact-span-participation-v1",
     model: str = "count-captures",
+    ordered: bool = False,
 ) -> dict[str, str]:
     if model == "count-captures":
         operation = "count-captures"
@@ -1220,20 +1226,38 @@ def single_capture_reducer_provenance_fields(
     else:
         raise AssertionError(f"unsupported synthetic capture reducer model {model!r}")
     if source_route == "exact-span-participation-v1":
-        adapter = {
-            "count-captures": (
-                "general-aot-native-exact-span-participation-count-reducer-v1"
-            ),
-            "grep-captures": (
-                "general-aot-native-exact-span-participation-grep-reducer-v1"
-            ),
-        }[model]
-        engine = "NativeExactSpanParticipationDfaV1"
-        aggregate = (
-            "native-exact-span-participation-whole-operation-reducer-v1"
-        )
-        private = (16, 0, 0, 0)
+        if ordered:
+            adapter = {
+                "count-captures": (
+                    "general-aot-native-exact-span-ordered-nfa-participation-count-reducer-v1"
+                ),
+                "grep-captures": (
+                    "general-aot-native-exact-span-ordered-nfa-participation-grep-reducer-v1"
+                ),
+            }[model]
+            engine = "NativeExactSpanParticipationOrderedNfaV1"
+            aggregate = (
+                "native-exact-span-participation-ordered-nfa-whole-operation-reducer-v1"
+            )
+            private = (0, 0, 0, 0)
+            reducer = reducer.replace("_captures_v1_", "_captures_scratch_v1_")
+        else:
+            adapter = {
+                "count-captures": (
+                    "general-aot-native-exact-span-participation-count-reducer-v1"
+                ),
+                "grep-captures": (
+                    "general-aot-native-exact-span-participation-grep-reducer-v1"
+                ),
+            }[model]
+            engine = "NativeExactSpanParticipationDfaV1"
+            aggregate = (
+                "native-exact-span-participation-whole-operation-reducer-v1"
+            )
+            private = (16, 0, 0, 0)
     elif source_route == "capture-next-v1":
+        if ordered:
+            raise AssertionError("CaptureNext has no ordered participation mode")
         adapter = {
             "count-captures": (
                 "general-aot-native-single-capture-next-count-reducer-v1"
@@ -1277,6 +1301,7 @@ def single_capture_reducer_provenance_fields(
         "can_match_empty": "false",
         "empty_progress": "byte",
         "semantic_runtime_calls": "0",
+        "caller_scratch_bytes": "232" if ordered else "0",
         "private_participation_scratch_bytes": str(private[0]),
         "private_iterator_state_bytes": str(private[1]),
         "private_result_slot_count": str(private[2]),
@@ -1309,18 +1334,24 @@ def single_capture_reducer_provenance_fields(
         )
         fields.update({
             "participation_algorithm_id": (
-                "fre-aot-regex.exact-span-participation-dfa.v1"
+                "fre-aot-regex.exact-span-participation-ordered-nfa.v1"
+                if ordered else "fre-aot-regex.exact-span-participation-dfa.v1"
             ),
-            "participation_strategy": "2",
+            "participation_strategy": "5" if ordered else "2",
             "participation_assertions": "0",
-            "participation_assertion_signatures": "1",
-            "participation_byte_classes": "8",
-            "participation_dfa_states": "17",
-            "participation_transition_cells": "136",
+            "participation_assertion_signatures": "0" if ordered else "1",
+            "participation_byte_classes": "0" if ordered else "8",
+            "participation_dfa_states": "0" if ordered else "17",
+            "participation_transition_cells": "0" if ordered else "136",
+            "participation_ordered_nfa_states": "3" if ordered else "0",
+            "participation_ordered_nfa_byte_ranges": "4" if ordered else "0",
+            "participation_dfa_fallback_resource": "1" if ordered else "0",
+            "participation_dfa_fallback_required": "131073" if ordered else "0",
+            "participation_dfa_fallback_limit": "131072" if ordered else "0",
             "participation_build_work": "999",
-            "participation_scratch_bytes": "16",
+            "participation_scratch_bytes": "232" if ordered else "16",
             "participation_plan_bytes": str(
-                CENSUS.participation_plan_bytes(0, 1, 17, 136)
+                424 if ordered else CENSUS.participation_plan_bytes(0, 1, 17, 136)
             ),
             "participation_selector_object_sha256": "5" * 64,
             "participation_bundle_sha256": "6" * 64,
@@ -1350,11 +1381,12 @@ def synthetic_single_capture_reducer_qualification_receipt(
     plan: dict[str, object],
     source_route: str = "exact-span-participation-v1",
     model: str = "count-captures",
+    ordered: bool = False,
 ) -> dict[str, object]:
     receipt = copy.deepcopy(synthetic_qualification_receipt(plan))
     receipt.pop("receipt_sha256")
     job = plan["jobs"][33 if model == "count-captures" else 35]
-    fields = single_capture_reducer_provenance_fields(source_route, model)
+    fields = single_capture_reducer_provenance_fields(source_route, model, ordered)
     encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
     parsed = CENSUS.parse_provenance(encoded)
     provenance = CENSUS.provenance_receipt(parsed)
@@ -2835,67 +2867,74 @@ class TrueNativeCensusTests(unittest.TestCase):
             "exact-span-participation-v1", "capture-next-v1"
         ):
             for model in ("count-captures", "grep-captures"):
-                with self.subTest(source_route=source_route, model=model):
-                    fields = single_capture_reducer_provenance_fields(
-                        source_route, model
-                    )
-                    encoded = " ".join(
-                        f"{key}={value}" for key, value in fields.items()
-                    ).encode()
-                    parsed = CENSUS.parse_provenance(encoded)
-                    provenance = CENSUS.provenance_receipt(parsed)
-                    CENSUS.validate_provenance_record(
-                        provenance, "synthetic single-capture reducer"
-                    )
-                    reducer = fields["reducer_symbol"]
-                    expected_route = (
-                        [reducer], "linked-native-single-capture-reducer"
-                    )
-                    self.assertEqual(
-                        CENSUS.selected_operation_entries(parsed), expected_route
-                    )
-                    self.assertEqual(
-                        CENSUS.operation_route_from_provenance_record(provenance),
-                        expected_route,
-                    )
-                    identity_symbols = (
-                        CENSUS.identity_defined_symbols_from_provenance(provenance)
-                    )
-                    self.assertEqual(len(identity_symbols), 3)
-                    self.assertNotIn(reducer, identity_symbols)
-                    self.assertEqual(
-                        CENSUS.authenticate_identity_defined_symbol_inventory(
-                            provenance, set(identity_symbols), set(identity_symbols)
-                        ),
-                        identity_symbols,
-                    )
-                    with self.assertRaisesRegex(
-                        CENSUS.CensusError, "identity symbols are absent"
+                ordered_modes = (
+                    (False, True)
+                    if source_route == "exact-span-participation-v1" else (False,)
+                )
+                for ordered in ordered_modes:
+                    with self.subTest(
+                        source_route=source_route, model=model, ordered=ordered
                     ):
-                        CENSUS.authenticate_identity_defined_symbol_inventory(
-                            provenance,
-                            set(identity_symbols[1:]),
-                            set(identity_symbols),
+                        fields = single_capture_reducer_provenance_fields(
+                            source_route, model, ordered
                         )
-                    receipt = synthetic_single_capture_reducer_qualification_receipt(
-                        plan, source_route, model
-                    )
-                    validated = CENSUS.validate_receipt(receipt, plan)
-                    self.assertEqual(
-                        validated["route"]["operation_entry_symbols"], [reducer]
-                    )
-                    self.assertTrue(
-                        validated["classification"][
-                            "whole_operation_native_authenticated"
-                        ]
-                    )
-                    self.assertFalse(
-                        validated["classification"]["adapter_outer_loop"]
-                    )
-                    self.assertEqual(
-                        validated["classification"]["reason"],
-                        "whole-operation-native-authenticated",
-                    )
+                        encoded = " ".join(
+                            f"{key}={value}" for key, value in fields.items()
+                        ).encode()
+                        parsed = CENSUS.parse_provenance(encoded)
+                        provenance = CENSUS.provenance_receipt(parsed)
+                        CENSUS.validate_provenance_record(
+                            provenance, "synthetic single-capture reducer"
+                        )
+                        reducer = fields["reducer_symbol"]
+                        expected_route = (
+                            [reducer], "linked-native-single-capture-reducer"
+                        )
+                        self.assertEqual(
+                            CENSUS.selected_operation_entries(parsed), expected_route
+                        )
+                        self.assertEqual(
+                            CENSUS.operation_route_from_provenance_record(provenance),
+                            expected_route,
+                        )
+                        identity_symbols = (
+                            CENSUS.identity_defined_symbols_from_provenance(provenance)
+                        )
+                        self.assertEqual(len(identity_symbols), 3)
+                        self.assertNotIn(reducer, identity_symbols)
+                        self.assertEqual(
+                            CENSUS.authenticate_identity_defined_symbol_inventory(
+                                provenance, set(identity_symbols), set(identity_symbols)
+                            ),
+                            identity_symbols,
+                        )
+                        with self.assertRaisesRegex(
+                            CENSUS.CensusError, "identity symbols are absent"
+                        ):
+                            CENSUS.authenticate_identity_defined_symbol_inventory(
+                                provenance,
+                                set(identity_symbols[1:]),
+                                set(identity_symbols),
+                            )
+                        receipt = synthetic_single_capture_reducer_qualification_receipt(
+                            plan, source_route, model, ordered
+                        )
+                        validated = CENSUS.validate_receipt(receipt, plan)
+                        self.assertEqual(
+                            validated["route"]["operation_entry_symbols"], [reducer]
+                        )
+                        self.assertTrue(
+                            validated["classification"][
+                                "whole_operation_native_authenticated"
+                            ]
+                        )
+                        self.assertFalse(
+                            validated["classification"]["adapter_outer_loop"]
+                        )
+                        self.assertEqual(
+                            validated["classification"]["reason"],
+                            "whole-operation-native-authenticated",
+                        )
 
     def test_single_capture_reducer_v5_fails_closed(self) -> None:
         base = single_capture_reducer_provenance_fields()

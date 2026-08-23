@@ -173,20 +173,26 @@ fn is_rebar_participation_lower_work_limit(
     )
 }
 
-fn is_rebar_participation_dfa_state_limit(
+fn is_rebar_participation_native_retry_limit(
     error: &RebarSingleCaptureParticipationAotErrorV1,
-    attempted_limit: usize,
+    attempted_limits: NativeParticipationAotLimitsV1,
 ) -> bool {
-    matches!(
-        error,
-        RebarSingleCaptureParticipationAotErrorV1::Participation(
-            NativeParticipationAotErrorV1::Resource {
-                resource: NativeParticipationAotResourceV1::DfaStates,
-                required,
-                limit,
-            }
-        ) if *limit == attempted_limit && *required == attempted_limit.saturating_add(1)
-    )
+    let RebarSingleCaptureParticipationAotErrorV1::Participation(
+        NativeParticipationAotErrorV1::Resource {
+            resource,
+            required,
+            limit,
+        },
+    ) = error
+    else {
+        return false;
+    };
+    let attempted_limit = match resource {
+        NativeParticipationAotResourceV1::DfaStates => attempted_limits.max_dfa_states,
+        NativeParticipationAotResourceV1::BuildWork => attempted_limits.max_build_work,
+        _ => return false,
+    };
+    *limit == attempted_limit && attempted_limit.checked_add(1) == Some(*required)
 }
 
 fn rebar_participation_native_retry_limits(
@@ -2078,7 +2084,7 @@ fn participation_dfa_envelope_exhaustion(
         }
         _ => false,
     };
-    (exact_limit && *required == limit.saturating_add(1)).then_some(
+    (exact_limit && limit.checked_add(1) == Some(*required)).then_some(
         ParticipationDfaEnvelopeExhaustion {
             resource: *resource,
             required: *required,
@@ -2118,8 +2124,32 @@ pub fn try_compile_participation_capture_bridge(
     };
     let compile_with_native_state_retry =
         |compile_limits| match compile_with_limits(compile_limits, native_limits) {
+            Ok(artifact)
+                if matches!(
+                    artifact.native_receipt().strategy,
+                    NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                        | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                ) && match artifact.native_receipt().dfa_fallback_resource {
+                    Some(NativeParticipationAotResourceV1::DfaStates) => {
+                        artifact.native_receipt().dfa_fallback_limit
+                            == native_limits.max_dfa_states
+                            && native_limits.max_dfa_states.checked_add(1)
+                                == Some(artifact.native_receipt().dfa_fallback_required)
+                    }
+                    Some(NativeParticipationAotResourceV1::BuildWork) => {
+                        artifact.native_receipt().dfa_fallback_limit
+                            == native_limits.max_build_work
+                            && native_limits.max_build_work.checked_add(1)
+                                == Some(artifact.native_receipt().dfa_fallback_required)
+                    }
+                    _ => false,
+                } =>
+            {
+                let retry_limits = rebar_participation_native_retry_limits(native_limits);
+                compile_with_limits(compile_limits, retry_limits)
+            }
             Err(error)
-                if is_rebar_participation_dfa_state_limit(&error, native_limits.max_dfa_states) =>
+                if is_rebar_participation_native_retry_limit(&error, native_limits) =>
             {
                 let retry_limits = rebar_participation_native_retry_limits(native_limits);
                 compile_with_limits(compile_limits, retry_limits)
@@ -2177,9 +2207,62 @@ pub fn try_compile_participation_capture_bridge(
             reason: format!("{decline:?}"),
         });
     }
-    let expected_strategy = match target.architecture {
-        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
-        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+    let strategy_matches_target = match target.architecture {
+        Architecture::X86_64 => matches!(
+            receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaX86_64
+                | NativeParticipationAotStrategyV1::OrderedNfaX86_64
+        ),
+        Architecture::Aarch64 => matches!(
+            receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaAarch64
+                | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+        ),
+    };
+    let dfa = matches!(
+        receipt.strategy,
+        NativeParticipationAotStrategyV1::DfaX86_64
+            | NativeParticipationAotStrategyV1::DfaAarch64
+    );
+    let ordered_nfa = matches!(
+        receipt.strategy,
+        NativeParticipationAotStrategyV1::OrderedNfaX86_64
+            | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+    );
+    let geometry_closes = if dfa {
+        receipt.assertion_signatures != 0
+            && receipt.byte_classes != 0
+            && receipt.dfa_states != 0
+            && receipt.transition_cells != 0
+            && receipt.ordered_nfa_states == 0
+            && receipt.ordered_nfa_byte_ranges == 0
+            && receipt.dfa_fallback_resource.is_none()
+            && receipt.dfa_fallback_required == 0
+            && receipt.dfa_fallback_limit == 0
+            && receipt.scratch_bytes
+                == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+    } else if ordered_nfa {
+        receipt.assertions <= 2
+            && receipt.assertion_signatures == 0
+            && receipt.byte_classes == 0
+            && receipt.dfa_states == 0
+            && receipt.transition_cells == 0
+            && receipt.ordered_nfa_states != 0
+            && matches!(
+                receipt.dfa_fallback_resource,
+                Some(
+                    NativeParticipationAotResourceV1::DfaStates
+                        | NativeParticipationAotResourceV1::BuildWork
+                )
+            )
+            && receipt.dfa_fallback_limit.checked_add(1)
+                == Some(receipt.dfa_fallback_required)
+            && receipt.scratch_bytes != 0
+            && receipt
+                .scratch_bytes
+                .is_multiple_of(fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN)
+    } else {
+        false
     };
     let module = artifact.module();
     let selector = artifact.selector_entry_symbol();
@@ -2201,17 +2284,13 @@ pub fn try_compile_participation_capture_bridge(
                 .iter()
                 .any(|relocation| relocation.symbol == index)
     });
-    if receipt.strategy != expected_strategy
+    if !strategy_matches_target
         || receipt.decline.is_some()
         || receipt.semantic_runtime_calls != 0
         || receipt.groups == 0
-        || receipt.groups > MAX_STRICT_CAPTURE_GROUPS
-        || receipt.assertion_signatures == 0
-        || receipt.byte_classes == 0
-        || receipt.dfa_states == 0
-        || receipt.transition_cells == 0
+        || receipt.groups > 64
+        || !geometry_closes
         || receipt.build_work == 0
-        || receipt.scratch_bytes != fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
         || receipt.plan_bytes != artifact.bundle().len()
         || selector.is_empty()
         || bundle.is_empty()
@@ -2232,7 +2311,7 @@ pub fn try_compile_participation_capture_bridge(
         || entry.size == 0
     {
         return Err(ParticipationCaptureBridgeError::Terminal(
-            "participation artifact is not a helper-free native DFA selector/replay closure"
+            "participation artifact is not a helper-free native selector/replay closure"
                 .to_owned(),
         ));
     }
@@ -2377,14 +2456,6 @@ pub fn compile_single_capture_reducer_bridge(
         Model::GrepCaptures => RebarSingleCaptureReducerOperationV1::GrepCaptures,
         _ => unreachable!("capture gate accepted a non-capture model"),
     };
-    let reducer_prefix = match operation {
-        RebarSingleCaptureReducerOperationV1::CountCaptures => {
-            "fre_aot_regex_count_captures_v1_"
-        }
-        RebarSingleCaptureReducerOperationV1::GrepCaptures => {
-            "fre_aot_regex_grep_captures_v1_"
-        }
-    };
     let artifact = compile_rebar_single_capture_reducer_aot_v1(
         source,
         operation,
@@ -2392,10 +2463,43 @@ pub fn compile_single_capture_reducer_bridge(
     )
     .map_err(|error| format!("single-capture whole-operation reducer compilation failed: {error}"))?;
     let receipt = artifact.receipt();
+    let reducer_prefix = match (operation, receipt.caller_scratch_bytes() != 0) {
+        (RebarSingleCaptureReducerOperationV1::CountCaptures, false) => {
+            "fre_aot_regex_count_captures_v1_"
+        }
+        (RebarSingleCaptureReducerOperationV1::GrepCaptures, false) => {
+            "fre_aot_regex_grep_captures_v1_"
+        }
+        (RebarSingleCaptureReducerOperationV1::CountCaptures, true) => {
+            "fre_aot_regex_count_captures_scratch_v1_"
+        }
+        (RebarSingleCaptureReducerOperationV1::GrepCaptures, true) => {
+            "fre_aot_regex_grep_captures_scratch_v1_"
+        }
+    };
     let private_schema_is_exact = match artifact.source() {
-        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(_) => {
-            receipt.private_participation_scratch_bytes()
-                == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(source) => {
+            let ordered = matches!(
+                source.native_receipt().strategy,
+                fre_aot_regex::NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                    | fre_aot_regex::NativeParticipationAotStrategyV1::OrderedNfaAarch64
+            );
+            receipt.caller_scratch_bytes()
+                == if ordered {
+                    source.native_receipt().scratch_bytes
+                } else {
+                    0
+                }
+                && (!ordered
+                    || receipt.caller_scratch_bytes().is_multiple_of(
+                        fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
+                    ))
+                && receipt.private_participation_scratch_bytes()
+                    == if ordered {
+                        0
+                    } else {
+                        fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                    }
                 && receipt.private_iterator_state_bytes() == 0
                 && receipt.private_result_slot_count() == 0
                 && receipt.private_result_slot_bytes() == 0
@@ -2405,7 +2509,8 @@ pub fn compile_single_capture_reducer_bridge(
                 usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_ITER_STATE_BYTES).ok();
             let slot_width =
                 usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES).ok();
-            receipt.private_participation_scratch_bytes() == 0
+            receipt.caller_scratch_bytes() == 0
+                && receipt.private_participation_scratch_bytes() == 0
                 && Some(receipt.private_iterator_state_bytes()) == state_bytes
                 && receipt.private_result_slot_count() == receipt.group_count()
                 && slot_width.and_then(|width| receipt.group_count().checked_mul(width))
@@ -4665,6 +4770,7 @@ mod tests {
                 receipt.source_route(),
                 fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1
             );
+            assert_eq!(receipt.caller_scratch_bytes(), 0);
             assert_eq!(
                 receipt.private_participation_scratch_bytes(),
                 fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
@@ -4781,7 +4887,8 @@ mod tests {
 
     #[test]
     fn participation_state_retry_classifier_is_narrow_and_fail_closed() {
-        let default_limit = NativeParticipationAotLimitsV1::default().max_dfa_states;
+        let default_limits = NativeParticipationAotLimitsV1::default();
+        let default_limit = default_limits.max_dfa_states;
         let exact_state_cap = RebarSingleCaptureParticipationAotErrorV1::Participation(
             NativeParticipationAotErrorV1::Resource {
                 resource: NativeParticipationAotResourceV1::DfaStates,
@@ -4789,9 +4896,9 @@ mod tests {
                 limit: default_limit,
             },
         );
-        assert!(is_rebar_participation_dfa_state_limit(
+        assert!(is_rebar_participation_native_retry_limit(
             &exact_state_cap,
-            default_limit
+            default_limits
         ));
 
         let non_exact_state_cap = RebarSingleCaptureParticipationAotErrorV1::Participation(
@@ -4801,27 +4908,27 @@ mod tests {
                 limit: default_limit,
             },
         );
-        assert!(!is_rebar_participation_dfa_state_limit(
+        assert!(!is_rebar_participation_native_retry_limit(
             &non_exact_state_cap,
-            default_limit
+            default_limits
         ));
         let build_work = RebarSingleCaptureParticipationAotErrorV1::Participation(
             NativeParticipationAotErrorV1::Resource {
                 resource: NativeParticipationAotResourceV1::BuildWork,
-                required: 2,
-                limit: 1,
+                required: default_limits.max_build_work + 1,
+                limit: default_limits.max_build_work,
             },
         );
-        assert!(!is_rebar_participation_dfa_state_limit(
+        assert!(is_rebar_participation_native_retry_limit(
             &build_work,
-            default_limit
+            default_limits
         ));
         let allocation = RebarSingleCaptureParticipationAotErrorV1::Participation(
             NativeParticipationAotErrorV1::Allocation("injected allocation failure"),
         );
-        assert!(!is_rebar_participation_dfa_state_limit(
+        assert!(!is_rebar_participation_native_retry_limit(
             &allocation,
-            default_limit
+            default_limits
         ));
 
         let exhausted_states = RebarSingleCaptureParticipationAotErrorV1::Participation(

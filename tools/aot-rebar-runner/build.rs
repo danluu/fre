@@ -1612,22 +1612,51 @@ fn configured_participation_capture_source(
     let bundle_symbol = artifact.bundle_symbol();
     let participation_symbol = artifact.participation_entry_symbol();
     let reducer_symbol = reducer.reducer_symbol();
-    let strategy = match receipt.strategy {
-        fre_aot_regex::NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
-        fre_aot_regex::NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
+    let (strategy, ordered_nfa) = match receipt.strategy {
+        fre_aot_regex::NativeParticipationAotStrategyV1::DfaX86_64 => (1_u16, false),
+        fre_aot_regex::NativeParticipationAotStrategyV1::DfaAarch64 => (2_u16, false),
         fre_aot_regex::NativeParticipationAotStrategyV1::NegativeEntry => {
             unreachable!("selected participation source cannot contain a negative entry")
         }
+        fre_aot_regex::NativeParticipationAotStrategyV1::OrderedNfaX86_64 => (4_u16, true),
+        fre_aot_regex::NativeParticipationAotStrategyV1::OrderedNfaAarch64 => (5_u16, true),
     };
     assert!(receipt.decline.is_none());
-    let adapter = match benchmark.model {
-        shared::Model::CountCaptures => {
+    let adapter = match (benchmark.model, ordered_nfa) {
+        (shared::Model::CountCaptures, false) => {
             "general-aot-native-exact-span-participation-count-reducer-v1"
         }
-        shared::Model::GrepCaptures => {
+        (shared::Model::GrepCaptures, false) => {
             "general-aot-native-exact-span-participation-grep-reducer-v1"
         }
+        (shared::Model::CountCaptures, true) => {
+            "general-aot-native-exact-span-ordered-nfa-participation-count-reducer-v1"
+        }
+        (shared::Model::GrepCaptures, true) => {
+            "general-aot-native-exact-span-ordered-nfa-participation-grep-reducer-v1"
+        }
         _ => unreachable!("participation source requires a capture model"),
+    };
+    let algorithm_id = if ordered_nfa {
+        fre_aot_regex::NATIVE_PARTICIPATION_ORDERED_NFA_V1_ALGORITHM_ID
+    } else {
+        fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
+    };
+    let engine = if ordered_nfa {
+        "NativeExactSpanParticipationOrderedNfaV1"
+    } else {
+        "NativeExactSpanParticipationDfaV1"
+    };
+    let aggregate_strategy = if ordered_nfa {
+        "native-exact-span-participation-ordered-nfa-whole-operation-reducer-v1"
+    } else {
+        "native-exact-span-participation-whole-operation-reducer-v1"
+    };
+    let dfa_fallback_resource = match receipt.dfa_fallback_resource {
+        None => 0_u16,
+        Some(fre_aot_regex::NativeParticipationAotResourceV1::DfaStates) => 1_u16,
+        Some(fre_aot_regex::NativeParticipationAotResourceV1::BuildWork) => 2_u16,
+        Some(_) => unreachable!("ordered participation retained a non-DFA fallback resource"),
     };
     let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
         "linked-native-single-capture-whole-operation-reducer-v1"
@@ -1692,7 +1721,7 @@ fn configured_participation_capture_source(
     writeln!(
         source,
         "pub const PARTICIPATION_ALGORITHM_ID: &str = {:?};",
-        fre_aot_regex::NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID
+        algorithm_id
     )
     .unwrap();
     writeln!(
@@ -1720,12 +1749,24 @@ fn configured_participation_capture_source(
         ("BYTE_CLASSES", receipt.byte_classes),
         ("DFA_STATES", receipt.dfa_states),
         ("TRANSITION_CELLS", receipt.transition_cells),
+        ("ORDERED_NFA_STATES", receipt.ordered_nfa_states),
+        (
+            "ORDERED_NFA_BYTE_RANGES",
+            receipt.ordered_nfa_byte_ranges,
+        ),
+        ("DFA_FALLBACK_REQUIRED", receipt.dfa_fallback_required),
+        ("DFA_FALLBACK_LIMIT", receipt.dfa_fallback_limit),
         ("BUILD_WORK", receipt.build_work),
         ("SCRATCH_BYTES", receipt.scratch_bytes),
         ("PLAN_BYTES", receipt.plan_bytes),
     ] {
         writeln!(source, "pub const PARTICIPATION_{name}: usize = {value};").unwrap();
     }
+    writeln!(
+        source,
+        "pub const PARTICIPATION_DFA_FALLBACK_RESOURCE: u16 = {dfa_fallback_resource};"
+    )
+    .unwrap();
     for (name, digest) in [
         ("SOURCE", outer.source_sha256()),
         ("CAPTURE", receipt.capture_sha256),
@@ -1796,10 +1837,12 @@ fn configured_participation_capture_source(
     .unwrap();
     source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
     source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
-    source.push_str("pub const ENGINE: &str = \"NativeExactSpanParticipationDfaV1\";\n");
-    source.push_str(
-        "pub const AGGREGATE_STRATEGY: &str = \"native-exact-span-participation-whole-operation-reducer-v1\";\n",
-    );
+    writeln!(source, "pub const ENGINE: &str = {engine:?};").unwrap();
+    writeln!(
+        source,
+        "pub const AGGREGATE_STRATEGY: &str = {aggregate_strategy:?};"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const COMPILER_VERSION: u32 = {};",
@@ -1829,7 +1872,11 @@ fn configured_participation_capture_source(
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {reducer_symbol:?}]").unwrap();
-    source.push_str("    fn LINKED_SINGLE_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+    if reducer_receipt.caller_scratch_bytes() == 0 {
+        source.push_str("    fn LINKED_SINGLE_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+    } else {
+        source.push_str("    fn LINKED_SINGLE_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, scratch: *mut u8, scratch_len: usize, value_out: *mut u64) -> u32;\n");
+    }
     source.push_str("}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
@@ -1837,7 +1884,11 @@ fn configured_participation_capture_source(
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn participation_exact(_request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
+    if reducer_receipt.caller_scratch_bytes() == 0 {
+        source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
+    } else {
+        source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, scratch: *mut u8, scratch_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, scratch, scratch_len, value_out) } }\n");
+    }
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
@@ -2125,7 +2176,7 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn capture_next(_haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, _slot_count: usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
+    source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
@@ -2909,6 +2960,7 @@ fn push_single_capture_reducer_receipt(
         ("SOURCE_BYTES", receipt.source_bytes()),
         ("GROUP_COUNT", receipt.group_count()),
         ("SEMANTIC_RUNTIME_CALLS", receipt.semantic_runtime_calls()),
+        ("CALLER_SCRATCH_BYTES", receipt.caller_scratch_bytes()),
         (
             "PRIVATE_PARTICIPATION_SCRATCH_BYTES",
             receipt.private_participation_scratch_bytes(),
@@ -2968,6 +3020,7 @@ fn push_empty_single_capture_reducer_bindings(source: &mut String) {
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_GROUP_COUNT: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = false;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT: usize = 0;\n");
@@ -2982,7 +3035,7 @@ fn push_empty_single_capture_reducer_bindings(source: &mut String) {
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub unsafe fn capture_reduce(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn capture_reduce(_haystack: *const u8, _haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
 fn push_empty_strict_capture_bindings(source: &mut String) {
@@ -3015,6 +3068,11 @@ fn push_empty_participation_capture_bindings(source: &mut String) {
     source.push_str("pub const PARTICIPATION_BYTE_CLASSES: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_DFA_STATES: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_TRANSITION_CELLS: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_ORDERED_NFA_STATES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_ORDERED_NFA_BYTE_RANGES: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_DFA_FALLBACK_RESOURCE: u16 = 0;\n");
+    source.push_str("pub const PARTICIPATION_DFA_FALLBACK_REQUIRED: usize = 0;\n");
+    source.push_str("pub const PARTICIPATION_DFA_FALLBACK_LIMIT: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_BUILD_WORK: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_SCRATCH_BYTES: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_PLAN_BYTES: usize = 0;\n");
@@ -3133,6 +3191,11 @@ pub const PARTICIPATION_ASSERTION_SIGNATURES: usize = 0;
 pub const PARTICIPATION_BYTE_CLASSES: usize = 0;
 pub const PARTICIPATION_DFA_STATES: usize = 0;
 pub const PARTICIPATION_TRANSITION_CELLS: usize = 0;
+pub const PARTICIPATION_ORDERED_NFA_STATES: usize = 0;
+pub const PARTICIPATION_ORDERED_NFA_BYTE_RANGES: usize = 0;
+pub const PARTICIPATION_DFA_FALLBACK_RESOURCE: u16 = 0;
+pub const PARTICIPATION_DFA_FALLBACK_REQUIRED: usize = 0;
+pub const PARTICIPATION_DFA_FALLBACK_LIMIT: usize = 0;
 pub const PARTICIPATION_BUILD_WORK: usize = 0;
 pub const PARTICIPATION_SCRATCH_BYTES: usize = 0;
 pub const PARTICIPATION_PLAN_BYTES: usize = 0;
@@ -3157,6 +3220,7 @@ pub const SINGLE_CAPTURE_REDUCER_SOURCE_BYTES: usize = 0;
 pub const SINGLE_CAPTURE_REDUCER_GROUP_COUNT: usize = 0;
 pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = false;
 pub const SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES: usize = 0;
 pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;
 pub const SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES: usize = 0;
 pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT: usize = 0;
@@ -3327,6 +3391,8 @@ pub unsafe fn participation_exact(
 pub unsafe fn capture_reduce(
     _haystack: *const u8,
     _haystack_len: usize,
+    _scratch: *mut u8,
+    _scratch_len: usize,
     _value_out: *mut u64,
 ) -> u32 { 2 }
 "#

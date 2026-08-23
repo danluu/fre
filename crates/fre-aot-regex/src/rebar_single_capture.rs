@@ -692,11 +692,23 @@ impl RebarSingleCaptureReducerSourceArtifactV1 {
     fn native_source(&self) -> crate::module::NativeCaptureReducerSourceV1<'_> {
         match self {
             Self::ExactSpanParticipation(source) => {
+                let participation_scratch_bytes = source.native_receipt().scratch_bytes;
+                let caller_scratch_bytes = if matches!(
+                    source.native_receipt().strategy,
+                    NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                        | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                ) {
+                    participation_scratch_bytes
+                } else {
+                    0
+                };
                 crate::module::NativeCaptureReducerSourceV1::ExactSpanParticipation {
                     selector_symbol: source.selector_entry_symbol(),
                     bundle_symbol: source.bundle_symbol(),
                     participation_symbol: source.participation_entry_symbol(),
                     group_count: source.receipt().group_count(),
+                    participation_scratch_bytes,
+                    caller_scratch_bytes,
                 }
             }
             Self::CaptureNext(source) => crate::module::NativeCaptureReducerSourceV1::CaptureNext {
@@ -734,6 +746,7 @@ pub struct RebarSingleCaptureReducerAotReceiptV1 {
     can_match_empty: bool,
     empty_progress: RebarSingleCaptureEmptyProgressV1,
     semantic_runtime_calls: usize,
+    caller_scratch_bytes: usize,
     private_participation_scratch_bytes: usize,
     private_iterator_state_bytes: usize,
     private_result_slot_count: usize,
@@ -813,6 +826,14 @@ impl RebarSingleCaptureReducerAotReceiptV1 {
     #[must_use]
     pub const fn semantic_runtime_calls(&self) -> usize {
         self.semantic_runtime_calls
+    }
+
+    /// Exact aligned scratch extent supplied by the operation owner on every
+    /// reducer call. The reducer authenticates this extent before reading the
+    /// haystack and never retains the pointer after return.
+    #[must_use]
+    pub const fn caller_scratch_bytes(&self) -> usize {
+        self.caller_scratch_bytes
     }
 
     #[must_use]
@@ -1287,6 +1308,7 @@ pub fn compile_rebar_single_capture_reducer_aot_v1(
     let source_artifact_identity_sha256 = source.artifact_identity_sha256();
     let source_object_sha256 = source.object_sha256();
     let (
+        caller_scratch_bytes,
         private_participation_scratch_bytes,
         private_iterator_state_bytes,
         private_result_slot_count,
@@ -1331,6 +1353,7 @@ pub fn compile_rebar_single_capture_reducer_aot_v1(
         can_match_empty,
         empty_progress: RebarSingleCaptureEmptyProgressV1::Byte,
         semantic_runtime_calls: 0,
+        caller_scratch_bytes,
         private_participation_scratch_bytes,
         private_iterator_state_bytes,
         private_result_slot_count,
@@ -1408,15 +1431,37 @@ fn authenticate_reducer_source(
                     ),
                 );
             }
-            let expected = match native.target.architecture {
-                Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
-                Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+            let architecture_closes = match native.target.architecture {
+                Architecture::X86_64 => matches!(
+                    native.strategy,
+                    NativeParticipationAotStrategyV1::DfaX86_64
+                        | NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                ),
+                Architecture::Aarch64 => matches!(
+                    native.strategy,
+                    NativeParticipationAotStrategyV1::DfaAarch64
+                        | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                ),
             };
-            if native.strategy != expected
+            let scratch_closes = match native.strategy {
+                NativeParticipationAotStrategyV1::DfaX86_64
+                | NativeParticipationAotStrategyV1::DfaAarch64 => {
+                    native.scratch_bytes == crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                }
+                NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                | NativeParticipationAotStrategyV1::OrderedNfaAarch64 => {
+                    native.scratch_bytes != 0
+                        && native.scratch_bytes.is_multiple_of(
+                            crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
+                        )
+                }
+                NativeParticipationAotStrategyV1::NegativeEntry => false,
+            };
+            if !architecture_closes
                 || native.decline.is_some()
                 || native.semantic_runtime_calls != 0
                 || native.groups != source.receipt().group_count()
-                || native.scratch_bytes != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                || !scratch_closes
                 || !(1..=64).contains(&native.groups)
             {
                 return Err(RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
@@ -1449,10 +1494,25 @@ fn authenticate_reducer_source(
 
 fn reducer_private_schema(
     source: &RebarSingleCaptureReducerSourceArtifactV1,
-) -> Result<(usize, usize, usize, usize), RebarSingleCaptureReducerAotErrorV1> {
+) -> Result<(usize, usize, usize, usize, usize), RebarSingleCaptureReducerAotErrorV1> {
     match source {
-        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(_) => {
-            Ok((crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES, 0, 0, 0))
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(source) => {
+            let native = source.native_receipt();
+            if matches!(
+                native.strategy,
+                NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                    | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+            ) {
+                Ok((native.scratch_bytes, 0, 0, 0, 0))
+            } else {
+                Ok((
+                    0,
+                    crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES,
+                    0,
+                    0,
+                    0,
+                ))
+            }
         }
         RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(source) => {
             let slots = source.receipt().group_count();
@@ -1473,7 +1533,7 @@ fn reducer_private_schema(
                     "private capture result slots",
                 ),
             )?;
-            Ok((0, state_bytes, slots, bytes))
+            Ok((0, 0, state_bytes, slots, bytes))
         }
     }
 }
@@ -1483,7 +1543,8 @@ fn rebar_single_capture_reducer_artifact_authenticates(
 ) -> bool {
     let receipt = &artifact.receipt;
     let source = &artifact.source;
-    let Ok((scratch_bytes, state_bytes, slot_count, slot_bytes)) = reducer_private_schema(source)
+    let Ok((caller_scratch_bytes, scratch_bytes, state_bytes, slot_count, slot_bytes)) =
+        reducer_private_schema(source)
     else {
         return false;
     };
@@ -1501,6 +1562,7 @@ fn rebar_single_capture_reducer_artifact_authenticates(
         || receipt.can_match_empty != source.can_match_empty()
         || receipt.empty_progress != RebarSingleCaptureEmptyProgressV1::Byte
         || receipt.semantic_runtime_calls != 0
+        || receipt.caller_scratch_bytes != caller_scratch_bytes
         || receipt.private_participation_scratch_bytes != scratch_bytes
         || receipt.private_iterator_state_bytes != state_bytes
         || receipt.private_result_slot_count != slot_count
@@ -1582,6 +1644,16 @@ fn rebar_single_capture_reducer_artifact_identity(
         receipt.max_object_bytes,
     ] {
         digest.update(reducer_usize_u64(value, "capture reducer receipt")?.to_le_bytes());
+    }
+    if receipt.caller_scratch_bytes != 0 {
+        digest.update(b"caller-scratch-v1\0");
+        digest.update(
+            reducer_usize_u64(
+                receipt.caller_scratch_bytes,
+                "capture reducer caller scratch",
+            )?
+            .to_le_bytes(),
+        );
     }
     for identity in [
         receipt.source_sha256,
@@ -1672,10 +1744,18 @@ fn rebar_single_participation_artifact_authenticates(
     let mut expected_profile = RustProfile::rebar_1_12_4();
     expected_profile.options = receipt.profile.options.clone();
     let selected_strategy = match receipt.target.architecture {
-        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
-        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+        Architecture::X86_64 => matches!(
+            native_receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaX86_64
+                | NativeParticipationAotStrategyV1::OrderedNfaX86_64
+        ),
+        Architecture::Aarch64 => matches!(
+            native_receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaAarch64
+                | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+        ),
     };
-    let route_closes = if native_receipt.strategy == selected_strategy {
+    let route_closes = if selected_strategy {
         native_receipt.decline.is_none()
             && native.module().required_runtime_symbols().next().is_none()
             && native.module().required_runtime_program().is_none()
@@ -1744,6 +1824,8 @@ fn rebar_single_participation_artifact_identity(
             NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
             NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
             NativeParticipationAotStrategyV1::NegativeEntry => 3_u16,
+            NativeParticipationAotStrategyV1::OrderedNfaX86_64 => 4_u16,
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64 => 5_u16,
         }
         .to_le_bytes(),
     );
@@ -1770,6 +1852,32 @@ fn rebar_single_participation_artifact_identity(
     ] {
         digest
             .update(participation_usize_u64(value, "native participation identity")?.to_le_bytes());
+    }
+    if matches!(
+        native_receipt.strategy,
+        NativeParticipationAotStrategyV1::OrderedNfaX86_64
+            | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+    ) {
+        digest.update(b"ordered-nfa-fallback-v1\0");
+        for value in [
+            native_receipt.ordered_nfa_states,
+            native_receipt.ordered_nfa_byte_ranges,
+            native_receipt.dfa_fallback_required,
+            native_receipt.dfa_fallback_limit,
+        ] {
+            digest.update(
+                participation_usize_u64(value, "ordered-NFA participation identity")?
+                    .to_le_bytes(),
+            );
+        }
+        digest.update(
+            match native_receipt.dfa_fallback_resource {
+                Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u16,
+                Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u16,
+                _ => 0_u16,
+            }
+            .to_le_bytes(),
+        );
     }
     for identity in [
         native_receipt.capture_sha256,

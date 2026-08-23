@@ -8441,11 +8441,15 @@ impl CompiledModule {
                 "capture reducer source is not one helper-free ordinary closure",
             ));
         }
-        let prefix = domain.symbol_prefix();
+        let caller_scratch = source.caller_scratch_bytes() != 0;
+        let prefix = domain.symbol_prefix(caller_scratch);
         if self
             .symbols
             .iter()
-            .any(|symbol| symbol.name.starts_with(prefix))
+            .any(|symbol| {
+                symbol.name.starts_with(domain.symbol_prefix(false))
+                    || symbol.name.starts_with(domain.symbol_prefix(true))
+            })
         {
             return Err(ObjectError::InvalidModule(
                 "capture reducer was appended more than once",
@@ -8482,8 +8486,20 @@ impl CompiledModule {
                 bundle_symbol,
                 participation_symbol,
                 group_count,
+                participation_scratch_bytes,
+                caller_scratch_bytes,
             } => {
-                if group_count == 0 || self.entry_symbol() != selector_symbol {
+                if group_count == 0
+                    || participation_scratch_bytes == 0
+                    || !participation_scratch_bytes
+                        .is_multiple_of(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN)
+                    || (caller_scratch_bytes == 0
+                        && participation_scratch_bytes
+                            != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+                    || (caller_scratch_bytes != 0
+                        && caller_scratch_bytes != participation_scratch_bytes)
+                    || self.entry_symbol() != selector_symbol
+                {
                     return Err(ObjectError::InvalidModule(
                         "capture reducer participation source identity disagrees",
                     ));
@@ -8625,6 +8641,16 @@ impl CompiledModule {
                 .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer group count"))?
                 .to_le_bytes(),
         );
+        if caller_scratch {
+            digest.update(b"caller-scratch-v1\0");
+            digest.update(
+                u64::try_from(source.caller_scratch_bytes())
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow("capture reducer caller scratch")
+                    })?
+                    .to_le_bytes(),
+            );
+        }
         digest.update(source_artifact_identity);
         for name in source.symbol_names().into_iter().flatten() {
             digest.update(
@@ -9050,12 +9076,28 @@ impl CompiledModule {
             ));
         }
         let lowering = match (self.target.architecture, geometry) {
-            (Architecture::X86_64, Some(shape)) => NativeParticipationLowering::X86(
-                lower_x86_64_native_participation_v1(self.target, shape)?,
-            ),
-            (Architecture::Aarch64, Some(shape)) => NativeParticipationLowering::Aarch64(
-                lower_aarch64_native_participation_v1(self.target, shape)?,
-            ),
+            (Architecture::X86_64, Some(shape)) => {
+                let lowered = match shape.kind {
+                    crate::participation_aot::NativeParticipationPlanKindV1::Dfa => {
+                        lower_x86_64_native_participation_v1(self.target, shape)?
+                    }
+                    crate::participation_aot::NativeParticipationPlanKindV1::OrderedNfa => {
+                        lower_x86_64_ordered_nfa_participation_v1(self.target, shape)?
+                    }
+                };
+                NativeParticipationLowering::X86(lowered)
+            }
+            (Architecture::Aarch64, Some(shape)) => {
+                let lowered = match shape.kind {
+                    crate::participation_aot::NativeParticipationPlanKindV1::Dfa => {
+                        lower_aarch64_native_participation_v1(self.target, shape)?
+                    }
+                    crate::participation_aot::NativeParticipationPlanKindV1::OrderedNfa => {
+                        lower_aarch64_ordered_nfa_participation_v1(self.target, shape)?
+                    }
+                };
+                NativeParticipationLowering::Aarch64(lowered)
+            }
             (architecture, None) => {
                 NativeParticipationLowering::Negative(native_participation_negative(architecture)?)
             }
@@ -9468,10 +9510,16 @@ pub(crate) enum NativeCaptureReducerDomainV1 {
 }
 
 impl NativeCaptureReducerDomainV1 {
-    const fn symbol_prefix(self) -> &'static str {
-        match self {
-            Self::WholeHaystack => "fre_aot_regex_count_captures_v1_",
-            Self::ByteSliceLines => "fre_aot_regex_grep_captures_v1_",
+    const fn symbol_prefix(self, caller_scratch: bool) -> &'static str {
+        match (self, caller_scratch) {
+            (Self::WholeHaystack, false) => "fre_aot_regex_count_captures_v1_",
+            (Self::ByteSliceLines, false) => "fre_aot_regex_grep_captures_v1_",
+            (Self::WholeHaystack, true) => {
+                "fre_aot_regex_count_captures_scratch_v1_"
+            }
+            (Self::ByteSliceLines, true) => {
+                "fre_aot_regex_grep_captures_scratch_v1_"
+            }
         }
     }
 
@@ -9491,6 +9539,8 @@ pub(crate) enum NativeCaptureReducerSourceV1<'a> {
         bundle_symbol: &'a str,
         participation_symbol: &'a str,
         group_count: usize,
+        participation_scratch_bytes: usize,
+        caller_scratch_bytes: usize,
     },
     CaptureNext {
         capture_next_symbol: &'a str,
@@ -9510,6 +9560,16 @@ impl<'a> NativeCaptureReducerSourceV1<'a> {
         match self {
             Self::ExactSpanParticipation { group_count, .. }
             | Self::CaptureNext { group_count, .. } => group_count,
+        }
+    }
+
+    const fn caller_scratch_bytes(self) -> usize {
+        match self {
+            Self::ExactSpanParticipation {
+                caller_scratch_bytes,
+                ..
+            } => caller_scratch_bytes,
+            Self::CaptureNext { .. } => 0,
         }
     }
 
@@ -27156,6 +27216,11 @@ fn native_participation_target_word(target: Target) -> Result<u32, ObjectError> 
 fn validate_native_participation_geometry(
     geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
 ) -> Result<(), ObjectError> {
+    if geometry.kind != crate::participation_aot::NativeParticipationPlanKindV1::Dfa {
+        return Err(ObjectError::InvalidModule(
+            "native participation DFA geometry kind",
+        ));
+    }
     let expected_transitions = geometry
         .state_count
         .checked_mul(geometry.alphabet_len)
@@ -27223,6 +27288,130 @@ fn validate_native_participation_geometry(
     {
         return Err(ObjectError::InvalidModule(
             "native participation geometry does not close",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordered_nfa_participation_geometry(
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<(), ObjectError> {
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES, NativeParticipationPlanKindV1,
+    };
+    let frontier_bytes = geometry
+        .state_count
+        .checked_mul(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation frontier",
+        ))?;
+    let expected_next = frontier_bytes;
+    let expected_stack = expected_next.checked_add(frontier_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation stack"),
+    )?;
+    let expected_seen = expected_stack.checked_add(frontier_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation seen"),
+    )?;
+    let seen_bytes = geometry
+        .state_count
+        .checked_mul(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation seen",
+        ))?;
+    let expected_scratch = expected_seen
+        .checked_add(seen_bytes)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation scratch",
+        ))?;
+    let expected_states = crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        .checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation states",
+        ))?;
+    let states_bytes = geometry
+        .state_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation states",
+        ))?;
+    let expected_ranges = expected_states
+        .checked_add(states_bytes)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation ranges",
+        ))?;
+    let ranges_bytes = geometry
+        .ordered_nfa_byte_range_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation ranges",
+        ))?;
+    let expected_total = expected_ranges.checked_add(ranges_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation plan"),
+    )?;
+    let fallback_closes = matches!(
+        geometry.dfa_fallback_resource,
+        Some(
+            crate::NativeParticipationAotResourceV1::DfaStates
+                | crate::NativeParticipationAotResourceV1::BuildWork
+        )
+    ) && geometry.dfa_fallback_limit.checked_add(1)
+        == Some(geometry.dfa_fallback_required);
+    if geometry.kind != NativeParticipationPlanKindV1::OrderedNfa
+        || geometry.total_bytes != expected_total
+        || geometry.build_work == 0
+        || geometry.group_count == 0
+        || geometry.group_count > 64
+        || geometry.assertion_count > 2
+        || geometry.signature_count != 0
+        || geometry.alphabet_len != 0
+        || geometry.state_count == 0
+        || geometry.transition_count != 0
+        || usize::try_from(geometry.ordered_nfa_start_state)
+            .ok()
+            .is_none_or(|start| start >= geometry.state_count)
+        || geometry.ordered_nfa_metadata_offset
+            != crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        || geometry.ordered_nfa_states_offset != expected_states
+        || geometry.ordered_nfa_byte_ranges_offset != expected_ranges
+        || geometry.replay_current_offset != 0
+        || geometry.replay_next_offset != expected_next
+        || geometry.replay_stack_offset != expected_stack
+        || geometry.replay_seen_offset != expected_seen
+        || geometry.replay_scratch_bytes != expected_scratch
+        || geometry.replay_scratch_bytes == 0
+        || !geometry.replay_scratch_bytes.is_multiple_of(8)
+        || !fallback_closes
+        || [
+            geometry.total_bytes,
+            geometry.build_work,
+            geometry.group_count,
+            geometry.assertion_count,
+            geometry.state_count,
+            geometry.ordered_nfa_byte_range_count,
+            geometry.ordered_nfa_metadata_offset,
+            geometry.ordered_nfa_states_offset,
+            geometry.ordered_nfa_byte_ranges_offset,
+            geometry.replay_current_offset,
+            geometry.replay_next_offset,
+            geometry.replay_stack_offset,
+            geometry.replay_seen_offset,
+            geometry.replay_scratch_bytes,
+            geometry.dfa_fallback_required,
+            geometry.dfa_fallback_limit,
+        ]
+        .iter()
+        .any(|&value| u32::try_from(value).is_err())
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA participation geometry does not close",
         ));
     }
     Ok(())
@@ -27598,6 +27787,1609 @@ fn lower_aarch64_native_participation_v1(
         (23, 24, 32),
         (25, 26, 48),
         (27, 28, 64),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        plan_page_relocation_offset,
+        plan_page_offset_relocation_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(Aarch64NativeParticipationLowering {
+        code,
+        plan_page_relocation_offset: relocation_offsets[0],
+        plan_page_offset_relocation_offset: relocation_offsets[1],
+    })
+}
+
+fn x86_ordered_nfa_compare_plan_u32(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: u32,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut instruction = vec![0x41, 0x81, 0x7f, offset];
+    instruction.extend_from_slice(&expected.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+fn x86_ordered_nfa_compare_plan_u64(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: usize,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut constant = vec![0x48, 0xb8];
+    constant.extend_from_slice(
+        &u64::try_from(expected)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan field"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&constant)?;
+    assembler.instruction(&[0x49, 0x39, 0x47, offset])?;
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+fn x86_ordered_nfa_compare_metadata_u64(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: u64,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut constant = vec![0x48, 0xb8];
+    constant.extend_from_slice(&expected.to_le_bytes());
+    assembler.instruction(&constant)?;
+    if offset == 0 {
+        assembler.instruction(&[0x49, 0x39, 0x02])?;
+    } else {
+        assembler.instruction(&[0x49, 0x39, 0x42, offset])?;
+    }
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+/// Push `(eax, rdx, rcx)` onto the ordered-NFA closure stack. The internal
+/// closure keeps its stack cardinality in `r11`; only `r8/r9` are temporary.
+fn x86_ordered_nfa_push_thread(
+    assembler: &mut X86Assembler,
+    state_count: u32,
+    stack_pointer_offset: u8,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut bound = vec![0x49, 0x81, 0xfb];
+    bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&bound)?;
+    assembler.branch(&[0x0f, 0x83], failed)?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc3, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, stack_pointer_offset])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc1])?;
+    assembler.instruction(&[0x41, 0x89, 0x01])?;
+    assembler.instruction(&[0x41, 0xc7, 0x41, 4, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0x89, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x89, 0x49, 16])?;
+    assembler.instruction(&[0x49, 0xff, 0xc3])?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated ordered-NFA request, closure, and exact-span replay are one helper-free leaf"
+)]
+fn lower_x86_64_ordered_nfa_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<X86NativeParticipationLowering, ObjectError> {
+    validate_ordered_nfa_participation_geometry(geometry)?;
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES,
+    };
+    const FRAME_BYTES: u32 = 104;
+    const SCRATCH_POINTER: u8 = 0;
+    const COUNT_POINTER: u8 = 8;
+    const CURRENT_POINTER: u8 = 16;
+    const NEXT_POINTER: u8 = 24;
+    const STACK_POINTER: u8 = 32;
+    const SEEN_POINTER: u8 = 40;
+    const CURRENT_COUNT: u8 = 48;
+    const NEXT_COUNT: u8 = 56;
+    const GENERATION: u8 = 64;
+    const STATES_POINTER: u8 = 72;
+    const RANGES_POINTER: u8 = 80;
+    const TARGET_PC: u8 = 88;
+    const SCRATCH_END: u8 = 96;
+    // A local `call` pushes one return address before the closure sees these.
+    const CLOSURE_STACK_POINTER: u8 = STACK_POINTER + 8;
+    const CLOSURE_SEEN_POINTER: u8 = SEEN_POINTER + 8;
+    const CLOSURE_GENERATION: u8 = GENERATION + 8;
+    const CLOSURE_STATES_POINTER: u8 = STATES_POINTER + 8;
+
+    let state_count = u32::try_from(geometry.state_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?;
+    let range_count = u32::try_from(geometry.ordered_nfa_byte_range_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?;
+    let group_count = u32::try_from(geometry.group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA groups"))?;
+    let slot_count = group_count
+        .checked_mul(2)
+        .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA slots"))?;
+    let fallback_resource = match geometry.dfa_fallback_resource {
+        Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u64,
+        Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u64,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA fallback resource",
+            ));
+        }
+    };
+
+    let mut assembler = X86Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let replay_loop = assembler.label()?;
+    let generation_ready = assembler.label()?;
+    let clear_seen = assembler.label()?;
+    let clear_seen_loop = assembler.label()?;
+    let thread_loop = assembler.label()?;
+    let next_thread = assembler.label()?;
+    let range_loop = assembler.label()?;
+    let range_next = assembler.label()?;
+    let byte_matched = assembler.label()?;
+    let swap_frontiers = assembler.label()?;
+    let accept_loop = assembler.label()?;
+    let accept_match = assembler.label()?;
+    let popcount_loop = assembler.label()?;
+    let popcount_done = assembler.label()?;
+    let closure = assembler.label()?;
+    let closure_loop = assembler.label()?;
+    let closure_append = assembler.label()?;
+    let closure_epsilon = assembler.label()?;
+    let closure_assert = assembler.label()?;
+    let closure_assert_start = assembler.label()?;
+    let closure_assert_end = assembler.label()?;
+    let closure_save = assembler.label()?;
+    let closure_save_close = assembler.label()?;
+    let closure_split = assembler.label()?;
+    let closure_done = assembler.label()?;
+    let closure_failure = assembler.label()?;
+    let scratch_haystack_disjoint = assembler.label()?;
+    let scratch_request_disjoint = assembler.label()?;
+    let scratch_count_disjoint = assembler.label()?;
+    let scratch_plan_disjoint = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_before_frame)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid_before_frame)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 64])?;
+    assembler.branch(&[0x0f, 0x82], invalid_before_frame)?;
+
+    for instruction in [
+        &[0x55][..],
+        &[0x53],
+        &[0x41, 0x54],
+        &[0x41, 0x55],
+        &[0x41, 0x56],
+        &[0x41, 0x57],
+    ] {
+        assembler.instruction(instruction)?;
+    }
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x4c, 0x8d, 0x3d])?;
+    let plan_relocation = assembler.label()?;
+    assembler.bind(plan_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x07])?;
+    assembler.instruction(&[0x4c, 0x39, 0xf8])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x8b, 0x5f, 8])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x67, 16])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x6f, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x77, 32])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x47, 40])?;
+    assembler.instruction(&[0x48, 0x8b, 0x47, 48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4f, 56])?;
+    assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, COUNT_POINTER])?;
+
+    assembler.instruction(&[0x48, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe6])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut scratch_bound = vec![0x48, 0x3d];
+    scratch_bound.extend_from_slice(
+        &u32::try_from(geometry.replay_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&scratch_bound)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    for (load, add) in [
+        (&[0x48, 0x89, 0xd9][..], &[0x4c, 0x01, 0xe1][..]),
+        (&[0x4c, 0x89, 0xc1][..], &[0x48, 0x01, 0xc1][..]),
+        (&[0x4c, 0x89, 0xc9][..], &[0x48, 0x83, 0xc1, 8][..]),
+    ] {
+        assembler.instruction(load)?;
+        assembler.instruction(add)?;
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+    }
+
+    assembler.instruction(&[0x4c, 0x89, 0xc1])?;
+    assembler.instruction(&[0x48, 0x01, 0xc1])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x4d, 0x85, 0xe4])?;
+    assembler.branch(&[0x0f, 0x84], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x89, 0xda])?;
+    assembler.instruction(&[0x4c, 0x01, 0xe2])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x48, 0x39, 0xcb])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x8d, 0x57, 64])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_request_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x48, 0x39, 0xcf])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_request_disjoint)?;
+    assembler.instruction(&[0x49, 0x8d, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_count_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x49, 0x39, 0xc9])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_count_disjoint)?;
+    let mut plan_bytes = vec![0x48, 0xb9];
+    plan_bytes.extend_from_slice(
+        &u64::try_from(geometry.total_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan bytes"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&plan_bytes)?;
+    assembler.instruction(&[0x4c, 0x89, 0xfa])?;
+    assembler.instruction(&[0x48, 0x01, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_plan_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x49, 0x39, 0xcf])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_plan_disjoint)?;
+
+    let mut magic = vec![0x48, 0xb8];
+    magic.extend_from_slice(
+        &u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC).to_le_bytes(),
+    );
+    assembler.instruction(&magic)?;
+    assembler.instruction(&[0x49, 0x39, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    let header_word = (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA header"))?
+        << 16)
+        | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION);
+    for (offset, expected) in [
+        (8, header_word),
+        (12, 7),
+        (32, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaX86_64 as u16),
+        ),
+        (
+            44,
+            u32::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+        (48, group_count),
+        (
+            52,
+            u32::try_from(geometry.assertion_count)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA assertions"))?,
+        ),
+        (56, 0),
+        (60, 0),
+        (64, state_count),
+        (68, range_count),
+    ] {
+        x86_ordered_nfa_compare_plan_u32(&mut assembler, offset, expected, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (16, geometry.total_bytes),
+        (
+            24,
+            usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seal"))?,
+        ),
+        (72, geometry.build_work),
+        (80, geometry.ordered_nfa_metadata_offset),
+        (88, geometry.ordered_nfa_states_offset),
+        (96, geometry.ordered_nfa_byte_ranges_offset),
+        (104, geometry.replay_current_offset),
+        (112, geometry.replay_next_offset),
+        (120, geometry.replay_stack_offset),
+    ] {
+        x86_ordered_nfa_compare_plan_u64(&mut assembler, offset, expected, runtime_failure)?;
+    }
+
+    let metadata_offset = i32::try_from(geometry.ordered_nfa_metadata_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?;
+    let mut metadata = vec![0x4d, 0x8d, 0x97];
+    metadata.extend_from_slice(&metadata_offset.to_le_bytes());
+    assembler.instruction(&metadata)?;
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        0,
+        u64::from_le_bytes(NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let metadata_shape = u64::from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?
+            << 16)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA state width"))?
+            << 32)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA range width"))?
+            << 48);
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        8,
+        metadata_shape,
+        runtime_failure,
+    )?;
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        16,
+        fallback_resource,
+        runtime_failure,
+    )?;
+    for (offset, expected) in [
+        (
+            24,
+            u64::try_from(geometry.dfa_fallback_required)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            32,
+            u64::try_from(geometry.dfa_fallback_limit)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            40,
+            u64::from(geometry.ordered_nfa_start_state) | (u64::from(state_count) << 32),
+        ),
+        (48, u64::from(range_count) | (u64::from(group_count) << 32)),
+        (
+            56,
+            u64::try_from(geometry.ordered_nfa_states_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?,
+        ),
+        (
+            64,
+            u64::try_from(geometry.ordered_nfa_byte_ranges_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?,
+        ),
+        (72, 0),
+        (
+            80,
+            u64::try_from(geometry.replay_next_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA next"))?,
+        ),
+        (
+            88,
+            u64::try_from(geometry.replay_stack_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA stack"))?,
+        ),
+        (
+            96,
+            u64::try_from(geometry.replay_seen_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seen"))?,
+        ),
+        (
+            104,
+            u64::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+    ] {
+        x86_ordered_nfa_compare_metadata_u64(
+            &mut assembler,
+            offset,
+            expected,
+            runtime_failure,
+        )?;
+    }
+
+    for (offset, displacement, site) in [
+        (
+            CURRENT_POINTER,
+            geometry.replay_current_offset,
+            "ordered-NFA current",
+        ),
+        (NEXT_POINTER, geometry.replay_next_offset, "ordered-NFA next"),
+        (
+            STACK_POINTER,
+            geometry.replay_stack_offset,
+            "ordered-NFA stack",
+        ),
+        (SEEN_POINTER, geometry.replay_seen_offset, "ordered-NFA seen"),
+    ] {
+        let mut address = vec![0x4d, 0x8d, 0x90];
+        address.extend_from_slice(
+            &i32::try_from(displacement)
+                .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&address)?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, offset])?;
+    }
+    for (offset, displacement, site) in [
+        (
+            STATES_POINTER,
+            geometry.ordered_nfa_states_offset,
+            "ordered-NFA states",
+        ),
+        (
+            RANGES_POINTER,
+            geometry.ordered_nfa_byte_ranges_offset,
+            "ordered-NFA ranges",
+        ),
+    ] {
+        let mut address = vec![0x4d, 0x8d, 0x97];
+        address.extend_from_slice(
+            &i32::try_from(displacement)
+                .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&address)?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, offset])?;
+    }
+
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, SEEN_POINTER])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    let mut seen_count = vec![0xb9];
+    seen_count.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&seen_count)?;
+    assembler.instruction(&[0xf3, 0xab])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, CURRENT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, NEXT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, GENERATION, 1, 0, 0, 0])?;
+    let mut start_pc = vec![0xb8];
+    start_pc.extend_from_slice(&geometry.ordered_nfa_start_state.to_le_bytes());
+    assembler.instruction(&start_pc)?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x31, 0xc9])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8d, 0x74, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0xe8], closure)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+
+    assembler.bind(replay_loop)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?;
+    assembler.branch(&[0x0f, 0x84], accept_loop)?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, NEXT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, GENERATION])?;
+    assembler.instruction(&[0x83, 0xc0, 1])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, GENERATION])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], generation_ready)?;
+    assembler.branch(&[0xe9], clear_seen)?;
+
+    assembler.bind(clear_seen)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, SEEN_POINTER])?;
+    let mut seen_count = vec![0xb9];
+    seen_count.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&seen_count)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.bind(clear_seen_loop)?;
+    assembler.instruction(&[0xf3, 0xab])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, GENERATION, 1, 0, 0, 0])?;
+    assembler.bind(generation_ready)?;
+    assembler.instruction(&[0x48, 0x31, 0xed])?;
+
+    assembler.bind(thread_loop)?;
+    assembler.instruction(&[0x48, 0x3b, 0x6c, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0x0f, 0x83], swap_frontiers)?;
+    assembler.instruction(&[0x4c, 0x6b, 0xc5, 24])?;
+    assembler.instruction(&[0x4c, 0x03, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x41, 0x8b, 0x00])?;
+    assembler.instruction(&[0x49, 0x8b, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 16])?;
+    let mut pc_bound = vec![0x3d];
+    pc_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&pc_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, STATES_POINTER])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe0, 4])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc2])?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x1a])?;
+    assembler.instruction(&[0x41, 0x83, 0xfb, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH])?;
+    assembler.branch(&[0x0f, 0x84], next_thread)?;
+    assembler.instruction(&[0x41, 0x83, 0xfb, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, TARGET_PC])?;
+    assembler.instruction(&[0x45, 0x8b, 0x42, 8])?;
+    assembler.instruction(&[0x45, 0x8b, 0x4a, 12])?;
+    assembler.instruction(&[0x45, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x45, 0x89, 0xcb])?;
+    assembler.instruction(&[0x45, 0x01, 0xc3])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    let mut range_bound = vec![0x41, 0x81, 0xfb];
+    range_bound.extend_from_slice(&range_count.to_le_bytes());
+    assembler.instruction(&range_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    assembler.bind(range_loop)?;
+    assembler.instruction(&[0x45, 0x39, 0xd8])?;
+    assembler.branch(&[0x0f, 0x83], next_thread)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc0])?;
+    assembler.instruction(&[0x48, 0x03, 0x44, 0x24, RANGES_POINTER])?;
+    assembler.instruction(&[0x46, 0x0f, 0xb6, 0x1c, 0x2b])?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x10])?;
+    assembler.instruction(&[0x45, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x82], range_next)?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x50, 1])?;
+    assembler.instruction(&[0x45, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x86], byte_matched)?;
+    assembler.bind(range_next)?;
+    assembler.instruction(&[0x41, 0x83, 0xc0, 1])?;
+    assembler.branch(&[0xe9], range_loop)?;
+
+    assembler.bind(byte_matched)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, TARGET_PC])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8d, 0x74, 0x24, NEXT_COUNT])?;
+    assembler.branch(&[0xe8], closure)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.bind(next_thread)?;
+    assembler.instruction(&[0x48, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0xe9], thread_loop)?;
+
+    assembler.bind(swap_frontiers)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, NEXT_COUNT])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, CURRENT_COUNT])?;
+    assembler.instruction(&[0x49, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], replay_loop)?;
+
+    assembler.bind(accept_loop)?;
+    assembler.instruction(&[0x48, 0x31, 0xed])?;
+    let accept_scan = assembler.label()?;
+    assembler.bind(accept_scan)?;
+    assembler.instruction(&[0x48, 0x3b, 0x6c, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x6b, 0xc5, 24])?;
+    assembler.instruction(&[0x4c, 0x03, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x41, 0x8b, 0x00])?;
+    assembler.instruction(&[0x49, 0x8b, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 16])?;
+    assembler.instruction(&[0x3d])?;
+    push_bytes(&mut assembler.code, &state_count.to_le_bytes())?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, STATES_POINTER])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe0, 4])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc2])?;
+    assembler.instruction(&[0x41, 0x80, 0x3a, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH])?;
+    assembler.branch(&[0x0f, 0x84], accept_match)?;
+    assembler.instruction(&[0x48, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0xe9], accept_scan)?;
+
+    assembler.bind(accept_match)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.instruction(&[0xf6, 0xc1, 1])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.bind(popcount_loop)?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], popcount_done)?;
+    assembler.instruction(&[0x48, 0x8d, 0x48, 0xff])?;
+    assembler.instruction(&[0x48, 0x21, 0xc8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc2, 1])?;
+    assembler.branch(&[0xe9], popcount_loop)?;
+    assembler.bind(popcount_done)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    let mut group_bound = vec![0x48, 0x81, 0xfa];
+    group_bound.extend_from_slice(&group_count.to_le_bytes());
+    assembler.instruction(&group_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, COUNT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x10])?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    // Internal ordered epsilon closure. `rdi/rsi` retain the selected output
+    // frontier and its count pointer; `r11` is the private LIFO count.
+    assembler.bind(closure)?;
+    assembler.instruction(&[0x4d, 0x31, 0xdb])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.bind(closure_loop)?;
+    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x84], closure_done)?;
+    assembler.instruction(&[0x49, 0xff, 0xcb])?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc3, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_STACK_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc1])?;
+    assembler.instruction(&[0x41, 0x8b, 0x01])?;
+    assembler.instruction(&[0x49, 0x8b, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x49, 16])?;
+    let mut pc_bound = vec![0x3d];
+    pc_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&pc_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe2, 2])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_SEEN_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xca])?;
+    assembler.instruction(&[0x44, 0x8b, 0x44, 0x24, CLOSURE_GENERATION])?;
+    assembler.instruction(&[0x45, 0x39, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], closure_loop)?;
+    assembler.instruction(&[0x45, 0x89, 0x02])?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe2, 4])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_STATES_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xca])?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x02])?;
+    for (tag, destination) in [
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE, closure_append),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH, closure_append),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL, closure_loop),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+            closure_epsilon,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT, closure_assert),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE, closure_save),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT, closure_split),
+    ] {
+        assembler.instruction(&[0x41, 0x83, 0xf8, tag])?;
+        assembler.branch(&[0x0f, 0x84], destination)?;
+    }
+    assembler.branch(&[0xe9], closure_failure)?;
+
+    assembler.bind(closure_append)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0e])?;
+    let mut output_bound = vec![0x49, 0x81, 0xf9];
+    output_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&output_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc1, 24])?;
+    assembler.instruction(&[0x49, 0x01, 0xf8])?;
+    assembler.instruction(&[0x41, 0x89, 0x00])?;
+    assembler.instruction(&[0x41, 0xc7, 0x40, 4, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0x89, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x89, 0x48, 16])?;
+    assembler.instruction(&[0x49, 0xff, 0xc1])?;
+    assembler.instruction(&[0x4c, 0x89, 0x0e])?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_epsilon)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_assert)?;
+    assembler.instruction(&[0x41, 0x80, 0x7a, 2, 0])?;
+    assembler.branch(&[0x0f, 0x85], closure_failure)?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x42, 1])?;
+    assembler.instruction(&[0x41, 0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], closure_assert_start)?;
+    assembler.instruction(&[0x41, 0x83, 0xf8, 2])?;
+    assembler.branch(&[0x0f, 0x84], closure_assert_end)?;
+    assembler.branch(&[0xe9], closure_failure)?;
+    assembler.bind(closure_assert_start)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x85], closure_loop)?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+    assembler.bind(closure_assert_end)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe5])?;
+    assembler.branch(&[0x0f, 0x85], closure_loop)?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+
+    assembler.bind(closure_save)?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x42, 1])?;
+    let mut slot_bound = vec![0x41, 0x81, 0xf8];
+    slot_bound.extend_from_slice(&slot_count.to_le_bytes());
+    assembler.instruction(&slot_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x45, 0x89, 0xc1])?;
+    assembler.instruction(&[0x41, 0xd1, 0xe9])?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 1])?;
+    assembler.branch(&[0x0f, 0x85], closure_save_close)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xa3, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], closure_failure)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xab, 0xca])?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+    assembler.bind(closure_save_close)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xa3, 0xca])?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xb3, 0xca])?;
+    assembler.instruction(&[0x4c, 0x0f, 0xab, 0xc9])?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+
+    assembler.bind(closure_split)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 8])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_done)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(closure_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&release)?;
+    for instruction in [
+        &[0x41, 0x5f][..],
+        &[0x41, 0x5e],
+        &[0x41, 0x5d],
+        &[0x41, 0x5c],
+        &[0x5b],
+        &[0x5d],
+        &[0xc3],
+    ] {
+        assembler.instruction(instruction)?;
+    }
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let plan_relocation_offset = finished.label_offset(plan_relocation)?;
+    Ok(X86NativeParticipationLowering {
+        code: finished.code,
+        plan_relocation_offset,
+    })
+}
+
+fn aarch64_ordered_nfa_compare_u32(
+    assembler: &mut Aarch64Assembler,
+    base: u8,
+    offset: u16,
+    expected: u32,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_w_imm(8, base, offset)?)?;
+    aarch64_load_u32_constant(assembler, 9, expected)?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, failed)?;
+    Ok(())
+}
+
+fn aarch64_ordered_nfa_compare_u64(
+    assembler: &mut Aarch64Assembler,
+    base: u8,
+    offset: u16,
+    expected: u64,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_x_imm(8, base, offset)?)?;
+    aarch64_load_u64_constant(assembler, 9, expected)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, failed)?;
+    Ok(())
+}
+
+/// Emit one bounded ordered-NFA stack push. The closure keeps its stack
+/// cardinality in `x5`; `(w0, x1, x2)` is the thread and `x25` is the
+/// authenticated caller-owned stack base. Only `x6/x7` are clobbered.
+fn aarch64_ordered_nfa_push_thread(
+    assembler: &mut Aarch64Assembler,
+    state_count: u32,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_load_u32_constant(assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, failed)?;
+    aarch64_load_u32_constant(
+        assembler,
+        6,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 5, 6, 25)?)?;
+    assembler.instruction(aarch64_store_w(0, 7, 0)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 4)?)?;
+    assembler.instruction(aarch64_store_x(1, 7, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 7, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated ordered-NFA request, closure, and exact-span replay are one helper-free leaf"
+)]
+fn lower_aarch64_ordered_nfa_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<Aarch64NativeParticipationLowering, ObjectError> {
+    validate_ordered_nfa_participation_geometry(geometry)?;
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES,
+    };
+    const FRAME_BYTES: u16 = 160;
+    const COUNT_POINTER: u16 = 96;
+    const MATCH_END: u16 = 104;
+    const CURRENT_COUNT: u16 = 112;
+    const NEXT_COUNT: u16 = 120;
+    const GENERATION: u16 = 128;
+    const TARGET_PC: u16 = 132;
+    const CLOSURE_OUTPUT: u16 = 136;
+    const CLOSURE_COUNT: u16 = 144;
+    const SCRATCH_POINTER: u16 = 152;
+
+    let state_count = u32::try_from(geometry.state_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?;
+    let range_count = u32::try_from(geometry.ordered_nfa_byte_range_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?;
+    let group_count = u32::try_from(geometry.group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA groups"))?;
+    let slot_count = group_count
+        .checked_mul(2)
+        .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA slots"))?;
+    let fallback_resource = match geometry.dfa_fallback_resource {
+        Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u64,
+        Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u64,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA fallback resource",
+            ));
+        }
+    };
+
+    let mut assembler = Aarch64Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let clear_seen = assembler.label()?;
+    let clear_seen_loop = assembler.label()?;
+    let clear_seen_done = assembler.label()?;
+    let replay_loop = assembler.label()?;
+    let generation_ready = assembler.label()?;
+    let thread_loop = assembler.label()?;
+    let next_thread = assembler.label()?;
+    let range_loop = assembler.label()?;
+    let range_next = assembler.label()?;
+    let byte_matched = assembler.label()?;
+    let swap_frontiers = assembler.label()?;
+    let accept_loop = assembler.label()?;
+    let accept_scan = assembler.label()?;
+    let accept_match = assembler.label()?;
+    let popcount_loop = assembler.label()?;
+    let popcount_done = assembler.label()?;
+    let closure = assembler.label()?;
+    let closure_loop = assembler.label()?;
+    let closure_append = assembler.label()?;
+    let closure_epsilon = assembler.label()?;
+    let closure_assert = assembler.label()?;
+    let closure_assert_start = assembler.label()?;
+    let closure_assert_end = assembler.label()?;
+    let closure_save = assembler.label()?;
+    let closure_save_open = assembler.label()?;
+    let closure_save_close = assembler.label()?;
+    let closure_split = assembler.label()?;
+    let closure_done = assembler.label()?;
+    let closure_failure = assembler.label()?;
+
+    // Validate the complete request object before touching the stack.
+    assembler.branch_zero_x(0, invalid_before_frame)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(8, 0)?)?;
+    assembler.branch_nonzero_x(8, invalid_before_frame)?;
+    assembler.instruction(aarch64_add_x_imm(8, 0, 64)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_before_frame)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_mov_x(29, 0)?)?;
+    let plan_page_relocation_offset = assembler.instruction(0x9000_0016)?; // adrp x22, bundle
+    let plan_page_offset_relocation_offset =
+        assembler.instruction(aarch64_add_x_imm(22, 22, 0)?)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 29, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 22)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(19, 29, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(20, 29, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 29, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 29, 32)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, MATCH_END)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 29, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 29, 40)?)?;
+    assembler.instruction(aarch64_store_x(9, 31, SCRATCH_POINTER)?)?;
+    assembler.instruction(aarch64_load_x_imm(11, 29, 56)?)?;
+
+    assembler.branch_zero_x(19, invalid)?;
+    assembler.instruction(aarch64_cmp_x(21, 8)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(8, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(9, invalid)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(12, 9)?)?;
+    assembler.branch_nonzero_x(12, invalid)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        12,
+        u64::try_from(geometry.replay_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(10, 12)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.branch_zero_x(11, invalid)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(12, 11)?)?;
+    assembler.branch_nonzero_x(12, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(12, 19, 20)?)?;
+    assembler.instruction(aarch64_cmp_x(12, 19)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(13, 9, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(13, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(14, 11, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(14, 11)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_store_x(11, 31, COUNT_POINTER)?)?;
+
+    // Scratch is written during replay, so it must be disjoint from every
+    // object that remains live for the call. Empty haystacks have no extent.
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.branch_zero_x(20, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(9, 12)?)?; // scratch >= haystack_end
+    assembler.branch_cond(AARCH64_HS, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(19, 13)?)?; // haystack < scratch_end
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_request_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(15, 29, 64)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 15)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_request_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(29, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_request_disjoint)?;
+    let scratch_count_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_cmp_x(9, 14)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_count_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(11, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_count_disjoint)?;
+    let scratch_plan_disjoint = assembler.label()?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        15,
+        u64::try_from(geometry.total_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan bytes"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(15, 22, 15)?)?;
+    assembler.instruction(aarch64_cmp_x(15, 22)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(9, 15)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_plan_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(22, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_plan_disjoint)?;
+
+    aarch64_ordered_nfa_compare_u64(
+        &mut assembler,
+        22,
+        0,
+        u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let header_word = (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA header"))?
+        << 16)
+        | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION);
+    for (offset, expected) in [
+        (8_u16, header_word),
+        (12, 7),
+        (32, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaAarch64 as u16),
+        ),
+        (
+            44,
+            u32::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+        (48, group_count),
+        (
+            52,
+            u32::try_from(geometry.assertion_count)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA assertions"))?,
+        ),
+        (56, 0),
+        (60, 0),
+        (64, state_count),
+        (68, range_count),
+    ] {
+        aarch64_ordered_nfa_compare_u32(&mut assembler, 22, offset, expected, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (16_u16, geometry.total_bytes),
+        (
+            24,
+            usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seal"))?,
+        ),
+        (72, geometry.build_work),
+        (80, geometry.ordered_nfa_metadata_offset),
+        (88, geometry.ordered_nfa_states_offset),
+        (96, geometry.ordered_nfa_byte_ranges_offset),
+        (104, geometry.replay_current_offset),
+        (112, geometry.replay_next_offset),
+        (120, geometry.replay_stack_offset),
+    ] {
+        aarch64_ordered_nfa_compare_u64(
+            &mut assembler,
+            22,
+            offset,
+            u64::try_from(expected)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan field"))?,
+            runtime_failure,
+        )?;
+    }
+
+    aarch64_load_u64_constant(
+        &mut assembler,
+        12,
+        u64::try_from(geometry.ordered_nfa_metadata_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(12, 22, 12)?)?;
+    aarch64_ordered_nfa_compare_u64(
+        &mut assembler,
+        12,
+        0,
+        u64::from_le_bytes(NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let metadata_shape = u64::from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?
+            << 16)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA state width"))?
+            << 32)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA range width"))?
+            << 48);
+    for (offset, expected) in [
+        (8_u16, metadata_shape),
+        (16, fallback_resource),
+        (
+            24,
+            u64::try_from(geometry.dfa_fallback_required)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            32,
+            u64::try_from(geometry.dfa_fallback_limit)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            40,
+            u64::from(geometry.ordered_nfa_start_state) | (u64::from(state_count) << 32),
+        ),
+        (48, u64::from(range_count) | (u64::from(group_count) << 32)),
+        (
+            56,
+            u64::try_from(geometry.ordered_nfa_states_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?,
+        ),
+        (
+            64,
+            u64::try_from(geometry.ordered_nfa_byte_ranges_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?,
+        ),
+        (72, 0),
+        (
+            80,
+            u64::try_from(geometry.replay_next_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA next"))?,
+        ),
+        (
+            88,
+            u64::try_from(geometry.replay_stack_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA stack"))?,
+        ),
+        (
+            96,
+            u64::try_from(geometry.replay_seen_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seen"))?,
+        ),
+        (
+            104,
+            u64::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+    ] {
+        aarch64_ordered_nfa_compare_u64(
+            &mut assembler,
+            12,
+            offset,
+            expected,
+            runtime_failure,
+        )?;
+    }
+
+    for (register, displacement, site) in [
+        (23, geometry.replay_current_offset, "ordered-NFA current"),
+        (24, geometry.replay_next_offset, "ordered-NFA next"),
+        (25, geometry.replay_stack_offset, "ordered-NFA stack"),
+        (26, geometry.replay_seen_offset, "ordered-NFA seen"),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(9, 31, SCRATCH_POINTER)?)?;
+        aarch64_load_u64_constant(
+            &mut assembler,
+            8,
+            u64::try_from(displacement).map_err(|_| ObjectError::ArithmeticOverflow(site))?,
+        )?;
+        assembler.instruction(aarch64_add_x_reg(register, 9, 8)?)?;
+    }
+    for (register, displacement, site) in [
+        (
+            27,
+            geometry.ordered_nfa_states_offset,
+            "ordered-NFA states",
+        ),
+        (
+            28,
+            geometry.ordered_nfa_byte_ranges_offset,
+            "ordered-NFA ranges",
+        ),
+    ] {
+        aarch64_load_u64_constant(
+            &mut assembler,
+            8,
+            u64::try_from(displacement).map_err(|_| ObjectError::ArithmeticOverflow(site))?,
+        )?;
+        assembler.instruction(aarch64_add_x_reg(register, 22, 8)?)?;
+    }
+
+    // Clear generation marks and seed the first prioritized closure.
+    assembler.bind(clear_seen)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.bind(clear_seen_loop)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, clear_seen_done)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 5, 2)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    assembler.branch(clear_seen_loop)?;
+    assembler.bind(clear_seen_done)?;
+    assembler.instruction(aarch64_store_x(31, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    aarch64_load_u32_constant(&mut assembler, 0, geometry.ordered_nfa_start_state)?;
+    assembler.instruction(aarch64_movz_x(1, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, CURRENT_COUNT)?)?;
+    assembler.call(closure)?;
+    assembler.branch_nonzero_w(0, runtime_failure)?;
+
+    assembler.bind(replay_loop)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, MATCH_END)?)?;
+    assembler.instruction(aarch64_cmp_x(21, 5)?)?;
+    assembler.branch_cond(AARCH64_EQ, accept_loop)?;
+    assembler.instruction(aarch64_store_x(31, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 31, GENERATION)?)?;
+    assembler.instruction(aarch64_movz_w(7, 1)?)?;
+    assembler.instruction(aarch64_add_w_reg(6, 6, 7)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    assembler.branch_nonzero_w(6, generation_ready)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    let generation_clear_loop = assembler.label()?;
+    let generation_clear_done = assembler.label()?;
+    assembler.bind(generation_clear_loop)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, generation_clear_done)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 5, 2)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    assembler.branch(generation_clear_loop)?;
+    assembler.bind(generation_clear_done)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    assembler.bind(generation_ready)?;
+    assembler.instruction(aarch64_movz_x(29, 0, 0)?)?;
+
+    assembler.bind(thread_loop)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_cmp_x(29, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, swap_frontiers)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(8, 29, 7, 23)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 8, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 8, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(9, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, next_thread)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE),
+    )?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_w_imm(11, 9, 4)?)?;
+    assembler.instruction(aarch64_store_w(11, 31, TARGET_PC)?)?;
+    assembler.instruction(aarch64_load_w_imm(12, 9, 8)?)?;
+    assembler.instruction(aarch64_load_w_imm(13, 9, 12)?)?;
+    assembler.branch_zero_w(13, runtime_failure)?;
+    assembler.instruction(aarch64_add_w_reg(14, 12, 13)?)?;
+    assembler.instruction(aarch64_cmp_w(14, 12)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    aarch64_load_u32_constant(&mut assembler, 10, range_count)?;
+    assembler.instruction(aarch64_cmp_w(14, 10)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_load_byte_reg(15, 19, 21)?)?;
+
+    assembler.bind(range_loop)?;
+    assembler.instruction(aarch64_cmp_w(12, 14)?)?;
+    assembler.branch_cond(AARCH64_HS, next_thread)?;
+    assembler.instruction(aarch64_add_x_uxtw(16, 28, 12, 1)?)?;
+    assembler.instruction(aarch64_load_byte_imm(17, 16, 0)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 16, 1)?)?;
+    assembler.instruction(aarch64_cmp_w(15, 17)?)?;
+    assembler.branch_cond(AARCH64_LO, range_next)?;
+    assembler.instruction(aarch64_cmp_w(15, 10)?)?;
+    assembler.branch_cond(AARCH64_LS, byte_matched)?;
+    assembler.bind(range_next)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_add_w_reg(12, 12, 6)?)?;
+    assembler.branch(range_loop)?;
+
+    assembler.bind(byte_matched)?;
+    assembler.instruction(aarch64_load_w_imm(0, 31, TARGET_PC)?)?;
+    assembler.instruction(aarch64_mov_x(3, 24)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, NEXT_COUNT)?)?;
+    assembler.call(closure)?;
+    assembler.branch_nonzero_w(0, runtime_failure)?;
+    assembler.bind(next_thread)?;
+    assembler.instruction(aarch64_adds_x_imm(29, 29, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(thread_loop)?;
+
+    assembler.bind(swap_frontiers)?;
+    assembler.instruction(aarch64_mov_x(5, 23)?)?;
+    assembler.instruction(aarch64_mov_x(23, 24)?)?;
+    assembler.instruction(aarch64_mov_x(24, 5)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_adds_x_imm(21, 21, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(replay_loop)?;
+
+    assembler.bind(accept_loop)?;
+    assembler.instruction(aarch64_movz_x(29, 0, 0)?)?;
+    assembler.bind(accept_scan)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_cmp_x(29, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(8, 29, 7, 23)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 8, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 8, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(9, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, accept_match)?;
+    assembler.instruction(aarch64_adds_x_imm(29, 29, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(accept_scan)?;
+
+    assembler.bind(accept_match)?;
+    assembler.branch_nonzero_x(1, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(5, 1, 0)?)?;
+    assembler.instruction(aarch64_tst_x(2, 5)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+    assembler.bind(popcount_loop)?;
+    assembler.branch_zero_x(2, popcount_done)?;
+    assembler.instruction(aarch64_sub_x_imm(4, 2, 1)?)?;
+    assembler.instruction(aarch64_and_x(2, 2, 4)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 3, 1)?)?;
+    assembler.branch(popcount_loop)?;
+    assembler.bind(popcount_done)?;
+    assembler.branch_zero_x(3, runtime_failure)?;
+    aarch64_load_u32_constant(&mut assembler, 5, group_count)?;
+    assembler.instruction(aarch64_cmp_x(3, 5)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_POINTER)?)?;
+    assembler.instruction(aarch64_store_x(3, 5, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+
+    // Internal prioritized epsilon closure. It has no nested calls, so the
+    // main leaf's saved link register remains sufficient.
+    assembler.bind(closure)?;
+    assembler.instruction(aarch64_store_x(3, 31, CLOSURE_OUTPUT)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, CLOSURE_COUNT)?)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.bind(closure_loop)?;
+    assembler.branch_zero_x(5, closure_done)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 5, 1)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        6,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 5, 6, 25)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 7, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 7, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 7, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 0, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 7, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(9, 31, GENERATION)?)?;
+    assembler.instruction(aarch64_cmp_w(6, 9)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_loop)?;
+    assembler.instruction(aarch64_store_w(9, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(8, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 0)?)?;
+    for (tag, destination) in [
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE, closure_append),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+            closure_append,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL, closure_loop),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+            closure_epsilon,
+        ),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+            closure_assert,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE, closure_save),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+            closure_split,
+        ),
+    ] {
+        assembler.instruction(aarch64_cmp_w_imm(9, u16::from(tag))?)?;
+        assembler.branch_cond(AARCH64_EQ, destination)?;
+    }
+    assembler.branch(closure_failure)?;
+
+    assembler.bind(closure_append)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, CLOSURE_OUTPUT)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, CLOSURE_COUNT)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 4, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 7, state_count)?;
+    assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 6, 7, 3)?)?;
+    assembler.instruction(aarch64_store_w(0, 7, 0)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 4)?)?;
+    assembler.instruction(aarch64_store_x(1, 7, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 7, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
+    assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_epsilon)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 4)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_assert)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 2)?)?;
+    assembler.branch_nonzero_w(9, closure_failure)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 1)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_assert_start)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 2)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_assert_end)?;
+    assembler.branch(closure_failure)?;
+    assembler.bind(closure_assert_start)?;
+    assembler.branch_nonzero_x(21, closure_loop)?;
+    assembler.branch(closure_epsilon)?;
+    assembler.bind(closure_assert_end)?;
+    assembler.instruction(aarch64_cmp_x(21, 20)?)?;
+    assembler.branch_cond(AARCH64_NE, closure_loop)?;
+    assembler.branch(closure_epsilon)?;
+
+    assembler.bind(closure_save)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 1)?)?;
+    aarch64_load_u32_constant(&mut assembler, 10, slot_count)?;
+    assembler.instruction(aarch64_cmp_w(9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    assembler.instruction(aarch64_lsr_w_imm(10, 9, 1)?)?;
+    assembler.instruction(aarch64_movz_x(11, 1, 0)?)?;
+    assembler.instruction(aarch64_lslv_x(11, 11, 10)?)?;
+    assembler.branch_bit_clear_w(9, 0, closure_save_open)?;
+    assembler.branch(closure_save_close)?;
+    assembler.bind(closure_save_open)?;
+    assembler.instruction(aarch64_tst_x(1, 11)?)?;
+    assembler.branch_cond(AARCH64_NE, closure_failure)?;
+    assembler.instruction(aarch64_orr_x(1, 1, 11)?)?;
+    assembler.branch(closure_epsilon)?;
+    assembler.bind(closure_save_close)?;
+    assembler.instruction(aarch64_tst_x(1, 11)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_failure)?;
+    assembler.instruction(aarch64_bic_x(1, 1, 11)?)?;
+    assembler.instruction(aarch64_orr_x(2, 2, 11)?)?;
+    assembler.branch(closure_epsilon)?;
+
+    assembler.bind(closure_split)?;
+    assembler.instruction(aarch64_load_w_imm(9, 8, 4)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 8)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.instruction(aarch64_add_w_reg(0, 9, 31)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_done)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(closure_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
     ] {
         assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
     }
@@ -39149,6 +40941,7 @@ fn lower_x86_64_prepared_grep_count(
 
 fn x86_native_capture_reducer_boundary(
     assembler: &mut X86Assembler,
+    caller_scratch_bytes: usize,
     invalid: X86Label,
 ) -> Result<(), ObjectError> {
     assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
@@ -39158,11 +40951,55 @@ fn x86_native_capture_reducer_boundary(
     assembler.instruction(&[0x48, 0x89, 0xf8])?;
     assembler.instruction(&[0x48, 0x01, 0xf0])?; // complete haystack extent
     assembler.branch(&[0x0f, 0x82], invalid)?;
-    assembler.instruction(&[0x48, 0x85, 0xd2])?; // scalar output
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // scalar output
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+        assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+        assembler.branch(&[0x0f, 0x85], invalid)?;
+        assembler.instruction(&[0x48, 0x89, 0xd0])?;
+        assembler.instruction(&[0x48, 0x83, 0xc0, 8])?; // complete output extent
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+        return Ok(());
+    }
+
+    assembler.instruction(&[0x49, 0x89, 0xc1])?; // retained haystack end
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // caller scratch
     assembler.branch(&[0x0f, 0x84], invalid)?;
     assembler.instruction(&[0xf6, 0xc2, 0x07])?;
     assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_scratch = vec![0x48, 0xb8];
+    exact_scratch.extend_from_slice(
+        &u64::try_from(caller_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer scratch"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&exact_scratch)?;
+    assembler.instruction(&[0x48, 0x39, 0xc1])?; // exact scratch extent
+    assembler.branch(&[0x0f, 0x85], invalid)?;
     assembler.instruction(&[0x48, 0x89, 0xd0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?; // complete scratch extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?; // retained scratch end
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x4c, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x83], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x4c, 0x39, 0xd7])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_output_disjoint = assembler.label()?;
+    assembler.instruction(&[0x4d, 0x8d, 0x58, 8])?;
+    assembler.instruction(&[0x4c, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x83], scratch_output_disjoint)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_output_disjoint)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // scalar output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
     assembler.instruction(&[0x48, 0x83, 0xc0, 8])?; // complete output extent
     assembler.branch(&[0x0f, 0x82], invalid)?;
     Ok(())
@@ -39191,6 +41028,8 @@ fn x86_native_capture_reducer_epilogue(
 )]
 fn lower_x86_64_native_participation_reducer_domain_v1(
     group_count: usize,
+    participation_scratch_bytes: usize,
+    caller_scratch_bytes: usize,
 ) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
     const FRAME_BYTES: u32 = 120;
     const SPAN_OFFSET: u8 = 0;
@@ -39198,7 +41037,14 @@ fn lower_x86_64_native_participation_reducer_domain_v1(
     const SCRATCH_OFFSET: u8 = 80;
     const COUNT_OFFSET: u8 = 96;
     const FLAGS_OFFSET: u8 = 112;
-    if !(1..=64).contains(&group_count) {
+    if !(1..=64).contains(&group_count)
+        || participation_scratch_bytes == 0
+        || (caller_scratch_bytes == 0
+            && participation_scratch_bytes
+                != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+        || (caller_scratch_bytes != 0
+            && caller_scratch_bytes != participation_scratch_bytes)
+    {
         return Err(ObjectError::InvalidModule(
             "participation reducer group cardinality",
         ));
@@ -39218,7 +41064,7 @@ fn lower_x86_64_native_participation_reducer_domain_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
     assembler.instruction(&[0x55])?;
     assembler.instruction(&[0x53])?;
     assembler.instruction(&[0x41, 0x54])?;
@@ -39230,7 +41076,13 @@ fn lower_x86_64_native_participation_reducer_domain_v1(
     assembler.instruction(&reserve)?;
     assembler.instruction(&[0x49, 0x89, 0xfc])?; // haystack
     assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
-    assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    } else {
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+    }
     assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
     assembler.instruction(&[0x48, 0x31, 0xdb])?; // next start
     assembler.instruction(&[0x48, 0x31, 0xed])?; // last end
@@ -39304,19 +41156,30 @@ fn lower_x86_64_native_participation_reducer_domain_v1(
     assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, REQUEST_OFFSET + 16])?;
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, REQUEST_OFFSET + 24])?;
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, REQUEST_OFFSET + 32])?;
-    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, SCRATCH_OFFSET])?;
-    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
-    assembler.instruction(&[
-        0x48,
-        0xc7,
-        0x44,
-        0x24,
-        REQUEST_OFFSET + 48,
-        16,
-        0,
-        0,
-        0,
-    ])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
+        let mut exact_scratch = vec![
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            REQUEST_OFFSET + 48,
+        ];
+        exact_scratch.extend_from_slice(
+            &u32::try_from(participation_scratch_bytes)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("participation reducer scratch")
+                })?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&exact_scratch)?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SCRATCH_OFFSET + 8])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 48])?;
+    }
     assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, COUNT_OFFSET])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 56])?;
     assembler.instruction(&[0x48, 0x8d, 0x7c, 0x24, REQUEST_OFFSET])?;
@@ -39411,7 +41274,7 @@ fn lower_x86_64_native_capture_next_reducer_domain_v1(
     let finished = assembler.label()?;
     let invalid = assembler.label()?;
 
-    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
     assembler.instruction(&[0x55])?;
     assembler.instruction(&[0x53])?;
     assembler.instruction(&[0x41, 0x54])?;
@@ -39515,9 +41378,11 @@ fn lower_x86_64_native_capture_next_reducer_domain_v1(
 }
 
 fn lower_x86_64_native_capture_grep_wrapper_v1(
+    caller_scratch_bytes: usize,
 ) -> Result<(Vec<u8>, usize), ObjectError> {
-    const FRAME_BYTES: u8 = 16;
     const LINE_START_OFFSET: u8 = 8;
+    const SCRATCH_OFFSET: u8 = 16;
+    let frame_bytes = if caller_scratch_bytes == 0 { 16 } else { 32 };
     let mut assembler = X86Assembler::new();
     let line_loop = assembler.label()?;
     let scan = assembler.label()?;
@@ -39529,16 +41394,22 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
     assembler.instruction(&[0x53])?;
     assembler.instruction(&[0x41, 0x54])?;
     assembler.instruction(&[0x41, 0x55])?;
     assembler.instruction(&[0x41, 0x56])?;
     assembler.instruction(&[0x41, 0x57])?;
-    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
     assembler.instruction(&[0x49, 0x89, 0xfc])?;
     assembler.instruction(&[0x49, 0x89, 0xf5])?;
-    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    } else {
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+    }
     assembler.instruction(&[0x4d, 0x31, 0xff])?;
     assembler.instruction(&[0x48, 0x31, 0xdb])?;
     assembler.instruction(&[0x4d, 0x85, 0xed])?;
@@ -39574,7 +41445,13 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.instruction(&[0x49, 0x29, 0xeb])?; // line length
     assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?;
     assembler.instruction(&[0x4c, 0x89, 0xde])?;
-    assembler.instruction(&[0x48, 0x8d, 0x14, 0x24])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x8d, 0x14, 0x24])?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    }
     assembler.instruction(&[0xe8])?;
     let private_call = assembler.label()?;
     assembler.bind(private_call)?;
@@ -39594,7 +41471,7 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.bind(overflow)?;
     assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
     assembler.bind(returned)?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0x41, 0x5f])?;
     assembler.instruction(&[0x41, 0x5e])?;
     assembler.instruction(&[0x41, 0x5d])?;
@@ -39614,10 +41491,18 @@ fn lower_x86_64_native_capture_reducer_v1(
     domain: NativeCaptureReducerDomainV1,
     source: NativeCaptureReducerSourceV1<'_>,
 ) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let caller_scratch_bytes = source.caller_scratch_bytes();
     let lowered = match source {
-        NativeCaptureReducerSourceV1::ExactSpanParticipation { group_count, .. } => {
-            lower_x86_64_native_participation_reducer_domain_v1(group_count)?
-        }
+        NativeCaptureReducerSourceV1::ExactSpanParticipation {
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+            ..
+        } => lower_x86_64_native_participation_reducer_domain_v1(
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+        )?,
         NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
             lower_x86_64_native_capture_next_reducer_domain_v1(group_count)?
         }
@@ -39625,7 +41510,8 @@ fn lower_x86_64_native_capture_reducer_v1(
     if domain == NativeCaptureReducerDomainV1::WholeHaystack {
         return Ok(lowered);
     }
-    let (mut code, private_call) = lower_x86_64_native_capture_grep_wrapper_v1()?;
+    let (mut code, private_call) =
+        lower_x86_64_native_capture_grep_wrapper_v1(caller_scratch_bytes)?;
     let private_offset = code
         .len()
         .checked_add(15)
@@ -41000,6 +42886,7 @@ fn lower_aarch64_prepared_grep_count(
 
 fn aarch64_native_capture_reducer_boundary(
     assembler: &mut Aarch64Assembler,
+    caller_scratch_bytes: usize,
     invalid: Aarch64Label,
 ) -> Result<(), ObjectError> {
     assembler.branch_zero_x(0, invalid)?;
@@ -41008,11 +42895,51 @@ fn aarch64_native_capture_reducer_boundary(
     assembler.instruction(aarch64_add_x_reg(5, 0, 1)?)?;
     assembler.instruction(aarch64_cmp_x(5, 0)?)?;
     assembler.branch_cond(AARCH64_LO, invalid)?;
+    if caller_scratch_bytes == 0 {
+        assembler.branch_zero_x(2, invalid)?;
+        assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
+        assembler.branch_nonzero_x(5, invalid)?;
+        assembler.instruction(aarch64_add_x_imm(5, 2, 8)?)?;
+        assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid)?;
+        return Ok(());
+    }
+
+    assembler.instruction(aarch64_mov_x(6, 5)?)?;
     assembler.branch_zero_x(2, invalid)?;
     assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
     assembler.branch_nonzero_x(5, invalid)?;
-    assembler.instruction(aarch64_add_x_imm(5, 2, 8)?)?;
+    aarch64_load_u64_constant(
+        assembler,
+        5,
+        u64::try_from(caller_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reducer scratch"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(3, 5)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 2, 3)?)?;
     assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_mov_x(7, 5)?)?;
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.branch_zero_x(1, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(2, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(0, 7)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_output_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(8, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(2, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_output_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(4, 7)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_output_disjoint)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 4)?)?;
     assembler.branch_cond(AARCH64_LO, invalid)?;
     Ok(())
 }
@@ -41060,13 +42987,22 @@ fn aarch64_native_capture_reducer_epilogue(
 )]
 fn lower_aarch64_native_participation_reducer_domain_v1(
     group_count: usize,
+    participation_scratch_bytes: usize,
+    caller_scratch_bytes: usize,
 ) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
     const FRAME_BYTES: u16 = 208;
     const SPAN_OFFSET: u16 = 96;
     const REQUEST_OFFSET: u16 = 112;
     const SCRATCH_OFFSET: u16 = 176;
     const COUNT_OFFSET: u16 = 192;
-    if !(1..=64).contains(&group_count) {
+    if !(1..=64).contains(&group_count)
+        || participation_scratch_bytes == 0
+        || (caller_scratch_bytes == 0
+            && participation_scratch_bytes
+                != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+        || (caller_scratch_bytes != 0
+            && caller_scratch_bytes != participation_scratch_bytes)
+    {
         return Err(ObjectError::InvalidModule(
             "AArch64 participation reducer group cardinality",
         ));
@@ -41086,11 +43022,21 @@ fn lower_aarch64_native_participation_reducer_domain_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    aarch64_native_capture_reducer_boundary(
+        &mut assembler,
+        caller_scratch_bytes,
+        invalid,
+    )?;
     aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
-    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+        assembler.instruction(aarch64_store_x(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(3, 31, SCRATCH_OFFSET + 8)?)?;
+    }
     assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
     assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
     assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
@@ -41158,10 +43104,23 @@ fn lower_aarch64_native_participation_reducer_domain_v1(
     assembler.instruction(aarch64_store_x(20, 31, REQUEST_OFFSET + 16)?)?;
     assembler.instruction(aarch64_store_x(5, 31, REQUEST_OFFSET + 24)?)?;
     assembler.instruction(aarch64_store_x(6, 31, REQUEST_OFFSET + 32)?)?;
-    assembler.instruction(aarch64_add_x_imm(7, 31, SCRATCH_OFFSET)?)?;
-    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
-    assembler.instruction(aarch64_movz_x(7, 16, 0)?)?;
-    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_add_x_imm(7, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
+        assembler.instruction(aarch64_movz_x(
+            7,
+            u16::try_from(participation_scratch_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 participation reducer scratch")
+            })?,
+            0,
+        )?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    } else {
+        assembler.instruction(aarch64_load_x_imm(7, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, SCRATCH_OFFSET + 8)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    }
     assembler.instruction(aarch64_add_x_imm(7, 31, COUNT_OFFSET)?)?;
     assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 56)?)?;
     assembler.instruction(aarch64_add_x_imm(0, 31, REQUEST_OFFSET)?)?;
@@ -41247,7 +43206,7 @@ fn lower_aarch64_native_capture_next_reducer_domain_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
     aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
@@ -41363,9 +43322,11 @@ fn lower_aarch64_native_capture_next_reducer_domain_v1(
 }
 
 fn lower_aarch64_native_capture_grep_wrapper_v1(
+    caller_scratch_bytes: usize,
 ) -> Result<(Vec<u8>, usize), ObjectError> {
-    const FRAME_BYTES: u16 = 112;
     const COUNT_OFFSET: u16 = 96;
+    const SCRATCH_OFFSET: u16 = 104;
+    let frame_bytes = if caller_scratch_bytes == 0 { 112 } else { 128 };
     let mut assembler = Aarch64Assembler::new();
     let line_loop = assembler.label()?;
     let scan = assembler.label()?;
@@ -41377,11 +43338,21 @@ fn lower_aarch64_native_capture_grep_wrapper_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
-    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    aarch64_native_capture_reducer_boundary(
+        &mut assembler,
+        caller_scratch_bytes,
+        invalid,
+    )?;
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
-    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+        assembler.instruction(aarch64_store_x(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(3, 31, SCRATCH_OFFSET + 8)?)?;
+    }
     assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
     assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
     assembler.branch_zero_x(20, finished)?;
@@ -41416,7 +43387,13 @@ fn lower_aarch64_native_capture_grep_wrapper_v1(
     assembler.bind(line_ready)?;
     assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
     assembler.instruction(aarch64_sub_x_reg(1, 25, 24)?)?;
-    assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    } else {
+        assembler.instruction(aarch64_load_x_imm(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, SCRATCH_OFFSET + 8)?)?;
+        assembler.instruction(aarch64_add_x_imm(4, 31, COUNT_OFFSET)?)?;
+    }
     let private_call = assembler.instruction(0x9400_0000)?;
     assembler.branch_nonzero_w(0, returned)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_OFFSET)?)?;
@@ -41433,7 +43410,7 @@ fn lower_aarch64_native_capture_grep_wrapper_v1(
     assembler.bind(overflow)?;
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.bind(returned)?;
-    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
@@ -41447,10 +43424,18 @@ fn lower_aarch64_native_capture_reducer_v1(
     domain: NativeCaptureReducerDomainV1,
     source: NativeCaptureReducerSourceV1<'_>,
 ) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let caller_scratch_bytes = source.caller_scratch_bytes();
     let lowered = match source {
-        NativeCaptureReducerSourceV1::ExactSpanParticipation { group_count, .. } => {
-            lower_aarch64_native_participation_reducer_domain_v1(group_count)?
-        }
+        NativeCaptureReducerSourceV1::ExactSpanParticipation {
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+            ..
+        } => lower_aarch64_native_participation_reducer_domain_v1(
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+        )?,
         NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
             lower_aarch64_native_capture_next_reducer_domain_v1(group_count)?
         }
@@ -41458,7 +43443,8 @@ fn lower_aarch64_native_capture_reducer_v1(
     if domain == NativeCaptureReducerDomainV1::WholeHaystack {
         return Ok(lowered);
     }
-    let (mut code, private_call) = lower_aarch64_native_capture_grep_wrapper_v1()?;
+    let (mut code, private_call) =
+        lower_aarch64_native_capture_grep_wrapper_v1(caller_scratch_bytes)?;
     if !code.len().is_multiple_of(4) || !lowered.code.len().is_multiple_of(4) {
         return Err(ObjectError::InvalidModule(
             "AArch64 capture reducer instruction alignment",
@@ -50889,9 +52875,36 @@ fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
     )
 }
 
+fn aarch64_and_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x8a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_bic_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x8a20_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_orr_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x2a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xaa00_0000
             | aarch64_reg(right, 16)?
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
@@ -50910,6 +52923,10 @@ fn aarch64_eor_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
 #[cfg(test)]
 fn aarch64_tst_w(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0x6a00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
+}
+
+fn aarch64_tst_x(left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0xea00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
 fn aarch64_tst_w_all_but_bit(register: u8, bit: u8) -> Result<u32, ObjectError> {
