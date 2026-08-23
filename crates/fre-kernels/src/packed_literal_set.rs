@@ -2001,14 +2001,13 @@ fn find_bounded_long_shared_fragment(
     // stream. It performs no verification work: absence proves the source is
     // exhausted, while presence leaves that candidate and every later start
     // to the unchanged native fallback.
-    if fragment
-        .earliest_possible_start_from(haystack, minimum_start)
-        .is_none()
-    {
-        Some(LongSharedFragmentFilterResult::Exhausted)
-    } else {
-        Some(LongSharedFragmentFilterResult::ResumeAt(minimum_start))
-    }
+    let Some(candidate) = fragment.earliest_possible_start_from(haystack, minimum_start) else {
+        return Some(LongSharedFragmentFilterResult::Exhausted);
+    };
+    // The lookahead proved that every possible start before `candidate` is
+    // fragment-free. Resume at the first still-unverified candidate instead
+    // of making the native engine rescan that disproved gap.
+    Some(LongSharedFragmentFilterResult::ResumeAt(candidate))
 }
 
 fn shared_fragment_native_start_budget(
@@ -4156,10 +4155,9 @@ mod tests {
         fallback[fallback_match_start..fallback_match_end].copy_from_slice(family.hit);
         assert_eq!(
             find_bounded_long_shared_fragment(shared_fragment, &fallback),
-            Some(LongSharedFragmentFilterResult::ResumeAt(
-                last_verified_start.checked_add(1).unwrap()
-            )),
+            Some(LongSharedFragmentFilterResult::ResumeAt(fallback_match_start)),
         );
+        assert!(fallback_match_start > last_verified_start.checked_add(1).unwrap());
         let expected = searcher
             .find(&fallback)
             .map(|matched| (matched.start(), matched.end()));
