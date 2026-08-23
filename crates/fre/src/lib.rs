@@ -2318,6 +2318,15 @@ impl K0ReverseSuffixSpanAdmission<'_> {
             .settle_transient(self.expected_transient, self.loss_payload);
         self.settled = true;
     }
+
+    fn observe_finite_early_prefix(mut self, window_bytes: usize, suffix_offset: usize) {
+        self.adaptive.settle_finite_early_prefix(
+            self.expected_transient,
+            window_bytes,
+            suffix_offset,
+        );
+        self.settled = true;
+    }
 }
 
 impl Drop for K0ReverseSuffixSpanAdmission<'_> {
@@ -2337,8 +2346,11 @@ impl K0ReverseSuffixSpanAdaptiveState {
     // encode six escalating skip epochs (8 through 256 calls). Class exponents
     // differing by two (window sizes differing by a factor of four) may share
     // a clock, which is harmless for this performance-only hint and preserves
-    // every exact permanent class bit. The clock never stores a source
-    // address, cursor, or result.
+    // every exact permanent class bit. A finite ConsumptionRun instead uses
+    // one exact class bit plus the raw offset of a proven early suffix in the
+    // low ten bits. That receipt is revalidated against immutable literal
+    // bytes on every bypass and never stores a source address, cursor, or
+    // match result.
     const MIN_WINDOW_CLASS: u32 = 10;
     const TRANSIENT_EPOCH_MASK: u64 = 0x1ff;
     const TRANSIENT_COHORT_MASK: u64 = 0x200;
@@ -2467,12 +2479,49 @@ impl K0ReverseSuffixSpanAdaptiveState {
 
     #[cfg(target_has_atomic = "64")]
     fn try_admit(&self, window_bytes: usize) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        self.try_admit_mode(window_bytes, false)
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn try_admit_finite(&self, window_bytes: usize) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        self.try_admit_mode(window_bytes, true)
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn try_admit_mode(
+        &self,
+        window_bytes: usize,
+        finite_early_receipts: bool,
+    ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
         let permanent = Self::permanent_class_mask(window_bytes)?;
         let cohort = Self::transient_cohort(window_bytes)?;
         let initial_loss_payload = Self::initial_loss_payload(window_bytes)
             .expect("an eligible reverse-suffix class has an initial epoch");
         let mut observed = self.load();
         loop {
+            if finite_early_receipts {
+                let receipt_class = observed & !Self::TRANSIENT_MASK;
+                if receipt_class == permanent {
+                    return None;
+                }
+                if receipt_class != 0 {
+                    match self.disabled_window_classes.compare_exchange_weak(
+                        observed,
+                        0,
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            observed = 0;
+                            continue;
+                        }
+                        Err(actual) => {
+                            observed = actual;
+                            continue;
+                        }
+                    }
+                }
+            }
             if observed & permanent != 0 {
                 return None;
             }
@@ -2599,6 +2648,94 @@ impl K0ReverseSuffixSpanAdaptiveState {
     }
 
     #[cfg(target_has_atomic = "64")]
+    fn finite_early_prefix_matches(
+        &self,
+        window_bytes: usize,
+        window: &[u8],
+        needle: &[u8],
+    ) -> bool {
+        let Some(class) = Self::permanent_class_mask(window_bytes) else {
+            return false;
+        };
+        let mut observed = self.load();
+        loop {
+            let receipt_class = observed & !Self::TRANSIENT_MASK;
+            if receipt_class == 0 {
+                return false;
+            }
+            if receipt_class == class {
+                let offset = usize::try_from(observed & Self::TRANSIENT_MASK)
+                    .expect("the finite early-prefix offset fits usize");
+                if offset
+                    .checked_add(needle.len())
+                    .and_then(|end| window.get(offset..end))
+                    == Some(needle)
+                {
+                    return true;
+                }
+            }
+            // A finite ConsumptionRun owns this adaptive word exclusively.
+            // Its receipt contains exactly one class and one raw prefix
+            // offset. Changed recorded bytes or another size class invalidate
+            // the whole performance hint and may immediately remeasure. Other
+            // source changes deliberately retain the conservative incumbent
+            // choice while the same proven early suffix remains in place.
+            match self.disabled_window_classes.compare_exchange_weak(
+                observed,
+                0,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return false,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn settle_finite_early_prefix(
+        &self,
+        expected_transient: u64,
+        window_bytes: usize,
+        suffix_offset: usize,
+    ) {
+        if suffix_offset > Self::TRANSIENT_MASK as usize {
+            self.settle_transient(expected_transient, 0);
+            return;
+        }
+        let Some(class) = Self::permanent_class_mask(window_bytes) else {
+            self.settle_transient(expected_transient, 0);
+            return;
+        };
+        let receipt = class | (suffix_offset as u64 & Self::TRANSIENT_MASK);
+        let mut observed = self.load();
+        loop {
+            if observed != expected_transient {
+                return;
+            }
+            match self.disabled_window_classes.compare_exchange_weak(
+                observed,
+                receipt,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    const fn settle_finite_early_prefix(
+        &self,
+        _expected_transient: u64,
+        _window_bytes: usize,
+        _suffix_offset: usize,
+    ) {
+        let _ = self.disabled_window_classes;
+    }
+
+    #[cfg(target_has_atomic = "64")]
     fn settle_transient(&self, expected_transient: u64, replacement_transient: u64) {
         debug_assert_eq!(expected_transient & !Self::TRANSIENT_MASK, 0);
         debug_assert_eq!(replacement_transient & !Self::TRANSIENT_MASK, 0);
@@ -2643,7 +2780,12 @@ impl Default for K0ReverseSuffixSpanAdaptiveState {
 struct K0ConsumptionRunPlan {
     ascii_members: AsciiByteSetRunScanner,
     high_members: [u64; 2],
-    reverse_suffix_span: bool,
+    // This word previously held one boolean plus alignment padding. Zero is
+    // the incumbent consumption run alone, `usize::MAX` is its established
+    // unbounded reverse-suffix route, and every other positive value is the
+    // HIR-authenticated finite maximum for ordinary pooled Span recovery.
+    // Thus the new finite facade retains no additional plan bytes.
+    span_recovery: usize,
     // Runtime-dispatch scanners are naturally wide enough without this word;
     // use the recovered word for a source-independent performance hint while
     // preserving the incumbent aggregate layout/ABI in compiler-fixed
@@ -2799,10 +2941,82 @@ impl K0MandatorySuffixPlan {
     fn reverse_suffix_span_adaptive(&self) -> Option<&K0ReverseSuffixSpanAdaptiveState> {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
-                if scanner.reverse_suffix_span => Some(&scanner.reverse_suffix_span_adaptive),
+                if scanner.span_recovery == usize::MAX =>
+            {
+                Some(&scanner.reverse_suffix_span_adaptive)
+            }
             K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(adaptive) => Some(adaptive),
             _ => None,
         }
+    }
+
+    fn pooled_finite_consumption_span_maximum_match_bytes(&self) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
+                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
+            {
+                Some(scanner.span_recovery)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn try_admit_pooled_finite_consumption_span(
+        &self,
+        window_bytes: usize,
+    ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
+                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
+            {
+                scanner
+                    .reverse_suffix_span_adaptive
+                    .try_admit_finite(window_bytes)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn pooled_finite_consumption_span_should_bypass_early(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> bool {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
+                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
+            {
+                scanner
+                    .reverse_suffix_span_adaptive
+                    .finite_early_prefix_matches(
+                        window.end().saturating_sub(window.start()),
+                        &haystack[window.start()..window.end()],
+                        self.needle(),
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn pooled_finite_consumption_span_should_bypass_early(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> bool {
+        let _ = (self, haystack, window);
+        true
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn try_admit_pooled_finite_consumption_span(
+        &self,
+        window_bytes: usize,
+    ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        let _ = (self, window_bytes);
+        None
     }
 
     fn reverse_suffix_span_is_disabled(&self, window_bytes: usize) -> bool {
@@ -3238,7 +3452,12 @@ fn try_build_k0_mandatory_suffix_with_short_policy(
     let baseline_recovery = if let Some(bounds) = short_finite_recovery_bounds {
         finite_recovery(bounds)
     } else {
-        match try_build_k0_consumption_run(raw, &mut planner_work, limits.max_planner_work)? {
+        match try_build_k0_consumption_run(
+            raw,
+            finite_bounds.map(|(_, maximum)| maximum),
+            &mut planner_work,
+            limits.max_planner_work,
+        )? {
             Some(run) => K0MandatorySuffixRecoveryPlan::ConsumptionRun(run),
             // A semantic decline (the union is empty or covers every byte)
             // and a planner-resource refusal are both safe here. The HIR's
@@ -3288,7 +3507,7 @@ fn try_build_k0_mandatory_suffix_with_short_policy(
                     let _proof = inspection.proof();
                     recovery = match recovery {
                         K0MandatorySuffixRecoveryPlan::ConsumptionRun(mut scanner) => {
-                            scanner.reverse_suffix_span = true;
+                            scanner.span_recovery = usize::MAX;
                             K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
                         }
                         K0MandatorySuffixRecoveryPlan::None => {
@@ -3632,6 +3851,7 @@ fn try_build_k0_deferred_short_mandatory_suffix(
 
 fn try_build_k0_consumption_run(
     raw: &fre_automata::RawPlan,
+    finite_maximum_match_bytes: Option<usize>,
     planner_work: &mut u64,
     max_planner_work: u64,
 ) -> Result<Option<K0ConsumptionRunPlan>, BuildError> {
@@ -3668,7 +3888,9 @@ fn try_build_k0_consumption_run(
             members[1],
         ])),
         high_members: [members[2], members[3]],
-        reverse_suffix_span: false,
+        span_recovery: finite_maximum_match_bytes
+            .filter(|maximum| *maximum != usize::MAX)
+            .unwrap_or(0),
         reverse_suffix_span_adaptive: K0ReverseSuffixSpanAdaptiveState::new(),
     }))
 }
@@ -9998,6 +10220,61 @@ mod contextual_span_v1_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod finite_consumption_span_facade_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) attempts: usize,
+        pub(super) completions: usize,
+        pub(super) declines: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            attempts: 0,
+            completions: 0,
+            declines: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_attempt() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                attempts: counts.attempts.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_result(completed: bool) {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(if completed {
+                Counts {
+                    completions: counts.completions.saturating_add(1),
+                    ..counts
+                }
+            } else {
+                Counts {
+                    declines: counts.declines.saturating_add(1),
+                    ..counts
+                }
+            });
+        });
+    }
+}
+
 // Re-authenticating the borrowed projection is not competitive with the
 // existing canonical warmed entry on tiny sources. Admit the ordinary lane
 // only where its omitted invocation ledger can amortize that fixed handoff.
@@ -10072,6 +10349,12 @@ enum K0PooledValue {
 enum K0PooledSpanRoute {
     Declined,
     Complete(Option<fre_automata::MatchSpan>),
+}
+
+enum K0PooledFiniteConsumptionSpanRoute {
+    Unattempted,
+    Complete(Option<fre_automata::MatchSpan>),
+    Fallback(SearchWindow),
 }
 
 /// Search one already-retained exact minimum word for warm ordinary Exists.
@@ -10218,6 +10501,309 @@ impl PortableK0Plan {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the outlined ordinary facade keeps its admission token and cut transaction out of the shared pooled caller"
+    )]
+    #[inline(never)]
+    fn pooled_finite_consumption_suffix_span_route(
+        &self,
+        suffix: &K0MandatorySuffixPlan,
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
+    ) -> Result<K0PooledFiniteConsumptionSpanRoute, K0SearchError> {
+        if limits != SearchLimits::unlimited()
+            || workspace_limits != SearchSessionLimits::unlimited()
+            || self.absolute_end_proof.is_some()
+            || self.automaton.stats().has_assertions()
+            || minimum_match_bytes == 0
+            || minimum_match_bytes > maximum_match_bytes
+            || suffix.needle().len() > minimum_match_bytes
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
+        }
+        let window_bytes = window.end().saturating_sub(window.start());
+        if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            || maximum_match_bytes
+                > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+        {
+            return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
+        }
+        let Some(admission) = suffix.try_admit_pooled_finite_consumption_span(window_bytes)
+        else {
+            return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
+        };
+
+        // Once this invocation owns the optional route, let the retained cut
+        // arbitrate first even when its maximum distance is zero. A negative
+        // cut completes the whole call without checking out or disturbing the
+        // pooled workspace. A positive cut may publish only its authenticated
+        // candidate floor; the finite suffix revalidates that bound below.
+        let mut incumbent_search_start = window.start();
+        if let Some(cut) = self.mandatory_cut.as_ref()
+            && k0_negative_prefilter_admitted(
+                Some(cut),
+                None,
+                haystack.len(),
+                window,
+                limits,
+            )
+        {
+            match cut.first_member(&haystack[window.start()..window.end()]) {
+                None => {
+                    drop(admission);
+                    return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(None));
+                }
+                Some(first_member) => {
+                    if let Some(floor) = cut.candidate_floor(window.start(), first_member) {
+                        incumbent_search_start = floor;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        finite_consumption_span_facade_probe::record_attempt();
+        let mut incumbent_candidate_floor =
+            (incumbent_search_start != window.start()).then_some(incumbent_search_start);
+        if incumbent_candidate_floor.is_none() {
+            // The exact route deliberately declines when its first suffix is
+            // within the incumbent's short forward prefix. Probe only that
+            // bounded prefix before checking out reverse workspace: a known
+            // losing source must not dirty and replace the pooled session.
+            // When the prefix contains no suffix, its mandatory-literal proof
+            // also publishes the earliest possible match-start floor. The
+            // exact route resumes with only the maximum-width overlap, so the
+            // probe does not add another whole-window literal pass.
+            let suffix_search_start = window
+                .start()
+                .saturating_add(minimum_match_bytes - suffix.needle().len())
+                .min(window.end());
+            let probe_end = window
+                .start()
+                .saturating_add(K0_SUFFIX_FORWARD_FALLBACK_BYTES)
+                .min(window.end());
+            let early_suffix = if suffix_search_start < probe_end {
+                suffix.find_window(haystack, suffix_search_start, probe_end)
+            } else {
+                Ok(None)
+            };
+            match early_suffix {
+                Ok(Some((suffix_start, _))) => {
+                    #[cfg(test)]
+                    finite_consumption_span_facade_probe::record_result(false);
+                    admission.observe_finite_early_prefix(
+                        window_bytes,
+                        suffix_start.saturating_sub(window.start()),
+                    );
+                    return Ok(K0PooledFiniteConsumptionSpanRoute::Fallback(window));
+                }
+                Err(_) => {
+                    #[cfg(test)]
+                    finite_consumption_span_facade_probe::record_result(false);
+                    admission.observe_loss();
+                    return Ok(K0PooledFiniteConsumptionSpanRoute::Fallback(window));
+                }
+                Ok(None) if probe_end == window.end() => {
+                    #[cfg(test)]
+                    finite_consumption_span_facade_probe::record_result(true);
+                    drop(admission);
+                    return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(None));
+                }
+                Ok(None) => {
+                    let floor = probe_end
+                        .saturating_add(1)
+                        .saturating_sub(maximum_match_bytes)
+                        .max(window.start());
+                    if floor > incumbent_search_start {
+                        incumbent_search_start = floor;
+                        incumbent_candidate_floor = Some(floor);
+                    }
+                }
+            }
+        }
+        let route = self.pooled_finite_consumption_suffix_span(
+            suffix,
+            minimum_match_bytes,
+            maximum_match_bytes,
+            admission,
+            haystack,
+            window,
+            incumbent_candidate_floor,
+            limits,
+            workspace_limits,
+        )?;
+        #[cfg(test)]
+        finite_consumption_span_facade_probe::record_result(matches!(
+            route,
+            K0PooledSpanRoute::Complete(_)
+        ));
+        Ok(match route {
+            K0PooledSpanRoute::Complete(output) => {
+                K0PooledFiniteConsumptionSpanRoute::Complete(output)
+            }
+            K0PooledSpanRoute::Declined => K0PooledFiniteConsumptionSpanRoute::Fallback(
+                SearchWindow::new(incumbent_search_start, window.end()),
+            ),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pooled finite proof carries its authenticated bounds, incumbent floor, and workspace contract"
+    )]
+    #[inline(never)]
+    fn pooled_finite_consumption_suffix_span(
+        &self,
+        suffix: &K0MandatorySuffixPlan,
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        admission: K0ReverseSuffixSpanAdmission<'_>,
+        haystack: &[u8],
+        window: SearchWindow,
+        incumbent_candidate_floor: Option<usize>,
+        limits: SearchLimits,
+        workspace_limits: SearchSessionLimits,
+    ) -> Result<K0PooledSpanRoute, K0SearchError> {
+        if limits != SearchLimits::unlimited()
+            || workspace_limits != SearchSessionLimits::unlimited()
+            || minimum_match_bytes == 0
+            || minimum_match_bytes > maximum_match_bytes
+            || suffix.needle().len() > minimum_match_bytes
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+            || incumbent_candidate_floor
+                .is_some_and(|floor| !(window.start()..=window.end()).contains(&floor))
+        {
+            admission.observe_loss();
+            return Ok(K0PooledSpanRoute::Declined);
+        }
+        let window_bytes = window.end().saturating_sub(window.start());
+        if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            || maximum_match_bytes
+                > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+        {
+            admission.observe_loss();
+            return Ok(K0PooledSpanRoute::Declined);
+        }
+
+        let mut session = match self.automaton.try_checkout_pooled_search_session(
+            workspace_limits,
+            true,
+            true,
+        ) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                admission.observe_loss();
+                return Ok(K0PooledSpanRoute::Declined);
+            }
+            Err(error) => {
+                admission.observe_loss();
+                return Err(error);
+            }
+        };
+        let mut direct_state = K0NegativePrefilterState::default();
+        let window_size_class = usize::BITS - window_bytes.leading_zeros();
+        let class_index = direct_state.class_for(window_size_class);
+        direct_state.classes[class_index].next_predicate = K0_FINITE_SUFFIX_EXACT_ROUTE;
+        let attempt = match try_k0_finite_mandatory_suffix_span_start(
+            &mut session,
+            suffix,
+            minimum_match_bytes,
+            maximum_match_bytes,
+            direct_state,
+            haystack,
+            window,
+            limits,
+            incumbent_candidate_floor,
+        ) {
+            Ok(attempt) => attempt,
+            Err(SearchError::K0(error)) => {
+                admission.observe_loss();
+                return Err(error);
+            }
+            Err(_) => {
+                admission.observe_loss();
+                return Err(K0SearchError::InternalInvariant {
+                    detail: "pooled finite mandatory-suffix proof escaped the K0 error domain",
+                });
+            }
+        };
+        let learned_loss = attempt.state_after_success.classes[class_index].next_predicate
+            & K0_FINITE_SUFFIX_BACKOFF_ROUTE
+            != 0;
+        let (route, transient_loss) = match attempt.outcome {
+            K0MandatorySuffixSpanOutcome::Absent
+            | K0MandatorySuffixSpanOutcome::ProvedAbsent => {
+                (K0PooledSpanRoute::Complete(None), learned_loss)
+            }
+            K0MandatorySuffixSpanOutcome::ProvedSpan { start, end } => (
+                K0PooledSpanRoute::Complete(Some(fre_automata::MatchSpan::new(start, end))),
+                learned_loss,
+            ),
+            K0MandatorySuffixSpanOutcome::ProvedStart {
+                start,
+                maximum_match_bytes,
+            } => {
+                let (output, exact_receipt) = match replay_k0_finite_proved_start_with_exact_receipt(
+                    &mut session,
+                    haystack,
+                    window,
+                    limits,
+                    start,
+                    maximum_match_bytes,
+                ) {
+                    Ok(result) => result,
+                    Err(SearchError::K0(error)) => {
+                        admission.observe_loss();
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        admission.observe_loss();
+                        return Err(K0SearchError::InternalInvariant {
+                            detail: "pooled finite selected-end replay escaped the K0 error domain",
+                        });
+                    }
+                };
+                (
+                    K0PooledSpanRoute::Complete(output.map(|matched| {
+                        fre_automata::MatchSpan::new(matched.start, matched.end)
+                    })),
+                    learned_loss || !exact_receipt,
+                )
+            }
+            K0MandatorySuffixSpanOutcome::Bypass
+            | K0MandatorySuffixSpanOutcome::GeometryBypass
+            | K0MandatorySuffixSpanOutcome::Incumbent { .. }
+            | K0MandatorySuffixSpanOutcome::Fallback
+            | K0MandatorySuffixSpanOutcome::Narrowed(_)
+            | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. } => {
+                (K0PooledSpanRoute::Declined, true)
+            }
+        };
+        if transient_loss {
+            admission.observe_loss();
+        } else {
+            drop(admission);
+        }
+        if transient_loss {
+            self.automaton.refresh_pooled_search_session(
+                session,
+                workspace_limits,
+                true,
+                true,
+            )?;
+        } else {
+            self.automaton.return_pooled_search_session(session)?;
+        }
+        Ok(route)
+    }
+
     fn pooled_value(
         &self,
         operation: K0PooledValueOperation,
@@ -10299,6 +10885,56 @@ impl PortableK0Plan {
             }?;
             if attempted.is_some() {
                 return Ok(attempted);
+            }
+        }
+
+        // Keep the Drop-bearing adaptive admission and its reverse workspace
+        // entirely inside the outlined finite facade. The shared pooled caller
+        // retains only this immutable geometry check, so unrelated K0 Span and
+        // every Exists path preserve their incumbent frame and cleanup graph.
+        if matches!(
+            (operation, execution),
+            (
+                K0PooledValueOperation::Span,
+                K0PooledValueExecution::OrdinarySpan,
+            )
+        ) && self.absolute_end_proof.is_none()
+            && !self.automaton.stats().has_assertions()
+            && let Some(minimum_match_bytes) = minimum_match_bytes.filter(|minimum| *minimum != 0)
+            && let Some(suffix) = self.mandatory_suffix.as_ref()
+            && let Some(maximum_match_bytes) =
+                suffix.pooled_finite_consumption_span_maximum_match_bytes()
+            && window.end().saturating_sub(window.start())
+                >= K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            && maximum_match_bytes
+                <= window.end().saturating_sub(window.start())
+                    / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+            && !suffix.pooled_finite_consumption_span_should_bypass_early(haystack, window)
+        {
+            match self.pooled_finite_consumption_suffix_span_route(
+                suffix,
+                minimum_match_bytes,
+                maximum_match_bytes,
+                haystack,
+                window,
+                limits,
+                workspace_limits,
+            )? {
+                K0PooledFiniteConsumptionSpanRoute::Unattempted => {}
+                K0PooledFiniteConsumptionSpanRoute::Complete(output) => {
+                    return Ok(Some(K0PooledValue::Span(output)));
+                }
+                K0PooledFiniteConsumptionSpanRoute::Fallback(search_window) => {
+                    return self.pooled_workspace_value(
+                        operation,
+                        execution,
+                        haystack,
+                        search_window,
+                        limits,
+                        workspace_limits,
+                        Some(minimum_match_bytes),
+                    );
+                }
             }
         }
 
@@ -25394,6 +26030,293 @@ mod tests {
         regex
     }
 
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn pooled_finite_consumption_suffix_span_is_exact_warm_and_ordinary_only() {
+        const PATTERN: &str = r"(?:ab){2,5}c";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("public bounded-repeat fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("public bounded-repeat fixture must retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("public bounded repeat retains its mandatory suffix");
+        assert_eq!(regex.report.minimum_match_bytes, Some(5));
+        assert_eq!(suffix.needle(), b"ababc");
+        assert_eq!(
+            suffix.pooled_finite_consumption_span_maximum_match_bytes(),
+            Some(11),
+        );
+        assert!(!suffix.has_reverse_suffix_span());
+
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let padded = |tail: &[u8]| {
+            let mut haystack = Vec::with_capacity(4_093);
+            while haystack.len() < 4_093 - tail.len() {
+                let remaining = 4_093 - tail.len() - haystack.len();
+                haystack.extend_from_slice(&b"abx"[..3.min(remaining)]);
+            }
+            haystack.extend_from_slice(tail);
+            haystack
+        };
+        let cases = [
+            padded(b""),
+            padded(b"ababc"),
+            padded(b"abababc"),
+            padded(b"abababababc"),
+            padded(b"abababcxxxxababc"),
+        ];
+        super::finite_consumption_span_facade_probe::reset();
+        for haystack in &cases {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            for _ in 0..2 {
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "haystack prefix={:?}",
+                    &haystack[..16.min(haystack.len())],
+                );
+            }
+        }
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: cases.len() * 2,
+                completions: cases.len() * 2,
+                declines: 0,
+            },
+        );
+
+        // A suffix close to the incumbent floor is exact but not economical.
+        // The outlined route records its exact prefix position before touching
+        // reverse workspace; subsequent calls revalidate those few literal
+        // bytes and remain on authoritative forward K0.
+        let early_regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("early bounded-repeat fixture builds");
+        let mut early = b"abababababc".to_vec();
+        early.resize(4_093, b'x');
+        let early_expected = upstream
+            .find(&early)
+            .map(|matched| (matched.start(), matched.end()));
+        super::finite_consumption_span_facade_probe::reset();
+        assert_eq!(
+            early_regex
+                .find(&early)
+                .map(|matched| (matched.start(), matched.end())),
+            early_expected,
+        );
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 0,
+                declines: 1,
+            },
+        );
+        let PortablePlan::K0(early_plan) = &early_regex.plan else {
+            unreachable!("early bounded-repeat fixture retains K0");
+        };
+        let early_suffix = early_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("early bounded repeat retains its mandatory suffix");
+        assert!(early_suffix.pooled_finite_consumption_span_should_bypass_early(
+            &early,
+            SearchWindow::full(&early),
+        ));
+        for _ in 0..72 {
+            assert_eq!(
+                early_regex
+                    .find(&early)
+                    .map(|matched| (matched.start(), matched.end())),
+                early_expected,
+            );
+        }
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 0,
+                declines: 1,
+            },
+            "a revalidated near-prefix receipt leaves later calls on incumbent K0",
+        );
+
+        // Changing the recorded suffix bytes invalidates the old receipt
+        // immediately. A successful late match clears the hint and keeps the
+        // exact route available without waiting through a cooldown.
+        let recover_regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("recovering bounded-repeat fixture builds");
+        super::finite_consumption_span_facade_probe::reset();
+        assert_eq!(
+            recover_regex
+                .find(&early)
+                .map(|matched| (matched.start(), matched.end())),
+            early_expected,
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                recover_regex
+                    .find(&early)
+                    .map(|matched| (matched.start(), matched.end())),
+                early_expected,
+            );
+        }
+        let late_expected = upstream
+            .find(&cases[3])
+            .map(|matched| (matched.start(), matched.end()));
+        for _ in 0..2 {
+            assert_eq!(
+                recover_regex
+                    .find(&cases[3])
+                    .map(|matched| (matched.start(), matched.end())),
+                late_expected,
+            );
+        }
+        let PortablePlan::K0(recover_plan) = &recover_regex.plan else {
+            unreachable!("recovering bounded-repeat fixture retains K0");
+        };
+        let recover_suffix = recover_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("recovering bounded repeat retains its mandatory suffix");
+        assert!(!recover_suffix.pooled_finite_consumption_span_should_bypass_early(
+            &cases[3],
+            SearchWindow::full(&cases[3]),
+        ));
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 3,
+                completions: 2,
+                declines: 1,
+            },
+        );
+
+        let ordinary_attempts_before_explicit =
+            super::finite_consumption_span_facade_probe::snapshot().attempts;
+        let explicit = regex
+            .find_value(&cases[3], SearchLimits::unlimited())
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            explicit,
+            upstream
+                .find(&cases[3])
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert!(regex.is_match(&cases[3]));
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot().attempts,
+            ordinary_attempts_before_explicit,
+            "explicit value and Exists APIs must not enter the ordinary Span sidecar",
+        );
+
+        let below = padded(b"ababc")[..1_023].to_vec();
+        super::finite_consumption_span_facade_probe::reset();
+        assert_eq!(
+            regex.find(&below).map(|matched| (matched.start(), matched.end())),
+            upstream
+                .find(&below)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts::default(),
+        );
+        let boundary = padded(b"ababc")[4_093 - 1_024..].to_vec();
+        assert_eq!(boundary.len(), 1_024);
+        assert_eq!(
+            regex
+                .find(&boundary)
+                .map(|matched| (matched.start(), matched.end())),
+            upstream
+                .find(&boundary)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 0,
+                declines: 1,
+            },
+        );
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn pooled_finite_consumption_suffix_span_foreign_owner_falls_back_exactly() {
+        const PATTERN: &str = r"(?:ab){2,5}c";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("public bounded-repeat fixture builds");
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut haystack = b"abx".repeat(1_362);
+        haystack.extend_from_slice(b"abababc");
+        let expected = upstream
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("public bounded-repeat fixture must retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("public bounded repeat retains its mandatory suffix");
+        let admission = suffix
+            .try_admit_pooled_finite_consumption_span(haystack.len())
+            .expect("idle finite suffix route admits one owner");
+        let (actual, counts) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    super::finite_consumption_span_facade_probe::reset();
+                    let actual = regex
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end()));
+                    (
+                        actual,
+                        super::finite_consumption_span_facade_probe::snapshot(),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(
+            counts,
+            super::finite_consumption_span_facade_probe::Counts::default(),
+            "an in-flight foreign owner must leave this invocation on incumbent K0",
+        );
+        drop(admission);
+    }
+
     #[test]
     fn compact_prepared_ordinary_exists_public_lifecycle_is_boundary_exact() {
         const PATTERN: &str = r"(?:ab|a)??b";
@@ -27230,7 +28153,7 @@ mod tests {
                 fre_kernels::AsciiByteSet::from_words([members[0], members[1]]),
             ),
             high_members: [members[2], members[3]],
-            reverse_suffix_span: true,
+            span_recovery: usize::MAX,
             reverse_suffix_span_adaptive: super::K0ReverseSuffixSpanAdaptiveState::new(),
         };
         for byte in u8::MIN..=u8::MAX {
@@ -27462,6 +28385,91 @@ mod tests {
             assert!(adaptive.try_admit(4_096).is_some());
             assert!(!adaptive.is_disabled(4_096));
         }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn finite_early_prefix_receipt_is_cause_class_and_source_shape_specific() {
+        const WINDOW_BYTES: usize = 4_096;
+        const OTHER_COHORT_CLASS_BYTES: usize = 16_384;
+        const OFFSET: usize = 6;
+        const NEEDLE: &[u8] = b"needle";
+
+        let adaptive = super::K0ReverseSuffixSpanAdaptiveState::new();
+        adaptive
+            .try_admit(WINDOW_BYTES)
+            .unwrap()
+            .observe_finite_early_prefix(WINDOW_BYTES, OFFSET);
+        let class = super::K0ReverseSuffixSpanAdaptiveState::permanent_class_mask(WINDOW_BYTES)
+            .unwrap();
+        assert_eq!(
+            adaptive.load() & !super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+            class,
+        );
+        assert_eq!(
+            adaptive.load() & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+            OFFSET as u64,
+        );
+
+        let mut early = vec![b'x'; WINDOW_BYTES];
+        early[OFFSET..OFFSET + NEEDLE.len()].copy_from_slice(NEEDLE);
+        assert!(adaptive.finite_early_prefix_matches(WINDOW_BYTES, &early, NEEDLE));
+        let other_class = adaptive
+            .try_admit_finite(OTHER_COHORT_CLASS_BYTES)
+            .expect("a different exact class clears the receipt and admits immediately");
+        assert_eq!(
+            adaptive.load() & !super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+            0,
+        );
+        drop(other_class);
+        assert_eq!(adaptive.load(), 0);
+
+        adaptive.try_admit(WINDOW_BYTES).unwrap().observe_loss();
+        assert_eq!(
+            adaptive.load() & !super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+            0,
+            "a generic loss cannot publish an early-prefix receipt",
+        );
+        for _ in 0..8 {
+            assert!(adaptive.try_admit(WINDOW_BYTES).is_none());
+        }
+        adaptive
+            .try_admit(WINDOW_BYTES)
+            .unwrap()
+            .observe_finite_early_prefix(WINDOW_BYTES, OFFSET);
+        early[OFFSET] = b'y';
+        assert!(
+            !adaptive.finite_early_prefix_matches(WINDOW_BYTES, &early, NEEDLE),
+            "changed literal bytes invalidate the receipt immediately",
+        );
+        assert_eq!(adaptive.load(), 0);
+        assert!(adaptive.try_admit_finite(WINDOW_BYTES).is_some());
+
+        for offset in [0, 1_023] {
+            let boundary = super::K0ReverseSuffixSpanAdaptiveState::new();
+            boundary
+                .try_admit_finite(1_024)
+                .unwrap()
+                .observe_finite_early_prefix(1_024, offset);
+            let mut window = vec![b'x'; 1_024];
+            window[offset] = b'n';
+            assert!(boundary.finite_early_prefix_matches(1_024, &window, b"n"));
+        }
+
+        let out_of_range = super::K0ReverseSuffixSpanAdaptiveState::new();
+        out_of_range
+            .try_admit_finite(1_024)
+            .unwrap()
+            .observe_finite_early_prefix(1_024, 1_024);
+        assert_eq!(out_of_range.load(), 0);
+
+        let malformed = super::K0ReverseSuffixSpanAdaptiveState::new();
+        malformed.disabled_window_classes.store(
+            (1_u64 << 10) | (1_u64 << 11) | OFFSET as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(!malformed.finite_early_prefix_matches(1_024, &early, NEEDLE));
+        assert_eq!(malformed.load(), 0);
     }
 
     #[test]
