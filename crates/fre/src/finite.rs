@@ -25,6 +25,7 @@ use crate::guarded_ascii_word::{
 const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 1;
 const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
 const FIXED_PREDICATE_MAX_RANGES: usize = 4;
+pub(crate) const FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FiniteExtractionTerminal {
@@ -1416,21 +1417,39 @@ impl<'hir> SingletonLiteralHandoff<'hir> {
     }
 }
 
+/// Storage selected for one independently authenticated flat literal handoff.
+///
+/// Ripgrep's common bounded alternations retain only the immutable HIR here;
+/// the caller projects their byte slices into a fixed stack table immediately
+/// before stable DFA construction. Larger alternations retain the incumbent
+/// heap-allocated slice table so their construction behavior is unchanged.
+pub(crate) enum FlatLiteralSetHandoffStorage<'hir> {
+    StackEligible(&'hir [Hir]),
+    HeapBorrowed(Vec<&'hir [u8]>),
+}
+
 /// One independently authenticated flat literal alternation borrowed directly
 /// from its retained HIR owner.
 ///
-/// The slice table is the only finite-language storage allocated by this
-/// handoff. Literal bytes remain in the immutable HIR until the selected plan
-/// has copied them into its final owner. Planner work deliberately replays the
-/// incumbent materializer even though no literal bytes are copied here.
+/// Literal bytes remain in the immutable HIR until the selected plan has
+/// copied them into its final owner. Planner work deliberately replays the
+/// incumbent materializer even when the borrowed slice table is deferred to
+/// the caller's stack.
 pub(crate) struct FlatLiteralSetHandoff<'hir> {
-    patterns: Vec<&'hir [u8]>,
+    storage: FlatLiteralSetHandoffStorage<'hir>,
     receipt: FiniteExtractionAttemptReceipt,
 }
 
 impl<'hir> FlatLiteralSetHandoff<'hir> {
-    pub(crate) fn patterns(&self) -> &[&'hir [u8]] {
-        self.patterns.as_slice()
+    pub(crate) fn storage(&self) -> &FlatLiteralSetHandoffStorage<'hir> {
+        &self.storage
+    }
+
+    pub(crate) fn pattern_count(&self) -> usize {
+        match &self.storage {
+            FlatLiteralSetHandoffStorage::StackEligible(branches) => branches.len(),
+            FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => patterns.len(),
+        }
     }
 
     pub(crate) const fn work(&self) -> u64 {
@@ -1438,14 +1457,21 @@ impl<'hir> FlatLiteralSetHandoff<'hir> {
     }
 
     pub(crate) fn has_closed_receipt(&self) -> bool {
-        self.receipt.has_basic_closure()
+        let storage_closes = match &self.storage {
+            FlatLiteralSetHandoffStorage::StackEligible(branches) => {
+                branches.len() <= FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
+                    && self.receipt.actual.local == FiniteExtractionLocalActual::default()
+            }
+            FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => {
+                patterns.len() > FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
+                    && patterns.capacity().checked_mul(size_of::<&[u8]>())
+                        == Some(self.receipt.actual.local.live_persistent_bytes)
+            }
+        };
+        storage_closes
+            && self.receipt.has_basic_closure()
             && self.receipt.terminal == FiniteExtractionTerminal::Fits
             && self.receipt.actual.guarded.is_none()
-            && self
-                .patterns
-                .capacity()
-                .checked_mul(size_of::<&[u8]>())
-                == Some(self.receipt.actual.local.live_persistent_bytes)
     }
 }
 
@@ -1603,9 +1629,24 @@ pub(crate) fn extract_authenticated_flat_literal_set_handoff(
     }
 
     let context = FiniteExtractionContext::new(initial_work, work_limit);
-    let result = (|| -> Result<Vec<&[u8]>, BuildError> {
+    let result = (|| -> Result<FlatLiteralSetHandoffStorage<'_>, BuildError> {
         context.charge(1)?;
-        context.charge(u64::try_from(branches.len()).unwrap_or(u64::MAX))?;
+        let branch_work = u64::try_from(branches.len()).unwrap_or(u64::MAX);
+        context.charge(branch_work)?;
+
+        if branches.len() <= FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS {
+            // Replay the incumbent outer-table publication work without
+            // allocating that table. The selected constructor will project
+            // these authenticated leaves into its bounded stack owner.
+            context.charge(branch_work)?;
+            for branch in branches {
+                let HirKind::Literal(literal) = branch.kind() else {
+                    unreachable!("flat literal branches were revalidated above");
+                };
+                context.charge(u64::try_from(literal.0.len()).unwrap_or(u64::MAX))?;
+            }
+            return Ok(FlatLiteralSetHandoffStorage::StackEligible(branches));
+        }
 
         let mut patterns = AccountedVec::new(&context, FiniteStorage::Persistent);
         patterns.reserve_planner(branches.len(), "flat finite-language borrowed patterns")?;
@@ -1616,13 +1657,15 @@ pub(crate) fn extract_authenticated_flat_literal_set_handoff(
             context.charge(u64::try_from(literal.0.len()).unwrap_or(u64::MAX))?;
             patterns.push_reserved(literal.0.as_ref())?;
         }
-        Ok(patterns.into_inner_kept())
+        Ok(FlatLiteralSetHandoffStorage::HeapBorrowed(
+            patterns.into_inner_kept(),
+        ))
     })();
 
     match result {
-        Ok(patterns) => {
+        Ok(storage) => {
             let handoff = FlatLiteralSetHandoff {
-                patterns,
+                storage,
                 receipt: context.close(FiniteExtractionTerminal::Fits),
             };
             debug_assert!(handoff.has_closed_receipt());
@@ -4656,7 +4699,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_flat_literal_set_handoff_borrows_one_closed_table() {
+    fn authenticated_flat_literal_set_handoff_defers_a_bounded_table_to_the_stack() {
         let hir = flat_literal_hir();
         let incumbent = super::extract_authenticated_flat_literal_set(
             &hir,
@@ -4679,10 +4722,54 @@ mod tests {
         assert!(handoff.has_closed_receipt());
         assert_eq!(handoff.work(), incumbent_work);
         assert_eq!(handoff.work(), 20);
-        assert_eq!(
-            handoff.patterns(),
-            [b"ab".as_slice(), b"cde".as_slice(), b"f".as_slice()],
+        let super::FlatLiteralSetHandoffStorage::StackEligible(branches) = handoff.storage() else {
+            panic!("bounded flat literal handoff retained a heap table");
+        };
+        assert_eq!(*branches, hir.kind().subs());
+
+        let actual = handoff.receipt.actual.local;
+        assert_eq!(actual, super::FiniteExtractionLocalActual::default());
+    }
+
+    #[test]
+    fn authenticated_flat_literal_set_handoff_preserves_the_large_heap_table() {
+        let pattern_count = super::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS + 1;
+        let hir = regex_syntax::hir::Hir::alternation(
+            (0..pattern_count)
+                .map(|index| {
+                    let value = u16::try_from(index).expect("focused pattern index fits u16");
+                    regex_syntax::hir::Hir::literal(value.to_le_bytes().to_vec())
+                })
+                .collect(),
         );
+        let max_bytes = pattern_count
+            .checked_mul(core::mem::size_of::<u16>())
+            .expect("focused byte limit remains representable");
+        let incumbent = super::extract_authenticated_flat_literal_set(
+            &hir,
+            pattern_count,
+            max_bytes,
+            7,
+            u64::MAX,
+        );
+        assert!(incumbent.has_closed_receipt());
+
+        let handoff = super::extract_authenticated_flat_literal_set_handoff(
+            &hir,
+            pattern_count,
+            max_bytes,
+            7,
+            u64::MAX,
+        )
+        .unwrap_or_else(|_| panic!("eligible large flat literal handoff was declined"));
+        assert!(handoff.has_closed_receipt());
+        assert_eq!(handoff.work(), incumbent.work());
+        let super::FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) = handoff.storage() else {
+            panic!("large flat literal handoff did not retain the incumbent heap table");
+        };
+        assert_eq!(patterns.len(), pattern_count);
+        assert_eq!(patterns.first().copied(), Some([0, 0].as_slice()));
+        assert_eq!(patterns.last().copied(), Some([0, 1].as_slice()));
 
         let actual = handoff.receipt.actual.local;
         assert_eq!(actual.allocations, 1);
@@ -4690,7 +4777,7 @@ mod tests {
         assert_eq!(actual.copied_bytes, 0);
         assert_eq!(
             actual.initialized_bytes,
-            3 * core::mem::size_of::<&[u8]>(),
+            pattern_count * core::mem::size_of::<&[u8]>(),
         );
         assert_eq!(actual.live_scratch_bytes, 0);
         assert_eq!(actual.released_scratch_bytes, 0);

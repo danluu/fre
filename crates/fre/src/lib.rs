@@ -5778,17 +5778,44 @@ fn build_ripgrep_flat_literal_handoff(
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<PortableRegex, BuildError> {
     if builder.selection != PlanSelection::Auto
-        || handoff.patterns().len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        || handoff.pattern_count() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
         || publication.syntax.class_ranges != 0
     {
         return Err(BuildError::InternalInvariant(
             "borrowed ripgrep literal set reached another planner terminal",
         ));
     }
-    let literal_set = LiteralSetPlan::new_stable_borrowed(
-        handoff.patterns(),
-        builder.limits.literal_set,
-    )?;
+    let literal_set = match handoff.storage() {
+        finite::FlatLiteralSetHandoffStorage::StackEligible(branches) => {
+            if branches.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS {
+                return Err(BuildError::InternalInvariant(
+                    "stack-eligible flat literal set exceeded its fixed table",
+                ));
+            }
+            let mut patterns: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
+                [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
+            for (pattern, branch) in patterns.iter_mut().zip(branches.iter()) {
+                let HirKind::Literal(literal) = branch.kind() else {
+                    return Err(BuildError::InternalInvariant(
+                        "authenticated flat literal handoff reached another HIR leaf",
+                    ));
+                };
+                if literal.0.is_empty() {
+                    return Err(BuildError::InternalInvariant(
+                        "authenticated flat literal handoff reached an empty leaf",
+                    ));
+                }
+                *pattern = literal.0.as_ref();
+            }
+            LiteralSetPlan::new_stable_borrowed(
+                &patterns[..branches.len()],
+                builder.limits.literal_set,
+            )?
+        }
+        finite::FlatLiteralSetHandoffStorage::HeapBorrowed(patterns) => {
+            LiteralSetPlan::new_stable_borrowed(patterns, builder.limits.literal_set)?
+        }
+    };
     let storage = literal_set.build_accounting().persistent_bytes;
     Ok(PortableRegex {
         source: publication.source,
