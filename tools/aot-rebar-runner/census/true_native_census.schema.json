@@ -389,7 +389,9 @@
         "span_fill_identity_sha256"
       ],
       "properties": {
-        "route_variant": { "enum": ["direct-v2", "ordered-v15"] },
+        "route_variant": {
+          "enum": ["direct-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
         "required_prepare_capabilities": { "enum": [0, 1] },
         "prepare_config_version": { "enum": [2, 3] },
         "prepare_operation_flags": { "enum": [2, 4] },
@@ -418,8 +420,7 @@
               "prepare_config_version": { "const": 2 },
               "max_handle_bytes": { "const": 0 },
               "max_scratch_bytes": { "const": 0 },
-              "max_setup_work": { "const": 0 },
-              "span_fill_identity_sha256": { "type": "null" }
+              "max_setup_work": { "const": 0 }
             }
           },
           "else": {
@@ -428,8 +429,23 @@
               "prepare_config_version": { "const": 3 },
               "max_handle_bytes": { "const": 8388608 },
               "max_scratch_bytes": { "const": 8388608 },
-              "max_setup_work": { "const": 2000000 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "ordered-v15" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
               "span_fill_identity_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          },
+          "else": {
+            "properties": {
+              "span_fill_identity_sha256": { "type": "null" }
             }
           }
         }
@@ -439,7 +455,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "receipt_schema_version", "source_pattern_count",
+        "route_variant", "receipt_schema_version", "source_pattern_count",
         "ordered_sources_sha256", "required_prepare_capabilities",
         "prepare_config_version", "prepare_operation_flags",
         "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
@@ -447,23 +463,52 @@
         "reducer_identity_sha256"
       ],
       "properties": {
+        "route_variant": {
+          "enum": ["native-fused-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
         "receipt_schema_version": { "const": 1 },
         "source_pattern_count": {
           "type": "integer", "minimum": 2, "maximum": 4096
         },
         "ordered_sources_sha256": { "$ref": "#/$defs/sha256" },
-        "required_prepare_capabilities": { "const": 1 },
-        "prepare_config_version": { "const": 3 },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
         "prepare_operation_flags": { "enum": [2, 4] },
-        "max_handle_bytes": { "const": 8388608 },
-        "max_scratch_bytes": { "const": 8388608 },
-        "max_setup_work": { "const": 2000000 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
         "runtime_program_len": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
         "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "native-fused-v2" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
     },
     "uniformCaptureProvenance": {
       "type": "object",
@@ -903,7 +948,7 @@
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
-        "validation"
+        "entry_abi", "validation"
       ],
       "properties": {
         "schema": {
@@ -919,6 +964,11 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
+        "entry_abi": {
+          "enum": [
+            null, "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+          ]
+        },
         "validation": { "$ref": "#/$defs/frozenValidation" },
         "kind": {
           "enum": [
@@ -989,6 +1039,22 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": { "schema": { "const": "fre.aot.rebar-runner.v2" } },
+            "required": ["schema"]
+          },
+          "then": {
+            "properties": {
+              "entry_abi": {
+                "enum": [
+                  "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+                ]
+              }
+            }
+          },
+          "else": { "properties": { "entry_abi": { "type": "null" } } }
+        },
         {
           "if": {
             "properties": {

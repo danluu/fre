@@ -45,6 +45,9 @@ PREPARED_V15_MAX_SETUP_WORK = 2_000_000
 PREPARED_V15_CAPABILITY = 1
 PREPARED_V2_CONFIG_VERSION = 2
 PREPARED_V15_CONFIG_VERSION = 3
+SPAN_SEARCH_ENTRY_ABI = "SpanSearchV1"
+EXISTS_SEARCH_ENTRY_ABI = "ExistsSearchV1"
+PREPARED_SCALAR_REDUCE_ENTRY_ABI = "PreparedScalarReduceV1"
 PREPARED_V15_SPAN_OPERATION_FLAGS = 1 << 1
 PREPARED_V15_SPAN_SUM_OPERATION_FLAGS = 1 << 2
 ORDERED_MANY_RECEIPT_VERSION = 1
@@ -1146,7 +1149,7 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "engine", "aggregate_strategy", "prepared_bulk_strategy",
             "span_iteration_strategy", "grep_iteration_strategy", "program_sha256",
             "object_sha256", "program_symbol", "program_len", "entry_symbol", "reducer_symbol",
-            "span_fill_symbol", "required_runtime_symbols",
+            "span_fill_symbol", "required_runtime_symbols", "entry_abi",
         }
     elif fields.get("schema") == "fre.aot.rebar-runner.v3":
         required = common | {
@@ -1217,7 +1220,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         "max_handle_bytes", "max_ordered_nfa_scratch_bytes",
         "max_ordered_nfa_setup_work", "program_sha256", "object_sha256",
         "program_symbol", "program_len", "entry_symbol", "reducer_symbol", "span_fill_symbol",
-        "required_runtime_symbols", "boundary", "required_comparators",
+        "required_runtime_symbols", "entry_abi", "boundary", "required_comparators",
     } | FROZEN_VALIDATION_FIELDS
     if set(fields) != expected:
         raise CensusError(
@@ -1229,6 +1232,27 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         raise CensusError("scalar provenance disposition is not executed")
     if fields["shared_ordered_many"] not in {"true", "false"}:
         raise CensusError("scalar provenance has an invalid shared ordered-many flag")
+    if fields["entry_abi"] not in {
+        EXISTS_SEARCH_ENTRY_ABI, SPAN_SEARCH_ENTRY_ABI,
+        PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+    }:
+        raise CensusError("scalar provenance has an unknown entry ABI")
+    if fields["entry_abi"] == EXISTS_SEARCH_ENTRY_ABI and not (
+        fields.get("model") == "grep"
+        and fields.get("aggregate_strategy") == "Some(NativeFused)"
+    ):
+        raise CensusError("Exists search ABI is attached to another scalar route")
+    if fields["entry_abi"] == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
+        fields.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
+        and fields.get("model") in {"count", "count-spans"}
+        and (
+            fields.get("shared_ordered_many") == "true"
+            or fields.get("model") == "count"
+            or fields.get("span_iteration_strategy")
+            == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+        )
+    ):
+        raise CensusError("prepared scalar reducer ABI is attached to another route")
     frozen_schedule_validation(fields)
     if fields["prepare_scope"] != "runtime-handle-state" or fields[
         "object_descriptor_setup"
@@ -1352,13 +1376,15 @@ def scalar_native_reducer_surface(
 
 
 def scalar_native_reducer_route(model: object, proof: object) -> str:
-    """Select only one of the four authenticated scalar reducer policies."""
+    """Select one exact scalar reducer policy from its authenticated topology."""
     if not isinstance(proof, dict):
         raise CensusError("scalar native reducer proof is not an object")
     variant = proof.get("route_variant")
-    if model == "count" and variant == "direct-v2":
+    if model == "count" and variant in {"direct-v2", "ordered-v15-operation-only"}:
         return "linked-reducer"
-    if model == "count-spans" and variant == "direct-v2":
+    if model == "count-spans" and variant in {
+        "direct-v2", "ordered-v15-operation-only",
+    }:
         return "linked-span-sum-reducer"
     if model in {"count", "count-spans"} and variant == "ordered-v15":
         return scalar_native_reducer_surface(model)[6]
@@ -1368,7 +1394,7 @@ def scalar_native_reducer_route(model: object, proof: object) -> str:
 def scalar_native_reducer_proof_from_provenance(
     fields: dict[str, str],
 ) -> dict[str, object]:
-    """Authenticate a helper-free V2 or exact helper-backed V15 scalar reducer."""
+    """Authenticate a direct, compatibility V15, or operation-only V15 reducer."""
     model = fields.get("model")
     (
         direct_adapter,
@@ -1407,9 +1433,12 @@ def scalar_native_reducer_proof_from_provenance(
     if not isinstance(runtime_symbols_text, str):
         raise CensusError("scalar native reducer runtime symbol list is malformed")
     runtime_symbols = tuple(sorted(filter(None, runtime_symbols_text.split(","))))
+    entry_abi = fields.get("entry_abi")
+    operation_only = ordered and entry_abi == PREPARED_SCALAR_REDUCE_ENTRY_ABI
     if direct:
         if (
-            fields.get("prepared_bulk_strategy") != "None"
+            entry_abi != SPAN_SEARCH_ENTRY_ABI
+            or fields.get("prepared_bulk_strategy") != "None"
             or fields.get("prepare_config_version") != str(PREPARED_V2_CONFIG_VERSION)
             or fields.get("required_prepare_capabilities") != f"{0:016x}"
             or fields.get("max_handle_bytes") != "0"
@@ -1421,6 +1450,24 @@ def scalar_native_reducer_proof_from_provenance(
             raise CensusError("helper-free scalar NativeFused reducer envelope differs")
         route_variant = "direct-v2"
         span_fill_identity = None
+    elif operation_only:
+        if (
+            fields.get("engine") != "OrderedNfa"
+            or fields.get("prepared_bulk_strategy") != "None"
+            or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
+            or fields.get("required_prepare_capabilities")
+            != f"{PREPARED_V15_CAPABILITY:016x}"
+            or fields.get("max_handle_bytes") != str(PREPARED_V15_MAX_HANDLE_BYTES)
+            or fields.get("max_ordered_nfa_scratch_bytes")
+            != str(PREPARED_V15_MAX_SCRATCH_BYTES)
+            or fields.get("max_ordered_nfa_setup_work")
+            != str(PREPARED_V15_MAX_SETUP_WORK)
+            or fields.get("span_fill_symbol") != ""
+            or runtime_symbols
+        ):
+            raise CensusError("operation-only scalar Ordered-NFA V15 envelope differs")
+        route_variant = "ordered-v15-operation-only"
+        span_fill_identity = None
     else:
         span_fill = fields.get("span_fill_symbol")
         if not isinstance(span_fill, str):
@@ -1431,7 +1478,8 @@ def scalar_native_reducer_proof_from_provenance(
             "helper-backed scalar reducer SpanFill entry",
         )
         if (
-            fields.get("engine") != "OrderedNfa"
+            entry_abi != SPAN_SEARCH_ENTRY_ABI
+            or fields.get("engine") != "OrderedNfa"
             or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
             or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
             or fields.get("required_prepare_capabilities")
@@ -1451,7 +1499,12 @@ def scalar_native_reducer_proof_from_provenance(
     if not all(isinstance(symbol, str) for symbol in (entry, program, reducer)):
         raise CensusError("scalar native reducer symbols are malformed")
     entry_identity = symbol_identity_suffix(
-        entry, NATIVE_SEARCH_ENTRY_SYMBOL, "scalar native reducer ordinary entry"
+        entry,
+        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        (
+            "operation-only scalar native reducer entry"
+            if operation_only else "scalar native reducer ordinary entry"
+        ),
     )
     program_identity = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, "scalar native reducer runtime program"
@@ -1459,7 +1512,12 @@ def scalar_native_reducer_proof_from_provenance(
     reducer_identity = symbol_identity_suffix(
         reducer, reducer_pattern, "scalar native reducer operation entry"
     )
-    if len({entry, program, reducer}) != 3:
+    if operation_only:
+        if entry != reducer or program_identity != reducer_identity:
+            raise CensusError(
+                "operation-only scalar reducer entry/program identities disagree"
+            )
+    elif len({entry, program, reducer}) != 3:
         raise CensusError("scalar native reducer symbols are not distinct")
     return {
         "route_variant": route_variant,
@@ -1503,6 +1561,7 @@ def scalar_direct_native_grep_proof(fields: dict[str, str]) -> None:
     """Authenticate the helper-free whole-operation direct GrepCount route."""
     if (
         fields.get("model") != "grep"
+        or fields.get("entry_abi") != EXISTS_SEARCH_ENTRY_ABI
         or fields.get("adapter")
         != "general-aot-linked-native-grep-count-reducer-prepared-v2"
         or fields.get("aggregate_strategy") != "Some(NativeFused)"
@@ -1553,6 +1612,7 @@ def scalar_native_uniform_capture_proof(
         raise CensusError("uniform-capture reducer has a non-capture model")
     if (
         fields.get("adapter") != adapter
+        or fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or fields.get("span_iteration_strategy") != "not-applicable"
         or fields.get("grep_iteration_strategy") != grep_iteration
         or fields.get("prepare_operation_flags")
@@ -1650,6 +1710,7 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     """Authenticate the exact scalar native V15 GrepCount route."""
     if (
         fields.get("model") != "grep"
+        or fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or fields.get("adapter")
         != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
         or fields.get("engine") != "OrderedNfa"
@@ -1751,6 +1812,7 @@ def shared_ordered_many_native_fused_proof(
         raise CensusError("shared NativeFused source digest is zero")
     if (
         fields.get("shared_ordered_many") != "true"
+        or fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or fields.get("adapter") != adapter
         or fields.get("aggregate_strategy") != "Some(NativeFused)"
         or fields.get("span_iteration_strategy") != span_iteration
@@ -1795,6 +1857,7 @@ def shared_ordered_many_native_fused_proof(
     else:
         raise CensusError("shared NativeFused route has a non-native bulk strategy")
     return {
+        "route_variant": "native-fused-v2",
         "receipt_schema_version": receipt_schema,
         "source_pattern_count": source_count,
         "ordered_sources_sha256": ordered_sources,
@@ -1811,7 +1874,7 @@ def shared_ordered_many_native_fused_proof(
 
 
 def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
-    """Authenticate one combined multi-source native Count/SpanSum reducer."""
+    """Authenticate one compatibility or operation-only combined V15 reducer."""
     route = {
         "count": (
             "general-aot-shared-ordered-many-native-count-v1",
@@ -1847,12 +1910,12 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     require_hex64(ordered_sources, "shared ordered-many source digest")
     if ordered_sources == "0" * 64:
         raise CensusError("shared ordered-many source digest is zero")
+    operation_only = fields.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI
     if (
         fields.get("shared_ordered_many") != "true"
         or fields.get("adapter") != adapter
         or fields.get("engine") != "OrderedNfa"
         or fields.get("aggregate_strategy") != "Some(NativeOrderedNfaFused)"
-        or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
         or fields.get("span_iteration_strategy") != span_iteration
         or fields.get("grep_iteration_strategy") != "not-applicable"
         or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
@@ -1866,22 +1929,35 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         != str(PREPARED_V15_MAX_SCRATCH_BYTES)
         or fields.get("max_ordered_nfa_setup_work")
         != str(PREPARED_V15_MAX_SETUP_WORK)
-        or fields.get("boundary")
-        != "single-call-shared-ordered-many-helper-backed-reducer"
     ):
         raise CensusError("shared ordered-many provenance has a noncanonical route or cap")
     actual_runtime_symbols = tuple(sorted(filter(
         None, fields.get("required_runtime_symbols", "").split(",")
     )))
-    if actual_runtime_symbols != runtime_symbols:
-        raise CensusError("shared ordered-many runtime dependency set differs")
+    if operation_only:
+        if (
+            fields.get("prepared_bulk_strategy") != "None"
+            or fields.get("span_fill_symbol") != ""
+            or actual_runtime_symbols
+            or fields.get("boundary")
+            != "single-call-shared-ordered-many-helper-free-native-reducer"
+        ):
+            raise CensusError("operation-only shared V15 topology differs")
+    elif (
+        fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
+        or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
+        or actual_runtime_symbols != runtime_symbols
+        or fields.get("boundary")
+        != "single-call-shared-ordered-many-helper-backed-reducer"
+    ):
+        raise CensusError("compatibility shared V15 topology differs")
     entry_suffix = symbol_identity_suffix(
-        fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
-        "shared ordered-many ordinary entry",
-    )
-    span_fill_suffix = symbol_identity_suffix(
-        fields["span_fill_symbol"], NATIVE_SPAN_FILL_ENTRY_SYMBOL,
-        "shared ordered-many SpanFill entry",
+        fields["entry_symbol"],
+        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        (
+            "operation-only shared ordered-many entry"
+            if operation_only else "shared ordered-many ordinary entry"
+        ),
     )
     program_suffix = symbol_identity_suffix(
         fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
@@ -1891,12 +1967,26 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         fields["reducer_symbol"], reducer_pattern,
         "shared ordered-many reducer",
     )
-    if (
-        len({entry_suffix, span_fill_suffix, program_suffix}) != 1
-        or reducer_suffix == entry_suffix
-    ):
-        raise CensusError("shared ordered-many symbol identities disagree")
+    if operation_only:
+        if (
+            fields["entry_symbol"] != fields["reducer_symbol"]
+            or len({entry_suffix, program_suffix, reducer_suffix}) != 1
+        ):
+            raise CensusError("operation-only shared V15 identities disagree")
+        route_variant = "ordered-v15-operation-only"
+    else:
+        span_fill_suffix = symbol_identity_suffix(
+            fields["span_fill_symbol"], NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+            "shared ordered-many SpanFill entry",
+        )
+        if (
+            len({entry_suffix, span_fill_suffix, program_suffix}) != 1
+            or reducer_suffix == entry_suffix
+        ):
+            raise CensusError("shared ordered-many symbol identities disagree")
+        route_variant = "ordered-v15"
     return {
+        "route_variant": route_variant,
         "receipt_schema_version": receipt_schema,
         "source_pattern_count": source_count,
         "ordered_sources_sha256": ordered_sources,
@@ -3501,11 +3591,11 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             raise CensusError("single-capture reducer operation entry is absent")
         return [reducer], "linked-native-single-capture-reducer"
     if provenance.get("shared_ordered_many") == "true":
-        shared_ordered_many_proof(provenance)
+        proof = shared_ordered_many_proof(provenance)
         route = (
-            "linked-shared-ordered-many-helper-free-reducer"
-            if provenance.get("aggregate_strategy") == "Some(NativeFused)"
-            else "linked-shared-ordered-many-helper-backed-reducer"
+            "linked-shared-ordered-many-helper-backed-reducer"
+            if proof.get("route_variant") == "ordered-v15"
+            else "linked-shared-ordered-many-helper-free-reducer"
         )
         return [provenance["reducer_symbol"]], route
     components = components_from_provenance(provenance)
@@ -3761,6 +3851,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "target", "feature_bits",
         )
     }
+    common["entry_abi"] = fields.get("entry_abi")
     common["validation"] = frozen_schedule_validation(fields)
     if fields["schema"] == "fre.aot.rebar-runner.v2":
         shared_ordered_many = fields["shared_ordered_many"] == "true"
@@ -3993,7 +4084,7 @@ def operation_route_from_provenance_record(
             raise CensusError("normalized single-capture reducer is absent")
         return [reducer], "linked-native-single-capture-reducer"
     if provenance.get("kind") == "shared-ordered-many-v2":
-        validate_normalized_shared_ordered_many(
+        variant = validate_normalized_shared_ordered_many(
             provenance.get("shared_ordered_many"), provenance,
             "normalized shared ordered-many provenance",
         )
@@ -4001,9 +4092,9 @@ def operation_route_from_provenance_record(
         if not isinstance(reducer, str):
             raise CensusError("normalized shared ordered-many reducer is absent")
         route = (
-            "linked-shared-ordered-many-helper-free-reducer"
-            if provenance.get("aggregate_strategy") == "Some(NativeFused)"
-            else "linked-shared-ordered-many-helper-backed-reducer"
+            "linked-shared-ordered-many-helper-backed-reducer"
+            if variant == "ordered-v15"
+            else "linked-shared-ordered-many-helper-free-reducer"
         )
         return [reducer], route
     components = provenance["components"]
@@ -4212,6 +4303,19 @@ def identity_defined_symbols_from_provenance(
         ])
     if provenance.get("kind") == "scalar-v2" and provenance.get("model") == "grep":
         return sorted([provenance["entry_symbol"], provenance["program_symbol"]])
+    if (
+        provenance.get("kind") == "scalar-v2"
+        and provenance.get("model") in {"count", "count-spans"}
+        and isinstance(provenance.get("scalar_native_reducer"), dict)
+        and provenance["scalar_native_reducer"].get("route_variant")
+        == "ordered-v15-operation-only"
+    ):
+        program = provenance.get("program_symbol")
+        if not isinstance(program, str) or NATIVE_RUNTIME_PROGRAM_SYMBOL.fullmatch(
+            program
+        ) is None:
+            raise CensusError("operation-only scalar runtime program is malformed")
+        return [program]
     if (
         provenance.get("kind") == "scalar-v2"
         and provenance.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
@@ -5066,7 +5170,7 @@ def validate_normalized_prepared_v15_component(
 def validate_normalized_scalar_native_reducer(
     proof: object, provenance: dict[str, object], context: str
 ) -> str:
-    """Close the normalized helper-free V2 or helper-backed V15 scalar route."""
+    """Close one direct, compatibility V15, or operation-only V15 scalar route."""
     if not isinstance(proof, dict):
         raise CensusError(f"{context} scalar native reducer proof is not an object")
     require_exact_keys(
@@ -5098,8 +5202,13 @@ def validate_normalized_scalar_native_reducer(
         raise CensusError(f"{context} scalar native reducer symbols are malformed")
     require_hex64(provenance.get("program_sha256"), f"{context} program digest")
     require_hex64(provenance.get("object_sha256"), f"{context} object digest")
+    direct = proof.get("route_variant") == "direct-v2"
+    ordered = proof.get("route_variant") == "ordered-v15"
+    operation_only = proof.get("route_variant") == "ordered-v15-operation-only"
     entry_identity = symbol_identity_suffix(
-        entry, NATIVE_SEARCH_ENTRY_SYMBOL, f"{context} ordinary entry"
+        entry,
+        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        f"{context} {'operation-only' if operation_only else 'ordinary'} entry",
     )
     program_identity = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, f"{context} runtime program"
@@ -5107,10 +5216,9 @@ def validate_normalized_scalar_native_reducer(
     reducer_identity = symbol_identity_suffix(
         reducer, reducer_pattern, f"{context} operation entry"
     )
-    direct = proof.get("route_variant") == "direct-v2"
-    ordered = proof.get("route_variant") == "ordered-v15"
     if direct:
         expected = {
+            "entry_abi": SPAN_SEARCH_ENTRY_ABI,
             "adapter": direct_adapter,
             "aggregate_strategy": "Some(NativeFused)",
             "prepared_bulk_strategy": "None",
@@ -5123,6 +5231,23 @@ def validate_normalized_scalar_native_reducer(
             "max_scratch_bytes": 0,
             "max_setup_work": 0,
         }
+    elif operation_only:
+        expected = {
+            "entry_abi": PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+            "adapter": ordered_adapter,
+            "aggregate_strategy": "Some(NativeOrderedNfaFused)",
+            "prepared_bulk_strategy": "None",
+            "required_runtime_symbols": [],
+            "span_fill_symbol": "",
+            "span_fill_identity_sha256": None,
+            "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
+            "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
+            "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
+            "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
+            "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
+        }
+        if provenance.get("engine") != "OrderedNfa":
+            raise CensusError(f"{context} operation-only scalar engine differs")
     elif ordered:
         span_fill = provenance.get("span_fill_symbol")
         if not isinstance(span_fill, str):
@@ -5131,6 +5256,7 @@ def validate_normalized_scalar_native_reducer(
             span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, f"{context} SpanFill entry"
         )
         expected = {
+            "entry_abi": SPAN_SEARCH_ENTRY_ABI,
             "adapter": ordered_adapter,
             "aggregate_strategy": "Some(NativeOrderedNfaFused)",
             "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
@@ -5159,6 +5285,7 @@ def validate_normalized_scalar_native_reducer(
         or provenance.get("shared_ordered_many") is not None
         or provenance.get("components") != []
         or provenance.get("adapter") != expected["adapter"]
+        or provenance.get("entry_abi") != expected["entry_abi"]
         or provenance.get("boundary") != "runtime-klv-warmup-schedule"
         or provenance.get("aggregate_strategy") != expected["aggregate_strategy"]
         or provenance.get("prepared_bulk_strategy")
@@ -5183,7 +5310,11 @@ def validate_normalized_scalar_native_reducer(
         or not isinstance(runtime_program_len, int)
         or isinstance(runtime_program_len, bool)
         or not 1 <= runtime_program_len <= MAX_SERIALIZED_PROGRAM_BYTES
-        or len({entry, program, reducer}) != 3
+        or (
+            operation_only
+            and (entry != reducer or program_identity != reducer_identity)
+        )
+        or (not operation_only and len({entry, program, reducer}) != 3)
     ):
         raise CensusError(f"{context} scalar native reducer route differs")
     return scalar_native_reducer_route(model, proof)
@@ -5315,6 +5446,7 @@ def validate_normalized_uniform_capture_reducer(
         raise CensusError(f"{context} uniform-capture route variant differs")
     if (
         provenance.get("adapter") != adapter
+        or provenance.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or provenance.get("boundary") != expected["boundary"]
         or provenance.get("aggregate_strategy") != expected["aggregate_strategy"]
         or provenance.get("prepared_bulk_strategy")
@@ -5348,14 +5480,14 @@ def validate_normalized_uniform_capture_reducer(
 
 def validate_normalized_shared_ordered_many(
     proof: object, provenance: dict[str, object], context: str
-) -> None:
+) -> str:
     """Close one normalized multi-source Count/SpanSum reducer receipt."""
     if not isinstance(proof, dict):
         raise CensusError(f"{context} shared ordered-many proof is not an object")
     require_exact_keys(
         proof,
         {
-            "receipt_schema_version", "source_pattern_count",
+            "route_variant", "receipt_schema_version", "source_pattern_count",
             "ordered_sources_sha256", "required_prepare_capabilities",
             "prepare_config_version", "prepare_operation_flags",
             "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
@@ -5383,18 +5515,23 @@ def validate_normalized_shared_ordered_many(
     if route is None:
         raise CensusError(f"{context} has an unsupported shared model")
     adapter, span_iteration, operation_flags, runtime_symbols, reducer_pattern = route
-    native_fused = provenance.get("aggregate_strategy") == "Some(NativeFused)"
+    variant = proof.get("route_variant")
+    native_fused = variant == "native-fused-v2"
+    compatibility = variant == "ordered-v15"
+    operation_only = variant == "ordered-v15-operation-only"
     if native_fused:
         bulk = provenance.get("prepared_bulk_strategy")
         variant_topology = (
             provenance.get("boundary")
             == "single-call-shared-ordered-many-helper-free-native-reducer"
+            and provenance.get("entry_abi") == SPAN_SEARCH_ENTRY_ABI
+            and provenance.get("aggregate_strategy") == "Some(NativeFused)"
             and provenance.get("required_runtime_symbols") == []
             and bulk in {
                 "None", "Some(NativePreparedLoop)", "Some(NativeFrozenLoop)",
             }
         )
-    else:
+    elif compatibility:
         variant_topology = (
             provenance.get("boundary")
             == "single-call-shared-ordered-many-helper-backed-reducer"
@@ -5404,7 +5541,22 @@ def validate_normalized_shared_ordered_many(
             and provenance.get("prepared_bulk_strategy")
             == "Some(NativeOrderedNfaLoop)"
             and provenance.get("required_runtime_symbols") == list(runtime_symbols)
+            and provenance.get("entry_abi") == SPAN_SEARCH_ENTRY_ABI
         )
+    elif operation_only:
+        variant_topology = (
+            provenance.get("boundary")
+            == "single-call-shared-ordered-many-helper-free-native-reducer"
+            and provenance.get("engine") == "OrderedNfa"
+            and provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI
+            and provenance.get("aggregate_strategy")
+            == "Some(NativeOrderedNfaFused)"
+            and provenance.get("prepared_bulk_strategy") == "None"
+            and provenance.get("required_runtime_symbols") == []
+            and provenance.get("span_fill_symbol") == ""
+        )
+    else:
+        raise CensusError(f"{context} shared ordered-many route variant differs")
     source_count = proof.get("source_pattern_count")
     source_map = provenance.get("source_to_artifact")
     if (
@@ -5432,12 +5584,22 @@ def validate_normalized_shared_ordered_many(
     reducer = provenance.get("reducer_symbol")
     if not all(isinstance(value, str) for value in (entry, span_fill, program, reducer)):
         raise CensusError(f"{context} shared ordered-many symbols are malformed")
-    entry_suffix = symbol_identity_suffix(entry, NATIVE_SEARCH_ENTRY_SYMBOL, context)
+    entry_suffix = symbol_identity_suffix(
+        entry,
+        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        context,
+    )
     program_suffix = symbol_identity_suffix(
         program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context
     )
     reducer_suffix = symbol_identity_suffix(reducer, reducer_pattern, context)
-    if native_fused and provenance.get("prepared_bulk_strategy") == "None":
+    if operation_only:
+        symbol_shape_is_exact = (
+            span_fill == ""
+            and entry == reducer
+            and len({entry_suffix, program_suffix, reducer_suffix}) == 1
+        )
+    elif native_fused and provenance.get("prepared_bulk_strategy") == "None":
         symbol_shape_is_exact = span_fill == ""
     else:
         span_fill_suffix = symbol_identity_suffix(
@@ -5477,6 +5639,7 @@ def validate_normalized_shared_ordered_many(
         or not symbol_shape_is_exact
     ):
         raise CensusError(f"{context} shared ordered-many proof differs")
+    return variant
 
 
 def validate_normalized_regex_redux(
@@ -5851,7 +6014,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
-        "validation",
+        "entry_abi", "validation",
     }
     if provenance.get("kind") == "strict-capture-v4":
         expected_keys.add("strict_capture")
@@ -5876,6 +6039,30 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         expected_keys.add("prepared_v15_limits")
     require_exact_keys(provenance, expected_keys, context)
+    if provenance.get("schema") == "fre.aot.rebar-runner.v2":
+        if provenance.get("entry_abi") not in {
+            EXISTS_SEARCH_ENTRY_ABI, SPAN_SEARCH_ENTRY_ABI,
+            PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+        }:
+            raise CensusError(f"{context} scalar entry ABI differs")
+        if provenance.get("entry_abi") == EXISTS_SEARCH_ENTRY_ABI and not (
+            provenance.get("model") == "grep"
+            and provenance.get("aggregate_strategy") == "Some(NativeFused)"
+        ):
+            raise CensusError(f"{context} Exists search ABI is attached to another route")
+        if provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
+            provenance.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
+            and provenance.get("model") in {"count", "count-spans"}
+            and (
+                provenance.get("kind") == "shared-ordered-many-v2"
+                or provenance.get("model") == "count"
+                or provenance.get("span_iteration_strategy")
+                == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+            )
+        ):
+            raise CensusError(f"{context} reducer entry ABI is attached to another route")
+    elif provenance.get("entry_abi") is not None:
+        raise CensusError(f"{context} non-scalar provenance retains an entry ABI")
     validate_normalized_frozen_validation(
         provenance["validation"], f"{context} validation"
     )
@@ -5950,6 +6137,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 provenance["model"] != "grep"
                 or provenance["adapter"]
                 != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
+                or provenance["entry_abi"] != SPAN_SEARCH_ENTRY_ABI
                 or provenance["boundary"] != "runtime-klv-warmup-schedule"
                 or provenance["engine"] != "OrderedNfa"
                 or provenance["aggregate_strategy"]
@@ -5987,6 +6175,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             if (
                 provenance["adapter"]
                 != "general-aot-linked-native-grep-count-reducer-prepared-v2"
+                or provenance["entry_abi"] != EXISTS_SEARCH_ENTRY_ABI
                 or provenance["boundary"] != "runtime-klv-warmup-schedule"
                 or provenance["aggregate_strategy"] != "Some(NativeFused)"
                 or provenance["prepared_bulk_strategy"] != "None"

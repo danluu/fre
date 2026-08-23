@@ -86,15 +86,31 @@ The strict whole-operation boundary is a closed route classification, not a
 route-name suffix convention. Scalar `count` and `count-spans` artifacts receive
 that classification only when an exact `Some(NativeFused)` receipt also proves
 an empty runtime-symbol set, zero prepare capability, and no prepared bulk
-route. An exact `Some(NativeOrderedNfaFused)` V15 envelope selects the same
-one-call reducer as the operation entry, but its model-specific compatibility
-helper remains trap-visible and the distinct
+route, or when the exact operation-only V15 topology is authenticated. The
+latter must carry `entry_abi=PreparedScalarReduceV1`,
+`Some(NativeOrderedNfaFused)`, the V15 capability and resource caps, no bulk or
+SpanFill entry, no runtime symbols, the reducer as the public entry, and one
+shared reducer/runtime-program identity. It maps to the same strict Count or
+SpanSum whole-operation policy as the direct reducer.
+
+The legacy `entry_abi=SpanSearchV1` V15 envelope is deliberately separate: its
+ordinary search/SpanFill entries and model-specific compatibility helper remain
+trap-visible, and the distinct
 `linked-native-count-helper-backed-reducer` or
 `linked-native-span-sum-helper-backed-reducer` route is classified
 semantic-helper-backed.
 A Span-fill entry used by the Rust adapter still leaves refill, validation, and
 reduction in Rust. Unknown, mixed, or mismatched scalar reducer envelopes are
 rejected rather than inferred native.
+
+Shared ordered-many Count and SpanSum use the same ABI distinction. A
+`PreparedScalarReduceV1` receipt is strict only when `bulk=None`, the entry is
+exactly the reducer, the runtime-symbol and SpanFill surfaces are empty, and
+the reducer/program identities agree. A legacy `SpanSearchV1` V15 receipt
+retains its semantic-helper-backed classification; the ordinary NativeFused
+`SpanSearchV1` receipt retains its independently authenticated helper-free
+classification. The normalized receipt preserves the entry ABI and route
+variant so neither topology can be reclassified after raw provenance parsing.
 
 ## Privacy boundary and static dry run
 
