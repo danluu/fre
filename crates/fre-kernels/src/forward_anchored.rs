@@ -356,6 +356,82 @@ pub struct SearchAccounting {
     pub suffix_confirmation_attempted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchEnvelope {
+    window_bytes: usize,
+    prefilter_bytes_upper_bound: usize,
+    prefix_bytes_upper_bound: usize,
+    suffix_bytes_upper_bound: usize,
+    examined_bytes_upper_bound: usize,
+    work_upper_bound: u64,
+}
+
+trait SearchRecorder {
+    fn set_prefix_bytes_examined(&mut self, examined: usize);
+
+    fn add_prefix_bytes_examined(
+        &mut self,
+        examined: usize,
+        computation: &'static str,
+    ) -> Result<(), SearchError>;
+
+    fn set_prefilter_calls(&mut self, calls: usize);
+
+    fn record_suffix_confirmation(&mut self);
+}
+
+impl SearchRecorder for SearchAccounting {
+    #[inline(always)]
+    fn set_prefix_bytes_examined(&mut self, examined: usize) {
+        self.prefix_bytes_examined = examined;
+    }
+
+    #[inline(always)]
+    fn add_prefix_bytes_examined(
+        &mut self,
+        examined: usize,
+        computation: &'static str,
+    ) -> Result<(), SearchError> {
+        self.prefix_bytes_examined = self
+            .prefix_bytes_examined
+            .checked_add(examined)
+            .ok_or(SearchError::ArithmeticOverflow { computation })?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn set_prefilter_calls(&mut self, calls: usize) {
+        self.prefilter_calls = calls;
+    }
+
+    #[inline(always)]
+    fn record_suffix_confirmation(&mut self) {
+        self.suffix_confirmation_attempted = true;
+    }
+}
+
+struct UnmeteredSearch;
+
+impl SearchRecorder for UnmeteredSearch {
+    #[inline(always)]
+    fn set_prefix_bytes_examined(&mut self, _examined: usize) {}
+
+    #[inline(always)]
+    fn add_prefix_bytes_examined(
+        &mut self,
+        _examined: usize,
+        _computation: &'static str,
+    ) -> Result<(), SearchError> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn set_prefilter_calls(&mut self, _calls: usize) {}
+
+    #[inline(always)]
+    fn record_suffix_confirmation(&mut self) {}
+}
+
 /// A semantic refusal or checked construction-resource failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1164,6 +1240,43 @@ impl ForwardAnchoredPlan {
         self.find_window(haystack, Window::full(haystack), limits)
     }
 
+    /// Test the full haystack under the construction-proved anchors without
+    /// constructing a window or publishing search accounting.
+    ///
+    /// This is reserved for an ordinary unlimited facade whose caller does
+    /// not consume diagnostics. Finite and windowed APIs must continue to use
+    /// [`Self::find`] or [`Self::find_window`].
+    ///
+    /// `None` declines when the exact canonical source-free arithmetic
+    /// envelope is not representable; the caller must use the canonical path
+    /// so its error precedence remains authoritative.
+    ///
+    /// A present result contains only a checked match-offset arithmetic
+    /// failure. Construction and the borrowed slice make range, accounting,
+    /// and resource refusals inapplicable.
+    #[inline]
+    pub fn ordinary_is_match_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<bool, SearchError>> {
+        self.ordinary_full_end_unmetered_with_run_scanner(haystack, None)
+            .map(|result| result.map(|end| end.is_some()))
+    }
+
+    /// Return the selected full-haystack span without constructing diagnostic
+    /// accounting. See [`Self::ordinary_is_match_full_unmetered`].
+    ///
+    /// It has the same decline and error contract as
+    /// [`Self::ordinary_is_match_full_unmetered`].
+    #[inline]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<Option<(usize, usize)>, SearchError>> {
+        self.ordinary_full_end_unmetered_with_run_scanner(haystack, None)
+            .map(|result| result.map(|matched| matched.map(|end| (0, end))))
+    }
+
     /// Find the selected span wholly within `window`; anchors remain absolute.
     ///
     /// # Errors
@@ -1208,21 +1321,55 @@ impl ForwardAnchoredPlan {
 
         let mut accounting = self.preflight_with_run_scanner(window, limits, bitset_scanner)?;
         let searched = &haystack[..window.end()];
+        let matched = self
+            .search_end_with_run_scanner(haystack, searched, bitset_scanner, &mut accounting)?
+            .map(|end| (0, end));
+        Ok((matched, accounting))
+    }
+
+    #[inline]
+    fn find_full_end_unmetered_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Option<usize>, SearchError> {
+        let mut recorder = UnmeteredSearch;
+        self.search_end_with_run_scanner(haystack, haystack, bitset_scanner, &mut recorder)
+    }
+
+    #[inline]
+    fn ordinary_full_end_unmetered_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Option<Result<Option<usize>, SearchError>> {
+        self.source_free_search_envelope_with_run_scanner(haystack.len(), bitset_scanner)
+            .ok()?;
+        Some(self.find_full_end_unmetered_with_run_scanner(haystack, bitset_scanner))
+    }
+
+    fn search_end_with_run_scanner<R: SearchRecorder>(
+        &self,
+        haystack: &[u8],
+        searched: &[u8],
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+        recorder: &mut R,
+    ) -> Result<Option<usize>, SearchError> {
         let boundary = if searched.len() < RANGE_BLOCK {
             let (boundary, examined) =
                 self.scan_prefix_with_run_scanner(searched, bitset_scanner)?;
-            accounting.prefix_bytes_examined = examined;
+            recorder.set_prefix_bytes_examined(examined);
             if boundary == 0 || boundary == searched.len() {
-                return Ok((None, accounting));
+                return Ok(None);
             }
             boundary
         } else {
             let Some(&first_byte) = searched.first() else {
-                return Ok((None, accounting));
+                return Ok(None);
             };
-            accounting.prefix_bytes_examined = 1;
+            recorder.set_prefix_bytes_examined(1);
             if !self.class.contains(first_byte) {
-                return Ok((None, accounting));
+                return Ok(None);
             }
             // Establish a small exact prefix before searching the complete
             // window for the suffix witness. Anchored records with a short
@@ -1243,12 +1390,10 @@ impl ForwardAnchoredPlan {
             } else {
                 let (relative_probe_boundary, probe_examined) =
                     self.scan_prefix(&searched[1..probe_end])?;
-                accounting.prefix_bytes_examined = accounting
-                    .prefix_bytes_examined
-                    .checked_add(probe_examined)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "leading prefix probe examinations",
-                    })?;
+                recorder.add_prefix_bytes_examined(
+                    probe_examined,
+                    "leading prefix probe examinations",
+                )?;
                 relative_probe_boundary
                     .checked_add(1)
                     .ok_or(SearchError::ArithmeticOverflow {
@@ -1290,9 +1435,9 @@ impl ForwardAnchoredPlan {
                 } else {
                     (memchr(self.suffix[0], witness_source), 1)
                 };
-                accounting.prefilter_calls = prefilter_calls;
+                recorder.set_prefilter_calls(prefilter_calls);
                 let Some(relative_candidate) = relative_candidate else {
-                    return Ok((None, accounting));
+                    return Ok(None);
                 };
                 let candidate = relative_candidate.checked_add(probe_end).ok_or(
                     SearchError::ArithmeticOverflow {
@@ -1308,12 +1453,7 @@ impl ForwardAnchoredPlan {
                     &searched[validation_start..candidate],
                     bitset_scanner,
                 )?;
-                accounting.prefix_bytes_examined = accounting
-                    .prefix_bytes_examined
-                    .checked_add(examined)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "actual prefix examinations",
-                    })?;
+                recorder.add_prefix_bytes_examined(examined, "actual prefix examinations")?;
                 let boundary = relative_boundary.checked_add(validation_start).ok_or(
                     SearchError::ArithmeticOverflow {
                         computation: "post-probe prefix boundary",
@@ -1323,7 +1463,7 @@ impl ForwardAnchoredPlan {
                 // outsider cannot begin the suffix. An edge witness may be later;
                 // there the scanner's returned first outsider is authoritative.
                 if (!uses_edge_witness || uses_short_forward_witness) && boundary != candidate {
-                    return Ok((None, accounting));
+                    return Ok(None);
                 }
                 boundary
             }
@@ -1335,17 +1475,17 @@ impl ForwardAnchoredPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "selected match end",
                 })?;
-        if end > window.end() {
-            return Ok((None, accounting));
+        if end > searched.len() {
+            return Ok(None);
         }
-        accounting.suffix_confirmation_attempted = true;
+        recorder.record_suffix_confirmation();
         if haystack.get(boundary..end) != Some(self.suffix()) {
-            return Ok((None, accounting));
+            return Ok(None);
         }
         if self.anchors.end && end != haystack.len() {
-            return Ok((None, accounting));
+            return Ok(None);
         }
-        Ok((Some((0, end)), accounting))
+        Ok(Some(end))
     }
 
     fn scan_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
@@ -1442,7 +1582,51 @@ impl ForwardAnchoredPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "search window bytes",
                 })?;
-        let uses_prefilter = window_bytes >= RANGE_BLOCK;
+        let envelope =
+            self.source_free_search_envelope_with_run_scanner(window_bytes, bitset_scanner)?;
+        let scratch_bytes = 0_usize;
+        if envelope.examined_bytes_upper_bound > limits.max_examined_bytes_upper_bound {
+            return Err(SearchError::ExaminedBytesLimit {
+                needed: envelope.examined_bytes_upper_bound,
+                limit: limits.max_examined_bytes_upper_bound,
+            });
+        }
+        if envelope.work_upper_bound > limits.max_work_upper_bound {
+            return Err(SearchError::WorkLimit {
+                needed: envelope.work_upper_bound,
+                limit: limits.max_work_upper_bound,
+            });
+        }
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        Ok(SearchAccounting {
+            window_bytes: envelope.window_bytes,
+            implementation: self.implementation,
+            prefilter_bytes_upper_bound: envelope.prefilter_bytes_upper_bound,
+            prefix_bytes_upper_bound: envelope.prefix_bytes_upper_bound,
+            suffix_bytes_upper_bound: envelope.suffix_bytes_upper_bound,
+            examined_bytes_upper_bound: envelope.examined_bytes_upper_bound,
+            work_upper_bound: envelope.work_upper_bound,
+            scratch_bytes,
+            prefilter_calls: 0,
+            prefix_bytes_examined: 0,
+            suffix_confirmation_attempted: false,
+        })
+    }
+
+    fn source_free_search_envelope_with_run_scanner(
+        &self,
+        window_bytes: usize,
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<SearchEnvelope, SearchError> {
+        debug_assert!(
+            bitset_scanner.is_none() || self.implementation == ClassImplementation::Bitset
+        );
+        debug_assert!(bitset_scanner.is_none() || self.class.is_ascii());
         let block_scanner = matches!(
             self.implementation,
             ClassImplementation::InclusiveRange { .. }
@@ -1464,7 +1648,7 @@ impl ForwardAnchoredPlan {
         } else {
             0
         };
-        let prefilter_bytes_upper_bound = if uses_prefilter {
+        let prefilter_bytes_upper_bound = if window_bytes >= RANGE_BLOCK {
             window_bytes.saturating_sub(1)
         } else {
             0
@@ -1482,44 +1666,22 @@ impl ForwardAnchoredPlan {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "examined bytes upper bound",
             })?;
-        let work_upper_bound = u64::try_from(examined_bytes_upper_bound).map_err(|_| {
-            SearchError::ArithmeticOverflow {
-                computation: "search work upper bound",
-            }
-        })?;
-        let scratch_bytes = 0_usize;
-        if examined_bytes_upper_bound > limits.max_examined_bytes_upper_bound {
-            return Err(SearchError::ExaminedBytesLimit {
-                needed: examined_bytes_upper_bound,
-                limit: limits.max_examined_bytes_upper_bound,
-            });
-        }
-        if work_upper_bound > limits.max_work_upper_bound {
-            return Err(SearchError::WorkLimit {
-                needed: work_upper_bound,
-                limit: limits.max_work_upper_bound,
-            });
-        }
-        if scratch_bytes > limits.max_scratch_bytes {
-            return Err(SearchError::ScratchLimit {
-                needed: scratch_bytes,
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        Ok(SearchAccounting {
+        let work_upper_bound = search_work_upper_bound(examined_bytes_upper_bound)?;
+        Ok(SearchEnvelope {
             window_bytes,
-            implementation: self.implementation,
             prefilter_bytes_upper_bound,
             prefix_bytes_upper_bound,
             suffix_bytes_upper_bound,
             examined_bytes_upper_bound,
             work_upper_bound,
-            scratch_bytes,
-            prefilter_calls: 0,
-            prefix_bytes_examined: 0,
-            suffix_confirmation_attempted: false,
         })
     }
+}
+
+fn search_work_upper_bound(examined_bytes_upper_bound: usize) -> Result<u64, SearchError> {
+    u64::try_from(examined_bytes_upper_bound).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "search work upper bound",
+    })
 }
 
 impl DispatchedForwardAnchoredPlan {
@@ -1579,6 +1741,45 @@ impl DispatchedForwardAnchoredPlan {
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
         self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Test the full haystack without window validation or diagnostic
+    /// accounting. The retained run scanner, when present, is the same one
+    /// used by [`Self::find_window`].
+    ///
+    /// `None` declines to the canonical path when its exact source-free
+    /// arithmetic envelope is not representable.
+    ///
+    /// A present result contains only a checked match-offset arithmetic
+    /// failure.
+    #[inline]
+    pub fn ordinary_is_match_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<bool, SearchError>> {
+        self.plan
+            .ordinary_full_end_unmetered_with_run_scanner(
+                haystack,
+                self.bitset_scanner.as_ref(),
+            )
+            .map(|result| result.map(|end| end.is_some()))
+    }
+
+    /// Return the selected full-haystack span without diagnostic accounting.
+    ///
+    /// It has the same decline and error contract as
+    /// [`Self::ordinary_is_match_full_unmetered`].
+    #[inline]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Result<Option<(usize, usize)>, SearchError>> {
+        self.plan
+            .ordinary_full_end_unmetered_with_run_scanner(
+                haystack,
+                self.bitset_scanner.as_ref(),
+            )
+            .map(|result| result.map(|matched| matched.map(|end| (0, end))))
     }
 
     /// Find the selected span wholly within `window`; anchors remain absolute.
@@ -2898,7 +3099,7 @@ mod tests {
         ForwardAnchoredPlan, PLAN_ID, RANGE_BLOCK, SIMD_RUN_SCANNER_BUILD_WORK, SearchError,
         SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
         copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
-        packed_outside_mask, repeat_byte, scan_swar_range_prefix,
+        packed_outside_mask, repeat_byte, scan_swar_range_prefix, search_work_upper_bound,
     };
     use crate::Window;
     use core::mem::size_of;
@@ -3000,6 +3201,38 @@ mod tests {
                 .find(&haystack, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(dispatched_result.0, legacy_result.0, "run_len={run_len}");
+            assert_eq!(
+                legacy
+                    .ordinary_find_full_unmetered(&haystack)
+                    .unwrap()
+                    .unwrap(),
+                legacy_result.0,
+                "legacy run_len={run_len}",
+            );
+            assert_eq!(
+                legacy
+                    .ordinary_is_match_full_unmetered(&haystack)
+                    .unwrap()
+                    .unwrap(),
+                legacy_result.0.is_some(),
+                "legacy run_len={run_len}",
+            );
+            assert_eq!(
+                dispatched
+                    .ordinary_find_full_unmetered(&haystack)
+                    .unwrap()
+                    .unwrap(),
+                dispatched_result.0,
+                "dispatched run_len={run_len}",
+            );
+            assert_eq!(
+                dispatched
+                    .ordinary_is_match_full_unmetered(&haystack)
+                    .unwrap()
+                    .unwrap(),
+                dispatched_result.0.is_some(),
+                "dispatched run_len={run_len}",
+            );
             if selection.is_none() {
                 assert_eq!(
                     dispatched_result.1, legacy_result.1,
@@ -3056,6 +3289,173 @@ mod tests {
             dispatched.find_window(&windowed, Window::new(49, 48), SearchLimits::unlimited(),),
             Err(SearchError::InvalidWindow { .. })
         ));
+    }
+
+    fn assert_source_free_envelope_ceiling(
+        plan: &ForwardAnchoredPlan,
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+        expected_rescan_margin: usize,
+    ) {
+        assert_eq!(plan.suffix().len(), 1);
+        let arithmetic_ceiling = usize::try_from(u64::MAX).unwrap_or(usize::MAX);
+        let largest = arithmetic_ceiling
+            .checked_sub(expected_rescan_margin)
+            .unwrap()
+            / 2;
+        assert!(largest >= RANGE_BLOCK);
+        let envelope = plan
+            .source_free_search_envelope_with_run_scanner(largest, bitset_scanner)
+            .unwrap();
+        let expected_prefix = largest.checked_add(expected_rescan_margin).unwrap();
+        let expected_examined = largest
+            .checked_sub(1)
+            .and_then(|prefilter| prefilter.checked_add(expected_prefix))
+            .and_then(|examined| examined.checked_add(1))
+            .unwrap();
+        assert_eq!(envelope.window_bytes, largest);
+        assert_eq!(
+            envelope.prefilter_bytes_upper_bound,
+            largest.checked_sub(1).unwrap(),
+        );
+        assert_eq!(envelope.prefix_bytes_upper_bound, expected_prefix);
+        assert_eq!(envelope.suffix_bytes_upper_bound, 1);
+        assert_eq!(envelope.examined_bytes_upper_bound, expected_examined);
+        assert_eq!(envelope.work_upper_bound, u64::try_from(expected_examined).unwrap());
+
+        let one_above = largest.checked_add(1).unwrap();
+        let Err(SearchError::ArithmeticOverflow { computation }) =
+            plan.source_free_search_envelope_with_run_scanner(one_above, bitset_scanner)
+        else {
+            panic!("one-above source-free envelope remained admitted")
+        };
+        assert_eq!(
+            computation,
+            if arithmetic_ceiling < usize::MAX {
+                "search work upper bound"
+            } else {
+                "examined bytes upper bound"
+            },
+        );
+
+        if expected_rescan_margin != 0 {
+            let first_prefix_overflow = usize::MAX
+                .checked_sub(expected_rescan_margin)
+                .and_then(|last| last.checked_add(1))
+                .unwrap();
+            assert!(matches!(
+                plan.source_free_search_envelope_with_run_scanner(
+                    first_prefix_overflow,
+                    bitset_scanner,
+                ),
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "prefix examinations upper bound"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn source_free_envelope_closes_scalar_scanner_and_u64_ceilings() {
+        let range = plan(ByteClass::inclusive(b'a', b'z'), b"Z", false);
+        assert_source_free_envelope_ceiling(&range, None, WORD_BYTES);
+
+        let quad = plan(ByteClass::from_bytes(b"aceg"), b"Z", false);
+        let quint = plan(ByteClass::from_bytes(b"acegi"), b"Z", false);
+        assert_source_free_envelope_ceiling(&quad, None, RANGE_BLOCK);
+        assert_source_free_envelope_ceiling(&quint, None, RANGE_BLOCK);
+
+        let bitset = plan(ascii_bitset(), b"Z", false);
+        assert_source_free_envelope_ceiling(&bitset, None, 0);
+
+        let unconditional_scanner = AsciiByteSetRunScanner::new(ascii_bitset().ascii_set());
+        let unconditional_margin = unconditional_scanner.max_classification_overhead();
+        assert_source_free_envelope_ceiling(
+            &bitset,
+            Some(&unconditional_scanner),
+            unconditional_margin,
+        );
+
+        let dispatched = ForwardAnchoredPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            ascii_bitset(),
+            b"Z",
+            Anchors {
+                start: true,
+                end: false,
+            },
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let scanner = dispatched.bitset_scanner.as_ref();
+        let scanner_margin = scanner.map_or(0, AsciiByteSetRunScanner::max_classification_overhead);
+        assert_source_free_envelope_ceiling(&dispatched.plan, scanner, scanner_margin);
+
+        let largest_work_input = usize::try_from(u64::MAX).unwrap_or(usize::MAX);
+        assert_eq!(
+            search_work_upper_bound(largest_work_input).unwrap(),
+            u64::try_from(largest_work_input).unwrap(),
+        );
+        if let Some(one_above_u64) = largest_work_input.checked_add(1) {
+            assert!(matches!(
+                search_work_upper_bound(one_above_u64),
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "search work upper bound"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_quad_and_quint_bordered_suffixes_match_canonical_geometry() {
+        let suffix = b"ZabaZ";
+        assert_eq!(suffix.first(), suffix.last());
+        for members in [b"aceg".as_slice(), b"acegi".as_slice()] {
+            for end in [false, true] {
+                let plan = plan(ByteClass::from_bytes(members), suffix, end);
+                assert!(matches!(
+                    plan.implementation(),
+                    ClassImplementation::Quad { .. } | ClassImplementation::Quint { .. }
+                ));
+                for run_len in [
+                    1_usize, 15, 16, 17, 31, 32, 33, 35, 36, 59, 60, 63, 64, 65, 68, 69, 257,
+                ] {
+                    let run: Vec<u8> = members.iter().copied().cycle().take(run_len).collect();
+                    let mut cases = vec![run.clone()];
+
+                    let mut hit = run.clone();
+                    hit.extend_from_slice(suffix);
+                    cases.push(hit.clone());
+                    hit.extend_from_slice(b"tail");
+                    cases.push(hit);
+
+                    let mut suffix_miss = run.clone();
+                    suffix_miss.extend_from_slice(b"ZabaQ");
+                    cases.push(suffix_miss);
+
+                    let mut early_outsider = run;
+                    early_outsider[run_len / 2] = b'Q';
+                    early_outsider.extend_from_slice(suffix);
+                    cases.push(early_outsider);
+
+                    for haystack in cases {
+                        let canonical = plan.find(&haystack, SearchLimits::unlimited()).unwrap().0;
+                        assert_eq!(
+                            plan.ordinary_find_full_unmetered(&haystack)
+                                .expect("small source-free envelope remains admitted")
+                                .unwrap(),
+                            canonical,
+                            "members={members:?} end={end} run_len={run_len} haystack={haystack:?}",
+                        );
+                        assert_eq!(
+                            plan.ordinary_is_match_full_unmetered(&haystack)
+                                .expect("small source-free envelope remains admitted")
+                                .unwrap(),
+                            canonical.is_some(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

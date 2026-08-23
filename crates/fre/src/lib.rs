@@ -10507,6 +10507,33 @@ mod exact_literal_ordinary_facade_probe {
 }
 
 #[cfg(test)]
+mod forward_anchored_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
+#[cfg(test)]
 mod required_literal_ordinary_find_facade_probe {
     use core::cell::Cell;
 
@@ -12608,12 +12635,31 @@ impl PortableRegex {
 
     #[inline]
     fn try_is_match_ordinary(&self, haystack: &[u8]) -> Result<bool, SearchError> {
-        let window = SearchWindow::full(haystack);
-        if let PortablePlan::BoundedWordClass(plan) = &self.plan
-            && let Some(matched) = plan.ordinary_is_match_full_unmetered(haystack)
-        {
-            return Ok(matched);
+        match &self.plan {
+            PortablePlan::BoundedWordClass(plan) => {
+                if let Some(matched) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    return Ok(matched);
+                }
+            }
+            PortablePlan::ForwardAnchored(plan) => {
+                if let Some(result) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_exists();
+                    return result.map_err(SearchError::from);
+                }
+            }
+            PortablePlan::DispatchedForwardAnchored(plan) => {
+                if let Some(result) = plan.ordinary_is_match_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_exists();
+                    return result.map_err(SearchError::from);
+                }
+            }
+            // The separately proved `ForwardEndFixed` owner and every other
+            // family deliberately keep their existing ordinary fallbacks.
+            _ => {}
         }
+        let window = SearchWindow::full(haystack);
         match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
                 #[cfg(test)]
@@ -14227,6 +14273,26 @@ impl PortableRegex {
                     return Ok(matched.map(|(start, end)| Match { start, end }));
                 }
             }
+            PortablePlan::ForwardAnchored(plan) => {
+                if let Some(result) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_span();
+                    return result
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from);
+                }
+            }
+            PortablePlan::DispatchedForwardAnchored(plan) => {
+                if let Some(result) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    forward_anchored_ordinary_facade_probe::record_span();
+                    return result
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from);
+                }
+            }
+            // The separately proved `ForwardEndFixed` owner and every other
+            // family deliberately keep their existing ordinary fallbacks.
             _ => {}
         }
         let window = SearchWindow::full(haystack);
@@ -49219,6 +49285,329 @@ mod tests {
         }
         assert_eq!(span_comparisons, 511_524);
         assert_eq!(operation_comparisons, 1_534_572);
+    }
+
+    #[test]
+    fn forward_ordinary_full_values_match_regex_1_12_4_exhaustively() {
+        let alphabet = [0_u8, 1, 2];
+        let haystacks = byte_words(&alphabet, 5);
+        let suffixes = non_empty_byte_words(&alphabet, 2);
+        let mut comparisons = 0_usize;
+
+        super::forward_anchored_ordinary_facade_probe::reset();
+        for mask in 1_u8..8 {
+            let class_bytes: Vec<u8> = alphabet
+                .into_iter()
+                .enumerate()
+                .filter_map(|(bit, byte)| (mask & (1_u8 << bit) != 0).then_some(byte))
+                .collect();
+            for suffix in &suffixes {
+                if class_bytes.contains(&suffix[0]) {
+                    continue;
+                }
+                for lazy in [false, true] {
+                    for end in [false, true] {
+                        let pattern = forward_pattern(&class_bytes, suffix, lazy, end);
+                        let fre = PortableBuilder::new(&pattern)
+                            .unicode(false)
+                            .build()
+                            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+                        assert_eq!(fre.build_report().plan, PlanKind::ForwardAnchored);
+                        assert!(matches!(
+                            &fre.plan,
+                            PortablePlan::ForwardAnchored(_)
+                                | PortablePlan::DispatchedForwardAnchored(_)
+                        ));
+                        let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                            .unicode(false)
+                            .build()
+                            .unwrap();
+                        for haystack in &haystacks {
+                            let expected = upstream
+                                .find(haystack)
+                                .map(|matched| (matched.start(), matched.end()));
+                            assert_eq!(
+                                fre.find_value(haystack, SearchLimits::unlimited())
+                                    .unwrap()
+                                    .map(|matched| (matched.start(), matched.end())),
+                                expected,
+                                "finite pattern={pattern:?} haystack={haystack:?}",
+                            );
+                            assert_eq!(
+                                fre.is_match(haystack),
+                                expected.is_some(),
+                                "exists pattern={pattern:?} haystack={haystack:?}",
+                            );
+                            assert_eq!(
+                                fre.find(haystack)
+                                    .map(|matched| (matched.start(), matched.end())),
+                                expected,
+                                "span pattern={pattern:?} haystack={haystack:?}",
+                            );
+                            comparisons = comparisons.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(comparisons, 52_416);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (comparisons, comparisons),
+        );
+    }
+
+    #[test]
+    fn forward_ordinary_boundaries_and_malformed_bytes_are_exact() {
+        let fixtures: [(&str, &[u8], &[u8]); 2] = [
+            (r"(?-u:\A[0_aceg]+Z)", b"0_aceg", b"Z"),
+            (
+                r"(?-u:\A[\x00\x02\x04\x06\x80\xFF]+?\x7F\xFE\z)",
+                &[0x00, 0x02, 0x04, 0x06, 0x80, 0xFF],
+                &[0x7F, 0xFE],
+            ),
+        ];
+        let boundaries = [
+            0_usize, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 4095,
+            4096, 4097,
+        ];
+        let mut comparisons = 0_usize;
+
+        for (pattern, members, suffix) in fixtures {
+            let fre = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                &fre.plan,
+                PortablePlan::ForwardAnchored(_) | PortablePlan::DispatchedForwardAnchored(_)
+            ));
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+
+            for run_len in boundaries {
+                let run: Vec<u8> = members.iter().copied().cycle().take(run_len).collect();
+                let mut cases = vec![run.clone()];
+
+                let mut success = run.clone();
+                success.extend_from_slice(suffix);
+                cases.push(success.clone());
+
+                let mut trailing = success;
+                trailing.push(b'!');
+                cases.push(trailing);
+
+                let mut suffix_miss = run.clone();
+                suffix_miss.extend_from_slice(suffix);
+                if let Some(last) = suffix_miss.last_mut() {
+                    *last ^= 1;
+                }
+                cases.push(suffix_miss);
+
+                if !run.is_empty() {
+                    let mut early_outsider = run;
+                    early_outsider[run_len / 2] = b'!';
+                    early_outsider.extend_from_slice(suffix);
+                    cases.push(early_outsider);
+                }
+
+                for haystack in cases {
+                    let expected = upstream
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        fre.find_value(&haystack, SearchLimits::unlimited())
+                            .unwrap()
+                            .map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "finite pattern={pattern:?} run_len={run_len} haystack={haystack:?}",
+                    );
+                    assert_eq!(
+                        fre.find(&haystack)
+                            .map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "ordinary pattern={pattern:?} run_len={run_len} haystack={haystack:?}",
+                    );
+                    assert_eq!(fre.is_match(&haystack), expected.is_some());
+                    comparisons = comparisons.saturating_add(1);
+                }
+            }
+        }
+        assert!(comparisons > 180);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one containment test keeps finite, windowed, session, iterator, capture, and excluded-owner routes adjacent"
+    )]
+    fn forward_ordinary_values_are_strictly_contained() {
+        let pattern = r"(?-u:\A[ab]+?Z\z)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::ForwardAnchored(_) | PortablePlan::DispatchedForwardAnchored(_)
+        ));
+        let haystack = b"ababZ";
+        let expected = Some(Match { start: 0, end: 5 });
+        let unlimited = SearchLimits::unlimited();
+        let full = SearchWindow::full(haystack);
+
+        super::forward_anchored_ordinary_facade_probe::reset();
+        assert!(regex.is_match_value(haystack, unlimited).unwrap());
+        assert!(regex.is_match_accounted(haystack, unlimited).unwrap().0);
+        assert!(regex
+            .is_match_window_value(haystack, full, unlimited)
+            .unwrap());
+        assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+        assert_eq!(regex.find_accounted(haystack, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_at_value(haystack, 0, unlimited).unwrap(), expected);
+        assert_eq!(regex.find_at(haystack, 0, unlimited).unwrap().0, expected);
+        assert_eq!(
+            regex.find_window_value(haystack, full, unlimited).unwrap(),
+            expected,
+        );
+        assert_eq!(regex.find_window(haystack, full, unlimited).unwrap().0, expected);
+
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(regex.is_match_value(haystack, refusing).is_err());
+        assert!(regex.find_value(haystack, refusing).is_err());
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(session.is_match_value(haystack, unlimited).unwrap());
+        assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        let mut ordinary_session = regex.ordinary_session().unwrap();
+        assert_eq!(ordinary_session.find_at(haystack, 0).unwrap(), expected);
+
+        assert_eq!(
+            regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, haystack, unlimited)
+                .unwrap()
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, windowed, session, iterator, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(haystack));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+
+        let fixed = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        assert!(matches!(&fixed.plan, PortablePlan::ForwardEndFixed(_)));
+        assert!(fixed.is_match(haystack));
+        assert_eq!(fixed.find(haystack), expected);
+
+        let unrelated = PortableBuilder::new(r"(?-u:[ab]+Z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(matches!(&unrelated.plan, PortablePlan::K0(_)));
+        assert!(unrelated.is_match(haystack));
+        assert_eq!(unrelated.find(haystack), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (1, 1),
+            "fixed-end and unrelated owners cannot enter the forward ordinary route",
+        );
+    }
+
+    #[test]
+    fn forward_explicit_capture_refusals_are_isolated_from_ordinary_values() {
+        let cases = [
+            (r"(?-u:(\A[ab]+Z))", 2_usize),
+            (r"(?-u:\A([ab])+Z)", 2),
+            (r"(?-u:\A(?P<run>(?P<byte>[ab])+?)Z\z)", 3),
+        ];
+        let haystack = b"ababZ";
+        let expected = Some(Match { start: 0, end: 5 });
+        let unlimited = SearchLimits::unlimited();
+        let mut ordinary_calls = 0_usize;
+
+        super::forward_anchored_ordinary_facade_probe::reset();
+        for (pattern, captures_len) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                &regex.plan,
+                PortablePlan::ForwardAnchored(_) | PortablePlan::DispatchedForwardAnchored(_)
+            ));
+            assert_eq!(regex.captures_len(), captures_len, "pattern={pattern:?}");
+            assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+
+            let mut locations = regex.capture_locations();
+            assert!(matches!(
+                regex.captures_read_value(&mut locations, haystack, unlimited),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == captures_len.saturating_sub(1),
+            ));
+            assert!(matches!(
+                regex.captures_read(&mut locations, haystack, unlimited),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == captures_len.saturating_sub(1),
+            ));
+            for slot in 0..captures_len {
+                assert_eq!(locations.get(slot), None);
+            }
+            assert_eq!(
+                super::forward_anchored_ordinary_facade_probe::snapshot(),
+                (ordinary_calls, ordinary_calls),
+                "finite and capture-refusal paths stay canonical",
+            );
+
+            assert!(regex.is_match(haystack));
+            assert_eq!(regex.find(haystack), expected);
+            ordinary_calls = ordinary_calls.saturating_add(1);
+            assert_eq!(
+                super::forward_anchored_ordinary_facade_probe::snapshot(),
+                (ordinary_calls, ordinary_calls),
+            );
+        }
     }
 
     #[test]
