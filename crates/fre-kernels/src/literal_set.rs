@@ -270,6 +270,47 @@ pub struct LiteralSetUniformStandardOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
 }
 
+/// Final selected-end evidence retained only by the ordinary scanner variant
+/// that may recommend one direct probe for its caller's next operation.
+///
+/// The const flag lets the generic ordinary visitor keep this bookkeeping in
+/// one source body while compiling it out of callers that do not request a
+/// recommendation.
+struct OrdinaryDirectRecommendation<const ENABLED: bool> {
+    start: usize,
+    penultimate_end: usize,
+    previous_end: usize,
+    promotion_bytes: usize,
+}
+
+impl<const ENABLED: bool> OrdinaryDirectRecommendation<ENABLED> {
+    #[inline]
+    const fn new(start: usize, promotion_bytes: usize) -> Self {
+        Self {
+            start,
+            penultimate_end: start,
+            previous_end: start,
+            promotion_bytes,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, end: usize) {
+        if ENABLED {
+            self.penultimate_end = self.previous_end;
+            self.previous_end = end;
+        }
+    }
+
+    #[inline]
+    fn after_exhaustion(&self, window_end: usize) -> bool {
+        ENABLED
+            && self.previous_end != self.start
+            && self.previous_end.saturating_sub(self.penultimate_end) <= self.promotion_bytes
+            && window_end.saturating_sub(self.previous_end) <= self.promotion_bytes
+    }
+}
+
 #[cfg(test)]
 mod ordinary_direct_probe {
     use std::cell::Cell;
@@ -1573,8 +1614,30 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         haystack: &[u8],
         window: Window,
         initial_direct: bool,
-        mut visitor: F,
+        visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        let (outcome, _) = self.try_visit_spans_window_value_impl::<false, _, _>(
+            haystack,
+            window,
+            initial_direct,
+            visitor,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Shared ordinary uniform-standard scanner with optional final-end
+    /// recommendation bookkeeping fused into its selected-span loop.
+    #[inline]
+    fn try_visit_spans_window_value_impl<const RECOMMEND_DIRECT: bool, F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        initial_direct: bool,
+        mut visitor: F,
+    ) -> Result<(Result<(), E>, bool), LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
@@ -1584,6 +1647,10 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         let direct_probe_bytes = uniform_width.saturating_mul(8);
         let mut cursor = window.start();
         let mut direct = initial_direct;
+        let mut recommendation = OrdinaryDirectRecommendation::<RECOMMEND_DIRECT>::new(
+            window.start(),
+            promotion_bytes,
+        );
         loop {
             while !direct {
                 let search_start = cursor;
@@ -1591,17 +1658,21 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                     haystack,
                     Window::new(cursor, window.end()),
                 )? else {
-                    return Ok(Ok(()));
+                    return Ok((
+                        Ok(()),
+                        recommendation.after_exhaustion(window.end()),
+                    ));
                 };
                 debug_assert!(
                     matched.1 > cursor,
                     "a positive-width literal-set match must advance its search cursor",
                 );
                 cursor = matched.1;
+                recommendation.record(matched.1);
                 match visitor(matched) {
                     Ok(true) => {}
-                    Ok(false) => return Ok(Ok(())),
-                    Err(error) => return Ok(Err(error)),
+                    Ok(false) => return Ok((Ok(()), false)),
+                    Err(error) => return Ok((Err(error), false)),
                 }
                 // An end within 2W places the selected start in the first W
                 // bytes. Once promoted, bound a mistaken density prediction
@@ -1625,7 +1696,10 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                         // semantic window. Unlike a miss at an artificial
                         // probe edge, no wholly contained match can cross
                         // this boundary, so the miss is authoritative.
-                        return Ok(Ok(()));
+                        return Ok((
+                            Ok(()),
+                            recommendation.after_exhaustion(window.end()),
+                        ));
                     }
                     // A miss costs at most one bounded direct probe. The
                     // authoritative prefiltered search restarts at the
@@ -1643,10 +1717,11 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
                 );
                 let matched = (end - uniform_width, end);
                 cursor = end;
+                recommendation.record(end);
                 match visitor(matched) {
                     Ok(true) => {}
-                    Ok(false) => return Ok(Ok(())),
-                    Err(error) => return Ok(Err(error)),
+                    Ok(false) => return Ok((Ok(()), false)),
+                    Err(error) => return Ok((Err(error), false)),
                 }
             }
         }
@@ -1674,46 +1749,17 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
         haystack: &[u8],
         window: Window,
         initial_direct: bool,
-        mut visitor: F,
+        visitor: F,
     ) -> Result<(Result<(), E>, bool), LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
-        let promotion_bytes = self.pattern_bytes().saturating_mul(2);
-        let start = window.start();
-        let mut penultimate_end = start;
-        let mut previous_end = start;
-        let mut exhausted = true;
-        let outcome = self.try_visit_spans_window_value_with_initial_direct(
+        self.try_visit_spans_window_value_impl::<true, _, _>(
             haystack,
             window,
             initial_direct,
-            |matched| {
-                penultimate_end = previous_end;
-                previous_end = matched.1;
-                match visitor(matched) {
-                    Ok(true) => Ok(true),
-                    Ok(false) => {
-                        exhausted = false;
-                        Ok(false)
-                    }
-                    Err(error) => {
-                        exhausted = false;
-                        Err(error)
-                    }
-                }
-            },
-        )?;
-        match outcome {
-            Ok(()) => {
-                let next_direct = exhausted
-                    && previous_end != start
-                    && previous_end.saturating_sub(penultimate_end) <= promotion_bytes
-                    && window.end().saturating_sub(previous_end) <= promotion_bytes;
-                Ok((Ok(()), next_direct))
-            }
-            Err(error) => Ok((Err(error), false)),
-        }
+            visitor,
+        )
     }
 }
 
@@ -4868,6 +4914,130 @@ mod tests {
             Ok(Ok(())),
         );
         assert_eq!(ordinary_direct_probe::calls(), 0);
+    }
+
+    #[test]
+    fn fused_direct_recommendation_preserves_callback_terminals() {
+        let patterns = vec![
+            b"qqqqqqqq".to_vec(),
+            b"zzzzzzzz".to_vec(),
+            b"qqqqqqqq".to_vec(),
+        ];
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
+        assert!(plan.automaton.prefilter().is_some());
+        let uniform = plan
+            .ordinary_executor()
+            .unwrap()
+            .uniform_standard_executor()
+            .unwrap();
+        let mut haystack = patterns[0].clone();
+        haystack.push(b'x');
+        haystack.extend_from_slice(&patterns[1]);
+        haystack.extend_from_slice(&[b'x'; 8]);
+        let window = Window::full(&haystack);
+
+        for initial_direct in [false, true] {
+            let mut plain_spans = Vec::new();
+            let plain_outcome = uniform
+                .try_visit_spans_window_value_with_initial_direct(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        plain_spans.push(matched);
+                        Ok::<bool, &'static str>(true)
+                    },
+                )
+                .unwrap();
+            let mut recommended_spans = Vec::new();
+            let (recommended_outcome, next_direct) = uniform
+                .try_visit_spans_window_value_with_direct_recommendation(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        recommended_spans.push(matched);
+                        Ok::<bool, &'static str>(true)
+                    },
+                )
+                .unwrap();
+            assert_eq!(plain_outcome, recommended_outcome);
+            assert_eq!(plain_spans, [(0, 8), (9, 17)]);
+            assert_eq!(recommended_spans, plain_spans);
+            assert!(next_direct);
+
+            let mut plain_stopped = Vec::new();
+            let plain_stop_outcome = uniform
+                .try_visit_spans_window_value_with_initial_direct(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        plain_stopped.push(matched);
+                        Ok::<bool, &'static str>(plain_stopped.len() < 2)
+                    },
+                )
+                .unwrap();
+            let mut recommended_stopped = Vec::new();
+            let (recommended_stop_outcome, stopped_next_direct) = uniform
+                .try_visit_spans_window_value_with_direct_recommendation(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        recommended_stopped.push(matched);
+                        Ok::<bool, &'static str>(recommended_stopped.len() < 2)
+                    },
+                )
+                .unwrap();
+            assert_eq!(plain_stop_outcome, recommended_stop_outcome);
+            assert_eq!(recommended_stopped, plain_stopped);
+            assert_eq!(recommended_stopped, [(0, 8), (9, 17)]);
+            assert!(!stopped_next_direct);
+
+            let mut plain_error_spans = Vec::new();
+            let plain_error = uniform
+                .try_visit_spans_window_value_with_initial_direct(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        plain_error_spans.push(matched);
+                        if plain_error_spans.len() == 2 {
+                            Err("callback")
+                        } else {
+                            Ok(true)
+                        }
+                    },
+                )
+                .unwrap();
+            let mut recommended_error_spans = Vec::new();
+            let (recommended_error, error_next_direct) = uniform
+                .try_visit_spans_window_value_with_direct_recommendation(
+                    &haystack,
+                    window,
+                    initial_direct,
+                    |matched| {
+                        recommended_error_spans.push(matched);
+                        if recommended_error_spans.len() == 2 {
+                            Err("callback")
+                        } else {
+                            Ok(true)
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(plain_error, recommended_error);
+            assert_eq!(recommended_error_spans, plain_error_spans);
+            assert_eq!(recommended_error_spans, [(0, 8), (9, 17)]);
+            assert_eq!(recommended_error, Err("callback"));
+            assert!(!error_next_direct);
+        }
     }
 
     #[test]

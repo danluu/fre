@@ -21557,43 +21557,22 @@ impl<'r> PortableOrdinarySession<'r> {
                 direct_next,
             } => {
                 let initial_direct = core::mem::take(direct_next);
-                let promotion_bytes = executor.pattern_bytes().saturating_mul(2);
-                let mut penultimate_end = start;
-                let mut previous_end = start;
-                let mut exhausted = true;
                 let mut visitor = visitor;
-                let outcome = executor
-                    .try_visit_spans_window_value_with_initial_direct(
+                let (outcome, next_direct) = executor
+                    .try_visit_spans_window_value_with_direct_recommendation(
                         haystack,
                         LiteralWindow::new(start, haystack.len()),
                         initial_direct,
                         |(matched_start, end)| {
-                            penultimate_end = previous_end;
-                            previous_end = end;
-                            match visitor(Match {
+                            visitor(Match {
                                 start: matched_start,
                                 end,
-                            }) {
-                                Ok(true) => Ok(true),
-                                Ok(false) => {
-                                    exhausted = false;
-                                    Ok(false)
-                                }
-                                Err(error) => {
-                                    exhausted = false;
-                                    Err(error)
-                                }
-                            }
+                            })
                         },
                     )
                     .map_err(SearchError::from)
                     .map_err(PortableFindIterError::Search)?;
-                if exhausted
-                    && outcome.is_ok()
-                    && previous_end != start
-                    && previous_end.saturating_sub(penultimate_end) <= promotion_bytes
-                    && haystack.len().saturating_sub(previous_end) <= promotion_bytes
-                {
+                if next_direct {
                     *direct_next = true;
                 }
                 Ok(outcome)
