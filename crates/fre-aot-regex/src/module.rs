@@ -26225,6 +26225,23 @@ fn native_participation_target_word(target: Target) -> Result<u32, ObjectError> 
         ))
 }
 
+/// Encode the architecture-qualified feature vocabulary in the participation
+/// V1 header's four-byte feature field. [`FeatureSet`] keeps x86-64 and
+/// AArch64 facts in the low and high halves of a `u64`; the adjacent
+/// architecture byte already disambiguates the wire value, so each target's
+/// half is stored at its architecture-local bit position. Existing x86-64 V1
+/// bytes remain unchanged while AArch64 ASIMD/SVE facts fit without loss.
+pub(crate) fn native_participation_feature_word_v1(
+    target: Target,
+) -> Result<u32, ObjectError> {
+    target.validate()?;
+    let bits = match target.architecture {
+        Architecture::X86_64 => target.features.bits(),
+        Architecture::Aarch64 => target.features.bits() >> 32,
+    };
+    u32::try_from(bits).map_err(|_| ObjectError::ArithmeticOverflow("participation features"))
+}
+
 fn validate_native_participation_geometry(
     geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
 ) -> Result<(), ObjectError> {
@@ -26479,8 +26496,7 @@ fn lower_aarch64_native_participation_v1(
         (32_u16, native_participation_target_word(target)?),
         (
             36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("participation features"))?,
+            native_participation_feature_word_v1(target)?,
         ),
         (
             40,
@@ -26809,8 +26825,7 @@ fn lower_x86_64_native_participation_v1(
         (32, native_participation_target_word(target)?),
         (
             36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("participation features"))?,
+            native_participation_feature_word_v1(target)?,
         ),
         (
             40,

@@ -1012,7 +1012,7 @@ fn encode_header(
     write_u32(
         bytes,
         36,
-        u32::try_from(target.features.bits()).map_err(|_| {
+        crate::module::native_participation_feature_word_v1(target).map_err(|_| {
             NativeParticipationAotErrorV1::InvalidProgram("target feature encoding")
         })?,
     )?;
@@ -1109,6 +1109,11 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         return false;
     };
     let receipt = artifact.receipt;
+    let Ok(target_features) =
+        crate::module::native_participation_feature_word_v1(receipt.target)
+    else {
+        return false;
+    };
     let Some(strategy) = read_wire_u16(&artifact.bundle, 40).and_then(|value| match value {
         1 => Some(NativeParticipationAotStrategyV1::DfaX86_64),
         2 => Some(NativeParticipationAotStrategyV1::DfaAarch64),
@@ -1144,8 +1149,7 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
             == Some(target_os_byte(receipt.target.operating_system))
         && artifact.bundle.get(34).copied() == Some(target_abi_byte(receipt.target.abi))
         && artifact.bundle.get(35).copied() == Some(0)
-        && read_wire_u32(&artifact.bundle, 36)
-            == u32::try_from(receipt.target.features.bits()).ok()
+        && read_wire_u32(&artifact.bundle, 36) == Some(target_features)
         && read_wire_usize_u32(&artifact.bundle, 44)
             == Some(if selected {
                 NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
@@ -2009,7 +2013,8 @@ fn clone_threads(
 mod tests {
     use super::*;
     use crate::{
-        CaptureCompileLimits, CaptureCompileRequest, CompileMode, Target, compile_captures,
+        CaptureCompileLimits, CaptureCompileRequest, CompileMode, CpuFeature, FeatureSet, Target,
+        compile_captures,
     };
     use fre_capture_lab::{CaptureGroupSlot, SearchLimits, Span, Window};
 
@@ -2129,12 +2134,40 @@ mod tests {
     }
 
     #[test]
+    fn target_feature_wire_bits_are_architecture_local() {
+        let x86 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Sse2).with(CpuFeature::X86Avx512F))
+            .expect("x86 feature target");
+        assert_eq!(
+            crate::module::native_participation_feature_word_v1(x86).unwrap(),
+            (1 << 0) | (1 << 2),
+        );
+
+        let aarch64 = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .expect("AArch64 feature target");
+        assert_eq!(aarch64.features.bits(), 7_u64 << 32);
+        assert_eq!(
+            crate::module::native_participation_feature_word_v1(aarch64).unwrap(),
+            7,
+        );
+    }
+
+    #[test]
     fn selected_aarch64_artifact_preserves_selector_and_has_no_helpers() {
-        let compiled = compile_captures(CaptureCompileRequest::new(
-            r"^((?:ab)+)(c)?$",
-            Target::aarch64_macos(),
-        ))
-        .expect("capture compile");
+        let target = Target::aarch64_macos()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .expect("ASIMD/SVE/SVE2 target");
+        let compiled = compile_captures(CaptureCompileRequest::new(r"^((?:ab)+)(c)?$", target))
+            .expect("capture compile");
         let ordinary_symbol = compiled.selector().module().entry_symbol().to_owned();
         let ordinary_symbols = compiled.selector().module().symbols().len();
         let ordinary_runtime: Vec<_> = compiled
@@ -2163,6 +2196,8 @@ mod tests {
             NativeParticipationAotStrategyV1::DfaAarch64
         );
         assert_eq!(artifact.receipt().semantic_runtime_calls, 0);
+        assert_eq!(artifact.receipt().target.features.bits(), 7_u64 << 32);
+        assert_eq!(read_wire_u32(artifact.bundle(), 36), Some(7));
         assert!(artifact.receipt().dfa_states > 0);
         assert!(artifact.receipt().transition_cells > 0);
         assert_eq!(
@@ -2326,9 +2361,16 @@ mod tests {
 
     #[test]
     fn unsupported_assertion_gets_transactional_negative_entry() {
+        let target = Target::aarch64_macos()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .expect("ASIMD/SVE/SVE2 target");
         let compiled = compile_captures(CaptureCompileRequest::new(
             r"(?m)^((?:ab)+)$",
-            Target::aarch64_macos(),
+            target,
         ))
         .expect("capture compile");
         let artifact = compiled
@@ -2342,6 +2384,8 @@ mod tests {
             artifact.receipt().decline,
             Some(NativeParticipationAotDeclineV1::UnsupportedAssertion)
         );
+        assert_eq!(read_wire_u32(artifact.bundle(), 36), Some(7));
+        assert!(artifact.authenticates_receipt());
         let symbol = artifact
             .module()
             .symbols()
