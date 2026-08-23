@@ -186,10 +186,10 @@ pub use participation_aot::{
     NATIVE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN, NATIVE_PARTICIPATION_AOT_V1_MAGIC,
     NATIVE_PARTICIPATION_AOT_V1_READY_SEAL, NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
     NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES, NATIVE_PARTICIPATION_AOT_V1_STATUS_UNAVAILABLE,
-    NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID, NativeParticipationAotArtifactV1,
-    NativeParticipationAotDeclineV1, NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
-    NativeParticipationAotReceiptV1, NativeParticipationAotResourceV1,
-    NativeParticipationAotStrategyV1,
+    NATIVE_PARTICIPATION_DFA_V1_ALGORITHM_ID, NATIVE_PARTICIPATION_ORDERED_NFA_V1_ALGORITHM_ID,
+    NativeParticipationAotArtifactV1, NativeParticipationAotDeclineV1,
+    NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1, NativeParticipationAotReceiptV1,
+    NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1,
 };
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport,
