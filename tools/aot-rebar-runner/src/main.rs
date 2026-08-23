@@ -2852,7 +2852,10 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
             return Err("count-spans artifact has no aggregate strategy".to_owned());
         }
         let iteration_is_exact = if native_scalar_reducer {
-            linked::SPAN_ITERATION_STRATEGY == "linked-native-span-sum-reducer"
+            linked_native_span_sum_iteration_is_exact(
+                linked::SHARED_ORDERED_MANY_AGGREGATE,
+                linked::SPAN_ITERATION_STRATEGY,
+            )
         } else if linked::HAS_SPAN_FILL {
             linked_span_fill_iteration_is_exact(
                 linked::PREPARED_BULK_STRATEGY,
@@ -3995,6 +3998,15 @@ fn native_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> 
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     .then_some(suffix)
+}
+
+fn linked_native_span_sum_iteration_is_exact(shared_ordered_many: bool, iteration: &str) -> bool {
+    iteration
+        == if shared_ordered_many {
+            "linked-shared-ordered-many-native-span-sum-reducer-v1"
+        } else {
+            "linked-native-span-sum-reducer"
+        }
 }
 
 fn linked_span_fill_iteration_is_exact(bulk: &str, iteration: &str) -> bool {
@@ -5772,6 +5784,20 @@ mod tests {
         assert!(!linked_span_fill_iteration_is_exact(
             "None",
             "linked-direct-entry-loop",
+        ));
+    }
+
+    #[test]
+    fn native_span_sum_iteration_requires_its_exact_topology_boundary() {
+        let direct = "linked-native-span-sum-reducer";
+        let shared = "linked-shared-ordered-many-native-span-sum-reducer-v1";
+        assert!(linked_native_span_sum_iteration_is_exact(false, direct));
+        assert!(linked_native_span_sum_iteration_is_exact(true, shared));
+        assert!(!linked_native_span_sum_iteration_is_exact(false, shared));
+        assert!(!linked_native_span_sum_iteration_is_exact(true, direct));
+        assert!(!linked_native_span_sum_iteration_is_exact(
+            true,
+            "linked-shared-ordered-many-native-span-sum-reducer-v2",
         ));
     }
 
