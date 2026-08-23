@@ -1880,6 +1880,7 @@ macro_rules! first_acceptance_end_body {
         $window:ident,
         $order:ident,
         $prefix:ident,
+        $restart_prefix:ident,
         $restart_floor:literal
     ) => {{
         #[cfg(test)]
@@ -1925,15 +1926,15 @@ macro_rules! first_acceptance_end_body {
                 automaton.is_start(state),
                 "a prefiltered literal-set DFA has no other special states",
             );
-            // A restart discards every partial literal. The count-only
-            // scanner reapplies the fixed-width floor before classifying
-            // another transition; endpoint and span scanners retain their
-            // established expansion.
+            // A restart discards every partial literal. Every direct scanner
+            // reapplies the fixed-width floor before classifying another
+            // transition. Span keeps its paired initial expansion, but uses
+            // the smaller scalar loop for each restart floor.
             if $restart_floor {
                 let next_acceptance_check =
                     at + (pattern_bytes - 1).min($window.end() - at);
                 first_acceptance_prefix!(
-                    $prefix,
+                    $restart_prefix,
                     automaton,
                     anchored,
                     state,
@@ -1960,7 +1961,7 @@ fn first_acceptance_end_without_prefilter(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first, scalar, false)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, scalar, scalar, true)
 }
 
 /// Span-visitor direct probe with its scanner forced into the emitting loop.
@@ -1975,7 +1976,7 @@ fn first_acceptance_end_for_span_visit(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first, pair, false)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, pair, scalar, true)
 }
 
 /// Count-only direct probe with accepting states before the dead-state test.
@@ -1989,7 +1990,7 @@ fn first_acceptance_end_for_count(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, match_first, chunks, true)
+    first_acceptance_end_body!(plan, haystack, window, match_first, chunks, chunks, true)
 }
 
 #[cfg(test)]
@@ -5371,8 +5372,6 @@ mod tests {
             assert_eq!(ordinary_direct_probe::special_checks(), 1);
 
             let repeated_restart = vec![b'x'; uniform_width * 8];
-            let incumbent_checks = repeated_restart.len() - (uniform_width - 1);
-
             ordinary_direct_probe::reset();
             assert_eq!(
                 first_acceptance_end_without_prefilter(
@@ -5383,7 +5382,7 @@ mod tests {
                 None,
             );
             assert_eq!(ordinary_direct_probe::calls(), 1);
-            assert_eq!(ordinary_direct_probe::special_checks(), incumbent_checks);
+            assert_eq!(ordinary_direct_probe::special_checks(), 8);
 
             ordinary_direct_probe::reset();
             assert_eq!(
@@ -5395,7 +5394,7 @@ mod tests {
                 None,
             );
             assert_eq!(ordinary_direct_probe::calls(), 1);
-            assert_eq!(ordinary_direct_probe::special_checks(), incumbent_checks);
+            assert_eq!(ordinary_direct_probe::special_checks(), 8);
 
             ordinary_direct_probe::reset();
             assert_eq!(
