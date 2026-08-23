@@ -80,17 +80,16 @@ timing belongs to a separately named compiler-stage benchmark.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
-- `count-spans` obtains every non-overlapping `{start,end}` record from the
-  identity-suffixed linked optimizing object and sums `end-start` in the
-  runner with checked per-record bounds, ordering, and arithmetic. Every
-  warmup or timed operation resets its iterator state. Runtime-backed and
-  retained-row objects repeatedly refill a 64-record stack buffer through
-  their generated stateful Span-fill entry until it reports exhaustion;
-  fully direct objects repeatedly call their native ordinary entry over
-  absolute full-haystack windows. Both routes implement Rebar's byte-wise
-  empty-match progress and adjacent-empty suppression. The compiler may still
-  emit an unused `SpanSum` export to provision the shared prepared
-  program/handle, but that scalar export is not called by this model.
+- `count-spans` calls the identity-suffixed whole-operation `SpanSum` reducer
+  once when the compile receipt selects exactly `NativeFused` or
+  `NativeOrderedNfaFused`. The runner authenticates that strategy, operation,
+  capability, and reducer symbol before session preparation or execution.
+  Other receipts retain the checked adapter: runtime-backed objects refill a
+  64-record stack buffer through their stateful Span-fill entry, while fully
+  direct objects repeat the ordinary native entry over absolute full-haystack
+  windows. Those adapter routes validate every span and implement Rebar's
+  byte-wise empty-match progress and adjacent-empty suppression; they are
+  reported as adapter loops rather than whole-operation-native execution.
 - grep iterates every LF/CRLF line domain and invokes the linked artifact's
   authenticated direct native search entry or prepared V15 native Span-fill
   entry for a single pattern. For multiple patterns it invokes every retained

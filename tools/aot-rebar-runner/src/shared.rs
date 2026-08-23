@@ -13,8 +13,8 @@ use fre_aot_regex::{
     OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
     PreparedOrderedNfaV15CompileDisposition, RebarSingleCaptureAotArtifactV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
-    RebarSingleCaptureParticipationAotErrorV1, SlowAotLimits, SymbolBinding, SymbolKind, Target,
-    UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
+    RebarSingleCaptureParticipationAotErrorV1, SectionKind, SlowAotLimits, SymbolBinding,
+    SymbolKind, Target, UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
     UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
     UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
     UniformCapturePreparedSpanFillCompileReceipt, PREPARED_CAPABILITY_ORDERED_NFA_V15,
@@ -299,6 +299,191 @@ impl Model {
     pub const fn is_capture(self) -> bool {
         matches!(self, Self::CountCaptures | Self::GrepCaptures)
     }
+}
+
+/// Whether the selected prepared aggregate is a compiler-generated native
+/// reducer for the complete scalar Rebar operation.
+///
+/// This deliberately excludes every `*WithRuntimeHelper` strategy. Even when
+/// the requested Count or `SpanSum` export happens to be native, a mixed
+/// aggregate receipt is not a closed proof that the selected operation entry
+/// has no semantic-helper path. Consumers authenticate the narrower exact
+/// strategies before treating one reducer call as the whole timed operation.
+#[must_use]
+pub const fn is_native_whole_scalar_reducer(
+    model: Model,
+    strategy: Option<PreparedAggregateStrategy>,
+) -> bool {
+    matches!(model, Model::Count | Model::SpanSum)
+        && matches!(
+            strategy,
+            Some(
+                PreparedAggregateStrategy::NativeFused
+                    | PreparedAggregateStrategy::NativeOrderedNfaFused
+            )
+        )
+}
+
+/// Authenticate that the selected Count or `SpanSum` export is one complete
+/// generated text function over the exact linked program.
+///
+/// The aggregate strategy is only the first gate. This also closes the export
+/// set, prepared capability/bulk shape, canonical program/reducer identity,
+/// defined-text extent, and every unresolved aggregate relocation. Other
+/// unresolved symbols owned by the ordinary search object do not make the
+/// selected reducer a helper; only an edge originating inside that reducer is
+/// relevant to the operation boundary.
+pub fn authenticate_native_whole_scalar_reducer(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> Result<bool, String> {
+    let receipt = compiled.receipt();
+    let module = compiled.module();
+    let strategy = receipt.prepared_aggregate_strategy;
+    if !is_native_whole_scalar_reducer(model, strategy) {
+        return Ok(false);
+    }
+
+    let (reducer_name, reducer_prefix, compatibility_helper) = match model {
+        Model::Count => (
+            module.prepared_count_symbol(),
+            "fre_aot_regex_count_exclusive_v1_",
+            "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+        ),
+        Model::SpanSum => (
+            module.prepared_span_sum_symbol(),
+            "fre_aot_regex_span_sum_exclusive_v1_",
+            "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+        ),
+        _ => unreachable!("native whole scalar reducer is restricted to Count and SpanSum"),
+    };
+    let reducer_name = reducer_name
+        .ok_or_else(|| "native scalar strategy has no model-specific reducer symbol".to_owned())?;
+    canonical_symbol_identity(reducer_name, reducer_prefix)
+        .ok_or_else(|| "native scalar reducer symbol is not canonical".to_owned())?;
+    let (program_name, program_len) = module
+        .required_runtime_program()
+        .ok_or_else(|| "native scalar reducer has no preparation program".to_owned())?;
+    canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_")
+        .ok_or_else(|| "native scalar preparation program symbol is not canonical".to_owned())?;
+
+    let ordered_nfa = strategy == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+    let bulk_shape_is_exact = if ordered_nfa {
+        receipt.engine == EngineKind::OrderedNfa
+            && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+            && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
+    } else {
+        matches!(
+            module.prepared_bulk_strategy(),
+            None | Some(
+                PreparedBulkStrategy::NativePreparedLoop | PreparedBulkStrategy::NativeFrozenLoop
+            )
+        ) && receipt.required_prepare_capabilities == 0
+    };
+    if receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Span
+        || receipt.prepared_aggregate_exports != model.exports()
+        || module.prepared_aggregate_exports() != model.exports()
+        || module.prepared_aggregate_strategy() != strategy
+        || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
+        || !bulk_shape_is_exact
+        || reducer_name == program_name
+        || program_len == 0
+        || receipt.program_sha256 == [0; 32]
+        || receipt.object_sha256 == [0; 32]
+        || receipt.object_bytes != compiled.object().len()
+        || compiled.object().is_empty()
+    {
+        return Err("native scalar reducer failed its receipt and route closure".to_owned());
+    }
+
+    let mut reducer_symbols = module
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == reducer_name);
+    let reducer = reducer_symbols
+        .next()
+        .ok_or_else(|| "native scalar reducer is absent from its module".to_owned())?;
+    if reducer_symbols.next().is_some()
+        || reducer.binding != SymbolBinding::Global
+        || reducer.kind != SymbolKind::Function
+        || reducer.size == 0
+    {
+        return Err("native scalar reducer is not one unique defined function".to_owned());
+    }
+    let section_index = reducer
+        .section
+        .ok_or_else(|| "native scalar reducer is undefined".to_owned())?;
+    let section = module
+        .sections()
+        .get(section_index)
+        .ok_or_else(|| "native scalar reducer section is absent".to_owned())?;
+    let reducer_start = usize::try_from(reducer.offset)
+        .map_err(|_| "native scalar reducer offset does not fit usize".to_owned())?;
+    let reducer_size = usize::try_from(reducer.size)
+        .map_err(|_| "native scalar reducer size does not fit usize".to_owned())?;
+    let reducer_end = reducer_start
+        .checked_add(reducer_size)
+        .ok_or_else(|| "native scalar reducer extent overflowed".to_owned())?;
+    let reducer_end_u64 = reducer
+        .offset
+        .checked_add(reducer.size)
+        .ok_or_else(|| "native scalar reducer relocation extent overflowed".to_owned())?;
+    if section.kind != SectionKind::Text || reducer_end > section.bytes().len() {
+        return Err("native scalar reducer is not wholly defined in text".to_owned());
+    }
+
+    let external_targets = module
+        .relocations()
+        .iter()
+        .filter(|relocation| {
+            relocation.section == section_index
+                && relocation.offset >= reducer.offset
+                && relocation.offset < reducer_end_u64
+        })
+        .filter_map(|relocation| {
+            module
+                .symbols()
+                .get(relocation.symbol)
+                .filter(|target| target.section.is_none())
+                .map(|target| target.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let expected_external_targets = if ordered_nfa {
+        vec![compatibility_helper]
+    } else {
+        Vec::new()
+    };
+    if external_targets != expected_external_targets {
+        return Err(format!(
+            "native scalar reducer has unexpected unresolved call targets: {external_targets:?}"
+        ));
+    }
+
+    let aggregate_helpers = module
+        .required_runtime_symbols()
+        .filter(|symbol| {
+            matches!(
+                *symbol,
+                "fre_aot_regex_runtime_compiler_private_count_exclusive_v1"
+                    | "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
+                    | "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
+            )
+        })
+        .collect::<Vec<_>>();
+    if aggregate_helpers != expected_external_targets {
+        return Err("native scalar reducer has an unexpected aggregate helper surface".to_owned());
+    }
+    Ok(true)
+}
+
+fn canonical_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = symbol.strip_prefix(prefix)?;
+    (suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(suffix)
 }
 
 /// Exact fixed regex suite used by Rebar's public `regex-redux` model.
@@ -624,13 +809,13 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
                 recovered_stats.thompson_states, recovered_stats.thompson_edges,
             )
         })?;
-        return select_prepared_ordered_nfa_v15_or_recovered(
-            benchmark.model,
-            compiled,
-            disposition,
-        );
+        let selected =
+            select_prepared_ordered_nfa_v15_or_recovered(benchmark.model, compiled, disposition)?;
+        authenticate_native_whole_scalar_reducer(benchmark.model, &selected)?;
+        return Ok(selected);
     }
     if benchmark.model != Model::GrepCount {
+        authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)?;
         return Ok(compiled);
     }
     if compiled.module().required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15 {
@@ -2412,6 +2597,14 @@ mod tests {
             rebar.module().entry_symbol(),
             ordinary.module().entry_symbol()
         );
+        assert_eq!(
+            authenticate_native_whole_scalar_reducer(benchmark.model, &rebar)
+                .expect("whole scalar authentication"),
+            is_native_whole_scalar_reducer(
+                benchmark.model,
+                rebar.receipt().prepared_aggregate_strategy,
+            ),
+        );
     }
 
     #[test]
@@ -2811,6 +3004,10 @@ mod tests {
         .expect("supported fixture must select V15");
         authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)
             .expect("native scalar route receipt");
+        assert!(
+            authenticate_native_whole_scalar_reducer(benchmark.model, &selected)
+                .expect("whole Ordered-NFA scalar authentication")
+        );
     }
 
     #[test]
@@ -3626,6 +3823,40 @@ mod tests {
             Model::SpanSum.adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
         );
+    }
+
+    #[test]
+    fn whole_scalar_reducer_requires_an_exact_native_strategy() {
+        for model in [Model::Count, Model::SpanSum] {
+            assert!(is_native_whole_scalar_reducer(
+                model,
+                Some(PreparedAggregateStrategy::NativeFused),
+            ));
+            assert!(is_native_whole_scalar_reducer(
+                model,
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+            ));
+            for strategy in [
+                None,
+                Some(PreparedAggregateStrategy::RuntimeHelper),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFusedWithRuntimeHelper),
+            ] {
+                assert!(!is_native_whole_scalar_reducer(model, strategy));
+            }
+        }
+        for model in [
+            Model::Compile,
+            Model::CountCaptures,
+            Model::GrepCount,
+            Model::GrepCaptures,
+            Model::RegexRedux,
+        ] {
+            assert!(!is_native_whole_scalar_reducer(
+                model,
+                Some(PreparedAggregateStrategy::NativeFused),
+            ));
+        }
     }
 
     #[test]

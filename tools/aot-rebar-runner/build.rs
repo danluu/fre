@@ -410,10 +410,15 @@ fn configured_source(
         3
     };
     let prepared_bulk_strategy = format!("{:?}", compiled.module().prepared_bulk_strategy());
+    let native_scalar_reducer =
+        shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
+            .expect("compiled native scalar reducer failed build-time authentication");
     let span_iteration_strategy = if prepared_uniform_capture {
         format!("linked-prepared-span-fill-uniform-capture-64::{prepared_bulk_strategy}")
     } else if benchmark.model != shared::Model::SpanSum {
         "not-applicable".to_owned()
+    } else if native_scalar_reducer {
+        "linked-native-span-sum-reducer".to_owned()
     } else if span_fill_symbol.is_some() {
         format!("linked-prepared-span-fill-64::{prepared_bulk_strategy}")
     } else {
@@ -446,6 +451,11 @@ fn configured_source(
     let mut source = String::new();
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = false;").unwrap();
+    writeln!(
+        source,
+        "pub const NATIVE_SCALAR_REDUCER: bool = {native_scalar_reducer};"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {prepared_uniform_capture};"
@@ -882,6 +892,7 @@ fn configured_regex_redux_source(
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = false;\n");
+    source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     writeln!(
         source,
@@ -1063,6 +1074,7 @@ fn configured_participation_capture_source(
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
@@ -1326,6 +1338,7 @@ fn configured_strict_capture_source(
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
     source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
     source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
@@ -1870,6 +1883,7 @@ fn configured_native_row_source(
     let mut source = String::new();
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
+    writeln!(source, "pub const NATIVE_SCALAR_REDUCER: bool = false;").unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
@@ -2364,6 +2378,7 @@ fn push_empty_prepared_row_bindings(source: &mut String, row_count: usize) {
 fn stub_source() -> &'static str {
     r#"pub const CONFIGURED: bool = false;
 pub const NATIVE_ROW_BRIDGE: bool = false;
+pub const NATIVE_SCALAR_REDUCER: bool = false;
 pub const UNIFORM_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;

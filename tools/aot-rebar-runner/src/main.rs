@@ -1846,6 +1846,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if linked::HAS_SPAN_FILL != has_named_span_fill {
         return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
     }
+    let native_scalar_reducer = authenticate_linked_native_scalar_reducer(benchmark.model)?;
     if prepared_uniform_capture {
         if benchmark.patterns.len() != 1
             || !benchmark.model.is_capture()
@@ -1905,6 +1906,22 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         }
         if linked::AGGREGATE_STRATEGY == "None" {
             return Err("count-spans artifact has no aggregate strategy".to_owned());
+        }
+        let iteration_is_exact = if native_scalar_reducer {
+            linked::SPAN_ITERATION_STRATEGY == "linked-native-span-sum-reducer"
+        } else if linked::HAS_SPAN_FILL {
+            linked_span_fill_iteration_is_exact(
+                linked::PREPARED_BULK_STRATEGY,
+                linked::SPAN_ITERATION_STRATEGY,
+            )
+        } else {
+            linked::SPAN_ITERATION_STRATEGY == "linked-direct-entry-loop"
+        };
+        if !iteration_is_exact {
+            return Err(
+                "count-spans execution boundary disagrees with its native reducer receipt"
+                    .to_owned(),
+            );
         }
     } else if linked::SPAN_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-count-spans artifact advertises a span iterator route".to_owned());
@@ -2577,11 +2594,115 @@ fn native_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> 
     .then_some(suffix)
 }
 
+fn linked_span_fill_iteration_is_exact(bulk: &str, iteration: &str) -> bool {
+    matches!(
+        (bulk, iteration),
+        (
+            "Some(RuntimeHelper)",
+            "linked-prepared-span-fill-64::Some(RuntimeHelper)"
+        ) | (
+            "Some(NativePreparedLoop)",
+            "linked-prepared-span-fill-64::Some(NativePreparedLoop)"
+        ) | (
+            "Some(NativeTrustedPreflightLoop)",
+            "linked-prepared-span-fill-64::Some(NativeTrustedPreflightLoop)"
+        ) | (
+            "Some(NativeTrustedPreflightRuntimeBulk)",
+            "linked-prepared-span-fill-64::Some(NativeTrustedPreflightRuntimeBulk)"
+        ) | (
+            "Some(NativeFrozenLoop)",
+            "linked-prepared-span-fill-64::Some(NativeFrozenLoop)"
+        ) | (
+            "Some(NativeOrderedNfaLoop)",
+            "linked-prepared-span-fill-64::Some(NativeOrderedNfaLoop)"
+        )
+    )
+}
+
+fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<bool, String> {
+    let strategy_is_native = matches!(
+        linked::AGGREGATE_STRATEGY,
+        "Some(NativeFused)" | "Some(NativeOrderedNfaFused)"
+    ) && matches!(model, shared::Model::Count | shared::Model::SpanSum);
+    if linked::NATIVE_SCALAR_REDUCER != strategy_is_native {
+        return Err(
+            "native scalar reducer flag disagrees with its exact aggregate strategy".to_owned(),
+        );
+    }
+    if !strategy_is_native {
+        return Ok(false);
+    }
+
+    let prefix = match model {
+        shared::Model::Count => "fre_aot_regex_count_exclusive_v1_",
+        shared::Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        _ => unreachable!("native scalar strategy was restricted to scalar models"),
+    };
+    native_symbol_identity(linked::REDUCER_SYMBOL, prefix)
+        .ok_or_else(|| "native scalar reducer has no canonical identity symbol".to_owned())?;
+    native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
+        .ok_or_else(|| "native scalar reducer has no canonical program identity".to_owned())?;
+    let compatibility_helper = match model {
+        shared::Model::Count => "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+        shared::Model::SpanSum => "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+        _ => unreachable!("native scalar strategy was restricted to scalar models"),
+    };
+    let aggregate_helpers = linked::REQUIRED_RUNTIME_SYMBOLS
+        .split(',')
+        .filter(|symbol| {
+            matches!(
+                *symbol,
+                "fre_aot_regex_runtime_compiler_private_count_exclusive_v1"
+                    | "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
+                    | "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
+            )
+        })
+        .collect::<Vec<_>>();
+    if linked::REDUCER_SYMBOL == linked::ENTRY_SYMBOL
+        || linked::REDUCER_SYMBOL == linked::PROGRAM_SYMBOL
+        || (!linked::SPAN_FILL_SYMBOL.is_empty()
+            && linked::REDUCER_SYMBOL == linked::SPAN_FILL_SYMBOL)
+        || linked::PROGRAM_LEN == 0
+        || linked::PROGRAM_SHA256 == [0; 32]
+        || linked::OBJECT_SHA256 == [0; 32]
+        || linked::PREPARE_OPERATION_FLAGS != model.prepare_operation_flags()
+        || linked::ADAPTER
+            != model.adapter_for_required_capabilities(linked::REQUIRED_PREPARE_CAPABILITIES)
+    {
+        return Err(
+            "native scalar reducer failed exact symbol and operation authentication".to_owned(),
+        );
+    }
+
+    let ordered_nfa = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
+    if ordered_nfa != (linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15)
+        || (ordered_nfa
+            && (linked::ENGINE != "OrderedNfa"
+                || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
+                || !linked::HAS_SPAN_FILL
+                || aggregate_helpers != [compatibility_helper]))
+        || (!ordered_nfa
+            && (linked::REQUIRED_PREPARE_CAPABILITIES != 0
+                || !matches!(
+                    linked::PREPARED_BULK_STRATEGY,
+                    "None" | "Some(NativePreparedLoop)" | "Some(NativeFrozenLoop)"
+                )
+                || linked::HAS_SPAN_FILL != (linked::PREPARED_BULK_STRATEGY != "None")
+                || !aggregate_helpers.is_empty()))
+    {
+        return Err("native scalar reducer failed exact capability authentication".to_owned());
+    }
+    Ok(true)
+}
+
 fn run_operation(
     benchmark: &shared::Benchmark,
     session: &mut ExclusiveSession,
 ) -> Result<Vec<Sample>, String> {
     match benchmark.model {
+        shared::Model::SpanSum if linked::NATIVE_SCALAR_REDUCER => {
+            run_operation_route(benchmark, session, ExclusiveSession::reduce)
+        }
         shared::Model::SpanSum if linked::HAS_SPAN_FILL => run_operation_route(
             benchmark,
             session,
@@ -3974,6 +4095,34 @@ mod tests {
         assert!(adjacent_empty
             .push(FreAotRegexResultV1 { start: 4, end: 4 })
             .is_err());
+    }
+
+    #[test]
+    fn linked_span_fill_iteration_requires_the_exact_bulk_suffix() {
+        for strategy in [
+            "RuntimeHelper",
+            "NativePreparedLoop",
+            "NativeTrustedPreflightLoop",
+            "NativeTrustedPreflightRuntimeBulk",
+            "NativeFrozenLoop",
+            "NativeOrderedNfaLoop",
+        ] {
+            let bulk = format!("Some({strategy})");
+            let iteration = format!("linked-prepared-span-fill-64::Some({strategy})");
+            assert!(linked_span_fill_iteration_is_exact(&bulk, &iteration));
+            assert!(!linked_span_fill_iteration_is_exact(
+                &bulk,
+                "linked-prepared-span-fill-64::Some(FutureLoop)",
+            ));
+        }
+        assert!(!linked_span_fill_iteration_is_exact(
+            "Some(FutureLoop)",
+            "linked-prepared-span-fill-64::Some(FutureLoop)",
+        ));
+        assert!(!linked_span_fill_iteration_is_exact(
+            "None",
+            "linked-direct-entry-loop",
+        ));
     }
 
     #[test]

@@ -561,8 +561,8 @@ fn regex_redux_smoke_klv() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "recursive Cargo smoke for linked prepared Span-fill refills and nullable progress"]
-fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), DynError> {
+#[ignore = "recursive Cargo smoke for linked native SpanSum reduction and nullable progress"]
+fn configured_count_spans_uses_linked_native_reducer() -> Result<(), DynError> {
     const KEYWORD_PATTERN: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";
 
     let keyword_haystack = "self ".repeat(130).into_bytes();
@@ -587,7 +587,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
     let root = env::temp_dir().join(format!(
-        "fre-aot-rebar-span-fill-smoke-{}-{nonce}",
+        "fre-aot-rebar-span-sum-reducer-smoke-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir(&root)?;
@@ -601,7 +601,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
             let match_count = regex.find_iter(&benchmark.haystack).count();
             if match_count <= 64 {
                 return Err(format!(
-                    "configured Span-fill smoke {name} has only {match_count} matches"
+                    "configured SpanSum reducer smoke {name} has only {match_count} matches"
                 )
                 .into());
             }
@@ -610,7 +610,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
                 .is_some_and(|matched| matched.start() == matched.end());
             if is_nullable != must_be_nullable {
                 return Err(format!(
-                    "configured Span-fill smoke {name} nullable={is_nullable}, expected {must_be_nullable}"
+                    "configured SpanSum reducer smoke {name} nullable={is_nullable}, expected {must_be_nullable}"
                 )
                 .into());
             }
@@ -637,7 +637,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
                 .output()?;
             if !built.status.success() {
                 return Err(format!(
-                    "configured Span-fill build failed for {name}: stdout={} stderr={}",
+                    "configured SpanSum reducer build failed for {name}: stdout={} stderr={}",
                     String::from_utf8_lossy(&built.stdout),
                     String::from_utf8_lossy(&built.stderr),
                 )
@@ -651,7 +651,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
             let provenance = Command::new(&runner).arg("--provenance").output()?;
             if !provenance.status.success() {
                 return Err(format!(
-                    "configured Span-fill provenance failed for {name}: {}",
+                    "configured SpanSum reducer provenance failed for {name}: {}",
                     String::from_utf8_lossy(&provenance.stderr)
                 )
                 .into());
@@ -662,18 +662,19 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
                 "adapter=general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
                 "aggregate_strategy=Some(NativeOrderedNfaFused)",
                 "prepared_bulk_strategy=Some(NativeOrderedNfaLoop)",
-                "span_iteration_strategy=linked-prepared-span-fill-64::Some(NativeOrderedNfaLoop)",
+                "span_iteration_strategy=linked-native-span-sum-reducer",
                 "prepare_config_version=3",
                 "required_prepare_capabilities=0000000000000001",
                 "max_handle_bytes=8388608",
                 "max_ordered_nfa_scratch_bytes=8388608",
                 "max_ordered_nfa_setup_work=2000000",
                 "span_fill_symbol=fre_aot_regex_fill_spans_exclusive_v1_",
+                "reducer_symbol=fre_aot_regex_span_sum_exclusive_v1_",
                 "required_comparators=rust-regex-1.12.4,fre-current-runtime",
             ] {
                 if !provenance.contains(required) {
                     return Err(format!(
-                        "configured Span-fill provenance for {name} omitted {required:?}: {provenance}"
+                        "configured SpanSum reducer provenance for {name} omitted {required:?}: {provenance}"
                     )
                     .into());
                 }
@@ -684,7 +685,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
                 .output()?;
             if !executed.status.success() {
                 return Err(format!(
-                    "configured Span-fill runner failed for {name}: status={:?} stdout={} stderr={}",
+                    "configured SpanSum reducer runner failed for {name}: status={:?} stdout={} stderr={}",
                     executed.status.code(),
                     String::from_utf8_lossy(&executed.stdout),
                     String::from_utf8_lossy(&executed.stderr),
@@ -692,16 +693,25 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
                 .into());
             }
             let stdout = std::str::from_utf8(&executed.stdout)?;
-            let (_, actual) = stdout
-                .trim()
-                .split_once(',')
-                .ok_or("configured Span-fill sample is not nanoseconds,value")?;
-            let actual = actual.parse::<u64>()?;
-            if actual != expected {
+            let samples = stdout.lines().collect::<Vec<_>>();
+            if samples.len() != 2 {
                 return Err(format!(
-                    "configured Span-fill returned {actual} for {name}, oracle returned {expected}"
+                    "configured SpanSum reducer returned {} timed samples for {name}, expected 2",
+                    samples.len(),
                 )
                 .into());
+            }
+            for sample in samples {
+                let (_, actual) = sample
+                    .split_once(',')
+                    .ok_or("configured SpanSum reducer sample is not nanoseconds,value")?;
+                let actual = actual.parse::<u64>()?;
+                if actual != expected {
+                    return Err(format!(
+                        "configured SpanSum reducer returned {actual} for {name}, oracle returned {expected}"
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
@@ -713,7 +723,7 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
         }
         Err(error) => {
             eprintln!(
-                "preserving failed configured Span-fill smoke at {}",
+                "preserving failed configured SpanSum reducer smoke at {}",
                 root.display()
             );
             Err(error)
@@ -728,10 +738,10 @@ fn configured_count_spans_klv(name: &str, pattern: &str, haystack: &[u8]) -> Vec
         ("model", b"count-spans".as_slice()),
         ("case-insensitive", b"false".as_slice()),
         ("unicode", b"true".as_slice()),
-        ("max-iters", b"1".as_slice()),
-        ("max-warmup-iters", b"0".as_slice()),
+        ("max-iters", b"2".as_slice()),
+        ("max-warmup-iters", b"1".as_slice()),
         ("max-time", b"1000000000".as_slice()),
-        ("max-warmup-time", b"0".as_slice()),
+        ("max-warmup-time", b"1000000000".as_slice()),
         ("pattern", pattern.as_bytes()),
         ("haystack", haystack),
     ] {
