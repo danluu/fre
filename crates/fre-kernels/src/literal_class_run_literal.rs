@@ -3371,6 +3371,20 @@ impl LiteralClassRunSearchPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Return the selected ordinary full-haystack span without retaining
+    /// window or diagnostic accounting machinery. All explicit-resource and
+    /// stateful APIs continue to use [`Self::find_window_value`] or
+    /// [`Self::find_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_ascii_word_suffix_full_ordinary_value(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
+        Ok(self.search_ascii_word_suffix_selected_value(haystack))
+    }
+
     /// Return the earliest accepting end without retaining diagnostic
     /// accounting when selected and earliest-end search share one loop.
     #[inline]
@@ -3972,6 +3986,48 @@ impl LiteralClassRunSearchPlan {
             // the recovered run end never exceeds it.
             let overlapping_end = run_end - prefix_bytes + 1;
             cursor = (anchor_start + 1).max(overlapping_end);
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the nonempty suffix finder bounds every full-haystack offset and rejected overlap restart"
+    )]
+    fn search_ascii_word_suffix_selected_value(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(usize, usize)> {
+        debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
+        let suffix_bytes = self.anchor.needle().len();
+        debug_assert!(suffix_bytes != 0);
+        let mut cursor = 0_usize;
+        loop {
+            let relative = self.anchor.find(&haystack[cursor..])?;
+            let suffix_start = cursor + relative;
+            let suffix_end = suffix_start + suffix_bytes;
+            if haystack
+                .get(suffix_end)
+                .is_some_and(|&byte| is_ascii_word(byte))
+            {
+                cursor = suffix_start + 1;
+                continue;
+            }
+
+            let Some(run_start) = scan_class_run_backward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                suffix_start,
+            )
+            .filter(|&start| start < suffix_start) else {
+                cursor = suffix_start + 1;
+                continue;
+            };
+            if run_start > 0 && is_ascii_word(haystack[run_start - 1]) {
+                cursor = suffix_start + 1;
+                continue;
+            }
+            return Some((run_start, suffix_end));
         }
     }
 
@@ -7797,6 +7853,115 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one matrix keeps exhaustive scalar/dispatched parity and fixed scanner-boundary corpora adjacent"
+    )]
+    fn guarded_ordinary_full_values_match_scalar_and_dispatched_oracles() {
+        let dispatch = SimdDispatchContext::capture();
+        let guarded_cases = [
+            (
+                [(b'A', b'B')],
+                r"\b[A-B]+T\b",
+                b"ABT0!\xFF".as_slice(),
+            ),
+            (
+                [(b'A', b'T')],
+                r"\b[A-T]+T\b",
+                b"AMT0!\x80".as_slice(),
+            ),
+        ];
+        for (ranges, pattern, alphabet) in guarded_cases {
+            let scalar = LiteralClassRunSearchPlan::build(
+                b"",
+                ranges.into_iter(),
+                b"T",
+                SearchRunMinimum::One,
+                BoundarySemantics::CompleteAsciiWordRun,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let dispatched = LiteralClassRunSearchPlan::build_with_dispatch(
+                dispatch,
+                b"",
+                ranges.into_iter(),
+                b"T",
+                SearchRunMinimum::One,
+                BoundarySemantics::CompleteAsciiWordRun,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            assert!(scalar.ascii_scanner.is_none());
+            assert!(dispatched.ascii_scanner.is_some());
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            for length in 0_usize..=5 {
+                let haystack_count = alphabet.len().pow(u32::try_from(length).unwrap());
+                for mut ordinal in 0..haystack_count {
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[ordinal % alphabet.len()];
+                        ordinal /= alphabet.len();
+                    }
+                    let expected = oracle
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end()));
+                    for plan in [&scalar, &dispatched] {
+                        assert_eq!(
+                            plan.find_ascii_word_suffix_full_ordinary_value(&haystack)
+                                .unwrap(),
+                            expected,
+                            "selected pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+                            expected,
+                            "accounted pattern={pattern:?} haystack={haystack:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let guarded_scalar = LiteralClassRunSearchPlan::build(
+            b"",
+            [(b'A', b'T')].into_iter(),
+            b"T",
+            SearchRunMinimum::One,
+            BoundarySemantics::CompleteAsciiWordRun,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let guarded_dispatched = LiteralClassRunSearchPlan::build_with_dispatch(
+            dispatch,
+            b"",
+            [(b'A', b'T')].into_iter(),
+            b"T",
+            SearchRunMinimum::One,
+            BoundarySemantics::CompleteAsciiWordRun,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut guarded_haystack = b"0AATX!\xFF".to_vec();
+        guarded_haystack.extend(core::iter::repeat_n(b'A', ASCII_WIDE_BYTES * 3 + 7));
+        guarded_haystack.extend_from_slice(b"TT\x80");
+        let guarded_oracle = RegexBuilder::new(r"\b[A-T]+T\b")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let guarded_expected = guarded_oracle
+            .find(&guarded_haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        for plan in [&guarded_scalar, &guarded_dispatched] {
+            assert_eq!(
+                plan.find_ascii_word_suffix_full_ordinary_value(&guarded_haystack)
+                    .unwrap(),
+                guarded_expected
+            );
         }
     }
 

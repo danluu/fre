@@ -71,6 +71,21 @@ fn assert_exhaustive_windows(pattern: &str, alphabet: &[u8], maximum_length: usi
     assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
 
     for haystack in byte_strings(maximum_length, alphabet) {
+        let expected_full = oracle
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected_full,
+            "ordinary selected pattern={pattern:?} haystack={haystack:?}"
+        );
+        assert_eq!(
+            regex.is_match(&haystack),
+            expected_full.is_some(),
+            "ordinary existence pattern={pattern:?} haystack={haystack:?}"
+        );
         for start in 0..=haystack.len() {
             for end in start..=haystack.len() {
                 let expected = oracle
@@ -332,7 +347,10 @@ fn generalized_and_singleton_shapes_have_stable_route_identity() {
     for pattern in [
         r"a[^z\r\n]*z",
         r"a[ab]+c",
+        r"a[ab]+",
         r"a[bc]*",
+        r"a[bc]*?d",
+        r"a[\x80-\xFF]*z",
         r"(?-u:\b[A-Za-z]+TRAILER\b)",
     ] {
         let regex = portable(pattern);
@@ -358,14 +376,140 @@ fn exhaustive_singleton_star_overlap_and_word_subset_match_oracles() {
     assert_exhaustive_windows(r"ab+c", b"abc!", 5);
     assert_exhaustive_windows(r"a[^z\r\n]*z", b"abz\r", 5);
     assert_exhaustive_windows(r"a[ab]+c", b"abc!", 5);
+    assert_exhaustive_windows(r"a[ab]+", b"ab!\xff", 5);
     assert_exhaustive_windows(r"a[bc]*", b"abc!", 5);
+    assert_exhaustive_windows(r"a[\x80-\xFF]*z", b"az!\x80\xff", 4);
     assert_exhaustive_windows(r"\b[A-B]+T\b", b"ABT!0_\xff", 5);
+}
+
+#[test]
+fn ordinary_lazy_byte_runs_match_upstream_with_stable_runtime_identity() {
+    for pattern in [r"a[bc]*?d", r"a[bc]+?d", r"a[ab]+?c"] {
+        let regex = portable(pattern);
+        let upstream = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
+            "{pattern:?}"
+        );
+        for haystack in [
+            b"".as_slice(),
+            b"!ad!",
+            b"!abcd!",
+            b"!abcbX!abcd!",
+            b"\xffa\x80d!abbd\x80",
+        ] {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                regex
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+                "selected pattern={pattern:?} haystack={haystack:?}"
+            );
+            assert_eq!(
+                regex.is_match(haystack),
+                expected.is_some(),
+                "existence pattern={pattern:?} haystack={haystack:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn exhaustive_guarded_suffix_inside_class_windows_match_oracles() {
     assert_exhaustive_windows(r"\b[AB]+B\b", b"ABC!\x80\xff", 4);
     assert_exhaustive_windows(r"\b[A-T]+T\b", b"AMTU!\x80\xff", 4);
+}
+
+#[test]
+fn guarded_self_overlapping_suffix_preserves_boundary_rejections_and_later_validity() {
+    let pattern = r"\b[A-B]+TAT\b";
+    let regex = portable(pattern);
+    let upstream = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+    assert_eq!(
+        regex.runtime_implementation_id(),
+        LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID
+    );
+
+    for (label, haystack, should_match) in [
+        ("right boundary", b"!ABTATX!".as_slice(), false),
+        ("left boundary", b"0ABTAT!".as_slice(), false),
+        (
+            "overlapping right then left",
+            b"!ABTATAT!".as_slice(),
+            false,
+        ),
+        ("miss", b"!ABTA!".as_slice(), false),
+        (
+            "overlapping rejections then later valid",
+            b"!ABTATAT!!BBTAT!".as_slice(),
+            true,
+        ),
+    ] {
+        let expected = upstream
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected.is_some(), should_match, "{label}");
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+            "{label}: haystack={haystack:?}"
+        );
+        assert_eq!(regex.is_match(haystack), should_match, "{label}");
+    }
+}
+
+#[test]
+fn guarded_suffix_inside_class_self_overlap_matches_ordinary_oracle() {
+    let pattern = r"\b[A-T]+TAT\b";
+    let regex = portable(pattern);
+    let upstream = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+    assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+    assert_eq!(
+        regex.runtime_implementation_id(),
+        LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID
+    );
+
+    for (label, haystack, should_match) in [
+        ("valid", b"!ABTAT!".as_slice(), true),
+        ("right boundary rejection", b"!ABTATX!".as_slice(), false),
+        ("left boundary rejection", b"0ABTAT!".as_slice(), false),
+        (
+            "overlapping second suffix valid",
+            b"!ABTATAT!".as_slice(),
+            true,
+        ),
+        ("suffix without a preceding run", b"!TAT!".as_slice(), false),
+        ("miss", b"!ABTA!".as_slice(), false),
+        (
+            "overlapping rejected segment then later valid",
+            b"0ABTATAT!!ABTAT!".as_slice(),
+            true,
+        ),
+        ("malformed separators", b"\xffABTAT\x80".as_slice(), true),
+    ] {
+        let expected = upstream
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected.is_some(), should_match, "oracle fixture {label}");
+        assert_eq!(
+            regex.is_match(haystack),
+            should_match,
+            "ordinary existence {label}: haystack={haystack:?}"
+        );
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+            "ordinary selected {label}: haystack={haystack:?}"
+        );
+    }
 }
 
 #[test]

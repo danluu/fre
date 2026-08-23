@@ -30,6 +30,15 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
         .unicode(false)
         .build()
         .unwrap();
+    let generalized = PortableBuilder::new(r"a[ab]+c")
+        .unicode(false)
+        .build()
+        .unwrap();
+    let generalized_guarded = PortableBuilder::new(r"\b[A-B]+T\b")
+        .unicode(false)
+        .build()
+        .unwrap();
+    let unicode_generalized = PortableBuilder::new(r"a[^z\r\n]*z").build().unwrap();
     let haystack = b"!aa0101QZ!";
     let suffix_haystack = b"!a0101TRAILER!";
     let absent = b"!aa0101XX!";
@@ -38,6 +47,12 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
     let inside_invalid_haystack = b"!aba!";
     let malformed_inside_haystack = b"\xFF\xFF!\x80\xFF\xFF!";
     let guarded_haystack = b"!testing!";
+    let generalized_haystack = b"\xFF!aaabc\x80";
+    let generalized_miss_haystack = b"\xFF!aaabX\x80";
+    let generalized_guarded_haystack = b"0AATX!\xFFAABT\x80";
+    let generalized_guarded_left_rejection_haystack = b"0AABT!";
+    let unicode_generalized_haystack = "!aé文z!".as_bytes();
+    let unicode_generalized_malformed_miss_haystack = b"!a\xC0\xAFz!";
     let window = SearchWindow::full(haystack);
     let (_, accounting) = regex
         .is_match_window(haystack, window, SearchLimits::unlimited())
@@ -124,6 +139,55 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
             black_box(guarded.find(black_box(guarded_haystack)))
                 .map(|matched| (matched.start(), matched.end())),
             Some((1, 8)),
+        );
+        assert!(black_box(
+            generalized.is_match(black_box(generalized_haystack))
+        ));
+        assert_eq!(
+            black_box(generalized.find(black_box(generalized_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 7)),
+        );
+        assert!(!black_box(
+            generalized.is_match(black_box(generalized_miss_haystack))
+        ));
+        assert_eq!(
+            black_box(generalized.find(black_box(generalized_miss_haystack))),
+            None,
+        );
+        assert!(black_box(
+            generalized_guarded.is_match(black_box(generalized_guarded_haystack))
+        ));
+        assert_eq!(
+            black_box(generalized_guarded.find(black_box(generalized_guarded_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((7, 11)),
+        );
+        assert!(!black_box(generalized_guarded.is_match(black_box(
+            generalized_guarded_left_rejection_haystack
+        ))));
+        assert_eq!(
+            black_box(
+                generalized_guarded.find(black_box(generalized_guarded_left_rejection_haystack))
+            ),
+            None,
+        );
+        assert!(black_box(
+            unicode_generalized.is_match(black_box(unicode_generalized_haystack))
+        ));
+        assert_eq!(
+            black_box(unicode_generalized.find(black_box(unicode_generalized_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 8)),
+        );
+        assert!(!black_box(unicode_generalized.is_match(black_box(
+            unicode_generalized_malformed_miss_haystack
+        ))));
+        assert_eq!(
+            black_box(
+                unicode_generalized.find(black_box(unicode_generalized_malformed_miss_haystack))
+            ),
+            None,
         );
         assert!(
             regex

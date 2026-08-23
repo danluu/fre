@@ -10811,6 +10811,28 @@ mod literal_class_run_literal_ordinary_find_probe {
     }
 }
 
+#[cfg(test)]
+mod literal_class_run_search_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -14178,6 +14200,16 @@ impl PortableRegex {
                 #[cfg(test)]
                 literal_class_run_literal_ordinary_find_probe::record();
                 plan.find_full_ordinary_value(haystack)
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
+            }
+            PortablePlan::LiteralClassRunSearch(plan)
+                if plan.boundary_semantics()
+                    == LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun =>
+            {
+                #[cfg(test)]
+                literal_class_run_search_ordinary_facade_probe::record_span();
+                plan.find_ascii_word_suffix_full_ordinary_value(haystack)
                     .map(|matched| matched.map(|(start, end)| Match { start, end }))
                     .map_err(SearchError::from)
             }
@@ -40764,6 +40796,163 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one route-isolation matrix covers every public explicit-state family"
+    )]
+    fn literal_class_run_search_ordinary_values_are_isolated_from_explicit_apis() {
+        for (pattern, haystack, expected, ordinary_guarded) in [
+            (
+                r"a[ab]+c",
+                b"--aaabc--".as_slice(),
+                Some(Match { start: 2, end: 7 }),
+                false,
+            ),
+            (
+                r"\b[A-B]+T\b",
+                b"--AABT--".as_slice(),
+                Some(Match { start: 2, end: 6 }),
+                true,
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                super::LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
+                "{pattern:?}"
+            );
+            let full = SearchWindow::full(haystack);
+            let unlimited = SearchLimits::unlimited();
+
+            super::literal_class_run_search_ordinary_facade_probe::reset();
+            assert!(regex.is_match_value(haystack, unlimited).unwrap());
+            assert!(regex.is_match_at(haystack, 0, unlimited).unwrap().0);
+            assert!(regex.is_match_value_at(haystack, 0, unlimited).unwrap());
+            assert!(regex.is_match_window(haystack, full, unlimited).unwrap().0);
+            assert!(regex
+                .is_match_window_value(haystack, full, unlimited)
+                .unwrap());
+            assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+            assert_eq!(regex.find_accounted(haystack, unlimited).unwrap().0, expected);
+            assert_eq!(regex.find_at(haystack, 0, unlimited).unwrap().0, expected);
+            assert_eq!(regex.find_at_value(haystack, 0, unlimited).unwrap(), expected);
+            assert_eq!(regex.find_window(haystack, full, unlimited).unwrap().0, expected);
+            assert_eq!(regex.find_window_value(haystack, full, unlimited).unwrap(), expected);
+
+            let refusing = SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            };
+            assert!(regex.is_match_value(haystack, refusing).is_err());
+            assert!(regex.find_value(haystack, refusing).is_err());
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert!(session.is_match_value(haystack, unlimited).unwrap());
+            assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+            assert_eq!(
+                regex
+                    .find_iter(haystack, PortableFindIterLimits::unlimited())
+                    .unwrap()
+                    .next()
+                    .transpose()
+                    .unwrap(),
+                expected,
+            );
+
+            let mut locations = regex.capture_locations();
+            assert_eq!(
+                regex
+                    .captures_read_value(&mut locations, haystack, unlimited)
+                    .unwrap()
+                    .map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    }),
+                expected,
+            );
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "finite, ranged, accounted, session, iterator, and capture APIs stay canonical",
+            );
+
+            assert!(regex.is_match(haystack));
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, 0),
+            );
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, usize::from(ordinary_guarded)),
+            );
+        }
+    }
+
+    #[test]
+    fn literal_class_run_search_explicit_capture_refusal_isolated_from_ordinary_values() {
+        for (pattern, haystack, expected, ordinary_guarded) in [
+            (
+                r"(a[ab]+c)",
+                b"--aaabc--".as_slice(),
+                Some(Match { start: 2, end: 7 }),
+                false,
+            ),
+            (
+                r"(\b[A-B]+T\b)",
+                b"--AABT--".as_slice(),
+                Some(Match { start: 2, end: 6 }),
+                true,
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                super::LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
+                "{pattern:?}"
+            );
+            assert_eq!(regex.captures_len(), 2);
+            let unlimited = SearchLimits::unlimited();
+
+            super::literal_class_run_search_ordinary_facade_probe::reset();
+            assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+            let mut locations = regex.capture_locations();
+            assert!(matches!(
+                regex.captures_read_value(&mut locations, haystack, unlimited),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 1 }),
+            ));
+            assert!(matches!(
+                regex.captures_read(&mut locations, haystack, unlimited),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 1 }),
+            ));
+            assert_eq!(locations.get(0), None);
+            assert_eq!(locations.get(1), None);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "canonical value and explicit-capture refusal paths cannot enter ordinary facades",
+            );
+
+            assert!(regex.is_match(haystack));
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, usize::from(ordinary_guarded)),
+            );
+        }
+    }
+
+    #[test]
     fn adjacent_identical_class_run_matches_upstream_exhaustively() {
         let pattern = r"\|[^|][^|]*\|";
         let regex = PortableBuilder::new(pattern)
@@ -41399,8 +41588,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps all four Unicode repetition modes and malformed-source facade parity adjacent"
+    )]
     fn unicode_all_non_ascii_unique_exit_admits_lazy_and_plus_repeats() {
-        let haystack = "--aéaaaz--a文z--a\nzzz--abz".as_bytes();
+        let haystacks = [
+            "--aéaaaz--a文z--a\nzzz--abz".as_bytes(),
+            b"a\x80z--abz--a\xC0\xAFz--aokz".as_slice(),
+            b"a\xED\xA0\x80z--aokz--a\xF0\x9F\x92z--abz".as_slice(),
+            b"--a\nz--a\x80z--".as_slice(),
+        ];
         for pattern in [
             r"a[^z\r\n]*z",
             r"a[^z\r\n]*?z",
@@ -41410,26 +41608,72 @@ mod tests {
             let regex = PortableBuilder::new(pattern).build().unwrap();
             let upstream = regex::bytes::RegexBuilder::new(pattern).build().unwrap();
             assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
-            let expected: Vec<_> = upstream
-                .find_iter(haystack)
-                .map(|matched| (matched.start(), matched.end()))
-                .collect();
-            let actual: Vec<_> = regex
-                .find_iter(haystack, PortableFindIterLimits::unlimited())
-                .unwrap()
-                .map(|matched| {
-                    let matched = matched.unwrap();
-                    (matched.start(), matched.end())
-                })
-                .collect();
-            assert_eq!(actual, expected, "pattern={pattern:?}");
             assert_eq!(
-                regex
-                    .is_match_value(haystack, SearchLimits::unlimited())
-                    .unwrap(),
-                !expected.is_empty(),
-                "value-only pattern={pattern:?}"
+                regex.runtime_implementation_id(),
+                "literal-class-run-search.unicode-all-non-ascii.v1",
+                "{pattern:?}"
             );
+            assert!(matches!(
+                &regex.plan,
+                PortablePlan::LiteralClassRunSearch(_)
+            ));
+            for haystack in haystacks {
+                let expected_match = upstream.find(haystack).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                let expected_iter: Vec<_> = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+
+                super::literal_class_run_search_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected_match.is_some(),
+                    "ordinary existence pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                    (0, 0),
+                    "Unicode generalized ordinary existence stays canonical",
+                );
+                assert_eq!(
+                    regex.find(haystack),
+                    expected_match,
+                    "ordinary selected pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                    (0, 0),
+                    "Unicode generalized ordinary selection stays canonical",
+                );
+
+                let actual_iter: Vec<_> = regex
+                    .find_iter(haystack, PortableFindIterLimits::unlimited())
+                    .unwrap()
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect();
+                assert_eq!(
+                    actual_iter, expected_iter,
+                    "iteration pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    regex
+                        .is_match_value(haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                    expected_match.is_some(),
+                    "value-only pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                    (0, 0),
+                    "iterator and reusable value paths remain canonical",
+                );
+            }
         }
     }
 
