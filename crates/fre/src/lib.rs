@@ -10554,6 +10554,33 @@ mod bounded_required_literal_ordinary_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod reverse_inner_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 // Contextual ordinary value projections occupy only the one-block margin
 // immediately below the incumbent 4,096-byte metered warm path. Longer
 // searches retain contextual loop-skip economics; shorter searches retain the
@@ -12657,6 +12684,17 @@ impl PortableRegex {
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .is_match_full_ordinary_value(haystack)
                 .map_err(SearchError::from),
+            PortablePlan::ReverseInner(plan) => {
+                if let Some(matched) = plan
+                    .ordinary_is_match_full_unmetered(haystack)
+                    .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    reverse_inner_ordinary_facade_probe::record_exists();
+                    return Ok(matched);
+                }
+                self.is_match_window_value(haystack, window, SearchLimits::unlimited())
+            }
             PortablePlan::PackedLiteralSet(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 if let Some(ordinary) =
@@ -14243,6 +14281,17 @@ impl PortableRegex {
                 plan.find_ascii_word_suffix_full_ordinary_value(haystack)
                     .map(|matched| matched.map(|(start, end)| Match { start, end }))
                     .map_err(SearchError::from)
+            }
+            PortablePlan::ReverseInner(plan) => {
+                if let Some(matched) = plan
+                    .ordinary_find_full_unmetered(haystack)
+                    .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    reverse_inner_ordinary_facade_probe::record_span();
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+                self.find_window_value(haystack, window, SearchLimits::unlimited())
             }
             PortablePlan::PackedLiteralSet(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
@@ -26404,6 +26453,195 @@ mod tests {
             0
         );
         assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+    }
+
+    #[test]
+    fn reverse_inner_ordinary_facades_are_single_literal_and_api_local() {
+        let regex = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        let haystack = b"!aaaab!";
+        let expected = Some((1, 6));
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            super::REVERSE_INNER_PLAN_ID,
+        );
+
+        super::reverse_inner_ordinary_facade_probe::reset();
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(regex.is_match(haystack));
+        let ordinary = super::reverse_inner_ordinary_facade_probe::snapshot();
+        assert_eq!(ordinary, (1, 1));
+
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            session
+                .is_match_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        let first = regex
+            .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .next()
+            .expect("one reverse-inner match")
+            .unwrap();
+        assert_eq!((first.start(), first.end()), expected.unwrap());
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(locations.get(0), expected);
+        assert_eq!(
+            super::reverse_inner_ordinary_facade_probe::snapshot(),
+            ordinary,
+            "finite, accounted, session, iterator, and capture APIs stay canonical",
+        );
+
+        let union = PortableBuilder::new(r"(?:[abλ]+aa[abλ]+|[abλ]+b[abλ]+)")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(union.build_report().plan, PlanKind::ReverseInner);
+        assert_eq!(
+            union.runtime_implementation_id(),
+            super::REVERSE_INNER_UNION_PLAN_ID,
+        );
+        super::reverse_inner_ordinary_facade_probe::reset();
+        assert_eq!(
+            union
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(union.is_match(haystack));
+        assert_eq!(
+            super::reverse_inner_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "literal unions must retain their construction-selected route",
+        );
+
+        let grouped_union = PortableBuilder::new(r"[a-zλ]+(?:aab|abb)[a-zλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(grouped_union.build_report().plan, PlanKind::ReverseInner);
+        assert_eq!(
+            grouped_union.runtime_implementation_id(),
+            super::REVERSE_INNER_GROUPED_UNION_PLAN_ID,
+        );
+        let grouped_haystack = b"!zaabz!";
+        super::reverse_inner_ordinary_facade_probe::reset();
+        assert_eq!(
+            grouped_union
+                .find(grouped_haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(grouped_union.is_match(grouped_haystack));
+        assert_eq!(
+            super::reverse_inner_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "grouped literal unions must retain their construction-selected route",
+        );
+    }
+
+    #[test]
+    fn reverse_inner_nested_named_capture_refusal_isolated_from_ordinary_values() {
+        let regex = PortableBuilder::new(r"(?P<outer>[abλ]+(?P<inner>aa)[abλ]+)")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            super::REVERSE_INNER_PLAN_ID,
+        );
+        assert_eq!(regex.captures_len(), 3);
+        assert_eq!(
+            regex.capture_names().collect::<Vec<_>>(),
+            vec![None, Some("outer"), Some("inner")],
+        );
+
+        let haystack = b"!aaaab!";
+        let expected = Some((1, 6));
+        super::reverse_inner_ordinary_facade_probe::reset();
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(regex.is_match(haystack));
+        let ordinary = super::reverse_inner_ordinary_facade_probe::snapshot();
+        assert_eq!(ordinary, (1, 1));
+
+        let mut locations = regex.capture_locations();
+        assert!(matches!(
+            regex.captures_read_value(
+                &mut locations,
+                haystack,
+                SearchLimits::unlimited(),
+            ),
+            Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 2 }),
+        ));
+        assert!(matches!(
+            regex.captures_read(&mut locations, haystack, SearchLimits::unlimited()),
+            Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 2 }),
+        ));
+        for index in 0..regex.captures_len() {
+            assert_eq!(locations.get(index), None);
+        }
+        assert_eq!(
+            super::reverse_inner_ordinary_facade_probe::snapshot(),
+            ordinary,
+            "explicit capture refusal cannot enter either ordinary facade",
+        );
     }
 
     #[test]

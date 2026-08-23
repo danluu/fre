@@ -1716,6 +1716,226 @@ impl ReverseInnerPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Try the report-free ordinary full-haystack selected-span route.
+    ///
+    /// The outer `None` declines unless construction retained exactly one
+    /// independent literal and the input is inside a conservative arithmetic
+    /// envelope for the canonical unlimited search. A completed attempt uses
+    /// the theorem's simpler local proof: an ASCII literal is strictly inside
+    /// a class run exactly when its immediately adjacent Unicode scalars are
+    /// members. The selected greedy span is then that complete maximal run.
+    #[doc(hidden)]
+    #[inline]
+    pub fn ordinary_find_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<Option<(usize, usize)>>, SearchError> {
+        if !self.ordinary_single_literal_envelope_fits(haystack.len()) {
+            return Ok(None);
+        }
+        let Some((literal_start, literal_end)) =
+            self.first_strict_single_literal_candidate(haystack)?
+        else {
+            return Ok(Some(None));
+        };
+        let run_start = self.scan_run_backward_value(haystack, literal_start)?;
+        let run_end = self.scan_run_forward_value(haystack, literal_end)?;
+        Ok(Some(Some((run_start, run_end))))
+    }
+
+    /// Try the report-free ordinary full-haystack existence route.
+    ///
+    /// The outer `None` has the same shape/envelope decline contract as
+    /// [`Self::ordinary_find_full_unmetered`]. Existence stops as soon as one
+    /// literal has class-member scalars on both sides and therefore does not
+    /// recover the containing maximal run.
+    #[doc(hidden)]
+    #[inline]
+    pub fn ordinary_is_match_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<bool>, SearchError> {
+        if !self.ordinary_single_literal_envelope_fits(haystack.len()) {
+            return Ok(None);
+        }
+        self.first_strict_single_literal_candidate(haystack)
+            .map(|candidate| Some(candidate.is_some()))
+    }
+
+    /// Admit only inputs for which the canonical one-literal upper-bound
+    /// derivation is necessarily representable. For `N` input bytes its only
+    /// quadratic term is overlapping finder service, bounded by `N^2`. Every
+    /// remaining work term is bounded by
+    /// `N * (42 + 2 * comparisons_per_membership) + 20`.
+    #[inline]
+    fn ordinary_single_literal_envelope_fits(&self, input_bytes: usize) -> bool {
+        if self.build.union_mode != UnionMode::None || self.finders.len() != 1 {
+            return false;
+        }
+        let comparisons =
+            binary_search_comparison_bound(self.build.retained_non_ascii_ranges).max(1);
+        let Some(linear_factor) = comparisons
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(42))
+        else {
+            return false;
+        };
+        if input_bytes
+            .checked_mul(input_bytes)
+            .and_then(|quadratic| {
+                input_bytes
+                    .checked_mul(linear_factor)
+                    .and_then(|linear| quadratic.checked_add(linear))
+            })
+            .and_then(|work| work.checked_add(20))
+            .is_none()
+        {
+            return false;
+        }
+        u64::try_from(input_bytes).is_ok()
+    }
+
+    #[inline]
+    fn first_strict_single_literal_candidate(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let finder = self.finders.first().ok_or(ReduceError::AccountingInvariant {
+            resource: "ordinary single-literal finder",
+            actual: 0,
+            upper: 1,
+        })?;
+        let mut cursor = 0_usize;
+        loop {
+            let search = haystack
+                .get(cursor..)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary single-literal search window",
+                })?;
+            let Some(relative) = finder.find(search) else {
+                return Ok(None);
+            };
+            let literal_start = cursor
+                .checked_add(relative)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary single-literal candidate start",
+                })?;
+            let literal_end = literal_start.checked_add(finder.needle().len()).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary single-literal candidate end",
+                },
+            )?;
+            if self.strict_candidate_has_member_neighbors(haystack, literal_start, literal_end)? {
+                return Ok(Some((literal_start, literal_end)));
+            }
+            cursor = literal_start
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary single-literal overlapping progress",
+                })?;
+        }
+    }
+
+    #[inline]
+    fn strict_candidate_has_member_neighbors(
+        &self,
+        haystack: &[u8],
+        literal_start: usize,
+        literal_end: usize,
+    ) -> Result<bool, SearchError> {
+        if literal_start == 0 || literal_end >= haystack.len() {
+            return Ok(false);
+        }
+        let preceding = decode_previous_scalar(haystack, 0, literal_start)?;
+        let Some(preceding_scalar) = preceding.scalar else {
+            return Ok(false);
+        };
+        if preceding.width == 0 || !self.contains_value(preceding_scalar) {
+            return Ok(false);
+        }
+        let following = decode_scalar(haystack.get(literal_end..).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "ordinary single-literal following window",
+            },
+        )?);
+        let Some(following_scalar) = following.scalar else {
+            return Ok(false);
+        };
+        Ok(following.width != 0 && self.contains_value(following_scalar))
+    }
+
+    #[inline]
+    fn scan_run_backward_value(
+        &self,
+        haystack: &[u8],
+        mut end: usize,
+    ) -> Result<usize, SearchError> {
+        while end != 0 {
+            let decoded = decode_previous_scalar(haystack, 0, end)?;
+            let Some(scalar) = decoded.scalar else {
+                break;
+            };
+            if decoded.width == 0 || !self.contains_value(scalar) {
+                break;
+            }
+            end = end
+                .checked_sub(decoded.width)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary reverse scalar progress",
+                })?;
+        }
+        Ok(end)
+    }
+
+    #[inline]
+    fn scan_run_forward_value(
+        &self,
+        haystack: &[u8],
+        mut start: usize,
+    ) -> Result<usize, SearchError> {
+        while start < haystack.len() {
+            let decoded = decode_scalar(haystack.get(start..).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary forward scalar decode window",
+                },
+            )?);
+            let Some(scalar) = decoded.scalar else {
+                break;
+            };
+            if decoded.width == 0 || !self.contains_value(scalar) {
+                break;
+            }
+            start = start
+                .checked_add(decoded.width)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary forward scalar progress",
+                })?;
+        }
+        Ok(start)
+    }
+
+    #[inline]
+    fn contains_value(&self, scalar: u32) -> bool {
+        if scalar <= 0x7F {
+            return u8::try_from(scalar)
+                .is_ok_and(|byte| ascii_contains(self.ascii, byte));
+        }
+        let mut low = 0_usize;
+        let mut high = self.non_ascii.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let range = self.non_ascii[middle];
+            if scalar < range.start {
+                high = middle;
+            } else if scalar > range.end {
+                low = middle + 1;
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
     fn search_in(
         &self,
         haystack: &[u8],
@@ -4854,6 +5074,12 @@ mod tests {
         let (shortest, shortest_search) = plan
             .shortest(haystack, SearchLimits::unlimited())
             .expect("shortest search");
+        let ordinary_find = plan
+            .ordinary_find_full_unmetered(haystack)
+            .expect("ordinary selected-span attempt");
+        let ordinary_exists = plan
+            .ordinary_is_match_full_unmetered(haystack)
+            .expect("ordinary existence attempt");
         assert_eq!(
             (count.count, span_sum.span_sum),
             expected,
@@ -4874,6 +5100,27 @@ mod tests {
         assert_eq!(found, expected_find, "find haystack={haystack:?}");
         assert_eq!(exists, expected_find.is_some(), "exists haystack={haystack:?}");
         assert_eq!(shortest, expected_shortest, "shortest haystack={haystack:?}");
+        if plan.finders.len() == 1 {
+            assert_eq!(
+                ordinary_find,
+                Some(expected_find),
+                "ordinary find haystack={haystack:?}",
+            );
+            assert_eq!(
+                ordinary_exists,
+                Some(expected_find.is_some()),
+                "ordinary exists haystack={haystack:?}",
+            );
+        } else {
+            assert_eq!(
+                ordinary_find, None,
+                "ordinary find must decline literal unions",
+            );
+            assert_eq!(
+                ordinary_exists, None,
+                "ordinary exists must decline literal unions",
+            );
+        }
         assert_eq!(search.identity.operation_id, SEARCH_OPERATION_ID);
         assert_eq!(exists_search.identity.operation_id, EXISTS_OPERATION_ID);
         assert_eq!(
@@ -4904,6 +5151,145 @@ mod tests {
             .expect("overlapping interior candidate");
         assert_eq!(accepted.span_sum, 4);
         assert_eq!(accepted.accounting.actual.match_events, 1);
+    }
+
+    #[test]
+    fn ordinary_single_literal_envelope_has_exact_boundaries_and_declines_unions() {
+        fn assert_exact_ceiling(plan: &ReverseInnerPlan) {
+            let mut admitted = 0_usize;
+            let mut candidate_ceiling = usize::MAX;
+            while admitted < candidate_ceiling {
+                let distance = candidate_ceiling - admitted;
+                let candidate = admitted + distance / 2 + distance % 2;
+                if plan.ordinary_single_literal_envelope_fits(candidate) {
+                    admitted = candidate;
+                } else {
+                    candidate_ceiling = candidate - 1;
+                }
+            }
+            assert!(plan.ordinary_single_literal_envelope_fits(admitted));
+            let one_above = admitted
+                .checked_add(1)
+                .expect("quadratic envelope ceiling is below usize::MAX");
+            assert!(!plan.ordinary_single_literal_envelope_fits(one_above));
+        }
+
+        let one_comparison = plan(&SMALL_CLASS, &[b"aa"]);
+        let two_comparisons = plan(
+            &[('a', 'b'), ('λ', 'λ'), ('π', 'π'), ('ω', 'ω')],
+            &[b"aa"],
+        );
+        let three_comparisons = plan(
+            &[
+                ('a', 'b'),
+                ('λ', 'λ'),
+                ('π', 'π'),
+                ('ω', 'ω'),
+                ('Ж', 'Ж'),
+                ('Я', 'Я'),
+                ('я', 'я'),
+                ('א', 'א'),
+            ],
+            &[b"aa"],
+        );
+        for (single, expected_comparisons) in [
+            (&one_comparison, 1),
+            (&two_comparisons, 2),
+            (&three_comparisons, 3),
+        ] {
+            assert_eq!(
+                super::binary_search_comparison_bound(single.build.retained_non_ascii_ranges),
+                expected_comparisons,
+            );
+            assert!(single.ordinary_single_literal_envelope_fits(0));
+            assert!(single.ordinary_single_literal_envelope_fits(4_096));
+            assert_exact_ceiling(single);
+        }
+
+        let adaptive_union = plan(&SMALL_CLASS, &SMALL_LITERALS);
+        assert_eq!(adaptive_union.build.union_mode, UnionMode::AdaptiveFirstByte);
+        let grouped_union = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
+        assert_eq!(grouped_union.build.union_mode, UnionMode::GroupedFixedColumn);
+        for union in [&adaptive_union, &grouped_union] {
+            assert!(!union.ordinary_single_literal_envelope_fits(4_096));
+            assert_eq!(
+                union
+                    .ordinary_find_full_unmetered(b"!aaaab!")
+                    .expect("union decline is infallible"),
+                None,
+            );
+            assert_eq!(
+                union
+                    .ordinary_is_match_full_unmetered(b"!aaaab!")
+                    .expect("union decline is infallible"),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_single_literal_matches_oracle_across_lifecycle_cases() {
+        let plan = plan(&SMALL_CLASS, &[b"aa"]);
+        let regex = oracle(r"[abλ]+aa[abλ]+");
+        let mut late = vec![b'!'; 4_093];
+        late.extend_from_slice("λaaaabλ".as_bytes());
+        let malformed = [
+            b"\xff\xce!".as_slice(),
+            "λaaaabλ".as_bytes(),
+            b"\xf0\x90\x80!\x80".as_slice(),
+        ]
+        .concat();
+        let haystacks = [
+            b"!aaaab!".to_vec(),
+            "--λaaaabλ--".as_bytes().to_vec(),
+            b"!aa!".to_vec(),
+            b"aaaa".to_vec(),
+            late,
+            malformed,
+        ];
+        for haystack in &haystacks {
+            assert_matches_oracle(&plan, &regex, haystack);
+        }
+    }
+
+    #[test]
+    fn ordinary_single_literal_exhaustive_cutpoints_and_malformed_adjacency_match_oracle() {
+        let plan = plan(&SMALL_CLASS, &[b"aa"]);
+        let regex = oracle(r"[abλ]+aa[abλ]+");
+        for run_len in [15_usize, 16, 17, 31, 32, 33] {
+            for literal_start in 1..=(run_len - 3) {
+                let mut run = vec![b'b'; run_len];
+                run[literal_start..literal_start + 2].copy_from_slice(b"aa");
+
+                let mut bounded = Vec::with_capacity(run_len + 2);
+                bounded.push(b'!');
+                bounded.extend_from_slice(&run);
+                bounded.push(b'!');
+                assert_matches_oracle(&plan, &regex, &bounded);
+
+                let mut malformed_boundaries = Vec::with_capacity(run_len + 2);
+                malformed_boundaries.push(0xFF);
+                malformed_boundaries.extend_from_slice(&run);
+                malformed_boundaries.push(0x80);
+                assert_matches_oracle(&plan, &regex, &malformed_boundaries);
+
+                let mut malformed_before = Vec::with_capacity(run_len + 5);
+                malformed_before.push(b'!');
+                malformed_before.extend_from_slice(&run[..literal_start - 1]);
+                malformed_before.extend_from_slice(b"\xF0\x90\x80");
+                malformed_before.extend_from_slice(&run[literal_start..]);
+                malformed_before.push(b'!');
+                assert_matches_oracle(&plan, &regex, &malformed_before);
+
+                let mut malformed_after = Vec::with_capacity(run_len + 6);
+                malformed_after.push(b'!');
+                malformed_after.extend_from_slice(&run[..literal_start + 2]);
+                malformed_after.extend_from_slice(b"\xF4\x90\x80\x80");
+                malformed_after.extend_from_slice(&run[literal_start + 3..]);
+                malformed_after.push(b'!');
+                assert_matches_oracle(&plan, &regex, &malformed_after);
+            }
+        }
     }
 
     #[test]

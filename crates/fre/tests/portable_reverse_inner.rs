@@ -27,6 +27,18 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
     let expected_find = expected
         .find(haystack)
         .map(|matched| (matched.start(), matched.end()));
+    assert_eq!(
+        actual
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end())),
+        expected_find,
+        "ordinary find haystack={haystack:?}",
+    );
+    assert_eq!(
+        actual.is_match(haystack),
+        expected_find.is_some(),
+        "ordinary is_match haystack={haystack:?}",
+    );
     let (found, accounting) = actual
         .find_accounted(haystack, SearchLimits::unlimited())
         .expect("reverse-inner find");
