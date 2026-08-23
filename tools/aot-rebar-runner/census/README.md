@@ -142,6 +142,10 @@ python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
 Repeat `--primary-object` and `--replica-object` in component ordinal order for
 a composite v3 runner or the single-component strict-capture v4 runner. Its
 normalized provenance must match every supplied object digest in both builds.
+For regex-redux, supply the 15 component objects in ordinal order followed by
+`aot-rebar-artifact.o`, the whole-operation reducer. Its reducer is the sole
+claimed operation entry; the 15 component entries are authenticated linked
+identities rather than Rust adapter-loop entries.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row

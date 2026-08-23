@@ -58,24 +58,28 @@ fn main() {
     let source_tree =
         env::var(SOURCE_TREE_ENV).unwrap_or_else(|_| "unbound-development".to_owned());
     if benchmark.model == shared::Model::RegexRedux {
-        let mut components = Vec::with_capacity(shared::REGEX_REDUX_COMPONENTS);
-        let mut object_paths = Vec::with_capacity(shared::REGEX_REDUX_COMPONENTS);
-        for component in 0..shared::REGEX_REDUX_COMPONENTS {
-            let compiled = shared::compile_regex_redux_component(component, target)
-                .expect("compile fixed public Rebar regex-redux component");
+        let artifact = fre_aot_regex::compile_native_regex_redux_aot_v1(
+            target,
+            fre_aot_regex::NativeRegexReduxAotLimitsV1::default(),
+        )
+        .expect("compile fixed public Rebar native regex-redux operation");
+        let mut object_paths = Vec::with_capacity(
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS.saturating_add(1),
+        );
+        for (component, compiled) in artifact.components().iter().enumerate() {
             let component_path = output.join(format!("aot-rebar-regex-redux-{component:02}.o"));
             fs::write(&component_path, compiled.object())
                 .expect("write linked regex-redux component object");
-            components.push(compiled);
             object_paths.push(component_path);
         }
-        fs::write(&object_path, []).expect("write unused scalar object sentinel");
+        fs::write(&object_path, artifact.reducer_object())
+            .expect("write linked regex-redux whole-operation reducer object");
+        object_paths.push(object_path.clone());
         fs::write(
             &generated_path,
             configured_regex_redux_source(
                 &benchmark,
-                &components,
-                &object_paths,
+                &artifact,
                 &architecture,
                 &operating_system,
                 feature_bits,
@@ -295,8 +299,10 @@ fn main() {
         return;
     }
     if benchmark.uses_native_row_bridge() {
-        let shared = if matches!(benchmark.model, shared::Model::Count | shared::Model::SpanSum)
-            && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        let shared = if matches!(
+            benchmark.model,
+            shared::Model::Count | shared::Model::SpanSum
+        ) && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         {
             Some(
                 shared::try_compile_shared_ordered_many_aggregate(&benchmark, target)
@@ -944,6 +950,7 @@ fn configured_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     writeln!(
         source,
         "pub static OBJECT_BYTES: &[u8] = include_bytes!({:?});",
@@ -997,9 +1004,6 @@ fn configured_source(
             "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
         );
     }
-    source.push_str(
-        "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
-    );
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
@@ -1013,8 +1017,7 @@ fn configured_source(
 )]
 fn configured_regex_redux_source(
     benchmark: &shared::Benchmark,
-    components: &[fre_aot_regex::CompiledRegex],
-    object_paths: &[PathBuf],
+    artifact: &fre_aot_regex::NativeRegexReduxAotArtifactV1,
     architecture: &str,
     operating_system: &str,
     feature_bits: u64,
@@ -1024,12 +1027,40 @@ fn configured_regex_redux_source(
     assert_eq!(benchmark.model, shared::Model::RegexRedux);
     assert!(benchmark.patterns.is_empty());
     assert!(!benchmark.unicode && !benchmark.case_insensitive);
+    let components = artifact.components();
     assert_eq!(components.len(), shared::REGEX_REDUX_COMPONENTS);
-    assert_eq!(object_paths.len(), components.len());
+    assert_eq!(
+        components.len(),
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+    );
+    assert_eq!(
+        shared::REGEX_REDUX_FLATTEN_PATTERN,
+        fre_aot_regex::NATIVE_REGEX_REDUX_FLATTEN_V1
+    );
+    assert_eq!(
+        shared::REGEX_REDUX_VARIANTS,
+        fre_aot_regex::NATIVE_REGEX_REDUX_VARIANTS_V1
+    );
+    assert!(
+        shared::REGEX_REDUX_SUBSTITUTIONS
+            .iter()
+            .zip(fre_aot_regex::NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1)
+            .all(
+                |((source, replacement), (native_source, native_replacement))| {
+                    source == &native_source && replacement.as_bytes() == native_replacement
+                }
+            )
+    );
 
     let first = components
         .first()
         .expect("regex-redux has fixed components");
+    let operation_receipt = artifact.receipt();
+    assert_eq!(
+        operation_receipt.target,
+        shared::target_from_parts(architecture, operating_system, feature_bits)
+            .expect("generated regex-redux target remains supported")
+    );
     let compiler_version = first.receipt().compiler_version;
     let optimizer_version = first.receipt().optimizer_version;
     let mut entry_symbols = Vec::with_capacity(components.len());
@@ -1088,6 +1119,52 @@ fn configured_regex_redux_source(
         program_hashes.push(receipt.program_sha256);
         object_hashes.push(receipt.object_sha256);
     }
+    assert_eq!(
+        operation_receipt.component_entry_symbols.as_ref(),
+        entry_symbols.as_slice()
+    );
+    assert_eq!(
+        operation_receipt.component_program_sha256.as_ref(),
+        program_hashes.as_slice()
+    );
+    assert_eq!(
+        operation_receipt.component_object_sha256.as_ref(),
+        object_hashes.as_slice()
+    );
+    assert_eq!(
+        artifact.reducer_module().entry_symbol(),
+        operation_receipt.reducer_symbol
+    );
+    assert!(
+        artifact
+            .reducer_module()
+            .required_runtime_symbols()
+            .eq(entry_symbols.iter().map(String::as_str)),
+        "regex-redux reducer link closure differs from its fifteen component entries"
+    );
+    assert!(
+        entry_symbols
+            .iter()
+            .all(|symbol| !symbol.starts_with("fre_aot_regex_runtime_")),
+        "regex-redux reducer retains a semantic runtime helper"
+    );
+    assert_eq!(
+        operation_receipt.abi_version,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION
+    );
+    assert_eq!(
+        operation_receipt.request_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES
+    );
+    assert_eq!(
+        operation_receipt.receipt_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES
+    );
+    assert_eq!(
+        operation_receipt.report_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES
+    );
+    assert!(!artifact.reducer_object().is_empty());
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
@@ -1144,19 +1221,22 @@ fn configured_regex_redux_source(
     writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
     source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
     source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
-    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
+    writeln!(
+        source,
+        "pub const REDUCER_SYMBOL: &str = {:?};",
+        operation_receipt.reducer_symbol
+    )
+    .unwrap();
     source.push_str("pub const ENTRY_SYMBOL: &str = \"\";\n");
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
     source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
-    source.push_str(
-        "pub const SPAN_ITERATION_STRATEGY: &str = \"fixed-component-direct-entry-loop\";\n",
-    );
+    source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
     source.push_str("pub const GREP_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
     source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
-    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"component-indexed\";\n");
-    source.push_str("pub const ENGINE: &str = \"FixedRegexReduxComponents\";\n");
+    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
+    source.push_str("pub const ENGINE: &str = \"NativeRegexReduxAotV1\";\n");
     source.push_str(
-        "pub const AGGREGATE_STRATEGY: &str = \"linked-fixed-regex-redux-span-entries\";\n",
+        "pub const AGGREGATE_STRATEGY: &str = \"native-fixed-regex-redux-whole-operation-v1\";\n",
     );
     writeln!(
         source,
@@ -1169,7 +1249,12 @@ fn configured_regex_redux_source(
     )
     .unwrap();
     source.push_str("pub const PROGRAM_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_object_sha256
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const REGEX_REDUX_COMPONENT_COUNT: usize = {};",
@@ -1202,24 +1287,88 @@ fn configured_regex_redux_source(
         "pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &{object_hashes:?};"
     )
     .unwrap();
-    source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = {:?};",
+        operation_receipt.operation_identity
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_code_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_data_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_object_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = {};",
+        operation_receipt.reducer_relocation_count
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_ABI_VERSION: u32 = {};",
+        operation_receipt.abi_version
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REQUEST_BYTES: usize = {};",
+        operation_receipt.request_bytes
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_RECEIPT_BYTES: usize = {};",
+        operation_receipt.receipt_bytes
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REPORT_BYTES: usize = {};",
+        operation_receipt.report_bytes
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 2;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 3;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 2;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = \"u64-input-clean-variant9-substitution5-final-report-v1\";\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_SCHEMA: &str = \"variant9-blank-input-clean-final-lines-v1\";\n");
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub static OBJECT_BYTES: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/aot-rebar-artifact.o\"));\n");
 
     source.push_str("unsafe extern \"C\" {\n");
-    for (component, entry) in entry_symbols.iter().enumerate() {
-        writeln!(source, "    #[link_name = {entry:?}]").unwrap();
-        writeln!(source, "    fn REGEX_REDUX_ENTRY_{component}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
-    }
+    writeln!(
+        source,
+        "    #[link_name = {:?}]",
+        operation_receipt.reducer_symbol
+    )
+    .unwrap();
+    source.push_str("    fn REGEX_REDUX_REDUCER(request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32;\n");
     source.push_str("}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn regex_redux_search(component: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match component {\n");
-    for component in 0..components.len() {
-        writeln!(source, "        {component} => unsafe {{ REGEX_REDUX_ENTRY_{component}(haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
-    }
-    source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
+    source.push_str("pub unsafe fn regex_redux_reduce(request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32 { unsafe { REGEX_REDUX_REDUCER(request) } }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
@@ -1244,11 +1393,13 @@ fn configured_participation_capture_source(
     assert_eq!(benchmark.patterns.len(), 1);
     let artifact = &bridge.artifact;
     assert!(artifact.authenticates_receipt());
-    assert!(artifact
-        .module()
-        .required_runtime_symbols()
-        .next()
-        .is_none());
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
     assert!(artifact.module().required_runtime_program().is_none());
     let outer = artifact.receipt();
     let receipt = outer.native();
@@ -1481,6 +1632,7 @@ fn configured_participation_capture_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {bundle_symbol:?}]").unwrap();
@@ -1497,7 +1649,6 @@ fn configured_participation_capture_source(
     source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { &raw const LINKED_PARTICIPATION_BUNDLE }\n");
     source.push_str("pub unsafe fn participation_exact(request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { unsafe { LINKED_PARTICIPATION_EXACT(request) } }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 1);
@@ -1521,11 +1672,13 @@ fn configured_strict_capture_source(
     assert_eq!(benchmark.patterns.len(), 1);
     let artifact = &bridge.artifact;
     assert!(artifact.authenticates_receipt());
-    assert!(artifact
-        .module()
-        .required_runtime_symbols()
-        .next()
-        .is_none());
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
     let receipt = artifact.receipt();
     let next_symbol = artifact.capture_next_symbol();
     let materialize_symbol = artifact.capture_materialize_symbol();
@@ -1745,6 +1898,7 @@ fn configured_strict_capture_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {next_symbol:?}]").unwrap();
@@ -1755,7 +1909,6 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
@@ -1819,24 +1972,28 @@ fn configured_native_row_source(
         match artifact.route {
             shared::NativeRowRoute::Ordinary => {
                 assert!(!compiled.receipt().runtime_helper_required);
-                assert!(compiled
-                    .module()
-                    .required_runtime_symbols()
-                    .next()
-                    .is_none());
-                assert!(!compiled
-                    .module()
-                    .symbols()
-                    .iter()
-                    .enumerate()
-                    .any(|(index, symbol)| {
-                        symbol.section.is_none()
-                            && compiled
-                                .module()
-                                .relocations()
-                                .iter()
-                                .any(|relocation| relocation.symbol == index)
-                    }));
+                assert!(
+                    compiled
+                        .module()
+                        .required_runtime_symbols()
+                        .next()
+                        .is_none()
+                );
+                assert!(
+                    !compiled
+                        .module()
+                        .symbols()
+                        .iter()
+                        .enumerate()
+                        .any(|(index, symbol)| {
+                            symbol.section.is_none()
+                                && compiled
+                                    .module()
+                                    .relocations()
+                                    .iter()
+                                    .any(|relocation| relocation.symbol == index)
+                        })
+                );
                 assert!(compiled.module().prepared_entry_symbol().is_none());
                 assert!(compiled.module().required_runtime_program().is_none());
             }
@@ -2093,9 +2250,17 @@ fn configured_native_row_source(
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_SCALAR_REDUCER: bool = false;").unwrap();
-    writeln!(source, "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;").unwrap();
+    writeln!(
+        source,
+        "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;"
+    )
+    .unwrap();
     writeln!(source, "pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;").unwrap();
-    writeln!(source, "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];").unwrap();
+    writeln!(
+        source,
+        "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
@@ -2395,6 +2560,7 @@ fn configured_native_row_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
     source.push_str("unsafe extern \"C\" {\n");
     for (index, artifact) in bridge.artifacts.iter().enumerate() {
@@ -2466,12 +2632,29 @@ fn configured_native_row_source(
     source.push_str(
         "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
-    source.push_str(
-        "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
-    );
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     source
+}
+
+fn push_empty_native_regex_redux_bindings(source: &mut String) {
+    source.push_str("pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_ABI_VERSION: u32 = 0;\n");
+    source.push_str("pub const REGEX_REDUX_REQUEST_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = \"\";\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_SCHEMA: &str = \"\";\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub unsafe fn regex_redux_reduce(_request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32 { fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT }\n");
 }
 
 fn push_empty_strict_capture_bindings(source: &mut String) {
@@ -2706,6 +2889,22 @@ pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];
 pub const REGEX_REDUX_NATIVE: &[bool] = &[];
 pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];
 pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];
+pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = 0;
+pub const REGEX_REDUX_ABI_VERSION: u32 = 0;
+pub const REGEX_REDUX_REQUEST_BYTES: usize = 0;
+pub const REGEX_REDUX_RECEIPT_BYTES: usize = 0;
+pub const REGEX_REDUX_REPORT_BYTES: usize = 0;
+pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 0;
+pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 0;
+pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 0;
+pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = "";
+pub const REGEX_REDUX_REPORT_SCHEMA: &str = "";
+pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &[];
+pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];
 pub static OBJECT_BYTES: &[u8] = &[];
 pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }
 pub unsafe fn reduce(
@@ -2748,14 +2947,9 @@ pub unsafe fn fill_spans(
     _capacity: usize,
     _written_out: *mut usize,
 ) -> u32 { 2 }
-pub unsafe fn regex_redux_search(
-    _component: usize,
-    _haystack: *const u8,
-    _haystack_len: usize,
-    _window_start: usize,
-    _window_end: usize,
-    _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
-) -> u32 { 2 }
+pub unsafe fn regex_redux_reduce(
+    _request: *const fre_aot_regex::NativeRegexReduxRequestV1,
+) -> u32 { fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT }
 pub unsafe fn capture_next(
     _haystack: *const u8,
     _haystack_len: usize,

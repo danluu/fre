@@ -581,6 +581,51 @@
         }
       }
     },
+    "regexReduxProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_version", "operation_identity_sha256", "reducer_symbol",
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+        "reducer_relocation_count", "reducer_link_symbols",
+        "semantic_runtime_symbols", "request_bytes", "receipt_bytes",
+        "report_bytes", "scratch_buffer_count", "scratch_capacity_numerator",
+        "scratch_capacity_denominator", "receipt_schema", "report_schema"
+      ],
+      "properties": {
+        "abi_version": { "const": 1 },
+        "operation_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_rebar_regex_redux_v1_[0-9a-f]{64}$"
+        },
+        "reducer_code_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_data_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_object_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_relocation_count": { "enum": [16, 17] },
+        "reducer_link_symbols": {
+          "type": "array", "minItems": 15, "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+          }
+        },
+        "semantic_runtime_symbols": { "const": [] },
+        "request_bytes": { "const": 72 },
+        "receipt_bytes": { "const": 144 },
+        "report_bytes": { "const": 1024 },
+        "scratch_buffer_count": { "const": 2 },
+        "scratch_capacity_numerator": { "const": 3 },
+        "scratch_capacity_denominator": { "const": 2 },
+        "receipt_schema": {
+          "const": "u64-input-clean-variant9-substitution5-final-report-v1"
+        },
+        "report_schema": {
+          "const": "variant9-blank-input-clean-final-lines-v1"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -650,6 +695,7 @@
         "selector_capture_fallback": {
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
+        "regex_redux": { "$ref": "#/$defs/regexReduxProvenance" },
         "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
         "prepared_v15_limits": { "$ref": "#/$defs/preparedV15LimitsProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
@@ -669,6 +715,16 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": {
+              "composite_kind": { "const": "regex-redux-fixed-v1" }
+            },
+            "required": ["composite_kind"]
+          },
+          "then": { "required": ["regex_redux"] },
+          "else": { "not": { "required": ["regex_redux"] } }
+        },
         {
           "if": {
             "properties": { "kind": { "const": "strict-capture-v4" } },

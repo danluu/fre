@@ -421,8 +421,8 @@ fn configured_native_rows_klv(model: Model) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "recursive Cargo smoke for all fixed regex-redux AOT objects and entries"]
-fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(), DynError> {
+#[ignore = "recursive Cargo smoke for the fixed one-call native regex-redux operation"]
+fn configured_regex_redux_links_and_executes_one_native_operation() -> Result<(), DynError> {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -447,7 +447,7 @@ fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(
             .args([
                 "build",
                 "--offline",
-                "--jobs=2",
+                "--jobs=1",
                 "-p",
                 "fre-aot-rebar-runner",
                 "--bin",
@@ -501,7 +501,22 @@ fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(
             "model=regex-redux",
             "benchmark=\"synthetic/aot-runner/regex-redux-smoke\"",
             "component_count=15",
-            "boundary=complete-regex-redux-aot-precompiled",
+            "adapter=general-aot-native-regex-redux-reducer-v1",
+            "engine=NativeRegexReduxAotV1",
+            "aggregate_strategy=native-fixed-regex-redux-whole-operation-v1",
+            "reducer_symbol=fre_aot_regex_rebar_regex_redux_v1_",
+            "reducer_link_symbols=fre_aot_regex_search_v1_",
+            "semantic_runtime_symbols=",
+            "abi_version=1",
+            "request_bytes=72",
+            "receipt_bytes=144",
+            "report_bytes=1024",
+            "scratch_buffer_count=2",
+            "scratch_capacity_numerator=3",
+            "scratch_capacity_denominator=2",
+            "receipt_schema=u64-input-clean-variant9-substitution5-final-report-v1",
+            "report_schema=variant9-blank-input-clean-final-lines-v1",
+            "boundary=single-call-native-regex-redux-reducer",
         ] {
             if !provenance.contains(expected_field) {
                 return Err(format!(

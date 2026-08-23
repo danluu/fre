@@ -17,20 +17,20 @@ use fre_aot_rebar_runner::shared;
 use fre_aot_regex::{
     CompiledRegex, DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+    NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
 };
 #[cfg(test)]
 use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
 use fre_aot_regex_runtime::{
-    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
-    fre_aot_regex_runtime_prepare_exclusive_v3, FreAotRegexCaptureSlotV1,
+    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, FreAotRegexCaptureSlotV1,
     FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexParticipationRequestV1,
-    FreAotRegexPrepareConfigV2, FreAotRegexPrepareConfigV3, FreAotRegexResultV1,
-    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK, ITER_FINISHED,
+    FreAotRegexPrepareConfigV2, FreAotRegexPrepareConfigV3, FreAotRegexResultV1, ITER_FINISHED,
     ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PREPARE_CAPABILITY_KNOWN_FLAGS,
     PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION,
-    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
+    STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v2, fre_aot_regex_runtime_prepare_exclusive_v3,
 };
-use regex_automata::{meta::Regex, Input};
+use regex_automata::{Input, meta::Regex};
 
 #[allow(
     unsafe_code,
@@ -116,6 +116,13 @@ struct RegexReduxStageReceipt {
     final_length: u64,
     report_length: u64,
     report: String,
+    final_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct RegexReduxRun {
+    samples: Vec<Sample>,
+    receipt: RegexReduxStageReceipt,
 }
 
 #[derive(Debug)]
@@ -1266,10 +1273,11 @@ fn main() -> Result<(), DynError> {
     authenticate_linked_route(&benchmark)?;
     let target =
         shared::target_from_parts(linked::TARGET_ARCH, linked::TARGET_OS, linked::FEATURE_BITS)?;
-    let samples = if benchmark.model == shared::Model::RegexRedux {
-        run_regex_redux(&benchmark)?
+    let (samples, regex_redux_receipt) = if benchmark.model == shared::Model::RegexRedux {
+        let run = run_regex_redux(&benchmark)?;
+        (run.samples, Some(run.receipt))
     } else if linked::NATIVE_ROW_BRIDGE {
-        run_native_row_operation(&benchmark)?
+        (run_native_row_operation(&benchmark)?, None)
     } else {
         let mut session = ExclusiveSession::prepare(benchmark.model)?;
         let samples = if benchmark.model == shared::Model::Compile {
@@ -1278,11 +1286,10 @@ fn main() -> Result<(), DynError> {
             run_operation(&benchmark, &mut session)?
         };
         session.destroy()?;
-        samples
+        (samples, None)
     };
     let expected = rust_oracle(&benchmark)?;
-    if benchmark.model == shared::Model::RegexRedux {
-        let actual_receipt = linked_regex_redux_receipt(&benchmark.haystack)?;
+    if let Some(actual_receipt) = regex_redux_receipt {
         let expected_receipt = rust_regex_redux_oracle(&benchmark.haystack)?;
         if actual_receipt != expected_receipt {
             return Err(format!(
@@ -1360,7 +1367,24 @@ fn print_provenance() {
             .expect("format regex-redux component provenance");
         }
         println!(
-            "{provenance} boundary=complete-regex-redux-aot-precompiled required_comparators=rust-regex-1.12.4,fre-current-runtime"
+            "{provenance} reducer_symbol={} operation_identity_sha256={} reducer_code_sha256={} reducer_data_sha256={} reducer_object_sha256={} reducer_relocation_count={} reducer_link_symbols={} semantic_runtime_symbols={} abi_version={} request_bytes={} receipt_bytes={} report_bytes={} scratch_buffer_count={} scratch_capacity_numerator={} scratch_capacity_denominator={} receipt_schema={} report_schema={} boundary=single-call-native-regex-redux-reducer required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            linked::REDUCER_SYMBOL,
+            hex(&linked::REGEX_REDUX_OPERATION_IDENTITY_SHA256),
+            hex(&linked::REGEX_REDUX_REDUCER_CODE_SHA256),
+            hex(&linked::REGEX_REDUX_REDUCER_DATA_SHA256),
+            hex(&linked::REGEX_REDUX_REDUCER_OBJECT_SHA256),
+            linked::REGEX_REDUX_REDUCER_RELOCATION_COUNT,
+            linked::REGEX_REDUX_REDUCER_LINK_SYMBOLS.join(","),
+            linked::REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS.join(","),
+            linked::REGEX_REDUX_ABI_VERSION,
+            linked::REGEX_REDUX_REQUEST_BYTES,
+            linked::REGEX_REDUX_RECEIPT_BYTES,
+            linked::REGEX_REDUX_REPORT_BYTES,
+            linked::REGEX_REDUX_SCRATCH_BUFFER_COUNT,
+            linked::REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR,
+            linked::REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR,
+            linked::REGEX_REDUX_RECEIPT_SCHEMA,
+            linked::REGEX_REDUX_REPORT_SCHEMA,
         );
         return;
     }
@@ -1748,6 +1772,16 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return Err("capture operation and linked native route disagree".to_owned());
     }
     if benchmark.model == shared::Model::RegexRedux {
+        let reducer_identity = native_symbol_identity(
+            linked::REDUCER_SYMBOL,
+            "fre_aot_regex_rebar_regex_redux_v1_",
+        );
+        let operation_identity = hex(&linked::REGEX_REDUX_OPERATION_IDENTITY_SHA256);
+        let expected_relocations = match linked::TARGET_ARCH {
+            "x86_64" => shared::REGEX_REDUX_COMPONENTS.saturating_add(1),
+            "aarch64" => shared::REGEX_REDUX_COMPONENTS.saturating_add(2),
+            _ => 0,
+        };
         if linked::REGEX_REDUX_COMPONENT_COUNT != shared::REGEX_REDUX_COMPONENTS
             || linked::REGEX_REDUX_ENTRY_SYMBOLS.len() != shared::REGEX_REDUX_COMPONENTS
             || linked::REGEX_REDUX_RUNTIME_SYMBOLS.len() != shared::REGEX_REDUX_COMPONENTS
@@ -1767,23 +1801,48 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
             || linked::REGEX_REDUX_OBJECT_SHA256
                 .iter()
                 .any(|digest| *digest == [0; 32])
+            || linked::REGEX_REDUX_REDUCER_LINK_SYMBOLS != linked::REGEX_REDUX_ENTRY_SYMBOLS
+            || !linked::REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS.is_empty()
+            || linked::REGEX_REDUX_OPERATION_IDENTITY_SHA256 == [0; 32]
+            || linked::REGEX_REDUX_REDUCER_CODE_SHA256 == [0; 32]
+            || linked::REGEX_REDUX_REDUCER_DATA_SHA256 == [0; 32]
+            || linked::REGEX_REDUX_REDUCER_OBJECT_SHA256 == [0; 32]
+            || linked::REGEX_REDUX_REDUCER_OBJECT_SHA256 != linked::OBJECT_SHA256
+            || linked::REGEX_REDUX_REDUCER_RELOCATION_COUNT != expected_relocations
+            || linked::REGEX_REDUX_ABI_VERSION
+                != fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION
+            || linked::REGEX_REDUX_REQUEST_BYTES
+                != fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES
+            || linked::REGEX_REDUX_REQUEST_BYTES != std::mem::size_of::<NativeRegexReduxRequestV1>()
+            || linked::REGEX_REDUX_RECEIPT_BYTES
+                != fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES
+            || linked::REGEX_REDUX_RECEIPT_BYTES
+                != std::mem::size_of::<NativeRegexReduxRunReceiptV1>()
+            || linked::REGEX_REDUX_REPORT_BYTES
+                != fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES
+            || linked::REGEX_REDUX_SCRATCH_BUFFER_COUNT != 2
+            || linked::REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR != 3
+            || linked::REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR != 2
+            || linked::REGEX_REDUX_RECEIPT_SCHEMA
+                != "u64-input-clean-variant9-substitution5-final-report-v1"
+            || linked::REGEX_REDUX_REPORT_SCHEMA != "variant9-blank-input-clean-final-lines-v1"
+            || reducer_identity != Some(operation_identity.as_str())
             || linked::PREPARE_OPERATION_FLAGS != 0
             || linked::REQUIRED_PREPARE_CAPABILITIES != 0
             || linked::HAS_SPAN_FILL
             || linked::PROGRAM_LEN != 0
             || !linked::PROGRAM_SYMBOL.is_empty()
             || !linked::ENTRY_SYMBOL.is_empty()
-            || !linked::REDUCER_SYMBOL.is_empty()
             || !linked::SPAN_FILL_SYMBOL.is_empty()
-            || !linked::OBJECT_BYTES.is_empty()
-            || linked::ENGINE != "FixedRegexReduxComponents"
-            || linked::SPAN_ITERATION_STRATEGY != "fixed-component-direct-entry-loop"
+            || linked::OBJECT_BYTES.is_empty()
+            || linked::ENGINE != "NativeRegexReduxAotV1"
+            || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
             || linked::GREP_ITERATION_STRATEGY != "not-applicable"
             || linked::PREPARED_BULK_STRATEGY != "None"
-            || linked::REQUIRED_RUNTIME_SYMBOLS != "component-indexed"
-            || linked::AGGREGATE_STRATEGY != "linked-fixed-regex-redux-span-entries"
+            || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+            || linked::AGGREGATE_STRATEGY != "native-fixed-regex-redux-whole-operation-v1"
         {
-            return Err("regex-redux linked component closure is inconsistent".to_owned());
+            return Err("regex-redux linked whole-operation closure is inconsistent".to_owned());
         }
         if linked::REGEX_REDUX_ENTRY_SYMBOLS
             .iter()
@@ -1814,6 +1873,22 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         || !linked::REGEX_REDUX_NATIVE.is_empty()
         || !linked::REGEX_REDUX_PROGRAM_SHA256.is_empty()
         || !linked::REGEX_REDUX_OBJECT_SHA256.is_empty()
+        || linked::REGEX_REDUX_OPERATION_IDENTITY_SHA256 != [0; 32]
+        || linked::REGEX_REDUX_REDUCER_CODE_SHA256 != [0; 32]
+        || linked::REGEX_REDUX_REDUCER_DATA_SHA256 != [0; 32]
+        || linked::REGEX_REDUX_REDUCER_OBJECT_SHA256 != [0; 32]
+        || linked::REGEX_REDUX_REDUCER_RELOCATION_COUNT != 0
+        || linked::REGEX_REDUX_ABI_VERSION != 0
+        || linked::REGEX_REDUX_REQUEST_BYTES != 0
+        || linked::REGEX_REDUX_RECEIPT_BYTES != 0
+        || linked::REGEX_REDUX_REPORT_BYTES != 0
+        || linked::REGEX_REDUX_SCRATCH_BUFFER_COUNT != 0
+        || linked::REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR != 0
+        || linked::REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR != 0
+        || !linked::REGEX_REDUX_RECEIPT_SCHEMA.is_empty()
+        || !linked::REGEX_REDUX_REPORT_SCHEMA.is_empty()
+        || !linked::REGEX_REDUX_REDUCER_LINK_SYMBOLS.is_empty()
+        || !linked::REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS.is_empty()
     {
         return Err("scalar artifact unexpectedly contains regex-redux components".to_owned());
     }
@@ -2143,9 +2218,7 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
         && reducer_identity != entry_identity
 }
 
-fn authenticate_linked_shared_ordered_many(
-    benchmark: &shared::Benchmark,
-) -> Result<(), String> {
+fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Result<(), String> {
     const COUNT_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
     const SPAN_SUM_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
     let (adapter, reducer_prefix, v15_runtime_symbols, span_iteration) = match benchmark.model {
@@ -2169,16 +2242,16 @@ fn authenticate_linked_shared_ordered_many(
     };
     let sources = benchmark.patterns.len();
     let valid_source_map = linked::SOURCE_TO_ARTIFACT.len() == sources
-        && linked::SOURCE_TO_ARTIFACT.iter().all(|&artifact| artifact == 0);
+        && linked::SOURCE_TO_ARTIFACT
+            .iter()
+            .all(|&artifact| artifact == 0);
     let entry_identity = native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_");
     let prepared_identity = native_symbol_identity(
         linked::SPAN_FILL_SYMBOL,
         "fre_aot_regex_fill_spans_exclusive_v1_",
     );
-    let program_identity = native_symbol_identity(
-        linked::PROGRAM_SYMBOL,
-        "fre_aot_regex_runtime_program_v1_",
-    );
+    let program_identity =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_");
     let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix);
     let native_fused_bulk_shape = match linked::PREPARED_BULK_STRATEGY {
         "None" => !linked::HAS_SPAN_FILL && linked::SPAN_FILL_SYMBOL.is_empty(),
@@ -2963,46 +3036,166 @@ fn run_operation(
     }
 }
 
-fn run_regex_redux(benchmark: &shared::Benchmark) -> Result<Vec<Sample>, String> {
+fn run_regex_redux(benchmark: &shared::Benchmark) -> Result<RegexReduxRun, String> {
     std::str::from_utf8(&benchmark.haystack)
         .map_err(|error| format!("regex-redux haystack is not UTF-8: {error}"))?;
-    run_operation_route_without_session(benchmark, |haystack| {
-        linked_regex_redux_receipt(haystack).map(|receipt| receipt.final_length)
-    })
+    let mut operation = LinkedRegexReduxOperation::new(benchmark.haystack.len())?;
+    let samples =
+        run_operation_route_without_session(benchmark, |haystack| operation.reduce(haystack))?;
+    let receipt = operation.receipt()?;
+    Ok(RegexReduxRun { samples, receipt })
 }
 
-#[allow(
-    unsafe_code,
-    reason = "the generated component declarations are the exact statically linked AOT search ABI"
-)]
-fn linked_regex_redux_receipt(haystack: &[u8]) -> Result<RegexReduxStageReceipt, String> {
-    execute_regex_redux(haystack, |component, bytes, start| {
-        let mut result = FreAotRegexResultV1::default();
-        // SAFETY: each generated component is an ordinary public search
-        // entry. The complete byte slice and aligned result are live and
-        // disjoint, and `start` is checked against the exact source len.
-        let status = unsafe {
-            linked::regex_redux_search(
-                component,
-                bytes.as_ptr(),
-                bytes.len(),
-                start,
-                bytes.len(),
-                &raw mut result,
-            )
-        };
-        match status {
-            STATUS_NO_MATCH => Ok(None),
-            STATUS_MATCH => Ok(Some(result)),
-            other => Err(format!(
-                "regex-redux component {component} entry {:?} returned status {other}",
-                linked::REGEX_REDUX_ENTRY_SYMBOLS
-                    .get(component)
-                    .copied()
-                    .unwrap_or("<out-of-range>")
-            )),
+#[derive(Debug)]
+struct LinkedRegexReduxOperation {
+    scratch_a: Vec<u8>,
+    scratch_b: Vec<u8>,
+    report: Vec<u8>,
+    receipt: NativeRegexReduxRunReceiptV1,
+    completed: bool,
+}
+
+impl LinkedRegexReduxOperation {
+    fn new(haystack_len: usize) -> Result<Self, String> {
+        if linked::REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR != 3
+            || linked::REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR != 2
+            || linked::REGEX_REDUX_SCRATCH_BUFFER_COUNT != 2
+        {
+            return Err("linked regex-redux scratch schema is not canonical".to_owned());
         }
-    })
+        let scratch_capacity = haystack_len
+            .checked_add(haystack_len / linked::REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR)
+            .ok_or_else(|| "regex-redux scratch capacity overflowed usize".to_owned())?;
+        Ok(Self {
+            scratch_a: zeroed_regex_redux_buffer(scratch_capacity, "scratch A")?,
+            scratch_b: zeroed_regex_redux_buffer(scratch_capacity, "scratch B")?,
+            report: zeroed_regex_redux_buffer(linked::REGEX_REDUX_REPORT_BYTES, "report")?,
+            receipt: poisoned_regex_redux_receipt(),
+            completed: false,
+        })
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the generated whole-operation declaration is the exact statically linked regex-redux AOT ABI"
+    )]
+    fn reduce(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        self.receipt = poisoned_regex_redux_receipt();
+        self.completed = false;
+        let request = NativeRegexReduxRequestV1 {
+            haystack: haystack.as_ptr(),
+            haystack_len: haystack.len(),
+            scratch_a: self.scratch_a.as_mut_ptr(),
+            scratch_a_capacity: self.scratch_a.len(),
+            scratch_b: self.scratch_b.as_mut_ptr(),
+            scratch_b_capacity: self.scratch_b.len(),
+            report: self.report.as_mut_ptr(),
+            report_capacity: self.report.len(),
+            receipt_out: &raw mut self.receipt,
+        };
+        // SAFETY: the request, immutable haystack, two owned scratch buffers,
+        // report buffer, and aligned receipt are live and pairwise disjoint.
+        // The generated authentication fixes every capacity and ABI extent.
+        let status = unsafe { linked::regex_redux_reduce(&raw const request) };
+        if status != fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_STATUS_SUCCESS {
+            return Err(format!(
+                "identity-suffixed regex-redux reducer {:?} returned status {status}",
+                linked::REDUCER_SYMBOL
+            ));
+        }
+        self.validate_receipt(haystack.len())?;
+        self.completed = true;
+        let final_length = usize::try_from(self.receipt.final_length)
+            .map_err(|_| "regex-redux final length does not fit usize".to_owned())?;
+        black_box(
+            self.scratch_b
+                .get(..final_length)
+                .ok_or_else(|| "regex-redux final bytes exceed scratch B".to_owned())?,
+        );
+        Ok(self.receipt.final_length)
+    }
+
+    fn validate_receipt(&self, haystack_len: usize) -> Result<(), String> {
+        let input_length = u64::try_from(haystack_len)
+            .map_err(|_| "regex-redux input length does not fit u64".to_owned())?;
+        if self.receipt.input_length != input_length {
+            return Err("native regex-redux receipt changed the input length".to_owned());
+        }
+        let scratch_limit = u64::try_from(self.scratch_b.len())
+            .map_err(|_| "regex-redux scratch capacity does not fit u64".to_owned())?;
+        if self.receipt.clean_length > scratch_limit
+            || self
+                .receipt
+                .substitution_lengths
+                .iter()
+                .any(|&length| length > scratch_limit)
+            || self.receipt.final_length > scratch_limit
+            || self.receipt.substitution_lengths[4] != self.receipt.final_length
+        {
+            return Err("native regex-redux receipt exceeds its scratch schema".to_owned());
+        }
+        let report_length = usize::try_from(self.receipt.report_length)
+            .map_err(|_| "regex-redux report length does not fit usize".to_owned())?;
+        let report = self
+            .report
+            .get(..report_length)
+            .ok_or_else(|| "native regex-redux report exceeds its sealed capacity".to_owned())?;
+        std::str::from_utf8(report)
+            .map_err(|error| format!("native regex-redux report is not UTF-8: {error}"))?;
+        Ok(())
+    }
+
+    fn receipt(&self) -> Result<RegexReduxStageReceipt, String> {
+        if !self.completed {
+            return Err("native regex-redux operation has no completed receipt".to_owned());
+        }
+        let report_length = usize::try_from(self.receipt.report_length)
+            .map_err(|_| "regex-redux report length does not fit usize".to_owned())?;
+        let final_length = usize::try_from(self.receipt.final_length)
+            .map_err(|_| "regex-redux final length does not fit usize".to_owned())?;
+        let report = std::str::from_utf8(
+            self.report
+                .get(..report_length)
+                .ok_or_else(|| "native regex-redux report range is invalid".to_owned())?,
+        )
+        .map_err(|error| format!("native regex-redux report is not UTF-8: {error}"))?
+        .to_owned();
+        let final_bytes = self
+            .scratch_b
+            .get(..final_length)
+            .ok_or_else(|| "native regex-redux final range is invalid".to_owned())?
+            .to_vec();
+        Ok(RegexReduxStageReceipt {
+            input_length: self.receipt.input_length,
+            clean_length: self.receipt.clean_length,
+            variant_counts: self.receipt.variant_counts,
+            substitution_lengths: self.receipt.substitution_lengths,
+            final_length: self.receipt.final_length,
+            report_length: self.receipt.report_length,
+            report,
+            final_bytes,
+        })
+    }
+}
+
+fn zeroed_regex_redux_buffer(length: usize, label: &str) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| format!("regex-redux {label} allocation failed"))?;
+    buffer.resize(length, 0);
+    Ok(buffer)
+}
+
+const fn poisoned_regex_redux_receipt() -> NativeRegexReduxRunReceiptV1 {
+    NativeRegexReduxRunReceiptV1 {
+        input_length: u64::MAX,
+        clean_length: u64::MAX,
+        variant_counts: [u64::MAX; 9],
+        substitution_lengths: [u64::MAX; 5],
+        final_length: u64::MAX,
+        report_length: u64::MAX,
+    }
 }
 
 fn run_operation_route_without_session(
@@ -3215,138 +3408,6 @@ fn validate_compiled_artifact(artifact: &CompiledRegex) -> Result<(), String> {
     Ok(())
 }
 
-fn execute_regex_redux(
-    haystack: &[u8],
-    mut search: impl FnMut(usize, &[u8], usize) -> Result<Option<FreAotRegexResultV1>, String>,
-) -> Result<RegexReduxStageReceipt, String> {
-    let input_length = u64::try_from(haystack.len())
-        .map_err(|_| "regex-redux input length does not fit u64".to_owned())?;
-    let mut sequence = haystack.to_vec();
-    sequence = replace_regex_redux_component(&sequence, 0, b"", &mut search)?;
-    let clean_length = u64::try_from(sequence.len())
-        .map_err(|_| "regex-redux clean length does not fit u64".to_owned())?;
-
-    let mut variant_counts = [0_u64; shared::REGEX_REDUX_VARIANTS.len()];
-    let mut report = String::new();
-    for (variant, count) in variant_counts.iter_mut().enumerate() {
-        let component = shared::regex_redux_variant_component(variant)
-            .ok_or_else(|| "regex-redux variant component is out of range".to_owned())?;
-        *count = count_regex_redux_component(&sequence, component, &mut search)?;
-        let pattern = shared::REGEX_REDUX_VARIANTS
-            .get(variant)
-            .ok_or_else(|| "regex-redux variant pattern is out of range".to_owned())?;
-        writeln!(&mut report, "{pattern} {count}")
-            .map_err(|_| "format regex-redux variant report".to_owned())?;
-    }
-
-    let mut substitution_lengths = [0_u64; shared::REGEX_REDUX_SUBSTITUTIONS.len()];
-    for (substitution, (_, replacement)) in shared::REGEX_REDUX_SUBSTITUTIONS.iter().enumerate() {
-        let component = shared::regex_redux_substitution_component(substitution)
-            .ok_or_else(|| "regex-redux substitution component is out of range".to_owned())?;
-        sequence = replace_regex_redux_component(
-            &sequence,
-            component,
-            replacement.as_bytes(),
-            &mut search,
-        )?;
-        substitution_lengths[substitution] = u64::try_from(sequence.len())
-            .map_err(|_| "regex-redux substitution length does not fit u64".to_owned())?;
-    }
-    let final_length = u64::try_from(sequence.len())
-        .map_err(|_| "regex-redux final length does not fit u64".to_owned())?;
-    writeln!(
-        &mut report,
-        "\n{input_length}\n{clean_length}\n{final_length}"
-    )
-    .map_err(|_| "format regex-redux terminal report".to_owned())?;
-    let report_length = u64::try_from(report.len())
-        .map_err(|_| "regex-redux report length does not fit u64".to_owned())?;
-    black_box(sequence.as_slice());
-    let receipt = RegexReduxStageReceipt {
-        input_length,
-        clean_length,
-        variant_counts,
-        substitution_lengths,
-        final_length,
-        report_length,
-        report,
-    };
-    Ok(black_box(receipt))
-}
-
-fn next_regex_redux_match(
-    component: usize,
-    haystack: &[u8],
-    start: usize,
-    search: &mut impl FnMut(usize, &[u8], usize) -> Result<Option<FreAotRegexResultV1>, String>,
-) -> Result<Option<FreAotRegexResultV1>, String> {
-    if component >= shared::REGEX_REDUX_COMPONENTS || start > haystack.len() {
-        return Err("regex-redux component window is out of range".to_owned());
-    }
-    let Some(matched) = search(component, haystack, start)? else {
-        return Ok(None);
-    };
-    validate_span(matched, haystack.len())?;
-    if matched.start < start {
-        return Err(format!(
-            "regex-redux component {component} returned {matched:?} before requested start {start}"
-        ));
-    }
-    if matched.start == matched.end {
-        return Err(format!(
-            "regex-redux component {component} violated its fixed nonempty-match contract at {}",
-            matched.start
-        ));
-    }
-    Ok(Some(matched))
-}
-
-fn count_regex_redux_component(
-    haystack: &[u8],
-    component: usize,
-    search: &mut impl FnMut(usize, &[u8], usize) -> Result<Option<FreAotRegexResultV1>, String>,
-) -> Result<u64, String> {
-    let mut count = 0_u64;
-    let mut start = 0_usize;
-    while let Some(matched) = next_regex_redux_match(component, haystack, start, search)? {
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| "regex-redux variant count overflowed u64".to_owned())?;
-        start = matched.end;
-    }
-    Ok(count)
-}
-
-fn replace_regex_redux_component(
-    haystack: &[u8],
-    component: usize,
-    replacement: &[u8],
-    search: &mut impl FnMut(usize, &[u8], usize) -> Result<Option<FreAotRegexResultV1>, String>,
-) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    output
-        .try_reserve(haystack.len())
-        .map_err(|_| "regex-redux replacement allocation failed".to_owned())?;
-    let mut copied = 0_usize;
-    let mut start = 0_usize;
-    while let Some(matched) = next_regex_redux_match(component, haystack, start, search)? {
-        output.extend_from_slice(
-            haystack
-                .get(copied..matched.start)
-                .ok_or_else(|| "regex-redux replacement copy range is invalid".to_owned())?,
-        );
-        output.extend_from_slice(replacement);
-        copied = matched.end;
-        start = matched.end;
-    }
-    output.extend_from_slice(
-        haystack
-            .get(copied..)
-            .ok_or_else(|| "regex-redux replacement tail is invalid".to_owned())?,
-    );
-    Ok(output)
-}
-
 fn rust_regex_redux_component(pattern: &str) -> Result<Regex, String> {
     Regex::builder()
         .configure(
@@ -3441,6 +3502,7 @@ fn rust_regex_redux_oracle(haystack: &[u8]) -> Result<RegexReduxStageReceipt, St
         final_length,
         report_length,
         report,
+        final_bytes: sequence,
     })
 }
 
@@ -3637,23 +3699,9 @@ mod tests {
     }
 
     #[test]
-    fn regex_redux_executes_every_fixed_component_and_rejects_empty_spans() {
-        let regexes = (0..shared::REGEX_REDUX_COMPONENTS)
-            .map(|component| {
-                byte_regex(shared::regex_redux_pattern(component).expect("fixed component pattern"))
-            })
-            .collect::<Vec<_>>();
-        let mut seen = [false; shared::REGEX_REDUX_COMPONENTS];
-        let actual = execute_regex_redux(b">test\nagggtaaa\n", |component, haystack, start| {
-            seen[component] = true;
-            Ok(regexes[component]
-                .find(regex_automata::Input::new(haystack).span(start..haystack.len()))
-                .map(|matched| FreAotRegexResultV1 {
-                    start: matched.start(),
-                    end: matched.end(),
-                }))
-        })
-        .expect("fixed regex-redux pipeline");
+    fn regex_redux_independent_oracle_seals_report_receipt_and_final_bytes() {
+        let actual = rust_regex_redux_oracle(b">test\nagggtaaa\n")
+            .expect("independent fixed regex-redux pipeline");
         let expected_report = concat!(
             "agggtaaa|tttaccct 1\n",
             "[cgt]gggtaaa|tttaccc[acg] 0\n",
@@ -3671,37 +3719,25 @@ mod tests {
         assert_eq!(actual.variant_counts, [1, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(actual.substitution_lengths, [8; 5]);
         assert_eq!(actual.final_length, 8);
+        assert_eq!(actual.final_bytes, b"agggtaaa");
         assert_eq!(actual.report, expected_report);
         assert_eq!(
             actual.report_length,
             u64::try_from(expected_report.len()).expect("fixed report length fits u64")
         );
-        assert_eq!(
-            actual,
-            rust_regex_redux_oracle(b">test\nagggtaaa\n").expect("independent stage receipt")
-        );
-        assert!(seen.into_iter().all(core::convert::identity));
-
         let cascade = b">x\ntHaNaNDaNStBY<abc>|xy|\n";
-        let cascade_actual = execute_regex_redux(cascade, |component, haystack, start| {
-            Ok(regexes[component]
-                .find(regex_automata::Input::new(haystack).span(start..haystack.len()))
-                .map(|matched| FreAotRegexResultV1 {
-                    start: matched.start(),
-                    end: matched.end(),
-                }))
-        })
-        .expect("ordered substitution cascade");
+        let cascade = rust_regex_redux_oracle(cascade).expect("ordered substitution cascade");
+        assert_eq!(cascade.substitution_lengths, [16, 16, 18, 10, 7]);
+        assert_eq!(cascade.final_bytes, b"||-<abc".as_slice());
         assert_eq!(
-            cascade_actual,
-            rust_regex_redux_oracle(cascade).expect("independent cascade receipt")
+            std::mem::size_of::<NativeRegexReduxRequestV1>(),
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES
         );
-
-        let error = execute_regex_redux(b"x", |_component, _haystack, _start| {
-            Ok(Some(FreAotRegexResultV1 { start: 0, end: 0 }))
-        })
-        .expect_err("fixed regex-redux components are all nonempty");
-        assert!(error.contains("nonempty-match contract"));
+        assert_eq!(
+            std::mem::size_of::<NativeRegexReduxRunReceiptV1>(),
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES
+        );
+        assert_eq!(poisoned_regex_redux_receipt().report_length, u64::MAX);
     }
 
     #[test]
@@ -3913,25 +3949,29 @@ mod tests {
         assert_eq!(impossible_fallback_calls, 0);
 
         let mut fallback_calls = 0_usize;
-        assert!(strict_selector_capture_grep_reduce_with(
-            b"line",
-            |_line, _result| Ok(STATUS_INVALID_ARGUMENT),
-            |_line| {
-                fallback_calls += 1;
-                Ok(1)
-            },
-        )
-        .is_err());
+        assert!(
+            strict_selector_capture_grep_reduce_with(
+                b"line",
+                |_line, _result| Ok(STATUS_INVALID_ARGUMENT),
+                |_line| {
+                    fallback_calls += 1;
+                    Ok(1)
+                },
+            )
+            .is_err()
+        );
         assert_eq!(fallback_calls, 0);
-        assert!(strict_selector_capture_grep_reduce_with(
-            b"line",
-            |_line, result| {
-                *result = FreAotRegexResultV1 { start: 0, end: 5 };
-                Ok(STATUS_MATCH)
-            },
-            |_line| Ok(1),
-        )
-        .is_err());
+        assert!(
+            strict_selector_capture_grep_reduce_with(
+                b"line",
+                |_line, result| {
+                    *result = FreAotRegexResultV1 { start: 0, end: 5 };
+                    Ok(STATUS_MATCH)
+                },
+                |_line| Ok(1),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4165,24 +4205,28 @@ mod tests {
         assert!(strict_capture_row_participation(5, &[]).is_err());
 
         assert!(validate_strict_capture_state(FreAotRegexIterStateV1::default(), 5).is_ok());
-        assert!(validate_strict_capture_state(
-            FreAotRegexIterStateV1 {
-                next_start: 6,
-                ..FreAotRegexIterStateV1::default()
-            },
-            5,
-        )
-        .is_err());
-        assert!(validate_strict_capture_state(
-            FreAotRegexIterStateV1 {
-                next_start: 2,
-                last_match_end: 2,
-                flags: ITER_PENDING_EMPTY,
-                reserved: 0,
-            },
-            5,
-        )
-        .is_err());
+        assert!(
+            validate_strict_capture_state(
+                FreAotRegexIterStateV1 {
+                    next_start: 6,
+                    ..FreAotRegexIterStateV1::default()
+                },
+                5,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_strict_capture_state(
+                FreAotRegexIterStateV1 {
+                    next_start: 2,
+                    last_match_end: 2,
+                    flags: ITER_PENDING_EMPTY,
+                    reserved: 0,
+                },
+                5,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4288,9 +4332,11 @@ mod tests {
             klv.extend_from_slice(value);
             klv.push(b'\n');
         }
-        assert!(shared::Benchmark::parse(&klv)
-            .expect_err("object emission is not Rebar compile")
-            .contains("not a search-ready Rebar compile"));
+        assert!(
+            shared::Benchmark::parse(&klv)
+                .expect_err("object emission is not Rebar compile")
+                .contains("not a search-ready Rebar compile")
+        );
     }
 
     #[test]
@@ -4299,17 +4345,21 @@ mod tests {
         overlap
             .push(FreAotRegexResultV1 { start: 1, end: 4 })
             .expect("first span");
-        assert!(overlap
-            .push(FreAotRegexResultV1 { start: 3, end: 5 })
-            .is_err());
+        assert!(
+            overlap
+                .push(FreAotRegexResultV1 { start: 3, end: 5 })
+                .is_err()
+        );
 
         let mut adjacent_empty = StrictSpanAccumulator::new(8);
         adjacent_empty
             .push(FreAotRegexResultV1 { start: 1, end: 4 })
             .expect("first span");
-        assert!(adjacent_empty
-            .push(FreAotRegexResultV1 { start: 4, end: 4 })
-            .is_err());
+        assert!(
+            adjacent_empty
+                .push(FreAotRegexResultV1 { start: 4, end: 4 })
+                .is_err()
+        );
     }
 
     #[test]

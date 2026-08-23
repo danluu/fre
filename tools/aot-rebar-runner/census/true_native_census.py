@@ -122,6 +122,9 @@ NATIVE_CAPTURE_MATERIALIZE_SYMBOL = re.compile(
 NATIVE_PARTICIPATION_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
 )
+NATIVE_REGEX_REDUX_ENTRY_SYMBOL = re.compile(
+    r"^fre_aot_regex_rebar_regex_redux_v1_[0-9a-f]{64}$"
+)
 NATIVE_PARTICIPATION_BUNDLE_SYMBOL = re.compile(
     r"^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
 )
@@ -205,9 +208,9 @@ OPERATION_ROUTE_POLICIES = {
         OperationBoundary.RUST_ADAPTER_LOOP,
         "native-prepared-span-fill-core-with-per-line-adapter-loop",
     ),
-    "linked-fixed-composite-adapter-loop": OperationRoutePolicy(
-        OperationBoundary.RUST_ADAPTER_LOOP,
-        "native-search-core-with-adapter-outer-loop",
+    "linked-native-regex-redux-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
     ),
     "linked-native-row-adapter-loop": OperationRoutePolicy(
         OperationBoundary.RUST_ADAPTER_LOOP,
@@ -2316,6 +2319,106 @@ def validate_native_row_engine_routes(
             )
 
 
+def regex_redux_proof_from_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> dict[str, object]:
+    """Authenticate the sealed helper-free one-call fixed operation."""
+    if (
+        fields.get("model") != "regex-redux"
+        or fields.get("adapter") != "general-aot-native-regex-redux-reducer-v1"
+        or fields.get("engine") != "NativeRegexReduxAotV1"
+        or fields.get("aggregate_strategy")
+        != "native-fixed-regex-redux-whole-operation-v1"
+        or fields.get("boundary") != "single-call-native-regex-redux-reducer"
+        or len(components) != 15
+    ):
+        raise CensusError("regex-redux provenance has a noncanonical native route")
+    entries = [str(component["entry_symbol"]) for component in components]
+    if (
+        len(entries) != len(set(entries))
+        or not all(NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry) for entry in entries)
+        or any(component["required_runtime_symbols"] for component in components)
+    ):
+        raise CensusError("regex-redux components are not closed direct Span entries")
+    operation_identity = fields.get("operation_identity_sha256", "")
+    require_hex64(operation_identity, "regex-redux operation identity")
+    if operation_identity == "0" * 64:
+        raise CensusError("regex-redux operation identity is zero")
+    reducer_symbol = fields.get("reducer_symbol", "")
+    reducer_identity = symbol_identity_suffix(
+        reducer_symbol,
+        NATIVE_REGEX_REDUX_ENTRY_SYMBOL,
+        "regex-redux reducer",
+    )
+    if reducer_identity != operation_identity:
+        raise CensusError("regex-redux reducer symbol and operation identity disagree")
+    digest_fields = (
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+    )
+    for name in digest_fields:
+        digest = require_hex64(fields.get(name, ""), f"regex-redux {name}")
+        if digest == "0" * 64:
+            raise CensusError(f"regex-redux {name} is zero")
+    link_symbols = fields.get("reducer_link_symbols", "").split(",")
+    if link_symbols != entries:
+        raise CensusError("regex-redux reducer link closure differs from its components")
+    semantic_symbols = sorted(filter(
+        None, fields.get("semantic_runtime_symbols", "").split(",")
+    ))
+    if semantic_symbols:
+        raise CensusError("regex-redux reducer retains semantic runtime helpers")
+    exact_decimal = {
+        "abi_version": 1,
+        "request_bytes": 72,
+        "receipt_bytes": 144,
+        "report_bytes": 1024,
+        "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3,
+        "scratch_capacity_denominator": 2,
+    }
+    for name, expected in exact_decimal.items():
+        if parse_canonical_decimal(
+            fields.get(name), f"regex-redux {name}", expected, expected
+        ) != expected:
+            raise CensusError(f"regex-redux {name} differs")
+    expected_relocations = 16 if fields.get("target", "").startswith("x86_64-") else (
+        17 if fields.get("target", "").startswith("aarch64-") else 0
+    )
+    if expected_relocations == 0 or parse_canonical_decimal(
+        fields.get("reducer_relocation_count"),
+        "regex-redux reducer relocation count",
+        expected_relocations,
+        expected_relocations,
+    ) != expected_relocations:
+        raise CensusError("regex-redux reducer relocation closure differs")
+    if (
+        fields.get("receipt_schema")
+        != "u64-input-clean-variant9-substitution5-final-report-v1"
+        or fields.get("report_schema")
+        != "variant9-blank-input-clean-final-lines-v1"
+    ):
+        raise CensusError("regex-redux execution schema differs")
+    return {
+        "abi_version": 1,
+        "operation_identity_sha256": operation_identity,
+        "reducer_symbol": reducer_symbol,
+        "reducer_code_sha256": fields["reducer_code_sha256"],
+        "reducer_data_sha256": fields["reducer_data_sha256"],
+        "reducer_object_sha256": fields["reducer_object_sha256"],
+        "reducer_relocation_count": expected_relocations,
+        "reducer_link_symbols": entries,
+        "semantic_runtime_symbols": [],
+        "request_bytes": 72,
+        "receipt_bytes": 144,
+        "report_bytes": 1024,
+        "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3,
+        "scratch_capacity_denominator": 2,
+        "receipt_schema": fields["receipt_schema"],
+        "report_schema": fields["report_schema"],
+    }
+
+
 def validate_v3_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
@@ -2346,9 +2449,16 @@ def validate_v3_provenance(
         )
     }
     if fields["model"] == "regex-redux":
-        if fields.get("boundary") != "complete-regex-redux-aot-precompiled":
-            raise CensusError("regex-redux provenance has the wrong operation boundary")
-        expected = base | component_fields
+        regex_redux_proof_from_provenance(fields, components)
+        expected = base | component_fields | {
+            "reducer_symbol", "operation_identity_sha256", "reducer_code_sha256",
+            "reducer_data_sha256", "reducer_object_sha256",
+            "reducer_relocation_count", "reducer_link_symbols",
+            "semantic_runtime_symbols", "abi_version", "request_bytes",
+            "receipt_bytes", "report_bytes", "scratch_buffer_count",
+            "scratch_capacity_numerator", "scratch_capacity_denominator",
+            "receipt_schema", "report_schema",
+        }
     elif fields.get("native_row_bridge") == "true":
         component_fields |= {
             f"component_{index}_{suffix}"
@@ -2735,7 +2845,8 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
                 )
             return [entries[0], participation], "linked-exact-span-participation-adapter-loop"
         if model == "regex-redux":
-            return entries, "linked-fixed-composite-adapter-loop"
+            proof = regex_redux_proof_from_provenance(provenance, components)
+            return [str(proof["reducer_symbol"])], "linked-native-regex-redux-reducer"
         if provenance.get("native_row_bridge") == "true" and model in {
             "count", "count-spans", "grep",
         }:
@@ -3069,6 +3180,9 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         [int(value, 10) for value in fields["source_to_artifact"].split(",")]
         if native_row else []
     )
+    regex_redux = (
+        None if native_row else regex_redux_proof_from_provenance(fields, components)
+    )
     result = {
         **common,
         "kind": "composite-v3",
@@ -3096,10 +3210,12 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         "span_iteration_strategy": None,
         "grep_iteration_strategy": None,
         "program_sha256": None,
-        "object_sha256": None,
+        "object_sha256": (
+            regex_redux["reducer_object_sha256"] if regex_redux else None
+        ),
         "program_symbol": None,
         "entry_symbol": None,
-        "reducer_symbol": None,
+        "reducer_symbol": regex_redux["reducer_symbol"] if regex_redux else None,
         "span_fill_symbol": None,
         "required_runtime_symbols": sorted(filter(
             None, fields.get("required_runtime_symbols", "").split(",")
@@ -3110,6 +3226,8 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         result["prepared_v15_limits"] = native_row_prepared_v15_limits(
             fields, components
         )
+    if regex_redux is not None:
+        result["regex_redux"] = regex_redux
     return result
 
 
@@ -3134,6 +3252,11 @@ def operation_route_from_provenance_record(
     components = provenance["components"]
     if components:
         entries = [component["entry_symbol"] for component in components]
+        if provenance["composite_kind"] == "regex-redux-fixed-v1":
+            validate_normalized_regex_redux(
+                provenance.get("regex_redux"), provenance, "normalized regex-redux provenance"
+            )
+            return [provenance["reducer_symbol"]], "linked-native-regex-redux-reducer"
         if provenance["composite_kind"] == "strict-capture-next-v1":
             strict_capture = provenance.get("strict_capture")
             if (
@@ -3201,8 +3324,6 @@ def operation_route_from_provenance_record(
             raise CensusError(
                 "normalized composite provenance has non-native operation entries"
             )
-        if provenance["composite_kind"] == "regex-redux-fixed-v1":
-            return entries, "linked-fixed-composite-adapter-loop"
         if provenance["composite_kind"] == "native-row-bridge-v1":
             return entries, "linked-native-row-adapter-loop"
         if provenance["composite_kind"] == "uniform-capture-row-bridge-v1":
@@ -3275,6 +3396,20 @@ def identity_defined_symbols_from_provenance(
     provenance: dict[str, object],
 ) -> list[str]:
     """Return route-bound defined symbols authenticated but not invoked."""
+    if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        proof = provenance.get("regex_redux")
+        symbols = proof.get("reducer_link_symbols") if isinstance(proof, dict) else None
+        if (
+            not isinstance(symbols, list)
+            or len(symbols) != 15
+            or len(symbols) != len(set(symbols))
+            or not all(
+                isinstance(symbol, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(symbol)
+                for symbol in symbols
+            )
+        ):
+            raise CensusError("regex-redux linked component symbol set is malformed")
+        return sorted(symbols)
     if provenance.get("kind") == "shared-ordered-many-v2":
         symbols = [
             provenance.get("entry_symbol"), provenance.get("span_fill_symbol"),
@@ -3497,6 +3632,8 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         }
         else [component["object_sha256"] for component in normalized_provenance["components"]]
     )
+    if normalized_provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        expected_object_hashes.append(normalized_provenance["object_sha256"])
     if [row["sha256"] for row in primary_hashes["objects"]] != expected_object_hashes:
         raise CensusError("primary object files differ from provenance object identities")
     if [row["sha256"] for row in replica_hashes["objects"]] != expected_object_hashes:
@@ -4393,6 +4530,73 @@ def validate_normalized_shared_ordered_many(
         raise CensusError(f"{context} shared ordered-many proof differs")
 
 
+def validate_normalized_regex_redux(
+    proof: object, provenance: dict[str, object], context: str
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} proof is not an object")
+    require_exact_keys(proof, {
+        "abi_version", "operation_identity_sha256", "reducer_symbol",
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+        "reducer_relocation_count", "reducer_link_symbols",
+        "semantic_runtime_symbols", "request_bytes", "receipt_bytes", "report_bytes",
+        "scratch_buffer_count", "scratch_capacity_numerator",
+        "scratch_capacity_denominator", "receipt_schema", "report_schema",
+    }, f"{context} proof")
+    components = provenance.get("components")
+    if not isinstance(components, list) or len(components) != 15:
+        raise CensusError(f"{context} component cardinality differs")
+    entries = [component.get("entry_symbol") for component in components]
+    if (
+        not all(
+            isinstance(entry, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry)
+            for entry in entries
+        )
+        or len(entries) != len(set(entries))
+        or proof["reducer_link_symbols"] != entries
+        or proof["semantic_runtime_symbols"] != []
+    ):
+        raise CensusError(f"{context} component link closure differs")
+    for name in (
+        "operation_identity_sha256", "reducer_code_sha256",
+        "reducer_data_sha256", "reducer_object_sha256",
+    ):
+        require_hex64(proof[name], f"{context} {name}")
+        if proof[name] == "0" * 64:
+            raise CensusError(f"{context} {name} is zero")
+    reducer = proof["reducer_symbol"]
+    if (
+        not isinstance(reducer, str)
+        or NATIVE_REGEX_REDUX_ENTRY_SYMBOL.fullmatch(reducer) is None
+        or reducer.rsplit("_", 1)[-1] != proof["operation_identity_sha256"]
+        or provenance.get("reducer_symbol") != reducer
+        or provenance.get("object_sha256") != proof["reducer_object_sha256"]
+    ):
+        raise CensusError(f"{context} reducer identity differs")
+    exact = {
+        "abi_version": 1, "request_bytes": 72, "receipt_bytes": 144,
+        "report_bytes": 1024, "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3, "scratch_capacity_denominator": 2,
+    }
+    if any(proof.get(name) != expected for name, expected in exact.items()):
+        raise CensusError(f"{context} ABI or workspace schema differs")
+    expected_relocations = 16 if str(provenance.get("target", "")).startswith(
+        "x86_64-"
+    ) else 17 if str(provenance.get("target", "")).startswith("aarch64-") else 0
+    if (
+        expected_relocations == 0
+        or proof["reducer_relocation_count"] != expected_relocations
+    ):
+        raise CensusError(f"{context} relocation closure differs")
+    if (
+        proof["receipt_schema"]
+        != "u64-input-clean-variant9-substitution5-final-report-v1"
+        or proof["report_schema"]
+        != "variant9-blank-input-clean-final-lines-v1"
+    ):
+        raise CensusError(f"{context} execution schema differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -4413,6 +4617,8 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         expected_keys.add("selector_capture_fallback")
     elif provenance.get("kind") == "prepared-grep-v15-v2":
         expected_keys.add("prepared_grep_v15")
+    if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        expected_keys.add("regex_redux")
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         expected_keys.add("prepared_v15_limits")
     require_exact_keys(provenance, expected_keys, context)
@@ -4544,6 +4750,11 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         if provenance["composite_kind"] == "regex-redux-fixed-v1":
             if (
                 provenance["model"] != "regex-redux"
+                or provenance["adapter"] != "general-aot-native-regex-redux-reducer-v1"
+                or provenance["boundary"] != "single-call-native-regex-redux-reducer"
+                or provenance["engine"] != "NativeRegexReduxAotV1"
+                or provenance["aggregate_strategy"]
+                != "native-fixed-regex-redux-whole-operation-v1"
                 or len(provenance["components"]) != 15
                 or provenance["source_pattern_count"] != 0
                 or provenance["source_to_artifact"] != []
@@ -4551,8 +4762,19 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or provenance["uniform_capture"] is not None
                 or any(component["source_ordinal"] is not None for component in provenance["components"])
                 or any(component["automaton_sha256"] is not None for component in provenance["components"])
+                or provenance["program_sha256"] is not None
+                or provenance["program_symbol"] is not None
+                or provenance["entry_symbol"] is not None
+                or provenance["span_fill_symbol"] is not None
+                or provenance["prepared_bulk_strategy"] is not None
+                or provenance["span_iteration_strategy"] is not None
+                or provenance["grep_iteration_strategy"] is not None
+                or provenance["required_runtime_symbols"] != []
             ):
                 raise CensusError(f"{context} regex-redux topology is not canonical")
+            validate_normalized_regex_redux(
+                provenance["regex_redux"], provenance, context
+            )
         elif provenance["composite_kind"] == "native-row-bridge-v1":
             source_count = provenance["source_pattern_count"]
             source_map = provenance["source_to_artifact"]
@@ -5098,6 +5320,8 @@ def validate_receipt(
             }
             else [component["object_sha256"] for component in provenance["components"]]
         )
+        if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+            expected_object_hashes.append(provenance["object_sha256"])
         for label, artifact in (("primary", primary), ("replica", replica)):
             if [row["sha256"] for row in artifact["objects"]] != expected_object_hashes:
                 raise CensusError(f"{label} object files differ from provenance")

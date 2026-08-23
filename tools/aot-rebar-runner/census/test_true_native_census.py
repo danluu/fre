@@ -255,6 +255,47 @@ def synthetic_qualification_receipt(plan: dict[str, object]) -> dict[str, object
     return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
+def synthetic_regex_redux_fields() -> dict[str, str]:
+    identity = "a" * 64
+    fields = {
+        "schema": "fre.aot.rebar-runner.v3",
+        "model": "regex-redux",
+        "component_count": "15",
+        "adapter": "general-aot-native-regex-redux-reducer-v1",
+        "engine": "NativeRegexReduxAotV1",
+        "aggregate_strategy": "native-fixed-regex-redux-whole-operation-v1",
+        "boundary": "single-call-native-regex-redux-reducer",
+        "target": "x86_64-unknown-linux-gnu",
+        "reducer_symbol": f"fre_aot_regex_rebar_regex_redux_v1_{identity}",
+        "operation_identity_sha256": identity,
+        "reducer_code_sha256": "b" * 64,
+        "reducer_data_sha256": "c" * 64,
+        "reducer_object_sha256": "d" * 64,
+        "reducer_relocation_count": "16",
+        "semantic_runtime_symbols": "",
+        "abi_version": "1",
+        "request_bytes": "72",
+        "receipt_bytes": "144",
+        "report_bytes": "1024",
+        "scratch_buffer_count": "2",
+        "scratch_capacity_numerator": "3",
+        "scratch_capacity_denominator": "2",
+        "receipt_schema": "u64-input-clean-variant9-substitution5-final-report-v1",
+        "report_schema": "variant9-blank-input-clean-final-lines-v1",
+    }
+    entries = []
+    for index in range(15):
+        fields[f"component_{index}_native"] = "true"
+        entry = f"fre_aot_regex_search_v1_{index + 1:064x}"
+        entries.append(entry)
+        fields[f"component_{index}_entry_symbol"] = entry
+        fields[f"component_{index}_runtime_symbols"] = ""
+        fields[f"component_{index}_program_sha256"] = f"{index:064x}"
+        fields[f"component_{index}_object_sha256"] = f"{index + 1:064x}"
+    fields["reducer_link_symbols"] = ",".join(entries)
+    return fields
+
+
 def uniform_capture_provenance_fields() -> dict[str, str]:
     entry_suffix = "d" * 64
     fields = {
@@ -1259,8 +1300,8 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False,
                 "native-prepared-span-fill-core-with-per-line-adapter-loop",
             ),
-            "linked-fixed-composite-adapter-loop": (
-                True, False, "native-search-core-with-adapter-outer-loop"
+            "linked-native-regex-redux-reducer": (
+                False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-row-adapter-loop": (
                 True, False, "native-search-core-with-adapter-outer-loop"
@@ -1405,25 +1446,78 @@ class TrueNativeCensusTests(unittest.TestCase):
                         {**provenance, "aggregate_strategy": strategy}
                     )
 
-    def test_composite_v3_requires_and_returns_every_component_entry(self) -> None:
-        fields = {
-            "schema": "fre.aot.rebar-runner.v3",
-            "model": "regex-redux",
-            "component_count": "15",
+    def test_regex_redux_selects_only_the_whole_operation_reducer(self) -> None:
+        fields = synthetic_regex_redux_fields()
+        selected, route = CENSUS.selected_operation_entries(fields)
+        self.assertEqual(route, "linked-native-regex-redux-reducer")
+        self.assertEqual(selected, [fields["reducer_symbol"]])
+        fields["semantic_runtime_symbols"] = "fre_aot_regex_runtime_search_v1"
+        with self.assertRaisesRegex(CENSUS.CensusError, "semantic runtime helpers"):
+            CENSUS.selected_operation_entries(fields)
+
+    def test_regex_redux_zero_identity_and_reducer_digests_fail_closed(self) -> None:
+        fields = synthetic_regex_redux_fields()
+        zero = "0" * 64
+        for name in (
+            "operation_identity_sha256",
+            "reducer_code_sha256",
+            "reducer_data_sha256",
+            "reducer_object_sha256",
+        ):
+            with self.subTest(layer="raw", field=name):
+                poisoned = copy.deepcopy(fields)
+                poisoned[name] = zero
+                if name == "operation_identity_sha256":
+                    poisoned["reducer_symbol"] = (
+                        f"fre_aot_regex_rebar_regex_redux_v1_{zero}"
+                    )
+                with self.assertRaisesRegex(CENSUS.CensusError, "zero"):
+                    CENSUS.selected_operation_entries(poisoned)
+
+        components = CENSUS.components_from_provenance(fields)
+        proof = CENSUS.regex_redux_proof_from_provenance(fields, components)
+        provenance = {
+            "components": components,
+            "target": fields["target"],
+            "reducer_symbol": fields["reducer_symbol"],
+            "object_sha256": fields["reducer_object_sha256"],
         }
-        for index in range(15):
-            fields[f"component_{index}_native"] = "true"
-            fields[f"component_{index}_entry_symbol"] = f"fre_component_{index}_entry"
-            fields[f"component_{index}_runtime_symbols"] = (
-                "fre_aot_regex_runtime_search_exclusive_v1"
+        CENSUS.validate_normalized_regex_redux(
+            proof, provenance, "synthetic normalized regex-redux"
+        )
+        for name in (
+            "operation_identity_sha256",
+            "reducer_code_sha256",
+            "reducer_data_sha256",
+            "reducer_object_sha256",
+        ):
+            with self.subTest(layer="normalized", field=name):
+                poisoned_proof = copy.deepcopy(proof)
+                poisoned_provenance = copy.deepcopy(provenance)
+                poisoned_proof[name] = zero
+                if name == "operation_identity_sha256":
+                    reducer = f"fre_aot_regex_rebar_regex_redux_v1_{zero}"
+                    poisoned_proof["reducer_symbol"] = reducer
+                    poisoned_provenance["reducer_symbol"] = reducer
+                elif name == "reducer_object_sha256":
+                    poisoned_provenance["object_sha256"] = zero
+                with self.assertRaisesRegex(CENSUS.CensusError, "zero"):
+                    CENSUS.validate_normalized_regex_redux(
+                        poisoned_proof,
+                        poisoned_provenance,
+                        "synthetic normalized regex-redux",
+                    )
+
+        unsupported_proof = copy.deepcopy(proof)
+        unsupported_proof["reducer_relocation_count"] = 0
+        unsupported_provenance = copy.deepcopy(provenance)
+        unsupported_provenance["target"] = "riscv64-unknown-linux-gnu"
+        with self.assertRaisesRegex(CENSUS.CensusError, "relocation closure"):
+            CENSUS.validate_normalized_regex_redux(
+                unsupported_proof,
+                unsupported_provenance,
+                "synthetic normalized regex-redux",
             )
-            fields[f"component_{index}_program_sha256"] = f"{index:064x}"
-            fields[f"component_{index}_object_sha256"] = f"{index + 1:064x}"
-        entries, route = CENSUS.selected_operation_entries(fields)
-        self.assertEqual(route, "linked-fixed-composite-adapter-loop")
-        self.assertEqual(len(entries), 15)
-        self.assertEqual(entries[0], "fre_component_0_entry")
-        self.assertEqual(entries[-1], "fre_component_14_entry")
 
     def test_native_row_components_are_search_core_with_an_adapter_loop(self) -> None:
         fields = {

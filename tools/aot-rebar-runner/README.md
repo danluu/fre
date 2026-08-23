@@ -8,7 +8,10 @@ portable FRE facade.
 The checked-in build script consumes one public Rebar KLV file. Scalar models
 compile and link one single-pattern general-AOT artifact. The fixed
 `regex-redux` model has no external patterns; it compiles and links the exact
-15 public Rebar stage patterns as independent ordinary Span artifacts. The
+15 public Rebar stage patterns as independent ordinary Span artifacts plus
+one helper-free whole-operation reducer object. The reducer owns flattening,
+all exhaustive count/substitution traversals, replacement copies, receipt and
+report publication, and calls only those 15 direct entries. The
 additive multi-pattern `count`/`count-spans`/`grep` route compiles an
 Optimizing+Span object for each distinct source row and links the deduplicated
 native objects. Each row is either an ordinary helper-free native entry or,
@@ -157,16 +160,14 @@ timing belongs to a separately named compiler-stage benchmark.
   conditional mixed route, not a claim that positive capture materialization
   became native.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
-  and all five ordered substitutions through their separately linked ordinary
-  Span entries. Rust owns only checked stage sequencing, replacement copies,
-  scalar accounting, and the canonical nine-line plus terminal report
-  formatting. Every stage must return an in-window nonempty Span; invalid,
-  backward, empty, or non-success results fail the complete sample. An untimed
-  independent Rust translation must reproduce the input/clean/final lengths,
-  all nine counts, all five substitution lengths, and the complete report
-  bytes exactly.
-  This is a complete runtime composite with precompiled entries, not a claim
-  that omitted per-call regex construction is timing-equivalent to Rebar.
+  and all five ordered substitutions in exactly one call to the linked native
+  reducer. Two `floor(3 * input_len / 2)` scratch buffers, the 1,024-byte report
+  buffer, and the 144-byte receipt are allocated once outside warmup and timed
+  loops. The reducer leaves final bytes in scratch B and transactionally
+  publishes the canonical report and 18-word receipt only after every stage
+  succeeds. Rust validates the sealed ABI and ranges around the call; after
+  timing, the independent stock translation must reproduce every receipt
+  field, every report byte, and every final byte exactly.
 
 For a multi-pattern scalar job, exact duplicate source rows are compiled once;
 distinct source spellings that produce the same complete route and object are
@@ -326,16 +327,19 @@ V15 loop. It never scans across a line boundary and never substitutes one
 whole-haystack match stream for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
-prepared program/entry and no semantic runtime-helper relocation. Native
-coverage additionally requires an independent final-binary audit, complete
-operation success after all semantic helpers are trap-patched, and a trap when
-each claimed component entry is patched on a fixture that reaches it.
+prepared program/entry and no semantic runtime-helper relocation, and unless
+the reducer's unresolved link closure is exactly the 15 component entries.
+Native coverage additionally requires an independent final-binary audit,
+complete operation success after all semantic helpers are trap-patched, and a
+trap when the claimed whole-operation reducer entry is patched.
 The v3 provenance record publishes a separate native flag, entry symbol,
 runtime-symbol surface, and program/object hash for every numbered regex-redux
-component or retained native row. Merely linking a component does not count a
-helper-backed entry as native.
-The census reports these componentized routes as native search cores with a
-Rust adapter loop, not as wholly fused native operations.
+component or retained native row. For regex-redux it additionally seals the
+operation identity, reducer symbol/code/data/object digests, exact relocation
+and component-link surfaces, empty semantic-helper surface, request/receipt/
+report extents, scratch formula, and report/receipt schemas. The census counts
+this route as whole-operation native only when the one reducer entry and all
+of those closures authenticate.
 Uniform-capture routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to

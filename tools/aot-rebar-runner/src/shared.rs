@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
 use fre_aot_regex::{
-    compile, compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
+    compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
     compile_uniform_capture_selector,
@@ -231,7 +231,7 @@ impl Model {
             Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
             Self::GrepCount => "general-aot-linked-native-grep-count-reducer-prepared-v2",
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
-            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
+            Self::RegexRedux => "general-aot-native-regex-redux-reducer-v1",
         }
     }
 
@@ -260,7 +260,7 @@ impl Model {
                 "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
             }
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
-            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
+            Self::RegexRedux => "general-aot-native-regex-redux-reducer-v1",
         }
     }
 
@@ -2994,29 +2994,6 @@ fn authenticate_prepared_v15_row(
     Ok(())
 }
 
-/// Compile one fixed regex-redux stage as an ordinary Span artifact.
-///
-/// No aggregate or runtime composite is smuggled into this boundary. The
-/// linked runner performs only Rebar's deterministic stage sequencing around
-/// these independently receipted search entries.
-pub fn compile_regex_redux_component(
-    component: usize,
-    target: Target,
-) -> Result<CompiledRegex, String> {
-    let pattern = regex_redux_pattern(component)
-        .ok_or_else(|| format!("regex-redux component {component} is out of range"))?;
-    let mut profile = RustProfile::rebar_1_12_4();
-    profile.options.unicode = false;
-    profile.options.case_insensitive = false;
-    compile(
-        CompileRequest::new(pattern, target)
-            .profile(profile)
-            .output(OutputContract::Span)
-            .mode(CompileMode::Optimizing),
-    )
-    .map_err(|error| format!("regex-redux component {component} compilation failed: {error}"))
-}
-
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, String> {
     std::str::from_utf8(value).map_err(|error| format!("{key} is not UTF-8: {error}"))
 }
@@ -3166,7 +3143,7 @@ mod tests {
 
     #[test]
     fn safe_v15_declines_return_the_recovered_incumbent_byte_for_byte() {
-        use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
+        use fre_aot_regex::{compile, PreparedOrderedNfaV15CompileDecline};
 
         let target = target_from_parts(
             std::env::consts::ARCH,
@@ -4539,6 +4516,26 @@ mod tests {
         assert_eq!(parsed.model, Model::RegexRedux);
         assert!(parsed.patterns.is_empty());
         assert_eq!(REGEX_REDUX_COMPONENTS, 15);
+        assert_eq!(
+            REGEX_REDUX_COMPONENTS,
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        );
+        assert_eq!(
+            REGEX_REDUX_FLATTEN_PATTERN,
+            fre_aot_regex::NATIVE_REGEX_REDUX_FLATTEN_V1
+        );
+        assert_eq!(
+            REGEX_REDUX_VARIANTS,
+            fre_aot_regex::NATIVE_REGEX_REDUX_VARIANTS_V1
+        );
+        for ((source, replacement), (native_source, native_replacement)) in
+            REGEX_REDUX_SUBSTITUTIONS
+                .iter()
+                .zip(fre_aot_regex::NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1)
+        {
+            assert_eq!(*source, native_source);
+            assert_eq!(replacement.as_bytes(), native_replacement);
+        }
         assert_eq!(regex_redux_pattern(0), Some(REGEX_REDUX_FLATTEN_PATTERN));
         assert_eq!(
             regex_redux_pattern(
@@ -4600,7 +4597,7 @@ mod tests {
             ),
             (
                 Model::RegexRedux,
-                "general-aot-linked-fixed-regex-redux-span-entries-v1",
+                "general-aot-native-regex-redux-reducer-v1",
                 0,
             ),
         ] {
