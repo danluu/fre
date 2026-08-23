@@ -107,4 +107,70 @@ fn exists_first_is_cheaper_then_promotes_once_without_losing_the_warm_path() {
         assert!(span_first.is_match_value(haystack, limits).unwrap());
     }
     assert_eq!(exists_after_span.change(), Stats::default());
+
+    // The ordinary finite-suffix Span sidecar shares the same automaton-owned
+    // bidirectional pool. Exercise it in this single allocation region owner
+    // so the process-global allocator meter cannot overlap another test.
+    let regex = PortableBuilder::new(r"(?:ab){2,5}c")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("bounded-repeat fixture builds through K0");
+    let mut matched = Vec::with_capacity(4_093);
+    while matched.len() < 4_093 - 7 {
+        let remaining = 4_093 - 7 - matched.len();
+        matched.extend_from_slice(&b"abx"[..3.min(remaining)]);
+    }
+    matched.extend_from_slice(b"abababc");
+    let absent = vec![b'x'; 4_093];
+
+    let cold = Region::new(GLOBAL);
+    assert_eq!(
+        regex
+            .find(&matched)
+            .map(|span| (span.start(), span.end())),
+        Some((4_086, 4_093)),
+    );
+    assert!(cold.change().allocations > 0);
+    assert_eq!(regex.find(&absent), None);
+
+    let warm = Region::new(GLOBAL);
+    for _ in 0..32 {
+        assert_eq!(
+            regex
+                .find(&matched)
+                .map(|span| (span.start(), span.end())),
+            Some((4_086, 4_093)),
+        );
+        assert_eq!(regex.find(&absent), None);
+    }
+    assert_eq!(warm.change(), Stats::default());
+
+    // A near-prefix suffix is a measured sidecar loss, but the bounded prefix
+    // probe must decline before reverse workspace is touched or refreshed.
+    // Repeated ordinary fallback therefore remains allocation-free as the
+    // adaptive retry clock remeasures the source.
+    let early_regex = PortableBuilder::new(r"(?:ab){2,5}c")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("early bounded-repeat fixture builds through K0");
+    let mut early = b"abababababc".to_vec();
+    early.resize(4_093, b'x');
+    assert_eq!(
+        early_regex
+            .find(&early)
+            .map(|span| (span.start(), span.end())),
+        Some((0, 11)),
+    );
+    let warm_early = Region::new(GLOBAL);
+    for _ in 0..32 {
+        assert_eq!(
+            early_regex
+                .find(&early)
+                .map(|span| (span.start(), span.end())),
+            Some((0, 11)),
+        );
+    }
+    assert_eq!(warm_early.change(), Stats::default());
 }
