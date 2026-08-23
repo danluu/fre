@@ -1,7 +1,7 @@
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
-    AsciiByteSet, AsciiByteSetRunScanner, DirectBuildAttemptActual, DispatchPolicy,
-    SimdDispatchContext,
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetRunScanner, DirectBuildAttemptActual,
+    DispatchPolicy, SimdDispatchContext, find_byte_delta,
 };
 use regex_syntax::{
     ParserBuilder,
@@ -63,6 +63,7 @@ const FIXED_BUILD_WORK: usize = 1;
 // The scanner compiles both run-table representations in one complete
 // 128-byte-domain pass and makes one paired-direction dispatch choice.
 const ASCII_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
+const ASCII_INITIAL_NONMEMBER_PROBE_BYTES: usize = ASCII_WIDE_BYTES;
 const FIXED_REDUCE_WORK: usize = 8;
 const UNIT_WORK: usize = 4;
 const RUN_WORK: usize = 2;
@@ -655,7 +656,18 @@ impl AsciiPlan {
         }
         let complete_word_boundaries = plan.has_complete_word_boundaries();
         let scanner = self.run_scanner();
-        let mut position = 0_usize;
+        // Every ASCII word byte lies in `0` through `z`. Keep this hot guard
+        // conservative so word-start inputs only pay the inline range
+        // rejection. The range finder may stop early at punctuation inside
+        // that span, but every byte it skips is therefore proved nonword.
+        let mut position = if haystack.len() >= ASCII_INITIAL_NONMEMBER_PROBE_BYTES
+            && haystack[0].wrapping_sub(b'0') > b'z' - b'0'
+            && haystack[1].wrapping_sub(b'0') > b'z' - b'0'
+        {
+            find_byte_delta(b'0', b'z' - b'0', haystack).unwrap_or(haystack.len())
+        } else {
+            0
+        };
         while position < haystack.len() {
             let byte = haystack[position];
             if !is_ascii_word(byte)
@@ -3112,6 +3124,15 @@ mod tests {
                         "prepared ASCII find {haystack:?}",
                     );
                     assert_eq!(
+                        auto.is_match_window_value(
+                            &haystack,
+                            SearchWindow::full(&haystack),
+                            SearchLimits::unlimited(),
+                        ),
+                        Ok(oracle_find(pattern, &haystack, false).is_some()),
+                        "prepared ASCII existence {haystack:?}",
+                    );
+                    assert_eq!(
                         auto.aggregate_count_value_success(
                             &haystack,
                             AggregateReduceLimits::unlimited(),
@@ -3339,6 +3360,124 @@ mod tests {
                 end: 0,
                 haystack_len: short.len(),
             }),
+        );
+    }
+
+    #[test]
+    fn prepaid_ascii_word_values_handle_initial_nonword_width_boundaries() {
+        let plan =
+            AsciiPlan::build_auto(Plan::new(2, WordMode::Ascii)).expect("ASCII word-run plan");
+        let immediate = vec![b'a'; 64 * 1024];
+        assert_eq!(
+            plan.is_match_window_value(
+                &immediate,
+                SearchWindow::full(&immediate),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+
+        let dense_short = b"a!".repeat(32 * 1024);
+        assert_eq!(
+            plan.is_match_window_value(
+                &dense_short,
+                SearchWindow::full(&dense_short),
+                SearchLimits::unlimited(),
+            ),
+            Ok(false),
+        );
+        assert_eq!(plan.find_full_prepared(&dense_short), None);
+
+        for prefix_len in [30_usize, 31, 32, 33, 63, 64, 65] {
+            for nonword in [b'!', b'{', 0xff] {
+                let miss = vec![nonword; prefix_len];
+                assert_eq!(plan.find_full_prepared(&miss), None);
+                assert_eq!(
+                    plan.is_match_window_value(
+                        &miss,
+                        SearchWindow::full(&miss),
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(false),
+                );
+
+                let mut late = miss;
+                late.extend_from_slice(b"AZ!");
+                assert_eq!(
+                    plan.find_full_prepared(&late),
+                    Some(Match {
+                        start: prefix_len,
+                        end: prefix_len + 2,
+                    }),
+                );
+                assert_eq!(
+                    plan.is_match_window_value(
+                        &late,
+                        SearchWindow::full(&late),
+                        SearchLimits::unlimited(),
+                    ),
+                    Ok(true),
+                );
+            }
+        }
+
+        let mut conservative_stop = vec![b'!'; 80];
+        conservative_stop[40] = b'?';
+        conservative_stop.extend_from_slice(b"AZ!");
+        assert_eq!(
+            plan.find_full_prepared(&conservative_stop),
+            Some(Match { start: 80, end: 82 }),
+        );
+        conservative_stop[40..42].copy_from_slice(b"_A");
+        assert_eq!(
+            plan.find_full_prepared(&conservative_stop),
+            Some(Match { start: 40, end: 42 }),
+        );
+
+        for plan in [
+            Plan::new(1, WordMode::Ascii),
+            Plan::bare_greedy(1, WordMode::Ascii),
+        ] {
+            let plan = AsciiPlan::build_auto(plan).expect("minimum-one ASCII word-run plan");
+            let mut late = vec![b'!'; 65];
+            late.extend_from_slice(b"A!");
+            assert_eq!(
+                plan.find_full_prepared(&late),
+                Some(Match { start: 65, end: 66 }),
+            );
+        }
+
+        let minimum_25 =
+            AsciiPlan::build_auto(Plan::new(25, WordMode::Ascii)).expect("minimum-25 plan");
+        let mut late_25 = vec![0xff; 65];
+        late_25.extend_from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ!");
+        assert_eq!(
+            minimum_25.find_full_prepared(&late_25),
+            Some(Match { start: 65, end: 91 }),
+        );
+        assert_eq!(
+            minimum_25.is_match_window_value(
+                &late_25,
+                SearchWindow::full(&late_25),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+
+        let early_isolated = [b'!', b'!', b'A', b'!', b'A', b'Z', b'!'];
+        assert_eq!(
+            plan.find_full_prepared(&early_isolated),
+            Some(Match { start: 4, end: 6 }),
+        );
+
+        let truncated = b"!a";
+        assert_eq!(
+            plan.is_match_window_value(
+                truncated,
+                SearchWindow::full(truncated),
+                SearchLimits::unlimited(),
+            ),
+            Ok(false),
         );
     }
 
