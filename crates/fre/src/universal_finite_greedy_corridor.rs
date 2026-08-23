@@ -1073,6 +1073,93 @@ pub(crate) struct BoundedDelimitedSegmentPlan {
     class_classifier: Option<ByteSetClassifier>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DelimitedSearchUpperBounds {
+    window_bytes: usize,
+    candidate_visits_upper_bound: usize,
+    finder_calls_upper_bound: usize,
+    finder_work_upper_bound: u64,
+    backward_work_upper_bound: usize,
+    work_upper_bound: u64,
+}
+
+impl DelimitedSearchUpperBounds {
+    fn into_accounting(self) -> SearchAccounting {
+        SearchAccounting {
+            window_bytes: self.window_bytes,
+            candidate_visits_upper_bound: self.candidate_visits_upper_bound,
+            finder_calls_upper_bound: self.finder_calls_upper_bound,
+            finder_work_upper_bound: self.finder_work_upper_bound,
+            backward_work_upper_bound: self.backward_work_upper_bound,
+            work_upper_bound: self.work_upper_bound,
+            scratch_bytes: 0,
+            candidate_visits: 0,
+            finder_calls: 0,
+            backward_bytes_examined: 0,
+        }
+    }
+}
+
+trait DelimitedSearchRecorder {
+    type Output;
+
+    fn finish(self, matched: Option<(usize, usize)>) -> Self::Output;
+
+    #[inline(always)]
+    fn record_forward_candidate(&mut self) -> Result<(), SearchError> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn record_backward_byte(&mut self) -> Result<(), SearchError> {
+        Ok(())
+    }
+}
+
+impl DelimitedSearchRecorder for () {
+    // Successful preflight computes finite `usize` bounds that dominate every
+    // candidate and byte-probe counter below. The reported checked additions
+    // therefore cannot overflow, so erasing them here removes only receipt
+    // projection and cannot erase a reachable semantic failure.
+    type Output = Option<(usize, usize)>;
+
+    #[inline(always)]
+    fn finish(self, matched: Option<(usize, usize)>) -> Self::Output {
+        matched
+    }
+}
+
+impl DelimitedSearchRecorder for SearchAccounting {
+    type Output = (Option<(usize, usize)>, SearchAccounting);
+
+    #[inline(always)]
+    fn finish(self, matched: Option<(usize, usize)>) -> Self::Output {
+        (matched, self)
+    }
+
+    #[inline(always)]
+    fn record_forward_candidate(&mut self) -> Result<(), SearchError> {
+        self.candidate_visits =
+            self.candidate_visits
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "delimited segment forward candidates",
+                })?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn record_backward_byte(&mut self) -> Result<(), SearchError> {
+        self.backward_bytes_examined =
+            self.backward_bytes_examined
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "delimited segment backward-byte accounting",
+                })?;
+        Ok(())
+    }
+}
+
 impl BoundedDelimitedSegmentPlan {
     pub(crate) fn projected_storage_bytes(suffix_bytes: usize) -> Option<usize> {
         size_of::<Self>().checked_add(suffix_bytes)
@@ -1123,8 +1210,10 @@ impl BoundedDelimitedSegmentPlan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        self.is_match_window(haystack, window, limits)
-            .map(|(matched, _)| matched)
+        #[cfg(test)]
+        value_path_probe::record_exists();
+        self.find_delimited_segment_window_value(haystack, window, limits)
+            .map(|matched| matched.is_some())
     }
 
     pub(crate) fn shortest_window(
@@ -1152,8 +1241,9 @@ impl BoundedDelimitedSegmentPlan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        self.find_window(haystack, window, limits)
-            .map(|(matched, _)| matched)
+        #[cfg(test)]
+        value_path_probe::record_span();
+        self.find_delimited_segment_window_value(haystack, window, limits)
     }
 
     fn find_delimited_segment_window(
@@ -1163,7 +1253,8 @@ impl BoundedDelimitedSegmentPlan {
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
         let segment = &self.segment;
-        let mut accounting = self.preflight_delimited_segment(haystack.len(), window, limits)?;
+        let upper_bounds = self.preflight_delimited_segment(haystack.len(), window, limits)?;
+        let mut accounting = upper_bounds.into_accounting();
         let Some(mut search_start) = window
             .start()
             .checked_add(self.descriptor.minimum_prefix_bytes)
@@ -1195,21 +1286,67 @@ impl BoundedDelimitedSegmentPlan {
         )? {
             return Ok((Some((start, suffix_end)), accounting));
         }
-        search_start = suffix_start.checked_add(1).ok_or(
-            SearchError::ArithmeticOverflow {
+        search_start = suffix_start
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
                 computation: "delimited segment barrier handoff",
-            },
-        )?;
+            })?;
         self.find_delimited_segment_forward(haystack, window, search_start, accounting)
     }
 
-    fn find_delimited_segment_forward(
+    fn find_delimited_segment_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.preflight_delimited_segment(haystack.len(), window, limits)?;
+        let segment = &self.segment;
+        let Some(mut search_start) = window
+            .start()
+            .checked_add(self.descriptor.minimum_prefix_bytes)
+        else {
+            return Ok(None);
+        };
+        if search_start > window.end() {
+            return Ok(None);
+        }
+        let found = self
+            .suffix
+            .find_window_value(
+                haystack,
+                LiteralWindow::new(search_start, window.end()),
+                LiteralSearchLimits::unlimited(),
+            )
+            .map_err(map_literal_search_error)?;
+        let Some((suffix_start, suffix_end)) = found else {
+            return Ok(None);
+        };
+        if let Some(start) = recover_delimited_segment_start(
+            haystack,
+            window.start(),
+            suffix_start,
+            segment,
+            &mut (),
+        )? {
+            return Ok(Some((start, suffix_end)));
+        }
+        search_start = suffix_start
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "delimited segment barrier handoff",
+            })?;
+        self.find_delimited_segment_forward(haystack, window, search_start, ())
+    }
+
+    #[inline(never)]
+    fn find_delimited_segment_forward<R: DelimitedSearchRecorder>(
         &self,
         haystack: &[u8],
         window: SearchWindow,
         mut position: usize,
-        mut accounting: SearchAccounting,
-    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        mut recorder: R,
+    ) -> Result<R::Output, SearchError> {
         let segment = &self.segment;
         while let Some(run_start) = segment.member_seek.seek_unmetered(
             haystack,
@@ -1226,41 +1363,36 @@ impl BoundedDelimitedSegmentPlan {
                     self.class_classifier.as_ref(),
                 )
                 .unwrap_or(window.end());
-            let run_bytes = run_end.checked_sub(run_start).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "delimited segment physical run",
-                },
-            )?;
+            let run_bytes =
+                run_end
+                    .checked_sub(run_start)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "delimited segment physical run",
+                    })?;
             if run_bytes >= segment.class_minimum {
-                accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "delimited segment forward candidates",
-                    },
-                )?;
-                let candidate = run_end
-                    .saturating_sub(segment.class_maximum)
-                    .max(run_start);
+                recorder.record_forward_candidate()?;
+                let candidate = run_end.saturating_sub(segment.class_maximum).max(run_start);
                 if let Some(end) = verify_delimited_segment_forward(
                     haystack,
                     candidate,
                     window.end(),
                     self.suffix.needle(),
                     segment,
-                    &mut accounting,
+                    &mut recorder,
                 )? {
-                    return Ok((Some((candidate, end)), accounting));
+                    return Ok(recorder.finish(Some((candidate, end))));
                 }
             }
             if run_end >= window.end() {
                 break;
             }
-            position = run_end.checked_add(1).ok_or(
-                SearchError::ArithmeticOverflow {
+            position = run_end
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
                     computation: "delimited segment forward resume",
-                },
-            )?;
+                })?;
         }
-        Ok((None, accounting))
+        Ok(recorder.finish(None))
     }
 
     fn preflight_delimited_segment(
@@ -1268,7 +1400,7 @@ impl BoundedDelimitedSegmentPlan {
         haystack_len: usize,
         window: SearchWindow,
         limits: SearchLimits,
-    ) -> Result<SearchAccounting, SearchError> {
+    ) -> Result<DelimitedSearchUpperBounds, SearchError> {
         let segment = &self.segment;
         if window.start() > window.end() || window.end() > haystack_len {
             return Err(SearchError::InvalidWindow {
@@ -1353,28 +1485,24 @@ impl BoundedDelimitedSegmentPlan {
                 limit: limits.max_work_upper_bound,
             });
         }
-        Ok(SearchAccounting {
+        Ok(DelimitedSearchUpperBounds {
             window_bytes,
             candidate_visits_upper_bound,
             finder_calls_upper_bound,
             finder_work_upper_bound,
             backward_work_upper_bound,
             work_upper_bound,
-            scratch_bytes: 0,
-            candidate_visits: 0,
-            finder_calls: 0,
-            backward_bytes_examined: 0,
         })
     }
 
 }
 
-fn recover_delimited_segment_start(
+fn recover_delimited_segment_start<R: DelimitedSearchRecorder>(
     haystack: &[u8],
     window_start: usize,
     suffix_start: usize,
     segment: &DelimitedSegment,
-    accounting: &mut SearchAccounting,
+    recorder: &mut R,
 ) -> Result<Option<usize>, SearchError> {
     let mut cursor = suffix_start;
     let mut recovered = None;
@@ -1382,7 +1510,7 @@ fn recover_delimited_segment_start(
         if cursor <= window_start {
             break;
         }
-        charge_delimited_backward(accounting)?;
+        charge_delimited_backward(recorder)?;
         if haystack[cursor - 1] != segment.delimiter {
             break;
         }
@@ -1390,7 +1518,7 @@ fn recover_delimited_segment_start(
         let mut run_start = run_end;
         let mut class_bytes = 0_usize;
         while run_start > window_start && class_bytes <= segment.class_maximum {
-            charge_delimited_backward(accounting)?;
+            charge_delimited_backward(recorder)?;
             let byte = haystack[run_start - 1];
             if !byte_is_member(segment.class_words, byte) {
                 break;
@@ -1415,19 +1543,19 @@ fn recover_delimited_segment_start(
     Ok(recovered)
 }
 
-fn verify_delimited_segment_forward(
+fn verify_delimited_segment_forward<R: DelimitedSearchRecorder>(
     haystack: &[u8],
     start: usize,
     window_end: usize,
     suffix: &[u8],
     segment: &DelimitedSegment,
-    accounting: &mut SearchAccounting,
+    recorder: &mut R,
 ) -> Result<Option<usize>, SearchError> {
     let mut position = start;
     for segment_count in 1..=segment.segment_maximum {
         let mut class_bytes = 0_usize;
         while position < window_end && class_bytes <= segment.class_maximum {
-            charge_delimited_backward(accounting)?;
+            charge_delimited_backward(recorder)?;
             if !byte_is_member(segment.class_words, haystack[position]) {
                 break;
             }
@@ -1440,7 +1568,7 @@ fn verify_delimited_segment_forward(
         if position >= window_end {
             return Ok(None);
         }
-        charge_delimited_backward(accounting)?;
+        charge_delimited_backward(recorder)?;
         if haystack[position] != segment.delimiter {
             return Ok(None);
         }
@@ -1455,7 +1583,7 @@ fn verify_delimited_segment_forward(
             if suffix_end <= window_end {
                 let mut matched = true;
                 for (&actual, &expected) in haystack[position..suffix_end].iter().zip(suffix) {
-                    charge_delimited_backward(accounting)?;
+                    charge_delimited_backward(recorder)?;
                     if actual != expected {
                         matched = false;
                         break;
@@ -1476,14 +1604,11 @@ fn verify_delimited_segment_forward(
     Ok(None)
 }
 
-fn charge_delimited_backward(accounting: &mut SearchAccounting) -> Result<(), SearchError> {
-    accounting.backward_bytes_examined = accounting
-        .backward_bytes_examined
-        .checked_add(1)
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "delimited segment backward-byte accounting",
-        })?;
-    Ok(())
+#[inline(always)]
+fn charge_delimited_backward<R: DelimitedSearchRecorder>(
+    recorder: &mut R,
+) -> Result<(), SearchError> {
+    recorder.record_backward_byte()
 }
 
 fn map_literal_search_error(error: LiteralError) -> SearchError {
@@ -1519,8 +1644,8 @@ mod tests {
     use super::{
         BYTE_SET_BLOCK_BYTES, BoundedDelimitedSegmentPlan, DELIMITED_SEGMENT_PLAN_ID,
         Descriptor, InspectionError, InspectionOutcome, LiteralBuildLimits,
-        NativeInspectionOutcome, Plan, SearchError, SearchLimits, SearchWindow, inspect,
-        inspect_native,
+        NativeInspectionOutcome, Plan, SearchAccounting, SearchError, SearchLimits,
+        SearchWindow, inspect, inspect_native,
     };
 
     fn parse_bytes(pattern: &str) -> regex_syntax::hir::Hir {
@@ -1966,6 +2091,26 @@ mod tests {
                             expected,
                             "span haystack={haystack:?} window={start}..{end}",
                         );
+                        assert_eq!(
+                            plan.find_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected,
+                            "value span haystack={haystack:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            plan.is_match_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected.is_some(),
+                            "value exists haystack={haystack:?} window={start}..{end}",
+                        );
                         assert!(
                             accounting.candidate_visits
                                 <= accounting.candidate_visits_upper_bound,
@@ -2002,6 +2147,146 @@ mod tests {
     }
 
     #[test]
+    fn bounded_delimited_segment_reported_receipts_remain_exact() {
+        let plan = delimited_plan(r"(?-u:(?:[ab]{1,2}/){1,2}X)");
+        for (haystack, matched, expected) in [
+            (
+                b"X".as_slice(),
+                None,
+                SearchAccounting {
+                    window_bytes: 1,
+                    candidate_visits_upper_bound: 1,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 2,
+                    backward_work_upper_bound: 33,
+                    work_upper_bound: 51,
+                    scratch_bytes: 0,
+                    candidate_visits: 0,
+                    finder_calls: 0,
+                    backward_bytes_examined: 0,
+                },
+            ),
+            (
+                b"!!!!".as_slice(),
+                None,
+                SearchAccounting {
+                    window_bytes: 4,
+                    candidate_visits_upper_bound: 4,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 5,
+                    backward_work_upper_bound: 108,
+                    work_upper_bound: 129,
+                    scratch_bytes: 0,
+                    candidate_visits: 0,
+                    finder_calls: 1,
+                    backward_bytes_examined: 0,
+                },
+            ),
+            (
+                b"aa/X".as_slice(),
+                Some((0, 4)),
+                SearchAccounting {
+                    window_bytes: 4,
+                    candidate_visits_upper_bound: 4,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 5,
+                    backward_work_upper_bound: 108,
+                    work_upper_bound: 129,
+                    scratch_bytes: 0,
+                    candidate_visits: 1,
+                    finder_calls: 1,
+                    backward_bytes_examined: 3,
+                },
+            ),
+            (
+                b"!!X!aa/X".as_slice(),
+                Some((4, 8)),
+                SearchAccounting {
+                    window_bytes: 8,
+                    candidate_visits_upper_bound: 8,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 9,
+                    backward_work_upper_bound: 208,
+                    work_upper_bound: 233,
+                    scratch_bytes: 0,
+                    candidate_visits: 2,
+                    finder_calls: 1,
+                    backward_bytes_examined: 6,
+                },
+            ),
+            (
+                b"aaa/X".as_slice(),
+                Some((1, 5)),
+                SearchAccounting {
+                    window_bytes: 5,
+                    candidate_visits_upper_bound: 5,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 6,
+                    backward_work_upper_bound: 133,
+                    work_upper_bound: 155,
+                    scratch_bytes: 0,
+                    candidate_visits: 1,
+                    finder_calls: 1,
+                    backward_bytes_examined: 4,
+                },
+            ),
+            (
+                b"!!X!aaa/!".as_slice(),
+                None,
+                SearchAccounting {
+                    window_bytes: 9,
+                    candidate_visits_upper_bound: 9,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 10,
+                    backward_work_upper_bound: 233,
+                    work_upper_bound: 259,
+                    scratch_bytes: 0,
+                    candidate_visits: 2,
+                    finder_calls: 1,
+                    backward_bytes_examined: 6,
+                },
+            ),
+        ] {
+            let (actual, accounting) = plan
+                .find_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(actual, matched, "haystack={haystack:?}");
+            assert_eq!(accounting, expected, "haystack={haystack:?}");
+        }
+
+        let classified = delimited_plan(r"(?-u:(?:[aceg]{1,2}/){1,2}X)");
+        let classified_haystack = b"!!X!a!c!e!g!a!c!e!g!";
+        assert_eq!(
+            classified
+                .find_window(
+                    classified_haystack,
+                    SearchWindow::full(classified_haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            (
+                None,
+                SearchAccounting {
+                    window_bytes: 20,
+                    candidate_visits_upper_bound: 20,
+                    finder_calls_upper_bound: 1,
+                    finder_work_upper_bound: 21,
+                    backward_work_upper_bound: 508,
+                    work_upper_bound: 545,
+                    scratch_bytes: 0,
+                    candidate_visits: 9,
+                    finder_calls: 1,
+                    backward_bytes_examined: 25,
+                },
+            ),
+        );
+    }
+
+    #[test]
     fn bounded_delimited_segment_search_limits_close_before_source_reads() {
         let plan = delimited_plan(r"(?-u:(?:[ab]{1,2}/){1,2}X)");
         let haystack = b"!!X!aa/X";
@@ -2022,7 +2307,43 @@ mod tests {
         };
         assert_eq!(plan.find_window(haystack, window, exact).unwrap().0, matched);
         assert_eq!(
+            plan.find_window_value(haystack, window, exact).unwrap(),
+            matched,
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, exact).unwrap(),
+            matched.is_some(),
+        );
+        assert_eq!(
             plan.find_window(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work_upper_bound: accounting.work_upper_bound - 1,
+                    ..exact
+                },
+            ),
+            Err(SearchError::WorkLimit {
+                needed: accounting.work_upper_bound,
+                limit: accounting.work_upper_bound - 1,
+            }),
+        );
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work_upper_bound: accounting.work_upper_bound - 1,
+                    ..exact
+                },
+            ),
+            Err(SearchError::WorkLimit {
+                needed: accounting.work_upper_bound,
+                limit: accounting.work_upper_bound - 1,
+            }),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
                 haystack,
                 window,
                 SearchLimits {
@@ -2049,6 +2370,57 @@ mod tests {
                 limit: accounting.candidate_visits_upper_bound - 1,
             }),
         );
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_candidate_visits: accounting.candidate_visits_upper_bound - 1,
+                    ..exact
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: accounting.candidate_visits_upper_bound,
+                limit: accounting.candidate_visits_upper_bound - 1,
+            }),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_candidate_visits: accounting.candidate_visits_upper_bound - 1,
+                    ..exact
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: accounting.candidate_visits_upper_bound,
+                limit: accounting.candidate_visits_upper_bound - 1,
+            }),
+        );
+
+        let invalid = SearchWindow::new(window.end(), window.start());
+        let refusing = SearchLimits {
+            max_work_upper_bound: 0,
+            max_candidate_visits: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(matches!(
+            plan.find_window(haystack, invalid, refusing),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.is_match_window(haystack, invalid, refusing),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.find_window_value(haystack, invalid, refusing),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.is_match_window_value(haystack, invalid, refusing),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
 
         let classified = delimited_plan(r"(?-u:(?:[aceg]{1,2}/){1,2}X)");
         let classified_haystack = b"!!X!a!c!e!g!a!c!e!g!";

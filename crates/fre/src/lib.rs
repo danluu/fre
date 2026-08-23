@@ -38499,6 +38499,38 @@ mod tests {
             .build()
             .unwrap();
 
+        let ordinary_haystack = b"DONE!b/DONE!cc/dd/DONE";
+        let ordinary_expected = upstream.find(ordinary_haystack).map(|matched| Match {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(regex.find(ordinary_haystack), ordinary_expected);
+        assert_eq!(regex.is_match(ordinary_haystack), ordinary_expected.is_some());
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (1, 1),
+        );
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(
+            regex
+                .find_accounted(ordinary_haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            ordinary_expected,
+        );
+        assert_eq!(
+            regex
+                .is_match_accounted(ordinary_haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            ordinary_expected.is_some(),
+        );
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 0),
+        );
+
         for haystack in [
             b"".as_slice(),
             b"DONE".as_slice(),
