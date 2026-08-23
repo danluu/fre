@@ -47,6 +47,28 @@ def public_klv(
     return b"".join(klv_field(key, value) for key, value in fields)
 
 
+def production_public_klv(
+    name: str,
+    model: str,
+    patterns: list[bytes],
+    haystack: bytes,
+    max_iters: bytes = b"1",
+) -> bytes:
+    fields = [
+        ("name", name.encode()),
+        ("model", model.encode()),
+        ("case-insensitive", b"false"),
+        ("unicode", b"true"),
+        ("max-iters", max_iters),
+        ("max-warmup-iters", b"0"),
+        ("max-time", b"1"),
+        ("max-warmup-time", b"0"),
+        *(("pattern", pattern) for pattern in patterns),
+        ("haystack", haystack),
+    ]
+    return b"".join(klv_field(key, value) for key, value in fields)
+
+
 def frozen_validation_fields() -> dict[str, str]:
     return {
         "validation_authority": "frozen-public-schedule-v1",
@@ -1861,6 +1883,22 @@ class TrueNativeCensusTests(unittest.TestCase):
                     oversized_integer, "oversized integer"
                 )
 
+    def test_public_klv_parser_accepts_exact_production_field_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "production.klv"
+            path.write_bytes(production_public_klv(
+                "production", "count", [b"first", b"second"], b"haystack"
+            ))
+            parsed = CENSUS.parse_public_klv_semantic_identity(path, "production")
+            self.assertEqual(parsed["identity"]["benchmark"], "production")
+            self.assertEqual(parsed["identity"]["model"], "count")
+            self.assertEqual(len(parsed["identity"]["input"]["pattern_sha256"]), 2)
+
+            fields = path.read_bytes().splitlines(keepends=True)
+            path.write_bytes(b"".join(fields[:4] + [fields[5], fields[4]] + fields[6:]))
+            with self.assertRaisesRegex(CENSUS.CensusError, "order or closure"):
+                CENSUS.parse_public_klv_semantic_identity(path, "reordered production")
+
     def test_public_manifest_rejects_duplicate_semantic_klvs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -1892,6 +1930,214 @@ class TrueNativeCensusTests(unittest.TestCase):
                     "public/klv",
                     2,
                 )
+
+    def test_public_inventory_manifest_normalizes_and_authenticates_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            compile_klv = root / "compile.klv"
+            runtime_klv = root / "runtime.klv"
+            second_runtime_klv = root / "runtime-second.klv"
+            compile_klv.write_bytes(
+                production_public_klv("compile-bench", "compile", [b"a"], b"hay")
+            )
+            runtime_klv.write_bytes(
+                production_public_klv("runtime-bench", "count", [b"b"], b"hay")
+            )
+            second_runtime_klv.write_bytes(
+                production_public_klv(
+                    "runtime-bench-second", "count", [b"c"], b"hay"
+                )
+            )
+            entries = [
+                {
+                    "benchmark": "compile-bench",
+                    "engine": "rust/regex",
+                    "job_id": "compile-job-000",
+                    "klv_bytes": compile_klv.stat().st_size,
+                    "klv_file": compile_klv.name,
+                    "klv_sha256": CENSUS.sha_file(compile_klv),
+                    "model": "compile",
+                },
+                {
+                    "benchmark": "runtime-bench",
+                    "engine": "rust/regex",
+                    "job_id": "runtime-job-000",
+                    "klv_bytes": runtime_klv.stat().st_size,
+                    "klv_file": runtime_klv.name,
+                    "klv_sha256": CENSUS.sha_file(runtime_klv),
+                    "model": "count",
+                },
+                {
+                    "benchmark": "runtime-bench-second",
+                    "engine": "rust/regex",
+                    "job_id": "runtime-job-001",
+                    "klv_bytes": second_runtime_klv.stat().st_size,
+                    "klv_file": second_runtime_klv.name,
+                    "klv_sha256": CENSUS.sha_file(second_runtime_klv),
+                    "model": "count",
+                },
+            ]
+            manifest_value = {
+                "compile_job_count": 1,
+                "entries": entries,
+                "job_count": 3,
+                "model_counts": {"compile": 1, "count": 2},
+                "rebar_binary_sha256": "7" * 64,
+                "rebar_revision": "8" * 40,
+                "runtime_job_count": 2,
+                "schema": CENSUS.PUBLIC_MANIFEST_SCHEMA,
+            }
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
+            record, indexed, metadata = CENSUS.external_public_manifest(
+                manifest, CENSUS.sha_file(manifest), root, "public/klv", 3
+            )
+            self.assertEqual(record["entry_count"], 3)
+            self.assertEqual(metadata, {"rebar_revision": "8" * 40})
+            self.assertEqual(
+                {entry["job_id"] for entry in indexed.values()},
+                {"compile-job-000", "runtime-job-000", "runtime-job-001"},
+            )
+            self.assertEqual(
+                {entry["klv"]["path"] for entry in indexed.values()},
+                {"compile.klv", "runtime.klv", "runtime-second.klv"},
+            )
+
+            poisoned = copy.deepcopy(manifest_value)
+            poisoned["model_counts"]["count"] = 3
+            manifest.write_text(json.dumps(poisoned), encoding="utf-8")
+            with self.assertRaisesRegex(CENSUS.CensusError, "model counts"):
+                CENSUS.external_public_manifest(
+                    manifest, CENSUS.sha_file(manifest), root, "public/klv", 3
+                )
+            for invalid in (True, 1.0):
+                poisoned = copy.deepcopy(manifest_value)
+                poisoned["model_counts"]["count"] = invalid
+                manifest.write_text(json.dumps(poisoned), encoding="utf-8")
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    CENSUS.CensusError, "model counts are invalid"
+                ):
+                    CENSUS.external_public_manifest(
+                        manifest, CENSUS.sha_file(manifest), root, "public/klv", 3
+                    )
+            poisoned = copy.deepcopy(manifest_value)
+            poisoned["entries"][1]["job_id"] = "runtime-job-001"
+            poisoned["entries"][2]["job_id"] = "runtime-job-000"
+            manifest.write_text(json.dumps(poisoned), encoding="utf-8")
+            with self.assertRaisesRegex(CENSUS.CensusError, "job ID topology"):
+                CENSUS.external_public_manifest(
+                    manifest, CENSUS.sha_file(manifest), root, "public/klv", 3
+                )
+
+    def test_manifest_schedule_claim_is_syntax_only_and_closed(self) -> None:
+        CENSUS.external_schedule_klv_claim({
+            "path": "/retired-host/public/job.klv",
+            "sha256": "9" * 64,
+        }, "candidate")
+        with self.assertRaisesRegex(CENSUS.CensusError, "keys differ"):
+            CENSUS.external_schedule_klv_claim({
+                "path": "/retired-host/public/job.klv",
+                "sha256": "9" * 64,
+                "bytes": 1,
+            }, "candidate")
+
+    def test_rich_manifest_joins_retired_schedule_paths_by_hashed_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            public_root = root / "public"
+            public_root.mkdir()
+            klv_path = public_root / "runtime-job-000.klv"
+            pattern = b"literal"
+            haystack = b"literal haystack"
+            klv_path.write_bytes(production_public_klv(
+                "public-bench", "count", [pattern], haystack
+            ))
+            revision = "4" * 40
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps({
+                "compile_job_count": 0,
+                "entries": [{
+                    "benchmark": "public-bench",
+                    "engine": "rust/regex",
+                    "job_id": "runtime-job-000",
+                    "klv_bytes": klv_path.stat().st_size,
+                    "klv_file": klv_path.name,
+                    "klv_sha256": CENSUS.sha_file(klv_path),
+                    "model": "count",
+                }],
+                "job_count": 1,
+                "model_counts": {"count": 1},
+                "rebar_binary_sha256": "5" * 64,
+                "rebar_revision": revision,
+                "runtime_job_count": 1,
+                "schema": CENSUS.PUBLIC_MANIFEST_SCHEMA,
+            }), encoding="utf-8")
+            schedule_value = {
+                "schema": CENSUS.SCHEDULE_SCHEMA,
+                "rebar_revision": revision,
+                "points": [{
+                    "point_id": "point-000",
+                    "fre_job_id": "public-bench@rust/regex",
+                    "benchmark": "public-bench",
+                    "model": "count",
+                    "boundary": "formal",
+                    "comparator": "rust-regex-1.12.4",
+                    "expected": 1,
+                    "input": {
+                        "pattern_sha256": [CENSUS.sha_bytes(pattern)],
+                        "haystack_sha256": CENSUS.sha_bytes(haystack),
+                        "haystack_bytes": len(haystack),
+                        "case_insensitive": False,
+                        "unicode": True,
+                    },
+                    "candidate_klv": {
+                        "path": "/retired-host/candidate.klv",
+                        "sha256": "6" * 64,
+                    },
+                    "reference_klv": {
+                        "path": "/retired-host/reference.klv",
+                        "sha256": "7" * 64,
+                    },
+                }],
+            }
+            schedule_path = root / "schedule.json"
+            schedule_path.write_text(json.dumps(schedule_value), encoding="utf-8")
+            expected_source = {
+                "commit": "1" * 40,
+                "tree": "2" * 40,
+                "cargo_lock_sha256": "3" * 64,
+            }
+            arguments = argparse.Namespace(
+                schedule=[str(schedule_path)],
+                schedule_sha256=[CENSUS.sha_file(schedule_path)],
+                public_manifest=str(manifest_path),
+                public_manifest_sha256=CENSUS.sha_file(manifest_path),
+                public_klv_root=str(public_root),
+                recorded_public_klv_root="public",
+                public_corpus_label="synthetic-rich-public-manifest",
+                source_dir=str(root),
+                source_commit=expected_source["commit"],
+                source_tree=expected_source["tree"],
+                target="aarch64-linux",
+                features="none",
+                expected_public_jobs=1,
+                expected_runtime_jobs=1,
+                expected_compile_jobs=0,
+                skip_klv_hashing=False,
+                dry_run=False,
+            )
+            with mock.patch.object(CENSUS, "source_identity", return_value=expected_source):
+                plan = CENSUS.make_plan(arguments)
+            job = plan["jobs"][0]
+            self.assertEqual(job["candidate_klv"]["path"], klv_path.name)
+            self.assertEqual(plan["points"][0]["reference_klv"], job["candidate_klv"])
+
+            schedule_value["points"][0]["fre_job_id"] = "noncanonical-job"
+            schedule_path.write_text(json.dumps(schedule_value), encoding="utf-8")
+            arguments.schedule_sha256 = [CENSUS.sha_file(schedule_path)]
+            with mock.patch.object(CENSUS, "source_identity", return_value=expected_source):
+                with self.assertRaisesRegex(CENSUS.CensusError, "not canonical"):
+                    CENSUS.make_plan(arguments)
 
     def test_manifest_plan_maps_all_344_semantic_identities_and_seals_digests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2012,7 +2258,31 @@ class TrueNativeCensusTests(unittest.TestCase):
                 {key: value for key, value in forged.items() if key != "plan_sha256"},
                 "plan_sha256",
             )
-            with self.assertRaisesRegex(CENSUS.CensusError, "mapping differs"):
+            with self.assertRaisesRegex(
+                CENSUS.CensusError, "semantic identity|mapping differs"
+            ):
+                CENSUS.validate_plan(forged)
+
+            forged = copy.deepcopy(validated)
+            forged_manifest = forged["public_corpus"]["manifest"]
+            forged_manifest["mappings"][0]["semantic_identity_sha256"] = "0" * 64
+            entries_projection = [{
+                "ordinal": mapping["manifest_ordinal"],
+                "klv": mapping["manifest_klv"],
+                "semantic_identity_sha256": mapping["semantic_identity_sha256"],
+            } for mapping in forged_manifest["mappings"]]
+            entries_projection.sort(key=lambda row: row["ordinal"])
+            forged_manifest["entries_sha256"] = CENSUS.sha_bytes(
+                CENSUS.canonical(entries_projection).encode()
+            )
+            forged_manifest["mapping_sha256"] = CENSUS.sha_bytes(
+                CENSUS.canonical(forged_manifest["mappings"]).encode()
+            )
+            forged = CENSUS.add_digest(
+                {key: value for key, value in forged.items() if key != "plan_sha256"},
+                "plan_sha256",
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "semantic identity"):
                 CENSUS.validate_plan(forged)
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:

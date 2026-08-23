@@ -147,24 +147,50 @@ schedule identities, public path containment, KLV hashes, and the 344/33/311
 denominators without writing output, invoking Cargo, building, running a test,
 or executing a benchmark.
 
-The preferred sealed mode additionally accepts a closed public KLV inventory:
+The preferred sealed mode additionally accepts a closed public KLV inventory.
+The production inventory carries authenticated job metadata:
 
 ```json
 {
   "schema": "fre.public-rebar-klv-inventory.v1",
+  "job_count": 344,
+  "compile_job_count": 33,
+  "runtime_job_count": 311,
+  "model_counts": {
+    "compile": 33, "count": 133, "count-captures": 15,
+    "count-spans": 129, "grep": 11, "grep-captures": 22,
+    "regex-redux": 1
+  },
+  "rebar_revision": "...",
+  "rebar_binary_sha256": "...",
   "entries": [
-    {"path": "relative/job.klv", "sha256": "...", "bytes": 123}
+    {
+      "benchmark": "public/name",
+      "engine": "rust/regex",
+      "job_id": "runtime-job-000",
+      "klv_file": "klv/runtime-job-000.klv",
+      "klv_sha256": "...",
+      "klv_bytes": 123,
+      "model": "count"
+    }
   ]
 }
 ```
 
-It must contain exactly 344 entries. Each KLV is parsed in canonical Rebar
-field order with a closed key set; pattern and haystack bytes are immediately
+The earlier minimal `path`/`sha256`/`bytes` entry form remains accepted. The
+inventory must contain exactly 344 entries. All production counts, job IDs,
+Rust-engine declarations, benchmark/model declarations, and the Rebar
+revision shared with the schedule are checked. Each KLV is parsed in either
+the current production Rebar field order or the exact legacy order, both with
+a closed key set; pattern and haystack bytes are immediately
 reduced to hashes and lengths. The semantic join uses benchmark, model,
 ordered pattern hashes, haystack hash/length, and the two regex flags. Timing
 fields are validated but deliberately do not change semantic identity, so the
-canonical manifest KLV can be joined to a schedule KLV with different public
-measurement controls. Every manifest identity must map to exactly one public
+canonical manifest KLV can be joined to sealed schedule metadata from a
+retired host path with different public measurement controls. In the rich
+production form only, the old path is syntax-checked but never resolved; the
+minimal compatibility form retains its byte-backed path check. The schedule
+file digest and complete point topology remain sealed. Every manifest identity must map to exactly one public
 job and all its frozen schedule points. The plan retains both input file
 digests, all 344 normalized mappings, and separate entries/mapping digests.
 Schedule-only invocation remains accepted for existing version-2 plans.
@@ -181,8 +207,8 @@ python3 tools/aot-rebar-runner/census/true_native_census.py plan \
   --schedule-sha256 EXPECTED_SHA256 \
   --public-manifest /public/control/public-klv-manifest.json \
   --public-manifest-sha256 EXPECTED_MANIFEST_SHA256 \
-  --public-klv-root /public/corpus/klv \
-  --recorded-public-klv-root public-corpus/klv \
+  --public-klv-root /public/corpus \
+  --recorded-public-klv-root public-corpus \
   --public-corpus-label public-rebar-CORPUS_ID \
   --source-dir /clean/fre-source \
   --source-commit EXPECTED_COMMIT \
@@ -217,7 +243,7 @@ resumes:
 python3 tools/aot-rebar-runner/census/formal_qualification.py \
   --plan census-plan.json \
   --source-dir /clean/fre-source \
-  --public-klv-root /public/corpus/klv \
+  --public-klv-root /public/corpus \
   --work-dir /qualification/formal-census \
   --primary-target-dir /qualification/target-a \
   --replica-target-dir /qualification/target-b \
@@ -265,7 +291,7 @@ one receipt per exact-adapter job:
 python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
   --plan census-plan.json \
   --job-id PUBLIC_FRE_JOB_ID \
-  --public-klv-root /public/corpus/klv \
+  --public-klv-root /public/corpus \
   --primary-runner /build-a/fre-aot-rebar-runner \
   --replica-runner /build-b/fre-aot-rebar-runner \
   --primary-object /build-a/aot-rebar-artifact.o \

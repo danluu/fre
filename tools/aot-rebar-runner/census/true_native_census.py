@@ -677,12 +677,17 @@ def parse_public_klv_semantic_identity(
 
     keys = [key for key, _ in fields]
     patterns = [value for key, value in fields if key == "pattern"]
-    expected_keys = [
+    legacy_keys = [
         "name", "model", *("pattern" for _ in patterns),
         "case-insensitive", "unicode", "haystack", "max-iters",
         "max-warmup-iters", "max-time", "max-warmup-time",
     ]
-    if keys != expected_keys:
+    production_keys = [
+        "name", "model", "case-insensitive", "unicode", "max-iters",
+        "max-warmup-iters", "max-time", "max-warmup-time",
+        *("pattern" for _ in patterns), "haystack",
+    ]
+    if keys not in (legacy_keys, production_keys):
         raise CensusError(f"{context} KLV field order or closure is noncanonical")
     by_key = {key: value for key, value in fields if key != "pattern"}
     try:
@@ -744,7 +749,9 @@ def external_public_manifest(
     public_root: pathlib.Path,
     recorded_root: str,
     expected_jobs: int,
-) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+) -> tuple[
+    dict[str, object], dict[str, dict[str, object]], Optional[dict[str, str]]
+]:
     """Authenticate and index the canonical public Rust KLV inventory."""
     forbidden = forbidden_path_components(path.resolve(strict=True).parts)
     if forbidden:
@@ -755,7 +762,15 @@ def external_public_manifest(
     value = load_json(path)
     if not isinstance(value, dict):
         raise CensusError("public KLV manifest is not an object")
-    require_exact_keys(value, {"schema", "entries"}, "public KLV manifest")
+    minimal_keys = {"schema", "entries"}
+    inventory_keys = {
+        "schema", "entries", "compile_job_count", "job_count", "model_counts",
+        "rebar_binary_sha256", "rebar_revision", "runtime_job_count",
+    }
+    inventory = "job_count" in value
+    require_exact_keys(
+        value, inventory_keys if inventory else minimal_keys, "public KLV manifest"
+    )
     if value["schema"] != PUBLIC_MANIFEST_SCHEMA:
         raise CensusError("unexpected public KLV manifest schema")
     entries = value["entries"]
@@ -764,27 +779,106 @@ def external_public_manifest(
             f"public KLV manifest has {len(entries) if isinstance(entries, list) else 'invalid'} "
             f"entries, expected {expected_jobs}"
         )
+    metadata: Optional[dict[str, str]] = None
+    if inventory:
+        for name in ("compile_job_count", "job_count", "runtime_job_count"):
+            count = value[name]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise CensusError(f"public KLV manifest {name} is invalid")
+        if value["job_count"] != len(entries):
+            raise CensusError("public KLV manifest job count differs from its entries")
+        require_hex64(
+            value["rebar_binary_sha256"], "public KLV manifest Rebar binary"
+        )
+        revision = value["rebar_revision"]
+        if not isinstance(revision, str) or HEX40.fullmatch(revision) is None:
+            raise CensusError("public KLV manifest Rebar revision is invalid")
+        metadata = {"rebar_revision": revision}
+        model_counts = value["model_counts"]
+        if (
+            not isinstance(model_counts, dict)
+            or not all(isinstance(name, str) and name for name in model_counts)
+            or not all(
+                isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                for count in model_counts.values()
+            )
+        ):
+            raise CensusError("public KLV manifest model counts are invalid")
     indexed: dict[str, dict[str, object]] = {}
     normalized_rows = []
     seen_klvs: set[tuple[str, str]] = set()
+    seen_job_ids: set[str] = set()
+    ordered_compile_job_ids: list[str] = []
+    ordered_runtime_job_ids: list[str] = []
+    observed_models: Counter[str] = Counter()
     for ordinal, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
             raise CensusError(f"public manifest entry {ordinal} is not an object")
-        require_exact_keys(
-            raw_entry, {"path", "sha256", "bytes"},
-            f"public manifest entry {ordinal}",
-        )
+        manifest_job_id: Optional[str] = None
+        declared_benchmark: Optional[str] = None
+        declared_model: Optional[str] = None
+        if inventory:
+            require_exact_keys(
+                raw_entry,
+                {
+                    "benchmark", "engine", "job_id", "klv_bytes", "klv_file",
+                    "klv_sha256", "model",
+                },
+                f"public manifest entry {ordinal}",
+            )
+            declared_benchmark = raw_entry["benchmark"]
+            declared_model = raw_entry["model"]
+            manifest_job_id = raw_entry["job_id"]
+            if not all(
+                isinstance(item, str) and item
+                for item in (declared_benchmark, declared_model, manifest_job_id)
+            ):
+                raise CensusError(
+                    f"public manifest entry {ordinal} has invalid textual metadata"
+                )
+            if raw_entry["engine"] != "rust/regex":
+                raise CensusError(
+                    f"public manifest entry {ordinal} is not a Rust regex job"
+                )
+            if declared_model not in PUBLIC_REBAR_MODELS:
+                raise CensusError(
+                    f"public manifest entry {ordinal} has an unsupported model"
+                )
+            job_prefix = "compile-job-" if declared_model == "compile" else "runtime-job-"
+            if re.fullmatch(re.escape(job_prefix) + r"[0-9]{3}", manifest_job_id) is None:
+                raise CensusError(
+                    f"public manifest entry {ordinal} has a noncanonical job ID"
+                )
+            if manifest_job_id in seen_job_ids:
+                raise CensusError("public KLV manifest repeats a job ID")
+            seen_job_ids.add(manifest_job_id)
+            if declared_model == "compile":
+                ordered_compile_job_ids.append(manifest_job_id)
+            else:
+                ordered_runtime_job_ids.append(manifest_job_id)
+            observed_models[declared_model] += 1
+            normalized_entry = {
+                "path": raw_entry["klv_file"],
+                "sha256": raw_entry["klv_sha256"],
+                "bytes": raw_entry["klv_bytes"],
+            }
+        else:
+            require_exact_keys(
+                raw_entry, {"path", "sha256", "bytes"},
+                f"public manifest entry {ordinal}",
+            )
+            normalized_entry = raw_entry
         if (
-            not isinstance(raw_entry["bytes"], int)
-            or isinstance(raw_entry["bytes"], bool)
-            or raw_entry["bytes"] < 0
+            not isinstance(normalized_entry["bytes"], int)
+            or isinstance(normalized_entry["bytes"], bool)
+            or normalized_entry["bytes"] < 0
         ):
             raise CensusError(f"public manifest entry {ordinal} byte count is invalid")
         klv = klv_identity(
-            raw_entry, public_root, recorded_root,
+            normalized_entry, public_root, recorded_root,
             f"public manifest entry {ordinal}", True,
         )
-        if raw_entry["bytes"] != klv["bytes"]:
+        if normalized_entry["bytes"] != klv["bytes"]:
             raise CensusError(f"public manifest entry {ordinal} byte count differs")
         klv_key = (str(klv["path"]), str(klv["sha256"]))
         if klv_key in seen_klvs:
@@ -796,6 +890,13 @@ def external_public_manifest(
         semantic = parse_public_klv_semantic_identity(
             absolute, f"public manifest entry {ordinal}"
         )
+        if inventory and (
+            semantic["identity"]["benchmark"] != declared_benchmark
+            or semantic["identity"]["model"] != declared_model
+        ):
+            raise CensusError(
+                f"public manifest entry {ordinal} metadata differs from its KLV"
+            )
         semantic_sha = str(semantic["semantic_identity_sha256"])
         if semantic_sha in indexed:
             raise CensusError(
@@ -806,6 +907,8 @@ def external_public_manifest(
             "klv": klv,
             "semantic_identity_sha256": semantic_sha,
             "identity": semantic["identity"],
+            "job_id": manifest_job_id,
+            "engine": "rust/regex" if inventory else None,
         }
         indexed[semantic_sha] = record
         normalized_rows.append({
@@ -813,6 +916,30 @@ def external_public_manifest(
             "klv": klv,
             "semantic_identity_sha256": semantic_sha,
         })
+    if inventory:
+        expected_model_counts = dict(sorted(observed_models.items()))
+        if value["model_counts"] != expected_model_counts:
+            raise CensusError("public KLV manifest model counts differ from its entries")
+        compile_count = observed_models.get("compile", 0)
+        if (
+            value["compile_job_count"] != compile_count
+            or value["runtime_job_count"] != len(entries) - compile_count
+            or value["compile_job_count"] + value["runtime_job_count"]
+            != value["job_count"]
+        ):
+            raise CensusError("public KLV manifest runtime/compile counts differ")
+        expected_compile_job_ids = [
+            f"compile-job-{index:03}" for index in range(compile_count)
+        ]
+        expected_runtime_job_ids = [
+            f"runtime-job-{index:03}"
+            for index in range(len(entries) - compile_count)
+        ]
+        if (
+            ordered_compile_job_ids != expected_compile_job_ids
+            or ordered_runtime_job_ids != expected_runtime_job_ids
+        ):
+            raise CensusError("public KLV manifest job ID topology differs")
     manifest_record = {
         "schema": PUBLIC_MANIFEST_SCHEMA,
         "file_sha256": expected_sha256,
@@ -821,7 +948,18 @@ def external_public_manifest(
         "mappings": None,
         "mapping_sha256": None,
     }
-    return manifest_record, indexed
+    return manifest_record, indexed, metadata
+
+
+def external_schedule_klv_claim(entry: object, context: str) -> None:
+    """Validate a sealed schedule KLV claim without requiring its old host path."""
+    if not isinstance(entry, dict):
+        raise CensusError(f"{context} KLV identity is not an object")
+    require_exact_keys(entry, {"path", "sha256"}, f"{context} KLV identity")
+    path = entry["path"]
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise CensusError(f"{context} KLV path is invalid")
+    require_hex64(entry["sha256"], f"{context} KLV SHA-256")
 
 
 def klv_identity(
@@ -939,10 +1077,11 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
         )
     manifest_record: Optional[dict[str, object]] = None
     manifest_entries: Optional[dict[str, dict[str, object]]] = None
+    manifest_metadata: Optional[dict[str, str]] = None
     if raw_public_manifest is not None:
         if args.skip_klv_hashing:
             raise CensusError("public manifest mode cannot skip KLV hashing")
-        manifest_record, manifest_entries = external_public_manifest(
+        manifest_record, manifest_entries, manifest_metadata = external_public_manifest(
             pathlib.Path(raw_public_manifest).resolve(strict=True),
             raw_public_manifest_sha256,
             public_root,
@@ -965,6 +1104,14 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
             "rebar_revision": schedule.get("rebar_revision"),
             "point_count": len(schedule["points"]),
         }
+        if (
+            manifest_metadata is not None
+            and schedule_record["rebar_revision"]
+            != manifest_metadata["rebar_revision"]
+        ):
+            raise CensusError(
+                "public KLV manifest Rebar revision differs from the schedule"
+            )
         schedules.append(schedule_record)
         for ordinal, raw_point in enumerate(schedule["points"]):
             if not isinstance(raw_point, dict):
@@ -980,40 +1127,69 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
             )):
                 raise CensusError("public schedule point omits a textual identity field")
             identity = point_input(raw_point)
-            schedule_candidate = klv_identity(
-                raw_point.get("candidate_klv"), public_root, args.recorded_public_klv_root,
-                f"point {point_id} candidate", not args.skip_klv_hashing,
-            )
-            candidate = schedule_candidate
+            structured_identity = {
+                "benchmark": benchmark,
+                "model": model,
+                "input": identity,
+            }
             if manifest_entries is not None:
-                schedule_key = (
-                    str(schedule_candidate["path"]), str(schedule_candidate["sha256"])
-                )
-                semantic = semantic_cache.get(schedule_key)
-                if semantic is None:
-                    schedule_path = (public_root / pathlib.Path(
-                        *pathlib.PurePosixPath(str(schedule_candidate["path"])).parts
-                    )).resolve(strict=True)
-                    semantic = parse_public_klv_semantic_identity(
-                        schedule_path, f"point {point_id} candidate"
+                if manifest_metadata is not None:
+                    external_schedule_klv_claim(
+                        raw_point.get("candidate_klv"), f"point {point_id} candidate"
                     )
-                    semantic_cache[schedule_key] = semantic
-                structured_identity = {
-                    "benchmark": benchmark,
-                    "model": model,
-                    "input": identity,
-                }
-                if semantic["identity"] != structured_identity:
-                    raise CensusError(
-                        f"point {point_id} structured identity differs from its candidate KLV"
+                    external_schedule_klv_claim(
+                        raw_point.get("reference_klv"), f"point {point_id} reference"
                     )
-                semantic_sha = str(semantic["semantic_identity_sha256"])
+                    semantic_sha = sha_bytes(canonical(structured_identity).encode())
+                else:
+                    schedule_candidate = klv_identity(
+                        raw_point.get("candidate_klv"), public_root,
+                        args.recorded_public_klv_root, f"point {point_id} candidate",
+                        not args.skip_klv_hashing,
+                    )
+                    schedule_key = (
+                        str(schedule_candidate["path"]),
+                        str(schedule_candidate["sha256"]),
+                    )
+                    semantic = semantic_cache.get(schedule_key)
+                    if semantic is None:
+                        schedule_path = (
+                            public_root
+                            / pathlib.Path(*pathlib.PurePosixPath(
+                                str(schedule_candidate["path"])
+                            ).parts)
+                        ).resolve(strict=True)
+                        semantic = parse_public_klv_semantic_identity(
+                            schedule_path, f"point {point_id} candidate"
+                        )
+                        semantic_cache[schedule_key] = semantic
+                    if semantic["identity"] != structured_identity:
+                        raise CensusError(
+                            f"point {point_id} structured identity differs from its "
+                            "candidate KLV"
+                        )
+                    semantic_sha = str(semantic["semantic_identity_sha256"])
                 manifest_entry = manifest_entries.get(semantic_sha)
                 if manifest_entry is None:
                     raise CensusError(
                         f"point {point_id} has no semantic match in the public KLV manifest"
                     )
+                if (
+                    manifest_metadata is not None
+                    and job_id != f"{benchmark}@{manifest_entry['engine']}"
+                ):
+                    raise CensusError(
+                        f"point {point_id} job ID is not canonical for its public engine"
+                    )
                 candidate = manifest_entry["klv"]
+                if manifest_metadata is not None:
+                    reference = candidate
+                else:
+                    reference = klv_identity(
+                        raw_point.get("reference_klv"), public_root,
+                        args.recorded_public_klv_root, f"point {point_id} reference",
+                        not args.skip_klv_hashing,
+                    )
                 mapping = manifest_mapping.setdefault(semantic_sha, {
                     "manifest_ordinal": manifest_entry["ordinal"],
                     "manifest_klv": candidate,
@@ -1023,10 +1199,17 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
                 })
                 mapping["job_ids"].add(job_id)
                 mapping["point_ids"].add(point_id)
-            reference = klv_identity(
-                raw_point.get("reference_klv"), public_root, args.recorded_public_klv_root,
-                f"point {point_id} reference", not args.skip_klv_hashing,
-            )
+            else:
+                candidate = klv_identity(
+                    raw_point.get("candidate_klv"), public_root,
+                    args.recorded_public_klv_root, f"point {point_id} candidate",
+                    not args.skip_klv_hashing,
+                )
+                reference = klv_identity(
+                    raw_point.get("reference_klv"), public_root,
+                    args.recorded_public_klv_root, f"point {point_id} reference",
+                    not args.skip_klv_hashing,
+                )
             point_record = {
                 "point_id": point_id,
                 "job_id": job_id,
@@ -1489,6 +1672,15 @@ def validate_plan(plan: object) -> dict[str, object]:
             ):
                 raise CensusError("plan public manifest mapping has invalid point IDs")
             mapped_job = jobs_by_id.get(job_id)
+            expected_semantic_sha = None if mapped_job is None else sha_bytes(canonical({
+                "benchmark": mapped_job["benchmark"],
+                "model": mapped_job["model"],
+                "input": mapped_job["input"],
+            }).encode())
+            if semantic_sha != expected_semantic_sha:
+                raise CensusError(
+                    "plan public manifest mapping semantic identity differs from its job"
+                )
             if (
                 mapped_job is None
                 or mapped_job["candidate_klv"] != mapping["manifest_klv"]
