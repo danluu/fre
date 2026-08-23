@@ -55,6 +55,11 @@ const SHARED_FRAGMENT_MIN_BYTES: usize = 2;
 const SHARED_FRAGMENT_DISPATCH_GROUPS: usize = 256;
 const SHARED_FRAGMENT_DISPATCH_TABLE_BYTES: usize =
     SHARED_FRAGMENT_DISPATCH_GROUPS * size_of::<u16>();
+const SHARED_FRAGMENT_DISPATCH_WORK_SHIFT: u32 = u16::BITS;
+const SHARED_FRAGMENT_DISPATCH_WORK_MASK: u32 = 0x3f;
+const SHARED_FRAGMENT_DISPATCH_BUDGET_SHIFT: u32 =
+    SHARED_FRAGMENT_DISPATCH_WORK_SHIFT + SHARED_FRAGMENT_DISPATCH_WORK_MASK.count_ones();
+const SHARED_FRAGMENT_DISPATCH_BUDGET_MASK: u32 = 0xff;
 /// Stable identity of the incumbent packed literal-set implementation.
 pub const RUNTIME_IMPLEMENTATION_ID: &str = "packed-literal-set";
 /// Stable identity of the equal-width scalar Shift-And search implementation.
@@ -415,9 +420,11 @@ struct SharedFragment {
     // computes it once so an early native match has no arithmetic tail.
     native_prefix_bytes: usize,
     finder: Finder<'static>,
-    // An exact byte outside the fragment. `None` keeps the incumbent
-    // source-order verifier and authenticates the absence of a group table.
-    dispatch_offset: Option<u16>,
+    // Packed exact dispatch certificate. Zero keeps the incumbent verifier.
+    // Otherwise the low u16 is offset + 1, followed by six bits of worst
+    // bucket work and eight bits of derived candidate budget. This occupies
+    // the same four-byte slot as R20's `Option<u16>` dispatch offset.
+    dispatch_metadata: u32,
     // Patterns encoded as a little-endian u16 width followed by the bytes.
     // With dispatch they retain source order within each byte bucket and are
     // followed by 256 cumulative u16 group ends. Without dispatch they retain
@@ -541,8 +548,49 @@ impl SharedFragment {
         self.minimum_pattern_width as usize
     }
 
+    fn dispatch_offset(&self) -> Option<usize> {
+        let encoded = u16::try_from(self.dispatch_metadata & u32::from(u16::MAX)).ok()?;
+        Some(usize::from(encoded.checked_sub(1)?))
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn maximum_dispatch_candidate_verification_work(&self) -> usize {
+        usize::try_from(
+            (self.dispatch_metadata >> SHARED_FRAGMENT_DISPATCH_WORK_SHIFT)
+                & SHARED_FRAGMENT_DISPATCH_WORK_MASK,
+        )
+        .expect("the dispatch work field fits usize")
+    }
+
+    fn retained_dispatch_candidate_budget(&self) -> usize {
+        usize::try_from(
+            (self.dispatch_metadata >> SHARED_FRAGMENT_DISPATCH_BUDGET_SHIFT)
+                & SHARED_FRAGMENT_DISPATCH_BUDGET_MASK,
+        )
+        .expect("the dispatch budget field fits usize")
+    }
+
+    fn dispatch_candidate_budget(&self) -> usize {
+        if self.dispatch_metadata == 0 {
+            return NATIVE_FILTER_CANDIDATE_BUDGET;
+        }
+        let dispatch_budget = self.retained_dispatch_candidate_budget();
+        #[cfg(debug_assertions)]
+        {
+            let dispatch_work = self.maximum_dispatch_candidate_verification_work();
+            let incumbent_envelope = self
+                .maximum_candidate_verification_work
+                .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+                .expect("the shared-fragment construction caps candidate work");
+            debug_assert!(dispatch_work <= self.maximum_candidate_verification_work);
+            debug_assert!(dispatch_budget >= NATIVE_FILTER_CANDIDATE_BUDGET);
+            debug_assert!(dispatch_work.checked_mul(dispatch_budget) <= Some(incumbent_envelope));
+        }
+        dispatch_budget
+    }
+
     fn dispatch_parts(&self) -> Option<(usize, &[u8], &[u8])> {
-        let dispatch_offset = usize::from(self.dispatch_offset?);
+        let dispatch_offset = self.dispatch_offset()?;
         let trailer_start = self
             .patterns
             .len()
@@ -1927,7 +1975,9 @@ fn find_bounded_long_shared_fragment(
 
     let mut pending_candidate = Some(second);
     let mut minimum_start = after_first;
-    for _ in 1..NATIVE_FILTER_CANDIDATE_BUDGET {
+    let candidate_budget = fragment.dispatch_candidate_budget();
+    debug_assert!(candidate_budget >= NATIVE_FILTER_CANDIDATE_BUDGET);
+    for _ in 1..candidate_budget {
         let candidate = if let Some(candidate) = pending_candidate.take() {
             candidate
         } else {
@@ -1947,7 +1997,18 @@ fn find_bounded_long_shared_fragment(
         }
         minimum_start = after_candidate;
     }
-    Some(LongSharedFragmentFilterResult::ResumeAt(minimum_start))
+    // One final lookahead stays in the same increasing fragment-occurrence
+    // stream. It performs no verification work: absence proves the source is
+    // exhausted, while presence leaves that candidate and every later start
+    // to the unchanged native fallback.
+    if fragment
+        .earliest_possible_start_from(haystack, minimum_start)
+        .is_none()
+    {
+        Some(LongSharedFragmentFilterResult::Exhausted)
+    } else {
+        Some(LongSharedFragmentFilterResult::ResumeAt(minimum_start))
+    }
 }
 
 fn shared_fragment_native_start_budget(
@@ -2328,6 +2389,8 @@ fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
         incumbent_sidecar_bytes.checked_add(SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)?;
     let dispatch_fits = dispatch_sidecar_bytes <= maximum_sidecar_bytes;
     let mut retained_dispatch = false;
+    let mut maximum_dispatch_candidate_verification_work = 0_usize;
+    let mut retained_dispatch_candidate_budget = 0_usize;
     if dispatch_fits && selected_dispatch_offset.is_some() {
         #[cfg(test)]
         let allocation_allowed = !shared_fragment_dispatch_allocation_probe::take_failure();
@@ -2341,28 +2404,57 @@ fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
     if retained_dispatch {
         let dispatch_offset = selected_dispatch_offset?;
         let mut group_ends = [0_u16; SHARED_FRAGMENT_DISPATCH_GROUPS];
+        let mut maximum_group_work = 0_usize;
         retained.clear();
         for dispatch_byte in 0_u16..=u16::from(u8::MAX) {
             let dispatch_byte = u8::try_from(dispatch_byte).ok()?;
+            let mut group_work = 0_usize;
             for pattern in patterns {
                 let pattern = pattern.as_ref();
                 if pattern[dispatch_offset] != dispatch_byte {
                     continue;
                 }
+                // One dispatch-byte load plus all comparisons outside the
+                // fragment costs no more than the sum of every surviving
+                // pattern's outside-fragment bytes. For a multi-pattern
+                // bucket this deliberately charges the shared dispatch byte
+                // once per pattern, making the bound conservative.
+                group_work = group_work.checked_add(pattern.len().checked_sub(best_width)?)?;
                 retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
                 retained.extend_from_slice(pattern);
             }
+            maximum_group_work = maximum_group_work.max(group_work);
             group_ends[usize::from(dispatch_byte)] = u16::try_from(retained.len()).ok()?;
         }
+        maximum_dispatch_candidate_verification_work = maximum_group_work;
+        debug_assert!(maximum_dispatch_candidate_verification_work > 0);
+        let incumbent_verification_envelope = maximum_candidate_verification_work
+            .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)?;
+        retained_dispatch_candidate_budget =
+            incumbent_verification_envelope.checked_div(maximum_group_work)?;
+        debug_assert!(
+            retained_dispatch_candidate_budget >= NATIVE_FILTER_CANDIDATE_BUDGET
+        );
         debug_assert_eq!(retained.len(), retained_pattern_bytes);
         for group_end in group_ends {
             retained.extend_from_slice(&group_end.to_le_bytes());
         }
     }
-    let dispatch_offset = if retained_dispatch {
-        Some(u16::try_from(selected_dispatch_offset?).ok()?)
+    let dispatch_metadata = if retained_dispatch {
+        let offset = u16::try_from(selected_dispatch_offset?.checked_add(1)?).ok()?;
+        let dispatch_work = u32::try_from(maximum_dispatch_candidate_verification_work).ok()?;
+        if dispatch_work > SHARED_FRAGMENT_DISPATCH_WORK_MASK {
+            return None;
+        }
+        let dispatch_budget = u32::try_from(retained_dispatch_candidate_budget).ok()?;
+        if dispatch_budget > SHARED_FRAGMENT_DISPATCH_BUDGET_MASK {
+            return None;
+        }
+        u32::from(offset)
+            | dispatch_work.checked_shl(SHARED_FRAGMENT_DISPATCH_WORK_SHIFT)?
+            | dispatch_budget.checked_shl(SHARED_FRAGMENT_DISPATCH_BUDGET_SHIFT)?
     } else {
-        None
+        0
     };
     let mut needle = Vec::with_capacity(best_width);
     needle.extend_from_slice(first.get(best_offset..fragment_end)?);
@@ -2374,7 +2466,7 @@ fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
         native_start_budget,
         native_prefix_bytes,
         finder: FinderBuilder::new().build_forward_owned(needle),
-        dispatch_offset,
+        dispatch_metadata,
         patterns: retained.into_boxed_slice(),
     })
 }
@@ -2779,6 +2871,110 @@ mod tests {
     fn shared_prefix_patterns() -> [&'static [u8]; 8] {
         [
             b"aa00x", b"aa11", b"aa22", b"aa33", b"aa44", b"aa55", b"aa66", b"aa77",
+        ]
+    }
+
+    #[derive(Clone, Copy)]
+    struct PublicLongFragmentFamily {
+        id: &'static str,
+        patterns: &'static [&'static [u8]],
+        decoy: &'static [u8],
+        hit: &'static [u8],
+        maximum_candidate_verification_work: usize,
+        maximum_dispatch_candidate_verification_work: usize,
+        dispatch_candidate_budget: usize,
+    }
+
+    fn public_long_fragment_families() -> [PublicLongFragmentFamily; 6] {
+        const PREFIX8: &[&[u8]] =
+            &[b"longpref0", b"longpref11", b"longpref222", b"longpref3333"];
+        const OFFSET4_WIDTH8: &[&[u8]] = &[
+            b"A000longpref0",
+            b"B111longpref11",
+            b"C222longpref222",
+            b"D333longpref3333",
+        ];
+        const PREFIX12: &[&[u8]] = &[
+            b"sharedfrag120",
+            b"sharedfrag1211",
+            b"sharedfrag12222",
+            b"sharedfrag123333",
+        ];
+        const OFFSET1_WIDTH16: &[&[u8]] = &[
+            b"ASHAREDFRAGMENT160",
+            b"BSHAREDFRAGMENT1611",
+            b"CSHAREDFRAGMENT162",
+            b"DSHAREDFRAGMENT1633",
+            b"ESHAREDFRAGMENT164",
+            b"FSHAREDFRAGMENT1655",
+            b"GSHAREDFRAGMENT166",
+            b"HSHAREDFRAGMENT1677",
+        ];
+        const OFFSET1_WIDTH8_PRIORITY: &[&[u8]] = &[
+            b"Alongpref00",
+            b"Alongpref0",
+            b"Blongpref11",
+            b"Clongpref22",
+            b"Dlongpref33",
+        ];
+        const SATURATED_WIDTH8: &[&[u8]] =
+            &[b"aaaaaaaa0", b"aaaaaaaa11", b"aaaaaaaa222", b"aaaaaaaa3333"];
+
+        [
+            PublicLongFragmentFamily {
+                id: "prefix8_c4_v14",
+                patterns: PREFIX8,
+                decoy: b"longprefx",
+                hit: b"longpref3333",
+                maximum_candidate_verification_work: 14,
+                maximum_dispatch_candidate_verification_work: 4,
+                dispatch_candidate_budget: 14,
+            },
+            PublicLongFragmentFamily {
+                id: "offset4_width8_c4_v30",
+                patterns: OFFSET4_WIDTH8,
+                decoy: b"Z999longprefx",
+                hit: b"D333longpref3333",
+                maximum_candidate_verification_work: 30,
+                maximum_dispatch_candidate_verification_work: 8,
+                dispatch_candidate_budget: 15,
+            },
+            PublicLongFragmentFamily {
+                id: "prefix12_c4_v14",
+                patterns: PREFIX12,
+                decoy: b"sharedfrag12x",
+                hit: b"sharedfrag123333",
+                maximum_candidate_verification_work: 14,
+                maximum_dispatch_candidate_verification_work: 4,
+                dispatch_candidate_budget: 14,
+            },
+            PublicLongFragmentFamily {
+                id: "offset1_width16_c8_v28",
+                patterns: OFFSET1_WIDTH16,
+                decoy: b"ZSHAREDFRAGMENT16x",
+                hit: b"HSHAREDFRAGMENT1677",
+                maximum_candidate_verification_work: 28,
+                maximum_dispatch_candidate_verification_work: 3,
+                dispatch_candidate_budget: 37,
+            },
+            PublicLongFragmentFamily {
+                id: "offset1_width8_c5_priority_v19",
+                patterns: OFFSET1_WIDTH8_PRIORITY,
+                decoy: b"Zlongprefx",
+                hit: b"Alongpref00",
+                maximum_candidate_verification_work: 19,
+                maximum_dispatch_candidate_verification_work: 5,
+                dispatch_candidate_budget: 15,
+            },
+            PublicLongFragmentFamily {
+                id: "saturated_width8_c4_v14",
+                patterns: SATURATED_WIDTH8,
+                decoy: b"aaaaaaaaaaaaaaaa",
+                hit: b"aaaaaaaa0",
+                maximum_candidate_verification_work: 14,
+                maximum_dispatch_candidate_verification_work: 4,
+                dispatch_candidate_budget: 14,
+            },
         ]
     }
 
@@ -3775,6 +3971,240 @@ mod tests {
     }
 
     #[test]
+    fn long_shared_fragment_dispatch_budgets_fit_the_incumbent_envelope() {
+        for family in public_long_fragment_families() {
+            let fragment = select_shared_fragment(family.patterns, 1)
+                .unwrap_or_else(|| panic!("{} lost its shared fragment", family.id));
+            assert!(fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES);
+            assert!(fragment.dispatch_parts().is_some());
+            assert_eq!(
+                fragment.maximum_candidate_verification_work,
+                family.maximum_candidate_verification_work,
+                "{}",
+                family.id,
+            );
+            let dispatch_work = fragment.maximum_dispatch_candidate_verification_work();
+            assert_eq!(
+                dispatch_work,
+                family.maximum_dispatch_candidate_verification_work,
+                "{}",
+                family.id,
+            );
+            let candidate_budget = fragment.dispatch_candidate_budget();
+            assert_eq!(
+                candidate_budget, family.dispatch_candidate_budget,
+                "{}",
+                family.id,
+            );
+            assert!(candidate_budget > NATIVE_FILTER_CANDIDATE_BUDGET);
+            let incumbent_envelope = fragment
+                .maximum_candidate_verification_work
+                .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+                .unwrap();
+            assert!(
+                dispatch_work.checked_mul(candidate_budget).unwrap() <= incumbent_envelope,
+                "{}",
+                family.id,
+            );
+            assert!(
+                dispatch_work
+                    .checked_mul(candidate_budget.checked_add(1).unwrap())
+                    .unwrap()
+                    > incumbent_envelope,
+                "{}",
+                family.id,
+            );
+
+            let Some(plan) = plan(family.patterns) else {
+                return;
+            };
+            let receipt = plan
+                .long_shared_fragment_build_receipt()
+                .unwrap_or_else(|| panic!("{} lost its public route receipt", family.id));
+            assert_eq!(
+                receipt.maximum_candidate_verification_work,
+                family.maximum_candidate_verification_work,
+                "{}",
+                family.id,
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof covers every public sparse family and the bounded fallback seam"
+    )]
+    fn long_shared_fragment_dispatch_covers_eight_64k_candidates_and_fallback_seams() {
+        const BUFFER_BYTES: usize = 64 * 1024;
+        const CANDIDATES: usize = 8;
+        const FIRST_START: usize = 1_024;
+        const CANDIDATE_GAP: usize = 8_000;
+
+        for family in public_long_fragment_families().into_iter().take(5) {
+            let Some(plan) = plan(family.patterns) else {
+                return;
+            };
+            let PackedLiteralEngine::NativeSharedFragment {
+                searcher,
+                shared_fragment,
+            } = &plan.engine
+            else {
+                panic!("{} lost its long shared-fragment route", family.id)
+            };
+            assert!(shared_fragment.dispatch_candidate_budget() >= CANDIDATES);
+
+            let starts = core::array::from_fn::<_, CANDIDATES, _>(|index| {
+                FIRST_START
+                    .checked_add(index.checked_mul(CANDIDATE_GAP).unwrap())
+                    .unwrap()
+            });
+            let mut exhausted = vec![b'.'; BUFFER_BYTES];
+            for start in starts {
+                let end = start.checked_add(family.decoy.len()).unwrap();
+                exhausted[start..end].copy_from_slice(family.decoy);
+            }
+            assert_eq!(
+                find_bounded_long_shared_fragment(shared_fragment, &exhausted),
+                Some(LongSharedFragmentFilterResult::Exhausted),
+                "{}",
+                family.id,
+            );
+            assert_eq!(
+                plan.find(&exhausted, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                searcher
+                    .find(&exhausted)
+                    .map(|matched| (matched.start(), matched.end())),
+                "{}",
+                family.id,
+            );
+
+            let mut hit = vec![b'.'; BUFFER_BYTES];
+            for start in starts[..CANDIDATES - 1].iter().copied() {
+                let end = start.checked_add(family.decoy.len()).unwrap();
+                hit[start..end].copy_from_slice(family.decoy);
+            }
+            let hit_start = starts[CANDIDATES - 1];
+            let hit_end = hit_start.checked_add(family.hit.len()).unwrap();
+            hit[hit_start..hit_end].copy_from_slice(family.hit);
+            assert_eq!(
+                find_bounded_long_shared_fragment(shared_fragment, &hit),
+                Some(LongSharedFragmentFilterResult::Match {
+                    start: hit_start,
+                    end: hit_end,
+                }),
+                "{}",
+                family.id,
+            );
+            assert_eq!(
+                plan.find(&hit, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                searcher
+                    .find(&hit)
+                    .map(|matched| (matched.start(), matched.end())),
+                "{}",
+                family.id,
+            );
+            assert_search_certificate(
+                &plan,
+                false,
+                &hit,
+                Window::full(&hit),
+                Some((hit_start, hit_end)),
+            );
+            assert_invalid_windows_precede_work(&plan, &hit);
+        }
+
+        let family = public_long_fragment_families()[0];
+        let Some(plan) = plan(family.patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("fallback family lost its long shared-fragment route")
+        };
+        let candidate_budget = shared_fragment.dispatch_candidate_budget();
+        let fallback_gap = 4_096_usize;
+        let fallback_first = 512_usize;
+        let mut fallback = vec![b'.'; BUFFER_BYTES];
+        for index in 0..candidate_budget {
+            let start = fallback_first
+                .checked_add(index.checked_mul(fallback_gap).unwrap())
+                .unwrap();
+            let end = start.checked_add(family.decoy.len()).unwrap();
+            fallback[start..end].copy_from_slice(family.decoy);
+        }
+        let last_verified_start = fallback_first
+            .checked_add(
+                candidate_budget
+                    .checked_sub(1)
+                    .unwrap()
+                    .checked_mul(fallback_gap)
+                    .unwrap(),
+            )
+            .unwrap();
+        let fallback_match_start = fallback_first
+            .checked_add(candidate_budget.checked_mul(fallback_gap).unwrap())
+            .unwrap();
+        let fallback_match_end = fallback_match_start.checked_add(family.hit.len()).unwrap();
+        fallback[fallback_match_start..fallback_match_end].copy_from_slice(family.hit);
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &fallback),
+            Some(LongSharedFragmentFilterResult::ResumeAt(
+                last_verified_start.checked_add(1).unwrap()
+            )),
+        );
+        let expected = searcher
+            .find(&fallback)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((fallback_match_start, fallback_match_end)));
+        assert_eq!(
+            plan.find(&fallback, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+    }
+
+    #[test]
+    fn long_shared_fragment_dispatch_keeps_dense_64k_fallback() {
+        let family = public_long_fragment_families()[5];
+        let Some(plan) = plan(family.patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("saturated public family lost its long shared-fragment route")
+        };
+        assert_eq!(
+            shared_fragment.dispatch_candidate_budget(),
+            family.dispatch_candidate_budget,
+        );
+        let saturated = vec![b'a'; 64 * 1024];
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &saturated),
+            Some(LongSharedFragmentFilterResult::ResumeAt(1)),
+        );
+        assert_eq!(
+            plan.find(&saturated, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            searcher
+                .find(&saturated)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+    }
+
+    #[test]
     fn shared_fragment_dispatch_allocation_failure_keeps_incumbent_fallback() {
         let patterns = [
             b"longpref0".as_slice(),
@@ -3794,6 +4224,14 @@ mod tests {
             panic!("dispatch allocation failure changed the incumbent engine")
         };
         assert!(shared_fragment.dispatch_parts().is_none());
+        assert_eq!(
+            shared_fragment.maximum_dispatch_candidate_verification_work(),
+            0,
+        );
+        assert_eq!(
+            shared_fragment.dispatch_candidate_budget(),
+            NATIVE_FILTER_CANDIDATE_BUDGET,
+        );
         for haystack in [
             b"longprefx..longpref3333".as_slice(),
             b"no shared fragment here".as_slice(),
@@ -4423,6 +4861,11 @@ mod tests {
         let persistent = plan.build_accounting().persistent_bytes;
         let (dispatch_offset, _, group_ends) = fragment.dispatch_parts().unwrap();
         assert_eq!(dispatch_offset, 2);
+        assert!(
+            fragment.maximum_dispatch_candidate_verification_work()
+                <= fragment.maximum_candidate_verification_work
+        );
+        assert!(fragment.dispatch_candidate_budget() > NATIVE_FILTER_CANDIDATE_BUDGET);
         assert_eq!(
             group_ends.len(),
             super::SHARED_FRAGMENT_DISPATCH_TABLE_BYTES
@@ -4485,6 +4928,14 @@ mod tests {
             panic!("tight cap did not retain the incumbent shared-fragment plan")
         };
         assert!(downgraded_fragment.dispatch_parts().is_none());
+        assert_eq!(
+            downgraded_fragment.maximum_dispatch_candidate_verification_work(),
+            0,
+        );
+        assert_eq!(
+            downgraded_fragment.dispatch_candidate_budget(),
+            NATIVE_FILTER_CANDIDATE_BUDGET,
+        );
         assert_eq!(
             downgraded.build_accounting().persistent_bytes,
             incumbent_persistent
