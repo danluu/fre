@@ -49,13 +49,13 @@ impl MatchSpan {
     }
 }
 
-/// Whether an ordered-resume value was decided entirely by immutable warm
+/// Whether a compiler-private value was decided entirely by immutable warm
 /// rows already retained in the authenticated workspace.
 ///
-/// This compiler-private receipt lets an adaptive caller distinguish a true
-/// warm completion from a call that had to publish or recover any row. It is
-/// deliberately independent of the selected output value: a warm no-match is
-/// still a complete warm execution.
+/// Ordered-resume and contextual ordinary-value callers use this receipt to
+/// distinguish a true warm completion from a call that had to publish or
+/// recover any row. It is deliberately independent of the selected output
+/// value: a warm no-match is still a complete warm execution.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum K0OrderedResumeCompletion {
@@ -63,8 +63,8 @@ pub enum K0OrderedResumeCompletion {
     NotFullyWarm,
 }
 
-/// A value-only ordered-resume result paired with its warm-row completion
-/// status.
+/// A compiler-private value-only result paired with its warm-row completion
+/// status. The historical type name is retained for API stability.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct K0OrderedResumeValue<T> {
@@ -1011,6 +1011,117 @@ impl Automaton {
                 session.commit_pooled_workspace();
                 Ok(())
             }
+        }
+    }
+
+    /// Return whether the immutable start proof admits the bounded
+    /// assertion-contextual ordinary Exists projection.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn can_use_pooled_contextual_ordinary_exists_projection(&self) -> bool {
+        crate::k0::can_prepare_contextual_ordinary_exists_projection(self)
+    }
+
+    /// Return whether the immutable start proof admits the bounded
+    /// assertion-contextual ordinary Span projection.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn can_use_pooled_contextual_ordinary_span_projection(&self) -> bool {
+        crate::k0::can_prepare_contextual_ordinary_span_projection(self)
+    }
+
+    /// Attempt the bounded contextual ordinary-Exists projection through the
+    /// populated owner lane only. A decline before checkout leaves the
+    /// incumbent pooled path untouched; after checkout, every projection
+    /// decline replays canonical unlimited K0 under the same owner guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing contextual authentication or canonical execution
+    /// error. Errors discard the checked-out owner exactly like the incumbent
+    /// pooled transaction.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn search_window_with_warm_owner_contextual_ordinary_exists_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<K0OrderedResumeValue<bool>>, SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let window_bytes = window.end().saturating_sub(window.start());
+        let Some(witness) =
+            crate::k0::prepared_contextual_ordinary_exists_witness(self, window_bytes)
+        else {
+            return Ok(None);
+        };
+        let warm = self.try_with_warm_owner_workspace(
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+            |workspace| {
+                crate::k0::search_prevalidated_contextual_ordinary_exists_value_with_authenticated_warm_owner(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    witness,
+                    Self::pooled_workspace_owner_bytes(),
+                )
+            },
+        );
+        match warm {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Attempt the bounded contextual ordinary-Span projection through the
+    /// populated owner lane only. A selected endpoint whose scalar start is
+    /// unknown replays canonical unlimited Span under the same owner guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing contextual authentication or canonical execution
+    /// error. Errors discard the checked-out owner exactly like the incumbent
+    /// pooled transaction.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn search_window_with_warm_owner_contextual_ordinary_span_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<K0OrderedResumeValue<Option<MatchSpan>>>, SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let window_bytes = window.end().saturating_sub(window.start());
+        let Some(witness) =
+            crate::k0::prepared_contextual_ordinary_span_witness(self, window_bytes)
+        else {
+            return Ok(None);
+        };
+        let warm = self.try_with_warm_owner_workspace(
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+            |workspace| {
+                crate::k0::search_prevalidated_contextual_ordinary_span_value_with_authenticated_warm_owner(
+                    self,
+                    haystack,
+                    window,
+                    workspace,
+                    witness,
+                    Self::pooled_workspace_owner_bytes(),
+                )
+            },
+        );
+        match warm {
+            Some(result) => result.map(Some),
+            None => Ok(None),
         }
     }
 

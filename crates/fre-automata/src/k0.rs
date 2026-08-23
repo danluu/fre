@@ -222,6 +222,21 @@ const WARM_EXISTS_INLINE_BYTES: usize = BYTE_SET_BLOCK_BYTES;
 // is no replay ceiling: every completed scanner and transition step remains
 // useful work in the same invocation.
 const WARM_CONTEXT_MIN_WINDOW_BYTES: usize = 4_096;
+// Ordinary positive value calls may omit report accounting once every
+// contextual record they need is already published. Admit one portable
+// classifier-block-sized margin below the metered warm policy so the public
+// 4,093-byte generic fixtures reach this complete-only projection. The lane
+// stops immediately below the shared warm threshold so longer searches retain
+// the incumbent metered loop-skip economics.
+const PREPARED_CONTEXTUAL_VALUE_MIN_WINDOW_BYTES: usize =
+    WARM_CONTEXT_MIN_WINDOW_BYTES - BYTE_SET_BLOCK_BYTES;
+// These complete-only leaves carry no work ledger and construct no omitted
+// `u64` work total. Their new execution arithmetic is checked source/scanner
+// progress, while this nonempty half-open band bounds one invocation to at
+// most 4,095 bytes. A hole returns to the canonical unlimited executor, which
+// retains normal work accounting.
+const _: () =
+    assert!(PREPARED_CONTEXTUAL_VALUE_MIN_WINDOW_BYTES < WARM_CONTEXT_MIN_WINDOW_BYTES);
 // A graph-certified loop scan must replace enough scalar DFA iterations to
 // amortize one state comparison plus the selected run-scanner entry. The
 // threshold is independent of the source contents and deliberately matches
@@ -614,23 +629,6 @@ const CONTEXT_DENSE_REALIZABLE_VARIANTS_BY_PAIR: [u8; CONTEXT_DENSE_REALIZABLE_P
     table
 };
 
-// Pack the four byte-local boundary-family pair classes into one byte. The
-// observation path pays the neighboring-byte classification once, then every
-// dependency projection is one immutable table read plus a mask operation.
-// Unicode is deliberately absent: decoding remains lazy and memoized by the
-// prepared observation.
-const RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS: [u32; 256] = {
-    let mut table = [0_u32; 256];
-    let mut packed = 0usize;
-    while packed < table.len() {
-        table[packed] = ABSOLUTE_ENABLED_BY_CLASS[packed & 0b11]
-            | CONFIGURED_LINE_ENABLED_BY_CLASS[(packed >> 2) & 0b11]
-            | CRLF_LINE_ENABLED_BY_CLASS[(packed >> 4) & 0b11]
-            | ASCII_WORD_ENABLED_BY_CLASS[(packed >> 6) & 0b11];
-        packed += 1;
-    }
-    table
-};
 const RAW_BOUNDARY_ENABLED_UNPREPARED: u32 = u32::MAX;
 const UNICODE_BOUNDARY_CLASS_UNPREPARED: u8 = u8::MAX;
 
@@ -4198,6 +4196,130 @@ pub struct K0DynamicRootProjection<'a> {
     unfilled_cell: u32,
     accept_mask: u32,
     next_row_token_mask: u32,
+}
+
+/// Compact copy of the only start-byte scanner shapes admitted by the
+/// contextual prepared value lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedContextualStartBytes {
+    One(u8),
+    Two(u8, u8),
+    Three(u8, u8, u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedContextualStartScanner {
+    offset: u8,
+    bytes: PreparedContextualStartBytes,
+}
+
+const _: () = assert!(size_of::<PreparedContextualStartScanner>() <= 8);
+
+/// Invocation-local immutable admission shared by the facade, warm-owner
+/// checkout, and contextual-only scalar leaf.
+///
+/// The start proof and global assertion domain belong to the immutable
+/// automaton. Copying their compact projection across one owner checkout is
+/// therefore sufficient; no retained epoch or cache-derived field is carried
+/// between calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedContextualOrdinaryExistsWitness {
+    scanner: PreparedContextualStartScanner,
+    global_dependencies: u32,
+}
+
+const _: () = assert!(size_of::<PreparedContextualOrdinaryExistsWitness>() <= 16);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedContextualOrdinarySpanWitness {
+    scanner: PreparedContextualStartScanner,
+    global_dependencies: u32,
+}
+
+const _: () = assert!(size_of::<PreparedContextualOrdinarySpanWitness>() <= 16);
+
+/// Borrow-scoped, report-free view of one already-initialized contextual
+/// cache. Unlike the metered warm path, this projection owns no continuation:
+/// a first missing record ends the borrow and canonical ordinary K0 replays
+/// the original window under the same pooled owner guard.
+struct PreparedContextualOrdinaryProjection<'a> {
+    automaton: &'a Automaton,
+    lazy: &'a LazyWorkspace,
+    scanner: PreparedContextualStartScanner,
+    global_dependencies: u32,
+    root_dependencies: u32,
+}
+
+/// Provenance retained only when an incomplete contextual row resolves its
+/// dependency-normalized key. A broader exact-key retry deliberately carries
+/// no such token: the omitted assertion bits can select a different absent
+/// record at the next boundary even though the normalized key is equal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedContextualNormalizedKey {
+    symbol: u32,
+    dependencies: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedContextualTransition {
+    cell: u32,
+    normalized_key: Option<PreparedContextualNormalizedKey>,
+}
+
+/// One invocation-local memo of an authoritative nonaccepting contextual
+/// self-loop. The retained cache is immutably borrowed for the whole prepared
+/// attempt, so a repeated source/key pair cannot change tier, value, or hole
+/// status before this value is dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedContextualSelfLoop {
+    state: u32,
+    cell: u32,
+    key: PreparedContextualNormalizedKey,
+}
+
+impl PreparedContextualSelfLoop {
+    #[inline]
+    fn from_normalized_transition(
+        state: u32,
+        transition: PreparedContextualTransition,
+    ) -> Option<Self> {
+        if !matches!(
+            context_self_loop_action(state, transition.cell),
+            Some((_, false))
+        ) {
+            return None;
+        }
+        Some(Self {
+            state,
+            cell: transition.cell,
+            key: transition.normalized_key?,
+        })
+    }
+
+    #[inline]
+    fn lookup(
+        self,
+        automaton: &Automaton,
+        haystack: &[u8],
+        destination: usize,
+        state: u32,
+        byte: u8,
+        global_dependencies: u32,
+    ) -> Option<u32> {
+        if self.state != state {
+            return None;
+        }
+        debug_assert_eq!(self.key.dependencies & !global_dependencies, 0);
+        let mut observation = PreparedBoundaryObservation::new(
+            automaton.line_terminator(),
+            haystack,
+            destination,
+            global_dependencies,
+        );
+        let assertions = observation.project(self.key.dependencies);
+        let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
+        (symbol == self.key.symbol).then_some(self.cell)
+    }
 }
 
 /// Exact source-provenance effect retained by one immutable direct self-loop.
@@ -12427,6 +12549,677 @@ impl<'a> K0SearchSession<'a> {
     }
 }
 
+#[inline]
+fn prepared_contextual_ordinary_scanner(
+    proof: &StartFilterProof,
+) -> Option<PreparedContextualStartScanner> {
+    if proof.force_haystack_start || proof.relaxed_nullable {
+        return None;
+    }
+    let scanner = proof.scanner.as_ref()?;
+    let bytes = match &scanner.scanner {
+        StartScanner::One(byte) => PreparedContextualStartBytes::One(*byte),
+        StartScanner::Two(first, second) => {
+            PreparedContextualStartBytes::Two(*first, *second)
+        }
+        StartScanner::Three(first, second, third) => {
+            PreparedContextualStartBytes::Three(*first, *second, *third)
+        }
+        StartScanner::Empty
+        | StartScanner::Range { .. }
+        | StartScanner::AsciiSet { .. }
+        | StartScanner::Set(_) => return None,
+    };
+    Some(PreparedContextualStartScanner {
+        offset: scanner.offset,
+        bytes,
+    })
+}
+
+#[inline]
+fn prepared_contextual_ordinary_value_witness(
+    automaton: &Automaton,
+    window_bytes: usize,
+) -> Option<(PreparedContextualStartScanner, u32)> {
+    if !(PREPARED_CONTEXTUAL_VALUE_MIN_WINDOW_BYTES..WARM_CONTEXT_MIN_WINDOW_BYTES)
+        .contains(&window_bytes)
+    {
+        return None;
+    }
+    let proof = automaton.start_filter_proof.get()?;
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    if global_dependencies == 0 {
+        return None;
+    }
+    Some((
+        prepared_contextual_ordinary_scanner(proof)?,
+        global_dependencies,
+    ))
+}
+
+/// Project the immutable half of contextual ordinary-Exists admission once.
+///
+/// Public-operation kind and positive-minimum policy remain facade concerns.
+/// Window admission is repeated here so the hidden warm-owner entry cannot
+/// widen the specialization when called directly.
+#[inline]
+pub(crate) fn prepared_contextual_ordinary_exists_witness(
+    automaton: &Automaton,
+    window_bytes: usize,
+) -> Option<PreparedContextualOrdinaryExistsWitness> {
+    let (scanner, global_dependencies) =
+        prepared_contextual_ordinary_value_witness(automaton, window_bytes)?;
+    Some(PreparedContextualOrdinaryExistsWitness {
+        scanner,
+        global_dependencies,
+    })
+}
+
+/// Project the immutable half of contextual ordinary-Span admission once.
+#[inline]
+pub(crate) fn prepared_contextual_ordinary_span_witness(
+    automaton: &Automaton,
+    window_bytes: usize,
+) -> Option<PreparedContextualOrdinarySpanWitness> {
+    let (scanner, global_dependencies) =
+        prepared_contextual_ordinary_value_witness(automaton, window_bytes)?;
+    Some(PreparedContextualOrdinarySpanWitness {
+        scanner,
+        global_dependencies,
+    })
+}
+
+#[inline]
+pub(crate) fn can_prepare_contextual_ordinary_exists_projection(
+    automaton: &Automaton,
+) -> bool {
+    automaton.stats().assertion_edges() != 0
+        && prepared_contextual_ordinary_exists_witness(
+            automaton,
+            PREPARED_CONTEXTUAL_VALUE_MIN_WINDOW_BYTES,
+        )
+        .is_some()
+}
+
+#[inline]
+pub(crate) fn can_prepare_contextual_ordinary_span_projection(
+    automaton: &Automaton,
+) -> bool {
+    automaton.stats().assertion_edges() != 0
+        && prepared_contextual_ordinary_span_witness(
+            automaton,
+            PREPARED_CONTEXTUAL_VALUE_MIN_WINDOW_BYTES,
+        )
+        .is_some()
+}
+
+#[cfg(test)]
+fn prepare_contextual_ordinary_projection<'a>(
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+    window_bytes: usize,
+) -> Result<Option<PreparedContextualOrdinaryProjection<'a>>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "contextual ordinary prepared K0 workspace belongs to another automaton",
+        });
+    }
+    let lazy = &workspace.lazy;
+    if !workspace.bound_capabilities.lazy
+        || !workspace.bound_capabilities.contextual
+        || automaton.stats().assertion_edges() == 0
+        || !lazy.is_allocated()
+        || !lazy.context.is_allocated()
+        || !lazy.initialized
+        || lazy.declined
+    {
+        return Ok(None);
+    }
+    if !lazy.is_bound_to(automaton) {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 cache belongs to another automaton",
+        });
+    }
+    if lazy.cache_identity == 0 {
+        return Ok(None);
+    }
+    let Some((scanner, global_dependencies)) =
+        prepared_contextual_ordinary_value_witness(automaton, window_bytes)
+    else {
+        return Ok(None);
+    };
+
+    lazy.context.validate_shape()?;
+    let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
+    validate_warm_context_dependency_subset(
+        root_dependencies,
+        global_dependencies,
+        "contextual ordinary prepared K0 root dependencies exceed the automaton domain",
+    )?;
+
+    Ok(Some(PreparedContextualOrdinaryProjection {
+        automaton,
+        lazy,
+        scanner,
+        global_dependencies,
+        root_dependencies,
+    }))
+}
+
+#[cfg(test)]
+fn prepare_contextual_ordinary_exists_projection<'a>(
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+    window_bytes: usize,
+) -> Result<Option<PreparedContextualOrdinaryProjection<'a>>, SearchError> {
+    prepare_contextual_ordinary_projection(automaton, workspace, window_bytes)
+}
+
+#[cfg(test)]
+fn prepare_contextual_ordinary_span_projection<'a>(
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+    window_bytes: usize,
+) -> Result<Option<PreparedContextualOrdinaryProjection<'a>>, SearchError> {
+    prepare_contextual_ordinary_projection(automaton, workspace, window_bytes)
+}
+
+/// Authenticate the mutable-cache half of one already-admitted warm-owner
+/// contextual projection.
+#[inline]
+fn prepare_contextual_ordinary_projection_from_warm_owner<'a>(
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+    scanner: PreparedContextualStartScanner,
+    global_dependencies: u32,
+) -> Result<Option<PreparedContextualOrdinaryProjection<'a>>, SearchError> {
+    debug_assert_eq!(workspace.bound_automaton_identity, automaton.identity());
+    debug_assert!(workspace.bound_capabilities.lazy);
+    let lazy = &workspace.lazy;
+    if !workspace.bound_capabilities.contextual
+        || !lazy.is_allocated()
+        || !lazy.context.is_allocated()
+        || !lazy.initialized
+        || lazy.declined
+    {
+        return Ok(None);
+    }
+    if !lazy.is_bound_to(automaton) {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 cache belongs to another automaton",
+        });
+    }
+    if lazy.cache_identity == 0 {
+        return Ok(None);
+    }
+
+    // Shape precedes dependency derivation exactly as in the incumbent
+    // projection. Declined and identity-exhausted caches above remain
+    // canonical fallbacks instead of exposing a new shape error.
+    lazy.context.validate_shape()?;
+    let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
+    validate_warm_context_dependency_subset(
+        root_dependencies,
+        global_dependencies,
+        "contextual ordinary prepared K0 root dependencies exceed the automaton domain",
+    )?;
+
+    Ok(Some(PreparedContextualOrdinaryProjection {
+        automaton,
+        lazy,
+        scanner,
+        global_dependencies,
+        root_dependencies,
+    }))
+}
+
+/// Execute one complete-only contextual Exists projection.
+///
+/// Scanner state, restart state, and the current DFA state are invocation
+/// local. Retained loop plans are deliberately neither rejected nor executed:
+/// each present scalar contextual record is authoritative. An absent inferred
+/// or evicted record returns `None`, after which the caller drops this borrow
+/// and replays canonical unlimited K0 from the original `window`.
+#[cfg(test)]
+fn try_prepared_contextual_ordinary_exists(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+) -> Result<Option<bool>, SearchError> {
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 window has a descending range",
+        })?;
+    if window.end() > haystack.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 window exceeds the validated haystack",
+        });
+    }
+    let Some(projection) =
+        prepare_contextual_ordinary_exists_projection(automaton, workspace, window_bytes)?
+    else {
+        return Ok(None);
+    };
+
+    try_prepared_contextual_ordinary_exists_with_projection(haystack, window, projection)
+}
+
+/// Walk one fully authenticated invocation-local contextual Exists
+/// projection. Cache mutation is impossible while the projection is borrowed;
+/// any hole returns `None` to the owning wrapper for same-owner replay.
+#[inline(never)]
+fn try_prepared_contextual_ordinary_exists_with_projection(
+    haystack: &[u8],
+    window: SearchWindow,
+    projection: PreparedContextualOrdinaryProjection<'_>,
+) -> Result<Option<bool>, SearchError> {
+    let mut position = next_prepared_contextual_start_candidate(
+        &projection.scanner,
+        haystack,
+        window.start(),
+        window.end(),
+    )?;
+    if position == window.end() {
+        return Ok(Some(false));
+    }
+
+    let Some(mut state) = warm_context_initial_state_for_prevalidated_dependencies(
+        projection.automaton,
+        haystack,
+        position,
+        projection.lazy,
+        projection.root_dependencies,
+        projection.global_dependencies,
+    )? else {
+        return Ok(None);
+    };
+    let mut restartable = true;
+    let mut entered = false;
+    let mut self_loop = None;
+
+    loop {
+        if entered && restartable {
+            let candidate = next_prepared_contextual_start_candidate(
+                &projection.scanner,
+                haystack,
+                position,
+                window.end(),
+            )?;
+            if candidate == window.end() {
+                return Ok(Some(false));
+            }
+            if candidate != position {
+                position = candidate;
+                self_loop = None;
+                let Some(initial) = warm_context_initial_state_for_prevalidated_dependencies(
+                    projection.automaton,
+                    haystack,
+                    position,
+                    projection.lazy,
+                    projection.root_dependencies,
+                    projection.global_dependencies,
+                )? else {
+                    return Ok(None);
+                };
+                state = initial;
+            }
+        }
+        entered = true;
+        if position == window.end() {
+            return Ok(Some(false));
+        }
+
+        let destination = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual ordinary prepared K0 destination",
+            })?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual ordinary prepared K0 source exceeded its validated window",
+            })?;
+        let source_state = state;
+        let cached_cell = self_loop.and_then(|cached: PreparedContextualSelfLoop| {
+            cached.lookup(
+                projection.automaton,
+                haystack,
+                destination,
+                source_state,
+                byte,
+                projection.global_dependencies,
+            )
+        });
+        #[cfg(test)]
+        if cached_cell.is_some() {
+            PREPARED_CONTEXTUAL_SELF_LOOP_HITS
+                .with(|count| count.set(count.get().saturating_add(1)));
+        }
+        let (cell, normalized_key) = if let Some(cell) = cached_cell {
+            (cell, None)
+        } else {
+            let hot = prepared_contextual_hot_transition(projection.lazy, source_state)?;
+            let Some(transition) = prepared_context_transition_for_dependencies(
+                projection.automaton,
+                haystack,
+                destination,
+                projection.lazy,
+                source_state,
+                hot,
+                byte,
+                projection.global_dependencies,
+            )? else {
+                return Ok(None);
+            };
+            (transition.cell, transition.normalized_key)
+        };
+        position = destination;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return Ok(Some(true));
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(Some(false));
+        }
+        let next_state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual ordinary prepared K0 state token underflowed",
+            })?;
+        restartable = cell & LAZY_CELL_RESTART != 0;
+        if cached_cell.is_none() {
+            // Installation deliberately follows accepting priority, dead-cell
+            // completion, and successor decoding. The constructor rejects
+            // Reset even when its successor names this state.
+            self_loop = PreparedContextualSelfLoop::from_normalized_transition(
+                source_state,
+                PreparedContextualTransition {
+                    cell,
+                    normalized_key,
+                },
+            );
+        } else {
+            debug_assert_eq!(next_state, source_state);
+            debug_assert!(!restartable);
+        }
+        state = next_state;
+    }
+}
+
+/// Execute one complete-only contextual Span projection.
+///
+/// Scanner state, restart state, selected endpoint, and scalar start
+/// provenance are invocation local. An absent inferred or evicted record
+/// returns `None`, after which the caller drops this borrow and replays
+/// canonical unlimited Span from the original `window`.
+#[cfg(test)]
+fn try_prepared_contextual_ordinary_span(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual ordinary Span prepared K0 window has a descending range",
+        })?;
+    if window.end() > haystack.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary Span prepared K0 window exceeds the validated haystack",
+        });
+    }
+    let Some(projection) =
+        prepare_contextual_ordinary_span_projection(automaton, workspace, window_bytes)?
+    else {
+        return Ok(None);
+    };
+
+    try_prepared_contextual_ordinary_span_with_projection(haystack, window, projection)
+}
+
+/// Walk one fully authenticated invocation-local contextual Span projection.
+/// Any initial or transition hole, or a selected endpoint whose exact scalar
+/// start was dropped, returns `None` to the owner wrapper for same-owner
+/// replay.
+#[inline(never)]
+fn try_prepared_contextual_ordinary_span_with_projection(
+    haystack: &[u8],
+    window: SearchWindow,
+    projection: PreparedContextualOrdinaryProjection<'_>,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    let mut position = next_prepared_contextual_start_candidate(
+        &projection.scanner,
+        haystack,
+        window.start(),
+        window.end(),
+    )?;
+    if position == window.end() {
+        return Ok(Some(None));
+    }
+
+    let Some(mut state) = warm_context_initial_state_for_prevalidated_dependencies(
+        projection.automaton,
+        haystack,
+        position,
+        projection.lazy,
+        projection.root_dependencies,
+        projection.global_dependencies,
+    )? else {
+        return Ok(None);
+    };
+    let mut restartable = true;
+    let mut entered = false;
+    let mut active_start = Some(position);
+    let mut pending_end = None;
+    let mut pending_start = None;
+    let mut self_loop = None;
+
+    loop {
+        // A provisional accept fixes the earliest start. Later injected roots
+        // have lower priority, so keep walking only its surviving
+        // higher-priority frontier until that frontier accepts again or dies.
+        if pending_end.is_none() && entered && restartable {
+            let candidate = next_prepared_contextual_start_candidate(
+                &projection.scanner,
+                haystack,
+                position,
+                window.end(),
+            )?;
+            if candidate == window.end() {
+                return Ok(Some(None));
+            }
+            if candidate != position {
+                position = candidate;
+                self_loop = None;
+                let Some(initial) = warm_context_initial_state_for_prevalidated_dependencies(
+                    projection.automaton,
+                    haystack,
+                    position,
+                    projection.lazy,
+                    projection.root_dependencies,
+                    projection.global_dependencies,
+                )? else {
+                    return Ok(None);
+                };
+                state = initial;
+            }
+            active_start = Some(position);
+        }
+        entered = true;
+        if position == window.end() {
+            return complete_prepared_contextual_span(window, pending_end, pending_start);
+        }
+
+        let destination = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual ordinary Span prepared K0 destination",
+            })?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual ordinary Span prepared K0 source exceeded its validated window",
+            })?;
+        let source_state = state;
+        let cached_cell = self_loop.and_then(|cached: PreparedContextualSelfLoop| {
+            cached.lookup(
+                projection.automaton,
+                haystack,
+                destination,
+                source_state,
+                byte,
+                projection.global_dependencies,
+            )
+        });
+        let (cell, normalized_key) = if let Some(cell) = cached_cell {
+            (cell, None)
+        } else {
+            let hot = prepared_contextual_hot_transition(projection.lazy, source_state)?;
+            let Some(transition) = prepared_context_transition_for_dependencies(
+                projection.automaton,
+                haystack,
+                destination,
+                projection.lazy,
+                source_state,
+                hot,
+                byte,
+                projection.global_dependencies,
+            )? else {
+                return Ok(None);
+            };
+            (transition.cell, transition.normalized_key)
+        };
+        position = destination;
+
+        #[cfg(test)]
+        if matches!(
+            LazyStartAction::from_direct_cell(cell),
+            LazyStartAction::Reset,
+        ) {
+            PREPARED_CONTEXTUAL_SPAN_V1_RESET_ACTIONS
+                .with(|count| count.set(count.get().saturating_add(1)));
+        }
+        let next_start = prepared_contextual_next_start(cell, active_start, position);
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+            pending_start = next_start;
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_prepared_contextual_span(window, pending_end, pending_start);
+        }
+        let next_state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual ordinary Span prepared K0 state token underflowed",
+            })?;
+        restartable = cell & LAZY_CELL_RESTART != 0;
+        if cached_cell.is_none() {
+            // The constructor rejects accepting and Reset cells, so a memo can
+            // never hide ordered endpoint or start-provenance effects.
+            self_loop = PreparedContextualSelfLoop::from_normalized_transition(
+                source_state,
+                PreparedContextualTransition {
+                    cell,
+                    normalized_key,
+                },
+            );
+        } else {
+            debug_assert_eq!(next_state, source_state);
+            debug_assert!(!restartable);
+        }
+        state = next_state;
+        active_start = next_start;
+    }
+}
+
+#[inline]
+fn prepared_contextual_next_start(
+    cell: u32,
+    active_start: Option<usize>,
+    destination: usize,
+) -> Option<usize> {
+    match LazyStartAction::from_direct_cell(cell) {
+        LazyStartAction::Drop => None,
+        LazyStartAction::Propagate => active_start,
+        LazyStartAction::Reset => Some(destination),
+    }
+}
+
+/// Finish an ordered forward projection only when it selected no match or
+/// retained the exact scalar start paired with its final endpoint.
+#[inline]
+fn complete_prepared_contextual_span(
+    window: SearchWindow,
+    pending_end: Option<usize>,
+    pending_start: Option<usize>,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    let Some(end) = pending_end else {
+        return Ok(Some(None));
+    };
+    let Some(start) = pending_start else {
+        return Ok(None);
+    };
+    if start < window.start() || start > end || end > window.end() {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary Span prepared K0 selected span is outside its window",
+        });
+    }
+    Ok(Some(Some(MatchSpan::new(start, end))))
+}
+
+#[inline]
+fn next_prepared_contextual_start_candidate(
+    scanner: &PreparedContextualStartScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+) -> Result<usize, SearchError> {
+    let scanner_offset = usize::from(scanner.offset);
+    let scan_start = position
+        .checked_add(scanner_offset)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual ordinary prepared K0 scanner position",
+        })?;
+    if scan_start >= end {
+        return Ok(end);
+    }
+    let remaining = haystack
+        .get(scan_start..end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 scanner exceeded its window",
+        })?;
+    let relative = match scanner.bytes {
+        PreparedContextualStartBytes::One(byte) => memchr(byte, remaining),
+        PreparedContextualStartBytes::Two(first, second) => {
+            memchr2(first, second, remaining)
+        }
+        PreparedContextualStartBytes::Three(first, second, third) => {
+            memchr3(first, second, third, remaining)
+        }
+    };
+    let scan_position = relative.map_or(Ok(end), |relative| {
+        scan_start
+            .checked_add(relative)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual ordinary prepared K0 scanner candidate",
+            })
+    })?;
+    if scan_position == end {
+        return Ok(end);
+    }
+    scan_position
+        .checked_sub(scanner_offset)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 scanner matched before its exact offset",
+        })
+}
+
 /// Try already-filled direct rows or contextual records for one authenticated
 /// value call. A direct miss hands off mutably at its exact first unread byte;
 /// an admitted contextual first hole does the same with its owned continuation.
@@ -12497,12 +13290,45 @@ fn try_authenticated_warm_exists_value(
     try_warm_direct_exists_with_limits(automaton, haystack, window, workspace, proof, limits)
 }
 
+#[inline]
+fn validate_warm_context_dependency_subset(
+    dependencies: u32,
+    global_dependencies: u32,
+    detail: &'static str,
+) -> Result<(), SearchError> {
+    if dependencies & !global_dependencies != 0 {
+        return Err(SearchError::InternalInvariant { detail });
+    }
+    Ok(())
+}
+
+#[inline]
+fn prepared_contextual_hot_transition(
+    lazy: &LazyWorkspace,
+    state: u32,
+) -> Result<ContextHotTransition, SearchError> {
+    let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+        detail: "contextual ordinary prepared K0 state token does not fit usize",
+    })?;
+    if state >= lazy.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 state token is outside the live cache",
+        });
+    }
+    lazy.context
+        .hot
+        .get(state)
+        .copied()
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual ordinary prepared K0 state token has no hot transition",
+        })
+}
+
 /// Read one already-published contextual initial state.
 ///
 /// `None` is a cache miss, not a negative language result. The caller must
 /// restart the ordinary executor without retaining any invocation-local
 /// scanner state.
-#[cfg(test)]
 fn warm_context_initial_state(
     lazy: &LazyWorkspace,
     assertions: u32,
@@ -12574,6 +13400,34 @@ fn warm_context_initial_state_for_dependencies(
     dependencies: u32,
     global_dependencies: u32,
 ) -> Result<Option<u32>, SearchError> {
+    validate_warm_context_dependency_subset(
+        dependencies,
+        global_dependencies,
+        "warm contextual initial dependencies exceed the automaton domain",
+    )?;
+    warm_context_initial_state_for_prevalidated_dependencies(
+        automaton,
+        haystack,
+        position,
+        lazy,
+        dependencies,
+        global_dependencies,
+    )
+}
+
+/// Read an initial record after this invocation's projection has authenticated
+/// the immutable root dependency subset. Restarts reuse the same root and the
+/// same immutable cache borrow, so repeating that subset test cannot reveal a
+/// new state.
+#[inline]
+fn warm_context_initial_state_for_prevalidated_dependencies(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+    lazy: &LazyWorkspace,
+    dependencies: u32,
+    global_dependencies: u32,
+) -> Result<Option<u32>, SearchError> {
     debug_assert_eq!(dependencies & !global_dependencies, 0);
     let mut observation = PreparedBoundaryObservation::new(
         automaton.line_terminator(),
@@ -12629,14 +13483,19 @@ fn warm_context_initial_state_for_dependencies_metered(
     warm_context_initial_state_metered(lazy, exact_assertions, meter, position)
 }
 
-/// Read one transition through its dependency-normalized key, with the same
-/// exact raw-key fallback used for a pre-analysis contextual publication.
-#[cfg(test)]
+/// Read one prepared transition through its dependency-normalized key, with
+/// the same exact raw-key fallback used for a pre-analysis contextual
+/// publication.
+///
+/// Only an incomplete row's first normalized lookup carries reusable
+/// provenance. Complete rows retain their per-source authentication path, and
+/// an exact fallback retains the normalized hole that required it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the warm reader keeps immutable source context, state identity, and its shared hot tag explicit"
 )]
-fn warm_context_transition_for_dependencies(
+#[inline(never)]
+fn prepared_context_transition_for_dependencies(
     automaton: &Automaton,
     haystack: &[u8],
     destination: usize,
@@ -12645,13 +13504,42 @@ fn warm_context_transition_for_dependencies(
     hot: ContextHotTransition,
     byte: u8,
     global_dependencies: u32,
-) -> Result<Option<u32>, SearchError> {
+) -> Result<Option<PreparedContextualTransition>, SearchError> {
+    if hot.dense_missing == 0 {
+        let row = lazy
+            .context
+            .authenticate_complete_dense_row_prevalidated(
+                hot,
+                global_dependencies,
+                automaton.byte_classes().count(),
+            )?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual transition lost a complete dense-row certificate",
+            })?;
+        return warm_context_complete_dense_transition(
+            automaton,
+            haystack,
+            destination,
+            row,
+            byte,
+        )
+        .map(|(cell, _)| {
+            Some(PreparedContextualTransition {
+                cell,
+                normalized_key: None,
+            })
+        });
+    }
     let dependencies = if hot.dependency_mask == CONTEXT_DEPENDENCY_UNCOMPUTED {
         global_dependencies
     } else {
         hot.dependency_mask
     };
-    debug_assert_eq!(dependencies & !global_dependencies, 0);
+    validate_warm_context_dependency_subset(
+        dependencies,
+        global_dependencies,
+        "warm contextual transition dependencies exceed the automaton domain",
+    )?;
     let mut observation = PreparedBoundaryObservation::new(
         automaton.line_terminator(),
         haystack,
@@ -12664,7 +13552,13 @@ fn warm_context_transition_for_dependencies(
         .context
         .lookup_existing_with_hot_prevalidated(state, hot, symbol)?
     {
-        return Ok(Some(cell));
+        return Ok(Some(PreparedContextualTransition {
+            cell,
+            normalized_key: Some(PreparedContextualNormalizedKey {
+                symbol,
+                dependencies,
+            }),
+        }));
     }
     if dependencies == global_dependencies {
         return Ok(None);
@@ -12673,11 +13567,49 @@ fn warm_context_transition_for_dependencies(
     if exact_assertions == assertions {
         return Ok(None);
     }
-    lazy.context.lookup_existing_with_hot_prevalidated(
+    lazy.context
+        .lookup_existing_with_hot_prevalidated(
+            state,
+            hot,
+            contextual_symbol_for_byte(automaton, byte, exact_assertions),
+        )
+        .map(|cell| {
+            cell.map(|cell| PreparedContextualTransition {
+                cell,
+                normalized_key: None,
+            })
+        })
+}
+
+/// Fully checked cell-only oracle retained for dependency and forged-state
+/// tests. Production prepared execution consumes the provenance-bearing
+/// value above directly.
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test oracle mirrors the prepared transition reader's authenticated inputs"
+)]
+fn warm_context_transition_for_dependencies(
+    automaton: &Automaton,
+    haystack: &[u8],
+    destination: usize,
+    lazy: &LazyWorkspace,
+    state: u32,
+    hot: ContextHotTransition,
+    byte: u8,
+    global_dependencies: u32,
+) -> Result<Option<u32>, SearchError> {
+    prepared_context_transition_for_dependencies(
+        automaton,
+        haystack,
+        destination,
+        lazy,
         state,
         hot,
-        contextual_symbol_for_byte(automaton, byte, exact_assertions),
+        byte,
+        global_dependencies,
     )
+    .map(|transition| transition.map(|transition| transition.cell))
 }
 
 /// Spend private warm work only for a source whose normalized row can still
@@ -15257,6 +16189,39 @@ std::thread_local! {
     /// Number of dense full-byte Set Guard continuations entered on this test
     /// thread. Production builds contain neither the slot nor its update.
     static CONTINUED_SET_GUARD_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Warm-owner calls entering the dedicated contextual Exists wrapper.
+    static PREPARED_CONTEXTUAL_EXISTS_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Contextual Exists calls completed by the immutable scalar leaf.
+    static PREPARED_CONTEXTUAL_EXISTS_COMPLETIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Contextual Exists calls canonically replayed under the same owner guard.
+    static PREPARED_CONTEXTUAL_EXISTS_REPLAYS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Warm-owner calls entering the dedicated contextual Span wrapper.
+    static PREPARED_CONTEXTUAL_SPAN_V1_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Contextual Span calls completed by the immutable scalar leaf.
+    static PREPARED_CONTEXTUAL_SPAN_V1_COMPLETIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Contextual Span calls canonically replayed under the same owner guard.
+    static PREPARED_CONTEXTUAL_SPAN_V1_REPLAYS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Reset-provenance cells consumed by the complete prepared Span machine.
+    static PREPARED_CONTEXTUAL_SPAN_V1_RESET_ACTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Incomplete-row normalized contextual self-loops served by the
+    /// invocation-local prepared cache on this test thread.
+    static PREPARED_CONTEXTUAL_SELF_LOOP_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -19056,6 +20021,129 @@ pub(crate) fn search_prevalidated_selected_end_value_with_authenticated_workspac
         capabilities,
     )
     .map(|report| report.found.map(MatchSpan::end))
+}
+
+/// Execute ordinary Rust-style Exists through one authenticated warm owner.
+///
+/// A completed prepared projection constructs no `SearchLimits`,
+/// `SetupAccounting`, or `WorkMeter`. Every decline drops its immutable borrow
+/// before canonical unlimited execution restarts from the original `window`
+/// under this same owner.
+#[inline]
+pub(crate) fn search_prevalidated_contextual_ordinary_exists_value_with_authenticated_warm_owner(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    witness: PreparedContextualOrdinaryExistsWitness,
+    external_scratch_bytes: usize,
+) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+    debug_assert!(validate_window(haystack, window).is_ok());
+    debug_assert_eq!(workspace.bound_automaton_identity, automaton.identity());
+    #[cfg(test)]
+    PREPARED_CONTEXTUAL_EXISTS_ATTEMPTS
+        .with(|count| count.set(count.get().saturating_add(1)));
+
+    // Endpoint-compatible checkout may legitimately select Pike when the
+    // graph is structurally too large for a lazy owner. Check the physical
+    // capability before any lazy assertion or field access, then replay
+    // canonically under this same authenticated owner.
+    let completed = if workspace.bound_capabilities.lazy {
+        match prepare_contextual_ordinary_projection_from_warm_owner(
+            automaton,
+            workspace,
+            witness.scanner,
+            witness.global_dependencies,
+        )? {
+            Some(projection) => try_prepared_contextual_ordinary_exists_with_projection(
+                haystack, window, projection,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(found) = completed {
+        #[cfg(test)]
+        PREPARED_CONTEXTUAL_EXISTS_COMPLETIONS
+            .with(|count| count.set(count.get().saturating_add(1)));
+        return Ok(K0OrderedResumeValue::new(
+            found,
+            K0OrderedResumeCompletion::FullyWarmRows,
+        ));
+    }
+
+    #[cfg(test)]
+    PREPARED_CONTEXTUAL_EXISTS_REPLAYS
+        .with(|count| count.set(count.get().saturating_add(1)));
+    search_prevalidated_exists_value_with_authenticated_workspace_and_external_scratch(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        SearchLimits::unlimited(),
+        external_scratch_bytes,
+    )
+    .map(|found| K0OrderedResumeValue::new(found, K0OrderedResumeCompletion::NotFullyWarm))
+}
+
+/// Execute ordinary Rust-style Span through one authenticated warm owner.
+///
+/// A completed prepared projection constructs no `SearchLimits`,
+/// `SetupAccounting`, `WorkMeter`, or reverse recovery. Every decline replays
+/// canonical unlimited Span under the same owner.
+#[inline]
+pub(crate) fn search_prevalidated_contextual_ordinary_span_value_with_authenticated_warm_owner(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    witness: PreparedContextualOrdinarySpanWitness,
+    external_scratch_bytes: usize,
+) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
+    debug_assert!(validate_window(haystack, window).is_ok());
+    debug_assert_eq!(workspace.bound_automaton_identity, automaton.identity());
+    #[cfg(test)]
+    PREPARED_CONTEXTUAL_SPAN_V1_ATTEMPTS
+        .with(|count| count.set(count.get().saturating_add(1)));
+
+    let completed = if workspace.bound_capabilities.lazy {
+        match prepare_contextual_ordinary_projection_from_warm_owner(
+            automaton,
+            workspace,
+            witness.scanner,
+            witness.global_dependencies,
+        )? {
+            Some(projection) => try_prepared_contextual_ordinary_span_with_projection(
+                haystack, window, projection,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(found) = completed {
+        #[cfg(test)]
+        PREPARED_CONTEXTUAL_SPAN_V1_COMPLETIONS
+            .with(|count| count.set(count.get().saturating_add(1)));
+        return Ok(K0OrderedResumeValue::new(
+            found,
+            K0OrderedResumeCompletion::FullyWarmRows,
+        ));
+    }
+
+    #[cfg(test)]
+    PREPARED_CONTEXTUAL_SPAN_V1_REPLAYS
+        .with(|count| count.set(count.get().saturating_add(1)));
+    search_prevalidated_span_value_with_authenticated_workspace_and_external_scratch(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        SearchLimits::unlimited(),
+        external_scratch_bytes,
+    )
+    .map(|found| K0OrderedResumeValue::new(found, K0OrderedResumeCompletion::NotFullyWarm))
 }
 
 pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace(
@@ -37257,40 +38345,15 @@ impl<'h> PreparedBoundaryObservation<'h> {
     #[inline]
     fn prepare_raw(&mut self) -> u32 {
         if self.raw_enabled == RAW_BOUNDARY_ENABLED_UNPREPARED {
-            let before = self
-                .position
-                .checked_sub(1)
-                .and_then(|index| self.haystack.get(index))
-                .copied();
-            let after = self.haystack.get(self.position).copied();
-            let absolute = binary_boundary_class(
-                self.position == 0,
-                self.position == self.haystack.len(),
-            );
-            let configured_line = binary_boundary_class(
-                self.position == 0 || before == Some(self.line_terminator),
-                self.position == self.haystack.len() || after == Some(self.line_terminator),
-            );
-            let crlf_line = binary_boundary_class(
-                self.position == 0
-                    || before == Some(b'\n')
-                    || before == Some(b'\r') && after != Some(b'\n'),
-                self.position == self.haystack.len()
-                    || after == Some(b'\r')
-                    || after == Some(b'\n') && before != Some(b'\r'),
-            );
-            let ascii_word = binary_boundary_class(
-                before.is_some_and(is_ascii_word),
-                after.is_some_and(is_ascii_word),
-            );
-            let packed = absolute
-                | (configured_line << 2)
-                | (crlf_line << 4)
-                | (ascii_word << 6);
             let unicode_dependencies =
                 BoundaryContextClassifier::new(self.global_dependencies).unicode_word();
             let raw_dependencies = self.global_dependencies & !unicode_dependencies;
-            self.raw_enabled = RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS[packed] & raw_dependencies;
+            self.raw_enabled = enabled_assertion_mask_unmetered_with_classifier(
+                BoundaryContextClassifier::new(raw_dependencies),
+                self.line_terminator,
+                self.haystack,
+                self.position,
+            );
             #[cfg(test)]
             {
                 self.raw_preparations = self
@@ -49052,6 +50115,23 @@ mod tests {
 
     const fn root_scanner(scanner: StartScanner) -> StartPositionScanner {
         positioned_scanner(0, scanner)
+    }
+
+    fn pin_start_scanner(
+        automaton: &Automaton,
+        scanner: Option<StartPositionScanner>,
+        force_haystack_start: bool,
+        relaxed_nullable: bool,
+    ) {
+        automaton
+            .start_filter_proof
+            .set(&StartFilterProof {
+                scanner,
+                filter: None,
+                force_haystack_start,
+                relaxed_nullable,
+            })
+            .expect("focused start scanner is published once");
     }
 
     fn expected_scanner_construction_work(bytes: &[u8]) -> u64 {
@@ -64082,6 +65162,214 @@ mod tests {
                         expected,
                         "dependencies={dependencies:#07x} terminator={line_terminator:#04x} source={haystack:?} position={position}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_matches_every_non_unicode_domain_and_retry() {
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let unicode_dependencies =
+            crate::plan::BoundaryContextClassifier::new(all_dependencies).unicode_word();
+        let non_unicode_dependencies = all_dependencies & !unicode_dependencies;
+        assert_eq!(non_unicode_dependencies + 1, 1_u32 << 12);
+
+        let line_terminator = b';';
+        let haystack = b"\r;a_\n";
+        let position = 2;
+        for global_dependencies in 0..=non_unicode_dependencies {
+            let mut dependencies = global_dependencies;
+            loop {
+                let mut observation = super::PreparedBoundaryObservation::new(
+                    line_terminator,
+                    haystack,
+                    position,
+                    global_dependencies,
+                );
+                let expected = super::enabled_assertion_mask_unmetered_with_classifier(
+                    crate::plan::BoundaryContextClassifier::new(dependencies),
+                    line_terminator,
+                    haystack,
+                    position,
+                );
+                assert_eq!(
+                    observation.project(dependencies),
+                    expected,
+                    "global={global_dependencies:#05x} dependencies={dependencies:#05x}",
+                );
+                assert_eq!(
+                    observation.raw_preparations(),
+                    u8::from(dependencies != 0),
+                    "first projection global={global_dependencies:#05x} dependencies={dependencies:#05x}",
+                );
+                assert_eq!(observation.unicode_classifications(), 0);
+
+                let expected_global = super::enabled_assertion_mask_unmetered_with_classifier(
+                    crate::plan::BoundaryContextClassifier::new(global_dependencies),
+                    line_terminator,
+                    haystack,
+                    position,
+                );
+                assert_eq!(
+                    observation.project(global_dependencies),
+                    expected_global,
+                    "broader retry global={global_dependencies:#05x} dependencies={dependencies:#05x}",
+                );
+                assert_eq!(
+                    observation.raw_preparations(),
+                    u8::from(global_dependencies != 0),
+                    "broader preparation global={global_dependencies:#05x} dependencies={dependencies:#05x}",
+                );
+                assert_eq!(observation.unicode_classifications(), 0);
+
+                if dependencies == 0 {
+                    break;
+                }
+                dependencies = dependencies.wrapping_sub(1) & global_dependencies;
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_preserves_finite_work_chronology() {
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let line_terminator = b';';
+        let haystack = b"\r;a_\n";
+        let position = 2;
+
+        for dependencies in 0..=all_dependencies {
+            let checks = u64::from(dependencies.count_ones());
+            let unicode_dependencies =
+                crate::plan::BoundaryContextClassifier::new(dependencies).unicode_word();
+            let raw_dependencies = dependencies & !unicode_dependencies;
+            for limit in 0..=checks {
+                let mut observation = super::PreparedBoundaryObservation::new(
+                    line_terminator,
+                    haystack,
+                    position,
+                    all_dependencies,
+                );
+                let mut observed_meter = WorkMeter::new(limit, 0);
+                let observed =
+                    observation.project_metered(dependencies, &mut observed_meter, position);
+
+                let mut expected_meter = WorkMeter::new(limit, 0);
+                let expected = super::enabled_assertion_mask_with_classifier(
+                    crate::plan::BoundaryContextClassifier::new(dependencies),
+                    line_terminator,
+                    haystack,
+                    position,
+                    &mut expected_meter,
+                );
+
+                assert_eq!(
+                    observed, expected,
+                    "dependencies={dependencies:#07x} limit={limit}",
+                );
+                assert_eq!(
+                    observed_meter.consumed, expected_meter.consumed,
+                    "dependencies={dependencies:#07x} limit={limit}",
+                );
+                let admitted = limit == checks;
+                assert_eq!(
+                    observation.raw_preparations(),
+                    u8::from(admitted && raw_dependencies != 0),
+                    "dependencies={dependencies:#07x} limit={limit}",
+                );
+                assert_eq!(
+                    observation.unicode_classifications(),
+                    u8::from(admitted && unicode_dependencies != 0),
+                    "dependencies={dependencies:#07x} limit={limit}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_covers_every_family_subset_boundary_and_terminator() {
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let classifier = crate::plan::BoundaryContextClassifier::new(all_dependencies);
+        let families = [
+            classifier.absolute(),
+            classifier.configured_line(),
+            classifier.crlf_line(),
+            classifier.ascii_word(),
+        ];
+
+        for line_terminator in u8::MIN..=u8::MAX {
+            let haystacks = [
+                Vec::new(),
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n', b'a', b'_'],
+                vec![line_terminator, b'a', b'_', line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    for global_families in 0_u8..1_u8 << families.len() {
+                        let global_dependencies = families.iter().enumerate().fold(
+                            0_u32,
+                            |dependencies, (family, mask)| {
+                                if global_families & (1_u8 << family) == 0 {
+                                    dependencies
+                                } else {
+                                    dependencies | *mask
+                                }
+                            },
+                        );
+                        let mut requested_families = global_families;
+                        loop {
+                            let dependencies = families.iter().enumerate().fold(
+                                0_u32,
+                                |dependencies, (family, mask)| {
+                                    if requested_families & (1_u8 << family) == 0 {
+                                        dependencies
+                                    } else {
+                                        dependencies | *mask
+                                    }
+                                },
+                            );
+                            let mut observation = super::PreparedBoundaryObservation::new(
+                                line_terminator,
+                                &haystack,
+                                position,
+                                global_dependencies,
+                            );
+                            assert_eq!(
+                                observation.project(dependencies),
+                                super::enabled_assertion_mask_unmetered_with_classifier(
+                                    crate::plan::BoundaryContextClassifier::new(dependencies),
+                                    line_terminator,
+                                    &haystack,
+                                    position,
+                                ),
+                                "first terminator={line_terminator:#04x} source={haystack:?} position={position} global_families={global_families:#06b} requested_families={requested_families:#06b}",
+                            );
+                            assert_eq!(
+                                observation.project(global_dependencies),
+                                super::enabled_assertion_mask_unmetered_with_classifier(
+                                    crate::plan::BoundaryContextClassifier::new(
+                                        global_dependencies,
+                                    ),
+                                    line_terminator,
+                                    &haystack,
+                                    position,
+                                ),
+                                "retry terminator={line_terminator:#04x} source={haystack:?} position={position} global_families={global_families:#06b} requested_families={requested_families:#06b}",
+                            );
+                            assert_eq!(
+                                observation.raw_preparations(),
+                                u8::from(global_dependencies != 0),
+                            );
+                            assert_eq!(observation.unicode_classifications(), 0);
+
+                            if requested_families == 0 {
+                                break;
+                            }
+                            requested_families =
+                                requested_families.wrapping_sub(1) & global_families;
+                        }
+                    }
                 }
             }
         }
@@ -82380,5 +83668,139 @@ mod tests {
                 requested: actual,
             }) if actual == requested
         ));
+    }
+
+    #[test]
+    fn prepared_contextual_exists_selective_line_projection_covers_terminators_and_boundaries() {
+        let source_len = 4_093;
+        for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+            let plan = asserted_line_a().with_line_terminator(line_terminator);
+            pin_start_scanner(
+                &plan,
+                Some(root_scanner(StartScanner::One(b'a'))),
+                false,
+                false,
+            );
+            let classifier = plan.boundary_context_classifier();
+            assert_ne!(classifier.configured_line(), 0);
+            assert_eq!(classifier.assertions(), classifier.configured_line());
+
+            for (candidate, preceded_by_terminator, expected) in [
+                (0, false, true),
+                (source_len / 2, true, true),
+                (source_len - 1, true, true),
+                (source_len - 1, false, false),
+            ] {
+                let mut source = vec![b'q'; source_len];
+                if preceded_by_terminator {
+                    source[candidate - 1] = line_terminator;
+                }
+                source[candidate] = b'a';
+                let window = SearchWindow::full(&source);
+                let mut session = K0SearchSession::new_selected(
+                    &plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        session
+                            .search_window::<Exists>(
+                                &source,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output(),
+                        expected,
+                        "canonical terminator={line_terminator:#04x} candidate={candidate} preceded={preceded_by_terminator}",
+                    );
+                }
+                assert_eq!(
+                    super::try_prepared_contextual_ordinary_exists(
+                        &plan,
+                        &source,
+                        window,
+                        &session.workspace,
+                    )
+                    .unwrap(),
+                    Some(expected),
+                    "prepared terminator={line_terminator:#04x} candidate={candidate} preceded={preceded_by_terminator}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_contextual_span_selective_line_projection_covers_terminators_and_boundaries() {
+        let source_len = 4_093;
+        for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+            let plan = asserted_line_a().with_line_terminator(line_terminator);
+            pin_start_scanner(
+                &plan,
+                Some(root_scanner(StartScanner::One(b'a'))),
+                false,
+                false,
+            );
+            let classifier = plan.boundary_context_classifier();
+            assert_ne!(classifier.configured_line(), 0);
+            assert_eq!(classifier.assertions(), classifier.configured_line());
+
+            for (candidate, preceded_by_terminator, expected) in [
+                (0, false, Some(MatchSpan::new(0, 1))),
+                (
+                    source_len / 2,
+                    true,
+                    Some(MatchSpan::new(source_len / 2, source_len / 2 + 1)),
+                ),
+                (
+                    source_len - 1,
+                    true,
+                    Some(MatchSpan::new(source_len - 1, source_len)),
+                ),
+                (source_len - 1, false, None),
+            ] {
+                let mut source = vec![b'q'; source_len];
+                if preceded_by_terminator {
+                    source[candidate - 1] = line_terminator;
+                }
+                source[candidate] = b'a';
+                let window = SearchWindow::full(&source);
+                let mut session = K0SearchSession::new_selected(
+                    &plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                for _ in 0..3 {
+                    assert_eq!(
+                        session
+                            .search_window::<Span>(
+                                &source,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output(),
+                        expected,
+                        "canonical terminator={line_terminator:#04x} candidate={candidate} preceded={preceded_by_terminator}",
+                    );
+                }
+                assert_eq!(
+                    super::try_prepared_contextual_ordinary_span(
+                        &plan,
+                        &source,
+                        window,
+                        &session.workspace,
+                    )
+                    .unwrap(),
+                    Some(expected),
+                    "prepared terminator={line_terminator:#04x} candidate={candidate} preceded={preceded_by_terminator}",
+                );
+            }
+        }
     }
 }

@@ -9869,6 +9869,80 @@ enum K0PooledValueOperation {
     Span,
 }
 
+/// Internal execution policy for one automaton-owned K0 value call.
+///
+/// This is deliberately independent of [`SearchLimits`]. An explicit value or
+/// accounted call may itself select [`SearchLimits::unlimited`], but only the
+/// matching Rust-style ordinary facade may enter a report-free, unmetered
+/// contextual lane.
+#[derive(Clone, Copy)]
+enum K0PooledValueExecution {
+    Canonical,
+    OrdinaryExists,
+    OrdinarySpan,
+}
+
+// Contextual ordinary value projections occupy only the one-block margin
+// immediately below the incumbent 4,096-byte metered warm path. Longer
+// searches retain contextual loop-skip economics; shorter searches retain the
+// baseline.
+const PREPARED_CONTEXTUAL_ORDINARY_VALUE_MIN_WINDOW_BYTES: usize = 4_080;
+const PREPARED_CONTEXTUAL_ORDINARY_VALUE_MAX_WINDOW_BYTES: usize = 4_096;
+
+#[cfg(test)]
+mod contextual_v4_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static COMPLETIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        ATTEMPTS.set(0);
+        COMPLETIONS.set(0);
+    }
+
+    pub(super) fn record_attempt() {
+        ATTEMPTS.set(ATTEMPTS.get().saturating_add(1));
+    }
+
+    pub(super) fn record_completion() {
+        COMPLETIONS.set(COMPLETIONS.get().saturating_add(1));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        (ATTEMPTS.get(), COMPLETIONS.get())
+    }
+}
+
+#[cfg(test)]
+mod contextual_span_v1_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static COMPLETIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        ATTEMPTS.set(0);
+        COMPLETIONS.set(0);
+    }
+
+    pub(super) fn record_attempt() {
+        ATTEMPTS.set(ATTEMPTS.get().saturating_add(1));
+    }
+
+    pub(super) fn record_completion() {
+        COMPLETIONS.set(COMPLETIONS.get().saturating_add(1));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        (ATTEMPTS.get(), COMPLETIONS.get())
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -9999,12 +10073,28 @@ impl PortableK0Plan {
     fn pooled_value(
         &self,
         operation: K0PooledValueOperation,
+        execution: K0PooledValueExecution,
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
         workspace_limits: SearchSessionLimits,
         minimum_match_bytes: Option<usize>,
     ) -> Result<Option<K0PooledValue>, K0SearchError> {
+        debug_assert!(
+            matches!(execution, K0PooledValueExecution::Canonical)
+                || matches!(
+                    (operation, execution),
+                    (
+                        K0PooledValueOperation::Exists,
+                        K0PooledValueExecution::OrdinaryExists,
+                    ) | (
+                        K0PooledValueOperation::Span,
+                        K0PooledValueExecution::OrdinarySpan,
+                    )
+                ) && limits == SearchLimits::unlimited()
+                    && workspace_limits == SearchSessionLimits::unlimited(),
+            "the unmetered K0 policies are reserved for ordinary is_match and find",
+        );
         // Both finite value calls and the Rust-style ordinary facade
         // automatically own reusable K0 scratch. Work-unlimited calls may
         // additionally consume the optional proof shortcuts below; default
@@ -10183,6 +10273,70 @@ impl PortableK0Plan {
             }
         }
 
+        // Contextual value projection remains behind every incumbent
+        // absolute-end, cut, and suffix decision above. It sees the same
+        // possibly narrowed K0 window together with the full haystack
+        // assertion context. Static or owner decline falls through to the
+        // incumbent pool; after checkout, a cache hole replays canonically
+        // under that same owner and therefore cannot escape as `None` here.
+        let contextual_window_bytes = search_window
+            .end()
+            .saturating_sub(search_window.start());
+        let positive = matches!(minimum_match_bytes, Some(minimum) if minimum > 0);
+        if matches!(operation, K0PooledValueOperation::Exists)
+            && matches!(execution, K0PooledValueExecution::OrdinaryExists)
+            && positive
+            && self.automaton.stats().has_assertions()
+            && (PREPARED_CONTEXTUAL_ORDINARY_VALUE_MIN_WINDOW_BYTES
+                ..PREPARED_CONTEXTUAL_ORDINARY_VALUE_MAX_WINDOW_BYTES)
+                .contains(&contextual_window_bytes)
+        {
+            #[cfg(test)]
+            contextual_v4_facade_probe::record_attempt();
+            if let Some(value) = self
+                .automaton
+                .search_window_with_warm_owner_contextual_ordinary_exists_value(
+                    haystack,
+                    search_window,
+                )?
+            {
+                #[cfg(test)]
+                if matches!(
+                    value.completion(),
+                    fre_automata::K0OrderedResumeCompletion::FullyWarmRows,
+                ) {
+                    contextual_v4_facade_probe::record_completion();
+                }
+                return Ok(Some(K0PooledValue::Exists(value.into_output())));
+            }
+        }
+        if matches!(operation, K0PooledValueOperation::Span)
+            && self.contextual_ordinary_span_projection_eligible(
+                execution,
+                positive,
+                contextual_window_bytes,
+            )
+        {
+            #[cfg(test)]
+            contextual_span_v1_facade_probe::record_attempt();
+            if let Some(value) = self
+                .automaton
+                .search_window_with_warm_owner_contextual_ordinary_span_value(
+                    haystack,
+                    search_window,
+                )?
+            {
+                #[cfg(test)]
+                if matches!(
+                    value.completion(),
+                    fre_automata::K0OrderedResumeCompletion::FullyWarmRows,
+                ) {
+                    contextual_span_v1_facade_probe::record_completion();
+                }
+                return Ok(Some(K0PooledValue::Span(value.into_output())));
+            }
+        }
+
         self.pooled_workspace_value(
             operation,
             haystack,
@@ -10237,6 +10391,41 @@ impl PortableK0Plan {
                 )
                 .map(|value| value.map(K0PooledValue::Span)),
         }
+    }
+
+    #[cfg(test)]
+    fn contextual_ordinary_exists_projection_eligible(
+        &self,
+        execution: K0PooledValueExecution,
+        positive: bool,
+        window_bytes: usize,
+    ) -> bool {
+        matches!(execution, K0PooledValueExecution::OrdinaryExists)
+            && positive
+            && self.automaton.stats().has_assertions()
+            && (PREPARED_CONTEXTUAL_ORDINARY_VALUE_MIN_WINDOW_BYTES
+                ..PREPARED_CONTEXTUAL_ORDINARY_VALUE_MAX_WINDOW_BYTES)
+                .contains(&window_bytes)
+            && self
+                .automaton
+                .can_use_pooled_contextual_ordinary_exists_projection()
+    }
+
+    fn contextual_ordinary_span_projection_eligible(
+        &self,
+        execution: K0PooledValueExecution,
+        positive: bool,
+        window_bytes: usize,
+    ) -> bool {
+        matches!(execution, K0PooledValueExecution::OrdinarySpan)
+            && positive
+            && self.automaton.stats().has_assertions()
+            && (PREPARED_CONTEXTUAL_ORDINARY_VALUE_MIN_WINDOW_BYTES
+                ..PREPARED_CONTEXTUAL_ORDINARY_VALUE_MAX_WINDOW_BYTES)
+                .contains(&window_bytes)
+            && self
+                .automaton
+                .can_use_pooled_contextual_ordinary_span_projection()
     }
 
     fn pooled_earliest_end_value(
@@ -11019,6 +11208,7 @@ impl PortableRegex {
         match &self.plan {
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Exists,
+                K0PooledValueExecution::OrdinaryExists,
                 haystack,
                 window,
                 SearchLimits::unlimited(),
@@ -11639,6 +11829,7 @@ impl PortableRegex {
                 .map_err(SearchError::from),
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Exists,
+                K0PooledValueExecution::Canonical,
                 haystack,
                 window,
                 limits,
@@ -12478,6 +12669,7 @@ impl PortableRegex {
         match &self.plan {
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Span,
+                K0PooledValueExecution::OrdinarySpan,
                 haystack,
                 window,
                 SearchLimits::unlimited(),
@@ -13486,6 +13678,7 @@ impl PortableRegex {
                 .map_err(SearchError::from),
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Span,
+                K0PooledValueExecution::Canonical,
                 haystack,
                 window,
                 limits,
@@ -24190,6 +24383,8 @@ fn unicode_scalar_search_limits(limits: SearchLimits) -> UnicodeScalarSearchLimi
 
 #[cfg(test)]
 mod tests {
+    use crate::{contextual_span_v1_facade_probe, contextual_v4_facade_probe};
+
     use super::{
         ASCII_RUN_SCANNER_BUILD_WORK, Automaton, BYTE_SET_BLOCK_BYTES, BuildError, BuildLimits,
         CanonicalPattern, CaptureFreeOperation, CompatibilityProfile, GuardedLiteralSetSearchError,
@@ -24201,9 +24396,9 @@ mod tests {
         K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome, K0MandatorySuffixPlan,
         K0MandatorySuffixRecoveryPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterClassState,
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
-        K0PackedFrontierPlan, K0PooledValue, K0PooledValueOperation, K0ReverseSuffixSpanAttempt,
-        K0SpanSourceCursor, LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError,
-        Match,
+        K0PackedFrontierPlan, K0PooledValue, K0PooledValueExecution, K0PooledValueOperation,
+        K0ReverseSuffixSpanAttempt, K0SpanSourceCursor,
+        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError, Match,
         OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
         PlanKind, PlanSelection, PortableBuilder, PortableFindIterAccounting, PortableFindIterError,
         PortableFindIterLimits, PortableFindIterRunLimits, PortableFindIterStepAccounting,
@@ -25181,6 +25376,7 @@ mod tests {
             matches!(
                 plan.pooled_value(
                     K0PooledValueOperation::Exists,
+                    K0PooledValueExecution::Canonical,
                     &storage,
                     SearchWindow::full(&storage),
                     SearchLimits::unlimited(),
@@ -43783,6 +43979,346 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixed predicate {pattern:?}: {error:?}"));
         assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
         regex
+    }
+
+    #[test]
+    fn generic_loop_late_public_lifecycle_and_canonical_apis_remain_equivalent() {
+        fn generated_with_suffix(length: usize, seed: u64, suffix: &[u8]) -> Vec<u8> {
+            const ALPHABET: &[u8] = b"qxvjkm ,.;/\n";
+            assert!(suffix.len() <= length);
+            let mut state = seed;
+            let mut bytes = (0..length - suffix.len())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let index =
+                        usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                    ALPHABET[index]
+                })
+                .collect::<Vec<_>>();
+            bytes.extend_from_slice(suffix);
+            bytes
+        }
+
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let mut source =
+            generated_with_suffix(4_093, 0x8a09_8b0a_8c0b_8d0c, b"\nabbbcdefZ\n");
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("the exact public fixture selected K0");
+        };
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected_exists = upstream.is_match(&source);
+        let expected_span = upstream
+            .find(&source)
+            .map(|matched| (matched.start(), matched.end()));
+        assert!(expected_exists);
+
+        contextual_v4_facade_probe::reset();
+        assert_eq!(regex.is_match(&source), expected_exists, "cold Pike call");
+        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
+            assert_eq!(
+                plan.contextual_ordinary_exists_projection_eligible(
+                    K0PooledValueExecution::OrdinaryExists,
+                    true,
+                    bytes,
+                ),
+                admitted,
+                "window bytes={bytes}",
+            );
+        }
+        assert!(!plan.contextual_ordinary_exists_projection_eligible(
+            K0PooledValueExecution::Canonical,
+            true,
+            source.len(),
+        ));
+        assert!(!plan.contextual_ordinary_exists_projection_eligible(
+            K0PooledValueExecution::OrdinaryExists,
+            false,
+            source.len(),
+        ));
+        assert_eq!(
+            regex.is_match(&source),
+            expected_exists,
+            "contextual promotion and canonical replay call",
+        );
+        assert_eq!(
+            regex.is_match(&source),
+            expected_exists,
+            "complete report-free contextual call",
+        );
+        assert_eq!(
+            contextual_v4_facade_probe::snapshot(),
+            (3, 2),
+            "current main's cold pooled call seeds the owner for both later immutable calls",
+        );
+        let terminal = source.len().checked_sub(2).unwrap();
+        assert_eq!(source[terminal], b'Z');
+        let mutated = terminal.checked_sub(1).unwrap();
+        assert_eq!(source[mutated], b'f');
+        source[mutated] = b'Q';
+        let expected_mutated_exists = upstream.is_match(&source);
+        assert!(!expected_mutated_exists);
+        assert_eq!(regex.is_match(&source), expected_mutated_exists);
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (4, 2));
+        assert_eq!(regex.is_match(&source), expected_mutated_exists);
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (5, 3));
+        source[mutated] = b'f';
+        let retained_counts = contextual_v4_facade_probe::snapshot();
+
+        for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+            assert_eq!(
+                regex.is_match_value(&source, limits).unwrap(),
+                expected_exists,
+            );
+            assert_eq!(
+                regex
+                    .find_value(&source, limits)
+                    .unwrap()
+                    .map(|matched| (matched.start(), matched.end())),
+                expected_span,
+            );
+        }
+        assert_eq!(
+            regex
+                .is_match_accounted(&source, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected_exists,
+        );
+        assert_eq!(
+            regex.find(&source).map(|matched| (matched.start(), matched.end())),
+            expected_span,
+        );
+        assert_eq!(
+            regex
+                .find_accounted(&source, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected_span,
+        );
+
+        let window = SearchWindow::full(&source);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .is_match_window_value(&source, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected_exists,
+        );
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(
+                    &mut locations,
+                    &source,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected_span,
+        );
+        assert_eq!(locations.get(0), expected_span);
+        assert_eq!(
+            contextual_v4_facade_probe::snapshot(),
+            retained_counts,
+            "explicit, accounted, find, session, and capture APIs stay out of Exists",
+        );
+    }
+
+    #[test]
+    fn generic_loop_late_public_span_lifecycle_and_api_containment() {
+        fn generated_with_suffix(length: usize, seed: u64, suffix: &[u8]) -> Vec<u8> {
+            const ALPHABET: &[u8] = b"qxvjkm ,.;/\n";
+            assert!(suffix.len() <= length);
+            let mut state = seed;
+            let mut bytes = (0..length - suffix.len())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let index =
+                        usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                    ALPHABET[index]
+                })
+                .collect::<Vec<_>>();
+            bytes.extend_from_slice(suffix);
+            bytes
+        }
+
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let mut source =
+            generated_with_suffix(4_093, 0x8a09_8b0a_8c0b_8d0c, b"\nabbbcdefZ\n");
+        let expected = Some((4_083, 4_092));
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("the exact public fixture selected K0");
+        };
+        assert_eq!(
+            regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap()
+                .find(&source)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        assert!(
+            !plan.contextual_ordinary_span_projection_eligible(
+                K0PooledValueExecution::OrdinarySpan,
+                true,
+                source.len(),
+            ),
+            "a cold K0 owner cannot expose compact contextual eligibility",
+        );
+
+        contextual_span_v1_facade_probe::reset();
+        assert_eq!(
+            regex.find(&source).map(|matched| (matched.start(), matched.end())),
+            expected,
+            "cold ordinary find",
+        );
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (0, 0));
+
+        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
+            assert_eq!(
+                plan.contextual_ordinary_span_projection_eligible(
+                    K0PooledValueExecution::OrdinarySpan,
+                    true,
+                    bytes,
+                ),
+                admitted,
+                "window bytes={bytes}",
+            );
+        }
+        assert!(!plan.contextual_ordinary_span_projection_eligible(
+            K0PooledValueExecution::Canonical,
+            true,
+            source.len(),
+        ));
+        assert!(!plan.contextual_ordinary_span_projection_eligible(
+            K0PooledValueExecution::OrdinaryExists,
+            true,
+            source.len(),
+        ));
+        assert!(!plan.contextual_ordinary_span_projection_eligible(
+            K0PooledValueExecution::OrdinarySpan,
+            false,
+            source.len(),
+        ));
+
+        assert_eq!(
+            regex.find(&source).map(|matched| (matched.start(), matched.end())),
+            expected,
+            "warm-owner promotion replay",
+        );
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (1, 1));
+        assert_eq!(
+            regex.find(&source).map(|matched| (matched.start(), matched.end())),
+            expected,
+            "immutable completion",
+        );
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (2, 2));
+
+        let address = source.as_ptr();
+        let capacity = source.capacity();
+        assert_eq!(source[4_090], b'f');
+        source[4_090] = b'Q';
+        assert_eq!(source.as_ptr(), address);
+        assert_eq!(source.capacity(), capacity);
+        assert_eq!(regex.find(&source), None);
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (3, 2));
+        assert_eq!(regex.find(&source), None);
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (4, 3));
+
+        source[4_090] = b'f';
+        let contained = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        contextual_span_v1_facade_probe::reset();
+        assert!(contained.is_match(&source));
+        for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+            assert_eq!(
+                contained
+                    .find_value(&source, limits)
+                    .unwrap()
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+            assert_eq!(
+                contained
+                    .find_window_value(&source, SearchWindow::full(&source), limits)
+                    .unwrap()
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+        }
+        assert_eq!(
+            contained
+                .find_accounted(&source, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+
+        let mut session = contained
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_window_value(
+                    &source,
+                    SearchWindow::full(&source),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        let first_iter = contained
+            .find_iter_value(&source, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .next()
+            .expect("the iterator yields the public match")
+            .unwrap();
+        assert_eq!((first_iter.start(), first_iter.end()), expected.unwrap());
+
+        let mut locations = contained.capture_locations();
+        assert_eq!(
+            contained
+                .captures_read_value(
+                    &mut locations,
+                    &source,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(locations.get(0), expected);
+        assert_eq!(
+            contextual_span_v1_facade_probe::snapshot(),
+            (0, 0),
+            "nonordinary Span APIs cannot enter the contextual lane",
+        );
     }
 
     fn words(max_len: usize) -> Vec<Vec<u8>> {
