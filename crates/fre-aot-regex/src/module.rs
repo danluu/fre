@@ -1576,19 +1576,20 @@ pub enum PreparedAggregateStrategy {
     RuntimeHelper,
     /// Count and `SpanSum` stay in one generated iterator frame and locally
     /// call an artifact-specific native prepared target or self-contained
-    /// ordinary Span entry. No requested aggregate export uses a runtime
-    /// reducer.
+    /// ordinary entry. `GrepCount` likewise owns LF/CRLF splitting when a
+    /// local ordinary target is available. No requested aggregate export uses
+    /// a runtime reducer.
     NativeFused,
-    /// Count and `SpanSum` use the generated native fused iterator while a
-    /// requested `GrepCount` export retains its authenticated runtime helper.
+    /// Some requested reducers use generated native loops while another
+    /// requested export retains its authenticated runtime helper.
     NativeFusedWithRuntimeHelper,
     /// Count and `SpanSum` classify one prepared capability before any
     /// operation state is initialized. Exact V15 owners stay in the generated
-    /// Ordered-TNFA iterator; authenticated legacy handles take one whole-
-    /// operation compatibility helper edge.
+    /// Ordered-TNFA iterator. `GrepCount` requires V15 and fails closed on a
+    /// legacy owner instead of taking a semantic reducer edge.
     NativeOrderedNfaFused,
-    /// The Ordered-TNFA reducers use the strategy above while a requested
-    /// `GrepCount` export remains an ordinary runtime helper.
+    /// Some Ordered-TNFA reducers use the strategy above while another
+    /// requested export remains an ordinary runtime helper.
     NativeOrderedNfaFusedWithRuntimeHelper,
 }
 
@@ -6463,6 +6464,7 @@ impl CompiledModule {
         }
         let span_reducers_requested = exports.contains(PreparedAggregateExports::COUNT)
             || exports.contains(PreparedAggregateExports::SPAN_SUM);
+        let grep_reducer_requested = exports.contains(PreparedAggregateExports::GREP_COUNT);
         let serialized_output =
             serialized_program_output_contract(serialized_program, serialized_program.len())?;
         if span_reducers_requested && serialized_output != OutputContract::Span
@@ -6493,7 +6495,7 @@ impl CompiledModule {
         // transactionally after partial accumulation, so it must retain the
         // whole-operation authenticated runtime reducer. Frozen sessions and
         // complete prepared loops have no such window ceiling.
-        let prepared_search_target = if span_reducers_requested
+        let prepared_span_target = span_reducers_requested
             && matches!(
                 self.prepared_bulk_strategy,
                 Some(
@@ -6501,7 +6503,10 @@ impl CompiledModule {
                         | PreparedBulkStrategy::NativePreparedLoop
                         | PreparedBulkStrategy::NativeOrderedNfaLoop
                 )
-            )
+            );
+        let prepared_grep_target = grep_reducer_requested
+            && self.prepared_bulk_strategy == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+        let prepared_search_target = if prepared_span_target || prepared_grep_target
         {
             self.native_prepared_bulk_search_target
                 .map(NativeSpanReducerTarget::PreparedPrivate)
@@ -6564,7 +6569,7 @@ impl CompiledModule {
                         .iter()
                         .any(|relocation| relocation.symbol == index)
             });
-        let direct_search_target = if span_reducers_requested
+        let direct_search_target = if (span_reducers_requested || grep_reducer_requested)
             && self.prepared_entry_symbol_index.is_none()
             && self.prepared_bulk_strategy.is_none()
             && self.native_prepared_bulk_search_target.is_none()
@@ -6598,7 +6603,12 @@ impl CompiledModule {
         } else {
             None
         };
-        let (direct_search_target, direct_count_wrapper, direct_span_sum_wrapper) =
+        let (
+            direct_search_target,
+            direct_count_wrapper,
+            direct_span_sum_wrapper,
+            direct_grep_count_wrapper,
+        ) =
             if let Some(target) = direct_search_target {
                 let count_wrapper = exports
                     .contains(PreparedAggregateExports::COUNT)
@@ -6630,19 +6640,36 @@ impl CompiledModule {
                         ),
                     })
                     .transpose()?;
-                let fits = native_span_reducer_wrappers_fit(
+                let grep_count_wrapper = grep_reducer_requested
+                    .then(|| match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_grep_count(
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
+                        ),
+                        Architecture::Aarch64 => lower_aarch64_prepared_grep_count(
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
+                        ),
+                    })
+                    .transpose()?;
+                let fits = native_aggregate_wrappers_fit(
                     self.target.architecture,
                     self.sections[TEXT_SECTION].data.len(),
                     target.offset(),
-                    [&count_wrapper, &span_sum_wrapper],
+                    &[&count_wrapper, &span_sum_wrapper, &grep_count_wrapper],
                 )?;
                 if fits {
-                    (Some(target), count_wrapper, span_sum_wrapper)
+                    (
+                        Some(target),
+                        count_wrapper,
+                        span_sum_wrapper,
+                        grep_count_wrapper,
+                    )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
         if prepared_search_target.is_some() && direct_search_target.is_some() {
             return Err(ObjectError::InvalidModule(
@@ -6651,11 +6678,14 @@ impl CompiledModule {
         }
         let native_search_target = prepared_search_target.or(direct_search_target);
         let native_span_reducers = span_reducers_requested && native_search_target.is_some();
-        let aggregate_runtime_helper = exports.contains(PreparedAggregateExports::GREP_COUNT)
-            || (span_reducers_requested && !native_span_reducers);
-        let ordered_nfa_reducers = native_span_reducers
+        let ordered_nfa_reducers = native_search_target.is_some()
             && self.prepared_bulk_strategy
                 == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+        let native_grep_reducer = grep_reducer_requested
+            && (direct_search_target.is_some() || ordered_nfa_reducers);
+        let aggregate_runtime_helper = (grep_reducer_requested && !native_grep_reducer)
+            || (span_reducers_requested && !native_span_reducers);
+        let any_native_reducer = native_span_reducers || native_grep_reducer;
         // Only exhaustive scalar reducers may spend unbounded work finding a
         // final candidate. A selected absolute-width gate already owns the
         // whole-window rejection path, so do not duplicate its work here.
@@ -6668,7 +6698,7 @@ impl CompiledModule {
         );
         let aggregate_strategy = match (
             ordered_nfa_reducers,
-            native_span_reducers,
+            any_native_reducer,
             aggregate_runtime_helper,
         ) {
             (true, true, false) => PreparedAggregateStrategy::NativeOrderedNfaFused,
@@ -6778,6 +6808,36 @@ impl CompiledModule {
         } else {
             None
         };
+        let native_grep_count_wrapper = if native_grep_reducer {
+            Some(match native_call.ok_or(ObjectError::InvalidModule(
+                "native GrepCount reducer has no local call kind",
+            ))? {
+                NativeSpanReducerCallKind::DirectOrdinary => direct_grep_count_wrapper.ok_or(
+                    ObjectError::InvalidModule(
+                        "direct GrepCount reducer wrapper was not retained",
+                    ),
+                )?,
+                NativeSpanReducerCallKind::PreparedPrivate => {
+                    if !ordered_nfa_reducers {
+                        return Err(ObjectError::InvalidModule(
+                            "prepared native GrepCount is not capability-authenticated V15",
+                        ));
+                    }
+                    match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_grep_count(
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                            true,
+                        )?,
+                        Architecture::Aarch64 => lower_aarch64_prepared_grep_count(
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                            true,
+                        )?,
+                    }
+                }
+            })
+        } else {
+            None
+        };
         let existing_runtime_program_symbol_index =
             if let Some(index) = self.runtime_program_symbol_index {
                 let symbol = self.symbols.get(index).ok_or(ObjectError::InvalidModule(
@@ -6838,6 +6898,7 @@ impl CompiledModule {
             ))?;
         let native_export_count = usize::from(count_native)
             .checked_add(usize::from(span_sum_native))
+            .and_then(|value| value.checked_add(usize::from(native_grep_reducer)))
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native prepared aggregate export count",
             ))?;
@@ -6891,7 +6952,11 @@ impl CompiledModule {
                 }),
             exports
                 .contains(PreparedAggregateExports::GREP_COUNT)
-                .then_some(12),
+                .then(|| {
+                    native_grep_count_wrapper
+                        .as_ref()
+                        .map_or(12, |wrapper| wrapper.code.len())
+                }),
         ];
         for code_size in entry_code_sizes.into_iter().flatten() {
             final_text_len = align(
@@ -7140,7 +7205,7 @@ impl CompiledModule {
                              compatibility_runtime_name: Option<&'static str>,
                              entry_prefix: &'static str|
          -> Result<usize, ObjectError> {
-            let ordered_gate = match (
+            let (ordered_gate_call, ordered_compatibility) = match (
                 wrapper.ordered_nfa_gate_call_offset,
                 wrapper.bulk_runtime_fallback_offset,
                 wrapper.compatibility_identity_relocation,
@@ -7148,9 +7213,12 @@ impl CompiledModule {
             ) {
                 (Some(call), Some(fallback), Some(identity), Some(runtime_name))
                     if ordered_nfa_reducers => {
-                        Some((call, fallback, identity, runtime_name))
+                        (Some(call), Some((fallback, identity, runtime_name)))
                     }
-                (None, None, None, None) if !ordered_nfa_reducers => None,
+                (Some(call), None, None, None) if ordered_nfa_reducers => {
+                    (Some(call), None)
+                }
+                (None, None, None, None) if !ordered_nfa_reducers => (None, None),
                 _ => {
                     return Err(ObjectError::InvalidModule(
                         "native prepared scalar reducer gate/fallback contract is inconsistent",
@@ -7189,8 +7257,8 @@ impl CompiledModule {
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "native prepared aggregate local call offset",
                 ))?;
-            let ordered_gate_call_offset = ordered_gate
-                .map(|(call, _, _, _)| {
+            let ordered_gate_call_offset = ordered_gate_call
+                .map(|call| {
                     code_offset.checked_add(call).ok_or(
                         ObjectError::ArithmeticOverflow(
                             "Ordered-NFA aggregate gate call offset",
@@ -7198,8 +7266,8 @@ impl CompiledModule {
                     )
                 })
                 .transpose()?;
-            let compatibility_runtime_offset = ordered_gate
-                .map(|(_, fallback, _, _)| {
+            let compatibility_runtime_offset = ordered_compatibility
+                .map(|(fallback, _, _)| {
                     code_offset.checked_add(fallback).ok_or(
                         ObjectError::ArithmeticOverflow(
                             "Ordered-NFA aggregate compatibility edge offset",
@@ -7298,7 +7366,7 @@ impl CompiledModule {
                     patch_aarch64_local_call(text, call_offset, search_target.offset())?;
                 }
             }
-            if let Some((_, _, identity_relocation, _)) = ordered_gate {
+            if let Some((_, identity_relocation, _)) = ordered_compatibility {
                 match (architecture, identity_relocation) {
                     (
                         Architecture::X86_64,
@@ -7388,7 +7456,7 @@ impl CompiledModule {
                     }
                 }
             }
-            if let Some((_, _, _, runtime_name)) = ordered_gate {
+            if let Some((_, _, runtime_name)) = ordered_compatibility {
                 let runtime_symbol = symbols.len();
                 symbols.push(ModuleSymbol {
                     name: owned_string(
@@ -7484,13 +7552,24 @@ impl CompiledModule {
             };
         let prepared_grep_count_symbol_index =
             if exports.contains(PreparedAggregateExports::GREP_COUNT) {
-                Some(append_runtime(
-                    &mut text,
-                    &mut symbols,
-                    &mut relocations,
-                    PREPARED_GREP_COUNT_RUNTIME_SYMBOL_NAME,
-                    PREPARED_GREP_COUNT_SYMBOL_PREFIX,
-                )?)
+                Some(if let Some(wrapper) = native_grep_count_wrapper {
+                    append_native(
+                        &mut text,
+                        &mut symbols,
+                        &mut relocations,
+                        wrapper,
+                        None,
+                        PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+                    )?
+                } else {
+                    append_runtime(
+                        &mut text,
+                        &mut symbols,
+                        &mut relocations,
+                        PREPARED_GREP_COUNT_RUNTIME_SYMBOL_NAME,
+                        PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+                    )?
+                })
             } else {
                 None
             };
@@ -8360,18 +8439,18 @@ enum NativeSpanReducerCallKind {
 /// `AArch64` object may exceed `BL`'s signed 26-bit word range under the public
 /// object-size ceiling; that is an optional-native decline, not a late module
 /// construction failure.
-fn native_span_reducer_wrappers_fit(
+fn native_aggregate_wrappers_fit(
     architecture: Architecture,
     initial_text_bytes: usize,
     target: usize,
-    wrappers: [&Option<NativePreparedBulkWrapper>; 2],
+    wrappers: &[&Option<NativePreparedBulkWrapper>],
 ) -> Result<bool, ObjectError> {
     let alignment_mask = match architecture {
         Architecture::X86_64 => 15,
         Architecture::Aarch64 => 3,
     };
     let mut text_bytes = initial_text_bytes;
-    for wrapper in wrappers.into_iter().filter_map(Option::as_ref) {
+    for wrapper in wrappers.iter().filter_map(|wrapper| wrapper.as_ref()) {
         let code_offset = text_bytes
             .checked_add(alignment_mask)
             .ok_or(ObjectError::ArithmeticOverflow(
@@ -8461,6 +8540,16 @@ fn native_span_reducer_wrappers_fit(
             ))?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+fn native_span_reducer_wrappers_fit(
+    architecture: Architecture,
+    initial_text_bytes: usize,
+    target: usize,
+    wrappers: [&Option<NativePreparedBulkWrapper>; 2],
+) -> Result<bool, ObjectError> {
+    native_aggregate_wrappers_fit(architecture, initial_text_bytes, target, &wrappers)
 }
 
 /// Select the exhaustive aggregate-only form of the compiler terminal proof.
@@ -34936,6 +35025,47 @@ fn x86_emit_ordered_nfa_operation_gate(
     Ok((gate_call, runtime_fallback, identity_relocation))
 }
 
+/// Admit only the exact capability-bearing Ordered-NFA owner. Unlike the
+/// compatibility gate above, a legacy handle fails closed instead of taking a
+/// semantic runtime reducer edge. This is the boundary used by reducers that
+/// claim the complete operation is compiler-generated native code.
+fn x86_emit_required_ordered_nfa_operation_gate(
+    assembler: &mut X86Assembler,
+) -> Result<usize, ObjectError> {
+    let native = assembler.label()?;
+    let failed = assembler.label()?;
+    assembler.instruction(&[0x48, 0x83, 0xec, 0x38])?;
+    assembler.instruction(&[0x48, 0x89, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0xe8])?;
+    let gate_call = assembler.label()?;
+    assembler.bind(gate_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x41, 0x89, 0xc3])?; // preserve classifier status
+    assembler.instruction(&[0x48, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, 0x38])?;
+    assembler.instruction(&[0x41, 0x83, 0xfb, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], native)?;
+    assembler.instruction(&[0x45, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?; // legacy is not admitted
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(failed)?;
+    assembler.instruction(&[0x44, 0x89, 0xd8])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(native)?;
+    Ok(gate_call)
+}
+
 fn lower_x86_64_prepared_span(
     sink: PreparedSpanSink,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
@@ -35674,6 +35804,232 @@ fn lower_x86_64_ordered_nfa_span_reduce(
     )
 }
 
+/// Emit one transactional LF/CRLF line-domain Count. Each logical line is
+/// presented to the local search as an independent 0..line_len haystack so
+/// anchors and empty matches have exactly `ByteSlice::lines` semantics. The
+/// private V15 session is cleared for every distinct line owner.
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw validation, line splitting, local calls, and scalar publication are one native leaf"
+)]
+fn lower_x86_64_prepared_grep_count(
+    call_kind: NativeSpanReducerCallKind,
+    required_ordered_nfa: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 48;
+    const SESSION_OFFSET: u8 = 16;
+    const COUNT_OFFSET: u8 = 32;
+    const LINE_START_OFFSET: u8 = 40;
+
+    if required_ordered_nfa && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
+        return Err(ObjectError::InvalidModule(
+            "required Ordered-NFA GrepCount has no private prepared target",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let matched_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    let ordered_gate_call = required_ordered_nfa
+        .then(|| x86_emit_required_ordered_nfa_operation_gate(&mut assembler))
+        .transpose()?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 native GrepCount identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 native GrepCount linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 native GrepCount header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 native GrepCount header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // handle
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // base
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xcf])?; // output
+    assembler.instruction(&[0x4d, 0x31, 0xf6])?; // cursor
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, COUNT_OFFSET, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x4c, 0x89, 0x74, 0x24, LINE_START_OFFSET])?;
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x34, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf2])?; // line end before LF
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?; // next line start
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x43, 0x80, 0x7c, 0x14, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x49, 0x83, 0xea, 0x01])?; // strip CR before LF
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf2])?;
+
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x29, 0xda])?; // line length
+
+    if call_kind == NativeSpanReducerCallKind::PreparedPrivate {
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, SESSION_OFFSET, 0, 0, 0, 0])?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            SESSION_OFFSET + 8,
+            0,
+            0,
+            0,
+            0,
+        ])?;
+        assembler.instruction(&[0x48, 0x89, 0xdf])?;
+        assembler.instruction(&[0x4b, 0x8d, 0x34, 0x1c])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd2])?;
+        assembler.instruction(&[0x31, 0xc9])?;
+        assembler.instruction(&[0x4d, 0x89, 0xd0])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
+    } else {
+        assembler.instruction(&[0x4b, 0x8d, 0x3c, 0x1c])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd6])?;
+        assembler.instruction(&[0x31, 0xd2])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd1])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    }
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched_line)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], completed_line)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched_line)?;
+    assembler.instruction(&[0x48, 0x83, 0x44, 0x24, COUNT_OFFSET, 0x01])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, COUNT_OFFSET])?;
+    assembler.instruction(&[0x49, 0x89, 0x07])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let prepared_call_offset = finished.label_offset(prepared_call)?;
+    let ordered_nfa_gate_call_offset = ordered_gate_call
+        .map(|call| finished.label_offset(call))
+        .transpose()?;
+    let identity_relocation = NativePreparedIdentityRelocation::X86PcRelative32(
+        finished.label_offset(identity_displacement)?,
+    );
+    Ok(NativePreparedBulkWrapper {
+        code: finished.code,
+        prepared_call_offset,
+        ordered_nfa_gate_call_offset,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(identity_relocation),
+    })
+}
+
 fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 48;
     let mut assembler = X86Assembler::new();
@@ -35835,6 +36191,48 @@ fn aarch64_emit_ordered_nfa_operation_gate(
     let runtime_fallback = assembler.instruction(0x1400_0000)?;
     assembler.bind(native)?;
     Ok((gate_call, runtime_fallback, identity_relocation))
+}
+
+/// AAPCS64 counterpart to
+/// [`x86_emit_required_ordered_nfa_operation_gate`]. A capability mismatch is
+/// terminal and never enters the target-neutral semantic reducer.
+fn aarch64_emit_required_ordered_nfa_operation_gate(
+    assembler: &mut Aarch64Assembler,
+) -> Result<usize, ObjectError> {
+    let native = assembler.label()?;
+    let failed = assembler.label()?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, 80)?)?;
+    for (left, right, offset) in [
+        (0, 1, 0),
+        (2, 3, 16),
+        (4, 5, 32),
+        (6, 7, 48),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(left, right, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_store_x(30, 31, 64)?)?;
+    let gate_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_mov_x(9, 0)?)?;
+    for (left, right, offset) in [
+        (0, 1, 0),
+        (2, 3, 16),
+        (4, 5, 32),
+        (6, 7, 48),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(left, right, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(30, 31, 64)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, 80)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, native)?;
+    assembler.branch_nonzero_w(9, failed)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(failed)?;
+    assembler.instruction(aarch64_mov_x(0, 9)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(native)?;
+    Ok(gate_call)
 }
 
 #[allow(
@@ -36496,6 +36894,207 @@ fn lower_aarch64_ordered_nfa_span_reduce(
         true,
         terminal_exact_set,
     )
+}
+
+/// AAPCS64 lowering of the transactional native line-domain reducer.
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw validation, line splitting, local calls, and scalar publication are one native leaf"
+)]
+fn lower_aarch64_prepared_grep_count(
+    call_kind: NativeSpanReducerCallKind,
+    required_ordered_nfa: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 112;
+    const SESSION_OFFSET: u16 = 96;
+    if required_ordered_nfa && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
+        return Err(ObjectError::InvalidModule(
+            "required Ordered-NFA GrepCount has no private prepared target",
+        ));
+    }
+
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let matched_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    let ordered_gate_call = required_ordered_nfa
+        .then(|| aarch64_emit_required_ordered_nfa_operation_gate(&mut assembler))
+        .transpose()?;
+
+    let identity_page = assembler.instruction(0x9000_0007)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 native GrepCount identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            7,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 native GrepCount linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 native GrepCount header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 native GrepCount header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+    }
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
+    assembler.branch_zero_x(21, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 20, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(26, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(26, 25)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(8, 26, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(9, 20, 8)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(26, 26, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(26, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_sub_x_reg(26, 26, 25)?)?;
+    assembler.instruction(aarch64_add_x_reg(8, 20, 25)?)?;
+    match call_kind {
+        NativeSpanReducerCallKind::PreparedPrivate => {
+            assembler.instruction(aarch64_store_pair_x(31, 31, 31, 96)?)?;
+            assembler.instruction(aarch64_mov_x(0, 19)?)?;
+            assembler.instruction(aarch64_mov_x(1, 8)?)?;
+            assembler.instruction(aarch64_mov_x(2, 26)?)?;
+            assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(4, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
+            assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
+        }
+        NativeSpanReducerCallKind::DirectOrdinary => {
+            assembler.instruction(aarch64_mov_x(0, 8)?)?;
+            assembler.instruction(aarch64_mov_x(1, 26)?)?;
+            assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(3, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+        }
+    }
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched_line)?;
+    assembler.branch_zero_w(0, completed_line)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched_line)?;
+    assembler.instruction(aarch64_adds_x_imm(24, 24, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(24, 22, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let gate_index = ordered_gate_call.map(|call| {
+        let index = offsets.len();
+        offsets.push(call);
+        index
+    });
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: gate_index.map(|index| offsets[index]),
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(
+            NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                page: offsets[1],
+                page_offset: offsets[2],
+            },
+        ),
+    })
 }
 
 fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
@@ -45761,6 +46360,16 @@ fn aarch64_add_x_imm(destination: u8, source: u8, immediate: u16) -> Result<u32,
         return Err(ObjectError::InvalidModule("AArch64 ADD immediate"));
     }
     Ok(0x9100_0000
+        | (u32::from(immediate) << 10)
+        | aarch64_reg(source, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_adds_x_imm(destination: u8, source: u8, immediate: u16) -> Result<u32, ObjectError> {
+    if immediate > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 ADDS immediate"));
+    }
+    Ok(0xb100_0000
         | (u32::from(immediate) << 10)
         | aarch64_reg(source, 5)?
         | aarch64_reg(destination, 0)?)

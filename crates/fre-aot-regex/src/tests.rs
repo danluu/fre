@@ -2896,7 +2896,7 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
         );
         assert_eq!(
             compiled.module().prepared_aggregate_strategy(),
-            Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+            Some(PreparedAggregateStrategy::NativeFused),
         );
         assert_eq!(
             compiled.receipt().prepared_aggregate_exports,
@@ -2904,9 +2904,9 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
         );
         assert_eq!(
             compiled.receipt().prepared_aggregate_strategy,
-            Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+            Some(PreparedAggregateStrategy::NativeFused),
         );
-        assert!(compiled.receipt().runtime_helper_required);
+        assert!(!compiled.receipt().runtime_helper_required);
         let expected_runtime_program = compiled
             .program()
             .serialize()
@@ -2981,7 +2981,7 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
         assert!(!required.contains(
             &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
         ));
-        assert!(required.contains(
+        assert!(!required.contains(
             &"fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
         ));
         let identity_index = compiled
@@ -3021,7 +3021,7 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
             .expect("ordinary native entry");
         let ordinary_offset = usize::try_from(ordinary_entry.offset)
             .expect("ordinary native entry offset");
-        for entry_name in [count_entry, span_sum_entry] {
+        for entry_name in [count_entry, span_sum_entry, grep_entry] {
             let entry = compiled
                 .module()
                 .symbols()
@@ -3098,51 +3098,6 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
                             == i64::try_from(ordinary_offset).ok()
                     }));
                 }
-            }
-        }
-        let grep = compiled
-            .module()
-            .symbols()
-            .iter()
-            .find(|symbol| symbol.name == grep_entry)
-            .expect("GrepCount aggregate entry record");
-        let grep_section = grep.section.expect("GrepCount text section");
-        let grep_start = usize::try_from(grep.offset).expect("GrepCount entry offset");
-        let grep_size = usize::try_from(grep.size).expect("GrepCount entry size");
-        let grep_end = grep_start
-            .checked_add(grep_size)
-            .expect("GrepCount entry end");
-        let grep_code =
-            &compiled.module().sections()[grep_section].data[grep_start..grep_end];
-        let grep_runtime_index = compiled
-            .module()
-            .symbols()
-            .iter()
-            .position(|symbol| {
-                symbol.section.is_none()
-                    && symbol.name
-                        == "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
-            })
-            .expect("undefined GrepCount runtime helper");
-        assert!(compiled.module().relocations().iter().any(|relocation| {
-            relocation.section == grep_section
-                && relocation.symbol == grep_runtime_index
-                && relocation.offset
-                    == grep
-                        .offset
-                        .checked_add(8)
-                        .expect("GrepCount runtime relocation offset")
-        }));
-        match target.architecture {
-            Architecture::X86_64 => {
-                assert_eq!(grep_code, [0x4c, 0x8d, 0x05, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0]);
-            }
-            Architecture::Aarch64 => {
-                let words = grep_code
-                    .chunks_exact(4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                assert_eq!(words, [0x9000_0004, 0x9100_0084, 0x1400_0000]);
             }
         }
     }
@@ -3424,6 +3379,72 @@ fn prepared_grep_count_export_is_legal_for_every_output_contract() {
             compiled.receipt().prepared_aggregate_exports,
             PreparedAggregateExports::GREP_COUNT,
         );
+    }
+}
+
+#[test]
+fn prepared_v15_grep_count_is_native_fail_closed_and_cross_target() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let compiled = crate::compile_with_prepared_ordered_nfa_v15(
+            CompileRequest::new(r"\b\w{12,}\b", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::GREP_COUNT,
+        )
+        .expect("explicit V15 GrepCount");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        );
+        assert_eq!(
+            compiled.receipt().required_prepare_capabilities,
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
+        assert_eq!(
+            compiled.module().prepared_bulk_strategy(),
+            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+        );
+        assert!(!compiled
+            .module()
+            .required_runtime_symbols()
+            .any(|symbol| symbol
+                == "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"));
+        let reducer_name = compiled
+            .module()
+            .prepared_grep_count_symbol()
+            .expect("native V15 GrepCount symbol");
+        let reducer = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == reducer_name)
+            .expect("native V15 GrepCount record");
+        assert_eq!(reducer.binding, crate::SymbolBinding::Global);
+        assert_eq!(reducer.kind, crate::SymbolKind::Function);
+        let section = reducer.section.expect("native V15 GrepCount text");
+        let end = reducer.offset.checked_add(reducer.size).expect("reducer end");
+        let identity = compiled
+            .module()
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+            .expect("native V15 aggregate identity");
+        let relocations = compiled
+            .module()
+            .relocations()
+            .iter()
+            .filter(|relocation| {
+                relocation.section == section
+                    && relocation.offset >= reducer.offset
+                    && relocation.offset < end
+            })
+            .collect::<Vec<_>>();
+        assert!(relocations.iter().any(|relocation| relocation.symbol == identity));
+        assert!(relocations.iter().all(|relocation| {
+            compiled.module().symbols()[relocation.symbol].section.is_some()
+        }));
+        assert!(reducer.size > 12, "native reducer must not be a helper thunk");
     }
 }
 
@@ -3887,6 +3908,20 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             ],
         ),
         (
+            "^a+$",
+            CompileMode::Optimizing,
+            EngineKind::OrderedContextDfa,
+            true,
+            false,
+            vec![
+                Vec::new(),
+                b"\n".to_vec(),
+                b"\r\n".to_vec(),
+                b"a\r\nno\naa\n\n\ra\na\r".to_vec(),
+                b"a\n".to_vec(),
+            ],
+        ),
+        (
             "(?:|a)",
             CompileMode::Optimizing,
             EngineKind::OrderedDfa,
@@ -4218,8 +4253,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             ],
         ),
     ];
-    let exports = PreparedAggregateExports::COUNT
-        .union(PreparedAggregateExports::SPAN_SUM);
+    let exports = PreparedAggregateExports::ALL;
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock")
@@ -4284,8 +4318,10 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             artifact.receipt().prepared_aggregate_strategy,
             Some(if *ordered_native {
                 PreparedAggregateStrategy::NativeOrderedNfaFused
-            } else {
+            } else if *direct {
                 PreparedAggregateStrategy::NativeFused
+            } else {
+                PreparedAggregateStrategy::NativeFusedWithRuntimeHelper
             }),
             "{pattern:?}",
         );
@@ -4536,6 +4572,10 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .module()
             .prepared_span_sum_symbol()
             .expect("linked SpanSum symbol");
+        let grep_count_symbol = artifact
+            .module()
+            .prepared_grep_count_symbol()
+            .expect("linked GrepCount symbol");
         let span_fill_symbol = (*ordered_native).then(|| {
             artifact
                 .module()
@@ -4560,6 +4600,11 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             "extern uint32_t {span_sum_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
         )
         .expect("declare SpanSum entry");
+        writeln!(
+            source,
+            "extern uint32_t {grep_count_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
+        )
+        .expect("declare GrepCount entry");
         if let Some(span_fill_symbol) = span_fill_symbol {
             writeln!(
                 source,
@@ -4585,6 +4630,29 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 sum.checked_add(u64::try_from(end - start).expect("oracle span width"))
             })
             .expect("oracle SpanSum");
+            let mut grep_count = 0_u64;
+            let mut line_start = 0_usize;
+            while line_start < haystack.len() {
+                let remainder = &haystack[line_start..];
+                let lf = remainder.iter().position(|&byte| byte == b'\n');
+                let mut line_end = lf.map_or(haystack.len(), |offset| line_start + offset);
+                if lf.is_some()
+                    && line_end > line_start
+                    && haystack[line_end - 1] == b'\r'
+                {
+                    line_end -= 1;
+                }
+                if oracle.is_match(&haystack[line_start..line_end]) {
+                    grep_count = grep_count.checked_add(1).expect("oracle GrepCount");
+                }
+                let Some(offset) = lf else {
+                    break;
+                };
+                line_start = line_start
+                    .checked_add(offset)
+                    .and_then(|value| value.checked_add(1))
+                    .expect("oracle line progress");
+            }
             let window_start = usize::from(haystack.len() >= 3);
             let window_end = if haystack.len() >= 2 {
                 haystack.len() - 1
@@ -4688,19 +4756,22 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 source,
                 concat!(
                     "static int run{fixture_index}_{case_index}(void){{",
-                    "const prepare_v2_t v2={{64U,2U,UINT64_C(7),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
-                    "handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb);",
+                    "const prepare_v2_t v2={{64U,2U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
+                    "handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb),g=UINT64_C(0xeeeeeeeeeeeeeeee);uint32_t gq;",
                     "if(fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&v2,&h)!=0U)return 1;",
                     "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 2;",
                     "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 3;",
+                    "gq={grep_count_symbol}(h,h{fixture_index}_{case_index},{length}U,&g);",
+                    "if(UINT64_C({required})==0U){{if(gq!=0U)return 21;if(g!=UINT64_C({grep_count}))return 24;}}else{{if(gq!=3U||g!=UINT64_C(0xeeeeeeeeeeeeeeee))return 22;}}",
                     "{legacy_fill}",
                     "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;",
                     "if(UINT64_C({required})!=0){{",
-                    "const prepare_v3_t v3={{112U,3U,UINT64_C(7),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C({required}),{{0,0}}}};",
-                    "h=0;c=UINT64_C(0xcccccccccccccccc);s=UINT64_C(0xdddddddddddddddd);",
+                    "const prepare_v3_t v3={{112U,3U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C({required}),{{0,0}}}};",
+                    "h=0;c=UINT64_C(0xcccccccccccccccc);s=UINT64_C(0xdddddddddddddddd);g=UINT64_C(0xffffffffffffffff);",
                     "if(fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&v3,&h)!=0U)return 5;",
                     "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 6;",
                     "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 7;",
+                    "if({grep_count_symbol}(h,h{fixture_index}_{case_index},{length}U,&g)!=0U||g!=UINT64_C({grep_count}))return 23;",
                     "{native_fill}",
                     "{native_search}",
                     "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 8;",
@@ -4714,6 +4785,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 count = count,
                 span_sum_symbol = span_sum_symbol,
                 span_sum = span_sum,
+                grep_count_symbol = grep_count_symbol,
+                grep_count = grep_count,
                 length = haystack.len(),
                 required = artifact.receipt().required_prepare_capabilities,
                 legacy_fill = span_fill_checks,
@@ -4775,6 +4848,10 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         .module()
         .prepared_span_sum_symbol()
         .expect("first authentication SpanSum");
+    let first_grep_count = first
+        .module()
+        .prepared_grep_count_symbol()
+        .expect("first authentication GrepCount");
     let exact_count = exact
         .module()
         .prepared_count_symbol()
@@ -4796,7 +4873,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         concat!(
             "static int authenticate_before_source(void){{",
             "handle_t right=0,wrong=0,width=0;",
-            "const prepare_v3_t v3={{112U,3U,UINT64_C(6),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};",
+            "const prepare_v3_t v3={{112U,3U,UINT64_C(14),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};",
             "uint64_t out=UINT64_C(0x1122334455667788);",
             "static const unsigned char readable[8]={{0}};",
             "unsigned char bytes[17];uint32_t q;int authentication_failed=0;memset(bytes,0xa5,sizeof(bytes));",
@@ -4807,6 +4884,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
             "out=UINT64_C(0x1122334455667788);",
             "q={first_span_sum}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={first_grep_count}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
             "out=UINT64_C(0x1122334455667788);",
             "q={exact_count}(right,(const unsigned char*)(uintptr_t)1,8U,&out);",
@@ -4832,10 +4912,13 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             "if({first_count}(right,(const unsigned char*)\"a\",1U,(uint64_t*)(void*)(bytes+1))!=2U)return 15;",
             "for(size_t i=0;i<sizeof(bytes);i++)if(bytes[i]!=0xa5U)return 16;",
             "if({first_count}(right,(const unsigned char*)\"a\",1U,(uint64_t*)0)!=2U)return 17;",
+            "if({first_grep_count}(right,(const unsigned char*)\"a\",1U,(uint64_t*)0)!=2U)return 21;",
             "out=UINT64_C(0x1122334455667788);",
             "if({first_count}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 18;",
             "out=UINT64_C(0x1122334455667788);",
             "if({first_span_sum}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 19;",
+            "out=UINT64_C(0x1122334455667788);",
+            "if({first_grep_count}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 22;",
             "if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(width)!=0U)return 20;",
             "return 0;}}",
         ),
@@ -4847,6 +4930,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         exact_width_program_len = exact_width_program_len,
         first_count = first_count,
         first_span_sum = first_span_sum,
+        first_grep_count = first_grep_count,
         exact_count = exact_count,
         exact_span_sum = exact_span_sum,
         exact_width_count = exact_width_count,
