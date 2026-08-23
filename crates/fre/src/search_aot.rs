@@ -576,8 +576,8 @@ mod tests {
     #[test]
     fn candidate_refuses_nondefault_build_policy_and_nonexact_plan() {
         let limits = BuildLimits {
-            max_persistent_bytes: BuildLimits::default()
-                .max_persistent_bytes
+            max_planner_work: BuildLimits::default()
+                .max_planner_work
                 .checked_add(1)
                 .unwrap(),
             ..BuildLimits::default()
