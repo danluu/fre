@@ -70,6 +70,11 @@ const SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP: usize = BYTE_SET_WIDE_BLOCK_BYTES - 1;
 const SEARCH_VALUE_PREFLIGHT_WORK_FACTOR: usize = size_of::<usize>() * 8 + 9;
 const SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES: usize =
     (usize::MAX - SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP) / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
+
+const fn ordinary_full_value_envelope_fits(input_bytes: usize) -> bool {
+    input_bytes <= SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+}
+
 // One batch spans enough accepted matches to amortize the cursor setup while
 // remaining small relative to the long sparse sources this route serves.
 // A batch whose selected spans occupy at most one wide classification block
@@ -4248,6 +4253,28 @@ impl UnicodeScalarSearchPlan {
         }
     }
 
+    /// Search one source-authenticated full haystack without constructing
+    /// diagnostic accounting or repeating checked-window preflight.
+    ///
+    /// The outer `None` declines when the input exceeds the exact arithmetic
+    /// envelope used by the canonical unlimited value projection. Callers can
+    /// then preserve its checked overflow chronology. An admitted search
+    /// returns `Some(None)` for a miss and `Some(Some(span))` for a match.
+    #[must_use]
+    #[inline]
+    pub fn ordinary_find_full_unmetered(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
+        if !ordinary_full_value_envelope_fits(haystack.len()) {
+            return None;
+        }
+        let cursor = self.search_cursor(haystack);
+        let mut state = cursor.state;
+        Some(
+            cursor
+                .execute::<false, true>(Window::full(haystack), &mut state)
+                .0,
+        )
+    }
+
     pub fn find_window(
         &self,
         haystack: &[u8],
@@ -4333,9 +4360,7 @@ impl UnicodeScalarSearchPlan {
         limits: SearchLimits,
     ) -> Result<(), SearchError> {
         let input_bytes = Self::validated_window_bytes(haystack, window)?;
-        if limits == SearchLimits::unlimited()
-            && input_bytes <= SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
-        {
+        if limits == SearchLimits::unlimited() && ordinary_full_value_envelope_fits(input_bytes) {
             return Ok(());
         }
         self.preflight_validated(input_bytes, limits).map(drop)
@@ -4995,7 +5020,7 @@ mod tests {
         SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES, SEARCH_VALUE_PREFLIGHT_WORK_FACTOR,
         SIMD_ASCII_CLASSIFIER_BUILD_WORK, SearchError, SearchLimits, UnicodeScalarAggregatePlan,
         UnicodeScalarSearchPlan, ValueReduction, binary_search_comparison_bound, decode_scalar,
-        decode_scalar_inline, decode_scalar_with,
+        decode_scalar_inline, decode_scalar_with, ordinary_full_value_envelope_fits,
     };
     #[cfg(all(
         feature = "static-dispatch-arm-41-d84",
@@ -6729,6 +6754,92 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn scalar_run_ordinary_full_find_matches_checked_and_upstream_widths_and_shapes() {
+        let cases: &[(&[(char, char)], u32, Option<u32>, bool, &str)] = &[
+            (&[('A', 'A'), ('α', 'α')], 1, Some(1), true, r"[Aα]"),
+            (
+                &[('Α', 'Ω'), ('α', 'ω')],
+                2,
+                Some(6),
+                true,
+                r"[Α-Ωα-ω]{2,6}",
+            ),
+            (
+                &[('Α', 'Ω'), ('α', 'ω')],
+                2,
+                Some(6),
+                false,
+                r"[Α-Ωα-ω]{2,6}?",
+            ),
+            (&[('雪', '雪')], 2, None, true, r"雪{2,}"),
+            (&[('𐐀', '𐐏')], 2, Some(3), true, r"[𐐀-𐐏]{2,3}"),
+            (
+                &[('A', 'A'), ('α', 'α'), ('雪', '雪'), ('𐐀', '𐐀')],
+                2,
+                Some(4),
+                false,
+                r"[Aα雪𐐀]{2,4}?",
+            ),
+        ];
+        let haystacks = [
+            b"".to_vec(),
+            b"--AAA--".to_vec(),
+            "--αβγδεζη--".as_bytes().to_vec(),
+            "--雪雪雪--".as_bytes().to_vec(),
+            "--𐐀𐐁𐐂𐐃--".as_bytes().to_vec(),
+            "--Aα雪𐐀A--".as_bytes().to_vec(),
+            [
+                b"!\xffA\xce".as_slice(),
+                "α雪𐐀".as_bytes(),
+                b"\xf0\x90!".as_slice(),
+            ]
+            .concat(),
+        ];
+
+        for &(ranges, minimum, maximum, greedy, pattern) in cases {
+            let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+                SimdDispatchContext::capture(),
+                ranges.iter().copied(),
+                minimum,
+                maximum,
+                greedy,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let upstream = RegexBuilder::new(pattern).build().unwrap();
+            for haystack in &haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let checked = plan
+                    .find_window_value(haystack, Window::full(haystack), SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(
+                    checked, expected,
+                    "checked pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    plan.ordinary_find_full_unmetered(haystack),
+                    Some(expected),
+                    "ordinary span pattern={pattern:?} haystack={haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_run_ordinary_full_value_envelope_has_an_exact_nonallocating_boundary() {
+        assert!(ordinary_full_value_envelope_fits(
+            SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+        ));
+        assert!(!ordinary_full_value_envelope_fits(
+            SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+                .checked_add(1)
+                .expect("the envelope is below usize::MAX"),
+        ));
     }
 
     #[test]

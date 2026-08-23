@@ -10833,6 +10833,27 @@ mod literal_class_run_search_ordinary_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod unicode_scalar_run_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record_span() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -14155,10 +14176,20 @@ impl PortableRegex {
 
     #[inline]
     fn try_find_ordinary(&self, haystack: &[u8]) -> Result<Option<Match>, SearchError> {
-        if let PortablePlan::BoundedWordClass(plan) = &self.plan
-            && let Some(matched) = plan.ordinary_find_full_unmetered(haystack)
-        {
-            return Ok(matched);
+        match &self.plan {
+            PortablePlan::BoundedWordClass(plan) => {
+                if let Some(matched) = plan.ordinary_find_full_unmetered(haystack) {
+                    return Ok(matched);
+                }
+            }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                if let Some(matched) = plan.ordinary_find_full_unmetered(haystack) {
+                    #[cfg(test)]
+                    unicode_scalar_run_ordinary_facade_probe::record_span();
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+            }
+            _ => {}
         }
         let window = SearchWindow::full(haystack);
         match &self.plan {
@@ -26326,7 +26357,7 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
-    fn composed_ordinary_boolean_routes_remain_plan_local() {
+    fn composed_ordinary_routes_remain_plan_local() {
         let bounded = PortableBuilder::new(r"\b\p{Greek}+\b")
             .unicode(true)
             .build()
@@ -26349,6 +26380,21 @@ mod tests {
             1
         );
         assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        super::bounded_word_class::ordinary_find_probe::reset();
+        super::unicode_scalar_run_ordinary_facade_probe::reset();
+        assert_eq!(
+            bounded
+                .find("!\u{03b1}\u{03b2}!".as_bytes())
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 5)),
+        );
+        assert_eq!(super::bounded_word_class::ordinary_find_probe::calls(), 1);
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            0,
+            "the BWC ordinary find arm remains first and plan-local",
+        );
 
         super::bounded_word_class::ordinary_is_match_probe::reset();
         super::unicode_word_run::reset_full_prepared_call_count();
@@ -49108,6 +49154,346 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unicode_scalar_run_ordinary_facades_match_upstream_widths_shapes_and_malformed_utf8() {
+        let patterns = [
+            r"\pL",
+            r"\p{Greek}{2,6}",
+            r"\p{Greek}{2,6}?",
+            r"[\x{96EA}\x{96F2}]{2,}",
+            r"[\x{10400}-\x{1040F}]{2,3}",
+            r"[A\x{03B1}\x{96EA}\x{10400}]{2,4}?",
+        ];
+        let haystacks = [
+            b"".to_vec(),
+            b"--AAA--".to_vec(),
+            "--αβγδεζη--".as_bytes().to_vec(),
+            "--雪雲雪--".as_bytes().to_vec(),
+            "--𐐀𐐁𐐂𐐃--".as_bytes().to_vec(),
+            "--Aα雪𐐀A--".as_bytes().to_vec(),
+            [
+                b"!\xffA\xce".as_slice(),
+                "α雪𐐀".as_bytes(),
+                b"\xf0\x90!".as_slice(),
+            ]
+            .concat(),
+        ];
+
+        for pattern in patterns {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::UnicodeScalarRun);
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+            );
+            let upstream = regex::bytes::Regex::new(pattern).unwrap();
+            for haystack in &haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                super::unicode_scalar_run_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "ordinary span pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected.is_some(),
+                    "ordinary existence pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    super::unicode_scalar_run_ordinary_facade_probe::calls(),
+                    1,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_scalar_run_ordinary_greedy_and_lazy_plus_match_upstream_cases() {
+        let mut late = vec![b'!'; 4_093];
+        late.extend_from_slice("αβγ".as_bytes());
+        let malformed = [
+            b"\xff\xce!\xf0\x90".as_slice(),
+            "αβ".as_bytes(),
+            b"\xf4\x90\x80\x80".as_slice(),
+        ]
+        .concat();
+        let haystacks = [
+            ("hit", "--αβγ--".as_bytes().to_vec()),
+            ("late", late),
+            ("miss", b"plain ASCII only".to_vec()),
+            ("malformed", malformed),
+        ];
+
+        for pattern in [r"\p{Greek}+", r"\p{Greek}+?"] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            let upstream = regex::bytes::Regex::new(pattern).unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::UnicodeScalarRun);
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+            );
+            for (case, haystack) in &haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                super::unicode_scalar_run_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "ordinary span pattern={pattern:?} case={case}",
+                );
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected.is_some(),
+                    "ordinary existence pattern={pattern:?} case={case}",
+                );
+                assert_eq!(
+                    super::unicode_scalar_run_ordinary_facade_probe::calls(),
+                    1,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_scalar_run_ordinary_facades_are_isolated_from_explicit_apis() {
+        let regex = PortableBuilder::new(r"\p{Greek}{2,6}").build().unwrap();
+        let haystack = "!ΑΒΓΔ!αβ!".as_bytes();
+        let expected = Some((1, 9));
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeScalarRun);
+
+        super::unicode_scalar_run_ordinary_facade_probe::reset();
+        assert_eq!(
+            regex
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(regex.is_match(haystack));
+        let ordinary = super::unicode_scalar_run_ordinary_facade_probe::calls();
+        assert_eq!(ordinary, 1);
+
+        let (accounted_match, accounting) = regex
+            .find_accounted(haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            accounted_match.map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        let SearchAccounting::UnicodeScalarRun(accounting) = accounting else {
+            unreachable!("the fixture retained its scalar-run plan")
+        };
+        let finite = SearchLimits {
+            max_work: u64::try_from(accounting.upper_bounds.work).unwrap(),
+            max_scratch_bytes: accounting.upper_bounds.scratch_bytes,
+        };
+        assert_ne!(finite, SearchLimits::unlimited());
+        assert_eq!(
+            regex
+                .find_value(haystack, finite)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(regex.is_match_value(haystack, finite).unwrap());
+        assert_eq!(
+            regex
+                .find_at_value(haystack, 0, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(
+            session
+                .is_match_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        let mut ordinary_session = regex.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary_session
+                .find_at(haystack, 0)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(ordinary_session.is_match_at(haystack, 0).unwrap());
+
+        let expected_iter = vec![(1, 9), (10, 14)];
+        let accounted_iter = regex
+            .find_iter(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accounted_iter, expected_iter);
+        let value_iter = regex
+            .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_iter, expected_iter);
+
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert!(matches!(
+            regex.find_value(
+                haystack,
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::UnicodeScalarRun(
+                fre_kernels::UnicodeScalarSearchError::WorkLimit { .. }
+            ))
+        ));
+        assert!(matches!(
+            regex.find_window_value(
+                haystack,
+                SearchWindow::new(2, 1),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::UnicodeScalarRun(
+                fre_kernels::UnicodeScalarSearchError::InvalidWindow {
+                    start: 2,
+                    end: 1,
+                    haystack_len,
+                }
+            )) if haystack_len == haystack.len()
+        ));
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            ordinary,
+            "finite, windowed, session, iterator, capture, and ordinary-session APIs stay canonical",
+        );
+
+        let capture_cases: &[(&str, &[Option<&str>])] = &[
+            (r"(?P<outer>\p{Greek}{2,6})", &[None, Some("outer")]),
+            (
+                r"(?P<outer>(?P<unit>\p{Greek}){2,6})",
+                &[None, Some("outer"), Some("unit")],
+            ),
+        ];
+        for &(pattern, names) in capture_cases {
+            let captured = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(captured.build_report().plan, PlanKind::UnicodeScalarRun);
+            assert_eq!(
+                captured.runtime_implementation_id(),
+                UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+            );
+            assert_eq!(captured.captures_len(), names.len());
+            assert_eq!(
+                captured.capture_names().collect::<Vec<_>>(),
+                names.to_vec(),
+            );
+            let explicit_captures = names.len() - 1;
+            let mut captured_locations = captured.capture_locations();
+            assert_eq!(captured_locations.len(), names.len());
+
+            super::unicode_scalar_run_ordinary_facade_probe::reset();
+            assert!(matches!(
+                captured.captures_read_value(
+                    &mut captured_locations,
+                    haystack,
+                    SearchLimits::unlimited(),
+                ),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == explicit_captures
+            ));
+            for index in 0..captured_locations.len() {
+                assert_eq!(captured_locations.get(index), None);
+            }
+            assert!(matches!(
+                captured.captures_read(
+                    &mut captured_locations,
+                    haystack,
+                    SearchLimits::unlimited(),
+                ),
+                Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures })
+                    if captures == explicit_captures
+            ));
+            for index in 0..captured_locations.len() {
+                assert_eq!(captured_locations.get(index), None);
+            }
+            assert_eq!(
+                super::unicode_scalar_run_ordinary_facade_probe::calls(),
+                0,
+                "capture APIs stay canonical for pattern={pattern:?}",
+            );
+
+            assert!(captured.is_match(haystack));
+            assert_eq!(
+                super::unicode_scalar_run_ordinary_facade_probe::calls(),
+                0,
+            );
+            assert_eq!(
+                captured
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+            assert_eq!(
+                super::unicode_scalar_run_ordinary_facade_probe::calls(),
+                1,
+            );
         }
     }
 
