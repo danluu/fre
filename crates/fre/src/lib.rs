@@ -5967,9 +5967,11 @@ fn append_ripgrep_literal_bytes_source(source: &mut String, bytes: &[u8]) {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn ripgrep_standard_literal_bytes_context<'literal>(
     pattern_count: usize,
-    literal_at: impl Fn(usize) -> Option<&'literal [u8]>,
+    literal_at: &dyn Fn(usize) -> Option<&'literal [u8]>,
     limits: BuildLimits,
     canonical_source_limit: usize,
     reject_meta_characters: bool,
@@ -6146,7 +6148,7 @@ fn ripgrep_standard_literal_context(
     match hir.kind() {
         HirKind::Literal(literal) => ripgrep_standard_literal_bytes_context(
             1,
-            |index| (index == 0).then_some(literal.0.as_ref()),
+            &|index| (index == 0).then_some(literal.0.as_ref()),
             limits,
             canonical_source_limit,
             false,
@@ -6154,7 +6156,7 @@ fn ripgrep_standard_literal_context(
         HirKind::Alternation(branches) if branches.len() >= 2 => {
             ripgrep_standard_literal_bytes_context(
                 branches.len(),
-                |index| {
+                &|index| {
                     let HirKind::Literal(literal) = branches.get(index)?.kind() else {
                         return None;
                     };
@@ -6708,6 +6710,8 @@ impl PortableBuilder {
     /// `Ok(None)` preserves the caller's configured-HIR fallback for every
     /// option, value or resource boundary outside this exact successful lane.
     #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
     pub fn build_ripgrep_standard_literals(
         self,
         patterns: &[&str],
@@ -6729,6 +6733,8 @@ impl PortableBuilder {
         )
     }
 
+    #[cold]
+    #[inline(never)]
     fn build_ripgrep_standard_literal_bytes(
         self,
         patterns: &[&[u8]],
@@ -6739,7 +6745,7 @@ impl PortableBuilder {
         }
         let Some(context) = ripgrep_standard_literal_bytes_context(
             patterns.len(),
-            |index| patterns.get(index).copied(),
+            &|index| patterns.get(index).copied(),
             self.limits,
             canonical_source_limit,
             true,
