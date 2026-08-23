@@ -254,6 +254,16 @@ struct PackedLiteralSetSearchPreflight {
     work_upper_bound: usize,
 }
 
+#[inline]
+fn search_work_upper_bound(
+    searched_bytes: usize,
+    verification_bytes_per_position: usize,
+) -> Option<(usize, usize)> {
+    let positions_upper_bound = searched_bytes.checked_add(1)?;
+    let work_upper_bound = positions_upper_bound.checked_mul(verification_bytes_per_position)?;
+    Some((positions_upper_bound, work_upper_bound))
+}
+
 /// Packed literal-set build or search failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1134,6 +1144,22 @@ impl PackedLiteralSetPlan {
         PackedLiteralSetOrdinaryExecutor { plan: self }
     }
 
+    /// Bind the direct ordinary-search engine for a complete source only when
+    /// the finite search's conservative work arithmetic is representable.
+    ///
+    /// This admission is source-free and does not enforce a caller-selected
+    /// work cap. A decline must replay the finite value path so its canonical
+    /// preflight reports the arithmetic failure before source access.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn try_ordinary_full_window_executor(
+        &self,
+        haystack_len: usize,
+    ) -> Option<PackedLiteralSetOrdinaryExecutor<'_>> {
+        search_work_upper_bound(haystack_len, self.verification_bytes_per_position)?;
+        Some(self.ordinary_executor())
+    }
+
     /// Return an allocation-free adaptive cursor when both uniform and native
     /// packed engines were admitted during construction.
     #[cfg(not(feature = "static-dispatch"))]
@@ -1285,7 +1311,7 @@ impl PackedLiteralSetPlan {
     #[inline]
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "a valid byte-slice window proves the subtraction and terminal position"
+        reason = "a validated byte-slice window proves the subtraction"
     )]
     fn search_preflight(
         &self,
@@ -1301,12 +1327,12 @@ impl PackedLiteralSetPlan {
             });
         }
         let searched_bytes = window.end() - window.start();
-        let positions_upper_bound = searched_bytes + 1;
-        let work_upper_bound = positions_upper_bound
-            .checked_mul(self.verification_bytes_per_position)
-            .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-                computation: "packed literal search work",
-            })?;
+        let (positions_upper_bound, work_upper_bound) =
+            search_work_upper_bound(searched_bytes, self.verification_bytes_per_position).ok_or(
+                PackedLiteralSetError::ArithmeticOverflow {
+                    computation: "packed literal search work",
+                },
+            )?;
         if work_upper_bound > limits.max_work {
             return Err(PackedLiteralSetError::WorkLimit {
                 needed: work_upper_bound,
@@ -2472,7 +2498,8 @@ mod tests {
         PackedLiteralSetSearchLimits, RUNTIME_IMPLEMENTATION_ID,
         find_bounded_long_shared_fragment,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
-        select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
+        search_work_upper_bound, select_shared_fragment, select_sparse_anchor,
+        shared_fragment_native_start_budget,
     };
     #[cfg(not(feature = "static-dispatch"))]
     use super::{
@@ -3012,6 +3039,11 @@ mod tests {
         };
         plan.verification_bytes_per_position = usize::MAX;
         let haystack = b"x";
+        assert!(
+            plan.try_ordinary_full_window_executor(haystack.len())
+                .is_none(),
+            "ordinary admission must decline before the canonical preflight reports overflow",
+        );
         assert_invalid_windows_precede_work(&plan, haystack);
         let expected = PackedLiteralSetError::ArithmeticOverflow {
             computation: "packed literal search work",
@@ -3039,6 +3071,62 @@ mod tests {
                 PackedLiteralSetSearchLimits::unlimited(),
             ),
             Err(expected)
+        );
+    }
+
+    #[test]
+    fn ordinary_full_window_admission_is_exact_at_address_space_edges() {
+        let patterns = [b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()];
+        let verification_bytes_per_position = patterns
+            .iter()
+            .map(|pattern| pattern.len())
+            .sum::<usize>()
+            .checked_add(patterns.len())
+            .unwrap();
+        assert_eq!(verification_bytes_per_position, 17);
+
+        let admitted_len = usize::MAX
+            .checked_div(verification_bytes_per_position)
+            .unwrap()
+            .checked_sub(1)
+            .unwrap();
+        let admitted_positions = admitted_len.checked_add(1).unwrap();
+        let admitted_work = admitted_positions
+            .checked_mul(verification_bytes_per_position)
+            .unwrap();
+        assert_eq!(
+            search_work_upper_bound(admitted_len, verification_bytes_per_position),
+            Some((admitted_positions, admitted_work)),
+        );
+        let declined_len = admitted_len.checked_add(1).unwrap();
+        assert_eq!(
+            search_work_upper_bound(declined_len, verification_bytes_per_position),
+            None,
+        );
+        assert_eq!(
+            search_work_upper_bound(usize::MAX - 1, 1),
+            Some((usize::MAX, usize::MAX)),
+        );
+        assert_eq!(search_work_upper_bound(usize::MAX, 1), None);
+
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        assert_eq!(
+            plan.verification_bytes_per_position,
+            verification_bytes_per_position,
+        );
+        assert!(
+            plan.try_ordinary_full_window_executor(admitted_len)
+                .is_some(),
+        );
+        assert!(
+            plan.try_ordinary_full_window_executor(declined_len)
+                .is_none(),
+        );
+        assert!(
+            plan.try_ordinary_full_window_executor(usize::MAX)
+                .is_none(),
         );
     }
 

@@ -10451,6 +10451,33 @@ mod k0_ordinary_exists_route_probe {
     }
 }
 
+#[cfg(test)]
+mod packed_literal_set_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -12246,6 +12273,26 @@ impl PortableRegex {
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .is_match_full_ordinary_value(haystack)
                 .map_err(SearchError::from),
+            PortablePlan::PackedLiteralSet(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                if let Some(ordinary) =
+                    literal_set.try_ordinary_full_window_executor(haystack.len())
+                {
+                    #[cfg(test)]
+                    packed_literal_set_ordinary_facade_probe::record_exists();
+                    ordinary
+                        .exists_window_value(haystack, literal_window)
+                        .map_err(SearchError::from)
+                } else {
+                    literal_set
+                        .is_match_window_value(
+                            haystack,
+                            literal_window,
+                            PackedLiteralSetSearchLimits::unlimited(),
+                        )
+                        .map_err(SearchError::from)
+                }
+            }
             PortablePlan::RequiredLiteral(required)
                 if !required.anchors().start && !required.anchors().end =>
             {
@@ -13723,6 +13770,23 @@ impl PortableRegex {
                     })
                     .map_err(SearchError::from),
             },
+            PortablePlan::PackedLiteralSet(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let matched = if let Some(ordinary) =
+                    literal_set.try_ordinary_full_window_executor(haystack.len())
+                {
+                    #[cfg(test)]
+                    packed_literal_set_ordinary_facade_probe::record_span();
+                    ordinary.find_window_value(haystack, literal_window)
+                } else {
+                    literal_set.find_window_value(
+                        haystack,
+                        literal_window,
+                        PackedLiteralSetSearchLimits::unlimited(),
+                    )
+                }?;
+                Ok(matched.map(|(start, end)| Match { start, end }))
+            }
             _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
@@ -42135,6 +42199,233 @@ mod tests {
         assert_eq!(
             wide.runtime_implementation_id(),
             "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1",
+        );
+    }
+
+    #[test]
+    fn packed_literal_set_ordinary_facades_bind_the_sealed_executor_exactly() {
+        let cases: &[(&str, &[&[u8]])] = &[
+            (
+                "alpha|beta|gamma",
+                &[
+                    b"",
+                    b"alpha",
+                    b"zzalpha",
+                    b"zzbetaqq",
+                    b"zzgamma",
+                    b"nope",
+                    b"\xff\0zzbeta",
+                ],
+            ),
+            ("ab|a|ba", &[b"a", b"ab", b"ba", b"zzababa", b"bbb"]),
+        ];
+        for &(pattern, haystacks) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::PackedLiteralSet);
+            assert!(matches!(&regex.plan, PortablePlan::PackedLiteralSet(_)));
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for &haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                super::packed_literal_set_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected.is_some(),
+                    "pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    super::packed_literal_set_ordinary_facade_probe::snapshot(),
+                    (1, 1),
+                );
+            }
+        }
+
+        let regex = PortableBuilder::new("alpha|beta|gamma")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut reused = b"--alpha--".to_vec();
+        let address = reused.as_ptr();
+        super::packed_literal_set_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), Some(Match { start: 2, end: 7 }));
+        reused.copy_from_slice(b"--xxxxx--");
+        assert_eq!(reused.as_ptr(), address);
+        assert!(!regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), None);
+        assert_eq!(
+            super::packed_literal_set_ordinary_facade_probe::snapshot(),
+            (2, 2),
+            "ordinary calls must reread the borrowed source",
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_packed_ordinary_facades_cover_seven_eight_split_and_miss() {
+        let pattern = "qqqqqqqq|zzzzzzzz";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .retained_find_iter(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::PackedLiteralSet);
+        assert!(
+            regex.retained_find_iter_build_accounting().is_some(),
+            "the fixture must retain both packed engines",
+        );
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        let mut start_seven = vec![0xff; 40];
+        start_seven[7..15].copy_from_slice(b"qqqqqqqq");
+        start_seven[24..32].copy_from_slice(b"zzzzzzzz");
+        let mut start_eight = vec![0xff; 40];
+        start_eight[8..16].copy_from_slice(b"qqqqqqqq");
+        start_eight[24..32].copy_from_slice(b"zzzzzzzz");
+        let miss = vec![0xff; 40];
+
+        for haystack in [&start_seven, &start_eight, &miss] {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+            super::packed_literal_set_ordinary_facade_probe::reset();
+            assert_eq!(regex.is_match(haystack), expected.is_some());
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(
+                super::packed_literal_set_ordinary_facade_probe::snapshot(),
+                (1, 1),
+            );
+        }
+    }
+
+    #[test]
+    fn packed_literal_set_ordinary_facade_is_contained_to_convenience_calls() {
+        let packed = PortableBuilder::new("alpha|beta|gamma")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(&packed.plan, PortablePlan::PackedLiteralSet(_)));
+        let haystack = b"--beta--";
+        let full = SearchWindow::full(haystack);
+        let expected = Some(Match { start: 2, end: 6 });
+
+        super::packed_literal_set_ordinary_facade_probe::reset();
+        assert!(packed
+            .is_match_value(haystack, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            packed
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(packed
+            .is_match_accounted(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0);
+        assert_eq!(
+            packed
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+        assert_eq!(
+            packed
+                .find_window_value(haystack, full, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(packed.is_match_value(haystack, refusing).is_err());
+        assert!(packed.find_value(haystack, refusing).is_err());
+        assert!(packed
+            .find_window_value(haystack, SearchWindow::new(2, 1), refusing)
+            .is_err());
+        let mut ordinary = packed.ordinary_session().unwrap();
+        assert!(ordinary.is_match_at(haystack, 0).unwrap());
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::packed_literal_set_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, windowed, and session APIs stay on their incumbent routes",
+        );
+
+        let dfa = PortableBuilder::new("ab|a|ba")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert!(matches!(&dfa.plan, PortablePlan::LiteralSetDfa(_)));
+        let guarded = PortableBuilder::new(r"(?-u:\b(?:a|ab|cat|dog)\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(&guarded.plan, PortablePlan::GuardedLiteralSet(_)));
+        let exact = PortableBuilder::new("alpha")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(&exact.plan, PortablePlan::ExactLiteral(_)));
+        let nullable = PortableBuilder::new("(?:|a)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(
+            !matches!(&nullable.plan, PortablePlan::PackedLiteralSet(_)),
+            "the packed executor's nonempty-literal invariant must exclude nullable languages",
+        );
+        let k0 = PortableBuilder::new("a+z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(matches!(&k0.plan, PortablePlan::K0(_)));
+
+        super::packed_literal_set_ordinary_facade_probe::reset();
+        for (regex, source) in [
+            (&dfa, b"zzababa".as_slice()),
+            (&guarded, b" cat ".as_slice()),
+            (&exact, b"--alpha--".as_slice()),
+            (&nullable, b"".as_slice()),
+            (&k0, b"--aaaz--".as_slice()),
+        ] {
+            assert!(regex.is_match(source));
+            assert!(regex.find(source).is_some());
+        }
+        assert_eq!(
+            super::packed_literal_set_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "DFA, guarded, exact, nullable, and K0 convenience APIs retain their incumbent routes",
         );
     }
 
