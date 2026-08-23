@@ -3431,6 +3431,24 @@ fn linked_span_fill_iteration_is_exact(bulk: &str, iteration: &str) -> bool {
     )
 }
 
+fn expected_native_scalar_adapter(
+    model: shared::Model,
+    shared_ordered_many: bool,
+    required_prepare_capabilities: u64,
+) -> Option<&'static str> {
+    match (shared_ordered_many, model) {
+        (true, shared::Model::Count) => Some("general-aot-shared-ordered-many-native-count-v1"),
+        (true, shared::Model::SpanSum) => {
+            Some("general-aot-shared-ordered-many-native-span-sum-v1")
+        }
+        (true, _) => None,
+        (false, shared::Model::Count | shared::Model::SpanSum) => {
+            Some(model.adapter_for_required_capabilities(required_prepare_capabilities))
+        }
+        (false, _) => None,
+    }
+}
+
 fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<bool, String> {
     let strategy_is_native = matches!(
         linked::AGGREGATE_STRATEGY,
@@ -3478,8 +3496,12 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
         || linked::PROGRAM_SHA256 == [0; 32]
         || linked::OBJECT_SHA256 == [0; 32]
         || linked::PREPARE_OPERATION_FLAGS != model.prepare_operation_flags()
-        || linked::ADAPTER
-            != model.adapter_for_required_capabilities(linked::REQUIRED_PREPARE_CAPABILITIES)
+        || Some(linked::ADAPTER)
+            != expected_native_scalar_adapter(
+                model,
+                linked::SHARED_ORDERED_MANY_AGGREGATE,
+                linked::REQUIRED_PREPARE_CAPABILITIES,
+            )
     {
         return Err(
             "native scalar reducer failed exact symbol and operation authentication".to_owned(),
@@ -4181,6 +4203,43 @@ mod tests {
             max_time: Duration::from_secs(1),
             max_warmup_time: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn native_scalar_adapter_authentication_closes_shared_topology() {
+        for required in [0, PREPARE_CAPABILITY_ORDERED_NFA_V15] {
+            assert_eq!(
+                expected_native_scalar_adapter(shared::Model::Count, true, required),
+                Some("general-aot-shared-ordered-many-native-count-v1"),
+            );
+            assert_eq!(
+                expected_native_scalar_adapter(shared::Model::SpanSum, true, required),
+                Some("general-aot-shared-ordered-many-native-span-sum-v1"),
+            );
+        }
+        assert_eq!(
+            expected_native_scalar_adapter(shared::Model::Count, false, 0),
+            Some(shared::Model::Count.adapter()),
+        );
+        assert_eq!(
+            expected_native_scalar_adapter(
+                shared::Model::SpanSum,
+                false,
+                PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ),
+            Some(
+                shared::Model::SpanSum
+                    .adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
+            ),
+        );
+        assert_eq!(
+            expected_native_scalar_adapter(shared::Model::CountCaptures, true, 0),
+            None,
+        );
+        assert_eq!(
+            expected_native_scalar_adapter(shared::Model::GrepCount, false, 0),
+            None,
+        );
     }
 
     #[test]
