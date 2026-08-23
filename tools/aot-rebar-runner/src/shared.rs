@@ -932,10 +932,12 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
             }
             Err(error) => return Err(format!("general AOT compilation failed: {error}")),
         };
-    // A cap-zero prepared scalar loop may own its outer reduction in generated
-    // text while its local search target still enters semantic runtime edges.
-    // Give that exact closed topology one bounded chance to replace the
-    // transitive target with the object-local prepared Ordered-TNFA. Typed
+    // A prepared scalar compatibility loop may own its outer reduction in
+    // generated text while its local search target or aggregate still enters
+    // semantic runtime edges. This includes the legacy capability-bearing
+    // Ordered-NFA loop as well as the cap-zero recovered loops. Give only those
+    // exact topologies one bounded chance to replace the compatibility surface
+    // with the object-local scalar Ordered-TNFA operation. Typed
     // unsupported/resource decline preserves the incumbent byte-for-byte;
     // construction or authentication failure remains terminal.
     if scalar_incumbent_requires_prepared_ordered_nfa(benchmark.model, &compiled) {
@@ -993,6 +995,7 @@ fn select_prepared_ordered_nfa_v15_or_incumbent(
 ) -> Result<CompiledRegex, String> {
     match disposition {
         PreparedOrderedNfaV15CompileDisposition::Compiled(selected) => {
+            authenticate_same_scalar_semantic_program(&incumbent, &selected)?;
             authenticate_prepared_ordered_nfa_scalar(model, &selected)?;
             Ok(selected)
         }
@@ -1000,17 +1003,45 @@ fn select_prepared_ordered_nfa_v15_or_incumbent(
     }
 }
 
+fn authenticate_same_scalar_semantic_program(
+    incumbent: &CompiledRegex,
+    candidate: &CompiledRegex,
+) -> Result<(), String> {
+    let incumbent = incumbent.receipt();
+    let candidate = candidate.receipt();
+    if candidate.automaton_sha256 != incumbent.automaton_sha256
+        || candidate.program_sha256 != incumbent.program_sha256
+        || candidate.output != incumbent.output
+        || candidate.target != incumbent.target
+        || candidate.mode != incumbent.mode
+        || candidate.line_terminator != incumbent.line_terminator
+        || candidate.source_bytes != incumbent.source_bytes
+        || candidate.thompson_states != incumbent.thompson_states
+        || candidate.thompson_edges != incumbent.thompson_edges
+    {
+        return Err(
+            "explicit prepared Ordered-NFA scalar candidate changed the incumbent semantic program"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn scalar_incumbent_requires_prepared_ordered_nfa(
     model: Model,
     compiled: &CompiledRegex,
 ) -> bool {
-    scalar_incumbent_route_shape(
+    let module = compiled.module();
+    let route_shape = scalar_incumbent_route_shape(
         model,
         compiled.receipt().engine,
-        compiled.module().prepared_bulk_strategy(),
-        compiled.module().prepared_aggregate_strategy(),
-        compiled.module().required_prepare_capabilities(),
-    )
+        module.prepared_bulk_strategy(),
+        module.prepared_aggregate_strategy(),
+        module.required_prepare_capabilities(),
+    );
+    route_shape
+        && (module.required_prepare_capabilities() == 0
+            || legacy_prepared_v15_scalar_incumbent_is_exact(model, compiled))
 }
 
 const fn scalar_incumbent_route_shape(
@@ -1037,10 +1068,100 @@ const fn scalar_incumbent_route_shape(
             Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
         )
     );
+    let legacy_ordered_nfa_loop = matches!(
+        (bulk, aggregate),
+        (
+            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        )
+    );
     matches!(model, Model::Count | Model::SpanSum)
         && matches!(engine, EngineKind::OrderedNfa)
-        && (recovered_runtime_bulk || transitive_prepared_loop)
-        && required_prepare_capabilities == 0
+        && (((recovered_runtime_bulk || transitive_prepared_loop)
+            && required_prepare_capabilities == 0)
+            || (legacy_ordered_nfa_loop
+                && required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15))
+}
+
+fn legacy_prepared_v15_scalar_incumbent_is_exact(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> bool {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let (reducer, other_reducer, runtime_symbols, reducer_prefix) = match model {
+        Model::Count => (
+            module.prepared_count_symbol(),
+            module.prepared_span_sum_symbol(),
+            &PREPARED_V15_COUNT_RUNTIME_SYMBOLS[..],
+            "fre_aot_regex_count_exclusive_v1_",
+        ),
+        Model::SpanSum => (
+            module.prepared_span_sum_symbol(),
+            module.prepared_count_symbol(),
+            &PREPARED_V15_SPAN_SUM_RUNTIME_SYMBOLS[..],
+            "fre_aot_regex_span_sum_exclusive_v1_",
+        ),
+        _ => return false,
+    };
+    let Some(reducer) = reducer else {
+        return false;
+    };
+    let Some(prepared_entry) = module.prepared_entry_symbol() else {
+        return false;
+    };
+    let Some(span_fill) = module.prepared_span_fill_symbol() else {
+        return false;
+    };
+    let Some((program, program_len)) = module.required_runtime_program() else {
+        return false;
+    };
+    receipt.mode == CompileMode::Optimizing
+        && receipt.output == OutputContract::Span
+        && receipt.entry_abi == EntryAbi::SpanSearchV1
+        && receipt.engine == EngineKind::OrderedNfa
+        && receipt.runtime_helper_required
+        && receipt.prepared_aggregate_exports == model.exports()
+        && receipt.prepared_aggregate_strategy
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        && module.prepared_aggregate_exports() == model.exports()
+        && module.prepared_aggregate_strategy()
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        && other_reducer.is_none()
+        && module.prepared_grep_count_symbol().is_none()
+        && module.prepared_exists_batch_symbol().is_none()
+        && program_len != 0
+        && has_exact_runtime_symbol_closure(compiled, runtime_symbols)
+        && has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
+        && has_defined_symbol(compiled, prepared_entry, SymbolKind::Function, None)
+        && has_defined_symbol(compiled, span_fill, SymbolKind::Function, None)
+        && has_defined_symbol(compiled, reducer, SymbolKind::Function, None)
+        && has_defined_symbol(compiled, program, SymbolKind::Object, Some(program_len))
+        && prepared_row_symbol_identities_are_closed(
+            module.entry_symbol(),
+            prepared_entry,
+            span_fill,
+            program,
+        )
+        && native_symbol_identity(reducer, reducer_prefix).is_some_and(|reducer_identity| {
+            native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+                .is_some_and(|program_identity| reducer_identity != program_identity)
+        })
+        && [
+            module.entry_symbol(),
+            prepared_entry,
+            span_fill,
+            reducer,
+            program,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+            == 5
+        && !compiled.object().is_empty()
 }
 
 fn authenticate_prepared_ordered_nfa_scalar(
@@ -1126,6 +1247,18 @@ const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_v1",
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+];
+const PREPARED_V15_COUNT_RUNTIME_SYMBOLS: [&str; 4] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+];
+const PREPARED_V15_SPAN_SUM_RUNTIME_SYMBOLS: [&str; 4] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+    "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
 ];
 const FROZEN_LOOP_RUNTIME_SYMBOL: &str = "fre_aot_regex_runtime_scan_frozen_loop_v2";
 
@@ -3742,6 +3875,98 @@ mod tests {
     }
 
     #[test]
+    fn scalar_v15_selector_rejects_a_valid_mismatched_semantic_program() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = true;
+        let incumbent = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(r"\b\w+\b", target)
+                .profile(profile.clone())
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::COUNT,
+            SlowAotLimits::default(),
+        )
+        .expect("ordinary incumbent");
+        let mismatched = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+            CompileRequest::new(r"\b\d+\b", target)
+                .profile(profile.clone())
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("explicit scalar V15 compilation")
+        .into_compiled()
+        .expect("mismatched fixture selects scalar V15");
+        authenticate_prepared_ordered_nfa_scalar(Model::Count, &mismatched)
+            .expect("mismatched candidate is independently valid");
+
+        let error = match select_prepared_ordered_nfa_v15_or_incumbent(
+            Model::Count,
+            incumbent.clone(),
+            PreparedOrderedNfaV15CompileDisposition::Compiled(mismatched),
+        ) {
+            Ok(_) => panic!("mismatched scalar V15 candidate was selected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "explicit prepared Ordered-NFA scalar candidate changed the incumbent semantic program",
+        );
+
+        let alternate_feature_bits = match std::env::consts::ARCH {
+            "x86_64" => 1_u64,
+            "aarch64" => 1_u64 << 32,
+            other => panic!("unsupported test architecture {other:?}"),
+        };
+        let alternate_target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            alternate_feature_bits,
+        )
+        .expect("feature-bearing host target");
+        let target_mismatched =
+            compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+                CompileRequest::new(r"\b\w+\b", alternate_target)
+                    .profile(profile)
+                    .output(OutputContract::Span)
+                    .mode(CompileMode::Optimizing),
+                PreparedAggregateExports::COUNT,
+            )
+            .expect("feature-bearing scalar V15 compilation")
+            .into_compiled()
+            .expect("feature-bearing fixture selects scalar V15");
+        authenticate_prepared_ordered_nfa_scalar(Model::Count, &target_mismatched)
+            .expect("target-mismatched candidate is independently valid");
+        assert_eq!(
+            target_mismatched.receipt().automaton_sha256,
+            incumbent.receipt().automaton_sha256,
+        );
+        assert_eq!(
+            target_mismatched.receipt().program_sha256,
+            incumbent.receipt().program_sha256,
+        );
+        assert_ne!(target_mismatched.receipt().target, incumbent.receipt().target);
+        let error = match select_prepared_ordered_nfa_v15_or_incumbent(
+            Model::Count,
+            incumbent,
+            PreparedOrderedNfaV15CompileDisposition::Compiled(target_mismatched),
+        ) {
+            Ok(_) => panic!("target-mismatched scalar V15 candidate was selected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "explicit prepared Ordered-NFA scalar candidate changed the incumbent semantic program",
+        );
+    }
+
+    #[test]
     fn safe_v15_grep_declines_return_the_incumbent_byte_for_byte() {
         use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
 
@@ -4144,13 +4369,37 @@ mod tests {
             Some(PreparedAggregateStrategy::RuntimeHelper),
             0,
         ));
-        assert!(!scalar_incumbent_route_shape(
-            Model::Count,
-            EngineKind::OrderedNfa,
-            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
-            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
-            PREPARED_CAPABILITY_ORDERED_NFA_V15,
-        ));
+        for model in [Model::Count, Model::SpanSum] {
+            assert!(scalar_incumbent_route_shape(
+                model,
+                EngineKind::OrderedNfa,
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            ));
+            for capabilities in [
+                0,
+                1_u64 << 63,
+                PREPARED_CAPABILITY_ORDERED_NFA_V15 | (1_u64 << 63),
+            ] {
+                assert!(!scalar_incumbent_route_shape(
+                    model,
+                    EngineKind::OrderedNfa,
+                    Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+                    Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+                    capabilities,
+                ));
+            }
+        }
+        for model in [Model::GrepCount, Model::CountCaptures] {
+            assert!(!scalar_incumbent_route_shape(
+                model,
+                EngineKind::OrderedNfa,
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            ));
+        }
 
         let selected = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
             CompileRequest::new(benchmark.pattern(), target)
@@ -4178,6 +4427,108 @@ mod tests {
             selected.module().prepared_count_symbol(),
             Some(selected.module().entry_symbol()),
         );
+    }
+
+    #[test]
+    fn unicode_word_scalars_replace_legacy_v15_with_closed_operations() {
+        use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
+
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model_name in ["count", "count-spans"] {
+            let mut benchmark =
+                Benchmark::parse(&fixture(model_name, br"\b\w+\b", b"word"))
+                    .expect("Unicode word scalar fixture");
+            benchmark.unicode = true;
+            let mut profile = RustProfile::rebar_1_12_4();
+            profile.options.unicode = benchmark.unicode;
+            profile.options.case_insensitive = benchmark.case_insensitive;
+            let incumbent = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(benchmark.pattern(), target)
+                    .profile(profile)
+                    .output(benchmark.model.output())
+                    .mode(CompileMode::Optimizing)
+                    .limits(CompileLimitsV1::default()),
+                benchmark.model.exports(),
+                SlowAotLimits::default(),
+            )
+            .expect("legacy prepared Ordered-NFA incumbent");
+            assert_eq!(incumbent.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(incumbent.receipt().entry_abi, EntryAbi::SpanSearchV1);
+            assert_eq!(
+                incumbent.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+            );
+            assert_eq!(
+                incumbent.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+            );
+            assert_eq!(
+                incumbent.module().required_prepare_capabilities(),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            );
+            assert!(incumbent.receipt().runtime_helper_required);
+            assert!(scalar_incumbent_requires_prepared_ordered_nfa(
+                benchmark.model,
+                &incumbent,
+            ));
+            assert!(
+                authenticate_native_whole_scalar_reducer(benchmark.model, &incumbent).is_err(),
+                "the helper-backed compatibility surface must remain non-native",
+            );
+
+            for decline in [
+                PreparedOrderedNfaV15CompileDecline::Unsupported,
+                PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                    limit: 7,
+                    required: 8,
+                },
+                PreparedOrderedNfaV15CompileDecline::ObjectBytes {
+                    limit: 11,
+                    required: 12,
+                },
+            ] {
+                let preserved = select_prepared_ordered_nfa_v15_or_incumbent(
+                    benchmark.model,
+                    incumbent.clone(),
+                    PreparedOrderedNfaV15CompileDisposition::Declined(decline),
+                )
+                .expect("typed decline preserves the legacy incumbent");
+                assert_eq!(preserved.object(), incumbent.object());
+                assert_eq!(preserved.receipt(), incumbent.receipt());
+                assert!(
+                    authenticate_native_whole_scalar_reducer(benchmark.model, &preserved)
+                        .is_err(),
+                    "a typed decline must not authenticate the legacy helper surface",
+                );
+            }
+
+            let selected = compile_benchmark(&benchmark, target)
+                .expect("closed Unicode word scalar operation");
+            authenticate_same_scalar_semantic_program(&incumbent, &selected)
+                .expect("replacement preserves its incumbent semantic identity");
+            authenticate_prepared_ordered_nfa_scalar(benchmark.model, &selected)
+                .expect("authenticated closed scalar V15 route");
+            assert!(
+                authenticate_native_whole_scalar_reducer(benchmark.model, &selected)
+                    .expect("whole scalar route authentication"),
+            );
+            assert_eq!(selected.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(selected.module().prepared_bulk_strategy(), None);
+            assert_eq!(selected.module().prepared_entry_symbol(), None);
+            assert_eq!(selected.module().prepared_span_fill_symbol(), None);
+            assert!(selected.module().required_runtime_symbols().next().is_none());
+            let reducer = match benchmark.model {
+                Model::Count => selected.module().prepared_count_symbol(),
+                Model::SpanSum => selected.module().prepared_span_sum_symbol(),
+                _ => unreachable!("scalar fixture"),
+            };
+            assert_eq!(reducer, Some(selected.module().entry_symbol()));
+        }
     }
 
     #[test]
