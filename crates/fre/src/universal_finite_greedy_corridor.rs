@@ -62,6 +62,33 @@ const SEARCH_BASE_WORK: u64 = 8;
 const SEARCH_CALL_WORK: u64 = 8;
 const NATIVE_SUFFIX_BYTES: usize = 1;
 
+#[cfg(test)]
+pub(crate) mod value_path_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 /// Stable identity for the early source-proved native owner.
 pub(crate) const PLAN_ID: &str = "required-literal.universal-finite-greedy-corridor.v1";
 pub(crate) const DELIMITED_SEGMENT_PLAN_ID: &str =
@@ -804,8 +831,11 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        self.is_match_window(haystack, window, limits)
-            .map(|(matched, _)| matched)
+        #[cfg(test)]
+        value_path_probe::record_exists();
+        self.preflight(haystack.len(), window, 1, limits)?;
+        self.first_suffix_value(haystack, window)
+            .map(|matched| matched.is_some())
     }
 
     pub(crate) fn shortest_window(
@@ -872,8 +902,63 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        self.find_window(haystack, window, limits)
-            .map(|(matched, _)| matched)
+        #[cfg(test)]
+        value_path_probe::record_span();
+        self.preflight(haystack.len(), window, 2, limits)?;
+        let Some((first_suffix_start, first_suffix_end)) =
+            self.first_suffix_value(haystack, window)?
+        else {
+            return Ok(None);
+        };
+
+        let selected_start = first_suffix_start
+            .saturating_sub(self.descriptor.maximum_prefix_bytes)
+            .max(window.start());
+        let corridor_end = selected_start
+            .saturating_add(self.descriptor.maximum_match_bytes)
+            .min(window.end());
+        let last_suffix = self
+            .suffix
+            .rfind_window_value(
+                haystack,
+                LiteralWindow::new(first_suffix_start, corridor_end),
+                LiteralSearchLimits::unlimited(),
+            )
+            .map_err(map_literal_search_error)?;
+        let Some((_, selected_end)) = last_suffix else {
+            return Err(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse finder lost its authenticated suffix",
+            });
+        };
+        if selected_end < first_suffix_end {
+            return Err(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse finder moved before its first suffix",
+            });
+        }
+        Ok(Some((selected_start, selected_end)))
+    }
+
+    fn first_suffix_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let Some(suffix_window_start) = window
+            .start()
+            .checked_add(self.descriptor.minimum_prefix_bytes)
+        else {
+            return Ok(None);
+        };
+        if suffix_window_start > window.end() {
+            return Ok(None);
+        }
+        self.suffix
+            .find_window_value(
+                haystack,
+                LiteralWindow::new(suffix_window_start, window.end()),
+                LiteralSearchLimits::unlimited(),
+            )
+            .map_err(map_literal_search_error)
     }
 
     fn first_suffix(
@@ -2022,6 +2107,16 @@ mod tests {
                                 "span pattern={pattern:?} haystack={haystack:?} window={start}..{end}",
                             );
                             assert_eq!(
+                                plan.find_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected,
+                                "value span pattern={pattern:?} haystack={haystack:?} window={start}..{end}",
+                            );
+                            assert_eq!(
                                 plan.shortest_window(
                                     &haystack,
                                     window,
@@ -2043,6 +2138,16 @@ mod tests {
                                 expected.is_some(),
                                 "exists pattern={pattern:?} haystack={haystack:?} window={start}..{end}",
                             );
+                            assert_eq!(
+                                plan.is_match_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected.is_some(),
+                                "value exists pattern={pattern:?} haystack={haystack:?} window={start}..{end}",
+                            );
                         }
                     }
                 }
@@ -2062,18 +2167,77 @@ mod tests {
         assert_eq!(accounting.finder_calls, 2);
         assert_eq!(accounting.candidate_visits, 2);
 
+        let (exists, exists_accounting) = plan
+            .is_match_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert!(exists);
+        assert_eq!(exists_accounting.finder_calls_upper_bound, 1);
+        let exact_exists = SearchLimits {
+            max_work_upper_bound: exists_accounting.work_upper_bound,
+            max_candidate_visits: exists_accounting.candidate_visits_upper_bound,
+            max_scratch_bytes: 0,
+        };
+        assert!(
+            plan.is_match_window_value(haystack, window, exact_exists)
+                .unwrap(),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work_upper_bound: exists_accounting.work_upper_bound - 1,
+                    ..exact_exists
+                },
+            ),
+            Err(SearchError::WorkLimit {
+                needed: exists_accounting.work_upper_bound,
+                limit: exists_accounting.work_upper_bound - 1,
+            }),
+        );
+        assert_eq!(
+            plan.is_match_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_candidate_visits: 0,
+                    ..SearchLimits::unlimited()
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: 1,
+                limit: 0,
+            }),
+        );
+
         let exact = SearchLimits {
             max_work_upper_bound: accounting.work_upper_bound,
             max_candidate_visits: accounting.candidate_visits_upper_bound,
             max_scratch_bytes: 0,
         };
         assert_eq!(plan.find_window(haystack, window, exact).unwrap().0, matched);
+        assert_eq!(
+            plan.find_window_value(haystack, window, exact).unwrap(),
+            matched,
+        );
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            matched.is_some(),
+        );
         let one_below = SearchLimits {
             max_work_upper_bound: accounting.work_upper_bound - 1,
             ..exact
         };
         assert_eq!(
             plan.find_window(haystack, window, one_below),
+            Err(SearchError::WorkLimit {
+                needed: accounting.work_upper_bound,
+                limit: accounting.work_upper_bound - 1,
+            }),
+        );
+        assert_eq!(
+            plan.find_window_value(haystack, window, one_below),
             Err(SearchError::WorkLimit {
                 needed: accounting.work_upper_bound,
                 limit: accounting.work_upper_bound - 1,
@@ -2093,8 +2257,38 @@ mod tests {
                 limit: 1,
             }),
         );
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_candidate_visits: 1,
+                    ..SearchLimits::unlimited()
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: 2,
+                limit: 1,
+            }),
+        );
         assert!(matches!(
             plan.find_window(
+                haystack,
+                SearchWindow::new(0, haystack.len() + 1),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.find_window_value(
+                haystack,
+                SearchWindow::new(0, haystack.len() + 1),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.is_match_window_value(
                 haystack,
                 SearchWindow::new(0, haystack.len() + 1),
                 SearchLimits::unlimited(),

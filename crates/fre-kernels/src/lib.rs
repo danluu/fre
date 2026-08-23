@@ -1370,6 +1370,29 @@ impl LiteralPlan {
         Ok((matched, accounting))
     }
 
+    /// Find the first occurrence wholly inside a range without projecting
+    /// diagnostic accounting.
+    ///
+    /// Window and linear-work validation remain identical to
+    /// [`Self::find_window`] and complete before the finder may inspect the
+    /// haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked window, resource, or arithmetic failure as
+    /// [`Self::find_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSearchLimits,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        self.preflight_window(haystack.len(), window, limits)?;
+        self.find_after_preflight(haystack, window)
+    }
+
     /// Find the last occurrence wholly inside a range.
     ///
     /// Overlapping occurrences participate independently. In particular, a
@@ -1390,6 +1413,29 @@ impl LiteralPlan {
         let accounting = self.preflight_window(haystack.len(), window, limits)?;
         let matched = self.rfind_after_preflight(haystack, window)?;
         Ok((matched, accounting))
+    }
+
+    /// Find the last occurrence wholly inside a range without projecting
+    /// diagnostic accounting.
+    ///
+    /// This is the value-only counterpart to [`Self::rfind_window`]. It keeps
+    /// the same overlapping-match semantics and performs the same complete
+    /// preflight before source access.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked window, resource, or arithmetic failure as
+    /// [`Self::rfind_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn rfind_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSearchLimits,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        self.preflight_window(haystack.len(), window, limits)?;
+        self.rfind_after_preflight(haystack, window)
     }
 
     fn find_after_preflight(
@@ -1637,6 +1683,37 @@ mod tests {
         assert_eq!(plan.find_full_value(haystack, exact), Ok(Some((2, 8))));
         assert_eq!(exact_literal_search_probe::calls(), 1);
 
+        let window = Window::new(1, haystack.len().saturating_sub(1));
+        let window_needed = window
+            .end()
+            .checked_sub(window.start())
+            .and_then(|bytes| bytes.checked_add(plan.needle().len()))
+            .unwrap();
+        let window_exact = LiteralSearchLimits {
+            max_linear_terms: window_needed,
+        };
+        exact_literal_search_probe::reset();
+        assert_eq!(
+            plan.find_window_value(haystack, window, window_exact),
+            Ok(Some((2, 8))),
+        );
+        assert_eq!(exact_literal_search_probe::calls(), 1);
+        exact_literal_search_probe::reset();
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                window,
+                LiteralSearchLimits {
+                    max_linear_terms: window_needed - 1,
+                },
+            ),
+            Err(LiteralError::LinearTermLimit {
+                needed: window_needed,
+                limit: window_needed - 1,
+            }),
+        );
+        assert_eq!(exact_literal_search_probe::calls(), 0);
+
         let empty = LiteralPlan::new(b"", LiteralBuildLimits::default()).unwrap();
         exact_literal_search_probe::reset();
         assert_eq!(
@@ -1678,6 +1755,15 @@ mod tests {
             .0,
             Some((2, 4))
         );
+        assert_eq!(
+            plan.rfind_window_value(
+                haystack,
+                Window::new(1, 5),
+                LiteralSearchLimits::unlimited(),
+            )
+            .unwrap(),
+            Some((3, 5)),
+        );
 
         let empty = LiteralPlan::new(b"", LiteralBuildLimits::default()).unwrap();
         assert_eq!(
@@ -1690,6 +1776,14 @@ mod tests {
                 .unwrap()
                 .0,
             Some((5, 5))
+        );
+        assert_eq!(
+            empty.rfind_window_value(
+                haystack,
+                Window::new(1, 5),
+                LiteralSearchLimits::unlimited(),
+            ),
+            Ok(Some((5, 5))),
         );
     }
 
@@ -1711,6 +1805,10 @@ mod tests {
             plan.rfind_window(haystack, window, exact),
             Ok((Some((3, 5)), expected))
         );
+        assert_eq!(
+            plan.rfind_window_value(haystack, window, exact),
+            Ok(Some((3, 5))),
+        );
 
         let one_below = LiteralSearchLimits {
             max_linear_terms: expected
@@ -1725,7 +1823,25 @@ mod tests {
                     && limit == one_below.max_linear_terms
         ));
         assert!(matches!(
+            plan.rfind_window_value(haystack, window, one_below),
+            Err(LiteralError::LinearTermLimit { needed, limit })
+                if needed == expected.linear_terms
+                    && limit == one_below.max_linear_terms
+        ));
+        assert!(matches!(
             plan.rfind_window(
+                haystack,
+                Window::new(5, 4),
+                LiteralSearchLimits::unlimited(),
+            ),
+            Err(LiteralError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 6,
+            })
+        ));
+        assert!(matches!(
+            plan.rfind_window_value(
                 haystack,
                 Window::new(5, 4),
                 LiteralSearchLimits::unlimited(),
