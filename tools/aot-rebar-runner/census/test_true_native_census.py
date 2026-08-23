@@ -3782,6 +3782,145 @@ class TrueNativeCensusTests(unittest.TestCase):
             "claimed-entry-negative-control-failure",
         )
 
+    def test_single_capture_reducer_accepts_only_trapped_unused_linker_helpers(
+        self,
+    ) -> None:
+        plan = synthetic_plan()
+        receipt = synthetic_single_capture_reducer_qualification_receipt(plan)
+        receipt.pop("receipt_sha256")
+        helper_symbols = [
+            "fre_aot_regex_runtime_capture_materialize_v1",
+            "fre_aot_regex_runtime_search_v1",
+        ]
+        receipt["route"]["semantic_helper_symbols"] = helper_symbols
+        receipt["route"]["semantic_helper_symbols_sha256"] = CENSUS.sha_bytes(
+            CENSUS.canonical(helper_symbols).encode()
+        )
+        helper = receipt["phases"]["semantic_helper_trap"]
+        helper["process"].update({"outcome": "exit", "returncode": 0})
+        helper["marker"] = {
+            "status": "valid",
+            "sha256": "f" * 64,
+            "kind": "semantic-helpers",
+            "architecture": "aarch64",
+            "installed": 2,
+            "expected": 2,
+            "armed": [
+                {
+                    "symbol": helper_symbols[0],
+                    "offset": "0x200",
+                    "before": "fd7bbfa9",
+                    "after": "000020d4",
+                },
+                {
+                    "symbol": helper_symbols[1],
+                    "offset": "0x204",
+                    "before": "a57bbfa9",
+                    "after": "000020d4",
+                },
+            ],
+            "triggered": None,
+            "completed": "normal",
+        }
+        receipt["classification"] = CENSUS.classification_from_qualification_evidence(
+            True,
+            receipt["route"]["operation_entry_symbols"],
+            receipt["route"]["adapter_route"],
+            helper_symbols,
+            receipt["phases"],
+            "aarch64",
+        )
+        receipt = CENSUS.add_digest(receipt, "receipt_sha256")
+        validated = CENSUS.validate_receipt(receipt, plan)
+        self.assertTrue(
+            validated["classification"]["whole_operation_native_authenticated"]
+        )
+        self.assertFalse(validated["classification"]["adapter_outer_loop"])
+        self.assertEqual(
+            validated["classification"]["reason"],
+            "whole-operation-native-authenticated",
+        )
+
+        triggered = copy.deepcopy(receipt)
+        triggered.pop("receipt_sha256")
+        helper = triggered["phases"]["semantic_helper_trap"]
+        helper["process"]["returncode"] = CENSUS.TRAP_EXIT
+        helper["marker"]["triggered"] = helper_symbols[0]
+        helper["marker"]["completed"] = None
+        triggered["classification"] = (
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                triggered["route"]["operation_entry_symbols"],
+                triggered["route"]["adapter_route"],
+                helper_symbols,
+                triggered["phases"],
+                "aarch64",
+            )
+        )
+        triggered = CENSUS.add_digest(triggered, "receipt_sha256")
+        validated_triggered = CENSUS.validate_receipt(triggered, plan)
+        self.assertFalse(
+            validated_triggered["classification"][
+                "whole_operation_native_authenticated"
+            ]
+        )
+        self.assertEqual(
+            validated_triggered["classification"]["reason"],
+            "semantic-runtime-helper-invoked",
+        )
+
+        reordered = copy.deepcopy(receipt)
+        reordered.pop("receipt_sha256")
+        reordered["phases"]["semantic_helper_trap"]["marker"]["armed"].reverse()
+        reordered["classification"] = (
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                reordered["route"]["operation_entry_symbols"],
+                reordered["route"]["adapter_route"],
+                helper_symbols,
+                reordered["phases"],
+                "aarch64",
+            )
+        )
+        reordered = CENSUS.add_digest(reordered, "receipt_sha256")
+        validated_reordered = CENSUS.validate_receipt(reordered, plan)
+        self.assertFalse(
+            validated_reordered["classification"][
+                "whole_operation_native_authenticated"
+            ]
+        )
+        self.assertEqual(
+            validated_reordered["classification"]["reason"],
+            "helper-trap-control-failure",
+        )
+
+        incomplete = copy.deepcopy(receipt)
+        incomplete.pop("receipt_sha256")
+        helper = incomplete["phases"]["semantic_helper_trap"]
+        helper["marker"]["installed"] = 0
+        helper["marker"]["armed"] = []
+        incomplete["classification"] = (
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                incomplete["route"]["operation_entry_symbols"],
+                incomplete["route"]["adapter_route"],
+                helper_symbols,
+                incomplete["phases"],
+                "aarch64",
+            )
+        )
+        incomplete = CENSUS.add_digest(incomplete, "receipt_sha256")
+        validated_incomplete = CENSUS.validate_receipt(incomplete, plan)
+        self.assertFalse(
+            validated_incomplete["classification"][
+                "whole_operation_native_authenticated"
+            ]
+        )
+        self.assertEqual(
+            validated_incomplete["classification"]["reason"],
+            "helper-trap-control-failure",
+        )
+
     def test_participation_capture_v4_closes_both_native_operation_entries(self) -> None:
         fields = participation_capture_provenance_fields()
         encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
@@ -4207,10 +4346,82 @@ class TrueNativeCensusTests(unittest.TestCase):
             ).encode()
         )
         retained_helper = CENSUS.add_digest(retained_helper, "receipt_sha256")
-        with self.assertRaisesRegex(
-            CENSUS.CensusError, "retains semantic runtime symbols"
-        ):
+        with self.assertRaisesRegex(CENSUS.CensusError, "classification differs"):
             CENSUS.validate_receipt(retained_helper, plan)
+
+    def test_capture_adapter_routes_accept_only_authenticated_linker_helpers(
+        self,
+    ) -> None:
+        plan = synthetic_plan()
+        cases = (
+            (
+                "strict",
+                synthetic_strict_capture_qualification_receipt,
+                "native-search-capture-core-with-checked-rust-adapter-loop",
+            ),
+            (
+                "participation",
+                synthetic_participation_capture_qualification_receipt,
+                "native-search-capture-core-with-exact-span-replay-adapter-loop",
+            ),
+        )
+        helper_symbol = "fre_aot_regex_runtime_search_v1"
+        for label, factory, success_reason in cases:
+            with self.subTest(route=label):
+                receipt = factory(plan)
+                receipt.pop("receipt_sha256")
+                receipt["route"]["semantic_helper_symbols"] = [helper_symbol]
+                receipt["route"]["semantic_helper_symbols_sha256"] = (
+                    CENSUS.sha_bytes(CENSUS.canonical([helper_symbol]).encode())
+                )
+                helper = receipt["phases"]["semantic_helper_trap"]
+                helper["process"].update({"outcome": "exit", "returncode": 0})
+                helper["marker"] = {
+                    "status": "valid",
+                    "sha256": "f" * 64,
+                    "kind": "semantic-helpers",
+                    "architecture": "aarch64",
+                    "installed": 1,
+                    "expected": 1,
+                    "armed": [{
+                        "symbol": helper_symbol,
+                        "offset": "0x200",
+                        "before": "fd7bbfa9",
+                        "after": "000020d4",
+                    }],
+                    "triggered": None,
+                    "completed": "normal",
+                }
+                receipt["classification"] = (
+                    CENSUS.classification_from_qualification_evidence(
+                        True,
+                        receipt["route"]["operation_entry_symbols"],
+                        receipt["route"]["adapter_route"],
+                        [helper_symbol],
+                        receipt["phases"],
+                        "aarch64",
+                    )
+                )
+                receipt = CENSUS.add_digest(receipt, "receipt_sha256")
+                validated = CENSUS.validate_receipt(receipt, plan)
+                self.assertEqual(
+                    validated["artifacts"]["provenance"][
+                        "required_runtime_symbols"
+                    ],
+                    [],
+                )
+                self.assertTrue(
+                    validated["classification"]["native_search_core_authenticated"]
+                )
+                self.assertTrue(validated["classification"]["adapter_outer_loop"])
+                self.assertFalse(
+                    validated["classification"][
+                        "whole_operation_native_authenticated"
+                    ]
+                )
+                self.assertEqual(
+                    validated["classification"]["reason"], success_reason
+                )
 
     def test_uniform_capture_build_decline_is_recorded_not_dropped(self) -> None:
         plan = synthetic_plan()

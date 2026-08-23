@@ -5605,11 +5605,6 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     runtime_helpers = semantic_helper_symbols(primary_runtime_references)
     if runtime_helpers != semantic_helper_symbols(replica_runtime_references):
         raise CensusError("independent binaries have different semantic helper inventories")
-    if normalized_provenance["kind"] in {
-        "strict-capture-v4", "participation-capture-v4",
-        "single-capture-reducer-v5",
-    } and runtime_helpers:
-        raise CensusError("native-capture final binary retains semantic runtime symbols")
     conditional_fallbacks = conditional_fallback_symbols_from_provenance(
         normalized_provenance
     )
@@ -8051,11 +8046,6 @@ def validate_receipt(
             or declared != expected_declared
         ):
             raise CensusError("qualification route differs from normalized provenance")
-        if provenance["kind"] in {
-            "strict-capture-v4", "participation-capture-v4",
-            "single-capture-reducer-v5",
-        } and helpers:
-            raise CensusError("native-capture final binary retains semantic runtime symbols")
         conditional_fallbacks = conditional_fallback_symbols_from_provenance(
             provenance
         )

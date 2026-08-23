@@ -336,18 +336,18 @@ missing raw v3 fields are rejected rather than silently discarded.
 Native-capture v4 publishes exactly one source, artifact, and component. The
 exact-span variant closes its selector, capture program, DFA geometry, bundle,
 object, architecture-specific strategy, and three distinct selector/bundle/
-replay symbols; its semantic-runtime-call count and final-binary helper
-inventory must both be empty. Strict-capture v4's
+replay symbols; its semantic-runtime-call count must be zero. Any independently
+inventoried linker-retained helper must be armed and remain untriggered.
+Strict-capture v4's
 sole component entry is an identity-suffixed native `capture_next`, its declared
 runtime-symbol list is empty, and its object/program identities agree with the
 component receipt. The closed record also seals group count and nullability,
 source/selector/capture/plan/bundle/artifact digests, and the distinct native
 materializer and ordinary selector symbols. Prepared V15 adds only the closed
 typed proof objects described above; `strict_capture` exists only on normalized
-v4. The
-independent final-binary inventory must also contain zero semantic runtime
-symbols for this strict route; an unused-but-linked helper is a failed strict
-qualification rather than a trap-only allowance.
+v4. Its provenance-declared helper list must remain empty. Linker-retained
+final-binary helpers are accepted only through the same complete arm-and-
+untriggered dynamic proof; reaching one fails strict qualification.
 
 Single-capture reducer v5 instead publishes no component list, runtime program,
 prepared handle, or native-row bridge. Its closed proof binds the operation and
@@ -430,8 +430,9 @@ Three fresh processes authenticate each job:
    Neither inflates the stricter wholly fused-operation numerator.
    Single-capture reducer v5 traps exactly its final Count/Grep reducer. Its
    child source symbols are inventoried but never substituted for that negative
-   control. With reproducible final-object identity, an oracle pass, an empty
-   helper surface, and that reducer trap, the exact
+   control. With reproducible final-object identity, an oracle pass, a helper
+   surface that is either empty or fully armed and untriggered, and that
+   reducer trap, the exact
    `linked-native-single-capture-reducer` policy enters the strict
    whole-operation numerator.
 
