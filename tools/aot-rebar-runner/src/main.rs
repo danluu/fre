@@ -1612,6 +1612,10 @@ fn print_provenance() {
         } else {
             "single-call-native-uniform-capture-helper-backed-reducer"
         }
+    } else if linked::SHARED_ORDERED_MANY_AGGREGATE
+        && linked::AGGREGATE_STRATEGY == "Some(NativeFused)"
+    {
+        "single-call-shared-ordered-many-helper-free-native-reducer"
     } else if linked::SHARED_ORDERED_MANY_AGGREGATE {
         "single-call-shared-ordered-many-helper-backed-reducer"
     } else {
@@ -2144,7 +2148,7 @@ fn authenticate_linked_shared_ordered_many(
 ) -> Result<(), String> {
     const COUNT_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
     const SPAN_SUM_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
-    let (adapter, reducer_prefix, runtime_symbols, span_iteration) = match benchmark.model {
+    let (adapter, reducer_prefix, v15_runtime_symbols, span_iteration) = match benchmark.model {
         shared::Model::Count => (
             "general-aot-shared-ordered-many-native-count-v1",
             "fre_aot_regex_count_exclusive_v1_",
@@ -2176,6 +2180,32 @@ fn authenticate_linked_shared_ordered_many(
         "fre_aot_regex_runtime_program_v1_",
     );
     let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix);
+    let native_fused_bulk_shape = match linked::PREPARED_BULK_STRATEGY {
+        "None" => !linked::HAS_SPAN_FILL && linked::SPAN_FILL_SYMBOL.is_empty(),
+        "Some(NativePreparedLoop)" | "Some(NativeFrozenLoop)" => {
+            linked::HAS_SPAN_FILL
+                && entry_identity.is_some()
+                && entry_identity == prepared_identity
+                && entry_identity == program_identity
+        }
+        _ => false,
+    };
+    let helper_free_native_fused = linked::AGGREGATE_STRATEGY == "Some(NativeFused)"
+        && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V2_VERSION
+        && linked::REQUIRED_PREPARE_CAPABILITIES == 0
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        && native_fused_bulk_shape;
+    let prepared_v15 = linked::ENGINE == "OrderedNfa"
+        && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
+        && linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)"
+        && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
+        && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
+        && linked::HAS_SPAN_FILL
+        && linked::REQUIRED_RUNTIME_SYMBOLS == v15_runtime_symbols
+        && entry_identity.is_some()
+        && entry_identity == prepared_identity
+        && entry_identity == program_identity
+        && entry_identity != reducer_identity;
     if sources < 2
         || sources > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         || linked::NATIVE_ROW_BRIDGE
@@ -2195,21 +2225,13 @@ fn authenticate_linked_shared_ordered_many(
         || linked::PROGRAM_SHA256 == [0; 32]
         || linked::OBJECT_SHA256 == [0; 32]
         || linked::ADAPTER != adapter
-        || linked::ENGINE != "OrderedNfa"
-        || linked::AGGREGATE_STRATEGY != "Some(NativeOrderedNfaFused)"
-        || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
-        || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION
         || linked::PREPARE_OPERATION_FLAGS != benchmark.model.prepare_operation_flags()
-        || linked::REQUIRED_PREPARE_CAPABILITIES != PREPARE_CAPABILITY_ORDERED_NFA_V15
-        || !linked::HAS_SPAN_FILL
         || linked::SPAN_ITERATION_STRATEGY != span_iteration
         || linked::GREP_ITERATION_STRATEGY != "not-applicable"
-        || linked::REQUIRED_RUNTIME_SYMBOLS != runtime_symbols
         || reducer_identity.is_none()
         || entry_identity.is_none()
-        || entry_identity != prepared_identity
-        || entry_identity != program_identity
-        || entry_identity == reducer_identity
+        || program_identity.is_none()
+        || (!helper_free_native_fused && !prepared_v15)
         || linked::ROW_REQUIRED_PREPARE_CAPABILITIES != [0]
         || linked::ROW_PREPARE_CONFIG_VERSIONS != [0]
         || linked::ROW_PREPARE_OPERATION_FLAGS != [0]

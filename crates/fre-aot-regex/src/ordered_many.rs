@@ -26,9 +26,10 @@ use regex_syntax::hir::Hir;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, CompileLimitsV1, CompileMode, CompiledRegex, DeterminizeLimits, MatchResult,
-    OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, ProgramWorkspace,
-    SearchWindow, SlowAotLimits, Target, program::CompiledProgram,
+    CompileError, CompileLimitsV1, CompileMode, CompileResource, CompiledRegex, DeterminizeLimits,
+    MatchResult, ObjectError, OutputContract, PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, ProgramWorkspace, SearchWindow, SectionKind, SlowAotLimits,
+    SymbolBinding, SymbolKind, Target, program::CompiledProgram,
     rust_profile_compiled_size_limit, set_rust_profile_compiled_size_limit,
 };
 
@@ -1134,7 +1135,9 @@ pub const ORDERED_MANY_AOT_RECEIPT_VERSION: u32 = 1;
 /// Unlike [`OrderedManyCompileLimits`], this route never builds independent
 /// scalar row programs. Every row is parsed independently and the resulting
 /// HIRs are composed as one ordered alternation before one semantic automaton
-/// is lowered and one whole-operation aggregate is emitted.
+/// is lowered. That exact program first compares the ordinary optimizer's
+/// whole-operation aggregate; an explicit prepared Ordered-NFA aggregate is
+/// attempted only when the ordinary incumbent is not helper-free native code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderedManyAotCompileLimits {
     /// Maximum source rows in the shared automaton.
@@ -1378,7 +1381,9 @@ impl std::error::Error for OrderedManyAotCompileError {
 /// Capture annotations are erased only after every row has parsed under the
 /// requested capture-free whole-match contract. Empty-match progress is the
 /// pinned Rust `build_many` byte-progress rule inherited by the combined
-/// semantic program and native reducer.
+/// semantic program and native reducer. A helper-free ordinary `NativeFused`
+/// aggregate is the incumbent. Otherwise the same raw program may select the
+/// explicit prepared Ordered-NFA route.
 ///
 /// # Errors
 ///
@@ -1420,13 +1425,23 @@ pub fn compile_ordered_many_aot(
 /// Attempt one shared ordered-many aggregate while preserving safe structural
 /// and numeric V15 refusals as typed declines.
 ///
-/// Count and SpanSum are fused native whole-operation reducers.
+/// Count and SpanSum are fused native whole-operation reducers. The complete
+/// ordinary optimizer transaction runs first and is selected only when its
+/// model-specific reducer is an authenticated helper-free `NativeFused`
+/// function. Every other ordinary aggregate—including a `NativeFused` object
+/// that still imports semantic helpers—defers to the explicit reported V15
+/// transaction against the same raw plan.
 ///
 /// # Errors
 ///
-/// Returns every parse, lower, allocation, overflow, invariant, codegen and
-/// authentication failure unchanged and terminal. Only [`OrderedManyAotCompileDecline`]
-/// authorizes retaining an independently authenticated incumbent.
+/// A well-formed ordinary candidate that is not helper-free merely selects
+/// the explicit V15 transaction. An ordinary `ProgramBytes` or final
+/// `ObjectBytes` representation cap also permits that exact prior backend to
+/// report its own success, typed decline, or terminal error. Every parse,
+/// lower, allocation, overflow, invariant, other numeric resource, codegen,
+/// semantic-identity, and final-artifact authentication failure remains
+/// terminal. Only [`OrderedManyAotCompileDecline`] authorizes retaining an
+/// independently authenticated incumbent.
 pub fn compile_ordered_many_aot_reported(
     request: OrderedManyAotCompileRequest,
     exports: PreparedAggregateExports,
@@ -1537,47 +1552,83 @@ pub fn compile_ordered_many_aot_reported(
     .map_err(CompileError::from)
     .map_err(OrderedManyAotCompileError::Combined)?
     .into_plan();
-    let disposition = crate::compile_raw_prepared_ordered_nfa_v15_reported(
+    let ordinary = match crate::compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
         pattern_bytes,
-        raw,
+        raw.clone(),
         profile.options.line_terminator,
         OutputContract::Span,
         target,
         mode,
         limits.compile,
         exports,
-        slow_aot_limits.max_native_data_bytes,
-    )
-    .map_err(OrderedManyAotCompileError::Combined)?;
-    let compiled = match disposition {
-        crate::PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => compiled,
-        crate::PreparedOrderedNfaV15CompileDisposition::Declined(decline) => {
-            let decline = match decline {
-                crate::PreparedOrderedNfaV15CompileDecline::Unsupported => {
-                    OrderedManyAotCompileDecline::Unsupported
+        slow_aot_limits,
+    ) {
+        Ok(compiled) => Some(compiled),
+        Err(error) if ordinary_aggregate_representation_cap_may_try_v15(&error) => None,
+        Err(error) => return Err(OrderedManyAotCompileError::Combined(error)),
+    };
+    if let Some(ordinary) = ordinary.as_ref() {
+        authenticate_ordered_many_aggregate_entries(ordinary, exports)?;
+    }
+    let compiled = match ordinary {
+        Some(ordinary)
+            if ordinary.module().prepared_aggregate_strategy()
+                == Some(PreparedAggregateStrategy::NativeFused)
+                && helper_free_ordered_many_aggregate_is_authenticated(&ordinary, exports) =>
+        {
+            ordinary
+        }
+        ordinary => {
+            let disposition = crate::compile_raw_prepared_ordered_nfa_v15_reported(
+                pattern_bytes,
+                raw,
+                profile.options.line_terminator,
+                OutputContract::Span,
+                target,
+                mode,
+                limits.compile,
+                exports,
+                slow_aot_limits.max_native_data_bytes,
+            )
+            .map_err(OrderedManyAotCompileError::Combined)?;
+            match disposition {
+                crate::PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => {
+                    if let Some(ordinary) = ordinary.as_ref() {
+                        authenticate_same_ordered_many_semantic_program(ordinary, &compiled)?;
+                    }
+                    compiled
                 }
-                crate::PreparedOrderedNfaV15CompileDecline::NativeDataBytes { limit, required } => {
-                    OrderedManyAotCompileDecline::NativeDataBytes { limit, required }
+                crate::PreparedOrderedNfaV15CompileDisposition::Declined(decline) => {
+                    let decline = match decline {
+                        crate::PreparedOrderedNfaV15CompileDecline::Unsupported => {
+                            OrderedManyAotCompileDecline::Unsupported
+                        }
+                        crate::PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                            limit,
+                            required,
+                        } => OrderedManyAotCompileDecline::NativeDataBytes { limit, required },
+                        crate::PreparedOrderedNfaV15CompileDecline::ObjectBytes {
+                            limit,
+                            required,
+                        } => OrderedManyAotCompileDecline::ObjectBytes { limit, required },
+                    };
+                    return Ok(OrderedManyAotCompileDisposition::Declined(decline));
                 }
-                crate::PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required } => {
-                    OrderedManyAotCompileDecline::ObjectBytes { limit, required }
-                }
-            };
-            return Ok(OrderedManyAotCompileDisposition::Declined(decline));
+            }
         }
     };
     let strategy = compiled.module().prepared_aggregate_strategy();
     let aggregate_shape_is_exact = matches!(
         strategy,
-        Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        Some(
+            PreparedAggregateStrategy::NativeFused
+                | PreparedAggregateStrategy::NativeOrderedNfaFused
+        )
     );
-    let requested_entries_exist = (!exports.contains(PreparedAggregateExports::COUNT)
-        || compiled.module().prepared_count_symbol().is_some())
-        && (!exports.contains(PreparedAggregateExports::SPAN_SUM)
-            || compiled.module().prepared_span_sum_symbol().is_some());
-    if !aggregate_shape_is_exact || !requested_entries_exist {
+    if !aggregate_shape_is_exact {
         return Err(OrderedManyAotCompileError::NativeReducerUnavailable { strategy });
     }
+    authenticate_ordered_many_aggregate_entries(&compiled, exports)?;
     let receipt = OrderedManyAotReceipt {
         schema_version: ORDERED_MANY_AOT_RECEIPT_VERSION,
         rows: row_count,
@@ -1597,6 +1648,164 @@ pub fn compile_ordered_many_aot_reported(
             receipt,
         },
     ))
+}
+
+fn ordinary_aggregate_representation_cap_may_try_v15(error: &CompileError) -> bool {
+    matches!(
+        error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ProgramBytes | CompileResource::ObjectBytes,
+            ..
+        }) | CompileError::Resource {
+            resource: CompileResource::ProgramBytes | CompileResource::ObjectBytes,
+            ..
+        }
+    )
+}
+
+fn authenticate_ordered_many_aggregate_entries(
+    compiled: &CompiledRegex,
+    exports: PreparedAggregateExports,
+) -> Result<(), OrderedManyAotCompileError> {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
+    let count = exports.contains(PreparedAggregateExports::COUNT);
+    let span_sum = exports.contains(PreparedAggregateExports::SPAN_SUM);
+    if receipt.output != OutputContract::Span
+        || receipt.prepared_aggregate_exports != exports
+        || module.prepared_aggregate_exports() != exports
+        || module.prepared_aggregate_strategy() != receipt.prepared_aggregate_strategy
+        || module.prepared_count_symbol().is_some() != count
+        || module.prepared_span_sum_symbol().is_some() != span_sum
+        || module.prepared_grep_count_symbol().is_some()
+        || module
+            .required_runtime_program()
+            .is_none_or(|(_, bytes)| bytes == 0)
+    {
+        return Err(OrderedManyAotCompileError::NativeReducerUnavailable {
+            strategy: module.prepared_aggregate_strategy(),
+        });
+    }
+    if receipt.program_sha256 != compiled.program().artifact_identity()
+        || receipt.object_sha256 != object_sha256
+        || receipt.object_bytes != compiled.object().len()
+        || compiled.object().is_empty()
+    {
+        return Err(OrderedManyAotCompileError::InternalInvariant(
+            "ordered-many aggregate receipt does not bind its selected artifact",
+        ));
+    }
+    Ok(())
+}
+
+fn helper_free_ordered_many_aggregate_is_authenticated(
+    compiled: &CompiledRegex,
+    exports: PreparedAggregateExports,
+) -> bool {
+    let module = compiled.module();
+    let bulk_shape_is_exact = match module.prepared_bulk_strategy() {
+        None => {
+            module.prepared_entry_symbol().is_none()
+                && module.prepared_span_fill_symbol().is_none()
+        }
+        Some(PreparedBulkStrategy::NativePreparedLoop | PreparedBulkStrategy::NativeFrozenLoop) => {
+            module.prepared_entry_symbol().is_some()
+                && module.prepared_span_fill_symbol().is_some()
+        }
+        Some(_) => false,
+    };
+    let reducers_are_closed = [
+        exports
+            .contains(PreparedAggregateExports::COUNT)
+            .then(|| module.prepared_count_symbol())
+            .flatten(),
+        exports
+            .contains(PreparedAggregateExports::SPAN_SUM)
+            .then(|| module.prepared_span_sum_symbol())
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|name| defined_function_has_no_unresolved_relocations(compiled, name));
+    module.prepared_aggregate_strategy() == Some(PreparedAggregateStrategy::NativeFused)
+        && module.required_prepare_capabilities() == 0
+        && compiled.receipt().required_prepare_capabilities == 0
+        && module.required_runtime_symbols().next().is_none()
+        && bulk_shape_is_exact
+        && reducers_are_closed
+}
+
+fn defined_function_has_no_unresolved_relocations(compiled: &CompiledRegex, name: &str) -> bool {
+    let module = compiled.module();
+    let mut matches = module.symbols().iter().filter(|symbol| symbol.name == name);
+    let Some(symbol) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some()
+        || symbol.binding != SymbolBinding::Global
+        || symbol.kind != SymbolKind::Function
+        || symbol.size == 0
+    {
+        return false;
+    }
+    let Some(section_index) = symbol.section else {
+        return false;
+    };
+    let Some(section) = module.sections().get(section_index) else {
+        return false;
+    };
+    let Ok(start) = usize::try_from(symbol.offset) else {
+        return false;
+    };
+    let Ok(size) = usize::try_from(symbol.size) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    let Some(end_u64) = symbol.offset.checked_add(symbol.size) else {
+        return false;
+    };
+    section.kind == SectionKind::Text
+        && end <= section.bytes().len()
+        && module
+            .relocations()
+            .iter()
+            .filter(|relocation| {
+                relocation.section == section_index
+                    && relocation.offset >= symbol.offset
+                    && relocation.offset < end_u64
+            })
+            .all(|relocation| {
+                module
+                    .symbols()
+                    .get(relocation.symbol)
+                    .is_some_and(|target| target.section.is_some())
+            })
+}
+
+fn authenticate_same_ordered_many_semantic_program(
+    incumbent: &CompiledRegex,
+    candidate: &CompiledRegex,
+) -> Result<(), OrderedManyAotCompileError> {
+    let incumbent = incumbent.receipt();
+    let candidate = candidate.receipt();
+    if candidate.automaton_sha256 != incumbent.automaton_sha256
+        || candidate.program_sha256 != incumbent.program_sha256
+        || candidate.output != incumbent.output
+        || candidate.target != incumbent.target
+        || candidate.mode != incumbent.mode
+        || candidate.line_terminator != incumbent.line_terminator
+        || candidate.source_bytes != incumbent.source_bytes
+        || candidate.thompson_states != incumbent.thompson_states
+        || candidate.thompson_edges != incumbent.thompson_edges
+    {
+        return Err(OrderedManyAotCompileError::InternalInvariant(
+            "explicit V15 candidate changed the ordinary ordered-many semantic program",
+        ));
+    }
+    Ok(())
 }
 
 /// Only bounded representation and cost refusals may select the already
@@ -1877,9 +2086,13 @@ mod tests {
     use super::{
         OrderedManyCompileLimits, OrderedManyCompileRequest, OrderedManyMatch,
         OrderedManyPatternId, OrderedManyProgram, OrderedManyRow, OrderedManySessionLimits,
-        OrderedManyStrategy, compile_ordered_many, reserve_exact, tagged_build_may_decline,
+        OrderedManyStrategy, compile_ordered_many,
+        ordinary_aggregate_representation_cap_may_try_v15, reserve_exact,
+        tagged_build_may_decline,
     };
-    use crate::CompileMode;
+    use crate::{
+        CompileError as AotCompileError, CompileMode, CompileResource, ObjectError,
+    };
     use fre_automata::{CompileError, TaggedManyBuildError};
 
     fn retention_fixture(force_fallback: bool) -> OrderedManyProgram {
@@ -2055,6 +2268,59 @@ mod tests {
             terminal
                 .iter()
                 .all(|source| !tagged_build_may_decline(source))
+        );
+    }
+
+    #[test]
+    fn only_ordinary_representation_caps_may_try_explicit_v15() {
+        let representation_caps = [
+            AotCompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ProgramBytes,
+                limit: 1,
+                required: 2,
+            }),
+            AotCompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 1,
+                required: 2,
+            }),
+            AotCompileError::Resource {
+                resource: CompileResource::ProgramBytes,
+                limit: 1,
+                required: 2,
+            },
+            AotCompileError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 1,
+                required: 2,
+            },
+        ];
+        assert!(
+            representation_caps
+                .iter()
+                .all(ordinary_aggregate_representation_cap_may_try_v15),
+        );
+
+        let terminal = [
+            AotCompileError::Object(ObjectError::Allocation("test")),
+            AotCompileError::Object(ObjectError::InvalidModule("test")),
+            AotCompileError::Object(ObjectError::ArithmeticOverflow("test")),
+            AotCompileError::Object(ObjectError::Resource {
+                resource: CompileResource::CodeBytes,
+                limit: 1,
+                required: 2,
+            }),
+            AotCompileError::Resource {
+                resource: CompileResource::Work,
+                limit: 1,
+                required: 2,
+            },
+            AotCompileError::InternalInvariant("test"),
+        ];
+        assert!(
+            terminal
+                .iter()
+                .all(|error| !ordinary_aggregate_representation_cap_may_try_v15(error)),
         );
     }
 

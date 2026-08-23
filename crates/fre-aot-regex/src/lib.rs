@@ -955,16 +955,47 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     if exports.is_empty() {
         return compile_with_slow_aot_limits(request, slow_aot_limits);
     }
+    validate_prepared_aggregate_exports(request.output, exports)?;
+    let target = request.target;
+    let mode = request.mode;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)?;
+    append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        slow_aot_limits,
+    )
+}
+
+fn validate_prepared_aggregate_exports(
+    output: OutputContract,
+    exports: PreparedAggregateExports,
+) -> Result<(), CompileError> {
     let span_reducers_requested = exports.contains(PreparedAggregateExports::COUNT)
         || exports.contains(PreparedAggregateExports::SPAN_SUM);
-    if span_reducers_requested && request.output != OutputContract::Span {
-        return Err(CompileError::PreparedAggregateRequiresSpan {
-            actual: request.output,
-        });
+    if span_reducers_requested && output != OutputContract::Span {
+        return Err(CompileError::PreparedAggregateRequiresSpan { actual: output });
     }
-    let target = request.target;
-    let max_object_bytes = request.limits.max_object_bytes;
-    let effective_native_data_limit_bytes = match request.mode {
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the selected ordinary object and its additive aggregate retries form one final-object transaction"
+)]
+fn append_prepared_aggregate_exports_to_compiled(
+    compiled: CompiledRegex,
+    exports: PreparedAggregateExports,
+    target: Target,
+    mode: CompileMode,
+    max_object_bytes: usize,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, CompileError> {
+    let effective_native_data_limit_bytes = match mode {
         CompileMode::Fast => usize::MAX,
         CompileMode::Optimizing => slow_aot_limits
             .max_native_data_bytes
@@ -975,7 +1006,7 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         module,
         object,
         mut receipt,
-    } = compile_with_slow_aot_limits(request, slow_aot_limits)?;
+    } = compiled;
     drop(object);
     let artifact_identity = program.artifact_identity();
     let serialized_program = program.serialize()?;
@@ -1877,6 +1908,67 @@ pub fn compile_raw_with_line_terminator(
         limits,
         SlowAotLimits::default(),
         ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+    )
+}
+
+/// Compile an already-lowered canonical automaton through the ordinary
+/// optimizer and append whole-operation aggregate exports to that exact
+/// selected incumbent.
+///
+/// This is crate-private because source-facing callers should use
+/// [`compile_with_prepared_aggregate_exports_and_slow_aot_limits`]. Composite
+/// frontends that already own one authenticated raw plan use this entry to
+/// compare the complete ordinary optimizer transaction before selecting a
+/// more specialized explicit backend.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, CompileError> {
+    if exports.is_empty() {
+        return compile_raw_with_line_terminator_and_slow_aot_limits(
+            source_bytes,
+            raw,
+            line_terminator,
+            output,
+            None,
+            None,
+            target,
+            mode,
+            limits,
+            slow_aot_limits,
+            ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        );
+    }
+    validate_prepared_aggregate_exports(output, exports)?;
+    let max_object_bytes = limits.max_object_bytes;
+    let compiled = compile_raw_with_line_terminator_and_slow_aot_limits(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        None,
+        None,
+        target,
+        mode,
+        limits,
+        slow_aot_limits,
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+    )?;
+    append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        slow_aot_limits,
     )
 }
 

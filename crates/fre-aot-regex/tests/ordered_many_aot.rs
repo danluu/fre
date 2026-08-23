@@ -1,8 +1,8 @@
 use fre_aot_regex::{
-    CompileMode, MatchResult, OrderedManyAotCompileDecline, OrderedManyAotCompileDisposition,
-    OrderedManyAotCompileError, OrderedManyAotCompileLimits, OrderedManyAotCompileRequest,
-    OrderedManyPatternId, OrderedManyRow, PreparedAggregateExports, PreparedAggregateStrategy,
-    SearchWindow, SlowAotLimits, Target, compile_ordered_many_aot,
+    CompileMode, DeterminizeLimits, MatchResult, OrderedManyAotCompileDecline,
+    OrderedManyAotCompileDisposition, OrderedManyAotCompileError, OrderedManyAotCompileLimits,
+    OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow, PreparedAggregateExports,
+    PreparedAggregateStrategy, SearchWindow, SlowAotLimits, Target, compile_ordered_many_aot,
     compile_ordered_many_aot_reported,
 };
 use regex_automata::meta::Regex as MetaRegex;
@@ -224,6 +224,43 @@ fn optimizing_count_and_span_sum_share_one_authenticated_source_identity() {
 }
 
 #[test]
+fn full_ordinary_optimizer_keeps_helper_free_native_fused_ahead_of_v15() {
+    let patterns = ["ab", "a", "b+"];
+    let ids = [0, 1, 2];
+    let mut limits = OrderedManyAotCompileLimits::default();
+    limits.compile.determinize = DeterminizeLimits {
+        max_states: 0,
+        max_transitions: 0,
+        max_work: 0,
+    };
+    let request = || {
+        OrderedManyAotCompileRequest::new(rows(&patterns, &ids), Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+    };
+    let ordinary = compile_ordered_many_aot(
+        request(),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    )
+    .expect("full ordinary ordered-many incumbent");
+    assert_eq!(
+        ordinary.receipt().aggregate_strategy,
+        PreparedAggregateStrategy::NativeFused,
+    );
+    assert_eq!(ordinary.compiled().module().required_prepare_capabilities(), 0);
+    assert!(
+        ordinary
+            .compiled()
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none(),
+    );
+
+}
+
+#[test]
 fn shared_aot_limits_and_export_surface_fail_closed() {
     let request = || {
         OrderedManyAotCompileRequest::new(rows(&["a", "b"], &[0, 1]), Target::x86_64_linux())
@@ -238,14 +275,53 @@ fn shared_aot_limits_and_export_surface_fail_closed() {
         Err(OrderedManyAotCompileError::UnsupportedExports { .. })
     ));
 
+    let v15_request = || {
+        OrderedManyAotCompileRequest::new(
+            rows(&[r"(?-u:[\x00-\xFF])\bfoo\b"], &[0]),
+            Target::x86_64_linux(),
+        )
+        .mode(CompileMode::Fast)
+    };
+    let v15 = compile_ordered_many_aot(
+        v15_request(),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    )
+    .expect("ordered-NFA V15 resource fixture");
+    assert_eq!(
+        v15.receipt().aggregate_strategy,
+        PreparedAggregateStrategy::NativeOrderedNfaFused,
+    );
+
     let mut slow = SlowAotLimits::default();
     slow.max_native_data_bytes = 0;
+    let capped_v15 = compile_ordered_many_aot_reported(
+        v15_request(),
+        PreparedAggregateExports::COUNT,
+        slow,
+    );
     assert!(matches!(
-        compile_ordered_many_aot_reported(request(), PreparedAggregateExports::COUNT, slow,),
+        &capped_v15,
         Ok(OrderedManyAotCompileDisposition::Declined(
-            OrderedManyAotCompileDecline::NativeDataBytes { limit: 0, .. }
-        ))
-    ));
+            OrderedManyAotCompileDecline::NativeDataBytes { limit, .. }
+        )) if *limit == 0
+    ), "unexpected capped V15 disposition: {capped_v15:?}");
+
+    let mut object_limits = OrderedManyAotCompileLimits::default();
+    let object_limit = v15.compiled().receipt().data_bytes;
+    assert!(object_limit < v15.compiled().object().len());
+    object_limits.compile.max_object_bytes = object_limit;
+    let object_capped_v15 = compile_ordered_many_aot_reported(
+        v15_request().limits(object_limits),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    );
+    assert!(matches!(
+        &object_capped_v15,
+        Ok(OrderedManyAotCompileDisposition::Declined(
+            OrderedManyAotCompileDecline::ObjectBytes { limit, .. }
+        )) if *limit == object_limit
+    ), "unexpected object-capped V15 disposition: {object_capped_v15:?}");
 
     let mut limits = OrderedManyAotCompileLimits::default();
     limits.max_rows = 1;

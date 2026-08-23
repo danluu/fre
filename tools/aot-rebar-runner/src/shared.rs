@@ -1214,7 +1214,7 @@ fn direct_native_grep_symbol_identities_are_closed(
     reducer_identity == program_identity && reducer_identity != ordinary_identity
 }
 
-fn shared_ordered_many_symbol_identities_are_closed(
+fn shared_ordered_many_v15_symbol_identities_are_closed(
     model: Model,
     ordinary_entry: &str,
     prepared_entry: &str,
@@ -1254,6 +1254,76 @@ fn shared_ordered_many_symbol_identities_are_closed(
         && ordinary_identity == span_fill_identity
         && ordinary_identity == program_identity
         && reducer_identity != ordinary_identity
+}
+
+fn shared_ordered_many_native_fused_symbol_identities_are_closed(
+    model: Model,
+    ordinary_entry: &str,
+    reducer: &str,
+    program: &str,
+) -> bool {
+    let reducer_prefix = match model {
+        Model::Count => "fre_aot_regex_count_exclusive_v1_",
+        Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        _ => return false,
+    };
+    native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_").is_some()
+        && native_symbol_identity(reducer, reducer_prefix).is_some()
+        && native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_").is_some()
+        && [ordinary_entry, reducer, program]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == 3
+}
+
+fn defined_function_has_no_unresolved_relocations(compiled: &CompiledRegex, name: &str) -> bool {
+    let module = compiled.module();
+    let mut matches = module.symbols().iter().filter(|symbol| symbol.name == name);
+    let Some(symbol) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some()
+        || symbol.binding != SymbolBinding::Global
+        || symbol.kind != SymbolKind::Function
+        || symbol.size == 0
+    {
+        return false;
+    }
+    let Some(section_index) = symbol.section else {
+        return false;
+    };
+    let Some(section) = module.sections().get(section_index) else {
+        return false;
+    };
+    let Ok(start) = usize::try_from(symbol.offset) else {
+        return false;
+    };
+    let Ok(size) = usize::try_from(symbol.size) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    let Some(end_u64) = symbol.offset.checked_add(symbol.size) else {
+        return false;
+    };
+    section.kind == SectionKind::Text
+        && end <= section.bytes().len()
+        && module
+            .relocations()
+            .iter()
+            .filter(|relocation| {
+                relocation.section == section_index
+                    && relocation.offset >= symbol.offset
+                    && relocation.offset < end_u64
+            })
+            .all(|relocation| {
+                module
+                    .symbols()
+                    .get(relocation.symbol)
+                    .is_some_and(|target| target.section.is_some())
+            })
 }
 
 fn ordinary_grep_symbol_identities_are_closed(
@@ -1545,9 +1615,12 @@ pub struct NativeRowBridge {
 /// Compile one genuine shared-scan ordered multi-pattern reducer.
 ///
 /// This route joins independently parsed canonical HIRs into one ordered
-/// automaton and emits one native Count or SpanSum entry. It never invokes or
-/// retains the independent native-row bridge. The caller may fall back only
-/// after classifying the returned typed error outside this function.
+/// automaton and emits one native Count or SpanSum entry. The combined program
+/// compares the full ordinary optimizing portfolio first, so an exact
+/// helper-free `NativeFused` reducer remains incumbent ahead of explicit V15.
+/// It never invokes or retains the independent native-row bridge. The caller
+/// may fall back only after classifying the returned typed error outside this
+/// function.
 pub fn compile_shared_ordered_many_aggregate(
     benchmark: &Benchmark,
     target: Target,
@@ -1614,7 +1687,7 @@ pub fn try_compile_shared_ordered_many_aggregate(
             .mode(CompileMode::Optimizing)
             .limits(limits),
         benchmark.model.exports(),
-        native_row_bridge_no_optional_dfa_limits(),
+        SlowAotLimits::default(),
     )
     .map_err(|error| format!("shared ordered-many AOT compilation failed: {error}"))?;
     let artifact = match disposition {
@@ -1647,13 +1720,66 @@ fn authenticate_shared_ordered_many_aggregate(
     let span_fill = module.prepared_span_fill_symbol();
     let program = module.required_runtime_program();
     let symbol_surface_closed = match strategy {
+        Some(PreparedAggregateStrategy::NativeFused) => {
+            let bulk_shape_is_exact = match module.prepared_bulk_strategy() {
+                None => prepared_entry.is_none() && span_fill.is_none(),
+                Some(
+                    PreparedBulkStrategy::NativePreparedLoop
+                    | PreparedBulkStrategy::NativeFrozenLoop,
+                ) => prepared_entry
+                    .zip(span_fill)
+                    .zip(program)
+                    .is_some_and(|((prepared_entry, span_fill), (program, _))| {
+                        prepared_row_symbol_identities_are_closed(
+                            module.entry_symbol(),
+                            prepared_entry,
+                            span_fill,
+                            program,
+                        )
+                    }),
+                Some(_) => false,
+            };
+            receipt.required_prepare_capabilities == 0
+                && module.required_prepare_capabilities() == 0
+                && has_exact_runtime_symbol_closure(compiled, &[])
+                && bulk_shape_is_exact
+                && reducer.is_some_and(|symbol| {
+                    has_defined_symbol(compiled, symbol, SymbolKind::Function, None)
+                        && defined_function_has_no_unresolved_relocations(compiled, symbol)
+                })
+                && program.is_some_and(|(symbol, len)| {
+                    len != 0
+                        && has_defined_symbol(
+                            compiled,
+                            symbol,
+                            SymbolKind::Object,
+                            Some(len),
+                        )
+                })
+                && reducer.zip(program).is_some_and(|(reducer, (program, _))| {
+                    shared_ordered_many_native_fused_symbol_identities_are_closed(
+                        benchmark.model,
+                        module.entry_symbol(),
+                        reducer,
+                        program,
+                    )
+                })
+                && has_defined_symbol(
+                    compiled,
+                    module.entry_symbol(),
+                    SymbolKind::Function,
+                    None,
+                )
+        }
         Some(PreparedAggregateStrategy::NativeOrderedNfaFused) => {
             let expected = match benchmark.model {
                 Model::Count => &PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS[..],
                 Model::SpanSum => &PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS[..],
                 _ => &[][..],
             };
-            module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+            receipt.engine == EngineKind::OrderedNfa
+                && module.prepared_bulk_strategy()
+                    == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
                 && module.required_prepare_capabilities()
                     == PREPARED_CAPABILITY_ORDERED_NFA_V15
                 && receipt.runtime_helper_required
@@ -1682,7 +1808,7 @@ fn authenticate_shared_ordered_many_aggregate(
                     .zip(program)
                     .is_some_and(
                         |(((prepared_entry, span_fill), reducer), (program, _))| {
-                            shared_ordered_many_symbol_identities_are_closed(
+                            shared_ordered_many_v15_symbol_identities_are_closed(
                                 benchmark.model,
                                 module.entry_symbol(),
                                 prepared_entry,
@@ -1705,7 +1831,6 @@ fn authenticate_shared_ordered_many_aggregate(
         || receipt.target != target
         || receipt.mode != CompileMode::Optimizing
         || receipt.output != OutputContract::Span
-        || receipt.engine != EngineKind::OrderedNfa
         || receipt.prepared_aggregate_exports != benchmark.model.exports()
         || receipt.prepared_aggregate_strategy != strategy
         || module.prepared_aggregate_exports() != benchmark.model.exports()
@@ -3750,10 +3875,19 @@ mod tests {
             artifact.compiled().module().prepared_aggregate_exports(),
             PreparedAggregateExports::COUNT,
         );
-        assert!(matches!(
+        assert_eq!(
             artifact.receipt().aggregate_strategy,
-            PreparedAggregateStrategy::NativeOrderedNfaFused
-        ));
+            PreparedAggregateStrategy::NativeFused,
+        );
+        assert_eq!(artifact.compiled().module().required_prepare_capabilities(), 0);
+        assert!(
+            artifact
+                .compiled()
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none(),
+        );
         assert!(artifact.compiled().module().prepared_count_symbol().is_some());
         assert_ne!(artifact.receipt().ordered_sources_sha256, [0; 32]);
     }
@@ -3779,12 +3913,9 @@ mod tests {
         assert_eq!(artifact.receipt().rows, 96);
         assert_eq!(
             artifact.receipt().aggregate_strategy,
-            PreparedAggregateStrategy::NativeOrderedNfaFused,
+            PreparedAggregateStrategy::NativeFused,
         );
-        assert_eq!(
-            artifact.compiled().module().prepared_bulk_strategy(),
-            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
-        );
+        assert_eq!(artifact.compiled().module().required_prepare_capabilities(), 0);
         assert!(artifact.compiled().module().prepared_count_symbol().is_some());
     }
 
@@ -3846,14 +3977,17 @@ mod tests {
             assert_eq!(artifact.receipt().rows, benchmark.patterns.len());
             assert_eq!(
                 artifact.receipt().aggregate_strategy,
-                PreparedAggregateStrategy::NativeOrderedNfaFused,
+                PreparedAggregateStrategy::NativeFused,
             );
             eprintln!(
-                "shared-admission name={name:?} model={} rows={} pattern_bytes={} object_bytes={}",
+                "shared-admission name={name:?} model={} rows={} pattern_bytes={} object_bytes={} strategy={:?} bulk={:?} runtime_symbols={:?}",
                 benchmark.model.name(),
                 artifact.receipt().rows,
                 artifact.receipt().pattern_bytes,
                 artifact.compiled().object().len(),
+                artifact.receipt().aggregate_strategy,
+                artifact.compiled().module().prepared_bulk_strategy(),
+                unresolved_runtime_function_names(artifact.compiled()),
             );
         }
     }
