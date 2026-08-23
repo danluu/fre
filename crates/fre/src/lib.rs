@@ -24242,6 +24242,41 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
+    fn composed_ordinary_boolean_routes_remain_plan_local() {
+        let bounded = PortableBuilder::new(r"\b\p{Greek}+\b")
+            .unicode(true)
+            .build()
+            .unwrap();
+        let word = PortableBuilder::new(r"\b\w{2,}\b")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &bounded.plan,
+            PortablePlan::BoundedWordClass(_)
+        ));
+        assert!(matches!(&word.plan, PortablePlan::UnicodeWordRun(_)));
+
+        super::bounded_word_class::ordinary_is_match_probe::reset();
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(bounded.is_match("!\u{03b1}\u{03b2}!".as_bytes()));
+        assert_eq!(
+            super::bounded_word_class::ordinary_is_match_probe::snapshot().calls,
+            1
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+
+        super::bounded_word_class::ordinary_is_match_probe::reset();
+        super::unicode_word_run::reset_full_prepared_call_count();
+        assert!(word.is_match("!\u{03b1}\u{03b2}!".as_bytes()));
+        assert_eq!(
+            super::bounded_word_class::ordinary_is_match_probe::snapshot().calls,
+            0
+        );
+        assert_eq!(super::unicode_word_run::full_prepared_call_count(), 1);
+    }
+
+    #[test]
     fn unicode_word_ordinary_full_unlimited_matches_find_at_boundaries_and_invalid_bytes() {
         let haystacks: &[&[u8]] = &[
             b"",
