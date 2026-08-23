@@ -157,6 +157,78 @@ fn ordinary_full_find_retries_overlapping_general_suffix_after_rejection() {
 }
 
 #[test]
+fn contained_suffix_ordinary_values_preserve_overlap_and_malformed_byte_geometry() {
+    let alternating = plan(b"", &[(b'a', b'b')], b"aba");
+    for (haystack, expected) in [
+        (b"aba".as_slice(), None),
+        (b"ababa".as_slice(), Some((0, 5))),
+        (b"aba!aababa".as_slice(), Some((4, 10))),
+        (b"!aababa!".as_slice(), Some((1, 7))),
+    ] {
+        assert_eq!(
+            alternating.find_full_ordinary_value(haystack).unwrap(),
+            expected,
+            "alternating haystack={haystack:?}",
+        );
+        assert_eq!(
+            alternating.is_match_full_ordinary_value(haystack).unwrap(),
+            expected.is_some(),
+            "alternating haystack={haystack:?}",
+        );
+        assert_eq!(
+            alternating
+                .find(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+            "accounted alternating haystack={haystack:?}",
+        );
+    }
+
+    let repeated = plan(b"", &[(b'a', b'a')], b"aa");
+    for (haystack, expected) in [
+        (b"aa".as_slice(), None),
+        (b"aaa".as_slice(), Some((0, 3))),
+        (b"aaaaa".as_slice(), Some((0, 5))),
+    ] {
+        assert_eq!(
+            repeated.find_full_ordinary_value(haystack).unwrap(),
+            expected,
+            "repeated haystack={haystack:?}",
+        );
+        assert_eq!(
+            repeated.is_match_full_ordinary_value(haystack).unwrap(),
+            expected.is_some(),
+            "repeated haystack={haystack:?}",
+        );
+        assert_eq!(
+            repeated
+                .find(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+            "accounted repeated haystack={haystack:?}",
+        );
+    }
+
+    let malformed = plan(b"", &[(0x80, 0xFF)], b"\xFF\xFF");
+    let haystack = b"\xFF\xFF!\x80\xFF\xFF";
+    let expected = Some((3, 6));
+    assert_eq!(
+        malformed.find_full_ordinary_value(haystack).unwrap(),
+        expected,
+    );
+    assert!(malformed.is_match_full_ordinary_value(haystack).unwrap());
+    assert_eq!(
+        malformed
+            .find(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0,
+        expected,
+    );
+}
+
+#[test]
 fn existence_values_preserve_finite_refusal_invalid_and_fallback_contracts() {
     let candidate = plan(b"aa", &[(b'0', b'1')], b"QZ");
     let haystack = b"!aa0101QZ!aa001QZ!";

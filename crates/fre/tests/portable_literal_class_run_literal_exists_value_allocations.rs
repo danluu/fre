@@ -22,6 +22,10 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
         .unicode(false)
         .build()
         .unwrap();
+    let malformed_inside = PortableBuilder::new(r"[\x80-\xFF]+\xFF\xFF")
+        .unicode(false)
+        .build()
+        .unwrap();
     let guarded = PortableBuilder::new(r"\b\w+ing\b")
         .unicode(false)
         .build()
@@ -30,6 +34,9 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
     let suffix_haystack = b"!a0101TRAILER!";
     let absent = b"!aa0101XX!";
     let inside_haystack = b"!aababa!";
+    let inside_overlap_haystack = b"!ababa!";
+    let inside_invalid_haystack = b"!aba!";
+    let malformed_inside_haystack = b"\xFF\xFF!\x80\xFF\xFF!";
     let guarded_haystack = b"!testing!";
     let window = SearchWindow::full(haystack);
     let (_, accounting) = regex
@@ -88,6 +95,29 @@ fn literal_class_run_ordinary_values_allocate_nothing() {
             black_box(inside.find(black_box(inside_haystack)))
                 .map(|matched| (matched.start(), matched.end())),
             Some((1, 7)),
+        );
+        assert!(black_box(
+            inside.is_match(black_box(inside_overlap_haystack))
+        ));
+        assert_eq!(
+            black_box(inside.find(black_box(inside_overlap_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 6)),
+        );
+        assert!(!black_box(
+            inside.is_match(black_box(inside_invalid_haystack))
+        ));
+        assert_eq!(
+            black_box(inside.find(black_box(inside_invalid_haystack))),
+            None,
+        );
+        assert!(black_box(
+            malformed_inside.is_match(black_box(malformed_inside_haystack))
+        ));
+        assert_eq!(
+            black_box(malformed_inside.find(black_box(malformed_inside_haystack)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((3, 6)),
         );
         assert!(black_box(guarded.is_match(black_box(guarded_haystack))));
         assert_eq!(

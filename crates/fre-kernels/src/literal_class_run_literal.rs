@@ -1496,10 +1496,10 @@ impl LiteralClassRunLiteralPlan {
     /// Whether the ordinary immutable full-haystack operation has a match.
     ///
     /// Construction resolves the only static specialist decision. General
-    /// prefix/suffix and complete ASCII-word geometry enter report-free loops
-    /// directly; contained-suffix geometry enters the incumbent checked
-    /// implementation directly. Ranged, finite, accounted, and session APIs
-    /// deliberately continue to use [`Self::is_match_window_value`].
+    /// prefix/suffix, contained-suffix, and complete ASCII-word geometry enter
+    /// report-free existence loops directly. Ranged, finite, accounted, and
+    /// session APIs deliberately continue to use
+    /// [`Self::is_match_window_value`].
     #[doc(hidden)]
     #[inline]
     pub fn is_match_full_ordinary_value(&self, haystack: &[u8]) -> Result<bool, SearchError> {
@@ -1507,24 +1507,19 @@ impl LiteralClassRunLiteralPlan {
             ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
                 Ok(self.search_general_exists_value(haystack))
             }
+            ResolvedSearchGeometry::SuffixInsideClass => {
+                Ok(self.search_suffix_inside_class_exists_value(haystack))
+            }
             ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
                 Ok(self.search_complete_ascii_word_run_value(haystack).is_some())
             }
-            ResolvedSearchGeometry::SuffixInsideClass => self.is_match_window_incumbent(
-                haystack,
-                Window::full(haystack),
-                SearchLimits::unlimited(),
-            ),
         }
     }
 
     /// Return the selected ordinary full-haystack span without retaining
-    /// diagnostic accounting for general prefix/suffix and complete
-    /// ASCII-word geometries.
-    ///
-    /// Contained-suffix geometry deliberately retains the incumbent checked
-    /// implementation. Ranged, finite, accounted, session, iterator, and
-    /// reusable value APIs continue to use [`Self::find_window`].
+    /// diagnostic accounting for general prefix/suffix, contained-suffix, and
+    /// complete ASCII-word geometry. Ranged, finite, accounted, session,
+    /// iterator, and reusable value APIs continue to use [`Self::find_window`].
     #[doc(hidden)]
     #[inline]
     pub fn find_full_ordinary_value(
@@ -1535,12 +1530,12 @@ impl LiteralClassRunLiteralPlan {
             ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
                 Ok(self.search_general_selected_value(haystack))
             }
+            ResolvedSearchGeometry::SuffixInsideClass => {
+                Ok(self.search_suffix_inside_class_selected_value(haystack))
+            }
             ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
                 Ok(self.search_complete_ascii_word_run_value(haystack))
             }
-            ResolvedSearchGeometry::SuffixInsideClass => self
-                .find(haystack, SearchLimits::unlimited())
-                .map(|(matched, _)| matched),
         }
     }
 
@@ -1704,6 +1699,83 @@ impl LiteralClassRunLiteralPlan {
                 return Some((run_start, suffix_end));
             }
             cursor = suffix_start + 1;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each finder result is bounded by the full haystack and every rejected overlap advances one byte"
+    )]
+    fn search_suffix_inside_class_exists_value(&self, haystack: &[u8]) -> bool {
+        debug_assert_eq!(self.geometry, ResolvedSearchGeometry::SuffixInsideClass);
+        debug_assert!(self.prefix().is_empty());
+        // Construction proved every suffix byte belongs to the class. A
+        // suffix occurrence is therefore a complete match exactly when its
+        // immediate predecessor exists and belongs to the same class run.
+        let mut cursor = 0_usize;
+        loop {
+            let Some(relative) = self.anchor.find(&haystack[cursor..]) else {
+                return false;
+            };
+            let suffix_start = cursor + relative;
+            if suffix_start > 0 && self.class.contains(haystack[suffix_start - 1]) {
+                return true;
+            }
+            cursor = suffix_start + 1;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "slice-proved suffix and run boundaries bound every overlap restart and selected end"
+    )]
+    fn search_suffix_inside_class_selected_value(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(usize, usize)> {
+        debug_assert_eq!(self.geometry, ResolvedSearchGeometry::SuffixInsideClass);
+        debug_assert!(self.prefix().is_empty());
+        let suffix_bytes = self.anchor.needle().len();
+        debug_assert!(suffix_bytes != 0);
+        let mut cursor = 0_usize;
+        loop {
+            // The earliest suffix globally identifies the earliest maximal
+            // class run that can contain a match. Greedy class repetition
+            // then selects the last overlapping suffix in that run.
+            let relative = self.anchor.find(&haystack[cursor..])?;
+            let first_suffix = cursor + relative;
+            let first_suffix_end = first_suffix + suffix_bytes;
+            let run_start = scan_class_run_backward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                first_suffix,
+            )
+            .unwrap_or(first_suffix);
+            let run_end = scan_class_run_forward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                first_suffix_end,
+            )
+            .unwrap_or(first_suffix_end);
+
+            let mut chosen = (run_start < first_suffix).then_some(first_suffix);
+            let mut overlap_cursor = first_suffix + 1;
+            while run_end.saturating_sub(overlap_cursor) >= suffix_bytes {
+                let Some(relative) = self.anchor.find(&haystack[overlap_cursor..run_end]) else {
+                    break;
+                };
+                let next_suffix = overlap_cursor + relative;
+                chosen = Some(next_suffix);
+                overlap_cursor = next_suffix + 1;
+            }
+            if let Some(suffix_start) = chosen {
+                return Some((run_start, suffix_start + suffix_bytes));
+            }
+            // With every suffix byte in the class, no occurrence can cross
+            // the non-class byte that terminated this invalid run.
+            cursor = run_end;
         }
     }
 
@@ -10438,7 +10510,7 @@ mod tests {
         assert!(contained
             .is_match_full_ordinary_value(b"!aababa!")
             .unwrap());
-        assert_eq!(test_search_preflight_calls(), 1);
+        assert_eq!(test_search_preflight_calls(), 0);
         reset_test_search_preflight_calls();
         assert_eq!(
             contained
@@ -10446,7 +10518,7 @@ mod tests {
                 .unwrap(),
             Some((1, 7)),
         );
-        assert_eq!(test_search_preflight_calls(), 1);
+        assert_eq!(test_search_preflight_calls(), 0);
 
         let guarded = complete_ascii_word_run_plan(b"ing");
         reset_test_search_preflight_calls();
@@ -10462,6 +10534,90 @@ mod tests {
             Some((1, 8)),
         );
         assert_eq!(test_search_preflight_calls(), 0);
+    }
+
+    #[test]
+    fn contained_suffix_ordinary_values_match_incumbent_across_vector_boundaries() {
+        let scalar = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'c')].into_iter(),
+            b"aba",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = LiteralClassRunLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"",
+            [(b'a', b'c')].into_iter(),
+            b"aba",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let scanner = dispatched
+            .ascii_scanner
+            .as_ref()
+            .expect("a dispatched ASCII plan retains one scanner");
+        assert!(
+            bounded_ascii_scanner_has_vector(Some(scanner)),
+            "the boundary fixture must exercise a retained vector scanner",
+        );
+
+        let padding = ASCII_WIDE_BYTES;
+        let backward_bytes = SIMD_SCALAR_PROOF_BYTES + ASCII_WIDE_BYTES + 3;
+        let mut backward = vec![b'!'; padding];
+        backward.extend(core::iter::repeat_n(b'c', backward_bytes));
+        let suffix_start = backward.len();
+        backward.extend_from_slice(b"ababa");
+        let expected_end = backward.len();
+        backward.extend(core::iter::repeat_n(b'!', ASCII_WIDE_BYTES));
+        assert_eq!(
+            scan_class_run_backward_value(
+                &backward,
+                dispatched.class,
+                dispatched.ascii_scanner.as_ref(),
+                suffix_start,
+            ),
+            Some(padding),
+            "the first suffix follows a nonzero class run spanning the scalar proof and one full vector block",
+        );
+        let expected = Some((padding, expected_end));
+        for candidate in [&scalar, &dispatched] {
+            assert_eq!(
+                candidate.find_full_ordinary_value(&backward).unwrap(),
+                expected,
+            );
+            assert!(candidate
+                .is_match_full_ordinary_value(&backward)
+                .unwrap());
+        }
+
+        for run_bytes in 0..=100 {
+            let mut haystack = vec![b'!'; ASCII_WIDE_BYTES];
+            haystack.extend((0..run_bytes).map(|index| if index % 2 == 0 { b'a' } else { b'b' }));
+            haystack.extend(core::iter::repeat_n(b'!', ASCII_WIDE_BYTES));
+
+            let expected_find = scalar
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            let expected_exists = scalar
+                .shortest(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .is_some();
+            for candidate in [&scalar, &dispatched] {
+                assert_eq!(
+                    candidate.find_full_ordinary_value(&haystack).unwrap(),
+                    expected_find,
+                    "run length {run_bytes}",
+                );
+                assert_eq!(
+                    candidate.is_match_full_ordinary_value(&haystack).unwrap(),
+                    expected_exists,
+                    "run length {run_bytes}",
+                );
+            }
+        }
     }
 
     #[test]
