@@ -95,6 +95,7 @@ mod k0_anchored_scalar_corridor_exists;
 mod k0_bounded_delimited_exists;
 mod k0_casefold_prefix_class_span;
 mod k0_class_delimiter_exists;
+mod k0_line_token_loop_exists;
 mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
 mod k0_reverse_suffix_span;
@@ -9755,6 +9756,93 @@ impl PortableBuilder {
                     .map_or(0, |_| deferred.storage_bytes);
             }
         }
+        // This final K0 proof recognizes deterministic singleton-byte token
+        // loops bounded by LF line assertions. It is deliberately below every
+        // incumbent planner and owner. The compact proof is boxed only from
+        // residual optional storage; source-density refusal at execution is
+        // fail-open to the unchanged canonical ordinary K0 route.
+        let line_token_loop_inspection = if correlated_terminal.is_none()
+            && k0_absolute_end_proof.is_none()
+            && packed_frontier_plan.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+            && rust
+                .hir
+                .properties()
+                .look_set_prefix()
+                .contains(Look::StartLF)
+            && rust
+                .hir
+                .properties()
+                .look_set_suffix()
+                .contains(Look::EndLF)
+        {
+            match k0_line_token_loop_exists::inspect(
+                &rust.hir,
+                self.profile.options.unicode,
+                self.profile.options.case_insensitive,
+                self.profile.options.line_terminator,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_line_token_loop_exists::InspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_line_token_loop_exists::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_line_token_loop_exists::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_line_token_loop_exists::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "line token-loop Exists planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let incumbent_optional_bytes = mandatory_suffix_storage_bytes
+            .checked_add(mandatory_cut_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
+            .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let line_token_loop_exists = match line_token_loop_inspection {
+            Some(plan)
+                if k0_line_token_loop_exists::Plan::storage_bytes()
+                    <= available_optional_bytes.saturating_sub(incumbent_optional_bytes) =>
+            {
+                match fre_exact_alloc::try_box_preserve(plan) {
+                    Ok(plan) => Some(plan),
+                    Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => None,
+                    Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+                        return Err(BuildError::InternalInvariant(
+                            "line token-loop Exists owner layout overflowed",
+                        ));
+                    }
+                }
+            }
+            Some(_) | None => None,
+        };
+        let line_token_loop_storage_bytes = line_token_loop_exists
+            .as_deref()
+            .map_or(0, |_| k0_line_token_loop_exists::Plan::storage_bytes());
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(lazy_delimited_repeat_storage_bytes)
@@ -9766,12 +9854,18 @@ impl PortableBuilder {
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(line_token_loop_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
-        let exclusive = match (correlated_terminal, packed_frontier_plan) {
-            (Some(plan), None) => K0ExclusivePlan::Correlated(plan),
-            (None, Some(plan)) => K0ExclusivePlan::Packed(plan),
-            (None, None) => K0ExclusivePlan::None,
-            (Some(_), Some(_)) => {
+        let exclusive = match (
+            correlated_terminal,
+            packed_frontier_plan,
+            line_token_loop_exists,
+        ) {
+            (Some(plan), None, None) => K0ExclusivePlan::Correlated(plan),
+            (None, Some(plan), None) => K0ExclusivePlan::Packed(plan),
+            (None, None, Some(plan)) => K0ExclusivePlan::LineTokenLoop(plan),
+            (None, None, None) => K0ExclusivePlan::None,
+            _ => {
                 return Err(BuildError::InternalInvariant(
                     "exclusive K0 sidecars were published together",
                 ));
@@ -10094,20 +10188,28 @@ enum K0ExclusivePlan {
     None,
     Correlated(correlated_bounded_alternation::Plan),
     Packed(Box<K0PackedFrontierPlan>),
+    LineTokenLoop(Box<k0_line_token_loop_exists::Plan>),
 }
 
 impl K0ExclusivePlan {
     fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
         match self {
             Self::Correlated(plan) => Some(plan),
-            Self::None | Self::Packed(_) => None,
+            Self::None | Self::Packed(_) | Self::LineTokenLoop(_) => None,
         }
     }
 
     fn packed_frontier(&self) -> Option<&K0PackedFrontierPlan> {
         match self {
             Self::Packed(plan) => Some(plan),
-            Self::None | Self::Correlated(_) => None,
+            Self::None | Self::Correlated(_) | Self::LineTokenLoop(_) => None,
+        }
+    }
+
+    fn line_token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
+        match self {
+            Self::LineTokenLoop(plan) => Some(plan),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
 }
@@ -12084,6 +12186,12 @@ impl PortableRegex {
         }
         match &self.plan {
             PortablePlan::K0(k0) => {
+                if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
+                    && let Some(plan) = k0.exclusive.line_token_loop()
+                    && let Some(matched) = plan.try_is_match_full(haystack)
+                {
+                    return Ok(matched);
+                }
                 let window_bytes = haystack.len();
                 let compact_prepared = window_bytes
                     >= PREPARED_COMPACT_ORDINARY_EXISTS_MIN_WINDOW_BYTES
@@ -16646,7 +16754,7 @@ impl K0ExclusiveRouteState {
         match plan {
             K0ExclusivePlan::Packed(_) => Self::Packed(K0PackedFrontierExistsState::default()),
             K0ExclusivePlan::Correlated(_) => Self::Correlated(K0CorrelatedRouteStates::default()),
-            K0ExclusivePlan::None => Self::NoneUnknown,
+            K0ExclusivePlan::None | K0ExclusivePlan::LineTokenLoop(_) => Self::NoneUnknown,
         }
     }
 
@@ -46951,6 +47059,7 @@ mod tests {
         let PortablePlan::K0(plan) = &regex.plan else {
             unreachable!("the exact public fixture selected K0");
         };
+        assert!(plan.exclusive.line_token_loop().is_some());
         let upstream = regex::bytes::RegexBuilder::new(pattern)
             .unicode(false)
             .build()
@@ -46962,16 +47071,20 @@ mod tests {
         assert!(expected_exists);
 
         contextual_v4_facade_probe::reset();
-        assert_eq!(regex.is_match(&source), expected_exists, "cold Pike call");
-        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
-            assert_eq!(
-                plan.contextual_ordinary_exists_projection_eligible(
+        super::k0_line_token_loop_exists::route_probe::reset();
+        assert_eq!(
+            regex.is_match(&source),
+            expected_exists,
+            "cold direct line-token call"
+        );
+        for bytes in [4_079, 4_080, 4_095, 4_096] {
+            assert!(
+                !plan.contextual_ordinary_exists_projection_eligible(
                     K0PooledValueExecution::OrdinaryExists,
                     true,
                     bytes,
                 ),
-                admitted,
-                "window bytes={bytes}",
+                "the direct route must not seed a contextual owner: window bytes={bytes}",
             );
         }
         assert!(!plan.contextual_ordinary_exists_projection_eligible(
@@ -46987,17 +47100,21 @@ mod tests {
         assert_eq!(
             regex.is_match(&source),
             expected_exists,
-            "contextual promotion and canonical replay call",
+            "second direct call",
         );
         assert_eq!(
             regex.is_match(&source),
             expected_exists,
-            "complete report-free contextual call",
+            "third direct call",
         );
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (0, 0));
         assert_eq!(
-            contextual_v4_facade_probe::snapshot(),
-            (3, 2),
-            "current main's cold pooled call seeds the owner for both later immutable calls",
+            super::k0_line_token_loop_exists::route_probe::snapshot(),
+            super::k0_line_token_loop_exists::route_probe::Counts {
+                attempts: 3,
+                completed: 3,
+                declined: 0,
+            },
         );
         let terminal = source.len().checked_sub(2).unwrap();
         assert_eq!(source[terminal], b'Z');
@@ -47007,11 +47124,18 @@ mod tests {
         let expected_mutated_exists = upstream.is_match(&source);
         assert!(!expected_mutated_exists);
         assert_eq!(regex.is_match(&source), expected_mutated_exists);
-        assert_eq!(contextual_v4_facade_probe::snapshot(), (4, 2));
         assert_eq!(regex.is_match(&source), expected_mutated_exists);
-        assert_eq!(contextual_v4_facade_probe::snapshot(), (5, 3));
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (2, 1));
         source[mutated] = b'f';
-        let retained_counts = contextual_v4_facade_probe::snapshot();
+        let retained_direct_counts = super::k0_line_token_loop_exists::route_probe::snapshot();
+        assert_eq!(
+            retained_direct_counts,
+            super::k0_line_token_loop_exists::route_probe::Counts {
+                attempts: 5,
+                completed: 3,
+                declined: 2,
+            },
+        );
 
         for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
             assert_eq!(
@@ -47032,6 +47156,25 @@ mod tests {
                 .unwrap()
                 .0,
             expected_exists,
+        );
+        let (match_start, match_end) = expected_span.expect("the fixture has one terminal line");
+        assert!(
+            regex
+                .is_match_window_value(
+                    &source,
+                    SearchWindow::new(match_start, match_end),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+        assert!(
+            !regex
+                .is_match_value_at(
+                    &source,
+                    match_start + 1,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
         );
         assert_eq!(
             regex.find(&source).map(|matched| (matched.start(), matched.end())),
@@ -47070,9 +47213,87 @@ mod tests {
         );
         assert_eq!(locations.get(0), expected_span);
         assert_eq!(
-            contextual_v4_facade_probe::snapshot(),
-            retained_counts,
+            super::k0_line_token_loop_exists::route_probe::snapshot(),
+            retained_direct_counts,
             "explicit, accounted, find, session, and capture APIs stay out of Exists",
+        );
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (2, 1));
+
+        let short = b"abbbcZ\n";
+        assert_eq!(regex.is_match(short), upstream.is_match(short));
+        assert_eq!(
+            super::k0_line_token_loop_exists::route_probe::snapshot(),
+            super::k0_line_token_loop_exists::route_probe::Counts {
+                attempts: 5,
+                completed: 3,
+                declined: 2,
+            },
+            "a short ordinary call must bypass the outlined route",
+        );
+    }
+
+    #[test]
+    fn generic_loop_force_k0_retains_contextual_exists_lifecycle() {
+        fn generated_with_suffix(length: usize, seed: u64, suffix: &[u8]) -> Vec<u8> {
+            const ALPHABET: &[u8] = b"qxvjkm ,.;/\n";
+            assert!(suffix.len() <= length);
+            let mut state = seed;
+            let mut bytes = (0..length - suffix.len())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let index =
+                        usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                    ALPHABET[index]
+                })
+                .collect::<Vec<_>>();
+            bytes.extend_from_slice(suffix);
+            bytes
+        }
+
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let mut source =
+            generated_with_suffix(4_093, 0x8a09_8b0a_8c0b_8d0c, b"\nabbbcdefZ\n");
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("the forced contextual control selected another plan");
+        };
+        assert!(plan.exclusive.line_token_loop().is_none());
+
+        contextual_v4_facade_probe::reset();
+        super::k0_line_token_loop_exists::route_probe::reset();
+        assert!(regex.is_match(&source), "cold contextual control");
+        assert!(regex.is_match(&source), "warm-owner promotion replay");
+        assert!(regex.is_match(&source), "immutable completion");
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (3, 2));
+        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
+            assert_eq!(
+                plan.contextual_ordinary_exists_projection_eligible(
+                    K0PooledValueExecution::OrdinaryExists,
+                    true,
+                    bytes,
+                ),
+                admitted,
+                "window bytes={bytes}",
+            );
+        }
+
+        assert_eq!(source[4_090], b'f');
+        source[4_090] = b'Q';
+        assert!(!regex.is_match(&source));
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (4, 2));
+        assert!(!regex.is_match(&source));
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (5, 3));
+        assert_eq!(
+            super::k0_line_token_loop_exists::route_probe::snapshot(),
+            super::k0_line_token_loop_exists::route_probe::Counts::default(),
+            "ForceK0 must retain the incumbent contextual route",
         );
     }
 
