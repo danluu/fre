@@ -32,6 +32,10 @@ SCHEDULE_SCHEMA = "fre.full-rebar.campaign.v1"
 EXPECTED_PUBLIC_JOBS = 344
 EXPECTED_RUNTIME_JOBS = 311
 EXPECTED_COMPILE_JOBS = 33
+FROZEN_COMPARATOR_PREFERENCE = (
+    "re2-2025-11-05",
+    "rust-regex-1.12.4",
+)
 MAX_NATIVE_ROW_COMPONENTS = 4_096
 MAX_NATIVE_ROW_OBJECT_BYTES = 256 * 1024 * 1024
 MAX_SERIALIZED_PROGRAM_BYTES = 256 * 1024 * 1024
@@ -1026,7 +1030,96 @@ def validate_plan(plan: object) -> dict[str, object]:
     for name, values in expected_sets.items():
         if denominators[name] != id_set(values):
             raise CensusError(f"plan denominator {name} differs from its rows")
+    for job in plan["jobs"]:
+        if job["is_runtime"]:
+            frozen_job_expectation(plan, job)
     return plan
+
+
+def frozen_job_expectation(
+    plan: dict[str, object], job: dict[str, object]
+) -> tuple[int, str]:
+    """Select one pre-frozen scalar/comparator without job-specific policy."""
+    point_ids = set(job["point_ids"])
+    points = [point for point in plan["points"] if point["point_id"] in point_ids]
+    if len(points) != len(point_ids):
+        raise CensusError("runtime job frozen point set is incomplete")
+    expected_values = set()
+    comparators = set()
+    for point in points:
+        expected = point["expected"]
+        if (
+            not isinstance(expected, int)
+            or isinstance(expected, bool)
+            or not 0 <= expected <= (1 << 64) - 1
+        ):
+            raise CensusError("runtime job expected value is not a frozen u64")
+        expected_values.add(expected)
+        comparator = point["comparator"]
+        if comparator not in FROZEN_COMPARATOR_PREFERENCE:
+            raise CensusError("runtime job names an unsupported frozen comparator")
+        comparators.add(comparator)
+    if len(expected_values) != 1:
+        raise CensusError("runtime job has conflicting frozen expected values")
+    comparator = next(
+        (name for name in FROZEN_COMPARATOR_PREFERENCE if name in comparators),
+        None,
+    )
+    if comparator is None:
+        raise CensusError("runtime job has no frozen comparator")
+    return next(iter(expected_values)), comparator
+
+
+FROZEN_VALIDATION_FIELDS = {
+    "validation_authority", "expected_value_sealed", "expected_value",
+    "expected_comparator", "schedule_klv_sha256", "schedule_binding_sha256",
+    "stock_comparator", "stock_divergence_policy",
+}
+
+
+def frozen_schedule_validation(fields: dict[str, str]) -> dict[str, object]:
+    """Require the closed build/runtime binding used by formal qualification."""
+    missing = FROZEN_VALIDATION_FIELDS - set(fields)
+    if missing:
+        raise CensusError(
+            f"runner provenance omits frozen validation fields {sorted(missing)!r}"
+        )
+    if fields["validation_authority"] != "frozen-public-schedule-v1":
+        raise CensusError("runner provenance is not frozen-schedule authoritative")
+    if fields["expected_value_sealed"] != "true":
+        raise CensusError("runner frozen expected value is not sealed")
+    expected_text = fields["expected_value"]
+    if re.fullmatch(r"0|[1-9][0-9]*", expected_text) is None:
+        raise CensusError("runner frozen expected value is not canonical u64 decimal")
+    expected_value = int(expected_text, 10)
+    if expected_value > (1 << 64) - 1:
+        raise CensusError("runner frozen expected value exceeds u64")
+    expected_comparator = fields["expected_comparator"]
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+:\-]{0,127}", expected_comparator) is None:
+        raise CensusError("runner frozen expected comparator is not canonical")
+    klv_sha256 = require_hex64(
+        fields["schedule_klv_sha256"], "runner frozen schedule KLV digest"
+    )
+    binding_sha256 = require_hex64(
+        fields["schedule_binding_sha256"], "runner frozen schedule binding digest"
+    )
+    if klv_sha256 == "0" * 64 or binding_sha256 == "0" * 64:
+        raise CensusError("runner frozen schedule binding contains a zero digest")
+    if fields["stock_comparator"] != "rust-regex-1.12.4":
+        raise CensusError("runner stock diagnostic comparator differs")
+    if fields["stock_divergence_policy"] != "report-only":
+        raise CensusError("runner frozen stock divergence policy is not report-only")
+    if fields.get("required_comparators") != f"{expected_comparator},fre-current-runtime":
+        raise CensusError("runner frozen comparator set differs")
+    return {
+        "authority": fields["validation_authority"],
+        "expected_value": expected_value,
+        "expected_comparator": expected_comparator,
+        "schedule_klv_sha256": klv_sha256,
+        "schedule_binding_sha256": binding_sha256,
+        "stock_comparator": fields["stock_comparator"],
+        "stock_divergence_policy": fields["stock_divergence_policy"],
+    }
 
 
 def parse_provenance(output: bytes) -> dict[str, str]:
@@ -1047,7 +1140,7 @@ def parse_provenance(output: bytes) -> dict[str, str]:
     common = {
         "schema", "configured", "adapter", "model", "benchmark", "source_commit",
         "source_tree", "target", "feature_bits",
-    }
+    } | FROZEN_VALIDATION_FIELDS
     if fields.get("schema") == "fre.aot.rebar-runner.v2":
         required = common | {
             "engine", "aggregate_strategy", "prepared_bulk_strategy",
@@ -1125,7 +1218,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         "max_ordered_nfa_setup_work", "program_sha256", "object_sha256",
         "program_symbol", "program_len", "entry_symbol", "reducer_symbol", "span_fill_symbol",
         "required_runtime_symbols", "boundary", "required_comparators",
-    }
+    } | FROZEN_VALIDATION_FIELDS
     if set(fields) != expected:
         raise CensusError(
             "runner v2 provenance field closure differs: "
@@ -1136,8 +1229,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         raise CensusError("scalar provenance disposition is not executed")
     if fields["shared_ordered_many"] not in {"true", "false"}:
         raise CensusError("scalar provenance has an invalid shared ordered-many flag")
-    if fields["required_comparators"] != "rust-regex-1.12.4,fre-current-runtime":
-        raise CensusError("scalar provenance comparator set differs")
+    frozen_schedule_validation(fields)
     if fields["prepare_scope"] != "runtime-handle-state" or fields[
         "object_descriptor_setup"
     ] != "authenticated-v3-when-required":
@@ -2638,8 +2730,7 @@ def validate_v3_provenance(
     """Validate the exact raw v3 field set and composite topology."""
     if fields.get("disposition") != "executed":
         raise CensusError("composite provenance disposition is not executed")
-    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
-        raise CensusError("composite provenance comparator set differs")
+    frozen_schedule_validation(fields)
     for name in ("compiler_version", "optimizer_version"):
         try:
             value = int(fields[name], 10)
@@ -2652,7 +2743,7 @@ def validate_v3_provenance(
         "source_commit", "source_tree", "target", "feature_bits",
         "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
         "component_count", "boundary", "required_comparators",
-    }
+    } | FROZEN_VALIDATION_FIELDS
     component_fields = {
         f"component_{index}_{suffix}"
         for index in range(len(components))
@@ -2796,8 +2887,7 @@ def validate_v4_provenance(
     """Validate the closed one-pattern native-capture v4 contracts."""
     if fields.get("disposition") != "executed":
         raise CensusError("native-capture provenance disposition is not executed")
-    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
-        raise CensusError("native-capture provenance comparator set differs")
+    frozen_schedule_validation(fields)
     for name in ("compiler_version", "optimizer_version"):
         parse_canonical_decimal(
             fields.get(name), f"native-capture provenance {name}", 1, (1 << 32) - 1
@@ -2816,7 +2906,7 @@ def validate_v4_provenance(
         "native_row_bridge", "uniform_capture_bridge", "strict_capture_bridge",
         "source_pattern_count", "row_total_object_bytes", "source_to_artifact",
         "component_count", "capture_resolution", "boundary", "required_comparators",
-    }
+    } | FROZEN_VALIDATION_FIELDS
     component_fields = {
         f"component_0_{suffix}"
         for suffix in (
@@ -3258,8 +3348,7 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
     """Validate the exact one-call, one-source reducer provenance closure."""
     if fields.get("disposition") != "executed":
         raise CensusError("single-capture reducer provenance disposition is not executed")
-    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
-        raise CensusError("single-capture reducer provenance comparator set differs")
+    frozen_schedule_validation(fields)
     for name in ("compiler_version", "optimizer_version"):
         parse_canonical_decimal(
             fields.get(name), f"single-capture reducer provenance {name}",
@@ -3312,7 +3401,7 @@ def validate_v5_provenance(fields: dict[str, str]) -> None:
         "reducer_symbol_sha256", "object_sha256", "object_bytes",
         "max_object_bytes", "artifact_identity_sha256", "required_runtime_symbols",
         "operation_entry_symbol", "boundary", "required_comparators",
-    }
+    } | FROZEN_VALIDATION_FIELDS
     route_fields = {
         "exact-span-participation-v1": {
             "participation_algorithm_id", "participation_strategy",
@@ -3672,6 +3761,7 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             "target", "feature_bits",
         )
     }
+    common["validation"] = frozen_schedule_validation(fields)
     if fields["schema"] == "fre.aot.rebar-runner.v2":
         shared_ordered_many = fields["shared_ordered_many"] == "true"
         prepared_grep_v15 = (
@@ -4329,6 +4419,16 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         ],
     }
     normalized_provenance = provenance_receipt(primary_fields)
+    frozen_expected, frozen_comparator = frozen_job_expectation(plan, job)
+    validation = normalized_provenance["validation"]
+    if (
+        validation["expected_value"] != frozen_expected
+        or validation["expected_comparator"] != frozen_comparator
+        or validation["schedule_klv_sha256"] != job["candidate_klv"]["sha256"]
+    ):
+        raise CensusError(
+            "runner frozen value/comparator/KLV binding differs from the sealed plan"
+        )
     if normalized_provenance["kind"] in {
         "composite-v3", "strict-capture-v4", "participation-capture-v4",
         "selector-capture-fallback-v4", "shared-ordered-many-v2",
@@ -5704,6 +5804,42 @@ def validate_normalized_single_capture_reducer(
             raise CensusError(f"{context} CaptureNext source identity closure differs")
 
 
+def validate_normalized_frozen_validation(validation: object, context: str) -> None:
+    if not isinstance(validation, dict):
+        raise CensusError(f"{context} is not an object")
+    require_exact_keys(validation, {
+        "authority", "expected_value", "expected_comparator",
+        "schedule_klv_sha256", "schedule_binding_sha256", "stock_comparator",
+        "stock_divergence_policy",
+    }, context)
+    expected_value = validation["expected_value"]
+    expected_comparator = validation["expected_comparator"]
+    if validation["authority"] != "frozen-public-schedule-v1":
+        raise CensusError(f"{context} authority differs")
+    if (
+        not isinstance(expected_value, int)
+        or isinstance(expected_value, bool)
+        or not 0 <= expected_value <= (1 << 64) - 1
+    ):
+        raise CensusError(f"{context} expected value is not u64")
+    if (
+        not isinstance(expected_comparator, str)
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._/+:\-]{0,127}", expected_comparator
+        ) is None
+    ):
+        raise CensusError(f"{context} expected comparator differs")
+    for field in ("schedule_klv_sha256", "schedule_binding_sha256"):
+        require_hex64(validation[field], f"{context} {field}")
+        if validation[field] == "0" * 64:
+            raise CensusError(f"{context} {field} is zero")
+    if (
+        validation["stock_comparator"] != "rust-regex-1.12.4"
+        or validation["stock_divergence_policy"] != "report-only"
+    ):
+        raise CensusError(f"{context} stock diagnostic policy differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -5715,6 +5851,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
         "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
+        "validation",
     }
     if provenance.get("kind") == "strict-capture-v4":
         expected_keys.add("strict_capture")
@@ -5739,6 +5876,9 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         expected_keys.add("prepared_v15_limits")
     require_exact_keys(provenance, expected_keys, context)
+    validate_normalized_frozen_validation(
+        provenance["validation"], f"{context} validation"
+    )
     if not isinstance(provenance["components"], list):
         raise CensusError(f"{context} components are not a list")
     for index, component in enumerate(provenance["components"]):
@@ -6452,6 +6592,17 @@ def validate_receipt(
             or provenance["benchmark"] != planned["benchmark"]
         ):
             raise CensusError("qualification provenance differs from its sealed job")
+        frozen_expected, frozen_comparator = frozen_job_expectation(plan, planned)
+        validation = provenance["validation"]
+        if (
+            validation["expected_value"] != frozen_expected
+            or validation["expected_comparator"] != frozen_comparator
+            or validation["schedule_klv_sha256"]
+            != planned["candidate_klv"]["sha256"]
+        ):
+            raise CensusError(
+                "qualification frozen value/comparator/KLV binding differs from its plan"
+            )
         validate_provenance_job_binding(provenance, planned["input"])
         expected_object_hashes = (
             [provenance["object_sha256"]]

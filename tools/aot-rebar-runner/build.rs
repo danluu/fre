@@ -9,19 +9,34 @@ mod shared;
 use std::{env, fmt::Write as _, fs, path::PathBuf};
 
 use fre_aot_regex::{CpuFeature, FeatureSet};
+use sha2::{Digest, Sha256};
 
 const KLV_ENV: &str = "FRE_AOT_REBAR_KLV";
 const FEATURES_ENV: &str = "FRE_AOT_REBAR_FEATURES";
 const SOURCE_COMMIT_ENV: &str = "FRE_AOT_REBAR_SOURCE_COMMIT";
 const SOURCE_TREE_ENV: &str = "FRE_AOT_REBAR_SOURCE_TREE";
+const EXPECTED_VALUE_ENV: &str = "FRE_AOT_REBAR_EXPECTED_VALUE";
+const EXPECTED_COMPARATOR_ENV: &str = "FRE_AOT_REBAR_EXPECTED_COMPARATOR";
 const GENERATED_FILE: &str = "linked_artifact.rs";
 const OBJECT_FILE: &str = "aot-rebar-artifact.o";
+
+#[derive(Debug)]
+struct ExpectedBinding {
+    validation_authority: &'static str,
+    expected_value_sealed: bool,
+    expected_value: u64,
+    expected_comparator: String,
+    schedule_klv_sha256: [u8; 32],
+    schedule_binding_sha256: [u8; 32],
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed={KLV_ENV}");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={SOURCE_COMMIT_ENV}");
     println!("cargo:rerun-if-env-changed={SOURCE_TREE_ENV}");
+    println!("cargo:rerun-if-env-changed={EXPECTED_VALUE_ENV}");
+    println!("cargo:rerun-if-env-changed={EXPECTED_COMPARATOR_ENV}");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     let object_path = output.join(OBJECT_FILE);
     let generated_path = output.join(GENERATED_FILE);
@@ -44,6 +59,11 @@ fn main() {
         shared::MAX_KLV_BYTES
     );
     let benchmark = shared::Benchmark::parse(&bytes).expect("parse public Rebar build KLV");
+    let expected_binding = expected_binding(&bytes);
+    let append_validation_binding = || {
+        append_expected_binding(&generated_path, &expected_binding)
+            .expect("append linked validation-authority bindings");
+    };
     let feature_bits = parse_features(
         env::var(FEATURES_ENV)
             .unwrap_or_else(|_| "none".to_owned())
@@ -88,6 +108,7 @@ fn main() {
             ),
         )
         .expect("write linked regex-redux bindings");
+        append_validation_binding();
         for component_path in object_paths {
             println!(
                 "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
@@ -134,6 +155,7 @@ fn main() {
                     ),
                 )
                 .expect("write linked native uniform-capture reducer bindings");
+                append_validation_binding();
                 println!(
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
                     object_path.display()
@@ -171,6 +193,7 @@ fn main() {
                     ),
                 )
                 .expect("write linked uniform-capture bindings");
+                append_validation_binding();
                 for row_path in object_paths {
                     println!(
                         "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
@@ -212,6 +235,7 @@ fn main() {
                     ),
                 )
                 .expect("write linked prepared uniform-capture bindings");
+                append_validation_binding();
                 println!(
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
                     object_path.display()
@@ -247,6 +271,7 @@ fn main() {
                             ),
                         )
                         .expect("write linked selector-first capture bindings");
+                        append_validation_binding();
                     }
                     Err(error) => {
                         panic!("compile exact-span participation capture bridge: {error}")
@@ -274,6 +299,7 @@ fn main() {
                                 ),
                             )
                             .expect("write linked participation capture bindings");
+                            append_validation_binding();
                         }
                         shared::ParticipationCaptureBridgeDisposition::Declined { .. } => {
                             let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
@@ -299,6 +325,7 @@ fn main() {
                                 ),
                             )
                             .expect("write linked strict capture bindings");
+                            append_validation_binding();
                         }
                     },
                 }
@@ -367,6 +394,7 @@ fn main() {
                     ),
                 )
                 .expect("write linked shared ordered-many bindings");
+                append_validation_binding();
                 println!(
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
                     object_path.display()
@@ -402,6 +430,7 @@ fn main() {
             ),
         )
         .expect("write linked general AOT native-row bindings");
+        append_validation_binding();
         for row_path in object_paths {
             println!(
                 "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
@@ -459,6 +488,7 @@ fn main() {
         ),
     )
     .expect("write linked general AOT bindings");
+    append_validation_binding();
     println!(
         "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
         object_path.display()
@@ -485,6 +515,104 @@ fn parse_features(value: &str) -> u64 {
         features = features.with(feature);
     }
     features.bits()
+}
+
+fn expected_binding(klv: &[u8]) -> ExpectedBinding {
+    let (expected_value_text, expected_comparator) = match (
+        env::var_os(EXPECTED_VALUE_ENV),
+        env::var_os(EXPECTED_COMPARATOR_ENV),
+    ) {
+        (None, None) => {
+            return ExpectedBinding {
+                validation_authority: shared::STOCK_UNSEALED_AUTHORITY,
+                expected_value_sealed: false,
+                expected_value: 0,
+                expected_comparator: shared::STOCK_RUST_COMPARATOR.to_owned(),
+                schedule_klv_sha256: [0; 32],
+                schedule_binding_sha256: [0; 32],
+            };
+        }
+        (Some(value), Some(comparator)) => (value, comparator),
+        _ => panic!("{EXPECTED_VALUE_ENV} and {EXPECTED_COMPARATOR_ENV} must be set together"),
+    };
+    let expected_value_text = expected_value_text
+        .into_string()
+        .unwrap_or_else(|_| panic!("{EXPECTED_VALUE_ENV} must be valid UTF-8"));
+    let expected_comparator = expected_comparator
+        .into_string()
+        .unwrap_or_else(|_| panic!("{EXPECTED_COMPARATOR_ENV} must be valid UTF-8"));
+    let expected_value = expected_value_text
+        .parse::<u64>()
+        .unwrap_or_else(|error| panic!("{EXPECTED_VALUE_ENV} is not a canonical u64: {error}"));
+    assert_eq!(
+        expected_value_text,
+        expected_value.to_string(),
+        "{EXPECTED_VALUE_ENV} is not canonical unsigned decimal"
+    );
+    shared::validate_expected_comparator(&expected_comparator)
+        .unwrap_or_else(|error| panic!("invalid {EXPECTED_COMPARATOR_ENV}: {error}"));
+    let digest = Sha256::digest(klv);
+    let mut schedule_klv_sha256 = [0_u8; 32];
+    schedule_klv_sha256.copy_from_slice(&digest);
+    let schedule_binding_sha256 = shared::frozen_schedule_binding_sha256(
+        schedule_klv_sha256,
+        expected_value,
+        &expected_comparator,
+    )
+    .expect("validated frozen expected binding");
+    ExpectedBinding {
+        validation_authority: shared::FROZEN_SCHEDULE_AUTHORITY,
+        expected_value_sealed: true,
+        expected_value,
+        expected_comparator,
+        schedule_klv_sha256,
+        schedule_binding_sha256,
+    }
+}
+
+fn append_expected_binding(
+    generated_path: &std::path::Path,
+    binding: &ExpectedBinding,
+) -> std::io::Result<()> {
+    let mut source = String::new();
+    writeln!(
+        source,
+        "pub const VALIDATION_AUTHORITY: &str = {:?};",
+        binding.validation_authority
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_VALUE_SEALED: bool = {};",
+        binding.expected_value_sealed
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_VALUE: u64 = {};",
+        binding.expected_value
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const EXPECTED_COMPARATOR: &str = {:?};",
+        binding.expected_comparator
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SCHEDULE_KLV_SHA256: [u8; 32] = {:?};",
+        binding.schedule_klv_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SCHEDULE_BINDING_SHA256: [u8; 32] = {:?};",
+        binding.schedule_binding_sha256
+    )
+    .unwrap();
+    let mut generated = fs::OpenOptions::new().append(true).open(generated_path)?;
+    std::io::Write::write_all(&mut generated, source.as_bytes())
 }
 
 #[allow(
@@ -3021,6 +3149,12 @@ pub const SELECTOR_CAPTURE_DIRECT_LIMIT: usize = 0;
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
+pub const VALIDATION_AUTHORITY: &str = "stock-rust-unsealed-v1";
+pub const EXPECTED_VALUE_SEALED: bool = false;
+pub const EXPECTED_VALUE: u64 = 0;
+pub const EXPECTED_COMPARATOR: &str = "rust-regex-1.12.4";
+pub const SCHEDULE_KLV_SHA256: [u8; 32] = [0; 32];
+pub const SCHEDULE_BINDING_SHA256: [u8; 32] = [0; 32];
 pub const PREPARE_OPERATION_FLAGS: u64 = 0;
 pub const PREPARE_CONFIG_VERSION: u32 = 2;
 pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;

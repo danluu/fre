@@ -126,6 +126,12 @@ struct RegexReduxRun {
     receipt: RegexReduxStageReceipt,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationAuthority {
+    FrozenSchedule,
+    StockUnsealed,
+}
+
 #[derive(Debug)]
 struct ExclusiveSession {
     handle: FreAotRegexExclusiveHandleV1,
@@ -1307,8 +1313,9 @@ fn main() -> Result<(), DynError> {
     if u64::try_from(input.len()).map_or(true, |length| length > shared::MAX_KLV_BYTES) {
         return Err(format!("KLV input exceeds {} bytes", shared::MAX_KLV_BYTES).into());
     }
+    let input_sha256 = sha256(&input);
     let benchmark = shared::Benchmark::parse(&input)?;
-    authenticate_benchmark(&benchmark)?;
+    let validation_authority = authenticate_benchmark(&benchmark, input_sha256)?;
     authenticate_linked_route(&benchmark)?;
     let target =
         shared::target_from_parts(linked::TARGET_ARCH, linked::TARGET_OS, linked::FEATURE_BITS)?;
@@ -1329,18 +1336,43 @@ fn main() -> Result<(), DynError> {
         session.destroy()?;
         (samples, None)
     };
-    let expected = rust_oracle(&benchmark)?;
-    if let Some(actual_receipt) = regex_redux_receipt {
-        let expected_receipt = rust_regex_redux_oracle(&benchmark.haystack)?;
-        if actual_receipt != expected_receipt {
-            return Err(format!(
-                "linked AOT regex-redux stage receipt {actual_receipt:?} differs from independent Rust receipt {expected_receipt:?}"
-            )
-            .into());
+    let mut stock_receipt_diverged = false;
+    let stock_value = if let Some(actual_receipt) = regex_redux_receipt {
+        match rust_regex_redux_oracle(&benchmark.haystack) {
+            Ok(stock_receipt) => {
+                stock_receipt_diverged = actual_receipt != stock_receipt;
+                Ok(stock_receipt.final_length)
+            }
+            Err(error) => Err(error),
         }
-    }
+    } else {
+        rust_oracle(&benchmark)
+    };
+    let expected = match validation_authority {
+        ValidationAuthority::FrozenSchedule => {
+            report_stock_comparator(&benchmark, &stock_value);
+            if stock_receipt_diverged {
+                report_stock_receipt_divergence(&benchmark);
+            }
+            linked::EXPECTED_VALUE
+        }
+        ValidationAuthority::StockUnsealed => {
+            if stock_receipt_diverged {
+                return Err(
+                    "linked AOT regex-redux stage receipt differs from the authoritative independent Rust receipt"
+                        .into(),
+                );
+            }
+            stock_value?
+        }
+    };
     for sample in &samples {
-        require_expected(sample.value, expected)?;
+        require_expected(
+            sample.value,
+            expected,
+            linked::EXPECTED_COMPARATOR,
+            validation_authority == ValidationAuthority::FrozenSchedule,
+        )?;
     }
 
     if !arguments.quiet {
@@ -1374,6 +1406,23 @@ fn parse_arguments() -> Result<Arguments, DynError> {
 }
 
 fn print_provenance() {
+    let stock_divergence_policy = match linked::VALIDATION_AUTHORITY {
+        shared::FROZEN_SCHEDULE_AUTHORITY => "report-only",
+        shared::STOCK_UNSEALED_AUTHORITY => "fatal",
+        _ => "invalid",
+    };
+    let required_comparators = format!("{},fre-current-runtime", linked::EXPECTED_COMPARATOR);
+    let validation_binding = format!(
+        "validation_authority={} expected_value_sealed={} expected_value={} expected_comparator={} schedule_klv_sha256={} schedule_binding_sha256={} stock_comparator={} stock_divergence_policy={}",
+        linked::VALIDATION_AUTHORITY,
+        linked::EXPECTED_VALUE_SEALED,
+        linked::EXPECTED_VALUE,
+        linked::EXPECTED_COMPARATOR,
+        hex(&linked::SCHEDULE_KLV_SHA256),
+        hex(&linked::SCHEDULE_BINDING_SHA256),
+        shared::STOCK_RUST_COMPARATOR,
+        stock_divergence_policy,
+    );
     if linked::EXPECTED_MODEL == "regex-redux" {
         let mut provenance = String::new();
         write!(
@@ -1408,7 +1457,7 @@ fn print_provenance() {
             .expect("format regex-redux component provenance");
         }
         println!(
-            "{provenance} reducer_symbol={} operation_identity_sha256={} reducer_code_sha256={} reducer_data_sha256={} reducer_object_sha256={} reducer_relocation_count={} reducer_link_symbols={} semantic_runtime_symbols={} abi_version={} request_bytes={} receipt_bytes={} report_bytes={} scratch_buffer_count={} scratch_capacity_numerator={} scratch_capacity_denominator={} receipt_schema={} report_schema={} boundary=single-call-native-regex-redux-reducer required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            "{provenance} reducer_symbol={} operation_identity_sha256={} reducer_code_sha256={} reducer_data_sha256={} reducer_object_sha256={} reducer_relocation_count={} reducer_link_symbols={} semantic_runtime_symbols={} abi_version={} request_bytes={} receipt_bytes={} report_bytes={} scratch_buffer_count={} scratch_capacity_numerator={} scratch_capacity_denominator={} receipt_schema={} report_schema={} boundary=single-call-native-regex-redux-reducer required_comparators={required_comparators} {validation_binding}",
             linked::REDUCER_SYMBOL,
             hex(&linked::REGEX_REDUX_OPERATION_IDENTITY_SHA256),
             hex(&linked::REGEX_REDUX_REDUCER_CODE_SHA256),
@@ -1522,13 +1571,13 @@ fn print_provenance() {
         }
         .expect("format single-capture reducer source provenance");
         println!(
-            "{provenance} boundary=single-call-helper-free-single-capture-whole-operation-reducer required_comparators=rust-regex-1.12.4,fre-current-runtime"
+            "{provenance} boundary=single-call-helper-free-single-capture-whole-operation-reducer required_comparators={required_comparators} {validation_binding}"
         );
         return;
     }
     if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         println!(
-            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=false selector_capture_fallback_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-selector-negative-certificate-with-stock-positive-capture-fallback-v1 positive_fallback_profile={} positive_fallback_symbol={} direct_participation_resource={} direct_participation_required={} direct_participation_limit={} boundary=per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=false selector_capture_fallback_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-selector-negative-certificate-with-stock-positive-capture-fallback-v1 positive_fallback_profile={} positive_fallback_symbol={} direct_participation_resource={} direct_participation_required={} direct_participation_limit={} boundary=per-line-native-span-negative-certificate-with-trap-visible-stock-positive-capture-fallback required_comparators={required_comparators} {validation_binding}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1556,7 +1605,7 @@ fn print_provenance() {
     }
     if linked::PARTICIPATION_CAPTURE_BRIDGE {
         println!(
-            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-exact-span-participation-dfa-v1 capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=false participation_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-exact-span-participation-dfa-v1 capture_group_count={} participation_algorithm_id={} participation_strategy={} participation_semantic_runtime_calls={} participation_assertions={} participation_assertion_signatures={} participation_byte_classes={} participation_dfa_states={} participation_transition_cells={} participation_build_work={} participation_scratch_bytes={} participation_plan_bytes={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} selector_object_sha256={} participation_bundle_sha256={} participation_export_identity_sha256={} participation_object_sha256={} capture_artifact_identity_sha256={} participation_bundle_symbol={} capture_selector_symbol={} participation_entry_symbol={} boundary=native-span-selector-with-helper-free-exact-span-participation-replay required_comparators={required_comparators} {validation_binding}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1602,7 +1651,7 @@ fn print_provenance() {
     }
     if linked::STRICT_CAPTURE_BRIDGE {
         println!(
-            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-onepass-capture-next-v1 capture_group_count={} capture_can_match_empty={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} capture_plan_sha256={} capture_bundle_sha256={} capture_artifact_identity_sha256={} capture_materialize_symbol={} capture_selector_symbol={} boundary=native-search-core-with-native-capture-materialization-adapter-loop required_comparators=rust-regex-1.12.4,fre-current-runtime",
+            "schema=fre.aot.rebar-runner.v4 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=false strict_capture_bridge=true source_pattern_count=1 row_total_object_bytes={} source_to_artifact=0 component_count=1 component_0_native=true component_0_source_ordinal=0 component_0_entry_symbol={} component_0_runtime_symbols= component_0_program_sha256={} component_0_object_sha256={} capture_resolution=native-onepass-capture-next-v1 capture_group_count={} capture_can_match_empty={} capture_source_sha256={} capture_selector_sha256={} capture_program_sha256={} capture_plan_sha256={} capture_bundle_sha256={} capture_artifact_identity_sha256={} capture_materialize_symbol={} capture_selector_symbol={} boundary=native-search-core-with-native-capture-materialization-adapter-loop required_comparators={required_comparators} {validation_binding}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1749,7 +1798,7 @@ fn print_provenance() {
             "complete-native-row-bridge"
         };
         println!(
-            "{provenance} boundary={boundary} required_comparators=rust-regex-1.12.4,fre-current-runtime"
+            "{provenance} boundary={boundary} required_comparators={required_comparators} {validation_binding}"
         );
         return;
     }
@@ -1784,7 +1833,7 @@ fn print_provenance() {
         "runtime-klv-warmup-schedule"
     };
     println!(
-        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators={required_comparators} {validation_binding}",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -1825,7 +1874,38 @@ fn print_provenance() {
     );
 }
 
-fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
+fn authenticate_benchmark(
+    benchmark: &shared::Benchmark,
+    runtime_klv_sha256: [u8; 32],
+) -> Result<ValidationAuthority, String> {
+    let validation_authority = match linked::VALIDATION_AUTHORITY {
+        shared::FROZEN_SCHEDULE_AUTHORITY => {
+            if !linked::EXPECTED_VALUE_SEALED {
+                return Err("frozen schedule authority is marked unsealed".to_owned());
+            }
+            shared::authenticate_frozen_schedule_binding(
+                runtime_klv_sha256,
+                linked::EXPECTED_VALUE,
+                linked::EXPECTED_COMPARATOR,
+                linked::SCHEDULE_KLV_SHA256,
+                linked::SCHEDULE_BINDING_SHA256,
+            )?;
+            ValidationAuthority::FrozenSchedule
+        }
+        shared::STOCK_UNSEALED_AUTHORITY => {
+            if linked::EXPECTED_VALUE_SEALED
+                || linked::EXPECTED_VALUE != 0
+                || linked::EXPECTED_COMPARATOR != shared::STOCK_RUST_COMPARATOR
+                || linked::SCHEDULE_KLV_SHA256 != [0; 32]
+                || linked::SCHEDULE_BINDING_SHA256 != [0; 32]
+            {
+                return Err("stock-authoritative validation metadata is not canonically unsealed"
+                    .to_owned());
+            }
+            ValidationAuthority::StockUnsealed
+        }
+        other => return Err(format!("unknown linked validation authority {other:?}")),
+    };
     let pattern_identity_is_valid = if linked::EXPECTED_MODEL == "regex-redux" {
         !linked::NATIVE_ROW_BRIDGE
             && linked::EXPECTED_PATTERN.is_empty()
@@ -1858,7 +1938,7 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
         max_warmup_time: Duration::ZERO,
     };
     if benchmark.same_compilation_identity(&expected) {
-        Ok(())
+        Ok(validation_authority)
     } else {
         Err("runtime KLV compilation identity differs from linked AOT artifact".to_owned())
     }
@@ -4150,12 +4230,73 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
     }
 }
 
-fn require_expected(actual: u64, expected: u64) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StockComparatorDisposition {
+    Agrees,
+    Diverges(u64),
+    Unavailable,
+}
+
+fn stock_comparator_disposition(
+    expected: u64,
+    stock: &Result<u64, String>,
+) -> StockComparatorDisposition {
+    match stock {
+        Ok(actual) if *actual == expected => StockComparatorDisposition::Agrees,
+        Ok(actual) => StockComparatorDisposition::Diverges(*actual),
+        Err(_) => StockComparatorDisposition::Unavailable,
+    }
+}
+
+fn report_stock_comparator(benchmark: &shared::Benchmark, stock: &Result<u64, String>) {
+    match stock_comparator_disposition(linked::EXPECTED_VALUE, stock) {
+        StockComparatorDisposition::Agrees => {}
+        StockComparatorDisposition::Diverges(observed) => eprintln!(
+            "schema=fre.aot.rebar-runner.stock-comparator.v1 status=diverged comparator={} expected_comparator={} expected_value={} observed_value={} benchmark={:?} model={}",
+            shared::STOCK_RUST_COMPARATOR,
+            linked::EXPECTED_COMPARATOR,
+            linked::EXPECTED_VALUE,
+            observed,
+            benchmark.name,
+            benchmark.model.name(),
+        ),
+        StockComparatorDisposition::Unavailable => eprintln!(
+            "schema=fre.aot.rebar-runner.stock-comparator.v1 status=unavailable comparator={} expected_comparator={} expected_value={} benchmark={:?} model={}",
+            shared::STOCK_RUST_COMPARATOR,
+            linked::EXPECTED_COMPARATOR,
+            linked::EXPECTED_VALUE,
+            benchmark.name,
+            benchmark.model.name(),
+        ),
+    }
+}
+
+fn report_stock_receipt_divergence(benchmark: &shared::Benchmark) {
+    eprintln!(
+        "schema=fre.aot.rebar-runner.stock-comparator.v1 status=receipt-diverged comparator={} expected_comparator={} expected_value={} benchmark={:?} model={}",
+        shared::STOCK_RUST_COMPARATOR,
+        linked::EXPECTED_COMPARATOR,
+        linked::EXPECTED_VALUE,
+        benchmark.name,
+        benchmark.model.name(),
+    );
+}
+
+fn require_expected(
+    actual: u64,
+    expected: u64,
+    comparator: &str,
+    frozen: bool,
+) -> Result<(), String> {
     if actual == expected {
         Ok(())
+    } else if frozen {
+        Err(format!(
+            "linked AOT reducer returned {actual}, frozen {comparator} schedule expected {expected}"
+        ))
     } else {
         Err(format!(
-            "linked AOT reducer returned {actual}, Rust Rebar oracle returned {expected}"
+            "linked AOT reducer returned {actual}, authoritative {comparator} oracle returned {expected}"
         ))
     }
 }
@@ -4203,6 +4344,33 @@ mod tests {
             max_time: Duration::from_secs(1),
             max_warmup_time: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn frozen_expected_value_is_authoritative_over_divergent_stock() {
+        let stock = Ok(2);
+        assert_eq!(
+            stock_comparator_disposition(1, &stock),
+            StockComparatorDisposition::Diverges(2)
+        );
+        require_expected(1, 1, "re2-2025-11-05", true)
+            .expect("candidate agrees with frozen public schedule");
+        let error = require_expected(2, 1, "re2-2025-11-05", true)
+            .expect_err("candidate must not inherit stock divergence");
+        assert!(error.contains("frozen re2-2025-11-05 schedule expected 1"));
+        assert_eq!(
+            stock_comparator_disposition(1, &Err("synthetic".to_owned())),
+            StockComparatorDisposition::Unavailable
+        );
+    }
+
+    #[test]
+    fn ordinary_unsealed_validation_remains_stock_authoritative() {
+        require_expected(2, 2, shared::STOCK_RUST_COMPARATOR, false)
+            .expect("candidate agrees with stock");
+        let error = require_expected(1, 2, shared::STOCK_RUST_COMPARATOR, false)
+            .expect_err("ordinary build must retain stock authority");
+        assert!(error.contains("authoritative rust-regex-1.12.4 oracle returned 2"));
     }
 
     #[test]

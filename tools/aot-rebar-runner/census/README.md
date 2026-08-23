@@ -18,6 +18,15 @@ and first/steady replication produces a larger raw schedule-point population;
 the plan seals those exact point IDs and their hash separately and never uses
 that raw count in place of 311.
 
+Every runtime job also has one frozen scalar authority. The controller rejects
+conflicting values across its replicated points and chooses
+`re2-2025-11-05` when that comparator is present, otherwise the pinned
+`rust-regex-1.12.4`; no benchmark-specific exception is allowed. Formal
+provenance must be `frozen-public-schedule-v1`, carry that exact scalar and
+comparator, and seal the byte-for-byte candidate KLV SHA-256 in a nonzero
+combined binding. Ordinary `stock-rust-unsealed-v1` builds remain supported by
+the runner for compatibility, but are categorically census-ineligible.
+
 Every runtime job remains in the headline denominator. Unsupported models,
 build/link failures, timeouts, missing receipts, wrong answers, helper-backed
 execution, and failed controls are nonnative outcomes. The summary reports:
@@ -133,7 +142,10 @@ design step.
 
 Build every exact-adapter job twice in independent, empty target directories,
 with the plan's commit/tree, target, feature set, public build KLV, locked
-dependencies, and `CARGO_INCREMENTAL=0`. The final runner must export its
+dependencies, `CARGO_INCREMENTAL=0`, and both
+`FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` selected
+from the sealed plan. Setting only one value or omitting the frozen authority
+must fail qualification. The final runner must export its
 symbols to the dynamic symbol table (`-Wl,--export-dynamic` on ELF;
 `-Wl,-export_dynamic` on Mach-O), because inability to arm a symbol is a failed
 qualification, not permission to omit it. Preserve each runner and

@@ -869,6 +869,29 @@
         }
       }
     },
+    "frozenValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority", "expected_value", "expected_comparator",
+        "schedule_klv_sha256", "schedule_binding_sha256", "stock_comparator",
+        "stock_divergence_policy"
+      ],
+      "properties": {
+        "authority": { "const": "frozen-public-schedule-v1" },
+        "expected_value": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "expected_comparator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/+:\\-]{0,127}$"
+        },
+        "schedule_klv_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "schedule_binding_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "stock_comparator": { "const": "rust-regex-1.12.4" },
+        "stock_divergence_policy": { "const": "report-only" }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -879,7 +902,8 @@
         "aggregate_strategy", "uniform_capture", "shared_ordered_many",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
-        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
+        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
+        "validation"
       ],
       "properties": {
         "schema": {
@@ -895,6 +919,7 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
+        "validation": { "$ref": "#/$defs/frozenValidation" },
         "kind": {
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",

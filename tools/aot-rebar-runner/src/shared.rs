@@ -32,6 +32,17 @@ use fre_syntax::{parse, CanonicalPattern, CompatibilityProfile, ParseRequest, Ru
 use sha2::{Digest, Sha256};
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
+/// The pinned Rust comparator used by ordinary, unsealed configured builds
+/// and retained as an independent diagnostic for frozen public schedules.
+pub const STOCK_RUST_COMPARATOR: &str = "rust-regex-1.12.4";
+/// Runtime/provenance token for a value and comparator sealed by the public
+/// schedule before the candidate is built.
+pub const FROZEN_SCHEDULE_AUTHORITY: &str = "frozen-public-schedule-v1";
+/// Runtime/provenance token for the backwards-compatible stock-authoritative
+/// path. This mode is deliberately not a frozen-schedule qualification.
+pub const STOCK_UNSEALED_AUTHORITY: &str = "stock-rust-unsealed-v1";
+/// Maximum byte length of a provenance-safe frozen comparator identifier.
+pub const MAX_EXPECTED_COMPARATOR_BYTES: usize = 128;
 /// Maximum source rows accepted by the additive independent-native-row bridge.
 ///
 /// This matches the ordinary multi-pattern facade's default construction
@@ -596,6 +607,83 @@ pub struct Benchmark {
     pub max_warmup_iters: u64,
     pub max_time: Duration,
     pub max_warmup_time: Duration,
+}
+
+/// Validate one frozen public-schedule comparator identifier.
+///
+/// The identifier is emitted as one unquoted provenance token. Restricting it
+/// to a small ASCII alphabet keeps that record unambiguous while permitting
+/// versioned names such as `re2-2025-11-05` and `rust-regex-1.12.4`.
+pub fn validate_expected_comparator(comparator: &str) -> Result<(), String> {
+    let bytes = comparator.as_bytes();
+    if bytes.is_empty() {
+        return Err("frozen expected comparator is missing".to_owned());
+    }
+    if bytes.len() > MAX_EXPECTED_COMPARATOR_BYTES {
+        return Err(format!(
+            "frozen expected comparator exceeds {MAX_EXPECTED_COMPARATOR_BYTES} bytes"
+        ));
+    }
+    if !bytes[0].is_ascii_alphanumeric()
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'/' | b'+' | b':')
+        })
+    {
+        return Err(
+            "frozen expected comparator is not a provenance-safe ASCII identifier".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Bind an exact public Rebar execution KLV to its frozen expected scalar and
+/// the independently selected comparator that established that scalar.
+///
+/// The KLV digest covers the complete byte-for-byte schedule, including its
+/// haystack and iteration/time limits. The domain separator and length prefix
+/// make the binding format stable and unambiguous.
+pub fn frozen_schedule_binding_sha256(
+    klv_sha256: [u8; 32],
+    expected_value: u64,
+    expected_comparator: &str,
+) -> Result<[u8; 32], String> {
+    validate_expected_comparator(expected_comparator)?;
+    let comparator_len = u64::try_from(expected_comparator.len())
+        .map_err(|_| "frozen expected comparator length does not fit u64".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(b"fre.aot.rebar-runner.frozen-schedule.v1\0");
+    digest.update(klv_sha256);
+    digest.update(expected_value.to_le_bytes());
+    digest.update(comparator_len.to_le_bytes());
+    digest.update(expected_comparator.as_bytes());
+    let bytes = digest.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&bytes);
+    Ok(output)
+}
+
+/// Authenticate the complete runtime schedule against build-sealed expected
+/// metadata. Missing metadata, a changed KLV, or a field/digest mismatch is a
+/// terminal error; there is no benchmark-name or pattern-specific fallback.
+pub fn authenticate_frozen_schedule_binding(
+    runtime_klv_sha256: [u8; 32],
+    expected_value: u64,
+    expected_comparator: &str,
+    sealed_klv_sha256: [u8; 32],
+    sealed_binding_sha256: [u8; 32],
+) -> Result<(), String> {
+    if sealed_klv_sha256 == [0; 32] || sealed_binding_sha256 == [0; 32] {
+        return Err("frozen schedule binding is missing".to_owned());
+    }
+    if runtime_klv_sha256 != sealed_klv_sha256 {
+        return Err("runtime KLV differs from the frozen build schedule".to_owned());
+    }
+    let authenticated =
+        frozen_schedule_binding_sha256(sealed_klv_sha256, expected_value, expected_comparator)?;
+    if authenticated != sealed_binding_sha256 {
+        return Err("frozen expected value or comparator binding was tampered".to_owned());
+    }
+    Ok(())
 }
 
 impl Benchmark {
@@ -3186,6 +3274,69 @@ fn required<T>(value: Option<T>, key: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_schedule_binding_rejects_missing_and_tampered_fields() {
+        let klv = [0x11; 32];
+        let expected_value = 1;
+        let comparator = "re2-2025-11-05";
+        let binding = frozen_schedule_binding_sha256(klv, expected_value, comparator)
+            .expect("valid frozen schedule binding");
+        authenticate_frozen_schedule_binding(
+            klv,
+            expected_value,
+            comparator,
+            klv,
+            binding,
+        )
+        .expect("exact frozen schedule metadata");
+        assert!(
+            authenticate_frozen_schedule_binding(
+                [0x22; 32],
+                expected_value,
+                comparator,
+                klv,
+                binding,
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_frozen_schedule_binding(
+                klv,
+                expected_value.saturating_add(1),
+                comparator,
+                klv,
+                binding,
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_frozen_schedule_binding(
+                klv,
+                expected_value,
+                "re2-2025-11-06",
+                klv,
+                binding,
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_frozen_schedule_binding(klv, expected_value, comparator, klv, [0; 32])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn frozen_comparator_identifier_is_one_safe_provenance_token() {
+        for comparator in ["re2-2025-11-05", "rust/regex-1.12.4", "reference:v1+public"] {
+            validate_expected_comparator(comparator).expect("valid comparator identifier");
+        }
+        for comparator in ["", "-leading", "has space", "has=equals", "line\nbreak"] {
+            assert!(validate_expected_comparator(comparator).is_err(), "{comparator:?}");
+        }
+        let oversized = "a".repeat(MAX_EXPECTED_COMPARATOR_BYTES.saturating_add(1));
+        assert!(validate_expected_comparator(&oversized).is_err());
+    }
 
     fn field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
         output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());

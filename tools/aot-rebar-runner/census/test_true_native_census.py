@@ -20,6 +20,19 @@ CENSUS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CENSUS)
 
 
+def frozen_validation_fields() -> dict[str, str]:
+    return {
+        "validation_authority": "frozen-public-schedule-v1",
+        "expected_value_sealed": "true",
+        "expected_value": "1",
+        "expected_comparator": "rust-regex-1.12.4",
+        "schedule_klv_sha256": "7" * 64,
+        "schedule_binding_sha256": "8" * 64,
+        "stock_comparator": "rust-regex-1.12.4",
+        "stock_divergence_policy": "report-only",
+    }
+
+
 def synthetic_plan() -> dict[str, object]:
     runtime_ids = [f"runtime-job-{index:03}" for index in range(311)]
     compile_ids = [f"compile-job-{index:03}" for index in range(33)]
@@ -32,7 +45,7 @@ def synthetic_plan() -> dict[str, object]:
         "case_insensitive": False,
         "unicode": True,
     }
-    klv_identity = {"path": "fixture.klv", "sha256": "5" * 64, "bytes": 1}
+    klv_identity = {"path": "fixture.klv", "sha256": "7" * 64, "bytes": 1}
     for job_id in compile_ids:
         jobs.append({
             "job_id": job_id, "benchmark": job_id, "model": "compile",
@@ -71,8 +84,8 @@ def synthetic_plan() -> dict[str, object]:
             "benchmark": job["benchmark"],
             "model": job["model"],
             "boundary": "synthetic",
-            "comparator": "synthetic",
-            "expected": 0,
+            "comparator": "rust-regex-1.12.4",
+            "expected": 1,
             "input": input_identity,
             "candidate_klv": klv_identity,
             "reference_klv": klv_identity,
@@ -238,6 +251,7 @@ def synthetic_qualification_receipt(plan: dict[str, object]) -> dict[str, object
 def synthetic_regex_redux_fields() -> dict[str, str]:
     identity = "a" * 64
     fields = {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v3",
         "model": "regex-redux",
         "component_count": "15",
@@ -279,6 +293,7 @@ def synthetic_regex_redux_fields() -> dict[str, str]:
 def uniform_capture_provenance_fields() -> dict[str, str]:
     entry_suffix = "d" * 64
     fields = {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v3",
         "disposition": "executed",
         "configured": "true",
@@ -337,6 +352,7 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
     native_identity = "d" * 64
     aggregate_identity = "e" * 64
     return {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v2",
         "disposition": "executed",
         "configured": "true",
@@ -612,6 +628,7 @@ def shared_ordered_many_provenance_fields(
         )
         boundary = "single-call-shared-ordered-many-helper-backed-reducer"
     return {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v2",
         "disposition": "executed",
         "configured": "true",
@@ -664,6 +681,7 @@ def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
     ordinary_identity = "a" * 64
     prepared_identity = "b" * 64
     fields = {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v3",
         "disposition": "executed",
         "configured": "true",
@@ -798,6 +816,7 @@ def participation_capture_provenance_fields() -> dict[str, str]:
     entry = f"fre_aot_regex_participation_exact_v1_{export_identity}"
     bundle = f"fre_aot_regex_participation_bundle_v1_{export_identity}"
     return {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v4",
         "disposition": "executed",
         "configured": "true",
@@ -921,6 +940,7 @@ def synthetic_participation_capture_qualification_receipt(
 def selector_capture_fallback_provenance_fields() -> dict[str, str]:
     selector = f"fre_aot_regex_search_v1_{'a' * 64}"
     return {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v4",
         "disposition": "executed",
         "configured": "true",
@@ -1049,6 +1069,7 @@ def synthetic_selector_capture_fallback_qualification_receipt(
 def strict_capture_provenance_fields() -> dict[str, str]:
     next_symbol = f"fre_aot_regex_capture_next_v1_{'a' * 64}"
     return {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v4",
         "disposition": "executed",
         "configured": "true",
@@ -1190,6 +1211,7 @@ def single_capture_reducer_provenance_fields(
     else:
         raise AssertionError(f"unsupported synthetic reducer source route {source_route!r}")
     fields = {
+        **frozen_validation_fields(),
         "schema": "fre.aot.rebar-runner.v5",
         "disposition": "executed",
         "configured": "true",
@@ -1377,6 +1399,11 @@ class TrueNativeCensusTests(unittest.TestCase):
     def test_json_schema_names_uniform_capture_proof_and_automaton_surface(self) -> None:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         definitions = schema["$defs"]
+        self.assertIn("validation", definitions["provenance"]["required"])
+        self.assertEqual(
+            definitions["frozenValidation"]["properties"]["authority"]["const"],
+            "frozen-public-schedule-v1",
+        )
         self.assertIn(
             "automaton_sha256",
             definitions["componentProvenance"]["required"],
@@ -1474,6 +1501,61 @@ class TrueNativeCensusTests(unittest.TestCase):
             "shared-ordered-many-v2",
             definitions["provenance"]["properties"]["kind"]["enum"],
         )
+
+    def test_formal_provenance_requires_closed_frozen_schedule_authority(self) -> None:
+        fields = prepared_scalar_grep_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        provenance = CENSUS.provenance_receipt(parsed)
+        self.assertEqual(
+            provenance["validation"]["authority"],
+            "frozen-public-schedule-v1",
+        )
+        for field, value in (
+            ("validation_authority", "stock-rust-unsealed-v1"),
+            ("expected_value_sealed", "false"),
+            ("schedule_klv_sha256", "0" * 64),
+            ("schedule_binding_sha256", "0" * 64),
+            ("stock_divergence_policy", "fatal"),
+        ):
+            with self.subTest(field=field):
+                poisoned = copy.deepcopy(fields)
+                poisoned[field] = value
+                poisoned_encoded = " ".join(
+                    f"{key}={item}" for key, item in poisoned.items()
+                ).encode()
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(poisoned_encoded)
+        missing = copy.deepcopy(fields)
+        missing.pop("expected_comparator")
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in missing.items()).encode()
+            )
+        normalized = copy.deepcopy(provenance)
+        normalized["validation"]["schedule_binding_sha256"] = "0" * 64
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(normalized, "tampered frozen binding")
+
+    def test_frozen_job_expectation_prefers_re2_and_rejects_conflicts(self) -> None:
+        plan = synthetic_plan()
+        job = plan["jobs"][33]
+        original = next(
+            point for point in plan["points"]
+            if point["point_id"] == job["point_ids"][0]
+        )
+        re2 = copy.deepcopy(original)
+        re2["point_id"] = "point-re2-replica"
+        re2["comparator"] = "re2-2025-11-05"
+        plan["points"].append(re2)
+        job["point_ids"].append(re2["point_id"])
+        self.assertEqual(
+            CENSUS.frozen_job_expectation(plan, job),
+            (1, "re2-2025-11-05"),
+        )
+        re2["expected"] = 2
+        with self.assertRaisesRegex(CENSUS.CensusError, "conflicting"):
+            CENSUS.frozen_job_expectation(plan, job)
 
     def test_denominator_set_is_sorted_unique_and_hashed(self) -> None:
         receipt = CENSUS.id_set(["b", "a"])
@@ -1952,6 +2034,7 @@ class TrueNativeCensusTests(unittest.TestCase):
 
     def test_native_row_v3_provenance_closes_and_seals_source_topology(self) -> None:
         fields = {
+            **frozen_validation_fields(),
             "schema": "fre.aot.rebar-runner.v3",
             "disposition": "executed",
             "configured": "true",

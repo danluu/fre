@@ -19,6 +19,21 @@ only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
 independently authenticated V15 prepared native search entry. A build with
 no KLV remains a harmless unconfigured workspace binary.
 
+A configured build has two validation modes. With both
+`FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` absent,
+the existing pinned Rust oracle remains authoritative; provenance marks this
+mode `stock-rust-unsealed-v1`, and the formal census rejects it. With both set,
+the build requires canonical unsigned decimal plus one safe versioned
+comparator identifier, then seals them together with the SHA-256 of the exact
+standard Rebar KLV. Runtime requires that byte-for-byte KLV and authenticates
+the combined binding before preparing or invoking the artifact. In this
+`frozen-public-schedule-v1` mode the sealed expected value is authoritative;
+the pinned Rust run is retained as a structured, report-only diagnostic.
+Setting only one variable, malformed metadata, a changed KLV, or a tampered or
+missing digest fails closed. This is one general input contract with no
+benchmark-name or pattern exception. Later references to a stock-authoritative
+oracle describe the backwards-compatible unsealed mode.
+
 `count-captures` and `grep-captures` have an additional all-or-nothing route.
 The compiler proves from the same canonical HIR that every nonempty match has
 one uniform group-zero-inclusive participation count. For an exact one-pattern
@@ -65,6 +80,8 @@ rebar klv --max-iters 9 --max-warmup-iters 1 \
   curated/01-literal/sherlock-en > /tmp/fre-aot-public.klv
 
 FRE_AOT_REBAR_KLV=/tmp/fre-aot-public.klv \
+  FRE_AOT_REBAR_EXPECTED_VALUE=123 \
+  FRE_AOT_REBAR_EXPECTED_COMPARATOR=re2-2025-11-05 \
   FRE_AOT_REBAR_SOURCE_COMMIT="$(git rev-parse HEAD)" \
   FRE_AOT_REBAR_SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
   CARGO_TARGET_DIR=/tmp/fre-aot-rebar-target \
@@ -248,11 +265,16 @@ defaults used to construct the config: 8 MiB whole handle, 8 MiB scratch, and
 surface: compatibility helpers may be unresolved even though a successfully
 prepared required-V15 benchmark operation cannot invoke them.
 
-The independent Rust oracle is deliberately constructed only after all AOT samples
-so it cannot warm the candidate's first-call path. The normal output remains Rebar's
-`nanoseconds,value` format. `--provenance` emits the adapter, compiler and
-optimizer versions, target/features, engine/aggregate strategy, exact symbols,
-required runtime surface, and program/object SHA-256 identities.
+The independent Rust oracle is deliberately constructed only after all AOT
+samples so it cannot warm the candidate's first-call path. It is fatal and
+authoritative in the unsealed compatibility mode. In frozen mode, scalar,
+availability, and regex-redux receipt differences are emitted on stderr as
+`fre.aot.rebar-runner.stock-comparator.v1` records without replacing the sealed
+answer. The normal output remains Rebar's `nanoseconds,value` format.
+`--provenance` emits validation authority, sealed value/comparator, exact KLV
+and combined-binding SHA-256 identities, stock divergence policy, adapter,
+compiler and optimizer versions, target/features, engine/aggregate strategy,
+exact symbols, required runtime surface, and program/object identities.
 The mixed selector-first route uses schema `fre.aot.rebar-runner.v4` and also
 publishes `selector_capture_fallback_bridge`, `capture_resolution`, the stock
 positive-fallback profile/symbol, and the exact direct-participation resource,
@@ -267,9 +289,12 @@ benchmark operation entries.
 
 ## Qualification before using results
 
-1. Run every statically eligible public exact-adapter job against the pinned
-   Rust 1.12.4 Rebar runner and require exact values for both first-call
-   (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules.
+1. Freeze a scalar and versioned independent comparator for every public
+   first-call (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) KLV
+   before building. Set both expected env vars and require exact candidate
+   agreement. Also run pinned Rust 1.12.4 and retain every structured
+   divergence; it cannot override the sealed schedule. Unsealed builds are
+   development/compatibility runs and are ineligible for the formal census.
 2. Retain explicit nullable/empty-match, empty-haystack, invalid-byte, CRLF,
    lone-CR, trailing-LF and no-final-LF fixtures.
 3. Run the linked ABI tests in `fre-aot-regex`, including wrong-artifact
