@@ -1874,7 +1874,14 @@ macro_rules! first_acceptance_prefix {
 }
 
 macro_rules! first_acceptance_end_body {
-    ($plan:ident, $haystack:ident, $window:ident, $order:ident, $prefix:ident) => {{
+    (
+        $plan:ident,
+        $haystack:ident,
+        $window:ident,
+        $order:ident,
+        $prefix:ident,
+        $restart_floor:literal
+    ) => {{
         #[cfg(test)]
         ordinary_direct_probe::record();
         let automaton = $plan.automaton.as_ref();
@@ -1918,6 +1925,23 @@ macro_rules! first_acceptance_end_body {
                 automaton.is_start(state),
                 "a prefiltered literal-set DFA has no other special states",
             );
+            // A restart discards every partial literal. The count-only
+            // scanner reapplies the fixed-width floor before classifying
+            // another transition; endpoint and span scanners retain their
+            // established expansion.
+            if $restart_floor {
+                let next_acceptance_check =
+                    at + (pattern_bytes - 1).min($window.end() - at);
+                first_acceptance_prefix!(
+                    $prefix,
+                    automaton,
+                    anchored,
+                    state,
+                    $haystack,
+                    at,
+                    next_acceptance_check
+                );
+            }
         }
         None
     }};
@@ -1936,7 +1960,7 @@ fn first_acceptance_end_without_prefilter(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first, scalar)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, scalar, false)
 }
 
 /// Span-visitor direct probe with its scanner forced into the emitting loop.
@@ -1951,7 +1975,7 @@ fn first_acceptance_end_for_span_visit(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first, pair)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, pair, false)
 }
 
 /// Count-only direct probe with accepting states before the dead-state test.
@@ -1965,7 +1989,7 @@ fn first_acceptance_end_for_count(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, match_first, chunks)
+    first_acceptance_end_body!(plan, haystack, window, match_first, chunks, true)
 }
 
 #[cfg(test)]
@@ -4489,7 +4513,8 @@ mod tests {
     use super::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetMatchSemantics, LiteralSetPlan,
         LiteralSetSearchLimits, first_acceptance_end_for_count,
-        first_acceptance_end_without_prefilter, ordinary_direct_probe,
+        first_acceptance_end_for_span_visit, first_acceptance_end_without_prefilter,
+        ordinary_direct_probe,
     };
     use crate::Window;
 
@@ -5300,6 +5325,11 @@ mod tests {
                             &haystack,
                             window,
                         );
+                        let span = first_acceptance_end_for_span_visit(
+                            &plan,
+                            &haystack,
+                            window,
+                        );
                         let incumbent = first_acceptance_end_without_prefilter(
                             &plan,
                             &haystack,
@@ -5309,6 +5339,7 @@ mod tests {
                             actual, expected,
                             "width={uniform_width}, haystack={haystack:?}, window={window:?}",
                         );
+                        assert_eq!(span, expected);
                         assert_eq!(incumbent, expected);
                     }
                 }
@@ -5338,6 +5369,45 @@ mod tests {
             );
             assert_eq!(ordinary_direct_probe::calls(), 1);
             assert_eq!(ordinary_direct_probe::special_checks(), 1);
+
+            let repeated_restart = vec![b'x'; uniform_width * 8];
+            let incumbent_checks = repeated_restart.len() - (uniform_width - 1);
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                first_acceptance_end_without_prefilter(
+                    &plan,
+                    &repeated_restart,
+                    Window::full(&repeated_restart),
+                ),
+                None,
+            );
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::special_checks(), incumbent_checks);
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                first_acceptance_end_for_span_visit(
+                    &plan,
+                    &repeated_restart,
+                    Window::full(&repeated_restart),
+                ),
+                None,
+            );
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::special_checks(), incumbent_checks);
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                first_acceptance_end_for_count(
+                    &plan,
+                    &repeated_restart,
+                    Window::full(&repeated_restart),
+                ),
+                None,
+            );
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::special_checks(), 8);
         }
     }
 
