@@ -14064,6 +14064,8 @@ impl PortableRegex {
                     .map(|matched| matched.map(|(start, end)| Match { start, end }))
                     .map_err(SearchError::from)
             }
+            PortablePlan::UnicodeWordRun(plan) => Ok(plan.find_full_prepared(haystack)),
+            PortablePlan::AsciiWordRun(plan) => Ok(plan.find_full_prepared(haystack)),
             _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
@@ -26303,6 +26305,159 @@ mod tests {
             )),
         );
         assert_eq!(super::unicode_word_run::full_prepared_call_count(), 0);
+    }
+
+    #[test]
+    fn word_run_ordinary_find_uses_only_the_prepared_full_span_route() {
+        let cases: &[(&str, bool, &[u8])] = &[
+            (r"\b\w{2,}\b", false, b"!abc!"),
+            (r"\b\w{2,}\b", false, b"!\xffab\x80!"),
+            (r"\b\w{2,}\b", true, "!αβ!".as_bytes()),
+            (r"\b\w{2,}\b", true, b"!\xffab\x80!"),
+        ];
+        for &(pattern, unicode, haystack) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            let (expected, accounting) = regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert_eq!(regex.find(haystack), expected);
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                1,
+            );
+
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert_eq!(
+                regex.find_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            let narrow = SearchWindow::new(1, haystack.len() - 1);
+            let narrow_expected = regex
+                .find_window(haystack, narrow, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert_eq!(
+                regex.find_window_value(haystack, narrow, SearchLimits::unlimited()),
+                Ok(narrow_expected),
+            );
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            let SearchAccounting::UnicodeWordRun(accounting) = accounting else {
+                panic!("word-run fixture published another accounting family");
+            };
+            assert!(accounting.work() > 0);
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert!(
+                regex
+                    .find_window_value(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        SearchLimits {
+                            max_work: accounting.work() - 1,
+                            max_scratch_bytes: usize::MAX,
+                        },
+                    )
+                    .is_err(),
+            );
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert!(matches!(
+                regex.find_window_value(
+                    haystack,
+                    SearchWindow::new(2, 1),
+                    SearchLimits {
+                        max_work: 0,
+                        max_scratch_bytes: 0,
+                    },
+                ),
+                Err(SearchError::UnicodeWordRun(
+                    super::unicode_word_run::Error::InvalidWindow { .. }
+                )),
+            ));
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            let first = regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap();
+            assert_eq!(first, expected);
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert_eq!(
+                session.find_value(haystack, SearchLimits::unlimited()),
+                Ok(expected),
+            );
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+
+            let mut ordinary = regex.ordinary_session().unwrap();
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert_eq!(ordinary.find_at(haystack, 0), Ok(expected));
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                0,
+            );
+        }
+
+        for (pattern, unicode, haystack) in [
+            (r"\b\w{2,}\b", false, "!abc!"),
+            (r"\b\w{2,}\b", true, "!αβ!"),
+        ] {
+            let regex = PortableTextBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            super::unicode_word_run::reset_full_prepared_find_call_count();
+            assert!(regex.find(haystack).is_some());
+            assert_eq!(
+                super::unicode_word_run::full_prepared_find_call_count(),
+                1,
+            );
+        }
     }
 
     #[test]

@@ -26,7 +26,12 @@ pub const FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID: &str = "fixed-byte-class-chu
 
 #[cfg(test)]
 std::thread_local! {
-    static FULL_PREPARED_CALL_COUNT: core::cell::Cell<usize> = core::cell::Cell::new(0);
+    static FULL_PREPARED_CALL_COUNT: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+    static FULL_PREPARED_FIND_CALL_COUNT: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -37,6 +42,21 @@ pub(crate) fn reset_full_prepared_call_count() {
 #[cfg(test)]
 pub(crate) fn full_prepared_call_count() -> usize {
     FULL_PREPARED_CALL_COUNT.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_prepared_find_call_count() {
+    FULL_PREPARED_FIND_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_prepared_find_call_count() -> usize {
+    FULL_PREPARED_FIND_CALL_COUNT.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_full_prepared_find_call() {
+    FULL_PREPARED_FIND_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
 }
 
 const FIXED_BUILD_WORK: usize = 1;
@@ -610,6 +630,74 @@ impl AsciiPlan {
         )
     }
 
+    /// Return the ordinary full-haystack span without materializing search
+    /// accounting after the caller admits unlimited work.
+    #[must_use]
+    pub(crate) fn find_full_prepared(&self, haystack: &[u8]) -> Option<Match> {
+        #[cfg(test)]
+        record_full_prepared_find_call();
+        let plan = self.owner().plan;
+        assert!(
+            matches!(
+                plan,
+                Plan::Word {
+                    minimum_scalars: 1..,
+                    mode: WordMode::Ascii,
+                    topology: WordRunTopology::CompleteWordBoundaries
+                        | WordRunTopology::BareGreedyRoot,
+                }
+            ),
+            "prepared ASCII span search requires a nonempty greedy word run",
+        );
+        let minimum_scalars = plan.word_minimum_scalars();
+        if haystack.len() < minimum_scalars {
+            return None;
+        }
+        let complete_word_boundaries = plan.has_complete_word_boundaries();
+        let scanner = self.run_scanner();
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            let byte = haystack[position];
+            if !is_ascii_word(byte)
+                || (complete_word_boundaries
+                    && position
+                        .checked_sub(1)
+                        .is_some_and(|before| is_ascii_word(haystack[before])))
+            {
+                position = position
+                    .checked_add(1)
+                    .expect("one inspected ASCII byte fits the haystack");
+                continue;
+            }
+
+            let start = position;
+            position = position
+                .checked_add(1)
+                .expect("the first ASCII run byte fits the haystack");
+            let continuation = scanner
+                .scan_forward(&haystack[position..])
+                .member_run_len();
+            position = position
+                .checked_add(continuation)
+                .expect("the scanned ASCII run fits the haystack");
+            if position
+                .checked_sub(start)
+                .expect("the run end follows its start")
+                >= minimum_scalars
+                && (!complete_word_boundaries
+                    || !haystack
+                        .get(position)
+                        .is_some_and(|&next| is_ascii_word(next)))
+            {
+                return Some(Match {
+                    start,
+                    end: position,
+                });
+            }
+        }
+        None
+    }
+
     pub(crate) fn is_match_window_value(
         &self,
         haystack: &[u8],
@@ -815,6 +903,79 @@ impl Plan {
             && run_start_is_boundary
             && run_scalars >= minimum_scalars
             && unicode_word_boundary_after(haystack, position)
+    }
+
+    /// Return the ordinary full-haystack span without materializing search
+    /// accounting after the caller admits unlimited work.
+    #[must_use]
+    pub(crate) fn find_full_prepared(self, haystack: &[u8]) -> Option<Match> {
+        #[cfg(test)]
+        record_full_prepared_find_call();
+        assert!(
+            matches!(
+                self,
+                Self::Word {
+                    minimum_scalars: 1..,
+                    mode: WordMode::Unicode,
+                    topology: WordRunTopology::CompleteWordBoundaries
+                        | WordRunTopology::BareGreedyRoot,
+                }
+            ),
+            "prepared Unicode span search requires a nonempty greedy word run",
+        );
+        let minimum_scalars = self.word_minimum_scalars();
+        if haystack.len() < minimum_scalars {
+            return None;
+        }
+        let complete_word_boundaries = self.has_complete_word_boundaries();
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            let Some((scalar, width)) = decode_first(&haystack[position..]) else {
+                position = position
+                    .checked_add(1)
+                    .expect("one malformed byte fits the haystack");
+                continue;
+            };
+            if !is_unicode_word(scalar)
+                || (complete_word_boundaries
+                    && !unicode_word_boundary_before(haystack, position))
+            {
+                position = position
+                    .checked_add(width)
+                    .expect("one decoded scalar fits the haystack");
+                continue;
+            }
+
+            let start = position;
+            let mut run_scalars = 1_usize;
+            position = position
+                .checked_add(width)
+                .expect("the first Unicode word scalar fits the haystack");
+            while position < haystack.len() {
+                let Some((next, next_width)) = decode_first(&haystack[position..]) else {
+                    break;
+                };
+                if !is_unicode_word(next) {
+                    break;
+                }
+                run_scalars = run_scalars
+                    .checked_add(1)
+                    .expect("a scalar count cannot exceed the haystack byte length");
+                position = position
+                    .checked_add(next_width)
+                    .expect("the decoded Unicode word run fits the haystack");
+            }
+            if run_scalars >= minimum_scalars
+                && (!complete_word_boundaries
+                    || unicode_word_boundary_after(haystack, position))
+            {
+                return Some(Match {
+                    start,
+                    end: position,
+                });
+            }
+        }
+        None
     }
 
     const fn minimum_match_units(self) -> usize {
@@ -2604,7 +2765,7 @@ mod tests {
         FIXED_BUILD_WORK, Plan, WordMode, WordRunTopology, aggregate_build_accounting_matches,
         ascii_word_set, inspect_aggregate_attempt,
     };
-    use crate::{SearchLimits, SearchWindow};
+    use crate::{Match, SearchLimits, SearchWindow};
 
     fn class_words(bytes: &[u8]) -> [u64; 4] {
         let mut words = [0_u64; 4];
@@ -2643,6 +2804,18 @@ mod tests {
 
     fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
         oracle_with_unicode(pattern, haystack, false)
+    }
+
+    fn oracle_find(pattern: &str, haystack: &[u8], unicode: bool) -> Option<Match> {
+        RegexBuilder::new(pattern)
+            .unicode(unicode)
+            .build()
+            .expect("oracle pattern")
+            .find(haystack)
+            .map(|matched| Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
     }
 
     fn assert_plan_matches(pattern: &str, plan: Plan, haystack: &[u8]) {
@@ -2910,10 +3083,12 @@ mod tests {
     }
 
     #[test]
-    fn bare_ascii_word_runs_exhaust_short_malformed_sources() {
+    fn prepared_ascii_word_find_exhausts_short_malformed_sources() {
         let cases = [
             (r"\w+", Plan::bare_greedy(1, WordMode::Ascii)),
             (r"\w{2,}", Plan::bare_greedy(2, WordMode::Ascii)),
+            (r"\b\w+\b", Plan::new(1, WordMode::Ascii)),
+            (r"\b\w{2,}\b", Plan::new(2, WordMode::Ascii)),
         ];
         for (pattern, plan) in cases {
             let auto = AsciiPlan::build_auto(plan).expect("exact ASCII owner");
@@ -2931,6 +3106,11 @@ mod tests {
                         encoded /= 4;
                     }
                     assert_plan_matches(pattern, plan, &haystack);
+                    assert_eq!(
+                        auto.find_full_prepared(&haystack),
+                        oracle_find(pattern, &haystack, false),
+                        "prepared ASCII find {haystack:?}",
+                    );
                     assert_eq!(
                         auto.aggregate_count_value_success(
                             &haystack,
@@ -2957,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_unicode_word_existence_matches_bytes_regex_on_malformed_sources() {
+    fn prepared_unicode_word_values_match_bytes_regex_on_malformed_sources() {
         let mut explicit = vec![
             Vec::new(),
             b"!".to_vec(),
@@ -2967,6 +3147,8 @@ mod tests {
             b"a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a".to_vec(),
             "abcdefghijklmnopqrstuvwx\u{e9}".as_bytes().to_vec(),
             "αβγδεζηθικλμνξοπρστυφχψωα".as_bytes().to_vec(),
+            "!中文!".as_bytes().to_vec(),
+            "!𐐀𐐁!".as_bytes().to_vec(),
             [vec![b'a'; 13], vec![0xff], vec![b'a'; 13]].concat(),
             b"a\x80aa".to_vec(),
             b"!\x80aa".to_vec(),
@@ -3000,6 +3182,14 @@ mod tests {
                         oracle.is_match(haystack),
                         "pattern={pattern:?} haystack={haystack:?}",
                     );
+                    assert_eq!(
+                        plan.find_full_prepared(haystack),
+                        oracle.find(haystack).map(|matched| Match {
+                            start: matched.start(),
+                            end: matched.end(),
+                        }),
+                        "pattern={pattern:?} haystack={haystack:?}",
+                    );
                     assert_plan_matches_with_unicode(&pattern, plan, haystack, true);
                 }
 
@@ -3018,6 +3208,14 @@ mod tests {
                         assert_eq!(
                             plan.is_match_full_prepared(&haystack),
                             oracle.is_match(&haystack),
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        assert_eq!(
+                            plan.find_full_prepared(&haystack),
+                            oracle.find(&haystack).map(|matched| Match {
+                                start: matched.start(),
+                                end: matched.end(),
+                            }),
                             "pattern={pattern:?} haystack={haystack:?}",
                         );
                     }
@@ -3401,6 +3599,13 @@ mod tests {
                         .find_window(haystack, window, SearchLimits::unlimited())
                         .expect("automatic search");
                     assert_eq!(auto_result, scalar_result, "{haystack:?}/{start}..{end}");
+                    if start == 0 && end == haystack.len() {
+                        assert_eq!(
+                            auto.find_full_prepared(haystack),
+                            scalar_result.0,
+                            "prepared full ASCII search {haystack:?}",
+                        );
+                    }
                     let work = scalar_result.1.work();
                     for limit in [0, work.saturating_sub(1), work, work.saturating_add(1)] {
                         let limits = SearchLimits {
