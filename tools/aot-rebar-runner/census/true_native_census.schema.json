@@ -115,7 +115,9 @@
         "model": { "type": "string", "minLength": 1 },
         "boundary": { "type": "string", "minLength": 1 },
         "comparator": { "type": "string", "minLength": 1 },
-        "expected": {},
+        "expected": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
         "input": { "$ref": "#/$defs/input" },
         "candidate_klv": { "$ref": "#/$defs/klv" },
         "reference_klv": { "$ref": "#/$defs/klv" },

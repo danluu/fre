@@ -242,8 +242,14 @@ defaults used to construct the config: 8 MiB whole handle, 8 MiB scratch, and
 surface: compatibility helpers may be unresolved even though a successfully
 prepared required-V15 benchmark operation cannot invoke them.
 
-The independent Rust oracle is deliberately constructed only after all AOT samples
-so it cannot warm the candidate's first-call path. The normal output remains Rebar's
+Without an externally authenticated expectation, the independent Rust oracle
+is deliberately constructed only after all AOT samples so it cannot warm the
+candidate's first-call path. A sealed schedule runner instead passes its
+selected comparator's scalar as `--expected-value=<u64>` after independently
+executing that comparator. This prevents a defect in a non-selected comparator
+from vetoing a correct candidate; it is not permission to derive an expectation
+from the candidate itself. Regex-redux retains its complete independent
+stage-receipt comparison in both modes. The normal output remains Rebar's
 `nanoseconds,value` format. `--provenance` emits the adapter, compiler and
 optimizer versions, target/features, engine/aggregate strategy, exact symbols,
 required runtime surface, and program/object SHA-256 identities.
@@ -254,17 +260,20 @@ required value, and limit that selected the route.
 
 ## Qualification before using results
 
-1. Run every statically eligible public exact-adapter job against the pinned
-   Rust 1.12.4 Rebar runner and require exact values for both first-call
-   (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules.
+1. Run every statically eligible public exact-adapter job against each point's
+   sealed selected comparator and require its sealed scalar for both first-call
+   (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules. Pass that
+   scalar to the AOT arm with `--expected-value=<u64>`; standalone development
+   runs continue to use the pinned Rust 1.12.4 fallback oracle.
 2. Retain explicit nullable/empty-match, empty-haystack, invalid-byte, CRLF,
    lone-CR, trailing-LF and no-final-LF fixtures.
 3. Run the linked ABI tests in `fre-aot-regex`, including wrong-artifact
    rejection before source access and transactional scalar output.
 4. Rebuild every admitted artifact twice and require identical program,
    object, symbol and receipt identities.
-5. Compare paired fresh-process operation samples against both Rust and the
-   former repeated-search/per-line adapters. Report the recorded
+5. Compare paired fresh-process operation samples against the selected
+   comparator, current FRE, and the former repeated-search/per-line adapters.
+   Report the recorded
    `PreparedAggregateStrategy`; do not call a runtime-helper row native.
 
 The four public rows that returned linked status 3 in the dd6 report are a

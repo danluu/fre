@@ -695,7 +695,9 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
                 "model": model,
                 "boundary": boundary,
                 "comparator": comparator,
-                "expected": raw_point.get("expected"),
+                "expected": canonical_expected_value(
+                    raw_point.get("expected"), f"point {point_id}"
+                ),
                 "input": identity,
                 "candidate_klv": candidate,
                 "reference_klv": reference,
@@ -727,6 +729,8 @@ def make_plan(args: argparse.Namespace) -> dict[str, object]:
         job["point_ids"] = sorted(set(job["point_ids"]))
     job_rows = sorted(jobs.values(), key=lambda value: value["job_id"])
     point_rows = sorted(raw_points.values(), key=lambda value: value["point_id"])
+    for job in job_rows:
+        expected_value_for_job_points(point_rows, job)
     all_jobs = [row["job_id"] for row in job_rows]
     compile_jobs = [row["job_id"] for row in job_rows if not row["is_runtime"]]
     runtime_jobs = [row["job_id"] for row in job_rows if row["is_runtime"]]
@@ -967,6 +971,7 @@ def validate_plan(plan: object) -> dict[str, object]:
             )
         ):
             raise CensusError(f"plan point {index} has an invalid textual identity")
+        canonical_expected_value(point["expected"], f"plan point {index}")
         validate_input_identity(point["input"], f"plan point {index} input")
         for name in ("candidate_klv", "reference_klv"):
             validate_recorded_klv(point[name], f"plan point {index} {name}")
@@ -999,6 +1004,7 @@ def validate_plan(plan: object) -> dict[str, object]:
     for job_id, point_ids_for_job in points_by_job.items():
         if jobs_by_id[job_id]["point_ids"] != sorted(point_ids_for_job):
             raise CensusError(f"plan job {job_id} point set differs from its points")
+        expected_value_for_job(plan, jobs_by_id[job_id])
     schedules_by_id = {schedule["file_sha256"]: schedule for schedule in schedules}
     for schedule_id, ordinals in points_by_schedule.items():
         expected_ordinals = list(range(schedules_by_id[schedule_id]["point_count"]))
@@ -3419,6 +3425,53 @@ def classification_from_qualification_evidence(
     }
 
 
+def canonical_expected_value(value: object, context: str) -> int:
+    """Require one schedule-selected scalar in the runner's `u64` domain."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > (1 << 64) - 1
+    ):
+        raise CensusError(f"{context} has a non-u64 selected-comparator expectation")
+    return value
+
+
+def expected_value_for_job_points(
+    point_rows: list[dict[str, object]], job: dict[str, object]
+) -> int:
+    """Return the one schedule-selected scalar shared by every job point."""
+    points = {point["point_id"]: point for point in point_rows}
+    values: list[int] = []
+    for point_id in job["point_ids"]:
+        point = points.get(point_id)
+        if point is None or point.get("job_id") != job["job_id"]:
+            raise CensusError(
+                f"job {job['job_id']!r} has an absent or foreign point {point_id!r}"
+            )
+        values.append(
+            canonical_expected_value(
+                point.get("expected"), f"job {job['job_id']!r}"
+            )
+        )
+    if not values or any(value != values[0] for value in values[1:]):
+        raise CensusError(
+            f"job {job['job_id']!r} changes expected value across schedule points"
+        )
+    return values[0]
+
+
+def expected_value_for_job(
+    plan: dict[str, object], job: dict[str, object]
+) -> int:
+    return expected_value_for_job_points(plan["points"], job)
+
+
+def runner_execution_command(runner: pathlib.Path, expected_value: int) -> list[str]:
+    expected_value = canonical_expected_value(expected_value, "runner execution")
+    return [str(runner), "--quiet", f"--expected-value={expected_value}"]
+
+
 def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     plan = validate_plan(load_json(pathlib.Path(args.plan)))
     jobs = {row["job_id"]: row for row in plan["jobs"]}
@@ -3427,6 +3480,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     job = jobs[args.job_id]
     if not job["is_runtime"] or not job["exact_adapter"]:
         raise CensusError("only exact-adapter runtime jobs can be dynamically qualified")
+    expected_value = expected_value_for_job(plan, job)
     public_root = pathlib.Path(args.public_klv_root).resolve(strict=True)
     klv_relative = pathlib.PurePosixPath(job["candidate_klv"]["path"])
     klv_path = (public_root / pathlib.Path(*klv_relative.parts)).resolve(strict=True)
@@ -3441,6 +3495,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     if not primary_objects or len(primary_objects) != len(replica_objects):
         raise CensusError("independent builds must supply the same nonzero object count")
     trap_library = pathlib.Path(args.trap_library).resolve(strict=True)
+    execution_command = runner_execution_command(primary_runner, expected_value)
     primary_provenance_process = subprocess.run(
         [str(primary_runner), "--provenance"], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, check=False, timeout=args.timeout,
@@ -3561,14 +3616,14 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         or not set(identity_symbols).issubset(replica_defined_symbols)
     ):
         raise CensusError("one or more provenance identity symbols are absent from a final binary")
-    unmodified = run_checked_process([str(primary_runner), "--quiet"], klv, args.timeout)
+    unmodified = run_checked_process(execution_command, klv, args.timeout)
     helper_marker: dict[str, object]
     negative_controls: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="fre-aot-native-census-") as temporary:
         temporary_path = pathlib.Path(temporary)
         helper_path = temporary_path / "helpers.marker"
         helper_phase = run_checked_process(
-            [str(primary_runner), "--quiet"], klv, args.timeout,
+            execution_command, klv, args.timeout,
             trap_environment(trap_library, helper_path, helpers, "semantic-helpers"),
         ) if helpers else {
             "outcome": "not-run", "returncode": None, "stdout_bytes": 0,
@@ -3579,7 +3634,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         for ordinal, entry in enumerate(entries):
             negative_path = temporary_path / f"entry-{ordinal:03}.marker"
             negative_phase = run_checked_process(
-                [str(primary_runner), "--quiet"], klv, args.timeout,
+                execution_command, klv, args.timeout,
                 trap_environment(
                     trap_library, negative_path, [entry], "claimed-operation-entry"
                 ),

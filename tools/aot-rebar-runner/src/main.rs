@@ -13,7 +13,10 @@ use std::{
 };
 
 use bstr::ByteSlice;
-use fre_aot_rebar_runner::shared;
+use fre_aot_rebar_runner::{
+    runner_arguments::{self, Arguments},
+    shared,
+};
 use fre_aot_regex::{
     CompiledRegex, DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
@@ -42,13 +45,6 @@ mod linked {
 }
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Arguments {
-    quiet: bool,
-    version: bool,
-    provenance: bool,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Sample {
@@ -1280,7 +1276,14 @@ fn main() -> Result<(), DynError> {
         session.destroy()?;
         samples
     };
-    let expected = rust_oracle(&benchmark)?;
+    let (expected, expected_source) = if let Some(expected) = arguments.expected_value {
+        (
+            expected,
+            "selected-comparator expectation supplied by the authenticated schedule",
+        )
+    } else {
+        (rust_oracle(&benchmark)?, "standalone Rust Rebar oracle")
+    };
     if benchmark.model == shared::Model::RegexRedux {
         let actual_receipt = linked_regex_redux_receipt(&benchmark.haystack)?;
         let expected_receipt = rust_regex_redux_oracle(&benchmark.haystack)?;
@@ -1292,7 +1295,7 @@ fn main() -> Result<(), DynError> {
         }
     }
     for sample in &samples {
-        require_expected(sample.value, expected)?;
+        require_expected(sample.value, expected, expected_source)?;
     }
 
     if !arguments.quiet {
@@ -1305,24 +1308,7 @@ fn main() -> Result<(), DynError> {
 }
 
 fn parse_arguments() -> Result<Arguments, DynError> {
-    let mut parsed = Arguments::default();
-    for argument in env::args().skip(1) {
-        match argument.as_str() {
-            "--quiet" | "-q" => parsed.quiet = true,
-            "--version" => parsed.version = true,
-            "--provenance" => parsed.provenance = true,
-            "--help" | "-h" => {
-                return Err(
-                    "usage: fre-aot-rebar-runner [--quiet | --version | --provenance]".into(),
-                );
-            }
-            other => return Err(format!("unrecognized argument {other:?}").into()),
-        }
-    }
-    if parsed.version && parsed.provenance {
-        return Err("--version and --provenance are mutually exclusive".into());
-    }
-    Ok(parsed)
+    runner_arguments::parse(env::args().skip(1)).map_err(Into::into)
 }
 
 fn print_provenance() {
@@ -3513,12 +3499,12 @@ fn rust_oracle(benchmark: &shared::Benchmark) -> Result<u64, String> {
     }
 }
 
-fn require_expected(actual: u64, expected: u64) -> Result<(), String> {
+fn require_expected(actual: u64, expected: u64, expected_source: &str) -> Result<(), String> {
     if actual == expected {
         Ok(())
     } else {
         Err(format!(
-            "linked AOT reducer returned {actual}, Rust Rebar oracle returned {expected}"
+            "linked AOT reducer returned {actual}, {expected_source} returned {expected}"
         ))
     }
 }

@@ -27,6 +27,13 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - native search cores / successfully executed jobs (diagnostic only); and
 - the raw runtime schedule-point denominator for comparison with older runs.
 
+Qualification derives one `u64` expectation from the sealed schedule points
+for each job, rejects missing, out-of-range, or disagreeing point values, and
+passes it to every unmodified and trap-controlled runner execution. Thus the
+schedule's selected comparator remains authoritative even when another pinned
+comparator has a known semantic defect; the candidate never supplies its own
+expected value.
+
 Fallback `count-spans` direct-entry or Span-fill iteration, multi-pattern
 per-line `grep`, the static uniform capture multiplier route, the helper-free
 exact-span participation route, the selector-negative/stock-positive capture

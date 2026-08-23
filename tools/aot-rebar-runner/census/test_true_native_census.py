@@ -1123,6 +1123,14 @@ class TrueNativeCensusTests(unittest.TestCase):
             "participation-capture-v4",
             definitions["provenance"]["properties"]["kind"]["enum"],
         )
+        self.assertEqual(
+            definitions["planPoint"]["properties"]["expected"],
+            {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": (1 << 64) - 1,
+            },
+        )
         self.assertIn(
             "exact-span-participation-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
@@ -1289,6 +1297,11 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False,
                 False,
                 "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
+            "linked-shared-ordered-many-helper-free-reducer": (
+                False,
+                True,
+                "whole-operation-native-authenticated",
             ),
         }
         self.assertEqual(set(CENSUS.OPERATION_ROUTE_POLICIES), set(expected))
@@ -2617,6 +2630,45 @@ class TrueNativeCensusTests(unittest.TestCase):
                 [], phase, {**marker, "armed": [1]}, "aarch64"
             )
         )
+
+    def test_job_expectation_is_one_consistent_u64_across_schedule_points(self) -> None:
+        plan = synthetic_plan()
+        job = plan["jobs"][33]
+        self.assertEqual(CENSUS.expected_value_for_job(plan, job), 0)
+
+        duplicate = copy.deepcopy(plan["points"][33])
+        duplicate["point_id"] = "point-runtime-replica"
+        duplicate["comparator"] = "other-selected-comparator"
+        duplicate["boundary"] = "other-public-operation-boundary"
+        plan["points"].append(duplicate)
+        job["point_ids"].append(duplicate["point_id"])
+        self.assertEqual(CENSUS.expected_value_for_job(plan, job), 0)
+        self.assertEqual(
+            CENSUS.runner_execution_command(pathlib.Path("/runner"), 0),
+            ["/runner", "--quiet", "--expected-value=0"],
+        )
+
+        duplicate["expected"] = 1
+        with self.assertRaisesRegex(CENSUS.CensusError, "changes expected value"):
+            CENSUS.expected_value_for_job(plan, job)
+
+        for invalid in (True, -1, 1 << 64, "0"):
+            duplicate["expected"] = invalid
+            with self.assertRaisesRegex(CENSUS.CensusError, "non-u64"):
+                CENSUS.expected_value_for_job(plan, job)
+
+            invalid_plan = synthetic_plan()
+            invalid_plan["points"][33]["expected"] = invalid
+            invalid_plan = CENSUS.add_digest(
+                {
+                    key: value
+                    for key, value in invalid_plan.items()
+                    if key != "plan_sha256"
+                },
+                "plan_sha256",
+            )
+            with self.assertRaisesRegex(CENSUS.CensusError, "non-u64"):
+                CENSUS.validate_plan(invalid_plan)
 
     def test_plan_is_closed_and_requires_canonical_311_jobs(self) -> None:
         plan = synthetic_plan()
