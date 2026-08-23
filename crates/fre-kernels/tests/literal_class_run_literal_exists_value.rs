@@ -68,7 +68,7 @@ fn existence_values_match_accounted_search_for_every_small_window() {
 }
 
 #[test]
-fn ordinary_full_exists_matches_incumbent_for_every_resolved_geometry() {
+fn ordinary_full_values_match_incumbent_for_every_resolved_geometry() {
     let guarded = LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
         b"",
         [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')].into_iter(),
@@ -84,14 +84,23 @@ fn ordinary_full_exists_matches_incumbent_for_every_resolved_geometry() {
     ];
     for (candidate, alphabet) in plans {
         for haystack in byte_strings(6, alphabet) {
-            let expected = candidate
+            let expected_span = candidate
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            let expected_exists = candidate
                 .shortest(&haystack, SearchLimits::unlimited())
                 .unwrap()
                 .0
                 .is_some();
             assert_eq!(
                 candidate.is_match_full_ordinary_value(&haystack).unwrap(),
-                expected,
+                expected_exists,
+                "haystack={haystack:?}"
+            );
+            assert_eq!(
+                candidate.find_full_ordinary_value(&haystack).unwrap(),
+                expected_span,
                 "haystack={haystack:?}"
             );
         }

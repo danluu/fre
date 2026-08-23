@@ -1496,8 +1496,8 @@ impl LiteralClassRunLiteralPlan {
     /// Whether the ordinary immutable full-haystack operation has a match.
     ///
     /// Construction resolves the only static specialist decision. General
-    /// prefix/suffix geometry enters the report-free existence loop directly;
-    /// contained-suffix and guarded geometry enter the incumbent checked
+    /// prefix/suffix and complete ASCII-word geometry enter report-free loops
+    /// directly; contained-suffix geometry enters the incumbent checked
     /// implementation directly. Ranged, finite, accounted, and session APIs
     /// deliberately continue to use [`Self::is_match_window_value`].
     #[doc(hidden)]
@@ -1507,8 +1507,10 @@ impl LiteralClassRunLiteralPlan {
             ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
                 Ok(self.search_general_exists_value(haystack))
             }
-            ResolvedSearchGeometry::SuffixInsideClass
-            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => self.is_match_window_incumbent(
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                Ok(self.search_complete_ascii_word_run_value(haystack).is_some())
+            }
+            ResolvedSearchGeometry::SuffixInsideClass => self.is_match_window_incumbent(
                 haystack,
                 Window::full(haystack),
                 SearchLimits::unlimited(),
@@ -1517,12 +1519,12 @@ impl LiteralClassRunLiteralPlan {
     }
 
     /// Return the selected ordinary full-haystack span without retaining
-    /// diagnostic accounting for the two general construction-resolved
-    /// geometries.
+    /// diagnostic accounting for general prefix/suffix and complete
+    /// ASCII-word geometries.
     ///
-    /// Contained-suffix and guarded geometry deliberately retain the
-    /// incumbent checked implementation. Ranged, finite, accounted, session,
-    /// iterator, and reusable value APIs continue to use [`Self::find_window`].
+    /// Contained-suffix geometry deliberately retains the incumbent checked
+    /// implementation. Ranged, finite, accounted, session, iterator, and
+    /// reusable value APIs continue to use [`Self::find_window`].
     #[doc(hidden)]
     #[inline]
     pub fn find_full_ordinary_value(
@@ -1533,8 +1535,10 @@ impl LiteralClassRunLiteralPlan {
             ResolvedSearchGeometry::GeneralPrefix | ResolvedSearchGeometry::GeneralSuffix => {
                 Ok(self.search_general_selected_value(haystack))
             }
-            ResolvedSearchGeometry::SuffixInsideClass
-            | ResolvedSearchGeometry::CompleteAsciiWordSuffix => self
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix => {
+                Ok(self.search_complete_ascii_word_run_value(haystack))
+            }
+            ResolvedSearchGeometry::SuffixInsideClass => self
                 .find(haystack, SearchLimits::unlimited())
                 .map(|(matched, _)| matched),
         }
@@ -1662,6 +1666,44 @@ impl LiteralClassRunLiteralPlan {
                 return matched;
             }
             cursor = anchor_start + 1;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the nonempty suffix finder bounds every offset within the full haystack"
+    )]
+    fn search_complete_ascii_word_run_value(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(usize, usize)> {
+        debug_assert_eq!(
+            self.geometry,
+            ResolvedSearchGeometry::CompleteAsciiWordSuffix
+        );
+        let mut cursor = 0_usize;
+        loop {
+            let relative = self.anchor.find(&haystack[cursor..])?;
+            let suffix_start = cursor + relative;
+            let suffix_end = suffix_start + self.anchor.needle().len();
+            if haystack
+                .get(suffix_end)
+                .is_some_and(|&byte| self.class.contains(byte))
+            {
+                cursor = suffix_start + 1;
+                continue;
+            }
+            if let Some(run_start) = scan_class_run_backward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                suffix_start,
+            )
+            .filter(|&start| start < suffix_start)
+            {
+                return Some((run_start, suffix_end));
+            }
+            cursor = suffix_start + 1;
         }
     }
 
@@ -10411,7 +10453,7 @@ mod tests {
         assert!(guarded
             .is_match_full_ordinary_value(b"!testing!")
             .unwrap());
-        assert_eq!(test_search_preflight_calls(), 1);
+        assert_eq!(test_search_preflight_calls(), 0);
         reset_test_search_preflight_calls();
         assert_eq!(
             guarded
@@ -10419,7 +10461,7 @@ mod tests {
                 .unwrap(),
             Some((1, 8)),
         );
-        assert_eq!(test_search_preflight_calls(), 1);
+        assert_eq!(test_search_preflight_calls(), 0);
     }
 
     #[test]

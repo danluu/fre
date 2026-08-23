@@ -94,6 +94,37 @@ fn literal_class_run_existence_values_match_every_window_and_session() {
 }
 
 #[test]
+fn complete_ascii_word_ordinary_values_match_accounted_search_exhaustively() {
+    let regex = portable(r"\b\w+nn\b");
+    for haystack in byte_strings(6, b"an_!\xff") {
+        let (expected, accounting) = regex
+            .find_accounted(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            accounting,
+            SearchAccounting::LiteralClassRunLiteral(_)
+        ));
+        assert_eq!(
+            regex.find(&haystack),
+            expected,
+            "ordinary find haystack={haystack:?}"
+        );
+        assert_eq!(
+            regex.is_match(&haystack),
+            expected.is_some(),
+            "ordinary is_match haystack={haystack:?}"
+        );
+        assert_eq!(
+            regex
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+            "finite value haystack={haystack:?}"
+        );
+    }
+}
+
+#[test]
 fn literal_class_run_existence_values_preserve_resources_errors_and_fallbacks() {
     let regex = portable(r"aa[01]+QZ");
     let haystack = b"!aa0101QZ!aa001QZ!";
@@ -204,17 +235,33 @@ fn literal_class_run_existence_values_preserve_resources_errors_and_fallbacks() 
 }
 
 #[test]
-fn text_ordinary_exists_delegates_to_the_resolved_byte_route() {
-    let regex = PortableTextRegex::new(r"(?-u:[ab]+aba)").expect("ASCII text corridor");
-    assert_eq!(
-        regex.build_report().portable.plan,
-        PlanKind::LiteralClassRunLiteral
-    );
-    for haystack in ["", "!", "!aababa!", "éaababa", "abab!"] {
-        let expected = regex
-            .is_match_accounted(haystack, SearchLimits::unlimited())
-            .unwrap()
-            .0;
-        assert_eq!(regex.is_match(haystack), expected, "haystack={haystack:?}");
+fn text_ordinary_values_delegate_to_the_resolved_byte_route() {
+    for (pattern, haystacks) in [
+        (
+            r"(?-u:[ab]+aba)",
+            ["", "!", "!aababa!", "éaababa", "abab!"],
+        ),
+        (
+            r"(?-u:\b\w+ing\b)",
+            ["", "!", "!testing!", "étesting!", "singing!"],
+        ),
+    ] {
+        let regex = PortableTextRegex::new(pattern).expect("ASCII text corridor");
+        assert_eq!(
+            regex.build_report().portable.plan,
+            PlanKind::LiteralClassRunLiteral
+        );
+        for haystack in haystacks {
+            let expected = regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(regex.find(haystack), expected, "haystack={haystack:?}");
+            assert_eq!(
+                regex.is_match(haystack),
+                expected.is_some(),
+                "haystack={haystack:?}"
+            );
+        }
     }
 }
