@@ -1967,17 +1967,24 @@ fn find_bounded_long_shared_fragment(
         return Some(LongSharedFragmentFilterResult::Exhausted);
     };
     if second < first.saturating_add(fragment.width) {
-        // Overlapping occurrences are a saturated stream. Native
-        // resumes after the one exactly disproved start instead of buying four
-        // exact probes that advance only a handful of bytes.
+        // Overlapping occurrences are a saturated stream. Native resumes
+        // after the one exactly disproved start instead of buying four exact
+        // probes that advance only a handful of bytes.
         return Some(LongSharedFragmentFilterResult::ResumeAt(after_first));
     }
 
+    // Keep the incumbent four exact probes for nonoverlapping occurrences.
+    // Every additional dispatch probe must independently buy more than two
+    // fragment widths of progress from the previous occurrence. Checking each
+    // adjacent gap prevents one early sparse pair from subsidizing a later
+    // dense tail, while a later sparse region is not poisoned by early density.
+    let dense_stream_span = fragment.width.saturating_mul(2);
     let mut pending_candidate = Some(second);
     let mut minimum_start = after_first;
+    let mut previous_candidate = first;
     let candidate_budget = fragment.dispatch_candidate_budget();
     debug_assert!(candidate_budget >= NATIVE_FILTER_CANDIDATE_BUDGET);
-    for _ in 1..candidate_budget {
+    for attempt in 1..candidate_budget {
         let candidate = if let Some(candidate) = pending_candidate.take() {
             candidate
         } else {
@@ -1988,6 +1995,11 @@ fn find_bounded_long_shared_fragment(
             };
             candidate
         };
+        if attempt >= NATIVE_FILTER_CANDIDATE_BUDGET
+            && candidate.saturating_sub(previous_candidate) <= dense_stream_span
+        {
+            return Some(LongSharedFragmentFilterResult::ResumeAt(candidate));
+        }
         let after_candidate = candidate.checked_add(1)?;
         if let Some(end) = fragment.verify_at(haystack, candidate) {
             return Some(LongSharedFragmentFilterResult::Match {
@@ -1996,6 +2008,7 @@ fn find_bounded_long_shared_fragment(
             });
         }
         minimum_start = after_candidate;
+        previous_candidate = candidate;
     }
     // One final lookahead stays in the same increasing fragment-occurrence
     // stream. It performs no verification work: absence proves the source is
@@ -4199,6 +4212,222 @@ mod tests {
             searcher
                 .find(&saturated)
                 .map(|matched| (matched.start(), matched.end())),
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof covers dense-gap containment and both exact budget seams"
+    )]
+    fn long_shared_fragment_dispatch_bounds_each_dense_gap_and_exact_budget_seam() {
+        let patterns = [
+            b"longprefA".as_slice(),
+            b"longprefB".as_slice(),
+            b"longprefC".as_slice(),
+            b"longprefD".as_slice(),
+            b"longprefE".as_slice(),
+            b"longprefF".as_slice(),
+            b"longprefG".as_slice(),
+            b"longprefH".as_slice(),
+            b"longprefI".as_slice(),
+            b"longprefJ".as_slice(),
+            b"longprefK".as_slice(),
+            b"longprefL".as_slice(),
+            b"longprefM".as_slice(),
+            b"longprefN".as_slice(),
+            b"longprefOZ".as_slice(),
+        ];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("budget-corner language lost its long shared-fragment route")
+        };
+        assert_eq!(shared_fragment.offset, 0);
+        assert_eq!(shared_fragment.width, 8);
+        assert_eq!(shared_fragment.maximum_candidate_verification_work, 31);
+        assert_eq!(
+            shared_fragment.maximum_dispatch_candidate_verification_work(),
+            2,
+        );
+        assert_eq!(shared_fragment.dispatch_candidate_budget(), 62);
+
+        let first_start = shared_fragment.native_prefix_bytes.checked_add(64).unwrap();
+        for gap in [8_usize, 9, 10, 16] {
+            let mut haystack = vec![
+                b'.';
+                first_start
+                    .checked_add(6_usize.checked_mul(gap).unwrap())
+                    .unwrap()
+                    .checked_add(64)
+                    .unwrap()
+            ];
+            for index in 0_usize..6 {
+                let start = first_start
+                    .checked_add(index.checked_mul(gap).unwrap())
+                    .unwrap();
+                haystack[start..start + 8].copy_from_slice(b"longpref");
+            }
+            assert_eq!(
+                find_bounded_long_shared_fragment(shared_fragment, &haystack),
+                Some(LongSharedFragmentFilterResult::ResumeAt(
+                    first_start
+                        .checked_add(4_usize.checked_mul(gap).unwrap())
+                        .unwrap(),
+                )),
+                "gap={gap}",
+            );
+            assert_eq!(
+                plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                searcher
+                    .find(&haystack)
+                    .map(|matched| (matched.start(), matched.end())),
+                "gap={gap}",
+            );
+        }
+
+        let mut dense_tail = vec![b'.'; first_start.checked_add(128).unwrap()];
+        for offset in [0_usize, 17, 25, 33, 41, 49] {
+            let start = first_start.checked_add(offset).unwrap();
+            dense_tail[start..start + 8].copy_from_slice(b"longpref");
+        }
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &dense_tail),
+            Some(LongSharedFragmentFilterResult::ResumeAt(
+                first_start.checked_add(41).unwrap(),
+            )),
+        );
+
+        // Admit the first guarded candidate on a sparse gap, then preserve a
+        // real match at the next, dense gap for the unchanged native fallback.
+        // This distinguishes the adjacent-gap guard from a one-shot decision
+        // and proves that resumption includes the unverified candidate itself.
+        let late_dense_match_start = first_start.checked_add(84).unwrap();
+        let late_dense_match_end = late_dense_match_start.checked_add(10).unwrap();
+        let mut late_dense_match = vec![b'.'; late_dense_match_end.checked_add(64).unwrap()];
+        for offset in [0_usize, 17, 34, 51, 68] {
+            let start = first_start.checked_add(offset).unwrap();
+            late_dense_match[start..start + 10].copy_from_slice(b"longprefOx");
+        }
+        late_dense_match[late_dense_match_start..late_dense_match_end]
+            .copy_from_slice(b"longprefOZ");
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &late_dense_match),
+            Some(LongSharedFragmentFilterResult::ResumeAt(
+                late_dense_match_start,
+            )),
+        );
+        let expected = searcher
+            .find(&late_dense_match)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((late_dense_match_start, late_dense_match_end)));
+        assert_eq!(
+            plan.find(
+                &late_dense_match,
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            expected,
+        );
+
+        let sparse_gap = 4_096_usize;
+        let sparse_tail_starts = [
+            first_start,
+            first_start.checked_add(8).unwrap(),
+            first_start.checked_add(8 + sparse_gap).unwrap(),
+            first_start.checked_add(8 + 2 * sparse_gap).unwrap(),
+            first_start.checked_add(8 + 3 * sparse_gap).unwrap(),
+            first_start.checked_add(8 + 4 * sparse_gap).unwrap(),
+        ];
+        let mut sparse_tail = vec![
+            b'.';
+            sparse_tail_starts[5].checked_add(64).unwrap()
+        ];
+        for start in sparse_tail_starts {
+            sparse_tail[start..start + 8].copy_from_slice(b"longpref");
+        }
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &sparse_tail),
+            Some(LongSharedFragmentFilterResult::Exhausted),
+        );
+
+        const EXACT_CANDIDATES: usize = 63;
+        const EXACT_GAP: usize = 17;
+        let exact_last_start = first_start
+            .checked_add(
+                EXACT_CANDIDATES
+                    .checked_sub(1)
+                    .unwrap()
+                    .checked_mul(EXACT_GAP)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut exact_false = vec![b'.'; exact_last_start.checked_add(64).unwrap()];
+        for index in 0..EXACT_CANDIDATES {
+            let start = first_start
+                .checked_add(index.checked_mul(EXACT_GAP).unwrap())
+                .unwrap();
+            exact_false[start..start + 10].copy_from_slice(b"longprefOx");
+        }
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &exact_false),
+            Some(LongSharedFragmentFilterResult::ResumeAt(exact_last_start)),
+        );
+
+        let direct_match_start = first_start
+            .checked_add(61_usize.checked_mul(EXACT_GAP).unwrap())
+            .unwrap();
+        let direct_match_end = direct_match_start.checked_add(10).unwrap();
+        let mut direct_match = exact_false.clone();
+        direct_match[direct_match_start..direct_match_end].copy_from_slice(b"longprefOZ");
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &direct_match),
+            Some(LongSharedFragmentFilterResult::Match {
+                start: direct_match_start,
+                end: direct_match_end,
+            }),
+        );
+        let expected = searcher
+            .find(&direct_match)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((direct_match_start, direct_match_end)));
+        assert_eq!(
+            plan.find(
+                &direct_match,
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            expected,
+        );
+
+        let mut fallback_match = exact_false;
+        let fallback_match_end = exact_last_start.checked_add(10).unwrap();
+        fallback_match[exact_last_start..fallback_match_end].copy_from_slice(b"longprefOZ");
+        assert_eq!(
+            find_bounded_long_shared_fragment(shared_fragment, &fallback_match),
+            Some(LongSharedFragmentFilterResult::ResumeAt(exact_last_start)),
+        );
+        let expected = searcher
+            .find(&fallback_match)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((exact_last_start, fallback_match_end)));
+        assert_eq!(
+            plan.find(
+                &fallback_match,
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            expected,
         );
     }
 
