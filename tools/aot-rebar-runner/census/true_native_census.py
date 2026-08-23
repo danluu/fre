@@ -193,6 +193,14 @@ OPERATION_ROUTE_POLICIES = {
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
     ),
+    "linked-native-count-helper-backed-reducer": OperationRoutePolicy(
+        OperationBoundary.SEMANTIC_HELPER_BACKED,
+        "single-call-native-reducer-retains-semantic-runtime-helpers",
+    ),
+    "linked-native-span-sum-helper-backed-reducer": OperationRoutePolicy(
+        OperationBoundary.SEMANTIC_HELPER_BACKED,
+        "single-call-native-reducer-retains-semantic-runtime-helpers",
+    ),
     "linked-native-grep-count-reducer": OperationRoutePolicy(
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
@@ -254,27 +262,7 @@ OPERATION_ROUTE_POLICIES = {
         "whole-operation-native-authenticated",
     ),
 }
-NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES = {
-    "Some(NativeFused)",
-    "Some(NativeOrderedNfaFused)",
-}
 NATIVE_SPAN_SUM_ITERATION_STRATEGY = "linked-native-span-sum-reducer"
-
-
-def selects_native_span_sum_reducer(provenance: dict[str, object]) -> bool:
-    """Authenticate the exact scalar SpanSum operation route or fail closed."""
-    if (
-        provenance.get("model") != "count-spans"
-        or provenance.get("span_iteration_strategy")
-        != NATIVE_SPAN_SUM_ITERATION_STRATEGY
-    ):
-        return False
-    strategy = provenance.get("aggregate_strategy")
-    if strategy not in NATIVE_SPAN_SUM_AGGREGATE_STRATEGIES:
-        raise CensusError(
-            "native SpanSum reducer has a helper-backed or unknown aggregate strategy"
-        )
-    return True
 
 
 def has_exact_adapter(model: str, pattern_count: int) -> bool:
@@ -1226,12 +1214,197 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
             raise CensusError("scalar grep provenance requires unknown capabilities")
     elif fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS:
         scalar_native_uniform_capture_proof(fields)
+    elif fields["shared_ordered_many"] == "false" and (
+        fields["model"] == "count" or (
+            fields["model"] == "count-spans"
+            and fields["span_iteration_strategy"]
+            == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+        )
+    ):
+        scalar_native_reducer_proof_from_provenance(fields)
 
 
 def symbol_identity_suffix(symbol: str, pattern: re.Pattern[str], context: str) -> str:
     if pattern.fullmatch(symbol) is None:
         raise CensusError(f"{context} has a noncanonical symbol")
     return symbol.rsplit("_", 1)[1]
+
+
+def scalar_native_reducer_surface(
+    model: object,
+) -> tuple[str, str, re.Pattern[str], int, tuple[str, ...], str, str]:
+    """Return the closed Count/SpanSum reducer surface for one scalar model."""
+    route = {
+        "count": (
+            "general-aot-identity-suffixed-exclusive-count-prepared-v2",
+            "general-aot-identity-suffixed-exclusive-count-prepared-v3-required-ordered-nfa-v15",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS,
+            "not-applicable",
+            "linked-native-count-helper-backed-reducer",
+        ),
+        "count-spans": (
+            "general-aot-linked-complete-spans-prepared-v2",
+            "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
+            PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS,
+            NATIVE_SPAN_SUM_ITERATION_STRATEGY,
+            "linked-native-span-sum-helper-backed-reducer",
+        ),
+    }.get(model)
+    if route is None:
+        raise CensusError("scalar native reducer has an unsupported model")
+    return route
+
+
+def scalar_native_reducer_route(model: object, proof: object) -> str:
+    """Select only one of the four authenticated scalar reducer policies."""
+    if not isinstance(proof, dict):
+        raise CensusError("scalar native reducer proof is not an object")
+    variant = proof.get("route_variant")
+    if model == "count" and variant == "direct-v2":
+        return "linked-reducer"
+    if model == "count-spans" and variant == "direct-v2":
+        return "linked-span-sum-reducer"
+    if model in {"count", "count-spans"} and variant == "ordered-v15":
+        return scalar_native_reducer_surface(model)[6]
+    raise CensusError("scalar native reducer has an unknown model or route variant")
+
+
+def scalar_native_reducer_proof_from_provenance(
+    fields: dict[str, str],
+) -> dict[str, object]:
+    """Authenticate a helper-free V2 or exact helper-backed V15 scalar reducer."""
+    model = fields.get("model")
+    (
+        direct_adapter,
+        ordered_adapter,
+        reducer_pattern,
+        operation_flags,
+        ordered_runtime_symbols,
+        span_iteration,
+        _,
+    ) = scalar_native_reducer_surface(model)
+    strategy = fields.get("aggregate_strategy")
+    direct = strategy == "Some(NativeFused)"
+    ordered = strategy == "Some(NativeOrderedNfaFused)"
+    if not (direct or ordered):
+        raise CensusError("scalar native reducer has a mixed or unknown aggregate strategy")
+    if (
+        fields.get("schema") != "fre.aot.rebar-runner.v2"
+        or fields.get("adapter") != (direct_adapter if direct else ordered_adapter)
+        or fields.get("shared_ordered_many") != "false"
+        or fields.get("source_pattern_count") != "1"
+        or fields.get("ordered_many_receipt_schema") != "0"
+        or fields.get("ordered_many_sources_sha256") != "0" * 64
+        or fields.get("prepare_scope") != "runtime-handle-state"
+        or fields.get("object_descriptor_setup") != "authenticated-v3-when-required"
+        or fields.get("max_start_filter_setup_work") != "100000000"
+        or fields.get("max_grep_count_workspace_bytes") != "67108864"
+        or fields.get("prepare_operation_flags") != f"{operation_flags:016x}"
+        or fields.get("span_iteration_strategy") != span_iteration
+        or fields.get("grep_iteration_strategy") != "not-applicable"
+        or fields.get("boundary") != "runtime-klv-warmup-schedule"
+    ):
+        raise CensusError("scalar native reducer operation surface differs")
+    require_hex64(fields.get("program_sha256"), "scalar native reducer program digest")
+    require_hex64(fields.get("object_sha256"), "scalar native reducer object digest")
+    runtime_symbols_text = fields.get("required_runtime_symbols")
+    if not isinstance(runtime_symbols_text, str):
+        raise CensusError("scalar native reducer runtime symbol list is malformed")
+    runtime_symbols = tuple(sorted(filter(None, runtime_symbols_text.split(","))))
+    if direct:
+        if (
+            fields.get("prepared_bulk_strategy") != "None"
+            or fields.get("prepare_config_version") != str(PREPARED_V2_CONFIG_VERSION)
+            or fields.get("required_prepare_capabilities") != f"{0:016x}"
+            or fields.get("max_handle_bytes") != "0"
+            or fields.get("max_ordered_nfa_scratch_bytes") != "0"
+            or fields.get("max_ordered_nfa_setup_work") != "0"
+            or fields.get("span_fill_symbol") != ""
+            or runtime_symbols
+        ):
+            raise CensusError("helper-free scalar NativeFused reducer envelope differs")
+        route_variant = "direct-v2"
+        span_fill_identity = None
+    else:
+        span_fill = fields.get("span_fill_symbol")
+        if not isinstance(span_fill, str):
+            raise CensusError("helper-backed scalar reducer SpanFill symbol is malformed")
+        span_fill_identity = symbol_identity_suffix(
+            span_fill,
+            NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+            "helper-backed scalar reducer SpanFill entry",
+        )
+        if (
+            fields.get("engine") != "OrderedNfa"
+            or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
+            or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
+            or fields.get("required_prepare_capabilities")
+            != f"{PREPARED_V15_CAPABILITY:016x}"
+            or fields.get("max_handle_bytes") != str(PREPARED_V15_MAX_HANDLE_BYTES)
+            or fields.get("max_ordered_nfa_scratch_bytes")
+            != str(PREPARED_V15_MAX_SCRATCH_BYTES)
+            or fields.get("max_ordered_nfa_setup_work")
+            != str(PREPARED_V15_MAX_SETUP_WORK)
+            or runtime_symbols != ordered_runtime_symbols
+        ):
+            raise CensusError("helper-backed scalar Ordered-NFA V15 reducer envelope differs")
+        route_variant = "ordered-v15"
+    entry = fields.get("entry_symbol")
+    program = fields.get("program_symbol")
+    reducer = fields.get("reducer_symbol")
+    if not all(isinstance(symbol, str) for symbol in (entry, program, reducer)):
+        raise CensusError("scalar native reducer symbols are malformed")
+    entry_identity = symbol_identity_suffix(
+        entry, NATIVE_SEARCH_ENTRY_SYMBOL, "scalar native reducer ordinary entry"
+    )
+    program_identity = symbol_identity_suffix(
+        program, NATIVE_RUNTIME_PROGRAM_SYMBOL, "scalar native reducer runtime program"
+    )
+    reducer_identity = symbol_identity_suffix(
+        reducer, reducer_pattern, "scalar native reducer operation entry"
+    )
+    if len({entry, program, reducer}) != 3:
+        raise CensusError("scalar native reducer symbols are not distinct")
+    return {
+        "route_variant": route_variant,
+        "required_prepare_capabilities": parse_fixed_hex_u64(
+            fields.get("required_prepare_capabilities"),
+            "scalar native reducer prepare capabilities",
+        ),
+        "prepare_config_version": parse_canonical_decimal(
+            fields.get("prepare_config_version"),
+            "scalar native reducer prepare config version",
+        ),
+        "prepare_operation_flags": parse_fixed_hex_u64(
+            fields.get("prepare_operation_flags"),
+            "scalar native reducer operation flags",
+        ),
+        "max_handle_bytes": parse_canonical_decimal(
+            fields.get("max_handle_bytes"), "scalar native reducer handle cap"
+        ),
+        "max_scratch_bytes": parse_canonical_decimal(
+            fields.get("max_ordered_nfa_scratch_bytes"),
+            "scalar native reducer scratch cap",
+        ),
+        "max_setup_work": parse_canonical_decimal(
+            fields.get("max_ordered_nfa_setup_work"),
+            "scalar native reducer setup-work cap",
+        ),
+        "runtime_program_len": parse_canonical_decimal(
+            fields.get("program_len"),
+            "scalar native reducer runtime program length",
+            1,
+            MAX_SERIALIZED_PROGRAM_BYTES,
+        ),
+        "entry_identity_sha256": entry_identity,
+        "program_identity_sha256": program_identity,
+        "reducer_identity_sha256": reducer_identity,
+        "span_fill_identity_sha256": span_fill_identity,
+    }
 
 
 def scalar_direct_native_grep_proof(fields: dict[str, str]) -> None:
@@ -3316,10 +3489,15 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             else "linked-native-uniform-capture-helper-backed-reducer"
         )
         return [provenance["reducer_symbol"]], route
-    if model == "count":
-        return [provenance["reducer_symbol"]], "linked-reducer"
-    if selects_native_span_sum_reducer(provenance):
-        return [provenance["reducer_symbol"]], "linked-span-sum-reducer"
+    if model == "count" or (
+        model == "count-spans"
+        and provenance.get("span_iteration_strategy")
+        == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+    ):
+        proof = scalar_native_reducer_proof_from_provenance(provenance)
+        return [provenance["reducer_symbol"]], scalar_native_reducer_route(
+            model, proof
+        )
     if model == "count-spans" and provenance["span_fill_symbol"]:
         return [provenance["span_fill_symbol"]], "linked-span-fill"
     if model == "grep":
@@ -3506,6 +3684,17 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
             if fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS
             else None
         )
+        scalar_native_reducer = (
+            scalar_native_reducer_proof_from_provenance(fields)
+            if not shared_ordered_many and (
+                fields["model"] == "count" or (
+                    fields["model"] == "count-spans"
+                    and fields["span_iteration_strategy"]
+                    == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+                )
+            )
+            else None
+        )
         shared_proof = (
             shared_ordered_many_proof(fields) if shared_ordered_many else None
         )
@@ -3548,6 +3737,8 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         }
         if prepared_grep_v15:
             result["prepared_grep_v15"] = scalar_prepared_grep_v15_proof(fields)
+        if scalar_native_reducer is not None:
+            result["scalar_native_reducer"] = scalar_native_reducer
         return result
     if fields["schema"] == "fre.aot.rebar-runner.v5":
         proof = single_capture_reducer_proof_from_provenance(fields)
@@ -3828,14 +4019,22 @@ def operation_route_from_provenance_record(
             if provenance["boundary"] == "single-call-native-uniform-capture-reducer"
             else "linked-native-uniform-capture-helper-backed-reducer"
         )
-    elif model == "count":
+    elif model == "count" or (
+        model == "count-spans"
+        and provenance.get("span_iteration_strategy")
+        == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+    ):
         entries = [provenance["reducer_symbol"]]
-        route = "linked-reducer"
-        expected_symbol = NATIVE_COUNT_ENTRY_SYMBOL
-    elif selects_native_span_sum_reducer(provenance):
-        entries = [provenance["reducer_symbol"]]
-        route = "linked-span-sum-reducer"
-        expected_symbol = NATIVE_SPAN_SUM_ENTRY_SYMBOL
+        route = validate_normalized_scalar_native_reducer(
+            provenance.get("scalar_native_reducer"),
+            provenance,
+            "normalized scalar native reducer provenance",
+        )
+        expected_symbol = (
+            NATIVE_COUNT_ENTRY_SYMBOL
+            if model == "count"
+            else NATIVE_SPAN_SUM_ENTRY_SYMBOL
+        )
     elif model == "count-spans" and provenance["span_fill_symbol"]:
         entries = [provenance["span_fill_symbol"]]
         route = "linked-span-fill"
@@ -4764,6 +4963,132 @@ def validate_normalized_prepared_v15_component(
         raise CensusError(f"{context} prepared V15 component identity differs")
 
 
+def validate_normalized_scalar_native_reducer(
+    proof: object, provenance: dict[str, object], context: str
+) -> str:
+    """Close the normalized helper-free V2 or helper-backed V15 scalar route."""
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} scalar native reducer proof is not an object")
+    require_exact_keys(
+        proof,
+        {
+            "route_variant", "required_prepare_capabilities",
+            "prepare_config_version", "prepare_operation_flags",
+            "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+            "runtime_program_len", "entry_identity_sha256",
+            "program_identity_sha256", "reducer_identity_sha256",
+            "span_fill_identity_sha256",
+        },
+        f"{context} scalar native reducer proof",
+    )
+    model = provenance.get("model")
+    (
+        direct_adapter,
+        ordered_adapter,
+        reducer_pattern,
+        operation_flags,
+        ordered_runtime_symbols,
+        span_iteration,
+        _,
+    ) = scalar_native_reducer_surface(model)
+    entry = provenance.get("entry_symbol")
+    program = provenance.get("program_symbol")
+    reducer = provenance.get("reducer_symbol")
+    if not all(isinstance(symbol, str) for symbol in (entry, program, reducer)):
+        raise CensusError(f"{context} scalar native reducer symbols are malformed")
+    require_hex64(provenance.get("program_sha256"), f"{context} program digest")
+    require_hex64(provenance.get("object_sha256"), f"{context} object digest")
+    entry_identity = symbol_identity_suffix(
+        entry, NATIVE_SEARCH_ENTRY_SYMBOL, f"{context} ordinary entry"
+    )
+    program_identity = symbol_identity_suffix(
+        program, NATIVE_RUNTIME_PROGRAM_SYMBOL, f"{context} runtime program"
+    )
+    reducer_identity = symbol_identity_suffix(
+        reducer, reducer_pattern, f"{context} operation entry"
+    )
+    direct = proof.get("route_variant") == "direct-v2"
+    ordered = proof.get("route_variant") == "ordered-v15"
+    if direct:
+        expected = {
+            "adapter": direct_adapter,
+            "aggregate_strategy": "Some(NativeFused)",
+            "prepared_bulk_strategy": "None",
+            "required_runtime_symbols": [],
+            "span_fill_symbol": "",
+            "span_fill_identity_sha256": None,
+            "required_prepare_capabilities": 0,
+            "prepare_config_version": PREPARED_V2_CONFIG_VERSION,
+            "max_handle_bytes": 0,
+            "max_scratch_bytes": 0,
+            "max_setup_work": 0,
+        }
+    elif ordered:
+        span_fill = provenance.get("span_fill_symbol")
+        if not isinstance(span_fill, str):
+            raise CensusError(f"{context} scalar native reducer SpanFill is malformed")
+        span_fill_identity = symbol_identity_suffix(
+            span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, f"{context} SpanFill entry"
+        )
+        expected = {
+            "adapter": ordered_adapter,
+            "aggregate_strategy": "Some(NativeOrderedNfaFused)",
+            "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+            "required_runtime_symbols": list(ordered_runtime_symbols),
+            "span_fill_symbol": span_fill,
+            "span_fill_identity_sha256": span_fill_identity,
+            "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
+            "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
+            "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
+            "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
+            "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
+        }
+        if provenance.get("engine") != "OrderedNfa":
+            raise CensusError(f"{context} scalar ordered reducer engine differs")
+    else:
+        raise CensusError(f"{context} scalar native reducer route variant differs")
+    runtime_program_len = proof.get("runtime_program_len")
+    if (
+        provenance.get("schema") != "fre.aot.rebar-runner.v2"
+        or provenance.get("kind") != "scalar-v2"
+        or provenance.get("composite_kind") is not None
+        or provenance.get("source_pattern_count") is not None
+        or provenance.get("source_to_artifact") != []
+        or provenance.get("row_total_object_bytes") is not None
+        or provenance.get("uniform_capture") is not None
+        or provenance.get("shared_ordered_many") is not None
+        or provenance.get("components") != []
+        or provenance.get("adapter") != expected["adapter"]
+        or provenance.get("boundary") != "runtime-klv-warmup-schedule"
+        or provenance.get("aggregate_strategy") != expected["aggregate_strategy"]
+        or provenance.get("prepared_bulk_strategy")
+        != expected["prepared_bulk_strategy"]
+        or provenance.get("span_iteration_strategy") != span_iteration
+        or provenance.get("grep_iteration_strategy") != "not-applicable"
+        or provenance.get("required_runtime_symbols")
+        != expected["required_runtime_symbols"]
+        or provenance.get("span_fill_symbol") != expected["span_fill_symbol"]
+        or proof.get("required_prepare_capabilities")
+        != expected["required_prepare_capabilities"]
+        or proof.get("prepare_config_version") != expected["prepare_config_version"]
+        or proof.get("prepare_operation_flags") != operation_flags
+        or proof.get("max_handle_bytes") != expected["max_handle_bytes"]
+        or proof.get("max_scratch_bytes") != expected["max_scratch_bytes"]
+        or proof.get("max_setup_work") != expected["max_setup_work"]
+        or proof.get("span_fill_identity_sha256")
+        != expected["span_fill_identity_sha256"]
+        or proof.get("entry_identity_sha256") != entry_identity
+        or proof.get("program_identity_sha256") != program_identity
+        or proof.get("reducer_identity_sha256") != reducer_identity
+        or not isinstance(runtime_program_len, int)
+        or isinstance(runtime_program_len, bool)
+        or not 1 <= runtime_program_len <= MAX_SERIALIZED_PROGRAM_BYTES
+        or len({entry, program, reducer}) != 3
+    ):
+        raise CensusError(f"{context} scalar native reducer route differs")
+    return scalar_native_reducer_route(model, proof)
+
+
 def validate_normalized_prepared_grep_v15(
     proof: object, provenance: dict[str, object], context: str
 ) -> None:
@@ -5401,6 +5726,14 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         expected_keys.add("selector_capture_fallback")
     elif provenance.get("kind") == "prepared-grep-v15-v2":
         expected_keys.add("prepared_grep_v15")
+    if provenance.get("kind") == "scalar-v2" and (
+        provenance.get("model") == "count" or (
+            provenance.get("model") == "count-spans"
+            and provenance.get("span_iteration_strategy")
+            == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+        )
+    ):
+        expected_keys.add("scalar_native_reducer")
     if provenance.get("composite_kind") == "regex-redux-fixed-v1":
         expected_keys.add("regex_redux")
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
@@ -5492,6 +5825,14 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 raise CensusError(f"{context} scalar prepared V15 route differs")
             validate_normalized_prepared_grep_v15(
                 provenance["prepared_grep_v15"], provenance, context
+            )
+        elif provenance["model"] == "count" or (
+            provenance["model"] == "count-spans"
+            and provenance["span_iteration_strategy"]
+            == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+        ):
+            validate_normalized_scalar_native_reducer(
+                provenance["scalar_native_reducer"], provenance, context
             )
         elif provenance["model"] == "grep":
             entry_suffix = symbol_identity_suffix(

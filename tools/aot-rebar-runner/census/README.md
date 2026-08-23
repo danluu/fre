@@ -74,13 +74,18 @@ Once either source route is selected, reducer construction and authentication
 are terminal: a reducer error never authorizes switching source routes.
 
 The strict whole-operation boundary is a closed route classification, not a
-route-name suffix convention. A scalar `count-spans` artifact receives that
-classification only when its exact `Some(NativeFused)` or
-`Some(NativeOrderedNfaFused)` receipt is selected through
-`linked-native-span-sum-reducer`. A Span-fill entry still leaves refill,
-validation, and reduction in Rust and therefore remains an adapter-loop route.
-An unknown route, or a helper-backed or unknown aggregate strategy claiming
-the native SpanSum reducer iteration, is rejected rather than inferred native.
+route-name suffix convention. Scalar `count` and `count-spans` artifacts receive
+that classification only when an exact `Some(NativeFused)` receipt also proves
+an empty runtime-symbol set, zero prepare capability, and no prepared bulk
+route. An exact `Some(NativeOrderedNfaFused)` V15 envelope selects the same
+one-call reducer as the operation entry, but its model-specific compatibility
+helper remains trap-visible and the distinct
+`linked-native-count-helper-backed-reducer` or
+`linked-native-span-sum-helper-backed-reducer` route is classified
+semantic-helper-backed.
+A Span-fill entry used by the Rust adapter still leaves refill, validation, and
+reduction in Rust. Unknown, mixed, or mismatched scalar reducer envelopes are
+rejected rather than inferred native.
 
 ## Privacy boundary and static dry run
 
