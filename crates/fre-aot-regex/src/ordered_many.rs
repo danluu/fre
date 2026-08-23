@@ -1245,6 +1245,10 @@ impl OrderedManyAotArtifact {
     pub const fn receipt(&self) -> OrderedManyAotReceipt {
         self.receipt
     }
+
+    pub(crate) fn into_parts(self) -> (CompiledRegex, RustProfile, OrderedManyAotReceipt) {
+        (self.compiled, self.profile, self.receipt)
+    }
 }
 
 /// Terminal failure before a shared ordered-many artifact is published.

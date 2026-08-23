@@ -149,6 +149,17 @@ timing belongs to a separately named compiler-stage benchmark.
   allocation, emission, authentication, and unrelated resource failures are
   terminal. The independent stock Rust captures oracle remains authoritative
   for the published benchmark value.
+- A multi-pattern capture job also first attempts one shared reducer when every
+  independently parsed source proves the same positive participation
+  multiplier. The compiler binds source order, caller IDs, exact source bytes,
+  Rust profile, every proof fact, the selected shared program and its
+  pre-wrapper object into one composite proof identity. It then appends one
+  Count/GrepCaptures wrapper to the full shared ordered-many Count portfolio.
+  Only helper-free `NativeFused` or scalar-operation-only V15 closure is
+  published: no SpanFill, runtime helper, or Rust row loop remains. Typed
+  semantic, unequal-multiplier, unsupported, native-data, and object-cap
+  declines retain the pre-existing row adapter; all other failures are
+  terminal.
 - The fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on

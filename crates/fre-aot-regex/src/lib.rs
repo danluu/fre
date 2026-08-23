@@ -45,6 +45,7 @@ mod regex_redux_aot;
 mod rebar_single_capture;
 mod required_literals;
 mod seeded_reverse;
+mod shared_uniform_capture;
 mod uniform_capture;
 
 use fre_automata::{Automaton, RawPlan};
@@ -352,6 +353,16 @@ pub use uniform_capture::{
     UniformCaptureReducerDomain, UniformCaptureReducerOperation,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
     compile_uniform_capture_selector,
+};
+pub use shared_uniform_capture::{
+    SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION,
+    SharedUniformCaptureReducerAotArtifact,
+    SharedUniformCaptureReducerAotAuthenticationError,
+    SharedUniformCaptureReducerAotCompileDecline,
+    SharedUniformCaptureReducerAotCompileDisposition,
+    SharedUniformCaptureReducerAotCompileError,
+    SharedUniformCaptureReducerAotReceipt,
+    compile_shared_uniform_capture_reducer_aot_reported,
 };
 
 /// Stable compiler pipeline identity.

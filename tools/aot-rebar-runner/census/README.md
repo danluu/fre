@@ -120,6 +120,17 @@ retains its semantic-helper-backed classification; the ordinary NativeFused
 classification. The normalized receipt preserves the entry ABI and route
 variant so neither topology can be reclassified after raw provenance parsing.
 
+Shared `count-captures` and `grep-captures` reuse that closed shared receipt,
+but the final selected entry is a distinct native capture reducer whose only
+semantic child is the authenticated local Count function. Direct
+`NativeFused` and `PreparedScalarReduceV1` V15 forms must both have no bulk
+entry, SpanFill symbol, or semantic runtime symbol. The latter binds the Count
+entry (not the outer capture reducer) to the serialized-program identity.
+Both map to `linked-shared-ordered-many-helper-free-reducer`; the selected-entry
+negative trap targets the outer capture reducer, while runner startup
+independently reconstructs the ordered source digest and every uniform-proof
+binding before provenance can be emitted.
+
 ## Privacy boundary and static dry run
 
 The controller accepts only files underneath an explicitly supplied public KLV

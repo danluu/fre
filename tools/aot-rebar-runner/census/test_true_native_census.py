@@ -616,6 +616,8 @@ def shared_ordered_many_provenance_fields(
         raise AssertionError("operation-only shared fixture requires Ordered-NFA V15")
     native_identity = "a" * 64
     aggregate_identity = "b" * 64
+    capture = False
+    grep_iteration = "not-applicable"
     if model == "count":
         adapter = "general-aot-shared-ordered-many-native-count-v1"
         reducer = f"fre_aot_regex_count_exclusive_v1_{aggregate_identity}"
@@ -630,6 +632,25 @@ def shared_ordered_many_provenance_fields(
         span_iteration = (
             "linked-shared-ordered-many-native-span-sum-reducer-v1"
         )
+    elif model == "count-captures":
+        capture = True
+        adapter = "general-aot-shared-uniform-capture-count-reducer-v1"
+        reducer = (
+            f"fre_aot_regex_count_captures_exclusive_v1_{aggregate_identity}"
+        )
+        operation_flags = CENSUS.PREPARED_V15_SPAN_OPERATION_FLAGS
+        runtime_symbols = ()
+        span_iteration = "not-applicable"
+    elif model == "grep-captures":
+        capture = True
+        adapter = "general-aot-shared-uniform-capture-grep-reducer-v1"
+        reducer = (
+            f"fre_aot_regex_grep_captures_exclusive_v1_{aggregate_identity}"
+        )
+        operation_flags = CENSUS.PREPARED_V15_SPAN_OPERATION_FLAGS
+        runtime_symbols = ()
+        span_iteration = "not-applicable"
+        grep_iteration = "linked-native-uniform-capture-reducer-v1"
     else:
         raise AssertionError(f"unsupported synthetic shared model {model!r}")
     if native_fused:
@@ -644,6 +665,8 @@ def shared_ordered_many_provenance_fields(
         span_fill_symbol = ""
         runtime_symbols = ()
         boundary = (
+            "single-call-shared-uniform-capture-helper-free-native-reducer"
+            if capture else
             "single-call-shared-ordered-many-helper-free-native-reducer"
         )
     elif operation_only:
@@ -657,9 +680,16 @@ def shared_ordered_many_provenance_fields(
         max_setup_work = CENSUS.PREPARED_V15_MAX_SETUP_WORK
         span_fill_symbol = ""
         runtime_symbols = ()
-        native_identity = aggregate_identity
-        boundary = "single-call-shared-ordered-many-helper-free-native-reducer"
+        if not capture:
+            native_identity = aggregate_identity
+        boundary = (
+            "single-call-shared-uniform-capture-helper-free-native-reducer"
+            if capture else
+            "single-call-shared-ordered-many-helper-free-native-reducer"
+        )
     else:
+        if capture:
+            raise AssertionError("shared capture fixture has no helper-backed V15 route")
         engine = "OrderedNfa"
         aggregate_strategy = "Some(NativeOrderedNfaFused)"
         prepared_bulk_strategy = "Some(NativeOrderedNfaLoop)"
@@ -690,7 +720,7 @@ def shared_ordered_many_provenance_fields(
         "aggregate_strategy": aggregate_strategy,
         "prepared_bulk_strategy": prepared_bulk_strategy,
         "span_iteration_strategy": span_iteration,
-        "grep_iteration_strategy": "not-applicable",
+        "grep_iteration_strategy": grep_iteration,
         "shared_ordered_many": "true",
         "source_pattern_count": "3",
         "ordered_many_receipt_schema": str(CENSUS.ORDERED_MANY_RECEIPT_VERSION),
@@ -714,7 +744,10 @@ def shared_ordered_many_provenance_fields(
         ),
         "program_len": "4096",
         "entry_symbol": (
-            reducer if operation_only
+            (
+                f"fre_aot_regex_count_exclusive_v1_{native_identity}"
+                if capture else reducer
+            ) if operation_only
             else f"fre_aot_regex_search_v1_{native_identity}"
         ),
         "entry_abi": (
@@ -2655,6 +2688,61 @@ class TrueNativeCensusTests(unittest.TestCase):
             ),
         }
         for name, value in poisons.items():
+            with self.subTest(poison=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+    def test_shared_uniform_capture_closes_one_helper_free_reducer(self) -> None:
+        for model in ("count-captures", "grep-captures"):
+            for native_fused in (True, False):
+                with self.subTest(model=model, native_fused=native_fused):
+                    fields = shared_ordered_many_provenance_fields(
+                        model,
+                        native_fused=native_fused,
+                        operation_only=not native_fused,
+                    )
+                    parsed = CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={value}" for key, value in fields.items()
+                        ).encode()
+                    )
+                    receipt = CENSUS.provenance_receipt(parsed)
+                    CENSUS.validate_provenance_record(
+                        receipt, "synthetic shared uniform capture"
+                    )
+                    self.assertEqual(receipt["kind"], "shared-ordered-many-v2")
+                    self.assertIsNone(receipt["uniform_capture"])
+                    self.assertEqual(
+                        CENSUS.selected_operation_entries(parsed),
+                        (
+                            [fields["reducer_symbol"]],
+                            "linked-shared-ordered-many-helper-free-reducer",
+                        ),
+                    )
+                    self.assertEqual(
+                        CENSUS.operation_route_from_provenance_record(receipt),
+                        (
+                            [fields["reducer_symbol"]],
+                            "linked-shared-ordered-many-helper-free-reducer",
+                        ),
+                    )
+
+        fields = shared_ordered_many_provenance_fields(
+            "grep-captures", operation_only=True
+        )
+        for name, value in {
+            "adapter": "general-aot-native-uniform-capture-grep-reducer-v1",
+            "boundary": "single-call-shared-ordered-many-helper-free-native-reducer",
+            "entry_symbol": fields["reducer_symbol"],
+            "required_runtime_symbols": "fre_aot_regex_runtime_search_v1",
+            "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+        }.items():
             with self.subTest(poison=name):
                 poisoned = dict(fields)
                 poisoned[name] = value

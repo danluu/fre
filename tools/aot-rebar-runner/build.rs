@@ -141,6 +141,7 @@ fn main() {
                         None,
                         Some(&capture_receipt),
                         None,
+                        None,
                         &object_path,
                         program_symbol,
                         program_len,
@@ -161,6 +162,53 @@ fn main() {
                     object_path.display()
                 );
                 return;
+            }
+        }
+        if benchmark.patterns.len() > 1
+            && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        {
+            match shared::try_compile_shared_uniform_capture_reducer(&benchmark, target)
+                .expect("attempt shared public Rebar uniform-capture reducer")
+            {
+                shared::SharedUniformCaptureReducerDisposition::Compiled(artifact) => {
+                    let compiled = artifact.compiled();
+                    let (program_symbol, program_len) =
+                        compiled.module().required_runtime_program().expect(
+                            "shared uniform-capture reducer publishes its exact runtime program",
+                        );
+                    fs::write(&object_path, compiled.object())
+                        .expect("write linked shared uniform-capture reducer object");
+                    fs::write(
+                        &generated_path,
+                        configured_source(
+                            &benchmark,
+                            compiled,
+                            None,
+                            None,
+                            Some(artifact.receipt()),
+                            None,
+                            &object_path,
+                            program_symbol,
+                            program_len,
+                            compiled.module().entry_symbol(),
+                            compiled.module().prepared_span_fill_symbol(),
+                            Some(artifact.reducer_symbol()),
+                            &architecture,
+                            &operating_system,
+                            feature_bits,
+                            &source_commit,
+                            &source_tree,
+                        ),
+                    )
+                    .expect("write linked shared uniform-capture reducer bindings");
+                    append_validation_binding();
+                    println!(
+                        "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                        object_path.display()
+                    );
+                    return;
+                }
+                shared::SharedUniformCaptureReducerDisposition::Declined(_) => {}
             }
         }
         match shared::try_compile_uniform_capture_bridge(&benchmark, target)
@@ -219,6 +267,7 @@ fn main() {
                         &benchmark,
                         compiled,
                         Some(&bridge.receipt),
+                        None,
                         None,
                         None,
                         &object_path,
@@ -379,6 +428,7 @@ fn main() {
                         compiled,
                         None,
                         None,
+                        None,
                         Some(&artifact.receipt()),
                         &object_path,
                         program_symbol,
@@ -471,6 +521,7 @@ fn main() {
         configured_source(
             &benchmark,
             &compiled,
+            None,
             None,
             None,
             None,
@@ -624,6 +675,9 @@ fn configured_source(
     compiled: &fre_aot_regex::CompiledRegex,
     uniform_capture_receipt: Option<&fre_aot_regex::UniformCapturePreparedSpanFillCompileReceipt>,
     uniform_capture_reducer_receipt: Option<&fre_aot_regex::UniformCaptureReducerCompileReceipt>,
+    shared_uniform_capture_reducer_receipt: Option<
+        &fre_aot_regex::SharedUniformCaptureReducerAotReceipt,
+    >,
     ordered_many_receipt: Option<&fre_aot_regex::OrderedManyAotReceipt>,
     object_path: &std::path::Path,
     program_symbol: &str,
@@ -639,13 +693,23 @@ fn configured_source(
 ) -> String {
     let receipt = compiled.receipt();
     let prepared_uniform_capture = uniform_capture_receipt.is_some();
-    let native_uniform_capture = uniform_capture_reducer_receipt.is_some();
+    let single_native_uniform_capture = uniform_capture_reducer_receipt.is_some();
+    let shared_uniform_capture = shared_uniform_capture_reducer_receipt.is_some();
+    let native_uniform_capture = single_native_uniform_capture || shared_uniform_capture;
     let uniform_capture = prepared_uniform_capture || native_uniform_capture;
-    let shared_ordered_many = ordered_many_receipt.is_some();
-    assert!(!(prepared_uniform_capture && native_uniform_capture));
+    let shared_ordered_many = ordered_many_receipt.is_some() || shared_uniform_capture;
+    assert_eq!(
+        usize::from(prepared_uniform_capture)
+            + usize::from(single_native_uniform_capture)
+            + usize::from(shared_uniform_capture),
+        usize::from(uniform_capture),
+    );
     assert_eq!(uniform_capture, benchmark.model.is_capture());
     assert_eq!(shared_ordered_many, benchmark.patterns.len() > 1);
-    assert!(!uniform_capture || !shared_ordered_many);
+    assert_eq!(
+        shared_uniform_capture,
+        uniform_capture && shared_ordered_many
+    );
     if let Some(ordered) = ordered_many_receipt {
         assert_eq!(ordered.rows, benchmark.patterns.len());
         assert_eq!(
@@ -660,11 +724,28 @@ fn configured_source(
             receipt.prepared_aggregate_strategy
         );
     }
+    if let Some(shared) = shared_uniform_capture_reducer_receipt {
+        assert_eq!(shared.rows(), benchmark.patterns.len());
+        assert_eq!(
+            shared.pattern_bytes(),
+            benchmark.patterns.iter().map(String::len).sum::<usize>()
+        );
+        assert_eq!(shared.program_sha256(), receipt.program_sha256);
+        assert_eq!(shared.object_sha256(), receipt.object_sha256);
+        assert_eq!(
+            Some(shared.aggregate_strategy()),
+            receipt.prepared_aggregate_strategy
+        );
+        assert_eq!(
+            shared.required_prepare_capabilities(),
+            receipt.required_prepare_capabilities
+        );
+    }
     assert_eq!(
         native_uniform_capture,
         uniform_capture && reducer_symbol.is_some()
     );
-    assert!(!uniform_capture || benchmark.patterns.len() == 1);
+    assert!(!uniform_capture || shared_uniform_capture || benchmark.patterns.len() == 1);
     assert!(!prepared_uniform_capture || span_fill_symbol.is_some());
     assert_eq!(
         receipt.required_prepare_capabilities,
@@ -694,10 +775,15 @@ fn configured_source(
     let native_scalar_reducer =
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
             .expect("compiled native scalar reducer failed build-time authentication");
-    let native_uniform_capture_operation_only = native_uniform_capture
+    let single_native_uniform_capture_operation_only = single_native_uniform_capture
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
-    let scalar_operation_only = (native_scalar_reducer || native_uniform_capture_operation_only)
+    let shared_uniform_capture_operation_only = shared_uniform_capture
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
+    let native_uniform_capture_operation_only = single_native_uniform_capture_operation_only
+        || shared_uniform_capture_operation_only;
+    let scalar_operation_only = (native_scalar_reducer
+        && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1)
+        || native_uniform_capture_operation_only;
     let scalar_entry_symbol = match benchmark.model {
         shared::Model::SpanSum => compiled.module().prepared_span_sum_symbol(),
         _ => compiled.module().prepared_count_symbol(),
@@ -711,7 +797,7 @@ fn configured_source(
             && span_fill_symbol.is_none(),
         "scalar operation-only ABI disagrees with the linked symbol topology",
     );
-    if native_uniform_capture_operation_only {
+    if single_native_uniform_capture_operation_only {
         let uniform = uniform_capture_reducer_receipt
             .expect("operation-only uniform capture has no compiler receipt");
         assert_eq!(
@@ -720,6 +806,23 @@ fn configured_source(
         );
         assert_eq!(uniform.required_prepare_capabilities(), required_prepare_capabilities);
         assert_ne!(reducer_symbol, Some(entry_symbol));
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(!receipt.runtime_helper_required);
+    } else if shared_uniform_capture_operation_only {
+        let shared = shared_uniform_capture_reducer_receipt
+            .expect("operation-only shared uniform capture has no compiler receipt");
+        assert_eq!(
+            shared.aggregate_strategy(),
+            fre_aot_regex::PreparedAggregateStrategy::NativeOrderedNfaFused
+        );
+        assert_eq!(shared.required_prepare_capabilities(), required_prepare_capabilities);
+        let count_symbol_sha256: [u8; 32] = Sha256::digest(entry_symbol.as_bytes()).into();
+        assert_eq!(shared.count_symbol_sha256(), count_symbol_sha256);
+        let reducer_symbol = reducer_symbol
+            .expect("operation-only shared uniform capture has no reducer symbol");
+        let reducer_symbol_sha256: [u8; 32] = Sha256::digest(reducer_symbol.as_bytes()).into();
+        assert_eq!(shared.reducer_symbol_sha256(), reducer_symbol_sha256);
+        assert_ne!(reducer_symbol, entry_symbol);
         assert!(compiled.module().required_runtime_symbols().next().is_none());
         assert!(!receipt.runtime_helper_required);
     } else if scalar_operation_only {
@@ -776,13 +879,26 @@ fn configured_source(
     writeln!(
         source,
         "pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = {};",
-        ordered_many_receipt.map_or(0, |receipt| receipt.schema_version)
+        if shared_uniform_capture {
+            fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
+        } else {
+            ordered_many_receipt.map_or(0, |receipt| receipt.schema_version)
+        }
     )
     .unwrap();
     writeln!(
         source,
         "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = {:?};",
-        ordered_many_receipt.map_or([0; 32], |receipt| receipt.ordered_sources_sha256)
+        shared_uniform_capture_reducer_receipt.map_or_else(
+            || ordered_many_receipt.map_or([0; 32], |receipt| receipt.ordered_sources_sha256),
+            |receipt| receipt.ordered_sources_sha256(),
+        )
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = {};",
+        shared_uniform_capture_reducer_receipt.map_or(0, |receipt| receipt.schema_version())
     )
     .unwrap();
     writeln!(
@@ -793,7 +909,15 @@ fn configured_source(
     writeln!(
         source,
         "pub const ADAPTER: &str = {:?};",
-        if shared_ordered_many {
+        if shared_uniform_capture {
+            match benchmark.model {
+                shared::Model::CountCaptures => {
+                    "general-aot-shared-uniform-capture-count-reducer-v1"
+                }
+                shared::Model::GrepCaptures => "general-aot-shared-uniform-capture-grep-reducer-v1",
+                _ => unreachable!("shared uniform-capture binding has a non-capture model"),
+            }
+        } else if shared_ordered_many {
             match benchmark.model {
                 shared::Model::Count => "general-aot-shared-ordered-many-native-count-v1",
                 shared::Model::SpanSum => "general-aot-shared-ordered-many-native-span-sum-v1",
@@ -938,7 +1062,84 @@ fn configured_source(
                 )
             })
         });
-    if let Some((participation, selector_automaton, selector_program, selector_object)) =
+    if let Some(shared_uniform) = shared_uniform_capture_reducer_receipt {
+        let proofs = shared_uniform.source_proofs();
+        let identity = proofs
+            .first()
+            .expect("shared uniform-capture receipt has source proofs")
+            .identity();
+        let groups = proofs
+            .iter()
+            .map(|proof| {
+                u64::try_from(proof.participating_groups_per_match().get())
+                    .expect("capture multiplier fits u64")
+            })
+            .collect::<Vec<_>>();
+        let minimums = proofs
+            .iter()
+            .map(|proof| proof.minimum_match_bytes().get())
+            .collect::<Vec<_>>();
+        let captures = proofs
+            .iter()
+            .map(|proof| proof.participating_user_captures())
+            .collect::<Vec<_>>();
+        let annotations = proofs
+            .iter()
+            .map(|proof| proof.canonical_capture_annotations())
+            .collect::<Vec<_>>();
+        let work = proofs.iter().map(|proof| proof.work()).collect::<Vec<_>>();
+        let stack = proofs
+            .iter()
+            .map(|proof| proof.peak_stack_items())
+            .collect::<Vec<_>>();
+        writeln!(
+            source,
+            "pub const UNIFORM_CAPTURE_ALGORITHM_VERSION: u32 = {};",
+            identity.algorithm_version()
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = {};",
+            identity.accounting_version()
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[{}];",
+            shared_uniform.multiplier().get()
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &{groups:?};"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &{minimums:?};"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &{captures:?};"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &{annotations:?};"
+        )
+        .unwrap();
+        writeln!(source, "pub const SOURCE_PROOF_WORK: &[u64] = &{work:?};").unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &{stack:?};"
+        )
+        .unwrap();
+        source.push_str("pub const SOURCE_SELECTOR_AUTOMATON_SHA256: &[[u8; 32]] = &[];\n");
+        source.push_str("pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+        source.push_str("pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    } else if let Some((participation, selector_automaton, selector_program, selector_object)) =
         uniform_proof
     {
         let identity = participation.identity();
@@ -970,6 +1171,12 @@ fn configured_source(
             source,
             "pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[{}];",
             participation.minimum_match_bytes().get()
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[{}];",
+            participation.participating_user_captures()
         )
         .unwrap();
         writeln!(
@@ -1014,6 +1221,7 @@ fn configured_source(
         source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
         source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
         source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+        source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
         source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
         source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
         source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
@@ -1021,6 +1229,65 @@ fn configured_source(
         source.push_str("pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
         source.push_str("pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     }
+    writeln!(
+        source,
+        "pub const UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256: [u8; 32] = {:?};",
+        shared_uniform_capture_reducer_receipt
+            .map_or([0; 32], |receipt| receipt.proof_identity_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256: [u8; 32] = {:?};",
+        shared_uniform_capture_reducer_receipt
+            .map_or([0; 32], |receipt| receipt.profile_identity_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SOURCE_PROOF_BINDINGS_SHA256: &[[u8; 32]] = &{:?};",
+        shared_uniform_capture_reducer_receipt
+            .map_or(&[][..], |receipt| receipt.source_proof_bindings_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const UNIFORM_CAPTURE_COUNT_SYMBOL: &str = {:?};",
+        if native_uniform_capture {
+            compiled
+                .module()
+                .prepared_count_symbol()
+                .expect("native uniform-capture reducer has one Count child")
+        } else {
+            ""
+        }
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256: [u8; 32] = {:?};",
+        shared_uniform_capture_reducer_receipt
+            .map(|receipt| receipt.count_symbol_sha256())
+            .or_else(|| {
+                uniform_capture_reducer_receipt.map(|receipt| receipt.count_symbol_sha256())
+            })
+            .unwrap_or([0; 32])
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = {:?};",
+        shared_uniform_capture_reducer_receipt
+            .map_or([0; 32], |receipt| receipt.reducer_symbol_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256: [u8; 32] = {:?};",
+        shared_uniform_capture_reducer_receipt
+            .map_or([0; 32], |receipt| receipt.aggregate_object_sha256())
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const EXPECTED_UNICODE: bool = {};",
@@ -1396,6 +1663,7 @@ fn configured_regex_redux_source(
     source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
@@ -1564,6 +1832,7 @@ fn configured_regex_redux_source(
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
     push_empty_single_capture_reducer_bindings(&mut source);
+    push_empty_shared_uniform_capture_bindings(&mut source);
     source
 }
 
@@ -1584,9 +1853,8 @@ fn configured_participation_capture_source(
     assert_eq!(benchmark.patterns.len(), 1);
     let reducer = &bridge.artifact;
     assert!(reducer.authenticates_receipt());
-    let fre_aot_regex::RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(
-        artifact,
-    ) = reducer.source()
+    let fre_aot_regex::RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(artifact) =
+        reducer.source()
     else {
         unreachable!("participation reducer retained a capture-next source")
     };
@@ -1599,11 +1867,7 @@ fn configured_participation_capture_source(
             .is_none()
     );
     assert!(artifact.module().required_runtime_program().is_none());
-    assert!(reducer
-        .module()
-        .required_runtime_symbols()
-        .next()
-        .is_none());
+    assert!(reducer.module().required_runtime_symbols().next().is_none());
     assert!(reducer.module().required_runtime_program().is_none());
     let reducer_receipt = reducer.receipt();
     let outer = artifact.receipt();
@@ -1733,6 +1997,7 @@ fn configured_participation_capture_source(
     source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
@@ -1843,11 +2108,7 @@ fn configured_participation_capture_source(
         "pub const REDUCER_SYMBOL: &str = {reducer_symbol:?};"
     )
     .unwrap();
-    writeln!(
-        source,
-        "pub const ENTRY_SYMBOL: &str = {reducer_symbol:?};"
-    )
-    .unwrap();
+    writeln!(source, "pub const ENTRY_SYMBOL: &str = {reducer_symbol:?};").unwrap();
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
     source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
     source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
@@ -1903,7 +2164,8 @@ fn configured_participation_capture_source(
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }\n");
+    source
+        .push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn participation_exact(_request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     if reducer_receipt.caller_scratch_bytes() == 0 {
         source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
@@ -1914,6 +2176,7 @@ fn configured_participation_capture_source(
     push_empty_strict_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
+    push_empty_shared_uniform_capture_bindings(&mut source);
     push_single_capture_reducer_receipt(&mut source, reducer);
     source
 }
@@ -1949,11 +2212,7 @@ fn configured_strict_capture_source(
             .is_none()
     );
     assert!(artifact.module().required_runtime_program().is_none());
-    assert!(reducer
-        .module()
-        .required_runtime_symbols()
-        .next()
-        .is_none());
+    assert!(reducer.module().required_runtime_symbols().next().is_none());
     assert!(reducer.module().required_runtime_program().is_none());
     let reducer_receipt = reducer.receipt();
     let receipt = artifact.receipt();
@@ -1983,12 +2242,8 @@ fn configured_strict_capture_source(
     let selector_symbol = artifact.selector_entry_symbol();
     let reducer_symbol = reducer.reducer_symbol();
     let adapter = match benchmark.model {
-        shared::Model::CountCaptures => {
-            "general-aot-native-single-capture-next-count-reducer-v1"
-        }
-        shared::Model::GrepCaptures => {
-            "general-aot-native-single-capture-next-grep-reducer-v1"
-        }
+        shared::Model::CountCaptures => "general-aot-native-single-capture-next-count-reducer-v1",
+        shared::Model::GrepCaptures => "general-aot-native-single-capture-next-grep-reducer-v1",
         _ => unreachable!("strict capture source requires a capture model"),
     };
     let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
@@ -2045,6 +2300,7 @@ fn configured_strict_capture_source(
     source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];\n");
+    source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_WORK: &[u64] = &[];\n");
     source.push_str("pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];\n");
@@ -2201,6 +2457,7 @@ fn configured_strict_capture_source(
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
+    push_empty_shared_uniform_capture_bindings(&mut source);
     push_single_capture_reducer_receipt(&mut source, reducer);
     source
 }
@@ -2744,6 +3001,7 @@ fn configured_native_row_source(
         "pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &{source_minimum_match_bytes:?};"
     )
     .unwrap();
+    source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
     writeln!(
         source,
         "pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &{source_canonical_capture_annotations:?};"
@@ -2925,7 +3183,21 @@ fn configured_native_row_source(
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_single_capture_reducer_bindings(&mut source);
+    push_empty_shared_uniform_capture_bindings(&mut source);
     source
+}
+
+fn push_empty_shared_uniform_capture_bindings(source: &mut String) {
+    source.push_str("pub const SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
+    source.push_str("pub const SOURCE_PROOF_BINDINGS_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const UNIFORM_CAPTURE_COUNT_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
 }
 
 fn push_empty_native_regex_redux_bindings(source: &mut String) {
@@ -2974,7 +3246,11 @@ fn push_single_capture_reducer_receipt(
         ("SOURCE_ROUTE", source_route),
         ("EMPTY_PROGRESS", empty_progress),
     ] {
-        writeln!(source, "pub const SINGLE_CAPTURE_REDUCER_{name}: u8 = {value};").unwrap();
+        writeln!(
+            source,
+            "pub const SINGLE_CAPTURE_REDUCER_{name}: u8 = {value};"
+        )
+        .unwrap();
     }
     for (name, value) in [
         ("SOURCE_CARDINALITY", receipt.source_cardinality()),
@@ -3001,7 +3277,11 @@ fn push_single_capture_reducer_receipt(
         ("OBJECT_BYTES", receipt.object_bytes()),
         ("MAX_OBJECT_BYTES", receipt.max_object_bytes()),
     ] {
-        writeln!(source, "pub const SINGLE_CAPTURE_REDUCER_{name}: usize = {value};").unwrap();
+        writeln!(
+            source,
+            "pub const SINGLE_CAPTURE_REDUCER_{name}: usize = {value};"
+        )
+        .unwrap();
     }
     writeln!(
         source,
@@ -3051,9 +3331,12 @@ fn push_empty_single_capture_reducer_bindings(source: &mut String) {
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_SELECTOR_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_CAPTURE_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const SINGLE_CAPTURE_REDUCER_SOURCE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
+    source
+        .push_str("pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub unsafe fn capture_reduce(_haystack: *const u8, _haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
@@ -3186,6 +3469,7 @@ pub const NATIVE_SCALAR_REDUCER: bool = false;
 pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;
 pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;
 pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];
+pub const SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;
 pub const UNIFORM_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;
@@ -3302,12 +3586,20 @@ pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = 0;
 pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];
 pub const SOURCE_PARTICIPATING_GROUPS: &[u64] = &[];
 pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &[];
+pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];
 pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &[];
 pub const SOURCE_PROOF_WORK: &[u64] = &[];
 pub const SOURCE_PROOF_PEAK_STACK_ITEMS: &[usize] = &[];
 pub const SOURCE_SELECTOR_AUTOMATON_SHA256: &[[u8; 32]] = &[];
 pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[];
 pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[];
+pub const UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const SOURCE_PROOF_BINDINGS_SHA256: &[[u8; 32]] = &[];
+pub const UNIFORM_CAPTURE_COUNT_SYMBOL: &str = "";
+pub const UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256: [u8; 32] = [0; 32];
+pub const UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];
+pub const UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const EXPECTED_UNICODE: bool = false;
 pub const EXPECTED_CASE_INSENSITIVE: bool = false;
 pub const TARGET_ARCH: &str = "";

@@ -20,15 +20,19 @@ use fre_aot_regex::{
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
     RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureReducerAotArtifactV1,
     RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
-    SectionKind, SlowAotLimits, SymbolBinding, SymbolKind, Target,
+    SectionKind, SharedUniformCaptureReducerAotArtifact,
+    SharedUniformCaptureReducerAotCompileDecline,
+    SharedUniformCaptureReducerAotCompileDisposition, SlowAotLimits, SymbolBinding, SymbolKind,
+    Target,
     UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
     UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
     UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
     UniformCapturePreparedSpanFillCompileReceipt, UniformCaptureReducerCompileDisposition,
     UniformCaptureReducerCompileError, UniformCaptureReducerOperation,
     PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    compile_shared_uniform_capture_reducer_aot_reported,
 };
-use fre_lower::{LowerError, LowerResource};
+use fre_lower::{LowerError, LowerResource, UniformCaptureParticipationLimits};
 use fre_syntax::{parse, CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
 use sha2::{Digest, Sha256};
 
@@ -1756,6 +1760,162 @@ pub fn compile_shared_ordered_many_aggregate(
 pub enum SharedOrderedManyAggregateDisposition {
     Compiled(OrderedManyAotArtifact),
     Declined(OrderedManyAotCompileDecline),
+}
+
+/// The only result that authorizes a capture build to retain its independently
+/// authenticated row-loop incumbent after attempting a shared native reducer.
+#[derive(Clone, Debug)]
+pub enum SharedUniformCaptureReducerDisposition {
+    Compiled(SharedUniformCaptureReducerAotArtifact),
+    Declined(SharedUniformCaptureReducerAotCompileDecline),
+}
+
+/// Attempt one genuine shared-scan capture reducer before constructing any
+/// independent selector rows.
+///
+/// The compiler independently parses and proves every exact source under the
+/// same Rebar profile, admits only one common nonzero multiplier, runs the full
+/// ordered-many Count portfolio, and appends one native capture operation.
+/// Its typed semantic/numeric/representation declines alone retain the row
+/// bridge; syntax, proof resource, allocation, lowering, object and
+/// authentication errors remain terminal.
+pub fn try_compile_shared_uniform_capture_reducer(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<SharedUniformCaptureReducerDisposition, String> {
+    if benchmark.patterns.len() <= 1
+        || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        || !benchmark.model.is_capture()
+    {
+        return Err(format!(
+            "shared uniform-capture AOT requires a 2..={} row capture job, got model={} rows={}",
+            fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS,
+            benchmark.model.name(),
+            benchmark.patterns.len(),
+        ));
+    }
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(benchmark.patterns.len())
+        .map_err(|_| "shared uniform-capture row allocation failed".to_owned())?;
+    for (ordinal, pattern) in benchmark.patterns.iter().enumerate() {
+        let id = u32::try_from(ordinal)
+            .map_err(|_| format!("shared uniform-capture source ordinal {ordinal} overflowed"))?;
+        rows.push(OrderedManyRow::new(
+            OrderedManyPatternId::new(id),
+            pattern.clone(),
+        ));
+    }
+    let mut limits = OrderedManyAotCompileLimits::default();
+    limits.max_rows = fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS;
+    limits.max_pattern_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "shared uniform-capture source byte sum overflowed".to_owned())?;
+    limits.compile = rebar_recovery_compile_limits();
+    limits.compile.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    let operation = match benchmark.model {
+        Model::CountCaptures => UniformCaptureReducerOperation::CountCaptures,
+        Model::GrepCaptures => UniformCaptureReducerOperation::GrepCaptures,
+        _ => unreachable!("capture gate accepted a non-capture operation"),
+    };
+    let disposition = compile_shared_uniform_capture_reducer_aot_reported(
+        OrderedManyAotCompileRequest::new(rows, target)
+            .profile(profile.clone())
+            .mode(CompileMode::Optimizing)
+            .limits(limits),
+        operation,
+        UniformCaptureParticipationLimits::default(),
+        SlowAotLimits::default(),
+    )
+    .map_err(|error| format!("shared uniform-capture AOT compilation failed: {error}"))?;
+    let artifact = match disposition {
+        SharedUniformCaptureReducerAotCompileDisposition::Compiled(artifact) => artifact,
+        SharedUniformCaptureReducerAotCompileDisposition::Declined(decline) => {
+            return Ok(SharedUniformCaptureReducerDisposition::Declined(decline));
+        }
+    };
+    artifact
+        .authenticate()
+        .map_err(|error| format!("shared uniform-capture AOT seal failed: {error}"))?;
+    authenticate_shared_uniform_capture_reducer(benchmark, target, &profile, &artifact)?;
+    Ok(SharedUniformCaptureReducerDisposition::Compiled(artifact))
+}
+
+fn authenticate_shared_uniform_capture_reducer(
+    benchmark: &Benchmark,
+    target: Target,
+    profile: &RustProfile,
+    artifact: &SharedUniformCaptureReducerAotArtifact,
+) -> Result<(), String> {
+    let receipt = artifact.receipt();
+    let compiled = artifact.compiled();
+    let operation = match benchmark.model {
+        Model::CountCaptures => UniformCaptureReducerOperation::CountCaptures,
+        Model::GrepCaptures => UniformCaptureReducerOperation::GrepCaptures,
+        _ => return Err("shared uniform-capture artifact has a non-capture model".to_owned()),
+    };
+    let expected_sources = ordered_many_source_sha256(&benchmark.patterns)?;
+    let common_multiplier = receipt.multiplier().get();
+    if artifact.profile() != profile
+        || receipt.rows() != benchmark.patterns.len()
+        || receipt.pattern_bytes() != benchmark.patterns.iter().map(String::len).sum::<usize>()
+        || receipt.ordered_sources_sha256() != expected_sources
+        || receipt.operation() != operation
+        || receipt.domain() != operation.domain()
+        || receipt.target() != target
+        || receipt.source_proofs().len() != benchmark.patterns.len()
+        || receipt.source_proof_bindings_sha256().len() != benchmark.patterns.len()
+        || receipt.source_proofs().iter().any(|proof| {
+            u64::try_from(proof.participating_groups_per_match().get()) != Ok(common_multiplier)
+        })
+        || receipt.proof_identity_sha256() == [0; 32]
+        || receipt.object_sha256() != compiled.receipt().object_sha256
+        || compiled.object().is_empty()
+        || compiled.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || compiled
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_some()
+        || compiled.module().prepared_count_symbol().is_none()
+        || artifact.reducer_symbol().is_empty()
+    {
+        return Err("shared uniform-capture AOT runner authentication failed".to_owned());
+    }
+    Ok(())
+}
+
+fn ordered_many_source_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre.ordered-many-aot.sources.v1\0");
+    digest.update(
+        u64::try_from(patterns.len())
+            .map_err(|_| "shared ordered source count overflowed u64".to_owned())?
+            .to_le_bytes(),
+    );
+    for (ordinal, pattern) in patterns.iter().enumerate() {
+        digest.update(
+            u64::try_from(ordinal)
+                .map_err(|_| "shared ordered source ordinal overflowed u64".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u32::try_from(ordinal)
+                .map_err(|_| "shared ordered source id overflowed u32".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u64::try_from(pattern.len())
+                .map_err(|_| "shared ordered source length overflowed u64".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(pattern.as_bytes());
+    }
+    Ok(digest.finalize().into())
 }
 
 /// Attempt the shared route without swallowing allocator, invariant, object or

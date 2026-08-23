@@ -1347,7 +1347,10 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
             scalar_direct_native_grep_proof(fields)
         else:
             raise CensusError("scalar grep provenance requires unknown capabilities")
-    elif fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS:
+    elif (
+        fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS
+        and fields["shared_ordered_many"] == "false"
+    ):
         scalar_native_uniform_capture_proof(fields)
     elif fields["shared_ordered_many"] == "false" and (
         fields["model"] == "count" or (
@@ -1840,11 +1843,41 @@ def shared_ordered_many_native_fused_proof(
             NATIVE_SPAN_SUM_ENTRY_SYMBOL,
             PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
             "linked-shared-ordered-many-native-span-sum-reducer-v1",
+            "not-applicable",
+            "single-call-shared-ordered-many-helper-free-native-reducer",
+            False,
+        ),
+        "count-captures": (
+            "general-aot-shared-uniform-capture-count-reducer-v1",
+            NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            "not-applicable",
+            "not-applicable",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            True,
+        ),
+        "grep-captures": (
+            "general-aot-shared-uniform-capture-grep-reducer-v1",
+            NATIVE_GREP_CAPTURES_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            "not-applicable",
+            "linked-native-uniform-capture-reducer-v1",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            True,
         ),
     }.get(fields.get("model"))
     if route is None:
         raise CensusError("shared NativeFused provenance has an unsupported model")
-    adapter, reducer_pattern, operation_flags, span_iteration = route
+    if len(route) == 4:
+        adapter, reducer_pattern, operation_flags, span_iteration = route
+        grep_iteration = "not-applicable"
+        boundary = "single-call-shared-ordered-many-helper-free-native-reducer"
+        capture = False
+    else:
+        (
+            adapter, reducer_pattern, operation_flags, span_iteration,
+            grep_iteration, boundary, capture,
+        ) = route
     source_count = parse_canonical_decimal(
         fields.get("source_pattern_count"),
         "shared NativeFused source_pattern_count",
@@ -1867,7 +1900,7 @@ def shared_ordered_many_native_fused_proof(
         or fields.get("adapter") != adapter
         or fields.get("aggregate_strategy") != "Some(NativeFused)"
         or fields.get("span_iteration_strategy") != span_iteration
-        or fields.get("grep_iteration_strategy") != "not-applicable"
+        or fields.get("grep_iteration_strategy") != grep_iteration
         or fields.get("prepare_config_version") != str(PREPARED_V2_CONFIG_VERSION)
         or fields.get("prepare_operation_flags") != f"{operation_flags:016x}"
         or fields.get("required_prepare_capabilities") != f"{0:016x}"
@@ -1877,8 +1910,7 @@ def shared_ordered_many_native_fused_proof(
         or fields.get("max_ordered_nfa_scratch_bytes") != "0"
         or fields.get("max_ordered_nfa_setup_work") != "0"
         or fields.get("required_runtime_symbols") != ""
-        or fields.get("boundary")
-        != "single-call-shared-ordered-many-helper-free-native-reducer"
+        or fields.get("boundary") != boundary
     ):
         raise CensusError("shared NativeFused provenance has a noncanonical route or cap")
     entry_suffix = symbol_identity_suffix(
@@ -1895,6 +1927,8 @@ def shared_ordered_many_native_fused_proof(
     )
     bulk = fields.get("prepared_bulk_strategy")
     span_fill = fields.get("span_fill_symbol", "")
+    if capture and bulk != "None":
+        raise CensusError("shared capture NativeFused route retains a bulk loop")
     if bulk == "None":
         if span_fill:
             raise CensusError("direct shared NativeFused route retains SpanFill")
@@ -1940,11 +1974,48 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
             PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
             PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS,
             "linked-shared-ordered-many-native-span-sum-reducer-v1",
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            "not-applicable",
+            "single-call-shared-ordered-many-helper-free-native-reducer",
+            False,
+        ),
+        "count-captures": (
+            "general-aot-shared-uniform-capture-count-reducer-v1",
+            NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            (),
+            "not-applicable",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            "not-applicable",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            True,
+        ),
+        "grep-captures": (
+            "general-aot-shared-uniform-capture-grep-reducer-v1",
+            NATIVE_GREP_CAPTURES_ENTRY_SYMBOL,
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            (),
+            "not-applicable",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            "linked-native-uniform-capture-reducer-v1",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            True,
         ),
     }.get(fields.get("model"))
     if route is None:
         raise CensusError("shared ordered-many provenance has an unsupported model")
-    adapter, reducer_pattern, operation_flags, runtime_symbols, span_iteration = route
+    if len(route) == 5:
+        adapter, reducer_pattern, operation_flags, runtime_symbols, span_iteration = route
+        operation_entry_pattern = reducer_pattern
+        grep_iteration = "not-applicable"
+        helper_free_boundary = "single-call-shared-ordered-many-helper-free-native-reducer"
+        capture = False
+    else:
+        (
+            adapter, reducer_pattern, operation_flags, runtime_symbols,
+            span_iteration, operation_entry_pattern, grep_iteration,
+            helper_free_boundary, capture,
+        ) = route
     source_count = parse_canonical_decimal(
         fields.get("source_pattern_count"),
         "shared ordered-many source_pattern_count",
@@ -1962,13 +2033,15 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     if ordered_sources == "0" * 64:
         raise CensusError("shared ordered-many source digest is zero")
     operation_only = fields.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI
+    if capture and not operation_only:
+        raise CensusError("shared capture V15 route is not operation-only")
     if (
         fields.get("shared_ordered_many") != "true"
         or fields.get("adapter") != adapter
         or fields.get("engine") != "OrderedNfa"
         or fields.get("aggregate_strategy") != "Some(NativeOrderedNfaFused)"
         or fields.get("span_iteration_strategy") != span_iteration
-        or fields.get("grep_iteration_strategy") != "not-applicable"
+        or fields.get("grep_iteration_strategy") != grep_iteration
         or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
         or fields.get("prepare_operation_flags") != f"{operation_flags:016x}"
         or fields.get("required_prepare_capabilities")
@@ -1991,7 +2064,7 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
             or fields.get("span_fill_symbol") != ""
             or actual_runtime_symbols
             or fields.get("boundary")
-            != "single-call-shared-ordered-many-helper-free-native-reducer"
+            != helper_free_boundary
         ):
             raise CensusError("operation-only shared V15 topology differs")
     elif (
@@ -2004,7 +2077,7 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         raise CensusError("compatibility shared V15 topology differs")
     entry_suffix = symbol_identity_suffix(
         fields["entry_symbol"],
-        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        operation_entry_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
         (
             "operation-only shared ordered-many entry"
             if operation_only else "shared ordered-many ordinary entry"
@@ -2019,10 +2092,15 @@ def shared_ordered_many_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         "shared ordered-many reducer",
     )
     if operation_only:
-        if (
-            fields["entry_symbol"] != fields["reducer_symbol"]
-            or len({entry_suffix, program_suffix, reducer_suffix}) != 1
-        ):
+        identities_close = (
+            entry_suffix == program_suffix
+            and (
+                (capture and reducer_suffix != entry_suffix)
+                or (not capture and reducer_suffix == entry_suffix)
+            )
+            and ((fields["entry_symbol"] != fields["reducer_symbol"]) == capture)
+        )
+        if not identities_close:
             raise CensusError("operation-only shared V15 identities disagree")
         route_variant = "ordered-v15-operation-only"
     else:
@@ -4091,7 +4169,10 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         )
         uniform_capture = (
             scalar_native_uniform_capture_proof(fields)
-            if fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS
+            if (
+                fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS
+                and not shared_ordered_many
+            )
             else None
         )
         scalar_native_reducer = (
@@ -5763,6 +5844,10 @@ def validate_normalized_shared_ordered_many(
             PREPARED_V15_SPAN_OPERATION_FLAGS,
             PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS,
             NATIVE_COUNT_ENTRY_SYMBOL,
+            "not-applicable",
+            "single-call-shared-ordered-many-helper-free-native-reducer",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            False,
         ),
         "count-spans": (
             "general-aot-shared-ordered-many-native-span-sum-v1",
@@ -5770,11 +5855,41 @@ def validate_normalized_shared_ordered_many(
             PREPARED_V15_SPAN_SUM_OPERATION_FLAGS,
             PREPARED_V15_SHARED_SPAN_SUM_RUNTIME_SYMBOLS,
             NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            "not-applicable",
+            "single-call-shared-ordered-many-helper-free-native-reducer",
+            NATIVE_SPAN_SUM_ENTRY_SYMBOL,
+            False,
+        ),
+        "count-captures": (
+            "general-aot-shared-uniform-capture-count-reducer-v1",
+            "not-applicable",
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            (),
+            NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL,
+            "not-applicable",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            True,
+        ),
+        "grep-captures": (
+            "general-aot-shared-uniform-capture-grep-reducer-v1",
+            "not-applicable",
+            PREPARED_V15_SPAN_OPERATION_FLAGS,
+            (),
+            NATIVE_GREP_CAPTURES_ENTRY_SYMBOL,
+            "linked-native-uniform-capture-reducer-v1",
+            "single-call-shared-uniform-capture-helper-free-native-reducer",
+            NATIVE_COUNT_ENTRY_SYMBOL,
+            True,
         ),
     }.get(provenance.get("model"))
     if route is None:
         raise CensusError(f"{context} has an unsupported shared model")
-    adapter, span_iteration, operation_flags, runtime_symbols, reducer_pattern = route
+    (
+        adapter, span_iteration, operation_flags, runtime_symbols,
+        reducer_pattern, grep_iteration, helper_free_boundary,
+        operation_entry_pattern, capture,
+    ) = route
     variant = proof.get("route_variant")
     native_fused = variant == "native-fused-v2"
     compatibility = variant == "ordered-v15"
@@ -5783,16 +5898,19 @@ def validate_normalized_shared_ordered_many(
         bulk = provenance.get("prepared_bulk_strategy")
         variant_topology = (
             provenance.get("boundary")
-            == "single-call-shared-ordered-many-helper-free-native-reducer"
+            == helper_free_boundary
             and provenance.get("entry_abi") == SPAN_SEARCH_ENTRY_ABI
             and provenance.get("aggregate_strategy") == "Some(NativeFused)"
             and provenance.get("required_runtime_symbols") == []
             and bulk in {
                 "None", "Some(NativePreparedLoop)", "Some(NativeFrozenLoop)",
             }
+            and (not capture or bulk == "None")
         )
     elif compatibility:
         variant_topology = (
+            not capture
+            and
             provenance.get("boundary")
             == "single-call-shared-ordered-many-helper-backed-reducer"
             and provenance.get("engine") == "OrderedNfa"
@@ -5806,7 +5924,7 @@ def validate_normalized_shared_ordered_many(
     elif operation_only:
         variant_topology = (
             provenance.get("boundary")
-            == "single-call-shared-ordered-many-helper-free-native-reducer"
+            == helper_free_boundary
             and provenance.get("engine") == "OrderedNfa"
             and provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI
             and provenance.get("aggregate_strategy")
@@ -5827,7 +5945,7 @@ def validate_normalized_shared_ordered_many(
         or provenance.get("adapter") != adapter
         or not variant_topology
         or provenance.get("span_iteration_strategy") != span_iteration
-        or provenance.get("grep_iteration_strategy") != "not-applicable"
+        or provenance.get("grep_iteration_strategy") != grep_iteration
         or not isinstance(source_count, int)
         or isinstance(source_count, bool)
         or not 2 <= source_count <= MAX_NATIVE_ROW_COMPONENTS
@@ -5846,7 +5964,7 @@ def validate_normalized_shared_ordered_many(
         raise CensusError(f"{context} shared ordered-many symbols are malformed")
     entry_suffix = symbol_identity_suffix(
         entry,
-        reducer_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
+        operation_entry_pattern if operation_only else NATIVE_SEARCH_ENTRY_SYMBOL,
         context,
     )
     program_suffix = symbol_identity_suffix(
@@ -5856,8 +5974,12 @@ def validate_normalized_shared_ordered_many(
     if operation_only:
         symbol_shape_is_exact = (
             span_fill == ""
-            and entry == reducer
-            and len({entry_suffix, program_suffix, reducer_suffix}) == 1
+            and entry_suffix == program_suffix
+            and ((entry != reducer) == capture)
+            and (
+                (capture and reducer_suffix != entry_suffix)
+                or (not capture and reducer_suffix == entry_suffix)
+            )
         )
     elif native_fused and provenance.get("prepared_bulk_strategy") == "None":
         symbol_shape_is_exact = span_fill == ""

@@ -19,6 +19,7 @@ use fre_aot_regex::{
     FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
     NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
 };
+use fre_syntax::RustProfile;
 #[cfg(test)]
 use fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT;
 use fre_aot_regex_runtime::{
@@ -1869,7 +1870,12 @@ fn print_provenance() {
                 FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
             )
         };
-    let boundary = if linked::UNIFORM_CAPTURE_BRIDGE
+    let boundary = if linked::SHARED_ORDERED_MANY_AGGREGATE
+        && linked::UNIFORM_CAPTURE_BRIDGE
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+    {
+        "single-call-shared-uniform-capture-helper-free-native-reducer"
+    } else if linked::UNIFORM_CAPTURE_BRIDGE
         && !linked::NATIVE_ROW_BRIDGE
         && !linked::REDUCER_SYMBOL.is_empty()
     {
@@ -2448,6 +2454,10 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     let scalar_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
     let native_uniform_capture = scalar_uniform_capture && !linked::REDUCER_SYMBOL.is_empty();
     let prepared_uniform_capture = scalar_uniform_capture && linked::REDUCER_SYMBOL.is_empty();
+    let shared_uniform_capture = linked::SHARED_ORDERED_MANY_AGGREGATE
+        && linked::UNIFORM_CAPTURE_BRIDGE
+        && linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA
+            == fre_aot_regex::SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION;
     if linked::SHARED_ORDERED_MANY_AGGREGATE
         != (linked::ORDERED_MANY_RECEIPT_SCHEMA == fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
             && linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32])
@@ -2460,9 +2470,31 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     {
         return Err("non-shared route contains an ordered-many source receipt".to_owned());
     }
+    if shared_uniform_capture
+        != (linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA
+            == fre_aot_regex::SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION
+            && linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256 != [0; 32]
+            && linked::SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256 != [0; 32]
+            && linked::UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256 != [0; 32]
+            && linked::UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256 != [0; 32]
+            && linked::UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256 != [0; 32]
+            && linked::SOURCE_PROOF_BINDINGS_SHA256.len() == benchmark.patterns.len())
+    {
+        return Err("shared uniform-capture route disagrees with its proof receipt".to_owned());
+    }
+    if !shared_uniform_capture
+        && (linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA != 0
+            || linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256 != [0; 32]
+            || linked::SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256 != [0; 32]
+            || linked::UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256 != [0; 32]
+            || linked::UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256 != [0; 32]
+            || !linked::SOURCE_PROOF_BINDINGS_SHA256.is_empty())
+    {
+        return Err("non-shared-uniform route contains a composite proof receipt".to_owned());
+    }
     if linked::SHARED_ORDERED_MANY_AGGREGATE
         && (linked::NATIVE_ROW_BRIDGE
-            || linked::UNIFORM_CAPTURE_BRIDGE
+            || (linked::UNIFORM_CAPTURE_BRIDGE && !shared_uniform_capture)
             || linked::STRICT_CAPTURE_BRIDGE
             || linked::PARTICIPATION_CAPTURE_BRIDGE
             || linked::SINGLE_CAPTURE_REDUCER_BRIDGE
@@ -2623,7 +2655,11 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return authenticate_native_row_route(benchmark);
     }
     if linked::SHARED_ORDERED_MANY_AGGREGATE {
-        authenticate_linked_shared_ordered_many(benchmark)?;
+        if shared_uniform_capture {
+            authenticate_linked_shared_uniform_capture(benchmark)?;
+        } else {
+            authenticate_linked_shared_ordered_many(benchmark)?;
+        }
     } else if benchmark.uses_native_row_bridge() {
         return Err("multi-pattern KLV is not bound to a native-row bridge".to_owned());
     }
@@ -2632,7 +2668,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
     }
     let native_scalar_reducer = authenticate_linked_native_scalar_reducer(benchmark.model)?;
-    if native_uniform_capture {
+    if native_uniform_capture && !shared_uniform_capture {
         let reducer_prefix = match benchmark.model {
             shared::Model::CountCaptures => "fre_aot_regex_count_captures_exclusive_v1_",
             shared::Model::GrepCaptures => "fre_aot_regex_grep_captures_exclusive_v1_",
@@ -2860,6 +2896,8 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         && linked::SPAN_FILL_SYMBOL.is_empty()
         && if native_uniform_capture {
             linked::ENTRY_SYMBOL != linked::REDUCER_SYMBOL
+                && (!shared_uniform_capture
+                    || linked::ENTRY_SYMBOL == linked::UNIFORM_CAPTURE_COUNT_SYMBOL)
         } else {
             linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
         }
@@ -2982,6 +3020,304 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
         && entry_identity == span_fill_identity
         && entry_identity == program_identity
         && reducer_identity != entry_identity
+}
+
+fn update_shared_uniform_identity_field(
+    digest: &mut Sha256,
+    tag: u64,
+    value: &[u8],
+) -> Result<(), String> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| "shared uniform-capture identity field length overflowed".to_owned())?;
+    digest.update(tag.to_le_bytes());
+    digest.update(length.to_le_bytes());
+    digest.update(value);
+    Ok(())
+}
+
+fn shared_uniform_ordered_sources_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre.ordered-many-aot.sources.v1\0");
+    digest.update(
+        u64::try_from(patterns.len())
+            .map_err(|_| "shared uniform-capture source count overflowed".to_owned())?
+            .to_le_bytes(),
+    );
+    for (row, pattern) in patterns.iter().enumerate() {
+        digest.update(
+            u64::try_from(row)
+                .map_err(|_| "shared uniform-capture source ordinal overflowed".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u32::try_from(row)
+                .map_err(|_| "shared uniform-capture pattern ID overflowed".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u64::try_from(pattern.len())
+                .map_err(|_| "shared uniform-capture source length overflowed".to_owned())?
+                .to_le_bytes(),
+        );
+        digest.update(pattern.as_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn shared_uniform_source_proof_binding(
+    row: usize,
+    pattern: &str,
+    profile_identity_sha256: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let pattern_id = u32::try_from(row)
+        .map_err(|_| "shared uniform-capture proof pattern ID overflowed".to_owned())?;
+    let minimum = linked::SOURCE_MINIMUM_MATCH_BYTES[row];
+    let captures = linked::SOURCE_PARTICIPATING_USER_CAPTURES[row];
+    let groups = linked::SOURCE_PARTICIPATING_GROUPS[row];
+    let annotations = linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS[row];
+    let work = linked::SOURCE_PROOF_WORK[row];
+    let stack = linked::SOURCE_PROOF_PEAK_STACK_ITEMS[row];
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/shared-uniform-capture-source-proof/v1\0");
+    update_shared_uniform_identity_field(
+        &mut digest,
+        0,
+        &u64::try_from(row)
+            .map_err(|_| "shared uniform-capture proof ordinal overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(&mut digest, 1, &pattern_id.to_le_bytes())?;
+    update_shared_uniform_identity_field(&mut digest, 2, pattern.as_bytes())?;
+    update_shared_uniform_identity_field(&mut digest, 3, &profile_identity_sha256)?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        4,
+        &linked::UNIFORM_CAPTURE_ALGORITHM_VERSION.to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        5,
+        &linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION.to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        6,
+        &u64::try_from(minimum)
+            .map_err(|_| "shared uniform-capture minimum width overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        7,
+        &u64::try_from(captures)
+            .map_err(|_| "shared uniform-capture user-capture count overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(&mut digest, 8, &groups.to_le_bytes())?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        9,
+        &u64::try_from(annotations)
+            .map_err(|_| "shared uniform-capture annotation count overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    update_shared_uniform_identity_field(&mut digest, 10, &work.to_le_bytes())?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        11,
+        &u64::try_from(stack)
+            .map_err(|_| "shared uniform-capture proof stack overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    Ok(digest.finalize().into())
+}
+
+fn shared_uniform_composite_proof_identity(
+    profile_identity_sha256: [u8; 32],
+    ordered_sources_sha256: [u8; 32],
+    multiplier: u64,
+    source_bindings: &[[u8; 32]],
+) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/shared-uniform-capture-proof-binding/v1\0");
+    update_shared_uniform_identity_field(&mut digest, 0, &profile_identity_sha256)?;
+    update_shared_uniform_identity_field(&mut digest, 1, &ordered_sources_sha256)?;
+    update_shared_uniform_identity_field(&mut digest, 2, &linked::PROGRAM_SHA256)?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        3,
+        &linked::UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256,
+    )?;
+    update_shared_uniform_identity_field(&mut digest, 4, &multiplier.to_le_bytes())?;
+    update_shared_uniform_identity_field(
+        &mut digest,
+        5,
+        &u64::try_from(source_bindings.len())
+            .map_err(|_| "shared uniform-capture proof count overflowed".to_owned())?
+            .to_le_bytes(),
+    )?;
+    for (row, binding) in source_bindings.iter().enumerate() {
+        let tag = u64::try_from(row)
+            .ok()
+            .and_then(|row| row.checked_add(6))
+            .ok_or_else(|| "shared uniform-capture proof tag overflowed".to_owned())?;
+        update_shared_uniform_identity_field(&mut digest, tag, binding)?;
+    }
+    Ok(digest.finalize().into())
+}
+
+fn authenticate_linked_shared_uniform_capture(benchmark: &shared::Benchmark) -> Result<(), String> {
+    let (adapter, reducer_prefix, grep_iteration) = match benchmark.model {
+        shared::Model::CountCaptures => (
+            "general-aot-shared-uniform-capture-count-reducer-v1",
+            "fre_aot_regex_count_captures_exclusive_v1_",
+            "not-applicable",
+        ),
+        shared::Model::GrepCaptures => (
+            "general-aot-shared-uniform-capture-grep-reducer-v1",
+            "fre_aot_regex_grep_captures_exclusive_v1_",
+            "linked-native-uniform-capture-reducer-v1",
+        ),
+        _ => {
+            return Err(
+                "shared uniform-capture artifact is bound to a non-capture model".to_owned(),
+            );
+        }
+    };
+    let sources = benchmark.patterns.len();
+    let proof_cardinalities = [
+        linked::SOURCE_PARTICIPATING_GROUPS.len(),
+        linked::SOURCE_MINIMUM_MATCH_BYTES.len(),
+        linked::SOURCE_PARTICIPATING_USER_CAPTURES.len(),
+        linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len(),
+        linked::SOURCE_PROOF_WORK.len(),
+        linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len(),
+        linked::SOURCE_PROOF_BINDINGS_SHA256.len(),
+    ];
+    if sources < 2
+        || sources > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        || proof_cardinalities
+            .into_iter()
+            .any(|length| length != sources)
+        || linked::SOURCE_PARTICIPATING_GROUPS.contains(&0)
+        || linked::SOURCE_MINIMUM_MATCH_BYTES.contains(&0)
+        || linked::SOURCE_PROOF_WORK.contains(&0)
+        || linked::SOURCE_PROOF_PEAK_STACK_ITEMS.contains(&0)
+        || linked::SOURCE_PROOF_BINDINGS_SHA256.contains(&[0; 32])
+        || !linked::SOURCE_SELECTOR_AUTOMATON_SHA256.is_empty()
+        || !linked::SOURCE_SELECTOR_PROGRAM_SHA256.is_empty()
+        || !linked::SOURCE_SELECTOR_OBJECT_SHA256.is_empty()
+        || linked::ROW_PARTICIPATING_GROUPS.len() != 1
+        || linked::ROW_PARTICIPATING_GROUPS[0] == 0
+        || linked::SOURCE_PARTICIPATING_GROUPS
+            .iter()
+            .any(|groups| *groups != linked::ROW_PARTICIPATING_GROUPS[0])
+        || linked::UNIFORM_CAPTURE_ALGORITHM_VERSION
+            != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION
+        || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION
+            != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
+    {
+        return Err("shared uniform-capture proof facts are inconsistent".to_owned());
+    }
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let profile_identity_sha256 = sha256(profile.identity_string().as_bytes());
+    let ordered_sources_sha256 = shared_uniform_ordered_sources_sha256(&benchmark.patterns)?;
+    let source_bindings = benchmark
+        .patterns
+        .iter()
+        .enumerate()
+        .map(|(row, pattern)| {
+            shared_uniform_source_proof_binding(row, pattern, profile_identity_sha256)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let proof_identity = shared_uniform_composite_proof_identity(
+        profile_identity_sha256,
+        ordered_sources_sha256,
+        linked::ROW_PARTICIPATING_GROUPS[0],
+        &source_bindings,
+    )?;
+    if profile_identity_sha256 != linked::SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256
+        || ordered_sources_sha256 != linked::ORDERED_MANY_SOURCES_SHA256
+        || source_bindings.as_slice() != linked::SOURCE_PROOF_BINDINGS_SHA256
+        || proof_identity != linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256
+    {
+        return Err("shared uniform-capture source/proof seal differs".to_owned());
+    }
+
+    let direct = linked::AGGREGATE_STRATEGY == "Some(NativeFused)";
+    let ordered = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
+    let count_identity = native_symbol_identity(
+        linked::UNIFORM_CAPTURE_COUNT_SYMBOL,
+        "fre_aot_regex_count_exclusive_v1_",
+    );
+    let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix);
+    let program_identity =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_");
+    let entry_identity = if ordered {
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_count_exclusive_v1_")
+    } else {
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
+    };
+    let topology = if direct {
+        linked::ENTRY_ABI == "SpanSearchV1"
+            && linked::ENGINE != "OrderedNfa"
+            && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V2_VERSION
+            && linked::REQUIRED_PREPARE_CAPABILITIES == 0
+            && entry_identity == program_identity
+    } else if ordered {
+        linked::ENTRY_ABI == "PreparedScalarReduceV1"
+            && linked::ENGINE == "OrderedNfa"
+            && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V3_VERSION
+            && linked::REQUIRED_PREPARE_CAPABILITIES == PREPARE_CAPABILITY_ORDERED_NFA_V15
+            && linked::ENTRY_SYMBOL == linked::UNIFORM_CAPTURE_COUNT_SYMBOL
+            && entry_identity == count_identity
+            && entry_identity == program_identity
+    } else {
+        false
+    };
+    if !topology
+        || linked::ADAPTER != adapter
+        || linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA
+            != fre_aot_regex::SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION
+        || linked::ORDERED_MANY_RECEIPT_SCHEMA != fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
+        || linked::SOURCE_PATTERN_COUNT != sources
+        || linked::ROW_ARTIFACT_COUNT != 1
+        || linked::SOURCE_TO_ARTIFACT.len() != sources
+        || linked::SOURCE_TO_ARTIFACT
+            .iter()
+            .any(|artifact| *artifact != 0)
+        || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+        || linked::ROW_ENTRY_SYMBOLS != [linked::ENTRY_SYMBOL]
+        || linked::ROW_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+        || linked::ROW_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+        || linked::ROW_TOTAL_OBJECT_BYTES != linked::OBJECT_BYTES.len()
+        || linked::OBJECT_BYTES.is_empty()
+        || sha256(linked::OBJECT_BYTES) != linked::OBJECT_SHA256
+        || linked::PROGRAM_LEN == 0
+        || linked::PROGRAM_SHA256 == [0; 32]
+        || linked::UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256 == [0; 32]
+        || linked::PREPARE_OPERATION_FLAGS != shared::Model::Count.prepare_operation_flags()
+        || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
+        || linked::GREP_ITERATION_STRATEGY != grep_iteration
+        || linked::PREPARED_BULK_STRATEGY != "None"
+        || linked::HAS_SPAN_FILL
+        || !linked::SPAN_FILL_SYMBOL.is_empty()
+        || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        || count_identity.is_none()
+        || reducer_identity.is_none()
+        || program_identity.is_none()
+        || entry_identity.is_none()
+        || linked::UNIFORM_CAPTURE_COUNT_SYMBOL == linked::REDUCER_SYMBOL
+        || sha256(linked::UNIFORM_CAPTURE_COUNT_SYMBOL.as_bytes())
+            != linked::UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256
+        || sha256(linked::REDUCER_SYMBOL.as_bytes())
+            != linked::UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256
+    {
+        return Err("shared uniform-capture linked identity closure is inconsistent".to_owned());
+    }
+    Ok(())
 }
 
 fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Result<(), String> {

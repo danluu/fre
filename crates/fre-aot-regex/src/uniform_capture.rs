@@ -950,7 +950,7 @@ impl UniformCaptureReducerOperation {
         }
     }
 
-    const fn native_domain(self) -> crate::module::NativeUniformCaptureReducerDomain {
+    pub(crate) const fn native_domain(self) -> crate::module::NativeUniformCaptureReducerDomain {
         match self {
             Self::CountCaptures => {
                 crate::module::NativeUniformCaptureReducerDomain::WholeHaystack
@@ -1721,7 +1721,7 @@ fn seal_finalized_uniform_capture_reducer(
     Ok(selected)
 }
 
-/// Final native wrapper state shared by the one-pattern proof and a future
+/// Final native wrapper state shared by the one-pattern proof and an
 /// independently authenticated ordered-many capture proof.
 #[derive(Debug)]
 pub(crate) struct FinalizedNativeUniformCaptureReducer {
