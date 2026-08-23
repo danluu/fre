@@ -290,47 +290,6 @@ impl ExclusiveSession {
         strict_span_sum_with_direct_entry(haystack)
     }
 
-    fn strict_grep_with_direct_entry(&mut self, haystack: &[u8]) -> Result<u64, String> {
-        strict_grep_with_direct_entry(haystack)
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "the exact prepared SpanFill is the authenticated per-line Exists boundary"
-    )]
-    fn strict_grep_with_prepared_fill(&mut self, haystack: &[u8]) -> Result<u64, String> {
-        strict_grep_with_search(haystack, |line| {
-            let mut state = FreAotRegexIterStateV1::default();
-            let mut result = FreAotRegexResultV1::default();
-            let mut written = usize::MAX;
-            // SAFETY: this session uniquely owns the prepared handle. The
-            // complete line and aligned state/result/count outputs are live,
-            // pairwise disjoint, and retained only for this call.
-            let status = unsafe {
-                linked::fill_spans(
-                    self.handle,
-                    line.as_ptr(),
-                    line.len(),
-                    &raw mut state,
-                    &raw mut result,
-                    1,
-                    &raw mut written,
-                )
-            };
-            match (status, written) {
-                (STATUS_MATCH, 1) => {
-                    validate_span(result, line.len())?;
-                    Ok(true)
-                }
-                (STATUS_NO_MATCH, 0) => Ok(false),
-                _ => Err(format!(
-                    "identity-suffixed prepared SpanFill {:?} returned status {status} and count {written} for one grep line",
-                    linked::SPAN_FILL_SYMBOL
-                )),
-            }
-        })
-    }
-
     #[allow(
         unsafe_code,
         reason = "explicit destruction is the audited exclusive-handle C ABI boundary"
@@ -660,29 +619,6 @@ fn strict_scalar_with_search(
         last_match_end = Some(matched.end);
         pending_empty_progress = matched.start == matched.end;
     }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the generated search declaration is the exact statically linked AOT C ABI boundary"
-)]
-fn strict_grep_with_direct_entry(haystack: &[u8]) -> Result<u64, String> {
-    strict_grep_with_search(haystack, |line| {
-        let mut result = FreAotRegexResultV1::default();
-        // SAFETY: `line` is one complete live Rebar line-domain haystack and
-        // the naturally aligned result is writable and disjoint. The public
-        // is-match operation always searches its complete 0..len window.
-        let status =
-            unsafe { linked::search(line.as_ptr(), line.len(), 0, line.len(), &raw mut result) };
-        match status {
-            STATUS_NO_MATCH => Ok(false),
-            STATUS_MATCH => Ok(true),
-            other => Err(format!(
-                "identity-suffixed direct entry {:?} returned status {other} for one grep line",
-                linked::ENTRY_SYMBOL
-            )),
-        }
-    })
 }
 
 fn strict_grep_with_search(
@@ -1932,8 +1868,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if prepared_uniform_capture {
         // The exact per-line or whole-domain route was authenticated above.
     } else if benchmark.model == shared::Model::GrepCount {
-        let direct = linked::GREP_ITERATION_STRATEGY == "linked-per-line-direct-entry"
-            && linked::AGGREGATE_STRATEGY == linked::GREP_ITERATION_STRATEGY;
+        let direct = authenticate_linked_direct_native_grep();
         let prepared = authenticate_linked_prepared_v15_grep();
         if !direct && !prepared {
             return Err("grep artifact is not bound to an authenticated grep route".to_owned());
@@ -1976,17 +1911,50 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
             linked::AGGREGATE_STRATEGY,
             "Some(NativeOrderedNfaFused)" | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
         );
-        let native_grep_fill = benchmark.model == shared::Model::GrepCount
-            && linked::AGGREGATE_STRATEGY == "linked-per-line-prepared-span-fill-v15";
-        if !native_aggregate && !native_grep_fill {
+        if !native_aggregate {
             return Err("Ordered-TNFA capability has no native operation route".to_owned());
         }
     }
     Ok(())
 }
 
+fn authenticate_linked_direct_native_grep() -> bool {
+    let Some(entry_identity) =
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) = native_symbol_identity(
+        linked::REDUCER_SYMBOL,
+        "fre_aot_regex_grep_count_exclusive_v1_",
+    ) else {
+        return false;
+    };
+    linked::ADAPTER == "general-aot-linked-native-grep-count-reducer-prepared-v2"
+        && linked::AGGREGATE_STRATEGY == "Some(NativeFused)"
+        && linked::GREP_ITERATION_STRATEGY == "linked-native-grep-count-reducer-v1"
+        && linked::SPAN_ITERATION_STRATEGY == "not-applicable"
+        && linked::PREPARED_BULK_STRATEGY == "None"
+        && !linked::HAS_SPAN_FILL
+        && linked::SPAN_FILL_SYMBOL.is_empty()
+        && linked::PREPARE_CONFIG_VERSION == PREPARE_CONFIG_V2_VERSION
+        && linked::PREPARE_OPERATION_FLAGS == shared::Model::GrepCount.prepare_operation_flags()
+        && linked::REQUIRED_PREPARE_CAPABILITIES == 0
+        && linked::PROGRAM_LEN != 0
+        && linked::PROGRAM_SHA256 != [0; 32]
+        && linked::OBJECT_SHA256 != [0; 32]
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        && reducer_identity == program_identity
+        && reducer_identity != entry_identity
+}
+
 fn authenticate_linked_prepared_v15_grep() -> bool {
-    const EXPECTED_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1,fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1";
+    const EXPECTED_RUNTIME_SYMBOLS: &str = "fre_aot_regex_runtime_search_v1,fre_aot_regex_runtime_search_exclusive_v1,fre_aot_regex_runtime_fill_spans_exclusive_v1";
     let Some(entry_identity) =
         native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
     else {
@@ -2009,10 +1977,11 @@ fn authenticate_linked_prepared_v15_grep() -> bool {
     ) else {
         return false;
     };
-    linked::ADAPTER == "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15"
+    linked::ADAPTER
+        == "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
         && linked::ENGINE == "OrderedNfa"
-        && linked::AGGREGATE_STRATEGY == "linked-per-line-prepared-span-fill-v15"
-        && linked::GREP_ITERATION_STRATEGY == linked::AGGREGATE_STRATEGY
+        && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
+        && linked::GREP_ITERATION_STRATEGY == "linked-native-grep-count-reducer-v1"
         && linked::SPAN_ITERATION_STRATEGY == "not-applicable"
         && linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)"
         && linked::HAS_SPAN_FILL
@@ -2713,20 +2682,9 @@ fn run_operation(
             session,
             ExclusiveSession::strict_span_sum_with_direct_entry,
         ),
-        shared::Model::GrepCount
-            if linked::GREP_ITERATION_STRATEGY == "linked-per-line-prepared-span-fill-v15" =>
-        {
-            run_operation_route(
-                benchmark,
-                session,
-                ExclusiveSession::strict_grep_with_prepared_fill,
-            )
+        shared::Model::GrepCount => {
+            run_operation_route(benchmark, session, ExclusiveSession::reduce)
         }
-        shared::Model::GrepCount => run_operation_route(
-            benchmark,
-            session,
-            ExclusiveSession::strict_grep_with_direct_entry,
-        ),
         shared::Model::CountCaptures | shared::Model::GrepCaptures
             if linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE =>
         {
@@ -2988,9 +2946,8 @@ fn validate_compiled_artifact(artifact: &CompiledRegex) -> Result<(), String> {
         || artifact.receipt().required_prepare_capabilities != linked::REQUIRED_PREPARE_CAPABILITIES
         || format!("{:?}", artifact.module().prepared_bulk_strategy())
             != linked::PREPARED_BULK_STRATEGY
-        || (linked::EXPECTED_MODEL != "grep"
-            && format!("{:?}", artifact.receipt().prepared_aggregate_strategy)
-                != linked::AGGREGATE_STRATEGY)
+        || format!("{:?}", artifact.receipt().prepared_aggregate_strategy)
+            != linked::AGGREGATE_STRATEGY
     {
         return Err(
             "timed compilation differs from the exact statically linked verification artifact"
@@ -4033,7 +3990,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_linked_grep_matches_every_rebar_line_domain_once() {
+    fn multi_row_grep_helper_matches_every_rebar_line_domain_once() {
         let regex = byte_regex("a+");
         let haystack = b"aa\r\nno\na\n\n";
         let mut observed = Vec::new();
@@ -4041,7 +3998,7 @@ mod tests {
             observed.push(line.to_vec());
             Ok(regex.is_match(line))
         })
-        .expect("strict direct grep");
+        .expect("strict multi-row grep helper");
         assert_eq!(actual, 2);
         assert_eq!(
             observed,

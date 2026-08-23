@@ -208,7 +208,7 @@ impl Model {
             Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
             Self::SpanSum => "general-aot-linked-complete-spans-prepared-v2",
             Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
-            Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+            Self::GrepCount => "general-aot-linked-native-grep-count-reducer-prepared-v2",
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
             Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
@@ -235,7 +235,9 @@ impl Model {
                 "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15"
             }
             Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
-            Self::GrepCount => "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15",
+            Self::GrepCount => {
+                "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
+            }
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
             Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
         }
@@ -258,9 +260,9 @@ impl Model {
     }
 
     /// Operation declaration used by a capability-bearing prepared route.
-    /// A V15 grep adapter drives the compiler-produced SpanFill per line, so
-    /// it declares Span iteration rather than the unused compatibility grep
-    /// reducer. Capability-free artifacts retain their established flags.
+    /// A V15 GrepCount reducer calls the compiler-produced private search and
+    /// therefore requests the Count bit that prepares its Ordered-NFA owner.
+    /// Capability-free artifacts retain their established operation flags.
     pub const fn prepare_operation_flags_for_required_capabilities(
         self,
         required_capabilities: u64,
@@ -823,6 +825,7 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         return Ok(compiled);
     }
     if !ordinary_grep_requires_prepared_v15(&compiled) {
+        authenticate_direct_native_grep(&compiled)?;
         return Ok(compiled);
     }
     let disposition = compile_with_prepared_ordered_nfa_v15_reported(
@@ -939,11 +942,10 @@ const ORDINARY_GREP_RUNTIME_SYMBOLS: [&str; 4] = [
     "fre_aot_regex_runtime_is_match_batch_exclusive_v1",
     "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
 ];
-const PREPARED_V15_GREP_RUNTIME_SYMBOLS: [&str; 4] = [
+const PREPARED_V15_GREP_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_v1",
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
-    "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
 ];
 const PREPARED_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
     "fre_aot_regex_runtime_search_v1",
@@ -1156,6 +1158,29 @@ fn prepared_v15_grep_symbol_identities_are_closed(
         && reducer_identity != ordinary_identity
 }
 
+fn direct_native_grep_symbol_identities_are_closed(
+    ordinary_entry: &str,
+    reducer: &str,
+    program: &str,
+) -> bool {
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) =
+        native_symbol_identity(reducer, "fre_aot_regex_grep_count_exclusive_v1_")
+    else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    reducer_identity == program_identity && reducer_identity != ordinary_identity
+}
+
 fn ordinary_grep_symbol_identities_are_closed(
     ordinary_entry: &str,
     prepared_entry: &str,
@@ -1266,6 +1291,72 @@ fn ordinary_grep_requires_prepared_v15(compiled: &CompiledRegex) -> bool {
             == 5
 }
 
+fn authenticate_direct_native_grep(compiled: &CompiledRegex) -> Result<(), String> {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let reducer = module
+        .prepared_grep_count_symbol()
+        .ok_or_else(|| "direct native grep has no reducer".to_owned())?;
+    let (program, program_len) = module
+        .required_runtime_program()
+        .ok_or_else(|| "direct native grep has no serialized program".to_owned())?;
+    if receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Exists
+        || receipt.runtime_helper_required
+        || receipt.prepared_aggregate_exports != PreparedAggregateExports::GREP_COUNT
+        || receipt.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::NativeFused)
+        || receipt.required_prepare_capabilities != 0
+        || module.prepared_aggregate_exports() != PreparedAggregateExports::GREP_COUNT
+        || module.prepared_aggregate_strategy() != Some(PreparedAggregateStrategy::NativeFused)
+        || module.required_prepare_capabilities() != 0
+        || module.prepared_bulk_strategy().is_some()
+        || module.prepared_entry_symbol().is_some()
+        || module.prepared_span_fill_symbol().is_some()
+        || module.prepared_exists_batch_symbol().is_some()
+        || module.prepared_count_symbol().is_some()
+        || module.prepared_span_sum_symbol().is_some()
+        || program_len == 0
+        || !has_exact_runtime_symbol_closure(compiled, &[])
+        || !has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
+        || !has_defined_symbol(compiled, reducer, SymbolKind::Function, None)
+        || !has_defined_symbol(compiled, program, SymbolKind::Object, Some(program_len))
+        || !direct_native_grep_symbol_identities_are_closed(
+            module.entry_symbol(),
+            reducer,
+            program,
+        )
+        || [module.entry_symbol(), reducer, program]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != 3
+        || compiled.object().is_empty()
+    {
+        return Err(format!(
+            "direct native grep failed exact reducer authentication: mode={:?} output={:?} engine={:?} runtime_helper={} receipt_exports={:?} module_exports={:?} aggregate={:?} bulk={:?} capabilities={:#x} prepared_entry={} span_fill={} exists_batch={} count={} span_sum={} program_len={} entry={:?} reducer={reducer:?} program={program:?} identities_closed={} runtime_symbols={:?}",
+            receipt.mode,
+            receipt.output,
+            receipt.engine,
+            receipt.runtime_helper_required,
+            receipt.prepared_aggregate_exports,
+            module.prepared_aggregate_exports(),
+            module.prepared_aggregate_strategy(),
+            module.prepared_bulk_strategy(),
+            module.required_prepare_capabilities(),
+            module.prepared_entry_symbol().is_some(),
+            module.prepared_span_fill_symbol().is_some(),
+            module.prepared_exists_batch_symbol().is_some(),
+            module.prepared_count_symbol().is_some(),
+            module.prepared_span_sum_symbol().is_some(),
+            program_len,
+            module.entry_symbol(),
+            direct_native_grep_symbol_identities_are_closed(module.entry_symbol(), reducer, program),
+            unresolved_runtime_function_names(compiled),
+        ));
+    }
+    Ok(())
+}
+
 fn authenticate_prepared_v15_grep(compiled: &CompiledRegex) -> Result<(), String> {
     let module = compiled.module();
     let receipt = compiled.receipt();
@@ -1286,10 +1377,12 @@ fn authenticate_prepared_v15_grep(compiled: &CompiledRegex) -> Result<(), String
         || receipt.engine != EngineKind::OrderedNfa
         || !receipt.runtime_helper_required
         || receipt.prepared_aggregate_exports != PreparedAggregateExports::GREP_COUNT
-        || receipt.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::RuntimeHelper)
+        || receipt.prepared_aggregate_strategy
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
         || receipt.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15
         || module.prepared_aggregate_exports() != PreparedAggregateExports::GREP_COUNT
-        || module.prepared_aggregate_strategy() != Some(PreparedAggregateStrategy::RuntimeHelper)
+        || module.prepared_aggregate_strategy()
+            != Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
         || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
         || module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
         || module.prepared_count_symbol().is_some()
@@ -2769,6 +2862,30 @@ mod tests {
     }
 
     #[test]
+    fn direct_native_grep_identity_requires_a_distinct_reducer() {
+        let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
+        let reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "b".repeat(64));
+        let program = format!("fre_aot_regex_runtime_program_v1_{}", "b".repeat(64));
+        assert!(direct_native_grep_symbol_identities_are_closed(
+            &ordinary, &reducer, &program,
+        ));
+        let aliased_reducer =
+            format!("fre_aot_regex_grep_count_exclusive_v1_{}", "a".repeat(64));
+        assert!(!direct_native_grep_symbol_identities_are_closed(
+            &ordinary,
+            &aliased_reducer,
+            &program,
+        ));
+        let wrong_program =
+            format!("fre_aot_regex_runtime_program_v1_{}", "c".repeat(64));
+        assert!(!direct_native_grep_symbol_identities_are_closed(
+            &ordinary,
+            &reducer,
+            &wrong_program,
+        ));
+    }
+
+    #[test]
     fn prepared_row_symbol_identity_requires_one_exact_suffix() {
         let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
         let prepared = format!("fre_aot_regex_search_exclusive_v1_{}", "a".repeat(64));
@@ -2921,6 +3038,26 @@ mod tests {
             PREPARED_CAPABILITY_ORDERED_NFA_V15
         );
         authenticate_prepared_v15_grep(&selected).expect("authenticated prepared V15 grep");
+    }
+
+    #[test]
+    fn direct_grep_compiles_to_one_authenticated_native_reducer() {
+        let benchmark =
+            Benchmark::parse(&fixture("grep", b"ab", b"none\nab\r\nlast"))
+                .expect("direct grep fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let selected = compile_benchmark(&benchmark, target).expect("direct native grep compile");
+        authenticate_direct_native_grep(&selected).expect("authenticated direct native grep");
+        assert_eq!(
+            selected.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert_eq!(selected.module().required_prepare_capabilities(), 0);
     }
 
     #[test]
@@ -3798,7 +3935,7 @@ mod tests {
             ),
             (
                 Model::GrepCount,
-                "general-aot-linked-per-line-is-match-v1",
+                "general-aot-linked-native-grep-count-reducer-prepared-v2",
                 PREPARE_OPERATION_GREP_COUNT,
             ),
             (
@@ -3822,6 +3959,17 @@ mod tests {
         assert_eq!(
             Model::SpanSum.adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
+        );
+        assert_eq!(
+            Model::GrepCount
+                .adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
+            "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15",
+        );
+        assert_eq!(
+            Model::GrepCount.prepare_operation_flags_for_required_capabilities(
+                PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ),
+            PREPARE_OPERATION_COUNT,
         );
     }
 

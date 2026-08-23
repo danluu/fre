@@ -46,10 +46,7 @@ PREPARED_V15_RUNTIME_SYMBOLS = (
     "fre_aot_regex_runtime_search_exclusive_v1",
     "fre_aot_regex_runtime_search_v1",
 )
-PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS = tuple(sorted((
-    *PREPARED_V15_RUNTIME_SYMBOLS,
-    "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
-)))
+PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS = PREPARED_V15_RUNTIME_SYMBOLS
 FEATURE_BITS = {
     "sse2": 1 << 0,
     "avx2": 1 << 1,
@@ -163,6 +160,10 @@ OPERATION_ROUTE_POLICIES = {
         "whole-operation-native-authenticated",
     ),
     "linked-span-sum-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
+    "linked-native-grep-count-reducer": OperationRoutePolicy(
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
     ),
@@ -1115,7 +1116,9 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         capabilities = int(fields["required_prepare_capabilities"], 16)
         if capabilities == PREPARED_V15_CAPABILITY:
             scalar_prepared_grep_v15_proof(fields)
-        elif capabilities != 0:
+        elif capabilities == 0:
+            scalar_direct_native_grep_proof(fields)
+        else:
             raise CensusError("scalar grep provenance requires unknown capabilities")
 
 
@@ -1125,19 +1128,56 @@ def symbol_identity_suffix(symbol: str, pattern: re.Pattern[str], context: str) 
     return symbol.rsplit("_", 1)[1]
 
 
-def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
-    """Authenticate the exact scalar per-line prepared SpanFill route."""
+def scalar_direct_native_grep_proof(fields: dict[str, str]) -> None:
+    """Authenticate the helper-free whole-operation direct GrepCount route."""
     if (
         fields.get("model") != "grep"
         or fields.get("adapter")
-        != "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15"
+        != "general-aot-linked-native-grep-count-reducer-prepared-v2"
+        or fields.get("aggregate_strategy") != "Some(NativeFused)"
+        or fields.get("prepared_bulk_strategy") != "None"
+        or fields.get("span_iteration_strategy") != "not-applicable"
+        or fields.get("grep_iteration_strategy")
+        != "linked-native-grep-count-reducer-v1"
+        or fields.get("prepare_config_version") != "2"
+        or fields.get("prepare_operation_flags") != f"{1 << 3:016x}"
+        or fields.get("required_prepare_capabilities") != f"{0:016x}"
+        or fields.get("max_handle_bytes") != "0"
+        or fields.get("max_ordered_nfa_scratch_bytes") != "0"
+        or fields.get("max_ordered_nfa_setup_work") != "0"
+        or fields.get("span_fill_symbol") != ""
+        or fields.get("required_runtime_symbols") != ""
+    ):
+        raise CensusError("scalar direct native grep has a noncanonical route")
+    entry_suffix = symbol_identity_suffix(
+        fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
+        "scalar direct native grep entry",
+    )
+    reducer_suffix = symbol_identity_suffix(
+        fields["reducer_symbol"], NATIVE_GREP_COUNT_ENTRY_SYMBOL,
+        "scalar direct native grep reducer",
+    )
+    program_suffix = symbol_identity_suffix(
+        fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
+        "scalar direct native grep runtime program",
+    )
+    if reducer_suffix != program_suffix or reducer_suffix == entry_suffix:
+        raise CensusError("scalar direct native grep symbol identities disagree")
+
+
+def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
+    """Authenticate the exact scalar native V15 GrepCount route."""
+    if (
+        fields.get("model") != "grep"
+        or fields.get("adapter")
+        != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
         or fields.get("engine") != "OrderedNfa"
         or fields.get("aggregate_strategy")
-        != "linked-per-line-prepared-span-fill-v15"
+        != "Some(NativeOrderedNfaFused)"
         or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
         or fields.get("span_iteration_strategy") != "not-applicable"
         or fields.get("grep_iteration_strategy")
-        != "linked-per-line-prepared-span-fill-v15"
+        != "linked-native-grep-count-reducer-v1"
         or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
         or fields.get("prepare_operation_flags")
         != f"{PREPARED_V15_SPAN_OPERATION_FLAGS:016x}"
@@ -1166,7 +1206,7 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     )
     reducer_suffix = symbol_identity_suffix(
         fields["reducer_symbol"], NATIVE_GREP_COUNT_ENTRY_SYMBOL,
-        "scalar prepared V15 compatibility reducer",
+        "scalar prepared V15 native reducer",
     )
     if (
         len({entry_suffix, span_fill_suffix, program_suffix}) != 1
@@ -2332,15 +2372,9 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
         return [provenance["reducer_symbol"]], "linked-span-sum-reducer"
     if model == "count-spans" and provenance["span_fill_symbol"]:
         return [provenance["span_fill_symbol"]], "linked-span-fill"
-    if (
-        model == "grep"
-        and provenance.get("required_prepare_capabilities")
-        == f"{PREPARED_V15_CAPABILITY:016x}"
-    ):
-        return [provenance["span_fill_symbol"]], (
-            "linked-prepared-span-fill-grep-adapter-loop"
-        )
-    if model in {"count-spans", "grep"}:
+    if model == "grep":
+        return [provenance["reducer_symbol"]], "linked-native-grep-count-reducer"
+    if model == "count-spans":
         return [provenance["entry_symbol"]], "linked-direct-entry-adapter-loop"
     raise CensusError(f"no exact operation entry for model {model!r}")
 
@@ -2740,9 +2774,9 @@ def operation_route_from_provenance_record(
         raise CensusError("normalized provenance has an unknown composite kind")
     model = provenance["model"]
     if provenance["kind"] == "prepared-grep-v15-v2":
-        entries = [provenance["span_fill_symbol"]]
-        route = "linked-prepared-span-fill-grep-adapter-loop"
-        expected_symbol = NATIVE_SPAN_FILL_ENTRY_SYMBOL
+        entries = [provenance["reducer_symbol"]]
+        route = "linked-native-grep-count-reducer"
+        expected_symbol = NATIVE_GREP_COUNT_ENTRY_SYMBOL
     elif model == "count":
         entries = [provenance["reducer_symbol"]]
         route = "linked-reducer"
@@ -2755,7 +2789,11 @@ def operation_route_from_provenance_record(
         entries = [provenance["span_fill_symbol"]]
         route = "linked-span-fill"
         expected_symbol = NATIVE_SPAN_FILL_ENTRY_SYMBOL
-    elif model in {"count-spans", "grep"}:
+    elif model == "grep":
+        entries = [provenance["reducer_symbol"]]
+        route = "linked-native-grep-count-reducer"
+        expected_symbol = NATIVE_GREP_COUNT_ENTRY_SYMBOL
+    elif model == "count-spans":
         entries = [provenance["entry_symbol"]]
         route = "linked-direct-entry-adapter-loop"
         expected_symbol = NATIVE_SEARCH_ENTRY_SYMBOL
@@ -2785,9 +2823,11 @@ def identity_defined_symbols_from_provenance(
     """Return route-bound defined symbols authenticated but not invoked."""
     if provenance.get("kind") == "prepared-grep-v15-v2":
         return sorted([
-            provenance["entry_symbol"], provenance["reducer_symbol"],
+            provenance["entry_symbol"], provenance["span_fill_symbol"],
             provenance["program_symbol"],
         ])
+    if provenance.get("kind") == "scalar-v2" and provenance.get("model") == "grep":
+        return sorted([provenance["entry_symbol"], provenance["program_symbol"]])
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         symbols = [
             symbol
@@ -3712,16 +3752,16 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             if (
                 provenance["model"] != "grep"
                 or provenance["adapter"]
-                != "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15"
+                != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
                 or provenance["boundary"] != "runtime-klv-warmup-schedule"
                 or provenance["engine"] != "OrderedNfa"
                 or provenance["aggregate_strategy"]
-                != "linked-per-line-prepared-span-fill-v15"
+                != "Some(NativeOrderedNfaFused)"
                 or provenance["prepared_bulk_strategy"]
                 != "Some(NativeOrderedNfaLoop)"
                 or provenance["span_iteration_strategy"] != "not-applicable"
                 or provenance["grep_iteration_strategy"]
-                != "linked-per-line-prepared-span-fill-v15"
+                != "linked-native-grep-count-reducer-v1"
                 or provenance["required_runtime_symbols"]
                 != list(PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS)
             ):
@@ -3729,6 +3769,31 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             validate_normalized_prepared_grep_v15(
                 provenance["prepared_grep_v15"], provenance, context
             )
+        elif provenance["model"] == "grep":
+            entry_suffix = symbol_identity_suffix(
+                provenance["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL, context
+            )
+            reducer_suffix = symbol_identity_suffix(
+                provenance["reducer_symbol"], NATIVE_GREP_COUNT_ENTRY_SYMBOL, context
+            )
+            program_suffix = symbol_identity_suffix(
+                provenance["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL, context
+            )
+            if (
+                provenance["adapter"]
+                != "general-aot-linked-native-grep-count-reducer-prepared-v2"
+                or provenance["boundary"] != "runtime-klv-warmup-schedule"
+                or provenance["aggregate_strategy"] != "Some(NativeFused)"
+                or provenance["prepared_bulk_strategy"] != "None"
+                or provenance["span_iteration_strategy"] != "not-applicable"
+                or provenance["grep_iteration_strategy"]
+                != "linked-native-grep-count-reducer-v1"
+                or provenance["span_fill_symbol"] != ""
+                or provenance["required_runtime_symbols"] != []
+                or reducer_suffix != program_suffix
+                or reducer_suffix == entry_suffix
+            ):
+                raise CensusError(f"{context} scalar direct native grep route differs")
     elif provenance["kind"] == "composite-v3":
         if provenance["schema"] != "fre.aot.rebar-runner.v3" or not provenance["components"]:
             raise CensusError(f"{context} composite fields disagree")

@@ -27,13 +27,16 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 - native search cores / successfully executed jobs (diagnostic only); and
 - the raw runtime schedule-point denominator for comparison with older runs.
 
-`count-spans` direct-entry or Span-fill iteration, per-line `grep`, the static
-uniform capture multiplier route, the helper-free exact-span participation
-route, the selector-negative/stock-positive capture route, and the strict
-native `capture_next` route can
+Fallback `count-spans` direct-entry or Span-fill iteration, multi-pattern
+per-line `grep`, the static uniform capture multiplier route, the helper-free
+exact-span participation route, the selector-negative/stock-positive capture
+route, and the strict native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
-numerator. The uniform route is labelled separately from both a fused capture
+numerator. Single-pattern `grep` instead enters the authenticated generated
+whole-operation reducer once, so its LF/CRLF split and checked scalar reduction
+do not retain that Rust outer loop. The uniform route is labelled separately
+from both a fused capture
 operation and capture-offset materialization: its native entries select spans;
 the adapter applies an independently sealed per-row participation count. The
 exact-span route separately traps both its ordinary native selector and its

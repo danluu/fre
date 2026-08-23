@@ -427,19 +427,13 @@ fn configured_source(
     let grep_iteration_strategy =
         if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "per-line-linked-prepared-span-fill-uniform-capture-v1".to_owned()
-        } else if benchmark.model == shared::Model::GrepCount
-            && required_prepare_capabilities == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
-        {
-            "linked-per-line-prepared-span-fill-v15".to_owned()
         } else if benchmark.model == shared::Model::GrepCount {
-            "linked-per-line-direct-entry".to_owned()
+            "linked-native-grep-count-reducer-v1".to_owned()
         } else {
             "not-applicable".to_owned()
         };
     let aggregate_strategy = if prepared_uniform_capture {
         "prepared-span-fill-static-uniform-capture-multiplier-v1".to_owned()
-    } else if benchmark.model == shared::Model::GrepCount {
-        grep_iteration_strategy.clone()
     } else {
         format!("{:?}", receipt.prepared_aggregate_strategy)
     };

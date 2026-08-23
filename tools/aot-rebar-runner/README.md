@@ -90,13 +90,14 @@ timing belongs to a separately named compiler-stage benchmark.
   windows. Those adapter routes validate every span and implement Rebar's
   byte-wise empty-match progress and adjacent-empty suppression; they are
   reported as adapter loops rather than whole-operation-native execution.
-- grep iterates every LF/CRLF line domain and invokes the linked artifact's
-  authenticated direct native search entry or prepared V15 native Span-fill
-  entry for a single pattern. For multiple patterns it invokes every retained
-  row's corresponding direct or prepared search entry and counts lines for which
-  any row reports a match. Prepared handles are constructed before warmup and
-  timed loops; the whole-haystack `GrepCount` export is never substituted for
-  Rebar's per-line operation.
+- Single-pattern `grep` calls its identity-suffixed native `GrepCount` reducer
+  exactly once per sample. That generated reducer owns Rebar's LF/CRLF line
+  domain, including empty input, lone CR, trailing LF, and checked
+  transactional `u64` publication, and calls only its authenticated local
+  ordinary search or prepared V15 search. For multiple patterns the runner
+  still invokes every retained row's corresponding direct or prepared search
+  entry per line and counts lines for which any row reports a match. Prepared
+  handles are constructed before warmup and timed loops.
 - `count-captures` repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on

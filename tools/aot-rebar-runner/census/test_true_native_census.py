@@ -318,7 +318,7 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
         "schema": "fre.aot.rebar-runner.v2",
         "disposition": "executed",
         "configured": "true",
-        "adapter": "general-aot-linked-grep-count-prepared-v3-required-ordered-nfa-v15",
+        "adapter": "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15",
         "model": "grep",
         "benchmark": "synthetic/prepared-grep",
         "source_commit": "1" * 40,
@@ -328,10 +328,10 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
         "compiler_version": "1",
         "optimizer_version": "1",
         "engine": "OrderedNfa",
-        "aggregate_strategy": "linked-per-line-prepared-span-fill-v15",
+        "aggregate_strategy": "Some(NativeOrderedNfaFused)",
         "prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
         "span_iteration_strategy": "not-applicable",
-        "grep_iteration_strategy": "linked-per-line-prepared-span-fill-v15",
+        "grep_iteration_strategy": "linked-native-grep-count-reducer-v1",
         "prepare_config_version": "3",
         "prepare_operation_flags": "0000000000000002",
         "required_prepare_capabilities": "0000000000000001",
@@ -361,6 +361,30 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
         "boundary": "runtime-klv-warmup-schedule",
         "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
     }
+
+
+def direct_scalar_grep_provenance_fields() -> dict[str, str]:
+    fields = prepared_scalar_grep_provenance_fields()
+    aggregate_identity = "e" * 64
+    fields.update({
+        "adapter": "general-aot-linked-native-grep-count-reducer-prepared-v2",
+        "engine": "OrderedContextDfa",
+        "aggregate_strategy": "Some(NativeFused)",
+        "prepared_bulk_strategy": "None",
+        "grep_iteration_strategy": "linked-native-grep-count-reducer-v1",
+        "prepare_config_version": "2",
+        "prepare_operation_flags": "0000000000000008",
+        "required_prepare_capabilities": "0000000000000000",
+        "max_handle_bytes": "0",
+        "max_ordered_nfa_scratch_bytes": "0",
+        "max_ordered_nfa_setup_work": "0",
+        "program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{aggregate_identity}"
+        ),
+        "span_fill_symbol": "",
+        "required_runtime_symbols": "",
+    })
+    return fields
 
 
 def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
@@ -1027,6 +1051,9 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-span-sum-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
+            "linked-native-grep-count-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
             "linked-span-fill": (
                 True,
                 False,
@@ -1361,14 +1388,18 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(receipt["kind"], "prepared-grep-v15-v2")
         self.assertEqual(receipt["prepared_grep_v15"]["runtime_program_len"], 4096)
         self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
             CENSUS.operation_route_from_provenance_record(receipt),
-            ([fields["span_fill_symbol"]], "linked-prepared-span-fill-grep-adapter-loop"),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
         )
         self.assertEqual(
             CENSUS.identity_defined_symbols_from_provenance(receipt),
             sorted([
                 fields["entry_symbol"], fields["program_symbol"],
-                fields["reducer_symbol"],
+                fields["span_fill_symbol"],
             ]),
         )
 
@@ -1396,6 +1427,58 @@ class TrueNativeCensusTests(unittest.TestCase):
                             f"{key}={item}" for key, item in poisoned.items()
                         ).encode()
                     )
+
+    def test_scalar_direct_grep_closes_whole_operation_reducer(self) -> None:
+        fields = direct_scalar_grep_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(receipt, "synthetic direct grep")
+        self.assertEqual(receipt["kind"], "scalar-v2")
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            sorted([fields["entry_symbol"], fields["program_symbol"]]),
+        )
+        for name, value in {
+            "aggregate_strategy": "Some(RuntimeHelper)",
+            "required_runtime_symbols": "fre_aot_regex_runtime_search_v1",
+            "program_symbol": f"fre_aot_regex_runtime_program_v1_{'9' * 64}",
+            "reducer_symbol": (
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}"
+            ),
+            "malformed_reducer_symbol": "fre_aot_regex_grep_count_exclusive_v1_not-a-digest",
+        }.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[
+                    "reducer_symbol" if name == "malformed_reducer_symbol" else name
+                ] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+    def test_unknown_non_loop_route_cannot_claim_whole_operation_native(self) -> None:
+        receipt = synthetic_qualification_receipt(synthetic_plan())
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                receipt["route"]["operation_entry_symbols"],
+                "linked-native-grep-count-reducer-v2-unsealed",
+                [],
+                receipt["phases"],
+                "aarch64",
+            )
 
     def test_mixed_prepared_v15_rows_close_each_component_and_engine(self) -> None:
         fields = mixed_prepared_grep_provenance_fields()
