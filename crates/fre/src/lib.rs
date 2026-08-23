@@ -1585,6 +1585,61 @@ const K0_MANDATORY_CUT_CARDINALITY_WORK: u64 = 4;
 const K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK: u64 = 256;
 const K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK: u64 = 1;
 
+#[cfg(test)]
+mod k0_exact_minimum_suffix_exists_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) scans: usize,
+        pub(super) refused_scans: usize,
+        pub(super) pooled_fallbacks: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            scans: 0,
+            refused_scans: 0,
+            pooled_fallbacks: 0,
+        }) };
+        static REFUSE_NEXT_SCAN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+        REFUSE_NEXT_SCAN.set(false);
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn refuse_next_scan() {
+        REFUSE_NEXT_SCAN.set(true);
+    }
+
+    pub(super) fn begin_scan() -> bool {
+        let refused = REFUSE_NEXT_SCAN.replace(false);
+        let counts = COUNTS.get();
+        COUNTS.set(Counts {
+            scans: counts.scans.saturating_add(1),
+            refused_scans: counts
+                .refused_scans
+                .saturating_add(if refused { 1 } else { 0 }),
+            ..counts
+        });
+        refused
+    }
+
+    pub(super) fn record_pooled_fallback() {
+        let counts = COUNTS.get();
+        COUNTS.set(Counts {
+            pooled_fallbacks: counts.pooled_fallbacks.saturating_add(1),
+            ..counts
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct K0MandatoryCutPlan {
     candidate: MandatoryCutCandidate,
@@ -9953,6 +10008,33 @@ enum K0PooledSpanRoute {
     Complete(Option<fre_automata::MatchSpan>),
 }
 
+/// Search one already-retained exact minimum word for warm ordinary Exists.
+///
+/// Mandatory-suffix construction accepts only a nonempty language and proves
+/// that every accepted word ends in `suffix`. When its length equals the exact
+/// minimum match length, one minimum-length accepted word is therefore exactly
+/// `suffix`. The warm admission below separately excludes assertions, so an
+/// occurrence of that word in the full haystack is both necessary and
+/// sufficient for Exists.
+/// Literal refusal is a transactional performance decline; the caller must
+/// continue through the incumbent pooled K0 chain from its authenticated cut
+/// floor.
+#[inline(never)]
+fn try_k0_warm_exact_minimum_suffix_exists(
+    suffix: &K0MandatorySuffixPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+) -> Option<bool> {
+    #[cfg(test)]
+    if k0_exact_minimum_suffix_exists_probe::begin_scan() {
+        return None;
+    }
+    suffix
+        .find_window(haystack, window.start(), window.end())
+        .ok()
+        .map(|found| found.is_some())
+}
+
 impl PortableK0Plan {
     fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
         self.exclusive.correlated_terminal()
@@ -10165,13 +10247,31 @@ impl PortableK0Plan {
         let mut search_window = window;
         let mut suffix_search_start = window.start();
         let window_bytes = window.end().saturating_sub(window.start());
-        // A short reverse route is newer and lower-priority than the actual
-        // pooled cut execution. Require that cut and a claimed adaptive token
-        // before changing the ordinary zero-distance-cut dispatch. Immutable
-        // negative metadata has no pooled executor and therefore is not an
-        // incumbent source pass. Cooldown, in-flight ownership, and targets
-        // without one-word atomic admission leave the established path
-        // byte-for-byte unchanged.
+        let exact_minimum_suffix = if matches!(operation, K0PooledValueOperation::Exists)
+            && workspace_limits == SearchSessionLimits::unlimited()
+            && window.start() == 0
+            && window.end() == haystack.len()
+            && window_bytes >= K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            && !self.automaton.stats().has_assertions()
+            && let Some(suffix) = self
+                .mandatory_suffix
+                .as_ref()
+                .filter(|suffix| !suffix.has_short_standalone_reverse_suffix_span())
+            && minimum_match_bytes == Some(suffix.needle().len())
+            && self
+                .automaton
+                .has_compatible_warm_pooled_ordinary_exists_owner()
+        {
+            Some(suffix)
+        } else {
+            None
+        };
+        // Optional suffix routes are lower-priority than the actual pooled cut
+        // execution. Require that cut and a claimed route before changing the
+        // ordinary zero-distance-cut dispatch. Immutable negative metadata has
+        // no pooled executor and therefore is not an incumbent source pass.
+        // Cooldown, in-flight ownership, and targets without one-word atomic
+        // admission leave the established path byte-for-byte unchanged.
         let mut short_reverse_admission = if matches!(operation, K0PooledValueOperation::Span)
             && self.absolute_end_proof.is_none()
             && self.mandatory_cut.is_some()
@@ -10184,14 +10284,16 @@ impl PortableK0Plan {
             None
         };
         let short_reverse_span_needs_cut = short_reverse_admission.is_some();
+        let exact_minimum_suffix_needs_cut = exact_minimum_suffix.is_some();
         if let Some(cut) = self.mandatory_cut.as_ref()
             // A zero-distance cut is the ordinary K0 start predicate. Running
             // the same scanner twice normally adds traffic without proving a
-            // stronger floor. A short standalone reverse-suffix route is the
-            // exception: let the actual retained start predicate arbitrate
-            // first so an absent prefix never pays a suffix pass.
+            // stronger floor. An admitted suffix route is the exception: let
+            // the actual retained start predicate arbitrate first so an absent
+            // prefix never pays a suffix pass.
             && (cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
-                || short_reverse_span_needs_cut)
+                || short_reverse_span_needs_cut
+                || exact_minimum_suffix_needs_cut)
             && k0_negative_prefilter_admitted(
                 Some(cut),
                 None,
@@ -10238,6 +10340,18 @@ impl PortableK0Plan {
                     }
                 }
             }
+        }
+
+        // The retained cut owns first refusal. Only after it admits the source
+        // may a warm ordinary Exists call consume an exact minimum suffix.
+        if let Some(suffix) = exact_minimum_suffix {
+            if let Some(found) =
+                try_k0_warm_exact_minimum_suffix_exists(suffix, haystack, search_window)
+            {
+                return Ok(Some(K0PooledValue::Exists(found)));
+            }
+            #[cfg(test)]
+            k0_exact_minimum_suffix_exists_probe::record_pooled_fallback();
         }
 
         if matches!(operation, K0PooledValueOperation::Span)
@@ -25458,6 +25572,410 @@ mod tests {
             "synthetic mandatory-suffix plan remains within the builder limit",
         );
         regex
+    }
+
+    const K0_EXACT_MINIMUM_SUFFIX_TARGET_PATTERN: &str = r"(?-u:(?:ab){2,5}c)";
+
+    fn k0_exact_minimum_suffix_target() -> PortableRegex {
+        let regex = PortableBuilder::new(K0_EXACT_MINIMUM_SUFFIX_TARGET_PATTERN)
+            .unicode(false)
+            .build()
+            .expect("exact-minimum-suffix target builds automatically");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("exact-minimum-suffix target must retain generic K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("exact-minimum-suffix target retains its established suffix");
+        assert_eq!(regex.report.minimum_match_bytes, Some(5));
+        assert_eq!(suffix.needle(), b"ababc");
+        assert!(
+            suffix.has_consumption_run(),
+            "the Exists-only route must not displace incumbent suffix recovery",
+        );
+        assert_eq!(suffix.finite_maximum_match_bytes(), None);
+        assert_eq!(
+            plan.mandatory_cut
+                .as_ref()
+                .expect("target retains its established mandatory cut")
+                .maximum_before_root(),
+            MaximumConsumedDistance::Finite(0),
+        );
+        regex
+    }
+
+    fn k0_exact_minimum_suffix_target_haystack() -> Vec<u8> {
+        let mut haystack = b"abx".repeat(1_362);
+        haystack.extend_from_slice(b"abababc");
+        assert_eq!(haystack.len(), 4_093);
+        haystack
+    }
+
+    fn k0_exact_minimum_suffix_with_assertion_automaton() -> PortableRegex {
+        let mut regex = forced_k0_with_only_mandatory_suffix(
+            K0_EXACT_MINIMUM_SUFFIX_TARGET_PATTERN,
+        );
+        let suffix_storage_bytes = {
+            let PortablePlan::K0(plan) = &regex.plan else {
+                unreachable!("focused suffix donor retains K0");
+            };
+            regex
+                .report
+                .plan_storage_bytes
+                .checked_sub(plan.automaton.stats().storage_bytes())
+                .expect("synthetic suffix storage separates from its automaton")
+        };
+        let (raw, limits, line_terminator, minimum_match_bytes, _) =
+            lowered_k0_mandatory_cut(r"(?-u:(?:ab){2,5}c\b)");
+        assert_eq!(minimum_match_bytes, regex.report.minimum_match_bytes);
+        let automaton = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("assertion-bearing synthetic graph validates")
+            .with_line_terminator(line_terminator);
+        assert!(automaton.stats().has_assertions());
+        let automaton_storage_bytes = automaton.stats().storage_bytes();
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            unreachable!("focused suffix donor retains K0");
+        };
+        plan.automaton = automaton;
+        assert!(plan.mandatory_suffix.is_some());
+        regex.report.plan_storage_bytes = automaton_storage_bytes
+            .checked_add(suffix_storage_bytes)
+            .expect("synthetic assertion/suffix storage accounting does not overflow");
+        regex.report.charged_persistent_bytes = regex
+            .report
+            .source_storage_bytes
+            .checked_add(regex.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(regex.report.plan_storage_bytes))
+            .expect("synthetic assertion/suffix facade accounting does not overflow");
+        regex
+    }
+
+    #[test]
+    fn warm_exact_minimum_suffix_exists_is_read_only_and_source_independent() {
+        let regex = k0_exact_minimum_suffix_target();
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused target retains K0");
+        };
+        let cut_byte = plan
+            .mandatory_cut
+            .as_ref()
+            .expect("focused target retains its incumbent cut")
+            .bytes[0];
+        let mut haystack = k0_exact_minimum_suffix_target_haystack();
+        let address = haystack.as_ptr();
+
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "the cold call must retain canonical K0 setup",
+        );
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            1,
+            "the first warm call must consume the exact retained word once",
+        );
+
+        haystack.fill(b'x');
+        haystack[0] = cut_byte;
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(!regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            2,
+        );
+
+        let suffix_start = haystack.len() - b"abababc".len();
+        haystack[suffix_start..].copy_from_slice(b"abababc");
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            3,
+            "no retained source cursor may survive same-owner mutation",
+        );
+    }
+
+    #[test]
+    fn warm_exact_minimum_suffix_exists_requires_a_compatible_owner_lifecycle() {
+        let regex = k0_exact_minimum_suffix_target();
+        let haystack = k0_exact_minimum_suffix_target_haystack();
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused target retains K0");
+        };
+        assert!(
+            !plan
+                .automaton
+                .has_compatible_warm_pooled_ordinary_exists_owner(),
+            "a fresh regex must not report an automaton-owned workspace",
+        );
+
+        let mut explicit = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("independent K0 session constructs");
+        assert!(
+            explicit
+                .prepare_k0_start_filter(SearchSessionLimits::unlimited())
+                .expect("source-free start proof prepares")
+                .is_some(),
+        );
+        drop(explicit);
+        assert!(
+            !plan
+                .automaton
+                .has_compatible_warm_pooled_ordinary_exists_owner(),
+            "proof preparation must not fabricate an ordinary pool owner",
+        );
+
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "a proof-only first ordinary call entered the literal lane",
+        );
+        assert!(
+            plan.automaton
+                .has_compatible_warm_pooled_ordinary_exists_owner(),
+            "the incumbent ordinary call must establish its compatible owner",
+        );
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            1,
+            "the next owner-warm call did not enter the exact-word lane",
+        );
+
+        let foreign = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(
+                        !plan
+                            .automaton
+                            .has_compatible_warm_pooled_ordinary_exists_owner(),
+                        "a foreign thread must not observe the original owner as compatible",
+                    );
+                    super::k0_exact_minimum_suffix_exists_probe::reset();
+                    assert!(regex.is_match(&haystack));
+                    super::k0_exact_minimum_suffix_exists_probe::snapshot()
+                })
+                .join()
+                .expect("foreign ordinary caller completes")
+        });
+        assert_eq!(
+            foreign,
+            super::k0_exact_minimum_suffix_exists_probe::Counts::default(),
+            "a nonowner thread entered or declined from the exact-word lane",
+        );
+
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            1,
+            "a foreign fallback displaced the original thread's owner",
+        );
+    }
+
+    #[test]
+    fn warm_exact_minimum_suffix_exists_admission_is_narrow() {
+        let short = k0_exact_minimum_suffix_target();
+        let short_haystack = vec![b'x'; super::K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES - 1];
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(!short.is_match(&short_haystack));
+        assert!(!short.is_match(&short_haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "a sub-threshold source entered the optional literal lane",
+        );
+
+        let regex = k0_exact_minimum_suffix_target();
+        let haystack = k0_exact_minimum_suffix_target_haystack();
+        assert!(regex.is_match(&haystack));
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused target retains K0");
+        };
+        let partial = SearchWindow::new(1, haystack.len());
+        let _ = plan
+            .pooled_value(
+                K0PooledValueOperation::Exists,
+                K0PooledValueExecution::Canonical,
+                &haystack,
+                partial,
+                SearchLimits::unlimited(),
+                SearchSessionLimits::unlimited(),
+                regex.report.minimum_match_bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "a non-full window entered the ordinary full-window lane",
+        );
+        let _ = plan
+            .pooled_value(
+                K0PooledValueOperation::Exists,
+                K0PooledValueExecution::Canonical,
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+                SearchSessionLimits::unlimited(),
+                Some(6),
+            )
+            .unwrap();
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "a suffix shorter than the authenticated minimum entered the lane",
+        );
+
+        let shorter = forced_k0_with_only_mandatory_suffix(r"(?-u:(?:a|b)XYZ)");
+        let PortablePlan::K0(shorter_plan) = &shorter.plan else {
+            unreachable!("focused suffix-shorter-than-minimum control retains K0");
+        };
+        assert_eq!(shorter.report.minimum_match_bytes, Some(4));
+        assert_eq!(
+            shorter_plan
+                .mandatory_suffix
+                .as_ref()
+                .expect("natural control retains a suffix")
+                .needle(),
+            b"XYZ",
+        );
+        let mut shorter_haystack = vec![b'!'; 1_024];
+        shorter_haystack[700..704].copy_from_slice(b"bXYZ");
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(shorter.is_match(&shorter_haystack));
+        assert!(shorter.is_match(&shorter_haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "a natural suffix shorter than the exact minimum entered the lane",
+        );
+
+        let asserted = k0_exact_minimum_suffix_with_assertion_automaton();
+        let PortablePlan::K0(asserted_plan) = &asserted.plan else {
+            unreachable!("synthetic assertion-bearing control retains K0");
+        };
+        assert!(
+            asserted_plan.mandatory_suffix.is_some()
+                && asserted_plan.automaton.stats().has_assertions(),
+            "runtime guard requires both a retained suffix and assertion edges",
+        );
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert!(asserted.is_match(&haystack));
+        assert!(asserted.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "an assertion-bearing automaton entered the context-free literal lane",
+        );
+    }
+
+    #[test]
+    fn warm_exact_minimum_suffix_exists_refusal_and_api_containment_are_canonical() {
+        let regex = k0_exact_minimum_suffix_target();
+        let haystack = k0_exact_minimum_suffix_target_haystack();
+        let expected = Some(Match {
+            start: haystack.len() - b"abababc".len(),
+            end: haystack.len(),
+        });
+        assert!(regex.is_match(&haystack));
+
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        super::k0_exact_minimum_suffix_exists_probe::refuse_next_scan();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot(),
+            super::k0_exact_minimum_suffix_exists_probe::Counts {
+                scans: 1,
+                refused_scans: 1,
+                pooled_fallbacks: 1,
+            },
+            "literal refusal did not restore the incumbent pooled chain",
+        );
+
+        super::k0_exact_minimum_suffix_exists_probe::reset();
+        assert_eq!(regex.find(&haystack), expected);
+        assert!(
+            regex
+                .is_match_value(&haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert!(
+            regex
+                .is_match_accounted(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(
+            session
+                .is_match_value(&haystack, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            0,
+            "Span, explicit, accounted, or session APIs entered the ordinary lane",
+        );
+
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+            1,
+        );
+    }
+
+    #[test]
+    fn warm_exact_minimum_suffix_exists_covers_unbounded_and_alternating_prefixes() {
+        for (pattern, body) in [
+            (r"(?-u:a*XYZ)", b"aaaaXYZ".as_slice()),
+            (
+                r"(?-u:(?:XYZ|aXYZ|bbbbXYZ))",
+                b"bbbbXYZ".as_slice(),
+            ),
+            (r"(?-u:(?:ba)?aaa)", b"baaaa".as_slice()),
+        ] {
+            let regex = forced_k0_with_only_mandatory_suffix(pattern);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut haystack = vec![b'!'; 1_024];
+            let start = 700;
+            haystack[start..start + body.len()].copy_from_slice(body);
+            let expected = upstream.is_match(&haystack);
+
+            super::k0_exact_minimum_suffix_exists_probe::reset();
+            assert_eq!(regex.is_match(&haystack), expected, "pattern={pattern:?}");
+            assert_eq!(
+                super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+                0,
+                "the first call must stay canonical: pattern={pattern:?}",
+            );
+            assert_eq!(regex.is_match(&haystack), expected, "pattern={pattern:?}");
+            assert_eq!(
+                super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+                1,
+                "the warmed exact word was not consumed: pattern={pattern:?}",
+            );
+
+            haystack.fill(b'!');
+            assert_eq!(regex.is_match(&haystack), upstream.is_match(&haystack));
+            assert_eq!(
+                super::k0_exact_minimum_suffix_exists_probe::snapshot().scans,
+                2,
+                "the negative exact-word proof did not complete: pattern={pattern:?}",
+            );
+        }
     }
 
     fn forced_k0_with_bound_hir_mandatory_suffix(pattern: &str) -> PortableRegex {

@@ -1125,6 +1125,26 @@ impl Automaton {
         }
     }
 
+    /// Return whether this thread owns a populated workspace compatible with
+    /// the ordinary positive-Exists capability envelope.
+    ///
+    /// This is a storage-free observation: a missing pool, foreign owner, or
+    /// incompatible workspace returns `false` without constructing or moving
+    /// scratch. A compatible owner is checked out only for a no-op transaction
+    /// and is committed unchanged before this method returns.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn has_compatible_warm_pooled_ordinary_exists_owner(&self) -> bool {
+        self.try_with_warm_owner_workspace(
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+            |_| Ok::<(), SearchError>(()),
+        )
+        .is_some_and(|result| result.is_ok())
+    }
+
     /// Search for existence through the automaton-owned optional value-only
     /// workspace. The workspace is checked out only from this exact immutable
     /// automaton and is returned only after a successful execution.
