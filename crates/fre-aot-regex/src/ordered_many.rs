@@ -22,15 +22,24 @@ use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustConstructor, RustMatchKind,
     RustProfile,
 };
+use regex_syntax::hir::Hir;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, CompileMode, DeterminizeLimits, MatchResult, OutputContract, ProgramWorkspace,
-    SearchWindow, program::CompiledProgram, rust_profile_compiled_size_limit,
-    set_rust_profile_compiled_size_limit,
+    CompileError, CompileLimitsV1, CompileMode, CompiledRegex, DeterminizeLimits, MatchResult,
+    OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, ProgramWorkspace,
+    SearchWindow, SlowAotLimits, Target, program::CompiledProgram,
+    rust_profile_compiled_size_limit, set_rust_profile_compiled_size_limit,
 };
 
 /// Maximum owner count represented by the current tagged quotient.
 pub const ORDERED_MANY_TAGGED_MAX_ROWS: usize = 128;
+/// Maximum source count admitted by one combined ordered-many AOT graph.
+///
+/// This route does not materialize tagged owner memberships, so it retains the
+/// established ordered-many source envelope rather than the smaller tagged
+/// quotient ceiling.
+pub const ORDERED_MANY_AOT_MAX_ROWS: usize = 4_096;
 
 /// Caller-defined pattern identifier returned with each selected row.
 ///
@@ -1115,6 +1124,479 @@ pub fn compile_ordered_many(
             serialized_program_bytes: total_program_bytes,
         },
     })
+}
+
+/// Receipt schema for one ordered multi-source native aggregate artifact.
+pub const ORDERED_MANY_AOT_RECEIPT_VERSION: u32 = 1;
+
+/// Bounded construction envelope for a shared ordered-many AOT aggregate.
+///
+/// Unlike [`OrderedManyCompileLimits`], this route never builds independent
+/// scalar row programs. Every row is parsed independently and the resulting
+/// HIRs are composed as one ordered alternation before one semantic automaton
+/// is lowered and one whole-operation aggregate is emitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedManyAotCompileLimits {
+    /// Maximum source rows in the shared automaton.
+    pub max_rows: usize,
+    /// Maximum sum of exact source bytes.
+    pub max_pattern_bytes: usize,
+    /// Limits for the one combined semantic program and final object.
+    pub compile: CompileLimitsV1,
+}
+
+impl Default for OrderedManyAotCompileLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: ORDERED_MANY_AOT_MAX_ROWS,
+            max_pattern_bytes: 4 * 1_048_576,
+            compile: CompileLimitsV1::default(),
+        }
+    }
+}
+
+/// Complete request for one shared ordered-many native Count/SpanSum reducer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderedManyAotCompileRequest {
+    pub rows: Vec<OrderedManyRow>,
+    pub profile: RustProfile,
+    pub target: Target,
+    pub mode: CompileMode,
+    pub limits: OrderedManyAotCompileLimits,
+}
+
+impl OrderedManyAotCompileRequest {
+    /// Construct a leftmost-first Rust-bytes shared aggregate request.
+    #[must_use]
+    pub fn new(rows: Vec<OrderedManyRow>, target: Target) -> Self {
+        Self {
+            rows,
+            profile: RustProfile::default(),
+            target,
+            mode: CompileMode::Optimizing,
+            limits: OrderedManyAotCompileLimits::default(),
+        }
+    }
+
+    /// Select the exact Rust compatibility profile shared by every row.
+    #[must_use]
+    pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Select fast or optimizing native compilation.
+    #[must_use]
+    pub const fn mode(mut self, mode: CompileMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Select an explicit combined construction envelope.
+    #[must_use]
+    pub const fn limits(mut self, limits: OrderedManyAotCompileLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// Immutable source and artifact identity for a shared ordered-many reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedManyAotReceipt {
+    pub schema_version: u32,
+    pub rows: usize,
+    pub pattern_bytes: usize,
+    /// Length-delimited SHA-256 over source ordinals, caller IDs and exact
+    /// source bytes. The semantic program identity independently binds the
+    /// selected compatibility profile and ordered automaton.
+    pub ordered_sources_sha256: [u8; 32],
+    pub program_sha256: [u8; 32],
+    pub object_sha256: [u8; 32],
+    pub exports: PreparedAggregateExports,
+    pub aggregate_strategy: PreparedAggregateStrategy,
+}
+
+/// One shared semantic program and its whole-operation aggregate.
+#[derive(Clone, Debug)]
+pub struct OrderedManyAotArtifact {
+    compiled: CompiledRegex,
+    profile: RustProfile,
+    receipt: OrderedManyAotReceipt,
+}
+
+impl OrderedManyAotArtifact {
+    /// Complete ordinary/prepared AOT artifact.
+    #[must_use]
+    pub const fn compiled(&self) -> &CompiledRegex {
+        &self.compiled
+    }
+
+    /// Exact shared syntax profile.
+    #[must_use]
+    pub const fn profile(&self) -> &RustProfile {
+        &self.profile
+    }
+
+    /// Ordered source and emitted artifact receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> OrderedManyAotReceipt {
+        self.receipt
+    }
+}
+
+/// Terminal failure before a shared ordered-many artifact is published.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OrderedManyAotCompileError {
+    EmptyPatternSet,
+    UnsupportedExports {
+        exports: PreparedAggregateExports,
+    },
+    Planning(OrderedManyCompileError),
+    Combined(CompileError),
+    NativeReducerUnavailable {
+        strategy: Option<PreparedAggregateStrategy>,
+    },
+    ArithmeticOverflow {
+        computation: &'static str,
+    },
+    AllocationFailed {
+        structure: &'static str,
+        entries: usize,
+    },
+    InternalInvariant(&'static str),
+}
+
+/// Safe refusal from the explicitly selected shared ordered-many AOT route.
+///
+/// Every unlisted failure remains terminal. In particular, allocation,
+/// arithmetic, malformed-module, code-generation and authentication failures
+/// are never converted into a scalar-row fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedManyAotCompileDecline {
+    /// The exact combined semantic graph has no supported native V15 view.
+    Unsupported,
+    /// The immutable native graph exceeds the caller's explicit data ceiling.
+    NativeDataBytes { limit: usize, required: usize },
+    /// Every authenticated final-object retry exceeds the object ceiling.
+    ObjectBytes { limit: usize, required: usize },
+}
+
+/// Transactional result of one shared ordered-many AOT attempt.
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation after a selected compiler transaction"
+)]
+pub enum OrderedManyAotCompileDisposition {
+    Compiled(OrderedManyAotArtifact),
+    Declined(OrderedManyAotCompileDecline),
+}
+
+impl OrderedManyAotCompileDisposition {
+    #[must_use]
+    pub const fn compiled(&self) -> Option<&OrderedManyAotArtifact> {
+        match self {
+            Self::Compiled(artifact) => Some(artifact),
+            Self::Declined(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn decline(&self) -> Option<OrderedManyAotCompileDecline> {
+        match self {
+            Self::Compiled(_) => None,
+            Self::Declined(decline) => Some(*decline),
+        }
+    }
+
+    #[must_use]
+    pub fn into_compiled(self) -> Option<OrderedManyAotArtifact> {
+        match self {
+            Self::Compiled(artifact) => Some(artifact),
+            Self::Declined(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for OrderedManyAotCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPatternSet => {
+                formatter.write_str("ordered-many AOT aggregate requires at least one row")
+            }
+            Self::UnsupportedExports { exports } => write!(
+                formatter,
+                "ordered-many AOT aggregate supports only nonempty Count/SpanSum exports, got {exports:?}"
+            ),
+            Self::Planning(source) => write!(formatter, "ordered-many AOT planning: {source}"),
+            Self::Combined(source) => {
+                write!(formatter, "ordered-many shared compilation: {source}")
+            }
+            Self::NativeReducerUnavailable { strategy } => write!(
+                formatter,
+                "ordered-many shared compilation did not publish a native whole-operation reducer: {strategy:?}"
+            ),
+            Self::ArithmeticOverflow { computation } => {
+                write!(
+                    formatter,
+                    "ordered-many AOT overflow computing {computation}"
+                )
+            }
+            Self::AllocationFailed { structure, entries } => write!(
+                formatter,
+                "ordered-many AOT could not reserve {entries} entries for {structure}"
+            ),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "ordered-many AOT invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrderedManyAotCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Planning(source) => Some(source),
+            Self::Combined(source) => Some(source),
+            Self::EmptyPatternSet
+            | Self::UnsupportedExports { .. }
+            | Self::NativeReducerUnavailable { .. }
+            | Self::ArithmeticOverflow { .. }
+            | Self::AllocationFailed { .. }
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+/// Compile independently parsed rows into one shared native Count/SpanSum
+/// reducer.
+///
+/// Source order becomes top-level alternation priority. Because construction
+/// joins canonical HIR rather than source strings, row-local flags, captures,
+/// duplicate capture names and source delimiters cannot leak across rows.
+/// Capture annotations are erased only after every row has parsed under the
+/// requested capture-free whole-match contract. Empty-match progress is the
+/// pinned Rust `build_many` byte-progress rule inherited by the combined
+/// semantic program and native reducer.
+///
+/// # Errors
+///
+/// Returns row-indexed syntax errors, combined lowering/program/object
+/// failures, or a terminalized explicit-route decline. No independent-row
+/// runtime fallback is hidden in this API.
+pub fn compile_ordered_many_aot(
+    request: OrderedManyAotCompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<OrderedManyAotArtifact, OrderedManyAotCompileError> {
+    match compile_ordered_many_aot_reported(request, exports, slow_aot_limits)? {
+        OrderedManyAotCompileDisposition::Compiled(artifact) => Ok(artifact),
+        OrderedManyAotCompileDisposition::Declined(decline) => {
+            let source = match decline {
+                OrderedManyAotCompileDecline::Unsupported => crate::ObjectError::InvalidModule(
+                    "shared ordered-many prepared Ordered-NFA V15 route is unsupported",
+                ),
+                OrderedManyAotCompileDecline::NativeDataBytes { limit, required } => {
+                    crate::ObjectError::Resource {
+                        resource: crate::CompileResource::ProgramBytes,
+                        limit,
+                        required,
+                    }
+                }
+                OrderedManyAotCompileDecline::ObjectBytes { limit, required } => {
+                    crate::ObjectError::Resource {
+                        resource: crate::CompileResource::ObjectBytes,
+                        limit,
+                        required,
+                    }
+                }
+            };
+            Err(OrderedManyAotCompileError::Combined(source.into()))
+        }
+    }
+}
+
+/// Attempt one shared ordered-many aggregate while preserving safe structural
+/// and numeric V15 refusals as typed declines.
+///
+/// Count and SpanSum are fused native whole-operation reducers.
+///
+/// # Errors
+///
+/// Returns every parse, lower, allocation, overflow, invariant, codegen and
+/// authentication failure unchanged and terminal. Only [`OrderedManyAotCompileDecline`]
+/// authorizes retaining an independently authenticated incumbent.
+pub fn compile_ordered_many_aot_reported(
+    request: OrderedManyAotCompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<OrderedManyAotCompileDisposition, OrderedManyAotCompileError> {
+    let OrderedManyAotCompileRequest {
+        rows,
+        profile,
+        target,
+        mode,
+        mut limits,
+    } = request;
+    if rows.is_empty() {
+        return Err(OrderedManyAotCompileError::EmptyPatternSet);
+    }
+    if exports.is_empty() || exports.contains(PreparedAggregateExports::GREP_COUNT) {
+        return Err(OrderedManyAotCompileError::UnsupportedExports { exports });
+    }
+    if rows.len() > limits.max_rows {
+        return Err(OrderedManyAotCompileError::Planning(
+            OrderedManyCompileError::RowsLimit {
+                needed: rows.len(),
+                limit: limits.max_rows,
+            },
+        ));
+    }
+    validate_profile(&profile).map_err(OrderedManyAotCompileError::Planning)?;
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.compile.max_program_bytes = limits.compile.max_program_bytes.min(profile_limit);
+    }
+
+    let row_count = rows.len();
+    let compatibility = CompatibilityProfile::RustBytes(profile.clone());
+    let mut hirs = reserve_exact(row_count, "ordered HIR rows", |structure, entries| {
+        OrderedManyAotCompileError::AllocationFailed { structure, entries }
+    })?;
+    let mut source_digest = Sha256::new();
+    source_digest.update(b"fre.ordered-many-aot.sources.v1\0");
+    source_digest.update(
+        u64::try_from(row_count)
+            .map_err(|_| OrderedManyAotCompileError::ArithmeticOverflow {
+                computation: "source row count identity",
+            })?
+            .to_le_bytes(),
+    );
+    let mut pattern_bytes = 0usize;
+    for (row, source) in rows.into_iter().enumerate() {
+        let pattern_id = source.pattern_id;
+        pattern_bytes = pattern_bytes.checked_add(source.pattern.len()).ok_or(
+            OrderedManyAotCompileError::ArithmeticOverflow {
+                computation: "source byte sum",
+            },
+        )?;
+        if pattern_bytes > limits.max_pattern_bytes {
+            return Err(OrderedManyAotCompileError::Planning(
+                OrderedManyCompileError::PatternBytesLimit {
+                    row,
+                    pattern_id,
+                    needed: pattern_bytes,
+                    limit: limits.max_pattern_bytes,
+                },
+            ));
+        }
+        let ordinal = u64::try_from(row).map_err(|_| {
+            OrderedManyAotCompileError::Planning(OrderedManyCompileError::PatternOrdinalOverflow {
+                row,
+                pattern_id,
+            })
+        })?;
+        let source_len = u64::try_from(source.pattern.len()).map_err(|_| {
+            OrderedManyAotCompileError::ArithmeticOverflow {
+                computation: "source length identity",
+            }
+        })?;
+        source_digest.update(ordinal.to_le_bytes());
+        source_digest.update(pattern_id.get().to_le_bytes());
+        source_digest.update(source_len.to_le_bytes());
+        source_digest.update(source.pattern.as_bytes());
+
+        let parsed = fre_syntax::parse(ParseRequest::rust(source.pattern, compatibility.clone()))
+            .map_err(CompileError::from)
+            .map_err(|source| {
+                OrderedManyAotCompileError::Planning(OrderedManyCompileError::Row {
+                    row,
+                    pattern_id,
+                    source,
+                })
+            })?;
+        let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            return Err(OrderedManyAotCompileError::InternalInvariant(
+                "Rust byte request produced a non-Rust syntax tree",
+            ));
+        };
+        hirs.push(parsed.hir);
+    }
+    if hirs.len() != row_count || hirs.capacity() != row_count {
+        return Err(OrderedManyAotCompileError::InternalInvariant(
+            "ordered HIR table lost its exact source shape",
+        ));
+    }
+
+    let ordered_hir = Hir::alternation(hirs);
+    let raw = fre_lower::lower_hir_raw_general(
+        &ordered_hir,
+        OperationSemantics::CaptureFree,
+        limits.compile.lower,
+    )
+    .map_err(CompileError::from)
+    .map_err(OrderedManyAotCompileError::Combined)?
+    .into_plan();
+    let disposition = crate::compile_raw_prepared_ordered_nfa_v15_reported(
+        pattern_bytes,
+        raw,
+        profile.options.line_terminator,
+        OutputContract::Span,
+        target,
+        mode,
+        limits.compile,
+        exports,
+        slow_aot_limits.max_native_data_bytes,
+    )
+    .map_err(OrderedManyAotCompileError::Combined)?;
+    let compiled = match disposition {
+        crate::PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => compiled,
+        crate::PreparedOrderedNfaV15CompileDisposition::Declined(decline) => {
+            let decline = match decline {
+                crate::PreparedOrderedNfaV15CompileDecline::Unsupported => {
+                    OrderedManyAotCompileDecline::Unsupported
+                }
+                crate::PreparedOrderedNfaV15CompileDecline::NativeDataBytes { limit, required } => {
+                    OrderedManyAotCompileDecline::NativeDataBytes { limit, required }
+                }
+                crate::PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required } => {
+                    OrderedManyAotCompileDecline::ObjectBytes { limit, required }
+                }
+            };
+            return Ok(OrderedManyAotCompileDisposition::Declined(decline));
+        }
+    };
+    let strategy = compiled.module().prepared_aggregate_strategy();
+    let aggregate_shape_is_exact = matches!(
+        strategy,
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+    );
+    let requested_entries_exist = (!exports.contains(PreparedAggregateExports::COUNT)
+        || compiled.module().prepared_count_symbol().is_some())
+        && (!exports.contains(PreparedAggregateExports::SPAN_SUM)
+            || compiled.module().prepared_span_sum_symbol().is_some());
+    if !aggregate_shape_is_exact || !requested_entries_exist {
+        return Err(OrderedManyAotCompileError::NativeReducerUnavailable { strategy });
+    }
+    let receipt = OrderedManyAotReceipt {
+        schema_version: ORDERED_MANY_AOT_RECEIPT_VERSION,
+        rows: row_count,
+        pattern_bytes,
+        ordered_sources_sha256: source_digest.finalize().into(),
+        program_sha256: compiled.receipt().program_sha256,
+        object_sha256: compiled.receipt().object_sha256,
+        exports,
+        aggregate_strategy: strategy.ok_or(OrderedManyAotCompileError::InternalInvariant(
+            "native ordered-many reducer omitted its strategy",
+        ))?,
+    };
+    Ok(OrderedManyAotCompileDisposition::Compiled(
+        OrderedManyAotArtifact {
+            compiled,
+            profile,
+            receipt,
+        },
+    ))
 }
 
 /// Only bounded representation and cost refusals may select the already

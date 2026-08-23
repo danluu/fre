@@ -19,6 +19,7 @@ fre-lower = { path = "../fre-lower" }
 fre-simd-kernels = { path = "../fre-simd-kernels" }
 fre-syntax = { path = "../fre-syntax" }
 memchr = "2.7"
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
 sha2 = "0.10.9"
 
 [dev-dependencies]

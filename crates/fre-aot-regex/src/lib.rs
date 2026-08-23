@@ -158,11 +158,15 @@ pub use ordered_literal_artifact::{
     OrderedLiteralCountPlanReconstructionReceipt, OrderedLiteralIterationSemantics,
 };
 pub use ordered_many::{
-    ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,
-    OrderedManyCompileRequest, OrderedManyFallbackReason, OrderedManyFillReport,
-    OrderedManyMatch, OrderedManyPatternId, OrderedManyPrepareError, OrderedManyProgram,
-    OrderedManyProgramStats, OrderedManyRow, OrderedManyRunError, OrderedManySession,
-    OrderedManySessionLimits, OrderedManyStrategy, compile_ordered_many,
+    ORDERED_MANY_AOT_MAX_ROWS, ORDERED_MANY_AOT_RECEIPT_VERSION, ORDERED_MANY_TAGGED_MAX_ROWS,
+    OrderedManyAotArtifact, OrderedManyAotCompileDecline, OrderedManyAotCompileDisposition,
+    OrderedManyAotCompileError, OrderedManyAotCompileLimits, OrderedManyAotCompileRequest,
+    OrderedManyAotReceipt, OrderedManyCompileError, OrderedManyCompileLimits,
+    OrderedManyCompileRequest, OrderedManyFallbackReason, OrderedManyFillReport, OrderedManyMatch,
+    OrderedManyPatternId, OrderedManyPrepareError, OrderedManyProgram, OrderedManyProgramStats,
+    OrderedManyRow, OrderedManyRunError, OrderedManySession, OrderedManySessionLimits,
+    OrderedManyStrategy, compile_ordered_many, compile_ordered_many_aot,
+    compile_ordered_many_aot_reported,
 };
 #[doc(hidden)]
 pub use ordered_nfa_native::{
