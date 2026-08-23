@@ -1580,71 +1580,73 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     {
         validate_window(window, haystack.len())?;
         let uniform_width = self.pattern_bytes();
+        let promotion_bytes = uniform_width.saturating_mul(2);
+        let direct_probe_bytes = uniform_width.saturating_mul(8);
         let mut cursor = window.start();
-        let mut direct_probe_bytes = initial_direct
-            .then(|| uniform_width.saturating_mul(8));
+        let mut direct = initial_direct;
         loop {
-            let search_start = cursor;
-            let matched = if let Some(probe_bytes) = direct_probe_bytes {
-                let probe_end = cursor.saturating_add(probe_bytes).min(window.end());
-                match first_acceptance_end_without_prefilter(
-                    self.plan,
+            while !direct {
+                let search_start = cursor;
+                let Some(matched) = self.plan.try_find_window_value(
                     haystack,
-                    Window::new(cursor, probe_end),
-                ) {
-                    Some(end) => {
-                        debug_assert!(
-                            end.checked_sub(uniform_width)
-                                .is_some_and(|matched_start| matched_start >= cursor),
-                            "a selected fixed-width literal must begin within its search window",
-                        );
-                        Some((end - uniform_width, end))
-                    }
-                    None => {
-                        if probe_end == window.end() {
-                            // The direct scan covered the complete remaining
-                            // semantic window. Unlike a miss at an artificial
-                            // probe edge, no wholly contained match can cross
-                            // this boundary, so the miss is authoritative.
-                            return Ok(Ok(()));
-                        }
-                        // A miss costs at most one bounded direct probe. The
-                        // authoritative prefiltered search restarts at the
-                        // original cursor so a match crossing the probe edge
-                        // cannot be skipped.
-                        direct_probe_bytes = None;
-                        #[cfg(test)]
-                        ordinary_direct_probe::record_adaptive_replay();
-                        self.plan.try_find_window_value(
-                            haystack,
-                            Window::new(cursor, window.end()),
-                        )?
-                    }
+                    Window::new(cursor, window.end()),
+                )? else {
+                    return Ok(Ok(()));
+                };
+                debug_assert!(
+                    matched.1 > cursor,
+                    "a positive-width literal-set match must advance its search cursor",
+                );
+                cursor = matched.1;
+                match visitor(matched) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
                 }
-            } else {
-                self.plan
-                    .try_find_window_value(haystack, Window::new(cursor, window.end()))?
-            };
-            let Some(matched) = matched else {
-                return Ok(Ok(()));
-            };
-            debug_assert!(
-                matched.1 > cursor,
-                "a positive-width literal-set match must advance its search cursor",
-            );
-            cursor = matched.1;
-            match visitor(matched) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
-            }
-            if direct_probe_bytes.is_none() {
                 // An end within 2W places the selected start in the first W
                 // bytes. Once promoted, bound a mistaken density prediction
                 // to eight pattern widths before authoritative replay.
-                let promotion_bytes = uniform_width.saturating_mul(2);
                 if cursor.saturating_sub(search_start) <= promotion_bytes {
-                    direct_probe_bytes = Some(uniform_width.saturating_mul(8));
+                    direct = true;
+                }
+            }
+
+            loop {
+                let probe_end = cursor
+                    .saturating_add(direct_probe_bytes)
+                    .min(window.end());
+                let Some(end) = first_acceptance_end_without_prefilter(
+                    self.plan,
+                    haystack,
+                    Window::new(cursor, probe_end),
+                ) else {
+                    if probe_end == window.end() {
+                        // The direct scan covered the complete remaining
+                        // semantic window. Unlike a miss at an artificial
+                        // probe edge, no wholly contained match can cross
+                        // this boundary, so the miss is authoritative.
+                        return Ok(Ok(()));
+                    }
+                    // A miss costs at most one bounded direct probe. The
+                    // authoritative prefiltered search restarts at the
+                    // original cursor so a match crossing the probe edge
+                    // cannot be skipped.
+                    direct = false;
+                    #[cfg(test)]
+                    ordinary_direct_probe::record_adaptive_replay();
+                    break;
+                };
+                debug_assert!(
+                    end.checked_sub(uniform_width)
+                        .is_some_and(|matched_start| matched_start >= cursor),
+                    "a selected fixed-width literal must begin within its search window",
+                );
+                let matched = (end - uniform_width, end);
+                cursor = end;
+                match visitor(matched) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
                 }
             }
         }
