@@ -8070,14 +8070,22 @@ impl PortableBuilder {
                         &words,
                         self.limits.literal_set,
                     )?;
-                    let attached = try_attach_unicode_folded_long_tail(
-                        attachment,
-                        (&rust.hir, syntax.hir_nodes),
-                        &self.profile,
-                        &self.limits,
-                        retained_facade_bytes,
-                        finite_work,
-                    )?;
+                    // The folded long-tail plan requires every alternative to
+                    // begin with a non-ASCII folded Unicode class. With no
+                    // class ranges in the authenticated HIR, its complete
+                    // inspection can only decline and need not be charged.
+                    let attached = if syntax.class_ranges == 0 {
+                        (attachment.into_plan(), finite_work)
+                    } else {
+                        try_attach_unicode_folded_long_tail(
+                            attachment,
+                            (&rust.hir, syntax.hir_nodes),
+                            &self.profile,
+                            &self.limits,
+                            retained_facade_bytes,
+                            finite_work,
+                        )?
+                    };
                     finite_work = attached.1;
                     attached.0
                 } else {
@@ -25959,6 +25967,41 @@ mod tests {
                 .expect("source envelope refusal is not a construction error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_hir_skips_impossible_folded_tail_inspection() {
+        let hir = Hir::alternation(
+            (0..256_u16)
+                .map(|bits| {
+                    Hir::literal(
+                        (0..8)
+                            .map(|shift| {
+                                if bits & (1 << shift) == 0 { b'q' } else { b'z' }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let regex = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir(&hir, usize::MAX)
+            .expect("direct construction completes")
+            .expect("class-free literal HIR is admitted");
+        let report = regex.build_report();
+        assert_eq!(report.plan, PlanKind::LiteralSetDfa);
+        assert_eq!(report.syntax.class_ranges, 0);
+        // The finite planner closes at 5,649 work. The formerly attempted
+        // folded inspection charged another 257 HIR-node visits even though
+        // a class-free HIR cannot have the required non-ASCII folded roots.
+        assert_eq!(report.planner_work, 5_649);
+        assert_eq!(
+            regex.find(b"xxqzqzzqzqyy"),
+            Some(Match { start: 2, end: 10 }),
+        );
+        assert_eq!(regex.find(b"xxxxxxxx"), None);
     }
 
     #[test]
