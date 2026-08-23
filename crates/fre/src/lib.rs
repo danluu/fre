@@ -10505,6 +10505,33 @@ mod packed_literal_set_ordinary_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod literal_set_dfa_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 enum K0PooledValue {
     Exists(bool),
     Span(Option<fre_automata::MatchSpan>),
@@ -12328,6 +12355,25 @@ impl PortableRegex {
                         .map_err(SearchError::from)
                 }
             }
+            PortablePlan::LiteralSetDfa(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                if let Some(ordinary) = literal_set.ordinary_executor() {
+                    #[cfg(test)]
+                    literal_set_dfa_ordinary_facade_probe::record_exists();
+                    ordinary
+                        .exists_window_value(haystack, literal_window)
+                        .map_err(SearchError::from)
+                } else {
+                    literal_set
+                        .find_window(
+                            haystack,
+                            literal_window,
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .map(|(matched, _)| matched.is_some())
+                        .map_err(SearchError::from)
+                }
+            }
             PortablePlan::RequiredLiteral(required)
                 if !required.anchors().start && !required.anchors().end =>
             {
@@ -13827,6 +13873,23 @@ impl PortableRegex {
                         literal_window,
                         PackedLiteralSetSearchLimits::unlimited(),
                     )
+                }?;
+                Ok(matched.map(|(start, end)| Match { start, end }))
+            }
+            PortablePlan::LiteralSetDfa(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let matched = if let Some(ordinary) = literal_set.ordinary_executor() {
+                    #[cfg(test)]
+                    literal_set_dfa_ordinary_facade_probe::record_span();
+                    ordinary.find_window_value(haystack, literal_window)
+                } else {
+                    literal_set
+                        .find_window(
+                            haystack,
+                            literal_window,
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .map(|(matched, _)| matched)
                 }?;
                 Ok(matched.map(|(start, end)| Match { start, end }))
             }
@@ -40690,6 +40753,259 @@ mod tests {
             })
             .is_err());
         assert!(!callback_called);
+    }
+
+    fn literal_set_dfa_fixture(pattern: &str) -> PortableRegex {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        regex
+    }
+
+    #[test]
+    fn literal_set_dfa_ordinary_facades_preserve_upstream_priority_and_source_reads() {
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"ab",
+            b"abzzzz",
+            b"zzzzzz",
+            b"abababababababab",
+            b"\xff\x80zzab\0abab",
+        ];
+        for pattern in ["a|ab", "ab|a"] {
+            let regex = literal_set_dfa_fixture(pattern);
+            let PortablePlan::LiteralSetDfa(plan) = &regex.plan else {
+                panic!("fixture did not retain a literal-set DFA")
+            };
+            assert!(plan.ordinary_executor().is_some());
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for &haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                super::literal_set_dfa_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected.is_some(),
+                    "pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+                    (1, 1),
+                );
+            }
+        }
+
+        assert_eq!(
+            literal_set_dfa_fixture("a|ab").find(b"ab"),
+            Some(Match { start: 0, end: 1 }),
+        );
+        assert_eq!(
+            literal_set_dfa_fixture("ab|a").find(b"ab"),
+            Some(Match { start: 0, end: 2 }),
+        );
+
+        let regex = literal_set_dfa_fixture("a|ab");
+        let mut reused = b"\xffab--".to_vec();
+        let address = reused.as_ptr();
+        super::literal_set_dfa_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), Some(Match { start: 1, end: 2 }));
+        reused.copy_from_slice(b"\xffzz--");
+        assert_eq!(reused.as_ptr(), address);
+        assert!(!regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), None);
+        assert_eq!(
+            super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+            (2, 2),
+            "ordinary calls must reread the borrowed source",
+        );
+    }
+
+    #[test]
+    fn literal_set_dfa_ordinary_facades_decline_nullable_and_folded_attachments() {
+        let nullable = literal_set_dfa_fixture("a|");
+        let PortablePlan::LiteralSetDfa(nullable_plan) = &nullable.plan else {
+            panic!("nullable fixture did not retain a literal-set DFA")
+        };
+        assert_eq!(nullable.build_report().minimum_match_bytes, Some(0));
+        assert!(nullable_plan.ordinary_executor().is_none());
+        let nullable_upstream = regex::bytes::RegexBuilder::new("a|")
+            .unicode(false)
+            .build()
+            .unwrap();
+        for haystack in [b"".as_slice(), b"a", b"zzz", b"\xffa"] {
+            let expected = nullable_upstream
+                .find(haystack)
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+            super::literal_set_dfa_ordinary_facade_probe::reset();
+            assert_eq!(nullable.is_match(haystack), expected.is_some());
+            assert_eq!(nullable.find(haystack), expected);
+            assert_eq!(
+                super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "nullable DFA must retain the canonical ordinary fallback",
+            );
+        }
+
+        const FOLDED_SOURCE: &str = "(?i:\u{212A}\u{212A}\u{212A}\u{212A}a)";
+        let folded = PortableRegex::new(FOLDED_SOURCE).unwrap();
+        assert_eq!(folded.build_report().plan, PlanKind::LiteralSetDfa);
+        let PortablePlan::LiteralSetDfa(folded_plan) = &folded.plan else {
+            panic!("folded fixture did not retain a literal-set DFA")
+        };
+        assert!(folded_plan.build_accounting().minimum_pattern_bytes > 0);
+        assert!(
+            folded_plan.ordinary_executor().is_none(),
+            "the attached folded route must own ordinary full searches",
+        );
+        let folded_upstream = regex::bytes::Regex::new(FOLDED_SOURCE).unwrap();
+        let mut folded_hit = vec![b'z'; 264];
+        folded_hit.extend_from_slice(b"KKKKa");
+        let folded_miss = vec![b'z'; folded_hit.len()];
+        for haystack in [&folded_hit, &folded_miss] {
+            let expected = folded_upstream
+                .find(haystack)
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+            super::literal_set_dfa_ordinary_facade_probe::reset();
+            assert_eq!(folded.is_match(haystack), expected.is_some());
+            assert_eq!(folded.find(haystack), expected);
+            assert_eq!(
+                super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "folded attachment must retain the checked canonical route",
+            );
+        }
+    }
+
+    #[test]
+    fn literal_set_dfa_ordinary_facade_isolated_from_explicit_apis() {
+        let regex = literal_set_dfa_fixture("ab|a|ba");
+        let haystack = b"zzababa";
+        let full = SearchWindow::full(haystack);
+        let expected = Some(Match { start: 2, end: 4 });
+        let unlimited = SearchLimits::unlimited();
+
+        super::literal_set_dfa_ordinary_facade_probe::reset();
+        assert!(regex.is_match_value(haystack, unlimited).unwrap());
+        assert_eq!(regex.find_value(haystack, unlimited).unwrap(), expected);
+        assert!(regex.is_match_accounted(haystack, unlimited).unwrap().0);
+        assert_eq!(regex.find_accounted(haystack, unlimited).unwrap().0, expected);
+        assert!(regex.is_match_at(haystack, 1, unlimited).unwrap().0);
+        assert!(regex.is_match_value_at(haystack, 1, unlimited).unwrap());
+        assert_eq!(regex.find_at(haystack, 1, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_at_value(haystack, 1, unlimited).unwrap(), expected);
+        assert!(regex.is_match_window(haystack, full, unlimited).unwrap().0);
+        assert!(regex
+            .is_match_window_value(haystack, full, unlimited)
+            .unwrap());
+        assert_eq!(regex.find_window(haystack, full, unlimited).unwrap().0, expected);
+        assert_eq!(
+            regex.find_window_value(haystack, full, unlimited).unwrap(),
+            expected,
+        );
+
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(matches!(
+            regex.is_match_value(haystack, refusing),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::TransitionLimit { .. }
+            )),
+        ));
+        assert!(matches!(
+            regex.find_value(haystack, refusing),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::TransitionLimit { .. }
+            )),
+        ));
+        assert!(matches!(
+            regex.find_window_value(haystack, SearchWindow::new(3, 2), refusing),
+            Err(SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
+                start: 3,
+                end: 2,
+                haystack_len: 7,
+            })),
+        ));
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(session.is_match_value(haystack, unlimited).unwrap());
+        assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(ordinary.is_match_at(haystack, 0).unwrap());
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+
+        let spans = regex
+            .find_iter(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let value_spans = regex
+            .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, value_spans);
+        assert_eq!(spans.first().copied(), expected);
+
+        let mut locations = regex.capture_locations();
+        let captured = regex
+            .captures_read(&mut locations, haystack, unlimited)
+            .unwrap()
+            .0;
+        assert_eq!(
+            captured.map(|matched| (matched.start(), matched.end())),
+            Some((2, 4)),
+        );
+        let captured = regex
+            .captures_read_value(&mut locations, haystack, unlimited)
+            .unwrap();
+        assert_eq!(
+            captured.map(|matched| (matched.start(), matched.end())),
+            Some((2, 4)),
+        );
+        assert_eq!(locations.get(0), Some((2, 4)));
+        assert_eq!(
+            super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, window, session, iterator, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(haystack));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(
+            super::literal_set_dfa_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
     }
 
     #[test]
