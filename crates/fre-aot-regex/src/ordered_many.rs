@@ -1579,17 +1579,33 @@ pub fn compile_ordered_many_aot_reported(
             ordinary
         }
         ordinary => {
-            let disposition = crate::compile_raw_prepared_ordered_nfa_v15_reported(
-                pattern_bytes,
-                raw,
-                profile.options.line_terminator,
-                OutputContract::Span,
-                target,
-                mode,
-                limits.compile,
-                exports,
-                slow_aot_limits.max_native_data_bytes,
-            )
+            let scalar_operation_only = exports == PreparedAggregateExports::COUNT
+                || exports == PreparedAggregateExports::SPAN_SUM;
+            let disposition = if scalar_operation_only {
+                crate::compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
+                    pattern_bytes,
+                    raw,
+                    profile.options.line_terminator,
+                    OutputContract::Span,
+                    target,
+                    mode,
+                    limits.compile,
+                    exports,
+                    slow_aot_limits.max_native_data_bytes,
+                )
+            } else {
+                crate::compile_raw_prepared_ordered_nfa_v15_reported(
+                    pattern_bytes,
+                    raw,
+                    profile.options.line_terminator,
+                    OutputContract::Span,
+                    target,
+                    mode,
+                    limits.compile,
+                    exports,
+                    slow_aot_limits.max_native_data_bytes,
+                )
+            }
             .map_err(OrderedManyAotCompileError::Combined)?;
             match disposition {
                 crate::PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => {

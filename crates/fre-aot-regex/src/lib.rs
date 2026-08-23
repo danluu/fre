@@ -437,6 +437,8 @@ pub enum EntryAbi {
     ExistsSearchV1,
     SelectedEndSearchV1,
     SpanSearchV1,
+    /// One exclusive-handle full-haystack Count or SpanSum transaction.
+    PreparedScalarReduceV1,
 }
 
 impl EntryAbi {
@@ -1355,6 +1357,37 @@ pub fn compile_with_prepared_ordered_nfa_v15_reported(
     )
 }
 
+/// Compile one exact Count or SpanSum operation through the closed V15
+/// surface. The selected object exports only the scalar reducer as a global
+/// function; the Ordered-NFA search and capability gate remain object-local.
+/// Legacy prepared V15 APIs retain their established public search, SpanFill,
+/// and compatibility topology byte-for-byte.
+pub fn compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+    request: CompileRequest,
+    export: PreparedAggregateExports,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_scalar_operation_and_native_data_limit_reported(
+        request,
+        export,
+        SlowAotLimits::default().max_native_data_bytes,
+    )
+}
+
+/// As [`compile_with_prepared_ordered_nfa_v15_scalar_operation_reported`],
+/// with an exact immutable native-data ceiling.
+pub fn compile_with_prepared_ordered_nfa_v15_scalar_operation_and_native_data_limit_reported(
+    request: CompileRequest,
+    export: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_surface(
+        request,
+        export,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+    )
+}
+
 /// As [`compile_with_prepared_ordered_nfa_v15`], with an exact ceiling for the
 /// additional immutable Ordered-NFA object data. Sizing precedes image
 /// allocation; a miss is returned as a terminal `ProgramBytes` resource error.
@@ -1379,9 +1412,31 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
     exports: PreparedAggregateExports,
     max_native_data_bytes: usize,
 ) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_surface(
+        request,
+        exports,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::Compatibility,
+    )
+}
+
+fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_surface(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+    surface: module::PreparedOrderedNfaV15Surface,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
     if request.output != OutputContract::Span {
         return Err(CompileError::PreparedAggregateRequiresSpan {
             actual: request.output,
+        });
+    }
+    if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
+        && exports != PreparedAggregateExports::COUNT
+        && exports != PreparedAggregateExports::SPAN_SUM
+    {
+        return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
+            actual: exports,
         });
     }
     let CompileRequest {
@@ -1408,7 +1463,7 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
     };
     let lowered =
         fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
-    compile_raw_prepared_ordered_nfa_v15_reported(
+    compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         source_bytes,
         lowered.into_plan(),
         line_terminator,
@@ -1418,6 +1473,7 @@ pub fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported(
         limits,
         exports,
         max_native_data_bytes,
+        surface,
     )
 }
 
@@ -1498,6 +1554,77 @@ fn compile_raw_prepared_ordered_nfa_v15_reported(
     exports: PreparedAggregateExports,
     max_native_data_bytes: usize,
 ) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        exports,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::Compatibility,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the explicit route keeps one plan, its six additive text retries, and its authenticated receipt in one transaction"
+)]
+// In-crate raw-plan hook for composite compilers. Uniform-capture and other
+// proved reducers can reuse this closed V15 finalizer without duplicating the
+// target-specific operation-only lowering or its retry/authentication rules.
+fn compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    export: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    if export != PreparedAggregateExports::COUNT
+        && export != PreparedAggregateExports::SPAN_SUM
+    {
+        return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
+            actual: export,
+        });
+    }
+    compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        export,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the explicit route keeps one plan, its six additive text retries, and its authenticated receipt in one transaction"
+)]
+fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    exports: PreparedAggregateExports,
+    max_native_data_bytes: usize,
+    surface: module::PreparedOrderedNfaV15Surface,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
@@ -1528,17 +1655,77 @@ fn compile_raw_prepared_ordered_nfa_v15_reported(
                 .map_err(CompileError::from)
         }
     };
-    let initial = match CompiledModule::lower_prepared_ordered_nfa_v15_reported(
-        &program,
-        target,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
-        max_native_data_bytes,
-    )? {
+    let lower_reported = |allow_ordered_edge_dispatch,
+                          allow_ordered_nfa_terminal_range,
+                          allow_ordered_nfa_start_closure_dispatch,
+                          allow_ordered_nfa_start_prefix,
+                          allow_ordered_nfa_whole_window_width_gate,
+                          allow_ordered_nfa_terminal_exact_set| {
+        match surface {
+            module::PreparedOrderedNfaV15Surface::Compatibility => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_reported(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+            module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_scalar_operation_reported(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+        }
+    };
+    let lower_terminal = |allow_ordered_edge_dispatch,
+                          allow_ordered_nfa_terminal_range,
+                          allow_ordered_nfa_start_closure_dispatch,
+                          allow_ordered_nfa_start_prefix,
+                          allow_ordered_nfa_whole_window_width_gate,
+                          allow_ordered_nfa_terminal_exact_set| {
+        match surface {
+            module::PreparedOrderedNfaV15Surface::Compatibility => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+            module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_scalar_operation_with_native_data_limit(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+        }
+    };
+    let initial = match lower_reported(true, true, true, true, true, true)? {
         module::PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => {
             append_exports(module)?
         }
@@ -1561,96 +1748,12 @@ fn compile_raw_prepared_ordered_nfa_v15_reported(
         initial,
         format,
         limits.max_object_bytes,
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    true,
-                    true,
-                    true,
-                    true,
-                    true,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    true,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    true,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
-        || {
-            append_exports(
-                CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
-                    &program,
-                    target,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?,
-            )
-        },
+        || append_exports(lower_terminal(true, true, true, true, true, false)?),
+        || append_exports(lower_terminal(true, true, true, true, false, false)?),
+        || append_exports(lower_terminal(true, true, true, false, false, false)?),
+        || append_exports(lower_terminal(true, true, false, false, false, false)?),
+        || append_exports(lower_terminal(true, false, false, false, false, false)?),
+        || append_exports(lower_terminal(false, false, false, false, false, false)?),
     )? {
         FinalObjectAttempt::Fit { module, object } => (module, object),
         FinalObjectAttempt::ObjectBytes {
@@ -1672,10 +1775,38 @@ fn compile_raw_prepared_ordered_nfa_v15_reported(
             ));
         }
     };
-    if module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+    let exact_surface = match surface {
+        module::PreparedOrderedNfaV15Surface::Compatibility => {
+            module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                && module.prepared_entry_symbol().is_some()
+                && module.prepared_span_fill_symbol().is_some()
+        }
+        module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+            let reducer = if exports == PreparedAggregateExports::COUNT {
+                module.prepared_count_symbol()
+            } else if exports == PreparedAggregateExports::SPAN_SUM {
+                module.prepared_span_sum_symbol()
+            } else {
+                None
+            };
+            let mut global_functions = module.symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && symbol.section.is_some()
+            });
+            module.prepared_bulk_strategy().is_none()
+                && module.prepared_entry_symbol().is_none()
+                && module.prepared_span_fill_symbol().is_none()
+                && module.prepared_aggregate_strategy()
+                    == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+                && module.required_runtime_symbols().next().is_none()
+                && reducer == Some(module.entry_symbol())
+                && global_functions.next().map(|symbol| symbol.name.as_str()) == reducer
+                && global_functions.next().is_none()
+        }
+    };
+    if !exact_surface
         || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
-        || module.prepared_entry_symbol().is_none()
-        || module.prepared_span_fill_symbol().is_none()
         || module.prepared_aggregate_exports() != exports
     {
         return Err(CompileError::InternalInvariant(
@@ -1716,7 +1847,11 @@ fn compile_raw_prepared_ordered_nfa_v15_reported(
         optimizer_version: OPTIMIZER_VERSION,
         mode,
         output,
-        entry_abi: EntryAbi::for_output(output),
+        entry_abi: if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly {
+            EntryAbi::PreparedScalarReduceV1
+        } else {
+            EntryAbi::for_output(output)
+        },
         target,
         line_terminator,
         automaton_sha256: digest,
