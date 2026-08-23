@@ -58,24 +58,28 @@ fn main() {
     let source_tree =
         env::var(SOURCE_TREE_ENV).unwrap_or_else(|_| "unbound-development".to_owned());
     if benchmark.model == shared::Model::RegexRedux {
-        let mut components = Vec::with_capacity(shared::REGEX_REDUX_COMPONENTS);
-        let mut object_paths = Vec::with_capacity(shared::REGEX_REDUX_COMPONENTS);
-        for component in 0..shared::REGEX_REDUX_COMPONENTS {
-            let compiled = shared::compile_regex_redux_component(component, target)
-                .expect("compile fixed public Rebar regex-redux component");
+        let artifact = fre_aot_regex::compile_native_regex_redux_aot_v1(
+            target,
+            fre_aot_regex::NativeRegexReduxAotLimitsV1::default(),
+        )
+        .expect("compile fixed public Rebar native regex-redux operation");
+        let mut object_paths = Vec::with_capacity(
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS.saturating_add(1),
+        );
+        for (component, compiled) in artifact.components().iter().enumerate() {
             let component_path = output.join(format!("aot-rebar-regex-redux-{component:02}.o"));
             fs::write(&component_path, compiled.object())
                 .expect("write linked regex-redux component object");
-            components.push(compiled);
             object_paths.push(component_path);
         }
-        fs::write(&object_path, []).expect("write unused scalar object sentinel");
+        fs::write(&object_path, artifact.reducer_object())
+            .expect("write linked regex-redux whole-operation reducer object");
+        object_paths.push(object_path.clone());
         fs::write(
             &generated_path,
             configured_regex_redux_source(
                 &benchmark,
-                &components,
-                &object_paths,
+                &artifact,
                 &architecture,
                 &operating_system,
                 feature_bits,
@@ -249,8 +253,14 @@ fn main() {
                     }
                     Ok(disposition) => match disposition {
                         shared::ParticipationCaptureBridgeDisposition::Selected(bridge) => {
+                            let bridge = shared::compile_single_capture_reducer_bridge(
+                                &benchmark,
+                                target,
+                                bridge.artifact.into(),
+                            )
+                            .expect("compile exact-span participation whole-operation reducer");
                             fs::write(&object_path, bridge.artifact.object())
-                                .expect("write linked participation capture object");
+                                .expect("write linked participation capture reducer object");
                             fs::write(
                                 &generated_path,
                                 configured_participation_capture_source(
@@ -268,8 +278,14 @@ fn main() {
                         shared::ParticipationCaptureBridgeDisposition::Declined { .. } => {
                             let bridge = shared::compile_strict_capture_bridge(&benchmark, target)
                                 .expect("compile exact single-pattern helper-free capture route");
+                            let bridge = shared::compile_single_capture_reducer_bridge(
+                                &benchmark,
+                                target,
+                                bridge.artifact.into(),
+                            )
+                            .expect("compile strict capture-next whole-operation reducer");
                             fs::write(&object_path, bridge.artifact.object())
-                                .expect("write linked strict capture object");
+                                .expect("write linked strict capture reducer object");
                             fs::write(
                                 &generated_path,
                                 configured_strict_capture_source(
@@ -295,8 +311,10 @@ fn main() {
         return;
     }
     if benchmark.uses_native_row_bridge() {
-        let shared = if matches!(benchmark.model, shared::Model::Count | shared::Model::SpanSum)
-            && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
+        let shared = if matches!(
+            benchmark.model,
+            shared::Model::Count | shared::Model::SpanSum
+        ) && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         {
             Some(
                 shared::try_compile_shared_ordered_many_aggregate(&benchmark, target)
@@ -944,6 +962,7 @@ fn configured_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     writeln!(
         source,
         "pub static OBJECT_BYTES: &[u8] = include_bytes!({:?});",
@@ -997,13 +1016,11 @@ fn configured_source(
             "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
         );
     }
-    source.push_str(
-        "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
-    );
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 1);
+    push_empty_single_capture_reducer_bindings(&mut source);
     source
 }
 
@@ -1013,8 +1030,7 @@ fn configured_source(
 )]
 fn configured_regex_redux_source(
     benchmark: &shared::Benchmark,
-    components: &[fre_aot_regex::CompiledRegex],
-    object_paths: &[PathBuf],
+    artifact: &fre_aot_regex::NativeRegexReduxAotArtifactV1,
     architecture: &str,
     operating_system: &str,
     feature_bits: u64,
@@ -1024,12 +1040,40 @@ fn configured_regex_redux_source(
     assert_eq!(benchmark.model, shared::Model::RegexRedux);
     assert!(benchmark.patterns.is_empty());
     assert!(!benchmark.unicode && !benchmark.case_insensitive);
+    let components = artifact.components();
     assert_eq!(components.len(), shared::REGEX_REDUX_COMPONENTS);
-    assert_eq!(object_paths.len(), components.len());
+    assert_eq!(
+        components.len(),
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+    );
+    assert_eq!(
+        shared::REGEX_REDUX_FLATTEN_PATTERN,
+        fre_aot_regex::NATIVE_REGEX_REDUX_FLATTEN_V1
+    );
+    assert_eq!(
+        shared::REGEX_REDUX_VARIANTS,
+        fre_aot_regex::NATIVE_REGEX_REDUX_VARIANTS_V1
+    );
+    assert!(
+        shared::REGEX_REDUX_SUBSTITUTIONS
+            .iter()
+            .zip(fre_aot_regex::NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1)
+            .all(
+                |((source, replacement), (native_source, native_replacement))| {
+                    source == &native_source && replacement.as_bytes() == native_replacement
+                }
+            )
+    );
 
     let first = components
         .first()
         .expect("regex-redux has fixed components");
+    let operation_receipt = artifact.receipt();
+    assert_eq!(
+        operation_receipt.target,
+        shared::target_from_parts(architecture, operating_system, feature_bits)
+            .expect("generated regex-redux target remains supported")
+    );
     let compiler_version = first.receipt().compiler_version;
     let optimizer_version = first.receipt().optimizer_version;
     let mut entry_symbols = Vec::with_capacity(components.len());
@@ -1088,6 +1132,52 @@ fn configured_regex_redux_source(
         program_hashes.push(receipt.program_sha256);
         object_hashes.push(receipt.object_sha256);
     }
+    assert_eq!(
+        operation_receipt.component_entry_symbols.as_ref(),
+        entry_symbols.as_slice()
+    );
+    assert_eq!(
+        operation_receipt.component_program_sha256.as_ref(),
+        program_hashes.as_slice()
+    );
+    assert_eq!(
+        operation_receipt.component_object_sha256.as_ref(),
+        object_hashes.as_slice()
+    );
+    assert_eq!(
+        artifact.reducer_module().entry_symbol(),
+        operation_receipt.reducer_symbol
+    );
+    assert!(
+        artifact
+            .reducer_module()
+            .required_runtime_symbols()
+            .eq(entry_symbols.iter().map(String::as_str)),
+        "regex-redux reducer link closure differs from its fifteen component entries"
+    );
+    assert!(
+        entry_symbols
+            .iter()
+            .all(|symbol| !symbol.starts_with("fre_aot_regex_runtime_")),
+        "regex-redux reducer retains a semantic runtime helper"
+    );
+    assert_eq!(
+        operation_receipt.abi_version,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION
+    );
+    assert_eq!(
+        operation_receipt.request_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES
+    );
+    assert_eq!(
+        operation_receipt.receipt_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES
+    );
+    assert_eq!(
+        operation_receipt.report_bytes,
+        fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES
+    );
+    assert!(!artifact.reducer_object().is_empty());
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
@@ -1144,19 +1234,22 @@ fn configured_regex_redux_source(
     writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
     source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
     source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
-    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
+    writeln!(
+        source,
+        "pub const REDUCER_SYMBOL: &str = {:?};",
+        operation_receipt.reducer_symbol
+    )
+    .unwrap();
     source.push_str("pub const ENTRY_SYMBOL: &str = \"\";\n");
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
     source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
-    source.push_str(
-        "pub const SPAN_ITERATION_STRATEGY: &str = \"fixed-component-direct-entry-loop\";\n",
-    );
+    source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
     source.push_str("pub const GREP_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
     source.push_str("pub const PREPARED_BULK_STRATEGY: &str = \"None\";\n");
-    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"component-indexed\";\n");
-    source.push_str("pub const ENGINE: &str = \"FixedRegexReduxComponents\";\n");
+    source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
+    source.push_str("pub const ENGINE: &str = \"NativeRegexReduxAotV1\";\n");
     source.push_str(
-        "pub const AGGREGATE_STRATEGY: &str = \"linked-fixed-regex-redux-span-entries\";\n",
+        "pub const AGGREGATE_STRATEGY: &str = \"native-fixed-regex-redux-whole-operation-v1\";\n",
     );
     writeln!(
         source,
@@ -1169,7 +1262,12 @@ fn configured_regex_redux_source(
     )
     .unwrap();
     source.push_str("pub const PROGRAM_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_object_sha256
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const REGEX_REDUX_COMPONENT_COUNT: usize = {};",
@@ -1202,28 +1300,93 @@ fn configured_regex_redux_source(
         "pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &{object_hashes:?};"
     )
     .unwrap();
-    source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = {:?};",
+        operation_receipt.operation_identity
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_code_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_data_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = {:?};",
+        operation_receipt.reducer_object_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = {};",
+        operation_receipt.reducer_relocation_count
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_ABI_VERSION: u32 = {};",
+        operation_receipt.abi_version
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REQUEST_BYTES: usize = {};",
+        operation_receipt.request_bytes
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_RECEIPT_BYTES: usize = {};",
+        operation_receipt.receipt_bytes
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REPORT_BYTES: usize = {};",
+        operation_receipt.report_bytes
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 2;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 3;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 2;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = \"u64-input-clean-variant9-substitution5-final-report-v1\";\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_SCHEMA: &str = \"variant9-blank-input-clean-final-lines-v1\";\n");
+    writeln!(
+        source,
+        "pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    source.push_str("pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub static OBJECT_BYTES: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/aot-rebar-artifact.o\"));\n");
 
     source.push_str("unsafe extern \"C\" {\n");
-    for (component, entry) in entry_symbols.iter().enumerate() {
-        writeln!(source, "    #[link_name = {entry:?}]").unwrap();
-        writeln!(source, "    fn REGEX_REDUX_ENTRY_{component}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
-    }
+    writeln!(
+        source,
+        "    #[link_name = {:?}]",
+        operation_receipt.reducer_symbol
+    )
+    .unwrap();
+    source.push_str("    fn REGEX_REDUX_REDUCER(request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32;\n");
     source.push_str("}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn regex_redux_search(component: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match component {\n");
-    for component in 0..components.len() {
-        writeln!(source, "        {component} => unsafe {{ REGEX_REDUX_ENTRY_{component}(haystack, haystack_len, window_start, window_end, result_out) }},").unwrap();
-    }
-    source.push_str("        _ => fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT,\n    }\n}\n");
+    source.push_str("pub unsafe fn regex_redux_reduce(request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32 { unsafe { REGEX_REDUX_REDUCER(request) } }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
+    push_empty_single_capture_reducer_bindings(&mut source);
     source
 }
 
@@ -1233,7 +1396,7 @@ fn configured_regex_redux_source(
 )]
 fn configured_participation_capture_source(
     benchmark: &shared::Benchmark,
-    bridge: &shared::ParticipationCaptureBridge,
+    bridge: &shared::SingleCaptureReducerBridge,
     architecture: &str,
     operating_system: &str,
     feature_bits: u64,
@@ -1242,19 +1405,57 @@ fn configured_participation_capture_source(
 ) -> String {
     assert!(benchmark.model.is_capture());
     assert_eq!(benchmark.patterns.len(), 1);
-    let artifact = &bridge.artifact;
+    let reducer = &bridge.artifact;
+    assert!(reducer.authenticates_receipt());
+    let fre_aot_regex::RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(
+        artifact,
+    ) = reducer.source()
+    else {
+        unreachable!("participation reducer retained a capture-next source")
+    };
     assert!(artifact.authenticates_receipt());
-    assert!(artifact
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
+    assert!(artifact.module().required_runtime_program().is_none());
+    assert!(reducer
         .module()
         .required_runtime_symbols()
         .next()
         .is_none());
-    assert!(artifact.module().required_runtime_program().is_none());
+    assert!(reducer.module().required_runtime_program().is_none());
+    let reducer_receipt = reducer.receipt();
     let outer = artifact.receipt();
     let receipt = outer.native();
+    assert_eq!(
+        reducer_receipt.source_route(),
+        fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1
+    );
+    assert_eq!(
+        reducer_receipt.operation(),
+        match benchmark.model {
+            shared::Model::CountCaptures => {
+                fre_aot_regex::RebarSingleCaptureReducerOperationV1::CountCaptures
+            }
+            shared::Model::GrepCaptures => {
+                fre_aot_regex::RebarSingleCaptureReducerOperationV1::GrepCaptures
+            }
+            _ => unreachable!("capture reducer requires a capture model"),
+        }
+    );
+    assert_eq!(
+        reducer_receipt.domain(),
+        reducer_receipt.operation().domain()
+    );
+    assert_eq!(reducer_receipt.group_count(), receipt.groups);
     let selector_symbol = artifact.selector_entry_symbol();
     let bundle_symbol = artifact.bundle_symbol();
     let participation_symbol = artifact.participation_entry_symbol();
+    let reducer_symbol = reducer.reducer_symbol();
     let strategy = match receipt.strategy {
         fre_aot_regex::NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
         fre_aot_regex::NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
@@ -1264,25 +1465,30 @@ fn configured_participation_capture_source(
     };
     assert!(receipt.decline.is_none());
     let adapter = match benchmark.model {
-        shared::Model::CountCaptures => "general-aot-native-exact-span-participation-count-v1",
-        shared::Model::GrepCaptures => "general-aot-native-exact-span-participation-grep-v1",
+        shared::Model::CountCaptures => {
+            "general-aot-native-exact-span-participation-count-reducer-v1"
+        }
+        shared::Model::GrepCaptures => {
+            "general-aot-native-exact-span-participation-grep-reducer-v1"
+        }
         _ => unreachable!("participation source requires a capture model"),
     };
     let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
-        "per-line-native-exact-span-participation-dfa-v1"
+        "linked-native-single-capture-whole-operation-reducer-v1"
     } else {
         "not-applicable"
     };
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
-    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = false;\n");
     source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
     source.push_str("pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;\n");
     source.push_str("pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;\n");
     source.push_str("pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
-    source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = true;\n");
+    source.push_str("pub const PARTICIPATION_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
     writeln!(
         source,
@@ -1307,38 +1513,14 @@ fn configured_participation_capture_source(
     )
     .unwrap();
     source.push_str("pub const SOURCE_PATTERN_COUNT: usize = 1;\n");
-    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 1;\n");
-    writeln!(
-        source,
-        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
-        artifact.object().len()
-    )
-    .unwrap();
-    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];\n");
-    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];\n");
-    writeln!(
-        source,
-        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &[{selector_symbol:?}];"
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.selector_sha256
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.capture_sha256
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.object_sha256
-    )
-    .unwrap();
+    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 0;\n");
+    source.push_str("pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[];\n");
+    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n");
+    source.push_str("pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const UNIFORM_CAPTURE_ALGORITHM_VERSION: u32 = 0;\n");
     source.push_str("pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = 0;\n");
     source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
@@ -1362,6 +1544,12 @@ fn configured_participation_capture_source(
     )
     .unwrap();
     source.push_str("pub const PARTICIPATION_DECLINE: u16 = 0;\n");
+    writeln!(
+        source,
+        "pub const PARTICIPATION_CAN_MATCH_EMPTY: bool = {};",
+        outer.can_match_empty()
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = {};",
@@ -1431,10 +1619,14 @@ fn configured_participation_capture_source(
     writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
     source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
     source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
-    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
     writeln!(
         source,
-        "pub const ENTRY_SYMBOL: &str = {selector_symbol:?};"
+        "pub const REDUCER_SYMBOL: &str = {reducer_symbol:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ENTRY_SYMBOL: &str = {reducer_symbol:?};"
     )
     .unwrap();
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
@@ -1449,7 +1641,7 @@ fn configured_participation_capture_source(
     source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
     source.push_str("pub const ENGINE: &str = \"NativeExactSpanParticipationDfaV1\";\n");
     source.push_str(
-        "pub const AGGREGATE_STRATEGY: &str = \"native-exact-span-participation-dfa-v1\";\n",
+        "pub const AGGREGATE_STRATEGY: &str = \"native-exact-span-participation-whole-operation-reducer-v1\";\n",
     );
     writeln!(
         source,
@@ -1463,16 +1655,11 @@ fn configured_participation_capture_source(
         fre_aot_regex::OPTIMIZER_VERSION
     )
     .unwrap();
-    writeln!(
-        source,
-        "pub const PROGRAM_SHA256: [u8; 32] = {:?};",
-        receipt.capture_sha256
-    )
-    .unwrap();
+    source.push_str("pub const PROGRAM_SHA256: [u8; 32] = [0; 32];\n");
     writeln!(
         source,
         "pub const OBJECT_SHA256: [u8; 32] = {:?};",
-        receipt.object_sha256
+        reducer_receipt.object_sha256()
     )
     .unwrap();
     source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
@@ -1481,26 +1668,24 @@ fn configured_participation_capture_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
     source.push_str("unsafe extern \"C\" {\n");
-    writeln!(source, "    #[link_name = {bundle_symbol:?}]").unwrap();
-    source.push_str("    static LINKED_PARTICIPATION_BUNDLE: u8;\n");
-    writeln!(source, "    #[link_name = {selector_symbol:?}]").unwrap();
-    source.push_str("    fn LINKED_PARTICIPATION_SELECTOR(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n");
-    writeln!(source, "    #[link_name = {participation_symbol:?}]").unwrap();
-    source.push_str("    fn LINKED_PARTICIPATION_EXACT(request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32;\n");
+    writeln!(source, "    #[link_name = {reducer_symbol:?}]").unwrap();
+    source.push_str("    fn LINKED_SINGLE_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
     source.push_str("}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { unsafe { LINKED_PARTICIPATION_SELECTOR(haystack, haystack_len, window_start, window_end, result_out) } }\n");
-    source.push_str("pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { if row != 0 { return fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT; } unsafe { LINKED_PARTICIPATION_SELECTOR(haystack, haystack_len, window_start, window_end, result_out) } }\n");
-    source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { &raw const LINKED_PARTICIPATION_BUNDLE }\n");
-    source.push_str("pub unsafe fn participation_exact(request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { unsafe { LINKED_PARTICIPATION_EXACT(request) } }\n");
+    source.push_str("pub unsafe fn search(_haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }\n");
+    source.push_str("pub unsafe fn participation_exact(_request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     push_empty_strict_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
-    push_empty_prepared_row_bindings(&mut source, 1);
+    push_empty_prepared_row_bindings(&mut source, 0);
+    push_single_capture_reducer_receipt(&mut source, reducer);
     source
 }
 
@@ -1510,7 +1695,7 @@ fn configured_participation_capture_source(
 )]
 fn configured_strict_capture_source(
     benchmark: &shared::Benchmark,
-    bridge: &shared::StrictCaptureBridge,
+    bridge: &shared::SingleCaptureReducerBridge,
     architecture: &str,
     operating_system: &str,
     feature_bits: u64,
@@ -1519,37 +1704,80 @@ fn configured_strict_capture_source(
 ) -> String {
     assert!(benchmark.model.is_capture());
     assert_eq!(benchmark.patterns.len(), 1);
-    let artifact = &bridge.artifact;
+    let reducer = &bridge.artifact;
+    assert!(reducer.authenticates_receipt());
+    let fre_aot_regex::RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(artifact) =
+        reducer.source()
+    else {
+        unreachable!("strict reducer retained an exact-span participation source")
+    };
     assert!(artifact.authenticates_receipt());
-    assert!(artifact
+    assert!(
+        artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none()
+    );
+    assert!(artifact.module().required_runtime_program().is_none());
+    assert!(reducer
         .module()
         .required_runtime_symbols()
         .next()
         .is_none());
+    assert!(reducer.module().required_runtime_program().is_none());
+    let reducer_receipt = reducer.receipt();
     let receipt = artifact.receipt();
+    assert_eq!(
+        reducer_receipt.source_route(),
+        fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::CaptureNextV1
+    );
+    assert_eq!(
+        reducer_receipt.operation(),
+        match benchmark.model {
+            shared::Model::CountCaptures => {
+                fre_aot_regex::RebarSingleCaptureReducerOperationV1::CountCaptures
+            }
+            shared::Model::GrepCaptures => {
+                fre_aot_regex::RebarSingleCaptureReducerOperationV1::GrepCaptures
+            }
+            _ => unreachable!("capture reducer requires a capture model"),
+        }
+    );
+    assert_eq!(
+        reducer_receipt.domain(),
+        reducer_receipt.operation().domain()
+    );
+    assert_eq!(reducer_receipt.group_count(), receipt.group_count());
     let next_symbol = artifact.capture_next_symbol();
     let materialize_symbol = artifact.capture_materialize_symbol();
     let selector_symbol = artifact.selector_entry_symbol();
+    let reducer_symbol = reducer.reducer_symbol();
     let adapter = match benchmark.model {
-        shared::Model::CountCaptures => "general-aot-native-single-capture-next-count-v1",
-        shared::Model::GrepCaptures => "general-aot-native-single-capture-next-grep-v1",
+        shared::Model::CountCaptures => {
+            "general-aot-native-single-capture-next-count-reducer-v1"
+        }
+        shared::Model::GrepCaptures => {
+            "general-aot-native-single-capture-next-grep-reducer-v1"
+        }
         _ => unreachable!("strict capture source requires a capture model"),
     };
     let grep_strategy = if benchmark.model == shared::Model::GrepCaptures {
-        "per-line-native-single-capture-next-v1"
+        "linked-native-single-capture-whole-operation-reducer-v1"
     } else {
         "not-applicable"
     };
 
     let mut source = String::new();
     source.push_str("pub const CONFIGURED: bool = true;\n");
-    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = true;\n");
+    source.push_str("pub const NATIVE_ROW_BRIDGE: bool = false;\n");
     source.push_str("pub const NATIVE_SCALAR_REDUCER: bool = false;\n");
     source.push_str("pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;\n");
     source.push_str("pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;\n");
     source.push_str("pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const UNIFORM_CAPTURE_BRIDGE: bool = false;\n");
-    source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = true;\n");
+    source.push_str("pub const STRICT_CAPTURE_BRIDGE: bool = false;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_BRIDGE: bool = true;\n");
     writeln!(source, "pub const ADAPTER: &str = {adapter:?};").unwrap();
     writeln!(
         source,
@@ -1574,38 +1802,14 @@ fn configured_strict_capture_source(
     )
     .unwrap();
     source.push_str("pub const SOURCE_PATTERN_COUNT: usize = 1;\n");
-    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 1;\n");
-    writeln!(
-        source,
-        "pub const ROW_TOTAL_OBJECT_BYTES: usize = {};",
-        artifact.object().len()
-    )
-    .unwrap();
-    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[0];\n");
-    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[0];\n");
-    writeln!(
-        source,
-        "pub const ROW_ENTRY_SYMBOLS: &[&str] = &[{next_symbol:?}];"
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.selector_sha256()
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.capture_sha256()
-    )
-    .unwrap();
-    writeln!(
-        source,
-        "pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
-        receipt.object_sha256()
-    )
-    .unwrap();
+    source.push_str("pub const ROW_ARTIFACT_COUNT: usize = 0;\n");
+    source.push_str("pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const SOURCE_TO_ARTIFACT: &[usize] = &[];\n");
+    source.push_str("pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n");
+    source.push_str("pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const ROW_AUTOMATON_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const ROW_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const ROW_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const UNIFORM_CAPTURE_ALGORITHM_VERSION: u32 = 0;\n");
     source.push_str("pub const UNIFORM_CAPTURE_ACCOUNTING_VERSION: u32 = 0;\n");
     source.push_str("pub const ROW_PARTICIPATING_GROUPS: &[u64] = &[];\n");
@@ -1667,6 +1871,12 @@ fn configured_strict_capture_source(
     .unwrap();
     writeln!(
         source,
+        "pub const STRICT_CAPTURE_OBJECT_SHA256: [u8; 32] = {:?};",
+        receipt.object_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
         "pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = {next_symbol:?};"
     )
     .unwrap();
@@ -1699,8 +1909,12 @@ fn configured_strict_capture_source(
     writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
     source.push_str("pub const PROGRAM_LEN: usize = 0;\n");
     source.push_str("pub const PROGRAM_SYMBOL: &str = \"\";\n");
-    source.push_str("pub const REDUCER_SYMBOL: &str = \"\";\n");
-    writeln!(source, "pub const ENTRY_SYMBOL: &str = {next_symbol:?};").unwrap();
+    writeln!(
+        source,
+        "pub const REDUCER_SYMBOL: &str = {reducer_symbol:?};"
+    )
+    .unwrap();
+    writeln!(source, "pub const ENTRY_SYMBOL: &str = {reducer_symbol:?};").unwrap();
     source.push_str("pub const SPAN_FILL_SYMBOL: &str = \"\";\n");
     source.push_str("pub const HAS_SPAN_FILL: bool = false;\n");
     source.push_str("pub const SPAN_ITERATION_STRATEGY: &str = \"not-applicable\";\n");
@@ -1713,7 +1927,7 @@ fn configured_strict_capture_source(
     source.push_str("pub const REQUIRED_RUNTIME_SYMBOLS: &str = \"\";\n");
     source.push_str("pub const ENGINE: &str = \"NativeOnePassCaptureV1\";\n");
     source.push_str(
-        "pub const AGGREGATE_STRATEGY: &str = \"native-single-capture-next-participation-v1\";\n",
+        "pub const AGGREGATE_STRATEGY: &str = \"native-single-capture-next-whole-operation-reducer-v1\";\n",
     );
     writeln!(
         source,
@@ -1727,16 +1941,11 @@ fn configured_strict_capture_source(
         fre_aot_regex::OPTIMIZER_VERSION
     )
     .unwrap();
-    writeln!(
-        source,
-        "pub const PROGRAM_SHA256: [u8; 32] = {:?};",
-        receipt.capture_sha256()
-    )
-    .unwrap();
+    source.push_str("pub const PROGRAM_SHA256: [u8; 32] = [0; 32];\n");
     writeln!(
         source,
         "pub const OBJECT_SHA256: [u8; 32] = {:?};",
-        receipt.object_sha256()
+        reducer_receipt.object_sha256()
     )
     .unwrap();
     source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
@@ -1745,10 +1954,11 @@ fn configured_strict_capture_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     source.push_str("pub static OBJECT_BYTES: &[u8] = &[];\n");
     source.push_str("unsafe extern \"C\" {\n");
-    writeln!(source, "    #[link_name = {next_symbol:?}]").unwrap();
-    source.push_str("    fn LINKED_STRICT_CAPTURE_NEXT(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32;\n");
+    writeln!(source, "    #[link_name = {reducer_symbol:?}]").unwrap();
+    source.push_str("    fn LINKED_SINGLE_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
     source.push_str("}\n");
     source.push_str("pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }\n");
     source.push_str("pub unsafe fn reduce(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
@@ -1756,10 +1966,12 @@ fn configured_strict_capture_source(
     source.push_str("pub unsafe fn search_row(_row: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     source.push_str("pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
-    source.push_str("pub unsafe fn capture_next(haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, slot_count: usize) -> u32 { unsafe { LINKED_STRICT_CAPTURE_NEXT(haystack, haystack_len, state, slots, slot_count) } }\n");
+    source.push_str("pub unsafe fn capture_next(_haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _slots: *mut fre_aot_regex_runtime::FreAotRegexCaptureSlotV1, _slot_count: usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn capture_reduce(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_SINGLE_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
     push_empty_participation_capture_bindings(&mut source);
     push_empty_selector_capture_fallback_bindings(&mut source);
-    push_empty_prepared_row_bindings(&mut source, 1);
+    push_empty_prepared_row_bindings(&mut source, 0);
+    push_single_capture_reducer_receipt(&mut source, reducer);
     source
 }
 
@@ -1819,24 +2031,28 @@ fn configured_native_row_source(
         match artifact.route {
             shared::NativeRowRoute::Ordinary => {
                 assert!(!compiled.receipt().runtime_helper_required);
-                assert!(compiled
-                    .module()
-                    .required_runtime_symbols()
-                    .next()
-                    .is_none());
-                assert!(!compiled
-                    .module()
-                    .symbols()
-                    .iter()
-                    .enumerate()
-                    .any(|(index, symbol)| {
-                        symbol.section.is_none()
-                            && compiled
-                                .module()
-                                .relocations()
-                                .iter()
-                                .any(|relocation| relocation.symbol == index)
-                    }));
+                assert!(
+                    compiled
+                        .module()
+                        .required_runtime_symbols()
+                        .next()
+                        .is_none()
+                );
+                assert!(
+                    !compiled
+                        .module()
+                        .symbols()
+                        .iter()
+                        .enumerate()
+                        .any(|(index, symbol)| {
+                            symbol.section.is_none()
+                                && compiled
+                                    .module()
+                                    .relocations()
+                                    .iter()
+                                    .any(|relocation| relocation.symbol == index)
+                        })
+                );
                 assert!(compiled.module().prepared_entry_symbol().is_none());
                 assert!(compiled.module().required_runtime_program().is_none());
             }
@@ -2093,9 +2309,17 @@ fn configured_native_row_source(
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_SCALAR_REDUCER: bool = false;").unwrap();
-    writeln!(source, "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;").unwrap();
+    writeln!(
+        source,
+        "pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;"
+    )
+    .unwrap();
     writeln!(source, "pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;").unwrap();
-    writeln!(source, "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];").unwrap();
+    writeln!(
+        source,
+        "pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
@@ -2395,6 +2619,7 @@ fn configured_native_row_source(
     source.push_str("pub const REGEX_REDUX_NATIVE: &[bool] = &[];\n");
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    push_empty_native_regex_redux_bindings(&mut source);
     writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
     source.push_str("unsafe extern \"C\" {\n");
     for (index, artifact) in bridge.artifacts.iter().enumerate() {
@@ -2466,12 +2691,139 @@ fn configured_native_row_source(
     source.push_str(
         "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
     );
-    source.push_str(
-        "pub unsafe fn regex_redux_search(_component: usize, _haystack: *const u8, _haystack_len: usize, _window_start: usize, _window_end: usize, _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
-    );
     push_empty_strict_capture_bindings(&mut source);
     push_empty_participation_capture_bindings(&mut source);
+    push_empty_single_capture_reducer_bindings(&mut source);
     source
+}
+
+fn push_empty_native_regex_redux_bindings(source: &mut String) {
+    source.push_str("pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_ABI_VERSION: u32 = 0;\n");
+    source.push_str("pub const REGEX_REDUX_REQUEST_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_BYTES: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 0;\n");
+    source.push_str("pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = \"\";\n");
+    source.push_str("pub const REGEX_REDUX_REPORT_SCHEMA: &str = \"\";\n");
+    source.push_str("pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub unsafe fn regex_redux_reduce(_request: *const fre_aot_regex::NativeRegexReduxRequestV1) -> u32 { fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT }\n");
+}
+
+fn push_single_capture_reducer_receipt(
+    source: &mut String,
+    artifact: &fre_aot_regex::RebarSingleCaptureReducerAotArtifactV1,
+) {
+    let receipt = artifact.receipt();
+    let operation = match receipt.operation() {
+        fre_aot_regex::RebarSingleCaptureReducerOperationV1::CountCaptures => 1_u8,
+        fre_aot_regex::RebarSingleCaptureReducerOperationV1::GrepCaptures => 2_u8,
+    };
+    let domain = match receipt.domain() {
+        fre_aot_regex::RebarSingleCaptureReducerDomainV1::WholeHaystack => 1_u8,
+        fre_aot_regex::RebarSingleCaptureReducerDomainV1::ByteSliceLinesLfCrLf => 2_u8,
+    };
+    let source_route = match receipt.source_route() {
+        fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1 => 1_u8,
+        fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::CaptureNextV1 => 2_u8,
+    };
+    let empty_progress = match receipt.empty_progress() {
+        fre_aot_regex::RebarSingleCaptureEmptyProgressV1::Byte => 1_u8,
+    };
+    for (name, value) in [
+        ("OPERATION", operation),
+        ("DOMAIN", domain),
+        ("SOURCE_ROUTE", source_route),
+        ("EMPTY_PROGRESS", empty_progress),
+    ] {
+        writeln!(source, "pub const SINGLE_CAPTURE_REDUCER_{name}: u8 = {value};").unwrap();
+    }
+    for (name, value) in [
+        ("SOURCE_CARDINALITY", receipt.source_cardinality()),
+        ("SOURCE_BYTES", receipt.source_bytes()),
+        ("GROUP_COUNT", receipt.group_count()),
+        ("SEMANTIC_RUNTIME_CALLS", receipt.semantic_runtime_calls()),
+        (
+            "PRIVATE_PARTICIPATION_SCRATCH_BYTES",
+            receipt.private_participation_scratch_bytes(),
+        ),
+        (
+            "PRIVATE_ITERATOR_STATE_BYTES",
+            receipt.private_iterator_state_bytes(),
+        ),
+        (
+            "PRIVATE_RESULT_SLOT_COUNT",
+            receipt.private_result_slot_count(),
+        ),
+        (
+            "PRIVATE_RESULT_SLOT_BYTES",
+            receipt.private_result_slot_bytes(),
+        ),
+        ("OBJECT_BYTES", receipt.object_bytes()),
+        ("MAX_OBJECT_BYTES", receipt.max_object_bytes()),
+    ] {
+        writeln!(source, "pub const SINGLE_CAPTURE_REDUCER_{name}: usize = {value};").unwrap();
+    }
+    writeln!(
+        source,
+        "pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = {};",
+        receipt.can_match_empty()
+    )
+    .unwrap();
+    for (name, digest) in [
+        ("SOURCE", receipt.source_sha256()),
+        ("SELECTOR", receipt.selector_sha256()),
+        ("CAPTURE", receipt.capture_sha256()),
+        (
+            "SOURCE_ARTIFACT_IDENTITY",
+            receipt.source_artifact_identity_sha256(),
+        ),
+        ("SOURCE_OBJECT", receipt.source_object_sha256()),
+        ("REDUCER_SYMBOL", receipt.reducer_symbol_sha256()),
+        ("OBJECT", receipt.object_sha256()),
+        ("ARTIFACT_IDENTITY", receipt.artifact_identity_sha256()),
+    ] {
+        writeln!(
+            source,
+            "pub const SINGLE_CAPTURE_REDUCER_{name}_SHA256: [u8; 32] = {digest:?};"
+        )
+        .unwrap();
+    }
+}
+
+fn push_empty_single_capture_reducer_bindings(source: &mut String) {
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_BRIDGE: bool = false;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_OPERATION: u8 = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_DOMAIN: u8 = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_ROUTE: u8 = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_EMPTY_PROGRESS: u8 = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_CARDINALITY: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_GROUP_COUNT: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = false;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_MAX_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SELECTOR_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_CAPTURE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_SOURCE_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub unsafe fn capture_reduce(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
 fn push_empty_strict_capture_bindings(source: &mut String) {
@@ -2484,6 +2836,7 @@ fn push_empty_strict_capture_bindings(source: &mut String) {
     source.push_str("pub const STRICT_CAPTURE_PLAN_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const STRICT_CAPTURE_BUNDLE_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const STRICT_CAPTURE_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = \"\";\n");
     source.push_str("pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = \"\";\n");
     source.push_str("pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = \"\";\n");
@@ -2495,6 +2848,7 @@ fn push_empty_participation_capture_bindings(source: &mut String) {
     source.push_str("pub const PARTICIPATION_ALGORITHM_ID: &str = \"\";\n");
     source.push_str("pub const PARTICIPATION_STRATEGY: u16 = 0;\n");
     source.push_str("pub const PARTICIPATION_DECLINE: u16 = 0;\n");
+    source.push_str("pub const PARTICIPATION_CAN_MATCH_EMPTY: bool = false;\n");
     source.push_str("pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_GROUP_COUNT: usize = 0;\n");
     source.push_str("pub const PARTICIPATION_ASSERTIONS: usize = 0;\n");
@@ -2604,6 +2958,7 @@ pub const STRICT_CAPTURE_CAPTURE_SHA256: [u8; 32] = [0; 32];
 pub const STRICT_CAPTURE_PLAN_SHA256: [u8; 32] = [0; 32];
 pub const STRICT_CAPTURE_BUNDLE_SHA256: [u8; 32] = [0; 32];
 pub const STRICT_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const STRICT_CAPTURE_OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const STRICT_CAPTURE_NEXT_SYMBOL: &str = "";
 pub const STRICT_CAPTURE_MATERIALIZE_SYMBOL: &str = "";
 pub const STRICT_CAPTURE_SELECTOR_SYMBOL: &str = "";
@@ -2611,6 +2966,7 @@ pub const PARTICIPATION_CAPTURE_BRIDGE: bool = false;
 pub const PARTICIPATION_ALGORITHM_ID: &str = "";
 pub const PARTICIPATION_STRATEGY: u16 = 0;
 pub const PARTICIPATION_DECLINE: u16 = 0;
+pub const PARTICIPATION_CAN_MATCH_EMPTY: bool = false;
 pub const PARTICIPATION_SEMANTIC_RUNTIME_CALLS: usize = 0;
 pub const PARTICIPATION_GROUP_COUNT: usize = 0;
 pub const PARTICIPATION_ASSERTIONS: usize = 0;
@@ -2632,6 +2988,30 @@ pub const PARTICIPATION_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
 pub const PARTICIPATION_BUNDLE_SYMBOL: &str = "";
 pub const PARTICIPATION_SELECTOR_SYMBOL: &str = "";
 pub const PARTICIPATION_ENTRY_SYMBOL: &str = "";
+pub const SINGLE_CAPTURE_REDUCER_BRIDGE: bool = false;
+pub const SINGLE_CAPTURE_REDUCER_OPERATION: u8 = 0;
+pub const SINGLE_CAPTURE_REDUCER_DOMAIN: u8 = 0;
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_ROUTE: u8 = 0;
+pub const SINGLE_CAPTURE_REDUCER_EMPTY_PROGRESS: u8 = 0;
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_CARDINALITY: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_GROUP_COUNT: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = false;
+pub const SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_MAX_OBJECT_BYTES: usize = 0;
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_SELECTOR_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_CAPTURE_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_SOURCE_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
 pub const SELECTOR_CAPTURE_FALLBACK_BRIDGE: bool = false;
 pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str = "";
 pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE: &str = "";
@@ -2706,6 +3086,22 @@ pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];
 pub const REGEX_REDUX_NATIVE: &[bool] = &[];
 pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];
 pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];
+pub const REGEX_REDUX_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_DATA_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const REGEX_REDUX_REDUCER_RELOCATION_COUNT: usize = 0;
+pub const REGEX_REDUX_ABI_VERSION: u32 = 0;
+pub const REGEX_REDUX_REQUEST_BYTES: usize = 0;
+pub const REGEX_REDUX_RECEIPT_BYTES: usize = 0;
+pub const REGEX_REDUX_REPORT_BYTES: usize = 0;
+pub const REGEX_REDUX_SCRATCH_BUFFER_COUNT: usize = 0;
+pub const REGEX_REDUX_SCRATCH_CAPACITY_NUMERATOR: usize = 0;
+pub const REGEX_REDUX_SCRATCH_CAPACITY_DENOMINATOR: usize = 0;
+pub const REGEX_REDUX_RECEIPT_SCHEMA: &str = "";
+pub const REGEX_REDUX_REPORT_SCHEMA: &str = "";
+pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &[];
+pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];
 pub static OBJECT_BYTES: &[u8] = &[];
 pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }
 pub unsafe fn reduce(
@@ -2748,14 +3144,9 @@ pub unsafe fn fill_spans(
     _capacity: usize,
     _written_out: *mut usize,
 ) -> u32 { 2 }
-pub unsafe fn regex_redux_search(
-    _component: usize,
-    _haystack: *const u8,
-    _haystack_len: usize,
-    _window_start: usize,
-    _window_end: usize,
-    _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
-) -> u32 { 2 }
+pub unsafe fn regex_redux_reduce(
+    _request: *const fre_aot_regex::NativeRegexReduxRequestV1,
+) -> u32 { fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT }
 pub unsafe fn capture_next(
     _haystack: *const u8,
     _haystack_len: usize,
@@ -2766,6 +3157,11 @@ pub unsafe fn capture_next(
 pub unsafe fn participation_bundle_ptr() -> *const u8 { core::ptr::null() }
 pub unsafe fn participation_exact(
     _request: *const fre_aot_regex_runtime::FreAotRegexParticipationRequestV1,
+) -> u32 { 2 }
+pub unsafe fn capture_reduce(
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _value_out: *mut u64,
 ) -> u32 { 2 }
 "#
 }

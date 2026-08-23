@@ -9,6 +9,10 @@
   ],
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonzeroSha256": {
+      "type": "string",
+      "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+    },
     "gitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "idSet": {
       "type": "object",
@@ -555,6 +559,187 @@
         }
       }
     },
+    "captureReducerParticipationSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm_id", "strategy", "assertions", "assertion_signatures",
+        "byte_classes", "dfa_states", "transition_cells", "build_work",
+        "scratch_bytes", "plan_bytes", "selector_object_sha256",
+        "bundle_sha256", "export_identity_sha256", "bundle_symbol",
+        "selector_symbol", "entry_symbol"
+      ],
+      "properties": {
+        "algorithm_id": {
+          "const": "fre-aot-regex.exact-span-participation-dfa.v1"
+        },
+        "strategy": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "assertions": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "assertion_signatures": {
+          "type": "integer", "minimum": 1, "maximum": 256
+        },
+        "byte_classes": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "dfa_states": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "transition_cells": {
+          "type": "integer", "minimum": 1, "maximum": 16777216
+        },
+        "build_work": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "scratch_bytes": { "const": 16 },
+        "plan_bytes": {
+          "type": "integer", "minimum": 256, "maximum": 268435456
+        },
+        "selector_object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "export_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
+        },
+        "selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        },
+        "entry_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "captureReducerCaptureNextSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_sha256", "bundle_sha256", "next_symbol",
+        "materialize_symbol", "selector_symbol"
+      ],
+      "properties": {
+        "plan_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "next_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
+        },
+        "materialize_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_materialize_v1_[0-9a-f]{64}$"
+        },
+        "selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "captureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "domain", "source_route", "source_cardinality",
+        "source_bytes", "source_pattern_sha256", "source_sha256", "group_count",
+        "can_match_empty",
+        "empty_progress", "semantic_runtime_calls",
+        "private_participation_scratch_bytes", "private_iterator_state_bytes",
+        "private_result_slot_count", "private_result_slot_bytes",
+        "selector_sha256", "capture_sha256",
+        "source_artifact_identity_sha256", "source_object_sha256",
+        "reducer_symbol", "reducer_symbol_sha256", "object_sha256",
+        "object_bytes", "max_object_bytes", "artifact_identity_sha256",
+        "participation_source", "capture_next_source"
+      ],
+      "properties": {
+        "operation": { "enum": ["count-captures", "grep-captures"] },
+        "domain": { "enum": ["whole-haystack", "byte-slice-lines-lf-crlf"] },
+        "source_route": {
+          "enum": ["exact-span-participation-v1", "capture-next-v1"]
+        },
+        "source_cardinality": { "const": 1 },
+        "source_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "source_pattern_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "group_count": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "can_match_empty": { "type": "boolean" },
+        "empty_progress": { "const": "byte" },
+        "semantic_runtime_calls": { "const": 0 },
+        "private_participation_scratch_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 16
+        },
+        "private_iterator_state_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 24
+        },
+        "private_result_slot_count": {
+          "type": "integer", "minimum": 0, "maximum": 16
+        },
+        "private_result_slot_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 256
+        },
+        "selector_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "capture_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "oneOf": [
+            { "pattern": "^fre_aot_regex_count_captures_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" }
+          ]
+        },
+        "reducer_symbol_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "max_object_bytes": { "const": 268435456 },
+        "artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "participation_source": {
+          "anyOf": [
+            { "$ref": "#/$defs/captureReducerParticipationSource" },
+            { "type": "null" }
+          ]
+        },
+        "capture_next_source": {
+          "anyOf": [
+            { "$ref": "#/$defs/captureReducerCaptureNextSource" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source_route": { "const": "exact-span-participation-v1" }
+            },
+            "required": ["source_route"]
+          },
+          "then": {
+            "properties": {
+              "participation_source": {
+                "$ref": "#/$defs/captureReducerParticipationSource"
+              },
+              "capture_next_source": { "type": "null" },
+              "private_participation_scratch_bytes": { "const": 16 },
+              "private_iterator_state_bytes": { "const": 0 },
+              "private_result_slot_count": { "const": 0 },
+              "private_result_slot_bytes": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "participation_source": { "type": "null" },
+              "capture_next_source": {
+                "$ref": "#/$defs/captureReducerCaptureNextSource"
+              },
+              "group_count": { "maximum": 16 },
+              "private_participation_scratch_bytes": { "const": 0 },
+              "private_iterator_state_bytes": { "const": 24 }
+            }
+          }
+        }
+      ]
+    },
     "selectorCaptureFallbackProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -581,6 +766,51 @@
         }
       }
     },
+    "regexReduxProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_version", "operation_identity_sha256", "reducer_symbol",
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+        "reducer_relocation_count", "reducer_link_symbols",
+        "semantic_runtime_symbols", "request_bytes", "receipt_bytes",
+        "report_bytes", "scratch_buffer_count", "scratch_capacity_numerator",
+        "scratch_capacity_denominator", "receipt_schema", "report_schema"
+      ],
+      "properties": {
+        "abi_version": { "const": 1 },
+        "operation_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_rebar_regex_redux_v1_[0-9a-f]{64}$"
+        },
+        "reducer_code_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_data_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_object_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_relocation_count": { "enum": [16, 17] },
+        "reducer_link_symbols": {
+          "type": "array", "minItems": 15, "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+          }
+        },
+        "semantic_runtime_symbols": { "const": [] },
+        "request_bytes": { "const": 72 },
+        "receipt_bytes": { "const": 144 },
+        "report_bytes": { "const": 1024 },
+        "scratch_buffer_count": { "const": 2 },
+        "scratch_capacity_numerator": { "const": 3 },
+        "scratch_capacity_denominator": { "const": 2 },
+        "receipt_schema": {
+          "const": "u64-input-clean-variant9-substitution5-final-report-v1"
+        },
+        "report_schema": {
+          "const": "variant9-blank-input-clean-final-lines-v1"
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -597,7 +827,7 @@
         "schema": {
           "enum": [
             "fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3",
-            "fre.aot.rebar-runner.v4"
+            "fre.aot.rebar-runner.v4", "fre.aot.rebar-runner.v5"
           ]
         },
         "adapter": { "type": "string" },
@@ -611,7 +841,8 @@
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
             "participation-capture-v4", "selector-capture-fallback-v4",
-            "prepared-grep-v15-v2", "shared-ordered-many-v2"
+            "prepared-grep-v15-v2", "shared-ordered-many-v2",
+            "single-capture-reducer-v5"
           ]
         },
         "composite_kind": {
@@ -620,7 +851,8 @@
             "regex-redux-fixed-v1", "strict-capture-next-v1",
             "exact-span-participation-v1", "selector-negative-certificate-v1",
             "mixed-prepared-native-row-bridge-v15",
-            "shared-ordered-many-native-reducer-v1"
+            "shared-ordered-many-native-reducer-v1",
+            "single-capture-whole-operation-reducer-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -647,9 +879,11 @@
         "participation_capture": {
           "$ref": "#/$defs/participationCaptureProvenance"
         },
+        "capture_reducer": { "$ref": "#/$defs/captureReducerProvenance" },
         "selector_capture_fallback": {
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
+        "regex_redux": { "$ref": "#/$defs/regexReduxProvenance" },
         "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
         "prepared_v15_limits": { "$ref": "#/$defs/preparedV15LimitsProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
@@ -669,6 +903,34 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": {
+              "composite_kind": { "const": "regex-redux-fixed-v1" }
+            },
+            "required": ["composite_kind"]
+          },
+          "then": { "required": ["regex_redux"] },
+          "else": { "not": { "required": ["regex_redux"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "single-capture-reducer-v5" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["capture_reducer"],
+            "properties": {
+              "schema": { "const": "fre.aot.rebar-runner.v5" },
+              "composite_kind": {
+                "const": "single-capture-whole-operation-reducer-v1"
+              },
+              "components": { "maxItems": 0 },
+              "required_runtime_symbols": { "maxItems": 0 }
+            }
+          },
+          "else": { "not": { "required": ["capture_reducer"] } }
+        },
         {
           "if": {
             "properties": { "kind": { "const": "strict-capture-v4" } },

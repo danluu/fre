@@ -66,6 +66,23 @@ typedef uint32_t (*FreAotRegexCaptureNextV1)(
     FreAotRegexCaptureSlotV1 *slots,
     size_t slot_count);
 
+/*
+ * Identity-suffixed whole-operation capture reducer. CountCaptures owns the
+ * complete haystack domain. GrepCaptures owns Rust bstr ByteSlice::lines:
+ * LF-delimited, one CR immediately before LF stripped, no line for empty
+ * input, and no synthetic line after final LF.
+ *
+ * SUCCESS publishes exactly one capture-participation total. Every other
+ * status leaves value_out unchanged. Selected entries call only their paired
+ * object-local ordinary Span selector plus exact-span participation closure,
+ * or their paired capture_next closure. They make no semantic
+ * fre_aot_regex_runtime_* call.
+ */
+typedef uint32_t (*FreAotRegexCaptureReducerV1)(
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
 #ifdef __cplusplus
 }
 #endif

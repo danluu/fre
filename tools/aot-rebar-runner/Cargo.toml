@@ -19,11 +19,13 @@ fre-aot-regex-runtime = { path = "../../crates/fre-aot-regex-runtime" }
 fre-lower = { path = "../../crates/fre-lower" }
 fre-syntax = { path = "../../crates/fre-syntax" }
 regex-automata = "=0.4.15"
+sha2 = "=0.10.9"
 
 [build-dependencies]
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
 fre-lower = { path = "../../crates/fre-lower" }
 fre-syntax = { path = "../../crates/fre-syntax" }
+sha2 = "=0.10.9"
 
 [lints.rust]
 unsafe_code = "warn"

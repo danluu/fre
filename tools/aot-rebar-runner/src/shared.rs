@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
 use fre_aot_regex::{
-    compile, compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
+    compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
+    compile_rebar_single_capture_reducer_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
     compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
@@ -16,8 +17,10 @@ use fre_aot_regex::{
     OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
     PreparedOrderedNfaV15CompileDisposition, RebarSingleCaptureAotArtifactV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
-    RebarSingleCaptureParticipationAotErrorV1, SectionKind, SlowAotLimits, SymbolBinding,
-    SymbolKind, Target, UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
+    RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureReducerAotArtifactV1,
+    RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    SectionKind, SlowAotLimits, SymbolBinding, SymbolKind, Target,
+    UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
     UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
     UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
     UniformCapturePreparedSpanFillCompileReceipt, UniformCaptureReducerCompileDisposition,
@@ -26,6 +29,7 @@ use fre_aot_regex::{
 };
 use fre_lower::{LowerError, LowerResource};
 use fre_syntax::{parse, CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+use sha2::{Digest, Sha256};
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
 /// Maximum source rows accepted by the additive independent-native-row bridge.
@@ -231,7 +235,7 @@ impl Model {
             Self::CountCaptures => "general-aot-uniform-capture-native-row-count-adapter-loop-v1",
             Self::GrepCount => "general-aot-linked-native-grep-count-reducer-prepared-v2",
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
-            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
+            Self::RegexRedux => "general-aot-native-regex-redux-reducer-v1",
         }
     }
 
@@ -260,7 +264,7 @@ impl Model {
                 "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
             }
             Self::GrepCaptures => "general-aot-uniform-capture-native-row-grep-adapter-loop-v1",
-            Self::RegexRedux => "general-aot-linked-fixed-regex-redux-span-entries-v1",
+            Self::RegexRedux => "general-aot-native-regex-redux-reducer-v1",
         }
     }
 
@@ -1889,6 +1893,29 @@ pub struct ParticipationCaptureBridge {
     pub artifact: RebarSingleCaptureParticipationAotArtifactV1,
 }
 
+/// One independently selected exact single-capture source sealed together
+/// with its helper-free whole-operation reducer.
+///
+/// The retained source enum is route-bearing, so build and runtime provenance
+/// cannot reinterpret an exact-span participation source as `capture_next` or
+/// vice versa. Reducer construction has no fallback of its own.
+#[derive(Debug)]
+pub struct SingleCaptureReducerBridge {
+    pub artifact: RebarSingleCaptureReducerAotArtifactV1,
+}
+
+/// Recompute the exact domain-separated source identity used by both native
+/// single-capture source routes.
+pub fn rebar_single_capture_source_sha256(source: &str) -> Result<[u8; 32], String> {
+    let source_bytes = u64::try_from(source.len())
+        .map_err(|_| "single-capture source length does not fit u64".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/rebar-single-capture-source-v1\0");
+    digest.update(source_bytes.to_le_bytes());
+    digest.update(source.as_bytes());
+    Ok(digest.finalize().into())
+}
+
 /// Exact deterministic construction envelope exhausted by the optional
 /// direct-DFA participation leaf. This is distinct from allocation, object,
 /// authentication and every non-numeric compiler failure.
@@ -2220,6 +2247,119 @@ pub fn compile_strict_capture_bridge(
         return Err("strict capture artifact has a malformed export closure".to_owned());
     }
     Ok(StrictCaptureBridge { artifact })
+}
+
+/// Append the exact CountCaptures/GrepCaptures whole-operation reducer to an
+/// already selected, independently authenticated source artifact.
+///
+/// Every reducer construction, allocation, object, arithmetic, and
+/// authentication error is terminal. In particular, this function never
+/// changes source routes after receiving `source`.
+pub fn compile_single_capture_reducer_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+    source: RebarSingleCaptureReducerSourceArtifactV1,
+) -> Result<SingleCaptureReducerBridge, String> {
+    if !benchmark.model.is_capture() || benchmark.patterns.len() != 1 {
+        return Err(
+            "single-capture reducer compilation requires one CountCaptures/GrepCaptures source"
+                .to_owned(),
+        );
+    }
+    let (source_sha256, source_target) = match &source {
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(source) => {
+            (source.receipt().source_sha256(), source.receipt().target())
+        }
+        RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(source) => {
+            (source.receipt().source_sha256(), source.receipt().target())
+        }
+    };
+    let expected_source_sha256 = rebar_single_capture_source_sha256(&benchmark.patterns[0])?;
+    if !source.authenticates_receipt()
+        || source.object().is_empty()
+        || source.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || source_sha256 != expected_source_sha256
+        || source_target != target
+    {
+        return Err("single-capture reducer source failed retained receipt authentication".to_owned());
+    }
+    let operation = match benchmark.model {
+        Model::CountCaptures => RebarSingleCaptureReducerOperationV1::CountCaptures,
+        Model::GrepCaptures => RebarSingleCaptureReducerOperationV1::GrepCaptures,
+        _ => unreachable!("capture gate accepted a non-capture model"),
+    };
+    let reducer_prefix = match operation {
+        RebarSingleCaptureReducerOperationV1::CountCaptures => {
+            "fre_aot_regex_count_captures_v1_"
+        }
+        RebarSingleCaptureReducerOperationV1::GrepCaptures => {
+            "fre_aot_regex_grep_captures_v1_"
+        }
+    };
+    let artifact = compile_rebar_single_capture_reducer_aot_v1(
+        source,
+        operation,
+        MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+    )
+    .map_err(|error| format!("single-capture whole-operation reducer compilation failed: {error}"))?;
+    let receipt = artifact.receipt();
+    let private_schema_is_exact = match artifact.source() {
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(_) => {
+            receipt.private_participation_scratch_bytes()
+                == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                && receipt.private_iterator_state_bytes() == 0
+                && receipt.private_result_slot_count() == 0
+                && receipt.private_result_slot_bytes() == 0
+        }
+        RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(_) => {
+            let state_bytes =
+                usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_ITER_STATE_BYTES).ok();
+            let slot_width =
+                usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES).ok();
+            receipt.private_participation_scratch_bytes() == 0
+                && Some(receipt.private_iterator_state_bytes()) == state_bytes
+                && receipt.private_result_slot_count() == receipt.group_count()
+                && slot_width.and_then(|width| receipt.group_count().checked_mul(width))
+                    == Some(receipt.private_result_slot_bytes())
+        }
+    };
+    if !artifact.authenticates_receipt()
+        || artifact.object().is_empty()
+        || artifact.object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || receipt.operation() != operation
+        || receipt.domain() != operation.domain()
+        || receipt.target() != target
+        || receipt.source_route() != artifact.source().route()
+        || !private_schema_is_exact
+        || receipt.source_cardinality() != 1
+        || receipt.source_bytes() != benchmark.patterns[0].len()
+        || receipt.source_sha256() != expected_source_sha256
+        || receipt.profile().options.unicode != benchmark.unicode
+        || receipt.profile().options.case_insensitive != benchmark.case_insensitive
+        || receipt.group_count() == 0
+        || receipt.group_count() > MAX_STRICT_CAPTURE_GROUPS
+        || receipt.empty_progress() != fre_aot_regex::RebarSingleCaptureEmptyProgressV1::Byte
+        || receipt.semantic_runtime_calls() != 0
+        || receipt.object_bytes() != artifact.object().len()
+        || receipt.max_object_bytes() != MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || receipt.source_object_sha256() == [0; 32]
+        || receipt.reducer_symbol_sha256() == [0; 32]
+        || receipt.object_sha256() == [0; 32]
+        || receipt.artifact_identity_sha256() == [0; 32]
+        || artifact.reducer_symbol().is_empty()
+        || native_symbol_identity(artifact.reducer_symbol(), reducer_prefix).is_none()
+        || artifact.module().required_runtime_symbols().next().is_some()
+        || artifact.module().required_runtime_program().is_some()
+        || artifact.module().prepared_entry_symbol().is_some()
+        || !artifact.module().prepared_aggregate_exports().is_empty()
+        || artifact.module().required_prepare_capabilities() != 0
+    {
+        return Err(
+            "single-capture whole-operation reducer failed sealed receipt authentication"
+                .to_owned(),
+        );
+    }
+    Ok(SingleCaptureReducerBridge { artifact })
 }
 
 /// Compile one single-source capture operation into one native reducer call.
@@ -2994,29 +3134,6 @@ fn authenticate_prepared_v15_row(
     Ok(())
 }
 
-/// Compile one fixed regex-redux stage as an ordinary Span artifact.
-///
-/// No aggregate or runtime composite is smuggled into this boundary. The
-/// linked runner performs only Rebar's deterministic stage sequencing around
-/// these independently receipted search entries.
-pub fn compile_regex_redux_component(
-    component: usize,
-    target: Target,
-) -> Result<CompiledRegex, String> {
-    let pattern = regex_redux_pattern(component)
-        .ok_or_else(|| format!("regex-redux component {component} is out of range"))?;
-    let mut profile = RustProfile::rebar_1_12_4();
-    profile.options.unicode = false;
-    profile.options.case_insensitive = false;
-    compile(
-        CompileRequest::new(pattern, target)
-            .profile(profile)
-            .output(OutputContract::Span)
-            .mode(CompileMode::Optimizing),
-    )
-    .map_err(|error| format!("regex-redux component {component} compilation failed: {error}"))
-}
-
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, String> {
     std::str::from_utf8(value).map_err(|error| format!("{key} is not UTF-8: {error}"))
 }
@@ -3166,7 +3283,7 @@ mod tests {
 
     #[test]
     fn safe_v15_declines_return_the_recovered_incumbent_byte_for_byte() {
-        use fre_aot_regex::PreparedOrderedNfaV15CompileDecline;
+        use fre_aot_regex::{compile, PreparedOrderedNfaV15CompileDecline};
 
         let target = target_from_parts(
             std::env::consts::ARCH,
@@ -4320,6 +4437,124 @@ mod tests {
     }
 
     #[test]
+    fn nonuniform_single_capture_reducer_sources_finalize_to_exact_one_call_receipts() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, operation, domain) in [
+            (
+                "count-captures",
+                RebarSingleCaptureReducerOperationV1::CountCaptures,
+                fre_aot_regex::RebarSingleCaptureReducerDomainV1::WholeHaystack,
+            ),
+            (
+                "grep-captures",
+                RebarSingleCaptureReducerOperationV1::GrepCaptures,
+                fre_aot_regex::RebarSingleCaptureReducerDomainV1::ByteSliceLinesLfCrLf,
+            ),
+        ] {
+            let benchmark = Benchmark::parse(&fixture(model, b"(a)?b", b"b\r\nab\n"))
+                .expect("nonuniform capture reducer fixture");
+            let ParticipationCaptureBridgeDisposition::Selected(participation) =
+                try_compile_participation_capture_bridge(&benchmark, target)
+                    .expect("participation source compilation")
+            else {
+                panic!("nonuniform fixture unexpectedly declined participation");
+            };
+            let participation = compile_single_capture_reducer_bridge(
+                &benchmark,
+                target,
+                participation.artifact.into(),
+            )
+            .expect("participation whole-operation reducer");
+            let receipt = participation.artifact.receipt();
+            assert!(participation.artifact.authenticates_receipt());
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.domain(), domain);
+            assert_eq!(
+                receipt.source_route(),
+                fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1
+            );
+            assert_eq!(
+                receipt.private_participation_scratch_bytes(),
+                fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+            );
+            assert_eq!(receipt.private_iterator_state_bytes(), 0);
+            assert_eq!(receipt.private_result_slot_count(), 0);
+            assert_eq!(receipt.private_result_slot_bytes(), 0);
+
+            // The current strict native subset is assertion-free and has at
+            // most 16 groups, so participation consumes it under production
+            // precedence. Finalize it independently here to prove the typed
+            // CaptureNext receipt without manufacturing an impossible branch.
+            let strict = compile_strict_capture_bridge(&benchmark, target)
+                .expect("capture-next source compilation");
+            let strict = compile_single_capture_reducer_bridge(
+                &benchmark,
+                target,
+                strict.artifact.into(),
+            )
+            .expect("capture-next whole-operation reducer");
+            let receipt = strict.artifact.receipt();
+            assert!(strict.artifact.authenticates_receipt());
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.domain(), domain);
+            assert_eq!(
+                receipt.source_route(),
+                fre_aot_regex::RebarSingleCaptureReducerSourceRouteV1::CaptureNextV1
+            );
+            assert_eq!(
+                receipt.private_iterator_state_bytes(),
+                usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_ITER_STATE_BYTES)
+                    .expect("state size fits usize")
+            );
+            assert_eq!(receipt.private_result_slot_count(), receipt.group_count());
+            assert_eq!(
+                receipt.private_result_slot_bytes(),
+                receipt.group_count()
+                    .checked_mul(
+                        usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES)
+                            .expect("slot width fits usize"),
+                    )
+                    .expect("slot schema fits usize")
+            );
+            assert_eq!(receipt.semantic_runtime_calls(), 0);
+            assert!(strict
+                .artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn single_capture_reducer_rejects_authenticated_equal_length_wrong_source() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab"))
+            .expect("source fixture");
+        let wrong = Benchmark::parse(&fixture("count-captures", b"(c)?b", b"ab"))
+            .expect("equal-length wrong-source fixture");
+        let ParticipationCaptureBridgeDisposition::Selected(source) =
+            try_compile_participation_capture_bridge(&benchmark, target)
+                .expect("participation source compilation")
+        else {
+            panic!("nonuniform fixture unexpectedly declined participation");
+        };
+        let error = compile_single_capture_reducer_bridge(&wrong, target, source.artifact.into())
+            .expect_err("wrong benchmark source must not authenticate");
+        assert!(error.contains("retained receipt authentication"), "{error}");
+    }
+
+    #[test]
     fn participation_state_retry_preserves_already_admitted_artifact_identity() {
         let target = target_from_parts(
             std::env::consts::ARCH,
@@ -4539,6 +4774,26 @@ mod tests {
         assert_eq!(parsed.model, Model::RegexRedux);
         assert!(parsed.patterns.is_empty());
         assert_eq!(REGEX_REDUX_COMPONENTS, 15);
+        assert_eq!(
+            REGEX_REDUX_COMPONENTS,
+            fre_aot_regex::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        );
+        assert_eq!(
+            REGEX_REDUX_FLATTEN_PATTERN,
+            fre_aot_regex::NATIVE_REGEX_REDUX_FLATTEN_V1
+        );
+        assert_eq!(
+            REGEX_REDUX_VARIANTS,
+            fre_aot_regex::NATIVE_REGEX_REDUX_VARIANTS_V1
+        );
+        for ((source, replacement), (native_source, native_replacement)) in
+            REGEX_REDUX_SUBSTITUTIONS
+                .iter()
+                .zip(fre_aot_regex::NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1)
+        {
+            assert_eq!(*source, native_source);
+            assert_eq!(replacement.as_bytes(), native_replacement);
+        }
         assert_eq!(regex_redux_pattern(0), Some(REGEX_REDUX_FLATTEN_PATTERN));
         assert_eq!(
             regex_redux_pattern(
@@ -4600,7 +4855,7 @@ mod tests {
             ),
             (
                 Model::RegexRedux,
-                "general-aot-linked-fixed-regex-redux-span-entries-v1",
+                "general-aot-native-regex-redux-reducer-v1",
                 0,
             ),
         ] {

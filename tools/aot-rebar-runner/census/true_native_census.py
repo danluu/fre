@@ -113,6 +113,12 @@ NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL = re.compile(
 NATIVE_GREP_CAPTURES_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_grep_captures_exclusive_v1_[0-9a-f]{64}$"
 )
+NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL = re.compile(
+    r"^fre_aot_regex_count_captures_v1_[0-9a-f]{64}$"
+)
+NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL = re.compile(
+    r"^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$"
+)
 NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
 )
@@ -122,6 +128,9 @@ NATIVE_CAPTURE_MATERIALIZE_SYMBOL = re.compile(
 NATIVE_PARTICIPATION_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
 )
+NATIVE_REGEX_REDUX_ENTRY_SYMBOL = re.compile(
+    r"^fre_aot_regex_rebar_regex_redux_v1_[0-9a-f]{64}$"
+)
 NATIVE_PARTICIPATION_BUNDLE_SYMBOL = re.compile(
     r"^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
 )
@@ -130,6 +139,9 @@ NATIVE_PARTICIPATION_ALGORITHM_ID = (
 )
 NATIVE_PARTICIPATION_SCRATCH_BYTES = 16
 NATIVE_PARTICIPATION_HEADER_BYTES = 256
+NATIVE_CAPTURE_ITERATOR_STATE_BYTES = 24
+NATIVE_CAPTURE_RESULT_SLOT_BYTES = 16
+NATIVE_CAPTURE_MAX_GROUPS = 16
 NATIVE_PARTICIPATION_MAX_ASSERTIONS = 64
 NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES = 256
 NATIVE_PARTICIPATION_MAX_BYTE_CLASSES = 256
@@ -189,6 +201,10 @@ OPERATION_ROUTE_POLICIES = {
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
     ),
+    "linked-native-single-capture-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
     "linked-native-uniform-capture-helper-backed-reducer": OperationRoutePolicy(
         OperationBoundary.SEMANTIC_HELPER_BACKED,
         "single-call-native-reducer-retains-semantic-runtime-helpers",
@@ -205,9 +221,9 @@ OPERATION_ROUTE_POLICIES = {
         OperationBoundary.RUST_ADAPTER_LOOP,
         "native-prepared-span-fill-core-with-per-line-adapter-loop",
     ),
-    "linked-fixed-composite-adapter-loop": OperationRoutePolicy(
-        OperationBoundary.RUST_ADAPTER_LOOP,
-        "native-search-core-with-adapter-outer-loop",
+    "linked-native-regex-redux-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
     ),
     "linked-native-row-adapter-loop": OperationRoutePolicy(
         OperationBoundary.RUST_ADAPTER_LOOP,
@@ -434,6 +450,13 @@ def require_hex64(value: object, context: str) -> str:
     if not isinstance(value, str) or HEX64.fullmatch(value) is None:
         raise CensusError(f"{context} is not a lowercase SHA-256 digest")
     return value
+
+
+def require_nonzero_hex64(value: object, context: str) -> str:
+    digest = require_hex64(value, context)
+    if digest == "0" * 64:
+        raise CensusError(f"{context} is the zero SHA-256 digest")
+    return digest
 
 
 def require_git_hash(value: object, context: str) -> str:
@@ -1058,9 +1081,27 @@ def parse_provenance(output: bytes) -> dict[str, str]:
             "row_total_object_bytes", "source_to_artifact", "component_count",
             "capture_resolution", "boundary", "required_comparators",
         }
+    elif fields.get("schema") == "fre.aot.rebar-runner.v5":
+        required = common | {
+            "disposition", "compiler_version", "optimizer_version", "engine",
+            "aggregate_strategy", "native_row_bridge", "capture_reducer_bridge",
+            "source_pattern_count", "operation", "domain", "source_route",
+            "source_cardinality", "source_bytes", "source_pattern_sha256",
+            "source_sha256", "group_count",
+            "can_match_empty", "empty_progress", "semantic_runtime_calls",
+            "private_participation_scratch_bytes", "private_iterator_state_bytes",
+            "private_result_slot_count", "private_result_slot_bytes",
+            "selector_sha256", "capture_sha256",
+            "source_artifact_identity_sha256", "source_object_sha256",
+            "reducer_symbol", "reducer_symbol_sha256", "object_sha256",
+            "object_bytes", "max_object_bytes", "artifact_identity_sha256",
+            "required_runtime_symbols", "operation_entry_symbol", "boundary",
+            "required_comparators",
+        }
     else:
         raise CensusError(
-            "runner provenance is neither scalar v2, composite v3, nor native-capture v4"
+            "runner provenance is neither scalar v2, composite v3, "
+            "native-capture v4, nor single-capture reducer v5"
         )
     missing = required - set(fields)
     if missing:
@@ -1072,9 +1113,11 @@ def parse_provenance(output: bytes) -> dict[str, str]:
     elif fields["schema"] == "fre.aot.rebar-runner.v3":
         components = components_from_provenance(fields)
         validate_v3_provenance(fields, components)
-    else:
+    elif fields["schema"] == "fre.aot.rebar-runner.v4":
         components = components_from_provenance(fields)
         validate_v4_provenance(fields, components)
+    else:
+        validate_v5_provenance(fields)
     return fields
 
 
@@ -2316,6 +2359,106 @@ def validate_native_row_engine_routes(
             )
 
 
+def regex_redux_proof_from_provenance(
+    fields: dict[str, str], components: list[dict[str, object]]
+) -> dict[str, object]:
+    """Authenticate the sealed helper-free one-call fixed operation."""
+    if (
+        fields.get("model") != "regex-redux"
+        or fields.get("adapter") != "general-aot-native-regex-redux-reducer-v1"
+        or fields.get("engine") != "NativeRegexReduxAotV1"
+        or fields.get("aggregate_strategy")
+        != "native-fixed-regex-redux-whole-operation-v1"
+        or fields.get("boundary") != "single-call-native-regex-redux-reducer"
+        or len(components) != 15
+    ):
+        raise CensusError("regex-redux provenance has a noncanonical native route")
+    entries = [str(component["entry_symbol"]) for component in components]
+    if (
+        len(entries) != len(set(entries))
+        or not all(NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry) for entry in entries)
+        or any(component["required_runtime_symbols"] for component in components)
+    ):
+        raise CensusError("regex-redux components are not closed direct Span entries")
+    operation_identity = fields.get("operation_identity_sha256", "")
+    require_hex64(operation_identity, "regex-redux operation identity")
+    if operation_identity == "0" * 64:
+        raise CensusError("regex-redux operation identity is zero")
+    reducer_symbol = fields.get("reducer_symbol", "")
+    reducer_identity = symbol_identity_suffix(
+        reducer_symbol,
+        NATIVE_REGEX_REDUX_ENTRY_SYMBOL,
+        "regex-redux reducer",
+    )
+    if reducer_identity != operation_identity:
+        raise CensusError("regex-redux reducer symbol and operation identity disagree")
+    digest_fields = (
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+    )
+    for name in digest_fields:
+        digest = require_hex64(fields.get(name, ""), f"regex-redux {name}")
+        if digest == "0" * 64:
+            raise CensusError(f"regex-redux {name} is zero")
+    link_symbols = fields.get("reducer_link_symbols", "").split(",")
+    if link_symbols != entries:
+        raise CensusError("regex-redux reducer link closure differs from its components")
+    semantic_symbols = sorted(filter(
+        None, fields.get("semantic_runtime_symbols", "").split(",")
+    ))
+    if semantic_symbols:
+        raise CensusError("regex-redux reducer retains semantic runtime helpers")
+    exact_decimal = {
+        "abi_version": 1,
+        "request_bytes": 72,
+        "receipt_bytes": 144,
+        "report_bytes": 1024,
+        "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3,
+        "scratch_capacity_denominator": 2,
+    }
+    for name, expected in exact_decimal.items():
+        if parse_canonical_decimal(
+            fields.get(name), f"regex-redux {name}", expected, expected
+        ) != expected:
+            raise CensusError(f"regex-redux {name} differs")
+    expected_relocations = 16 if fields.get("target", "").startswith("x86_64-") else (
+        17 if fields.get("target", "").startswith("aarch64-") else 0
+    )
+    if expected_relocations == 0 or parse_canonical_decimal(
+        fields.get("reducer_relocation_count"),
+        "regex-redux reducer relocation count",
+        expected_relocations,
+        expected_relocations,
+    ) != expected_relocations:
+        raise CensusError("regex-redux reducer relocation closure differs")
+    if (
+        fields.get("receipt_schema")
+        != "u64-input-clean-variant9-substitution5-final-report-v1"
+        or fields.get("report_schema")
+        != "variant9-blank-input-clean-final-lines-v1"
+    ):
+        raise CensusError("regex-redux execution schema differs")
+    return {
+        "abi_version": 1,
+        "operation_identity_sha256": operation_identity,
+        "reducer_symbol": reducer_symbol,
+        "reducer_code_sha256": fields["reducer_code_sha256"],
+        "reducer_data_sha256": fields["reducer_data_sha256"],
+        "reducer_object_sha256": fields["reducer_object_sha256"],
+        "reducer_relocation_count": expected_relocations,
+        "reducer_link_symbols": entries,
+        "semantic_runtime_symbols": [],
+        "request_bytes": 72,
+        "receipt_bytes": 144,
+        "report_bytes": 1024,
+        "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3,
+        "scratch_capacity_denominator": 2,
+        "receipt_schema": fields["receipt_schema"],
+        "report_schema": fields["report_schema"],
+    }
+
+
 def validate_v3_provenance(
     fields: dict[str, str], components: list[dict[str, object]]
 ) -> None:
@@ -2346,9 +2489,16 @@ def validate_v3_provenance(
         )
     }
     if fields["model"] == "regex-redux":
-        if fields.get("boundary") != "complete-regex-redux-aot-precompiled":
-            raise CensusError("regex-redux provenance has the wrong operation boundary")
-        expected = base | component_fields
+        regex_redux_proof_from_provenance(fields, components)
+        expected = base | component_fields | {
+            "reducer_symbol", "operation_identity_sha256", "reducer_code_sha256",
+            "reducer_data_sha256", "reducer_object_sha256",
+            "reducer_relocation_count", "reducer_link_symbols",
+            "semantic_runtime_symbols", "abi_version", "request_bytes",
+            "receipt_bytes", "report_bytes", "scratch_buffer_count",
+            "scratch_capacity_numerator", "scratch_capacity_denominator",
+            "receipt_schema", "report_schema",
+        }
     elif fields.get("native_row_bridge") == "true":
         component_fields |= {
             f"component_{index}_{suffix}"
@@ -2621,6 +2771,400 @@ def validate_v4_provenance(
         )
 
 
+def single_capture_reducer_proof_from_provenance(
+    fields: dict[str, str],
+) -> dict[str, object]:
+    """Authenticate and normalize the closed helper-free v5 reducer receipt."""
+    model = fields.get("model")
+    operation_contract = {
+        "count-captures": (
+            "count-captures", "whole-haystack",
+            NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL,
+        ),
+        "grep-captures": (
+            "grep-captures", "byte-slice-lines-lf-crlf",
+            NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL,
+        ),
+    }.get(model)
+    if operation_contract is None:
+        raise CensusError("single-capture reducer has an unsupported model")
+    operation, domain, reducer_pattern = operation_contract
+    if fields.get("operation") != operation or fields.get("domain") != domain:
+        raise CensusError("single-capture reducer operation/domain differs from its model")
+    source_route = fields.get("source_route")
+    if source_route not in {
+        "exact-span-participation-v1", "capture-next-v1",
+    }:
+        raise CensusError("single-capture reducer source route is not canonical")
+    target_architecture(fields.get("target", ""))
+    if re.fullmatch(r"[0-9a-f]{16}", fields.get("feature_bits", "")) is None:
+        raise CensusError("single-capture reducer feature bits are not canonical")
+    source_pattern_count = parse_canonical_decimal(
+        fields.get("source_pattern_count"),
+        "single-capture reducer source pattern count", 1, 1,
+    )
+    source_cardinality = parse_canonical_decimal(
+        fields.get("source_cardinality"),
+        "single-capture reducer source cardinality", 1, 1,
+    )
+    source_bytes = parse_canonical_decimal(
+        fields.get("source_bytes"), "single-capture reducer source bytes",
+        0, (1 << 64) - 1,
+    )
+    group_maximum = (
+        NATIVE_PARTICIPATION_MAX_ASSERTIONS
+        if source_route == "exact-span-participation-v1"
+        else NATIVE_CAPTURE_MAX_GROUPS
+    )
+    group_count = parse_canonical_decimal(
+        fields.get("group_count"), "single-capture reducer group count",
+        1, group_maximum,
+    )
+    can_match_empty_text = fields.get("can_match_empty")
+    if can_match_empty_text not in {"true", "false"}:
+        raise CensusError("single-capture reducer nullable flag is not canonical")
+    if fields.get("empty_progress") != "byte":
+        raise CensusError("single-capture reducer empty progress is not byte")
+    semantic_runtime_calls = parse_canonical_decimal(
+        fields.get("semantic_runtime_calls"),
+        "single-capture reducer semantic runtime calls", 0, 0,
+    )
+    private_participation_scratch_bytes = parse_canonical_decimal(
+        fields.get("private_participation_scratch_bytes"),
+        "single-capture reducer private participation scratch bytes", 0,
+        NATIVE_PARTICIPATION_SCRATCH_BYTES,
+    )
+    private_iterator_state_bytes = parse_canonical_decimal(
+        fields.get("private_iterator_state_bytes"),
+        "single-capture reducer private iterator state bytes", 0,
+        NATIVE_CAPTURE_ITERATOR_STATE_BYTES,
+    )
+    private_result_slot_count = parse_canonical_decimal(
+        fields.get("private_result_slot_count"),
+        "single-capture reducer private result slot count", 0,
+        NATIVE_CAPTURE_MAX_GROUPS,
+    )
+    private_result_slot_bytes = parse_canonical_decimal(
+        fields.get("private_result_slot_bytes"),
+        "single-capture reducer private result slot bytes", 0,
+        NATIVE_CAPTURE_MAX_GROUPS * NATIVE_CAPTURE_RESULT_SLOT_BYTES,
+    )
+    if source_route == "exact-span-participation-v1":
+        expected_private = (NATIVE_PARTICIPATION_SCRATCH_BYTES, 0, 0, 0)
+    else:
+        expected_private = (
+            0, NATIVE_CAPTURE_ITERATOR_STATE_BYTES, group_count,
+            group_count * NATIVE_CAPTURE_RESULT_SLOT_BYTES,
+        )
+    if (
+        private_participation_scratch_bytes, private_iterator_state_bytes,
+        private_result_slot_count, private_result_slot_bytes,
+    ) != expected_private:
+        raise CensusError(
+            "single-capture reducer private schema differs from its source route"
+        )
+    digest_fields = {
+        name: require_nonzero_hex64(
+            fields.get(name), f"single-capture reducer {name}"
+        )
+        for name in (
+            "source_pattern_sha256", "source_sha256", "selector_sha256",
+            "capture_sha256",
+            "source_artifact_identity_sha256", "source_object_sha256",
+            "reducer_symbol_sha256", "object_sha256", "artifact_identity_sha256",
+        )
+    }
+    reducer_symbol = fields.get("reducer_symbol")
+    if (
+        not isinstance(reducer_symbol, str)
+        or reducer_pattern.fullmatch(reducer_symbol) is None
+    ):
+        raise CensusError("single-capture reducer symbol is not canonical for its model")
+    if digest_fields["reducer_symbol_sha256"] != sha_bytes(
+        reducer_symbol.encode("ascii", "strict")
+    ):
+        raise CensusError("single-capture reducer symbol digest does not authenticate symbol")
+    if digest_fields["source_pattern_sha256"] == digest_fields["source_sha256"]:
+        raise CensusError(
+            "single-capture reducer raw-pattern and source-receipt digests are not distinct"
+        )
+    if fields.get("operation_entry_symbol") != reducer_symbol:
+        raise CensusError("single-capture reducer operation entry is not the reducer")
+    if digest_fields["source_object_sha256"] == digest_fields["object_sha256"]:
+        raise CensusError("single-capture reducer source and final objects are not distinct")
+    if (
+        digest_fields["source_artifact_identity_sha256"]
+        == digest_fields["artifact_identity_sha256"]
+    ):
+        raise CensusError("single-capture reducer source and final identities are not distinct")
+    object_bytes = parse_canonical_decimal(
+        fields.get("object_bytes"), "single-capture reducer object bytes",
+        1, MAX_NATIVE_ROW_OBJECT_BYTES,
+    )
+    max_object_bytes = parse_canonical_decimal(
+        fields.get("max_object_bytes"), "single-capture reducer maximum object bytes",
+        MAX_NATIVE_ROW_OBJECT_BYTES, MAX_NATIVE_ROW_OBJECT_BYTES,
+    )
+    if object_bytes > max_object_bytes:
+        raise CensusError("single-capture reducer object exceeds its receipt cap")
+
+    participation_source: Optional[dict[str, object]] = None
+    capture_next_source: Optional[dict[str, object]] = None
+    if source_route == "exact-span-participation-v1":
+        selector_symbol = fields.get("participation_selector_symbol")
+        entry_symbol = fields.get("participation_entry_symbol")
+        bundle_symbol = fields.get("participation_bundle_symbol")
+        export_identity = require_nonzero_hex64(
+            fields.get("participation_export_identity_sha256"),
+            "single-capture participation export identity",
+        )
+        selector_object = require_nonzero_hex64(
+            fields.get("participation_selector_object_sha256"),
+            "single-capture participation selector object",
+        )
+        bundle_sha256 = require_nonzero_hex64(
+            fields.get("participation_bundle_sha256"),
+            "single-capture participation bundle",
+        )
+        if (
+            not isinstance(selector_symbol, str)
+            or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector_symbol) is None
+            or not isinstance(entry_symbol, str)
+            or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(entry_symbol) is None
+            or not isinstance(bundle_symbol, str)
+            or NATIVE_PARTICIPATION_BUNDLE_SYMBOL.fullmatch(bundle_symbol) is None
+            or len({reducer_symbol, selector_symbol, entry_symbol, bundle_symbol}) != 4
+            or not entry_symbol.endswith(export_identity)
+            or not bundle_symbol.endswith(export_identity)
+        ):
+            raise CensusError("single-capture participation child symbols are not canonical")
+        if export_identity != participation_export_identity(
+            bundle_sha256, fields.get("target", ""),
+            fields.get("feature_bits", ""), selector_object, selector_symbol,
+        ):
+            raise CensusError(
+                "single-capture participation export identity does not authenticate its inputs"
+            )
+        expected_strategy = {"x86_64": 1, "aarch64": 2}[
+            target_architecture(fields.get("target", ""))
+        ]
+        strategy = parse_canonical_decimal(
+            fields.get("participation_strategy"),
+            "single-capture participation strategy",
+            expected_strategy, expected_strategy,
+        )
+        assertions = parse_canonical_decimal(
+            fields.get("participation_assertions"),
+            "single-capture participation assertions",
+            0, NATIVE_PARTICIPATION_MAX_ASSERTIONS,
+        )
+        assertion_signatures = parse_canonical_decimal(
+            fields.get("participation_assertion_signatures"),
+            "single-capture participation assertion signatures",
+            1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES,
+        )
+        byte_classes = parse_canonical_decimal(
+            fields.get("participation_byte_classes"),
+            "single-capture participation byte classes",
+            1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES,
+        )
+        dfa_states = parse_canonical_decimal(
+            fields.get("participation_dfa_states"),
+            "single-capture participation DFA states",
+            1, NATIVE_PARTICIPATION_MAX_DFA_STATES,
+        )
+        transition_cells = parse_canonical_decimal(
+            fields.get("participation_transition_cells"),
+            "single-capture participation transition cells",
+            1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS,
+        )
+        if transition_cells != dfa_states * byte_classes * assertion_signatures:
+            raise CensusError("single-capture participation transition geometry does not close")
+        plan_bytes = parse_canonical_decimal(
+            fields.get("participation_plan_bytes"),
+            "single-capture participation plan bytes",
+            NATIVE_PARTICIPATION_HEADER_BYTES, NATIVE_PARTICIPATION_MAX_PLAN_BYTES,
+        )
+        if plan_bytes != participation_plan_bytes(
+            assertions, assertion_signatures, dfa_states, transition_cells
+        ):
+            raise CensusError("single-capture participation plan extent does not close")
+        scratch_bytes = parse_canonical_decimal(
+            fields.get("participation_scratch_bytes"),
+            "single-capture participation scratch bytes",
+            NATIVE_PARTICIPATION_SCRATCH_BYTES,
+            NATIVE_PARTICIPATION_SCRATCH_BYTES,
+        )
+        participation_source = {
+            "algorithm_id": fields.get("participation_algorithm_id"),
+            "strategy": strategy,
+            "assertions": assertions,
+            "assertion_signatures": assertion_signatures,
+            "byte_classes": byte_classes,
+            "dfa_states": dfa_states,
+            "transition_cells": transition_cells,
+            "build_work": parse_canonical_decimal(
+                fields.get("participation_build_work"),
+                "single-capture participation build work",
+                1, NATIVE_PARTICIPATION_MAX_BUILD_WORK,
+            ),
+            "scratch_bytes": scratch_bytes,
+            "plan_bytes": plan_bytes,
+            "selector_object_sha256": selector_object,
+            "bundle_sha256": bundle_sha256,
+            "export_identity_sha256": export_identity,
+            "bundle_symbol": bundle_symbol,
+            "selector_symbol": selector_symbol,
+            "entry_symbol": entry_symbol,
+        }
+        if participation_source["algorithm_id"] != NATIVE_PARTICIPATION_ALGORITHM_ID:
+            raise CensusError("single-capture participation algorithm identity differs")
+    else:
+        plan_sha256 = require_nonzero_hex64(
+            fields.get("capture_plan_sha256"),
+            "single-capture CaptureNext plan digest",
+        )
+        bundle_sha256 = require_nonzero_hex64(
+            fields.get("capture_bundle_sha256"),
+            "single-capture CaptureNext bundle digest",
+        )
+        next_symbol = fields.get("capture_next_symbol")
+        materialize_symbol = fields.get("capture_materialize_symbol")
+        selector_symbol = fields.get("capture_selector_symbol")
+        if (
+            not isinstance(next_symbol, str)
+            or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(next_symbol) is None
+            or not isinstance(materialize_symbol, str)
+            or NATIVE_CAPTURE_MATERIALIZE_SYMBOL.fullmatch(materialize_symbol) is None
+            or not isinstance(selector_symbol, str)
+            or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector_symbol) is None
+            or len({reducer_symbol, next_symbol, materialize_symbol, selector_symbol}) != 4
+        ):
+            raise CensusError("single-capture CaptureNext child symbols are not canonical")
+        capture_next_source = {
+            "plan_sha256": plan_sha256,
+            "bundle_sha256": bundle_sha256,
+            "next_symbol": next_symbol,
+            "materialize_symbol": materialize_symbol,
+            "selector_symbol": selector_symbol,
+        }
+    return {
+        "operation": operation,
+        "domain": domain,
+        "source_route": source_route,
+        "source_cardinality": source_cardinality,
+        "source_bytes": source_bytes,
+        "source_pattern_sha256": digest_fields["source_pattern_sha256"],
+        "source_sha256": digest_fields["source_sha256"],
+        "group_count": group_count,
+        "can_match_empty": can_match_empty_text == "true",
+        "empty_progress": "byte",
+        "semantic_runtime_calls": semantic_runtime_calls,
+        "private_participation_scratch_bytes": private_participation_scratch_bytes,
+        "private_iterator_state_bytes": private_iterator_state_bytes,
+        "private_result_slot_count": private_result_slot_count,
+        "private_result_slot_bytes": private_result_slot_bytes,
+        "selector_sha256": digest_fields["selector_sha256"],
+        "capture_sha256": digest_fields["capture_sha256"],
+        "source_artifact_identity_sha256": (
+            digest_fields["source_artifact_identity_sha256"]
+        ),
+        "source_object_sha256": digest_fields["source_object_sha256"],
+        "reducer_symbol": reducer_symbol,
+        "reducer_symbol_sha256": digest_fields["reducer_symbol_sha256"],
+        "object_sha256": digest_fields["object_sha256"],
+        "object_bytes": object_bytes,
+        "max_object_bytes": max_object_bytes,
+        "artifact_identity_sha256": digest_fields["artifact_identity_sha256"],
+        "participation_source": participation_source,
+        "capture_next_source": capture_next_source,
+    }
+
+
+def validate_v5_provenance(fields: dict[str, str]) -> None:
+    """Validate the exact one-call, one-source reducer provenance closure."""
+    if fields.get("disposition") != "executed":
+        raise CensusError("single-capture reducer provenance disposition is not executed")
+    if fields.get("required_comparators") != "rust-regex-1.12.4,fre-current-runtime":
+        raise CensusError("single-capture reducer provenance comparator set differs")
+    for name in ("compiler_version", "optimizer_version"):
+        parse_canonical_decimal(
+            fields.get(name), f"single-capture reducer provenance {name}",
+            1, (1 << 32) - 1,
+        )
+    proof = single_capture_reducer_proof_from_provenance(fields)
+    expected_adapter = {
+        ("count-captures", "exact-span-participation-v1"):
+            "general-aot-native-exact-span-participation-count-reducer-v1",
+        ("grep-captures", "exact-span-participation-v1"):
+            "general-aot-native-exact-span-participation-grep-reducer-v1",
+        ("count-captures", "capture-next-v1"):
+            "general-aot-native-single-capture-next-count-reducer-v1",
+        ("grep-captures", "capture-next-v1"):
+            "general-aot-native-single-capture-next-grep-reducer-v1",
+    }[(fields["model"], proof["source_route"])]
+    expected_engine, expected_strategy = {
+        "exact-span-participation-v1": (
+            "NativeExactSpanParticipationDfaV1",
+            "native-exact-span-participation-whole-operation-reducer-v1",
+        ),
+        "capture-next-v1": (
+            "NativeOnePassCaptureV1",
+            "native-single-capture-next-whole-operation-reducer-v1",
+        ),
+    }[proof["source_route"]]
+    if (
+        fields.get("adapter") != expected_adapter
+        or fields.get("engine") != expected_engine
+        or fields.get("aggregate_strategy") != expected_strategy
+        or fields.get("native_row_bridge") != "false"
+        or fields.get("capture_reducer_bridge") != "true"
+        or fields.get("required_runtime_symbols") != ""
+        or fields.get("boundary")
+        != "single-call-helper-free-single-capture-whole-operation-reducer"
+    ):
+        raise CensusError("single-capture reducer provenance has a noncanonical route")
+    base = {
+        "schema", "disposition", "configured", "adapter", "model", "benchmark",
+        "source_commit", "source_tree", "target", "feature_bits",
+        "compiler_version", "optimizer_version", "engine", "aggregate_strategy",
+        "native_row_bridge", "capture_reducer_bridge", "source_pattern_count",
+        "operation", "domain", "source_route", "source_cardinality", "source_bytes",
+        "source_pattern_sha256", "source_sha256", "group_count", "can_match_empty",
+        "empty_progress",
+        "semantic_runtime_calls", "private_participation_scratch_bytes",
+        "private_iterator_state_bytes", "private_result_slot_count",
+        "private_result_slot_bytes", "selector_sha256", "capture_sha256",
+        "source_artifact_identity_sha256", "source_object_sha256", "reducer_symbol",
+        "reducer_symbol_sha256", "object_sha256", "object_bytes",
+        "max_object_bytes", "artifact_identity_sha256", "required_runtime_symbols",
+        "operation_entry_symbol", "boundary", "required_comparators",
+    }
+    route_fields = {
+        "exact-span-participation-v1": {
+            "participation_algorithm_id", "participation_strategy",
+            "participation_assertions", "participation_assertion_signatures",
+            "participation_byte_classes", "participation_dfa_states",
+            "participation_transition_cells", "participation_build_work",
+            "participation_scratch_bytes", "participation_plan_bytes",
+            "participation_selector_object_sha256", "participation_bundle_sha256",
+            "participation_export_identity_sha256", "participation_bundle_symbol",
+            "participation_selector_symbol", "participation_entry_symbol",
+        },
+        "capture-next-v1": {
+            "capture_plan_sha256", "capture_bundle_sha256", "capture_next_symbol",
+            "capture_materialize_symbol", "capture_selector_symbol",
+        },
+    }[proof["source_route"]]
+    expected = base | route_fields
+    if set(fields) != expected:
+        raise CensusError(
+            "runner v5 provenance field closure differs: "
+            f"missing={sorted(expected - set(fields))!r} "
+            f"extra={sorted(set(fields) - expected)!r}"
+        )
+
+
 def nm_symbols_with_types(nm_output: str, symbol_types: set[str]) -> set[str]:
     result: set[str] = set()
     for line in nm_output.splitlines():
@@ -2688,6 +3232,12 @@ def run_nm(nm: str, binary: pathlib.Path) -> tuple[set[str], set[str], set[str],
 
 def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], str]:
     model = provenance["model"]
+    if provenance.get("schema") == "fre.aot.rebar-runner.v5":
+        proof = single_capture_reducer_proof_from_provenance(provenance)
+        reducer = proof["reducer_symbol"]
+        if not isinstance(reducer, str):
+            raise CensusError("single-capture reducer operation entry is absent")
+        return [reducer], "linked-native-single-capture-reducer"
     if provenance.get("shared_ordered_many") == "true":
         shared_ordered_many_proof(provenance)
         route = (
@@ -2735,7 +3285,8 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
                 )
             return [entries[0], participation], "linked-exact-span-participation-adapter-loop"
         if model == "regex-redux":
-            return entries, "linked-fixed-composite-adapter-loop"
+            proof = regex_redux_proof_from_provenance(provenance, components)
+            return [str(proof["reducer_symbol"])], "linked-native-regex-redux-reducer"
         if provenance.get("native_row_bridge") == "true" and model in {
             "count", "count-spans", "grep",
         }:
@@ -2998,6 +3549,33 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         if prepared_grep_v15:
             result["prepared_grep_v15"] = scalar_prepared_grep_v15_proof(fields)
         return result
+    if fields["schema"] == "fre.aot.rebar-runner.v5":
+        proof = single_capture_reducer_proof_from_provenance(fields)
+        return {
+            **common,
+            "kind": "single-capture-reducer-v5",
+            "composite_kind": "single-capture-whole-operation-reducer-v1",
+            "source_pattern_count": 1,
+            "source_to_artifact": [],
+            "row_total_object_bytes": None,
+            "uniform_capture": None,
+            "shared_ordered_many": None,
+            "capture_reducer": proof,
+            "boundary": fields["boundary"],
+            "engine": fields["engine"],
+            "aggregate_strategy": fields["aggregate_strategy"],
+            "prepared_bulk_strategy": None,
+            "span_iteration_strategy": None,
+            "grep_iteration_strategy": None,
+            "program_sha256": None,
+            "object_sha256": proof["object_sha256"],
+            "program_symbol": None,
+            "entry_symbol": None,
+            "reducer_symbol": proof["reducer_symbol"],
+            "span_fill_symbol": None,
+            "required_runtime_symbols": [],
+            "components": [],
+        }
     if fields["schema"] == "fre.aot.rebar-runner.v4":
         components = components_from_provenance(fields)
         source_pattern_count = int(fields["source_pattern_count"], 10)
@@ -3069,6 +3647,9 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         [int(value, 10) for value in fields["source_to_artifact"].split(",")]
         if native_row else []
     )
+    regex_redux = (
+        None if native_row else regex_redux_proof_from_provenance(fields, components)
+    )
     result = {
         **common,
         "kind": "composite-v3",
@@ -3096,10 +3677,12 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         "span_iteration_strategy": None,
         "grep_iteration_strategy": None,
         "program_sha256": None,
-        "object_sha256": None,
+        "object_sha256": (
+            regex_redux["reducer_object_sha256"] if regex_redux else None
+        ),
         "program_symbol": None,
         "entry_symbol": None,
-        "reducer_symbol": None,
+        "reducer_symbol": regex_redux["reducer_symbol"] if regex_redux else None,
         "span_fill_symbol": None,
         "required_runtime_symbols": sorted(filter(
             None, fields.get("required_runtime_symbols", "").split(",")
@@ -3110,6 +3693,8 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         result["prepared_v15_limits"] = native_row_prepared_v15_limits(
             fields, components
         )
+    if regex_redux is not None:
+        result["regex_redux"] = regex_redux
     return result
 
 
@@ -3117,6 +3702,15 @@ def operation_route_from_provenance_record(
     provenance: dict[str, object],
 ) -> tuple[list[str], str]:
     """Reconstruct the exact operation entries from normalized provenance."""
+    if provenance.get("kind") == "single-capture-reducer-v5":
+        validate_normalized_single_capture_reducer(
+            provenance.get("capture_reducer"), provenance,
+            "normalized single-capture reducer provenance",
+        )
+        reducer = provenance.get("reducer_symbol")
+        if not isinstance(reducer, str):
+            raise CensusError("normalized single-capture reducer is absent")
+        return [reducer], "linked-native-single-capture-reducer"
     if provenance.get("kind") == "shared-ordered-many-v2":
         validate_normalized_shared_ordered_many(
             provenance.get("shared_ordered_many"), provenance,
@@ -3134,6 +3728,11 @@ def operation_route_from_provenance_record(
     components = provenance["components"]
     if components:
         entries = [component["entry_symbol"] for component in components]
+        if provenance["composite_kind"] == "regex-redux-fixed-v1":
+            validate_normalized_regex_redux(
+                provenance.get("regex_redux"), provenance, "normalized regex-redux provenance"
+            )
+            return [provenance["reducer_symbol"]], "linked-native-regex-redux-reducer"
         if provenance["composite_kind"] == "strict-capture-next-v1":
             strict_capture = provenance.get("strict_capture")
             if (
@@ -3201,8 +3800,6 @@ def operation_route_from_provenance_record(
             raise CensusError(
                 "normalized composite provenance has non-native operation entries"
             )
-        if provenance["composite_kind"] == "regex-redux-fixed-v1":
-            return entries, "linked-fixed-composite-adapter-loop"
         if provenance["composite_kind"] == "native-row-bridge-v1":
             return entries, "linked-native-row-adapter-loop"
         if provenance["composite_kind"] == "uniform-capture-row-bridge-v1":
@@ -3275,6 +3872,41 @@ def identity_defined_symbols_from_provenance(
     provenance: dict[str, object],
 ) -> list[str]:
     """Return route-bound defined symbols authenticated but not invoked."""
+    if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        proof = provenance.get("regex_redux")
+        symbols = proof.get("reducer_link_symbols") if isinstance(proof, dict) else None
+        if (
+            not isinstance(symbols, list)
+            or len(symbols) != 15
+            or len(symbols) != len(set(symbols))
+            or not all(
+                isinstance(symbol, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(symbol)
+                for symbol in symbols
+            )
+        ):
+            raise CensusError("regex-redux linked component symbol set is malformed")
+        return sorted(symbols)
+    if provenance.get("kind") == "single-capture-reducer-v5":
+        validate_normalized_single_capture_reducer(
+            provenance.get("capture_reducer"), provenance,
+            "normalized single-capture reducer provenance",
+        )
+        proof = provenance["capture_reducer"]
+        if proof["source_route"] == "exact-span-participation-v1":
+            child = proof["participation_source"]
+            symbols = [
+                child["bundle_symbol"], child["selector_symbol"],
+                child["entry_symbol"],
+            ]
+        else:
+            child = proof["capture_next_source"]
+            symbols = [
+                child["next_symbol"], child["materialize_symbol"],
+                child["selector_symbol"],
+            ]
+        if len(symbols) != len(set(symbols)):
+            raise CensusError("single-capture reducer repeats a child identity symbol")
+        return sorted(symbols)
     if provenance.get("kind") == "shared-ordered-many-v2":
         symbols = [
             provenance.get("entry_symbol"), provenance.get("span_fill_symbol"),
@@ -3313,6 +3945,23 @@ def identity_defined_symbols_from_provenance(
             raise CensusError("mixed prepared V15 route repeats a linked identity symbol")
         return sorted(symbols)
     return []
+
+
+def authenticate_identity_defined_symbol_inventory(
+    provenance: dict[str, object],
+    primary_defined_symbols: set[str],
+    replica_defined_symbols: set[str],
+) -> list[str]:
+    """Require both final binaries to retain every route-bound identity symbol."""
+    symbols = identity_defined_symbols_from_provenance(provenance)
+    if (
+        not set(symbols).issubset(primary_defined_symbols)
+        or not set(symbols).issubset(replica_defined_symbols)
+    ):
+        raise CensusError(
+            "one or more provenance identity symbols are absent from a final binary"
+        )
+    return symbols
 
 
 def conditional_fallback_symbols_from_provenance(
@@ -3484,6 +4133,7 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     if normalized_provenance["kind"] in {
         "composite-v3", "strict-capture-v4", "participation-capture-v4",
         "selector-capture-fallback-v4", "shared-ordered-many-v2",
+        "single-capture-reducer-v5",
     } and (
         normalized_provenance["source_pattern_count"]
         != len(job["input"]["pattern_sha256"])
@@ -3494,9 +4144,12 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         [normalized_provenance["object_sha256"]]
         if normalized_provenance["kind"] in {
             "scalar-v2", "prepared-grep-v15-v2", "shared-ordered-many-v2",
+            "single-capture-reducer-v5",
         }
         else [component["object_sha256"] for component in normalized_provenance["components"]]
     )
+    if normalized_provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        expected_object_hashes.append(normalized_provenance["object_sha256"])
     if [row["sha256"] for row in primary_hashes["objects"]] != expected_object_hashes:
         raise CensusError("primary object files differ from provenance object identities")
     if [row["sha256"] for row in replica_hashes["objects"]] != expected_object_hashes:
@@ -3508,6 +4161,15 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
             for artifact in (primary_hashes, replica_hashes)
         ):
             raise CensusError("native-row object files differ from its total-byte receipt")
+    if normalized_provenance["kind"] == "single-capture-reducer-v5":
+        expected_bytes = normalized_provenance["capture_reducer"]["object_bytes"]
+        if any(
+            artifact["objects"][0]["bytes"] != expected_bytes
+            for artifact in (primary_hashes, replica_hashes)
+        ):
+            raise CensusError(
+                "single-capture reducer object file differs from its byte receipt"
+            )
     if normalized_provenance["kind"] in {
         "prepared-grep-v15-v2", "shared-ordered-many-v2",
     } and any(
@@ -3527,7 +4189,8 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     if runtime_helpers != semantic_helper_symbols(replica_runtime_references):
         raise CensusError("independent binaries have different semantic helper inventories")
     if normalized_provenance["kind"] in {
-        "strict-capture-v4", "participation-capture-v4"
+        "strict-capture-v4", "participation-capture-v4",
+        "single-capture-reducer-v5",
     } and runtime_helpers:
         raise CensusError("native-capture final binary retains semantic runtime symbols")
     conditional_fallbacks = conditional_fallback_symbols_from_provenance(
@@ -3546,7 +4209,8 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         declared_set.update(component["required_runtime_symbols"])
     declared = sorted(declared_set)
     if normalized_provenance["kind"] in {
-        "strict-capture-v4", "participation-capture-v4"
+        "strict-capture-v4", "participation-capture-v4",
+        "single-capture-reducer-v5",
     } and declared:
         raise CensusError("native-capture provenance requires runtime symbols")
     declared_semantic = [name for name in declared if not name.startswith(CONTROL_PLANE_PREFIXES)]
@@ -3555,12 +4219,9 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
     entries, adapter_route = selected_operation_entries(primary_fields)
     if not set(entries).issubset(primary_symbols) or not set(entries).issubset(replica_symbols):
         raise CensusError("one or more claimed operation entries are absent from a final binary")
-    identity_symbols = identity_defined_symbols_from_provenance(normalized_provenance)
-    if (
-        not set(identity_symbols).issubset(primary_defined_symbols)
-        or not set(identity_symbols).issubset(replica_defined_symbols)
-    ):
-        raise CensusError("one or more provenance identity symbols are absent from a final binary")
+    authenticate_identity_defined_symbol_inventory(
+        normalized_provenance, primary_defined_symbols, replica_defined_symbols
+    )
     unmodified = run_checked_process([str(primary_runner), "--quiet"], klv, args.timeout)
     helper_marker: dict[str, object]
     negative_controls: list[dict[str, object]] = []
@@ -4393,6 +5054,331 @@ def validate_normalized_shared_ordered_many(
         raise CensusError(f"{context} shared ordered-many proof differs")
 
 
+def validate_normalized_regex_redux(
+    proof: object, provenance: dict[str, object], context: str
+) -> None:
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} proof is not an object")
+    require_exact_keys(proof, {
+        "abi_version", "operation_identity_sha256", "reducer_symbol",
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+        "reducer_relocation_count", "reducer_link_symbols",
+        "semantic_runtime_symbols", "request_bytes", "receipt_bytes", "report_bytes",
+        "scratch_buffer_count", "scratch_capacity_numerator",
+        "scratch_capacity_denominator", "receipt_schema", "report_schema",
+    }, f"{context} proof")
+    components = provenance.get("components")
+    if not isinstance(components, list) or len(components) != 15:
+        raise CensusError(f"{context} component cardinality differs")
+    entries = [component.get("entry_symbol") for component in components]
+    if (
+        not all(
+            isinstance(entry, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry)
+            for entry in entries
+        )
+        or len(entries) != len(set(entries))
+        or proof["reducer_link_symbols"] != entries
+        or proof["semantic_runtime_symbols"] != []
+    ):
+        raise CensusError(f"{context} component link closure differs")
+    for name in (
+        "operation_identity_sha256", "reducer_code_sha256",
+        "reducer_data_sha256", "reducer_object_sha256",
+    ):
+        require_hex64(proof[name], f"{context} {name}")
+        if proof[name] == "0" * 64:
+            raise CensusError(f"{context} {name} is zero")
+    reducer = proof["reducer_symbol"]
+    if (
+        not isinstance(reducer, str)
+        or NATIVE_REGEX_REDUX_ENTRY_SYMBOL.fullmatch(reducer) is None
+        or reducer.rsplit("_", 1)[-1] != proof["operation_identity_sha256"]
+        or provenance.get("reducer_symbol") != reducer
+        or provenance.get("object_sha256") != proof["reducer_object_sha256"]
+    ):
+        raise CensusError(f"{context} reducer identity differs")
+    exact = {
+        "abi_version": 1, "request_bytes": 72, "receipt_bytes": 144,
+        "report_bytes": 1024, "scratch_buffer_count": 2,
+        "scratch_capacity_numerator": 3, "scratch_capacity_denominator": 2,
+    }
+    if any(proof.get(name) != expected for name, expected in exact.items()):
+        raise CensusError(f"{context} ABI or workspace schema differs")
+    expected_relocations = 16 if str(provenance.get("target", "")).startswith(
+        "x86_64-"
+    ) else 17 if str(provenance.get("target", "")).startswith("aarch64-") else 0
+    if (
+        expected_relocations == 0
+        or proof["reducer_relocation_count"] != expected_relocations
+    ):
+        raise CensusError(f"{context} relocation closure differs")
+    if (
+        proof["receipt_schema"]
+        != "u64-input-clean-variant9-substitution5-final-report-v1"
+        or proof["report_schema"]
+        != "variant9-blank-input-clean-final-lines-v1"
+    ):
+        raise CensusError(f"{context} execution schema differs")
+
+
+def validate_normalized_single_capture_reducer(
+    proof: object, provenance: dict[str, object], context: str
+) -> None:
+    """Reauthenticate a normalized v5 reducer without trusting raw parsing."""
+    if not isinstance(proof, dict):
+        raise CensusError(f"{context} single-capture reducer proof is not an object")
+    common_keys = {
+        "operation", "domain", "source_route", "source_cardinality", "source_bytes",
+        "source_pattern_sha256", "source_sha256", "group_count",
+        "can_match_empty", "empty_progress",
+        "semantic_runtime_calls", "private_participation_scratch_bytes",
+        "private_iterator_state_bytes", "private_result_slot_count",
+        "private_result_slot_bytes", "selector_sha256", "capture_sha256",
+        "source_artifact_identity_sha256", "source_object_sha256", "reducer_symbol",
+        "reducer_symbol_sha256", "object_sha256", "object_bytes",
+        "max_object_bytes", "artifact_identity_sha256", "participation_source",
+        "capture_next_source",
+    }
+    require_exact_keys(proof, common_keys, f"{context} single-capture reducer proof")
+    operation_contract = {
+        "count-captures": (
+            "count-captures", "whole-haystack",
+            NATIVE_SINGLE_CAPTURE_COUNT_REDUCER_SYMBOL,
+        ),
+        "grep-captures": (
+            "grep-captures", "byte-slice-lines-lf-crlf",
+            NATIVE_SINGLE_CAPTURE_GREP_REDUCER_SYMBOL,
+        ),
+    }.get(provenance.get("model"))
+    if operation_contract is None:
+        raise CensusError(f"{context} single-capture reducer model differs")
+    operation, domain, reducer_pattern = operation_contract
+    route = proof["source_route"]
+    if route not in {"exact-span-participation-v1", "capture-next-v1"}:
+        raise CensusError(f"{context} single-capture reducer source route differs")
+    group_maximum = (
+        NATIVE_PARTICIPATION_MAX_ASSERTIONS
+        if route == "exact-span-participation-v1"
+        else NATIVE_CAPTURE_MAX_GROUPS
+    )
+    integer_ranges = {
+        "source_cardinality": (1, 1),
+        "source_bytes": (0, (1 << 64) - 1),
+        "group_count": (1, group_maximum),
+        "semantic_runtime_calls": (0, 0),
+        "private_participation_scratch_bytes": (0, NATIVE_PARTICIPATION_SCRATCH_BYTES),
+        "private_iterator_state_bytes": (0, NATIVE_CAPTURE_ITERATOR_STATE_BYTES),
+        "private_result_slot_count": (0, NATIVE_CAPTURE_MAX_GROUPS),
+        "private_result_slot_bytes": (
+            0, NATIVE_CAPTURE_MAX_GROUPS * NATIVE_CAPTURE_RESULT_SLOT_BYTES
+        ),
+        "object_bytes": (1, MAX_NATIVE_ROW_OBJECT_BYTES),
+        "max_object_bytes": (MAX_NATIVE_ROW_OBJECT_BYTES, MAX_NATIVE_ROW_OBJECT_BYTES),
+    }
+    for field, (minimum, maximum) in integer_ranges.items():
+        value = proof[field]
+        if (
+            not isinstance(value, int) or isinstance(value, bool)
+            or not minimum <= value <= maximum
+        ):
+            raise CensusError(f"{context} single-capture reducer {field} differs")
+    expected_private = (
+        (NATIVE_PARTICIPATION_SCRATCH_BYTES, 0, 0, 0)
+        if route == "exact-span-participation-v1"
+        else (
+            0, NATIVE_CAPTURE_ITERATOR_STATE_BYTES, proof["group_count"],
+            proof["group_count"] * NATIVE_CAPTURE_RESULT_SLOT_BYTES,
+        )
+    )
+    if (
+        proof["private_participation_scratch_bytes"],
+        proof["private_iterator_state_bytes"],
+        proof["private_result_slot_count"],
+        proof["private_result_slot_bytes"],
+    ) != expected_private:
+        raise CensusError(
+            f"{context} single-capture reducer private schema differs from source route"
+        )
+    if (
+        proof["operation"] != operation
+        or proof["domain"] != domain
+        or proof["empty_progress"] != "byte"
+        or not isinstance(proof["can_match_empty"], bool)
+        or proof["object_bytes"] > proof["max_object_bytes"]
+    ):
+        raise CensusError(f"{context} single-capture reducer operation receipt differs")
+    digest_fields = (
+        "source_pattern_sha256", "source_sha256", "selector_sha256",
+        "capture_sha256",
+        "source_artifact_identity_sha256", "source_object_sha256",
+        "reducer_symbol_sha256", "object_sha256", "artifact_identity_sha256",
+    )
+    for field in digest_fields:
+        require_nonzero_hex64(proof[field], f"{context} single-capture reducer {field}")
+    reducer = proof["reducer_symbol"]
+    if (
+        not isinstance(reducer, str)
+        or reducer_pattern.fullmatch(reducer) is None
+        or proof["reducer_symbol_sha256"]
+        != sha_bytes(reducer.encode("ascii", "strict"))
+        or proof["source_pattern_sha256"] == proof["source_sha256"]
+        or proof["source_object_sha256"] == proof["object_sha256"]
+        or proof["source_artifact_identity_sha256"]
+        == proof["artifact_identity_sha256"]
+    ):
+        raise CensusError(f"{context} single-capture reducer identity closure differs")
+
+    expected_adapter = {
+        ("count-captures", "exact-span-participation-v1"):
+            "general-aot-native-exact-span-participation-count-reducer-v1",
+        ("grep-captures", "exact-span-participation-v1"):
+            "general-aot-native-exact-span-participation-grep-reducer-v1",
+        ("count-captures", "capture-next-v1"):
+            "general-aot-native-single-capture-next-count-reducer-v1",
+        ("grep-captures", "capture-next-v1"):
+            "general-aot-native-single-capture-next-grep-reducer-v1",
+    }[(provenance["model"], route)]
+    expected_engine, expected_strategy = {
+        "exact-span-participation-v1": (
+            "NativeExactSpanParticipationDfaV1",
+            "native-exact-span-participation-whole-operation-reducer-v1",
+        ),
+        "capture-next-v1": (
+            "NativeOnePassCaptureV1",
+            "native-single-capture-next-whole-operation-reducer-v1",
+        ),
+    }[route]
+    if (
+        provenance.get("schema") != "fre.aot.rebar-runner.v5"
+        or provenance.get("kind") != "single-capture-reducer-v5"
+        or provenance.get("composite_kind")
+        != "single-capture-whole-operation-reducer-v1"
+        or provenance.get("adapter") != expected_adapter
+        or provenance.get("boundary")
+        != "single-call-helper-free-single-capture-whole-operation-reducer"
+        or provenance.get("engine") != expected_engine
+        or provenance.get("aggregate_strategy") != expected_strategy
+        or provenance.get("source_pattern_count") != 1
+        or provenance.get("source_to_artifact") != []
+        or provenance.get("row_total_object_bytes") is not None
+        or provenance.get("uniform_capture") is not None
+        or provenance.get("shared_ordered_many") is not None
+        or provenance.get("components") != []
+        or provenance.get("required_runtime_symbols") != []
+        or provenance.get("program_sha256") is not None
+        or provenance.get("program_symbol") is not None
+        or provenance.get("entry_symbol") is not None
+        or provenance.get("span_fill_symbol") is not None
+        or provenance.get("object_sha256") != proof["object_sha256"]
+        or provenance.get("reducer_symbol") != reducer
+    ):
+        raise CensusError(f"{context} single-capture reducer topology differs")
+    if any(
+        provenance.get(field) is not None
+        for field in (
+            "prepared_bulk_strategy", "span_iteration_strategy",
+            "grep_iteration_strategy",
+        )
+    ):
+        raise CensusError(f"{context} single-capture reducer retains scalar state")
+
+    if route == "exact-span-participation-v1":
+        child = proof["participation_source"]
+        if not isinstance(child, dict) or proof["capture_next_source"] is not None:
+            raise CensusError(f"{context} participation source proof topology differs")
+        numeric_ranges = {
+            "strategy": (1, 2),
+            "assertions": (0, NATIVE_PARTICIPATION_MAX_ASSERTIONS),
+            "assertion_signatures": (1, NATIVE_PARTICIPATION_MAX_ASSERTION_SIGNATURES),
+            "byte_classes": (1, NATIVE_PARTICIPATION_MAX_BYTE_CLASSES),
+            "dfa_states": (1, NATIVE_PARTICIPATION_MAX_DFA_STATES),
+            "transition_cells": (1, NATIVE_PARTICIPATION_MAX_TRANSITION_CELLS),
+            "build_work": (1, NATIVE_PARTICIPATION_MAX_BUILD_WORK),
+            "scratch_bytes": (
+                NATIVE_PARTICIPATION_SCRATCH_BYTES,
+                NATIVE_PARTICIPATION_SCRATCH_BYTES,
+            ),
+            "plan_bytes": (
+                NATIVE_PARTICIPATION_HEADER_BYTES, NATIVE_PARTICIPATION_MAX_PLAN_BYTES
+            ),
+        }
+        child_keys = {
+            "algorithm_id", *numeric_ranges, "selector_object_sha256", "bundle_sha256",
+            "export_identity_sha256", "bundle_symbol", "selector_symbol", "entry_symbol",
+        }
+        require_exact_keys(child, child_keys, f"{context} participation source proof")
+        for field, (minimum, maximum) in numeric_ranges.items():
+            value = child[field]
+            if (
+                not isinstance(value, int) or isinstance(value, bool)
+                or not minimum <= value <= maximum
+            ):
+                raise CensusError(f"{context} participation source {field} differs")
+        expected_strategy_number = {"x86_64": 1, "aarch64": 2}[
+            target_architecture(str(provenance.get("target", "")))
+        ]
+        if (
+            child["algorithm_id"] != NATIVE_PARTICIPATION_ALGORITHM_ID
+            or child["strategy"] != expected_strategy_number
+            or child["transition_cells"]
+            != child["dfa_states"] * child["byte_classes"] * child["assertion_signatures"]
+            or child["plan_bytes"] != participation_plan_bytes(
+                child["assertions"], child["assertion_signatures"],
+                child["dfa_states"], child["transition_cells"],
+            )
+        ):
+            raise CensusError(f"{context} participation source geometry differs")
+        for field in (
+            "selector_object_sha256", "bundle_sha256", "export_identity_sha256"
+        ):
+            require_nonzero_hex64(child[field], f"{context} participation source {field}")
+        bundle = child["bundle_symbol"]
+        selector = child["selector_symbol"]
+        entry = child["entry_symbol"]
+        export_identity = child["export_identity_sha256"]
+        feature_bits = provenance.get("feature_bits")
+        if (
+            not isinstance(bundle, str)
+            or NATIVE_PARTICIPATION_BUNDLE_SYMBOL.fullmatch(bundle) is None
+            or not isinstance(selector, str)
+            or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+            or not isinstance(entry, str)
+            or NATIVE_PARTICIPATION_ENTRY_SYMBOL.fullmatch(entry) is None
+            or len({reducer, bundle, selector, entry}) != 4
+            or not bundle.endswith(export_identity)
+            or not entry.endswith(export_identity)
+            or not isinstance(feature_bits, str)
+            or export_identity != participation_export_identity(
+                child["bundle_sha256"], str(provenance.get("target", "")),
+                feature_bits, child["selector_object_sha256"], selector,
+            )
+        ):
+            raise CensusError(f"{context} participation source identity closure differs")
+    else:
+        child = proof["capture_next_source"]
+        if not isinstance(child, dict) or proof["participation_source"] is not None:
+            raise CensusError(f"{context} CaptureNext source proof topology differs")
+        require_exact_keys(child, {
+            "plan_sha256", "bundle_sha256", "next_symbol", "materialize_symbol",
+            "selector_symbol",
+        }, f"{context} CaptureNext source proof")
+        require_nonzero_hex64(child["plan_sha256"], f"{context} CaptureNext plan")
+        require_nonzero_hex64(child["bundle_sha256"], f"{context} CaptureNext bundle")
+        next_symbol = child["next_symbol"]
+        materialize = child["materialize_symbol"]
+        selector = child["selector_symbol"]
+        if (
+            not isinstance(next_symbol, str)
+            or NATIVE_CAPTURE_NEXT_ENTRY_SYMBOL.fullmatch(next_symbol) is None
+            or not isinstance(materialize, str)
+            or NATIVE_CAPTURE_MATERIALIZE_SYMBOL.fullmatch(materialize) is None
+            or not isinstance(selector, str)
+            or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(selector) is None
+            or len({reducer, next_symbol, materialize, selector}) != 4
+        ):
+            raise CensusError(f"{context} CaptureNext source identity closure differs")
+
+
 def validate_provenance_record(provenance: object, context: str) -> None:
     if not isinstance(provenance, dict):
         raise CensusError(f"{context} is not an object")
@@ -4409,10 +5395,14 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         expected_keys.add("strict_capture")
     elif provenance.get("kind") == "participation-capture-v4":
         expected_keys.add("participation_capture")
+    elif provenance.get("kind") == "single-capture-reducer-v5":
+        expected_keys.add("capture_reducer")
     elif provenance.get("kind") == "selector-capture-fallback-v4":
         expected_keys.add("selector_capture_fallback")
     elif provenance.get("kind") == "prepared-grep-v15-v2":
         expected_keys.add("prepared_grep_v15")
+    if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+        expected_keys.add("regex_redux")
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         expected_keys.add("prepared_v15_limits")
     require_exact_keys(provenance, expected_keys, context)
@@ -4544,6 +5534,11 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         if provenance["composite_kind"] == "regex-redux-fixed-v1":
             if (
                 provenance["model"] != "regex-redux"
+                or provenance["adapter"] != "general-aot-native-regex-redux-reducer-v1"
+                or provenance["boundary"] != "single-call-native-regex-redux-reducer"
+                or provenance["engine"] != "NativeRegexReduxAotV1"
+                or provenance["aggregate_strategy"]
+                != "native-fixed-regex-redux-whole-operation-v1"
                 or len(provenance["components"]) != 15
                 or provenance["source_pattern_count"] != 0
                 or provenance["source_to_artifact"] != []
@@ -4551,8 +5546,19 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or provenance["uniform_capture"] is not None
                 or any(component["source_ordinal"] is not None for component in provenance["components"])
                 or any(component["automaton_sha256"] is not None for component in provenance["components"])
+                or provenance["program_sha256"] is not None
+                or provenance["program_symbol"] is not None
+                or provenance["entry_symbol"] is not None
+                or provenance["span_fill_symbol"] is not None
+                or provenance["prepared_bulk_strategy"] is not None
+                or provenance["span_iteration_strategy"] is not None
+                or provenance["grep_iteration_strategy"] is not None
+                or provenance["required_runtime_symbols"] != []
             ):
                 raise CensusError(f"{context} regex-redux topology is not canonical")
+            validate_normalized_regex_redux(
+                provenance["regex_redux"], provenance, context
+            )
         elif provenance["composite_kind"] == "native-row-bridge-v1":
             source_count = provenance["source_pattern_count"]
             source_map = provenance["source_to_artifact"]
@@ -4737,6 +5743,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             )
         else:
             raise CensusError(f"{context} has an unknown composite kind")
+    elif provenance["kind"] == "single-capture-reducer-v5":
+        validate_normalized_single_capture_reducer(
+            provenance["capture_reducer"], provenance, context
+        )
     elif provenance["kind"] == "strict-capture-v4":
         components = provenance["components"]
         component = components[0] if len(components) == 1 else None
@@ -4890,11 +5900,22 @@ def validate_provenance_job_binding(
     if provenance["kind"] not in {
         "composite-v3", "strict-capture-v4", "participation-capture-v4",
         "selector-capture-fallback-v4", "shared-ordered-many-v2",
+        "single-capture-reducer-v5",
     }:
         return
     pattern_hashes = input_identity["pattern_sha256"]
     if provenance["source_pattern_count"] != len(pattern_hashes):
         raise CensusError("multi-source provenance count differs from sealed job")
+    if provenance["kind"] == "single-capture-reducer-v5":
+        if (
+            len(pattern_hashes) != 1
+            or provenance["capture_reducer"]["source_pattern_sha256"]
+            != pattern_hashes[0]
+        ):
+            raise CensusError(
+                "single-capture reducer raw pattern digest differs from sealed job"
+            )
+        return
     if provenance["composite_kind"] in NATIVE_ROW_COMPOSITE_KINDS:
         source_map = provenance["source_to_artifact"]
         proof = provenance["uniform_capture"]
@@ -5095,9 +6116,12 @@ def validate_receipt(
             [provenance["object_sha256"]]
             if provenance["kind"] in {
                 "scalar-v2", "prepared-grep-v15-v2", "shared-ordered-many-v2",
+                "single-capture-reducer-v5",
             }
             else [component["object_sha256"] for component in provenance["components"]]
         )
+        if provenance.get("composite_kind") == "regex-redux-fixed-v1":
+            expected_object_hashes.append(provenance["object_sha256"])
         for label, artifact in (("primary", primary), ("replica", replica)):
             if [row["sha256"] for row in artifact["objects"]] != expected_object_hashes:
                 raise CensusError(f"{label} object files differ from provenance")
@@ -5107,6 +6131,14 @@ def validate_receipt(
                 != provenance["row_total_object_bytes"]
             ):
                 raise CensusError(f"{label} native-row object byte total differs")
+            if (
+                provenance["kind"] == "single-capture-reducer-v5"
+                and artifact["objects"][0]["bytes"]
+                != provenance["capture_reducer"]["object_bytes"]
+            ):
+                raise CensusError(
+                    f"{label} single-capture reducer object byte total differs"
+                )
             if provenance["kind"] in {
                 "prepared-grep-v15-v2", "shared-ordered-many-v2",
             } and any(
@@ -5127,7 +6159,8 @@ def validate_receipt(
         ):
             raise CensusError("qualification route differs from normalized provenance")
         if provenance["kind"] in {
-            "strict-capture-v4", "participation-capture-v4"
+            "strict-capture-v4", "participation-capture-v4",
+            "single-capture-reducer-v5",
         } and helpers:
             raise CensusError("native-capture final binary retains semantic runtime symbols")
         conditional_fallbacks = conditional_fallback_symbols_from_provenance(

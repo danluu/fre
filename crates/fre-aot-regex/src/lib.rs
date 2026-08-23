@@ -41,6 +41,7 @@ mod prefix_predicate;
 mod prefix_relation;
 mod program;
 mod regex_set;
+mod regex_redux_aot;
 mod rebar_single_capture;
 mod required_literals;
 mod seeded_reverse;
@@ -311,14 +312,33 @@ pub use regex_set::{
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
 };
+pub use regex_redux_aot::{
+    NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,
+    NATIVE_REGEX_REDUX_AOT_V1_IDENTITY_DOMAIN, NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES,
+    NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES, NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_INVALID_ARGUMENT,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_RUNTIME_FAILURE,
+    NATIVE_REGEX_REDUX_AOT_V1_STATUS_SUCCESS,
+    NATIVE_REGEX_REDUX_FLATTEN_V1, NATIVE_REGEX_REDUX_SUBSTITUTIONS_V1,
+    NATIVE_REGEX_REDUX_VARIANTS_V1,
+    NativeRegexReduxAotArtifactV1, NativeRegexReduxAotErrorV1, NativeRegexReduxAotLimitsV1,
+    NativeRegexReduxAotReceiptV1, NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
+    compile_native_regex_redux_aot_v1,
+};
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
     REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_SINGLE_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN,
     RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotError, RebarSingleCaptureAotReceiptV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureCardinalityError,
     RebarSingleCaptureEmptyProgressV1, RebarSingleCaptureParticipationAotArtifactV1,
     RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureParticipationAotReceiptV1,
-    compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
+    RebarSingleCaptureReducerAotArtifactV1, RebarSingleCaptureReducerAotErrorV1,
+    RebarSingleCaptureReducerAotReceiptV1, RebarSingleCaptureReducerDomainV1,
+    RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    RebarSingleCaptureReducerSourceRouteV1, compile_rebar_single_capture_aot_v1,
+    compile_rebar_single_capture_participation_aot_v1,
+    compile_rebar_single_capture_reducer_aot_v1,
 };
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureReducer,

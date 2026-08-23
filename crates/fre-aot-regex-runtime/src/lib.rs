@@ -598,6 +598,11 @@ pub type FreAotRegexCaptureNextV1 = unsafe extern "C" fn(
     usize,
 ) -> u32;
 
+/// Identity-suffixed whole-operation capture-participation scalar. Selected
+/// entries publish `value_out` only on [`STATUS_SUCCESS`].
+pub type FreAotRegexCaptureReducerV1 =
+    unsafe extern "C" fn(*const u8, usize, *mut u64) -> u32;
+
 /// Complete request for an object-local exact-span participation replay.
 ///
 /// `bundle` must be the paired identity-suffixed bundle symbol from the same
@@ -10562,8 +10567,10 @@ mod tests {
             .contains("FRE_AOT_REGEX_STATUS_NATIVE_CAPTURE_UNAVAILABLE 10u"));
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureMaterializeV1"));
         assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureNextV1"));
+        assert!(C_API_NATIVE_CAPTURE_V1_HEADER.contains("FreAotRegexCaptureReducerV1"));
         assert_eq!(size_of::<FreAotRegexCaptureMaterializeV1>(), size_of::<usize>());
         assert_eq!(size_of::<FreAotRegexCaptureNextV1>(), size_of::<usize>());
+        assert_eq!(size_of::<FreAotRegexCaptureReducerV1>(), size_of::<usize>());
         assert!(
             C_API_NATIVE_PARTICIPATION_V1_HEADER
                 .contains("FRE_AOT_REGEX_STATUS_NATIVE_PARTICIPATION_UNAVAILABLE 10u")

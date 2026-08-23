@@ -29,8 +29,8 @@ execution, and failed controls are nonnative outcomes. The summary reports:
 
 Fallback `count-spans` direct-entry or Span-fill iteration, multi-pattern
 per-line `grep`, the static uniform capture multiplier route, the helper-free
-exact-span participation route, the selector-negative/stock-positive capture
-route, and the strict native `capture_next` route can
+legacy v4 exact-span participation route, the selector-negative/stock-positive
+capture route, and the legacy v4 strict native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. Single-pattern `grep` instead enters the authenticated generated
@@ -50,6 +50,16 @@ unreached. A positive input remains correct through stock captures but is
 classified nonnative rather than receiving credit for a partially native
 operation.
 
+The v5 single-capture reducer route is different from those legacy v4 source
+bridges. After exactly one participation or `capture_next` source has been
+selected and authenticated, the compiler seals that source into one
+helper-free `CountCaptures` or `GrepCaptures` reducer. That reducer owns the
+complete whole-haystack traversal or exact byte-slice LF/CRLF line domain.
+Only its final reducer symbol is an operation entry and trap target. The three
+route-specific selector/replay/bundle or `capture_next`/materializer/selector
+symbols remain required defined-symbol inventory bound to the retained source
+receipt; they are not counted as additional operation entries.
+
 `grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
 are exact adapter *shapes*. This admits them to the sealed qualification
 population; it does not turn either build-time proof into an assumption. A
@@ -60,6 +70,8 @@ allocation, resource, emission,
 authentication, multi-source, or remaining semantic decline fails the
 all-or-nothing build and must receive a `record-failure` receipt. It remains in
 the 311-job denominator as nonnative rather than disappearing as unsupported.
+Once either source route is selected, reducer construction and authentication
+are terminal: a reducer error never authorizes switching source routes.
 
 The strict whole-operation boundary is a closed route classification, not a
 route-name suffix convention. A scalar `count-spans` artifact receives that
@@ -142,6 +154,14 @@ python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
 Repeat `--primary-object` and `--replica-object` in component ordinal order for
 a composite v3 runner or the single-component strict-capture v4 runner. Its
 normalized provenance must match every supplied object digest in both builds.
+For regex-redux, supply the 15 component objects in ordinal order followed by
+`aot-rebar-artifact.o`, the whole-operation reducer. Its reducer is the sole
+claimed operation entry; the 15 component entries are authenticated linked
+identities rather than Rust adapter-loop entries. A v5 single-capture reducer
+supplies its one final reducer object, not its retained source object. That
+reducer is likewise the sole operation entry; its retained source symbols are
+independently inventoried identities inside the object, not adapter-loop
+entries.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
@@ -179,6 +199,21 @@ v4. The
 independent final-binary inventory must also contain zero semantic runtime
 symbols for this strict route; an unused-but-linked helper is a failed strict
 qualification rather than a trap-only allowance.
+
+Single-capture reducer v5 instead publishes no component list, runtime program,
+prepared handle, or native-row bridge. Its closed proof binds the operation and
+domain, exact retained source route, cardinality, both source identities, group
+and empty-match obligations, zero semantic-runtime calls, route-specific
+private state layout, source artifact/object identities, full reducer-symbol
+digest, and distinct final object/identity under the fixed 256 MiB cap.
+`source_pattern_sha256` is the ordinary SHA-256 of the raw schedule pattern and
+is the only field bound to `input.pattern_sha256[0]`. The separate
+`source_sha256` is the compiler receipt's domain-separated, length-bearing
+source identity; neither field may substitute for the other. The normalized
+receipt keeps the final object hash separate from the retained source-object
+hash; the supplied `aot-rebar-artifact.o` must match the final reducer object.
+The route-specific nested source proof is reauthenticated on receipt read-back,
+and all three child identity symbols must exist in both final binaries.
 
 The closed selector-capture-fallback v4 variant is deliberately narrower. It
 binds one helper-free native Span selector, the exact fixed-cap
@@ -244,6 +279,12 @@ Three fresh processes authenticate each job:
    `linked-uniform-capture-row-adapter-loop`; strict capture uses
    `strict-capture-next-v1` and `linked-strict-capture-next-adapter-loop`.
    Neither inflates the stricter wholly fused-operation numerator.
+   Single-capture reducer v5 traps exactly its final Count/Grep reducer. Its
+   child source symbols are inventoried but never substituted for that negative
+   control. With reproducible final-object identity, an oracle pass, an empty
+   helper surface, and that reducer trap, the exact
+   `linked-native-single-capture-reducer` policy enters the strict
+   whole-operation numerator.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:
