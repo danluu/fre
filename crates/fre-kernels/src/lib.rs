@@ -1330,6 +1330,29 @@ impl LiteralPlan {
         self.find_window(haystack, Window::full(haystack), limits)
     }
 
+    /// Find the first occurrence in a full haystack without projecting
+    /// diagnostic accounting.
+    ///
+    /// This retains the exact validation and source-access chronology of
+    /// [`Self::find`]: the complete window and linear-work bound are admitted
+    /// before the preprocessed finder may inspect the haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked resource or arithmetic failure as
+    /// [`Self::find`] before invoking the native primitive.
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_full_value(
+        &self,
+        haystack: &[u8],
+        limits: LiteralSearchLimits,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        let window = Window::full(haystack);
+        self.preflight_window(haystack.len(), window, limits)?;
+        self.find_after_preflight(haystack, window)
+    }
+
     /// Find the first occurrence wholly inside a range.
     ///
     /// # Errors
@@ -1374,6 +1397,8 @@ impl LiteralPlan {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<(usize, usize)>, LiteralError> {
+        #[cfg(test)]
+        exact_literal_search_probe::record();
         let relative = self.finder.find(&haystack[window.start..window.end]);
         relative
             .map(|relative| {
@@ -1468,6 +1493,27 @@ impl LiteralPlan {
     }
 }
 
+#[cfg(test)]
+mod exact_literal_search_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 fn copy_literal_exact(needle: &[u8]) -> Result<Vec<u8>, LiteralError> {
     #[cfg(test)]
     exact_literal_copy_probe::record();
@@ -1533,7 +1579,7 @@ mod tests {
     use super::{
         LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
         LiteralSearchPrefixSplit, Window, copy_literal_exact, exact_literal_copy_probe,
-        preflight_checked_literal_window, preflight_literal_window,
+        exact_literal_search_probe, preflight_checked_literal_window, preflight_literal_window,
     };
 
     #[test]
@@ -1554,6 +1600,58 @@ mod tests {
                 .0,
             Some((2, 2))
         );
+    }
+
+    #[test]
+    fn full_value_projection_preserves_preflight_before_source_access() {
+        let plan = LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap();
+        let haystack = b"xxneedlexx";
+        let needed = haystack.len().checked_add(plan.needle().len()).unwrap();
+        let refusing = LiteralSearchLimits {
+            max_linear_terms: needed.checked_sub(1).unwrap(),
+        };
+        let expected_error = LiteralError::LinearTermLimit {
+            needed,
+            limit: refusing.max_linear_terms,
+        };
+
+        exact_literal_search_probe::reset();
+        assert_eq!(
+            plan.find_full_value(haystack, refusing),
+            Err(expected_error.clone()),
+        );
+        assert_eq!(
+            exact_literal_search_probe::calls(),
+            0,
+            "a refused value projection must not cross the source-access boundary",
+        );
+
+        exact_literal_search_probe::reset();
+        assert_eq!(plan.find(haystack, refusing), Err(expected_error));
+        assert_eq!(exact_literal_search_probe::calls(), 0);
+
+        let exact = LiteralSearchLimits {
+            max_linear_terms: needed,
+        };
+        exact_literal_search_probe::reset();
+        assert_eq!(plan.find_full_value(haystack, exact), Ok(Some((2, 8))));
+        assert_eq!(exact_literal_search_probe::calls(), 1);
+
+        let empty = LiteralPlan::new(b"", LiteralBuildLimits::default()).unwrap();
+        exact_literal_search_probe::reset();
+        assert_eq!(
+            empty.find_full_value(
+                b"\xff",
+                LiteralSearchLimits {
+                    max_linear_terms: 0,
+                },
+            ),
+            Err(LiteralError::LinearTermLimit {
+                needed: 1,
+                limit: 0,
+            }),
+        );
+        assert_eq!(exact_literal_search_probe::calls(), 0);
     }
 
     #[test]

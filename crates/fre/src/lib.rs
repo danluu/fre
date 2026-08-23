@@ -10269,6 +10269,33 @@ enum K0PooledValueExecution {
     OrdinarySpan,
 }
 
+#[cfg(test)]
+mod exact_literal_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
 // Contextual ordinary value projections occupy only the one-block margin
 // immediately below the incumbent 4,096-byte metered warm path. Longer
 // searches retain contextual loop-skip economics; shorter searches retain the
@@ -12212,6 +12239,14 @@ impl PortableRegex {
             return Ok(matched);
         }
         match &self.plan {
+            PortablePlan::ExactLiteral(literal) => {
+                #[cfg(test)]
+                exact_literal_ordinary_facade_probe::record_exists();
+                literal
+                    .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
+                    .map(|matched| matched.is_some())
+                    .map_err(SearchError::from)
+            }
             PortablePlan::K0(k0) => {
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
                     && let Some(plan) = k0.exclusive.line_token_loop()
@@ -13744,6 +13779,14 @@ impl PortableRegex {
     fn try_find_ordinary(&self, haystack: &[u8]) -> Result<Option<Match>, SearchError> {
         let window = SearchWindow::full(haystack);
         match &self.plan {
+            PortablePlan::ExactLiteral(literal) => {
+                #[cfg(test)]
+                exact_literal_ordinary_facade_probe::record_span();
+                literal
+                    .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
+            }
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Span,
                 K0PooledValueExecution::OrdinarySpan,
@@ -41960,6 +42003,213 @@ mod tests {
                 .next(),
             None,
             "a new iterator must bind the mutated source rather than retained masks",
+        );
+    }
+
+    #[test]
+    fn exact_literal_ordinary_facades_match_pinned_bytes_at_boundaries() {
+        let cases: &[(&str, &[&[u8]])] = &[
+            ("", &[b"", b"a", b"\xff\x80"]),
+            ("a", &[b"", b"a", b"\xffa", b"bbb"]),
+            ("aba", &[b"ab", b"aba", b"ababa", b"xababax", b"\xffaba"]),
+            ("(aba)", &[b"ababa", b"zzaba", b"none"]),
+            ("needle", &[b"need", b"needle", b"--needle--", b"\xff\x80"]),
+            (r"(?-u:\xFF)", &[b"", b"\xff", b"\x80\xff\0", b"ascii"]),
+        ];
+        for &(pattern, haystacks) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::ExactLiteral,
+                "pattern={pattern:?}",
+            );
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for &haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                super::exact_literal_ordinary_facade_probe::reset();
+                assert_eq!(
+                    regex.is_match(haystack),
+                    expected.is_some(),
+                    "is_match pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    regex
+                        .find(haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "find pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    super::exact_literal_ordinary_facade_probe::snapshot(),
+                    (1, 1),
+                );
+            }
+        }
+
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut reused = b"--needle--".to_vec();
+        let address = reused.as_ptr();
+        super::exact_literal_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), Some(Match { start: 2, end: 8 }));
+        reused.fill(b'x');
+        assert_eq!(reused.as_ptr(), address);
+        assert!(!regex.is_match(&reused));
+        assert_eq!(regex.find(&reused), None);
+        assert_eq!(
+            super::exact_literal_ordinary_facade_probe::snapshot(),
+            (2, 2),
+            "each ordinary call must inspect the current borrowed source",
+        );
+    }
+
+    #[test]
+    fn exact_literal_ordinary_facade_is_isolated_from_finite_and_reusable_apis() {
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+        let haystack = b"--needle--";
+        let full = SearchWindow::full(haystack);
+        let expected = Some(Match { start: 2, end: 8 });
+
+        super::exact_literal_ordinary_facade_probe::reset();
+        assert!(regex
+            .is_match_value(haystack, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(regex
+            .is_match_accounted(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0);
+        assert_eq!(
+            regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+        assert!(regex
+            .is_match_window_value(haystack, full, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            regex
+                .find_window_value(haystack, full, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(regex
+            .is_match_window(haystack, full, SearchLimits::unlimited())
+            .unwrap()
+            .0);
+        assert_eq!(
+            regex
+                .find_window(haystack, full, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected,
+        );
+
+        let refusing = SearchLimits {
+            max_work: 15,
+            max_scratch_bytes: 0,
+        };
+        let expected_error = SearchError::ExactLiteral(
+            fre_kernels::LiteralError::LinearTermLimit {
+                needed: 16,
+                limit: 15,
+            },
+        );
+        assert_eq!(
+            regex.is_match_value(haystack, refusing),
+            Err(expected_error.clone()),
+        );
+        assert_eq!(
+            regex.find_value(haystack, refusing),
+            Err(expected_error.clone()),
+        );
+        assert_eq!(
+            regex.find_window_value(
+                haystack,
+                SearchWindow::new(3, 2),
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::ExactLiteral(
+                fre_kernels::LiteralError::InvalidWindow {
+                    start: 3,
+                    end: 2,
+                    haystack_len: haystack.len(),
+                },
+            )),
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(session
+            .is_match_value(haystack, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(ordinary.is_match_at(haystack, 0).unwrap());
+        assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(
+                    &mut locations,
+                    haystack,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8)),
+        );
+        assert_eq!(
+            regex
+                .captures_read(&mut locations, haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8)),
+        );
+        assert_eq!(
+            super::exact_literal_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, windowed, session, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(haystack));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(
+            super::exact_literal_ordinary_facade_probe::snapshot(),
+            (1, 1),
         );
     }
 
