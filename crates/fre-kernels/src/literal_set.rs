@@ -1811,11 +1811,11 @@ macro_rules! first_acceptance_special_state {
     };
 }
 
-// Keep the dead-first find/span expansion scalar. Only the count-only
-// match-first leaf pairs its pre-acceptance transitions.
+// Keep ordinary find/exists expansion scalar. Count and the isolated span
+// visitor select paired pre-acceptance transitions explicitly.
 macro_rules! first_acceptance_prefix {
     (
-        dead_first,
+        scalar,
         $automaton:ident,
         $anchored:ident,
         $state:ident,
@@ -1829,7 +1829,7 @@ macro_rules! first_acceptance_prefix {
         }
     };
     (
-        match_first,
+        pair,
         $automaton:ident,
         $anchored:ident,
         $state:ident,
@@ -1850,7 +1850,7 @@ macro_rules! first_acceptance_prefix {
 }
 
 macro_rules! first_acceptance_end_body {
-    ($plan:ident, $haystack:ident, $window:ident, $order:ident) => {{
+    ($plan:ident, $haystack:ident, $window:ident, $order:ident, $prefix:ident) => {{
         #[cfg(test)]
         ordinary_direct_probe::record();
         let automaton = $plan.automaton.as_ref();
@@ -1873,7 +1873,7 @@ macro_rules! first_acceptance_end_body {
         // metadata, then begin the ordinary acceptance loop at byte W.
         let first_acceptance_check = $window.start() + pattern_bytes - 1;
         first_acceptance_prefix!(
-            $order,
+            $prefix,
             automaton,
             anchored,
             state,
@@ -1912,21 +1912,22 @@ fn first_acceptance_end_without_prefilter(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, scalar)
 }
 
 /// Span-visitor direct probe with its scanner forced into the emitting loop.
 ///
 /// Dense iteration invokes this once per selected span. Keeping the stronger
-/// inline request local to that loop avoids changing the ordinary find and
-/// existence call sites that share the same scanner body.
+/// inline request and paired fixed-width prefix local to that loop avoids
+/// changing the ordinary find and existence call sites that share the same
+/// scanner body.
 #[inline(always)]
 fn first_acceptance_end_for_span_visit(
     plan: &LiteralSetPlan,
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, dead_first)
+    first_acceptance_end_body!(plan, haystack, window, dead_first, pair)
 }
 
 /// Count-only direct probe with accepting states before the dead-state test.
@@ -1940,7 +1941,7 @@ fn first_acceptance_end_for_count(
     haystack: &[u8],
     window: Window,
 ) -> Option<usize> {
-    first_acceptance_end_body!(plan, haystack, window, match_first)
+    first_acceptance_end_body!(plan, haystack, window, match_first, pair)
 }
 
 #[cfg(test)]
