@@ -8059,6 +8059,265 @@ impl CompiledModule {
         Ok(())
     }
 
+    /// Append one helper-free whole-operation capture-participation reducer.
+    ///
+    /// The source closure is either the exact ordinary Span selector paired
+    /// with its object-local exact-span participation entry, or the complete
+    /// object-local `capture_next` iterator. All calls are patched directly to
+    /// defined text in this module. The only relocation a participation
+    /// wrapper may add resolves the already-authenticated bundle object used
+    /// to form its private replay request.
+    pub(crate) fn append_native_capture_reducer_v1(
+        mut self,
+        domain: NativeCaptureReducerDomainV1,
+        source: NativeCaptureReducerSourceV1<'_>,
+        source_artifact_identity: [u8; 32],
+    ) -> Result<(Self, String), ObjectError> {
+        if source_artifact_identity == [0; 32]
+            || self.required_runtime_symbols().next().is_some()
+            || self.required_runtime_program().is_some()
+            || self.prepared_entry_symbol_index.is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.required_prepare_capabilities != 0
+        {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer source is not one helper-free ordinary closure",
+            ));
+        }
+        let prefix = domain.symbol_prefix();
+        if self
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name.starts_with(prefix))
+        {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer was appended more than once",
+            ));
+        }
+        let exact_symbol = |name: &str, kind: SymbolKind| {
+            let mut matches = self
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, symbol)| symbol.name == name);
+            let (index, symbol) = matches.next().ok_or(ObjectError::InvalidModule(
+                "capture reducer source symbol is absent",
+            ))?;
+            if matches.next().is_some()
+                || symbol.binding != SymbolBinding::Global
+                || symbol.kind != kind
+                || symbol.size == 0
+                || symbol.section
+                    != Some(match kind {
+                        SymbolKind::Function => TEXT_SECTION,
+                        SymbolKind::Object => PROGRAM_SECTION,
+                    })
+            {
+                return Err(ObjectError::InvalidModule(
+                    "capture reducer source symbol is not one canonical definition",
+                ));
+            }
+            Ok((index, symbol))
+        };
+        let source_targets = match source {
+            NativeCaptureReducerSourceV1::ExactSpanParticipation {
+                selector_symbol,
+                bundle_symbol,
+                participation_symbol,
+                group_count,
+            } => {
+                if group_count == 0 || self.entry_symbol() != selector_symbol {
+                    return Err(ObjectError::InvalidModule(
+                        "capture reducer participation source identity disagrees",
+                    ));
+                }
+                let (_, selector) = exact_symbol(selector_symbol, SymbolKind::Function)?;
+                let (bundle_index, _) = exact_symbol(bundle_symbol, SymbolKind::Object)?;
+                let (_, participation) =
+                    exact_symbol(participation_symbol, SymbolKind::Function)?;
+                NativeCaptureReducerTargetsV1 {
+                    selector: Some(symbol_text_offset(
+                        selector,
+                        "capture reducer selector offset",
+                    )?),
+                    participation: Some(symbol_text_offset(
+                        participation,
+                        "capture reducer participation offset",
+                    )?),
+                    capture_next: None,
+                    bundle_symbol: Some(bundle_index),
+                }
+            }
+            NativeCaptureReducerSourceV1::CaptureNext {
+                capture_next_symbol,
+                group_count,
+            } => {
+                if group_count == 0 {
+                    return Err(ObjectError::InvalidModule(
+                        "capture reducer capture-next schema is empty",
+                    ));
+                }
+                let (_, capture_next) =
+                    exact_symbol(capture_next_symbol, SymbolKind::Function)?;
+                NativeCaptureReducerTargetsV1 {
+                    selector: None,
+                    participation: None,
+                    capture_next: Some(symbol_text_offset(
+                        capture_next,
+                        "capture reducer capture-next offset",
+                    )?),
+                    bundle_symbol: None,
+                }
+            }
+        };
+        let lowering = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_native_capture_reducer_v1(domain, source)?,
+            Architecture::Aarch64 => lower_aarch64_native_capture_reducer_v1(domain, source)?,
+        };
+        let architecture = self.target.architecture;
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        let alignment_mask = match architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let reducer_offset = text
+            .len()
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "capture reducer alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = reducer_offset.checked_add(lowering.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("capture reducer text extent"),
+        )?;
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("capture reducer text"))?;
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("capture reducer symbol"))?;
+        match architecture {
+            Architecture::X86_64 => text.resize(reducer_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < reducer_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &lowering.code)?;
+        for &(call, target) in lowering.local_calls.iter() {
+            let call = reducer_offset
+                .checked_add(call)
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer local call"))?;
+            let target = match target {
+                NativeCaptureReducerCallTargetV1::Selector => source_targets.selector,
+                NativeCaptureReducerCallTargetV1::Participation => {
+                    source_targets.participation
+                }
+                NativeCaptureReducerCallTargetV1::CaptureNext => source_targets.capture_next,
+                NativeCaptureReducerCallTargetV1::PrivateDomain(offset) => reducer_offset
+                    .checked_add(offset),
+            }
+            .ok_or(ObjectError::InvalidModule(
+                "capture reducer local call has no authenticated target",
+            ))?;
+            match architecture {
+                Architecture::X86_64 => patch_x86_64_local_call(&mut text, call, target)?,
+                Architecture::Aarch64 => patch_aarch64_local_call(&mut text, call, target)?,
+            }
+        }
+        if !lowering.bundle_relocations.is_empty() {
+            let bundle_symbol = source_targets.bundle_symbol.ok_or(
+                ObjectError::InvalidModule("capture reducer bundle relocation has no bundle"),
+            )?;
+            relocations
+                .try_reserve_exact(lowering.bundle_relocations.len())
+                .map_err(|_| ObjectError::Allocation("capture reducer relocations"))?;
+            for &(offset, kind, addend) in lowering.bundle_relocations.iter() {
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: offset_u64(
+                        reducer_offset.checked_add(offset).ok_or(
+                            ObjectError::ArithmeticOverflow("capture reducer relocation"),
+                        )?,
+                        "capture reducer relocation",
+                    )?,
+                    kind,
+                    symbol: bundle_symbol,
+                    addend,
+                });
+            }
+        }
+        let reducer_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(prefix, "capture reducer symbol prefix")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: offset_u64(reducer_offset, "capture reducer offset")?,
+            size: u64::try_from(lowering.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer size"))?,
+        });
+        let mut digest = Sha256::new();
+        digest.update(b"fre-aot-regex/native-capture-reducer-v1\0");
+        digest.update([domain.identity_tag(), source.identity_tag()]);
+        digest.update(
+            u64::try_from(source.group_count())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer group count"))?
+                .to_le_bytes(),
+        );
+        digest.update(source_artifact_identity);
+        for name in source.symbol_names().into_iter().flatten() {
+            digest.update(
+                u64::try_from(name.len())
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow("capture reducer child symbol length")
+                    })?
+                    .to_le_bytes(),
+            );
+            digest.update(name.as_bytes());
+        }
+        digest.update(
+            u64::try_from(lowering.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer code length"))?
+                .to_le_bytes(),
+        );
+        digest.update(&lowering.code);
+        let reducer_symbol = identity_symbol(prefix, &digest.finalize())?;
+        symbols[reducer_index].name = reducer_symbol.clone();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        Ok((self, reducer_symbol))
+    }
+
+    /// Deterministically reconstruct an additive capture reducer from its
+    /// fully authenticated source module and compare the complete module and
+    /// strong symbol identity.
+    pub(crate) fn authenticate_native_capture_reducer_v1(
+        &self,
+        source_module: &Self,
+        domain: NativeCaptureReducerDomainV1,
+        source: NativeCaptureReducerSourceV1<'_>,
+        source_artifact_identity: [u8; 32],
+        reducer_symbol: &str,
+    ) -> Result<(), ObjectError> {
+        let (expected, expected_symbol) = source_module.clone().append_native_capture_reducer_v1(
+            domain,
+            source,
+            source_artifact_identity,
+        )?;
+        if expected_symbol != reducer_symbol || expected != *self {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer is not the exact additive source closure",
+            ));
+        }
+        Ok(())
+    }
+
     /// Append one authenticated capture bundle and its two additive entries
     /// without changing any existing entry or compiler receipt field.
     pub(crate) fn append_native_capture_exports_v1(
@@ -8842,6 +9101,105 @@ impl NativeUniformCaptureReducerDomain {
 struct NativeUniformCaptureReducerWrapper {
     code: Vec<u8>,
     count_call_offsets: Box<[usize]>,
+}
+
+/// Exact byte domain owned by a helper-free capture reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCaptureReducerDomainV1 {
+    WholeHaystack,
+    ByteSliceLines,
+}
+
+impl NativeCaptureReducerDomainV1 {
+    const fn symbol_prefix(self) -> &'static str {
+        match self {
+            Self::WholeHaystack => "fre_aot_regex_count_captures_v1_",
+            Self::ByteSliceLines => "fre_aot_regex_grep_captures_v1_",
+        }
+    }
+
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::WholeHaystack => 1,
+            Self::ByteSliceLines => 2,
+        }
+    }
+}
+
+/// Already-authenticated helper-free child closure consumed by one reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCaptureReducerSourceV1<'a> {
+    ExactSpanParticipation {
+        selector_symbol: &'a str,
+        bundle_symbol: &'a str,
+        participation_symbol: &'a str,
+        group_count: usize,
+    },
+    CaptureNext {
+        capture_next_symbol: &'a str,
+        group_count: usize,
+    },
+}
+
+impl<'a> NativeCaptureReducerSourceV1<'a> {
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::ExactSpanParticipation { .. } => 1,
+            Self::CaptureNext { .. } => 2,
+        }
+    }
+
+    const fn group_count(self) -> usize {
+        match self {
+            Self::ExactSpanParticipation { group_count, .. }
+            | Self::CaptureNext { group_count, .. } => group_count,
+        }
+    }
+
+    const fn symbol_names(self) -> [Option<&'a str>; 3] {
+        match self {
+            Self::ExactSpanParticipation {
+                selector_symbol,
+                bundle_symbol,
+                participation_symbol,
+                ..
+            } => [
+                Some(selector_symbol),
+                Some(bundle_symbol),
+                Some(participation_symbol),
+            ],
+            Self::CaptureNext {
+                capture_next_symbol,
+                ..
+            } => [Some(capture_next_symbol), None, None],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCaptureReducerCallTargetV1 {
+    Selector,
+    Participation,
+    CaptureNext,
+    PrivateDomain(usize),
+}
+
+struct NativeCaptureReducerLoweringV1 {
+    code: Vec<u8>,
+    local_calls: Box<[(usize, NativeCaptureReducerCallTargetV1)]>,
+    bundle_relocations: Box<[(usize, RelocationKind, i64)]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCaptureReducerTargetsV1 {
+    selector: Option<usize>,
+    participation: Option<usize>,
+    capture_next: Option<usize>,
+    bundle_symbol: Option<usize>,
+}
+
+fn symbol_text_offset(symbol: &ModuleSymbol, site: &'static str) -> Result<usize, ObjectError> {
+    usize::try_from(symbol.offset).map_err(|_| ObjectError::ArithmeticOverflow(site))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36467,6 +36825,539 @@ fn lower_x86_64_prepared_grep_count(
     })
 }
 
+fn x86_native_capture_reducer_boundary(
+    assembler: &mut X86Assembler,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x01, 0xf0])?; // complete haystack extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // scalar output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xd0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 8])?; // complete output extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    Ok(())
+}
+
+fn x86_native_capture_reducer_epilogue(
+    assembler: &mut X86Assembler,
+    frame_bytes: u32,
+) -> Result<(), ObjectError> {
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&frame_bytes.to_le_bytes());
+    assembler.instruction(&release)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact selector progress, private replay request, and transactional reduction form one auditable native closure"
+)]
+fn lower_x86_64_native_participation_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const FRAME_BYTES: u32 = 120;
+    const SPAN_OFFSET: u8 = 0;
+    const REQUEST_OFFSET: u8 = 16;
+    const SCRATCH_OFFSET: u8 = 80;
+    const COUNT_OFFSET: u8 = 96;
+    const FLAGS_OFFSET: u8 = 112;
+    if !(1..=64).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "participation reducer group cardinality",
+        ));
+    }
+    let group_count = u32::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("participation reducer groups"))?;
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let participation_matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // next start
+    assembler.instruction(&[0x48, 0x31, 0xed])?; // last end
+    assembler.instruction(&[0xc7, 0x44, 0x24, FLAGS_OFFSET, 0, 0, 0, 0])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], search)?;
+    assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?; // next == length
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x48, 0x89, 0xda])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe9])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x44, 0x24, SPAN_OFFSET])?;
+    assembler.instruction(&[0xe8])?;
+    let selector_call = assembler.label()?;
+    assembler.bind(selector_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, SPAN_OFFSET])?; // start
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, SPAN_OFFSET + 8])?; // end
+    assembler.instruction(&[0x49, 0x39, 0xd9])?; // start >= next
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xca])?; // end >= start
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xea])?; // end <= length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?;
+    assembler.branch(&[0x0f, 0x85], nonempty)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], accepted_empty)?;
+    assembler.instruction(&[0x49, 0x39, 0xea])?; // end != last
+    assembler.branch(&[0x0f, 0x85], accepted_empty)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(accepted)?;
+    assembler.instruction(&[0x4c, 0x89, 0xd3])?; // next = end
+    assembler.instruction(&[0x4c, 0x89, 0xd5])?; // last = end
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?; // bundle(%rip)
+    let bundle_relocation = assembler.label()?;
+    assembler.bind(bundle_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET])?;
+    assembler.instruction(&[0x4c, 0x89, 0x64, 0x24, REQUEST_OFFSET + 8])?;
+    assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, REQUEST_OFFSET + 16])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, REQUEST_OFFSET + 24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, REQUEST_OFFSET + 32])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, SCRATCH_OFFSET])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        REQUEST_OFFSET + 48,
+        16,
+        0,
+        0,
+        0,
+    ])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, COUNT_OFFSET])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 56])?;
+    assembler.instruction(&[0x48, 0x8d, 0x7c, 0x24, REQUEST_OFFSET])?;
+    assembler.instruction(&[0xe8])?;
+    let participation_call = assembler.label()?;
+    assembler.bind(participation_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], participation_matched)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(participation_matched)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, COUNT_OFFSET])?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    let mut group_bound = vec![0x48, 0x3d];
+    group_bound.extend_from_slice(&group_count.to_le_bytes());
+    assembler.instruction(&group_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x01, 0xc7])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    x86_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let selector_call = finished.label_offset(selector_call)?;
+    let participation_call = finished.label_offset(participation_call)?;
+    let bundle_relocation = finished.label_offset(bundle_relocation)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code: finished.code,
+        local_calls: vec![
+            (
+                selector_call,
+                NativeCaptureReducerCallTargetV1::Selector,
+            ),
+            (
+                participation_call,
+                NativeCaptureReducerCallTargetV1::Participation,
+            ),
+        ]
+        .into_boxed_slice(),
+        bundle_relocations: vec![(
+            bundle_relocation,
+            RelocationKind::X86PcRelative32,
+            -4,
+        )]
+        .into_boxed_slice(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "private iterator state, exact capture schema validation, and transactional reduction form one generated native closure"
+)]
+fn lower_x86_64_native_capture_next_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const STATE_BYTES: usize = 24;
+    if !(1..=16).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "capture-next reducer group cardinality",
+        ));
+    }
+    let slots_bytes = group_count
+        .checked_mul(16)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer slots"))?;
+    let frame_bytes = STATE_BYTES
+        .checked_add(slots_bytes)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .filter(|bytes| bytes % 16 == 8)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer frame"))?;
+    let group_count_u32 = u32::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer groups"))?;
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let finished = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&frame_bytes.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    assembler.instruction(&[0x4d, 0x31, 0xff])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 8])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 16])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x48, 0x89, 0xe2])?;
+    assembler.instruction(&[0x48, 0x8d, 0x4c, 0x24, STATE_BYTES as u8])?;
+    let mut exact_count = vec![0x41, 0xb8];
+    exact_count.extend_from_slice(&group_count_u32.to_le_bytes());
+    assembler.instruction(&exact_count)?;
+    assembler.instruction(&[0xe8])?;
+    let capture_next_call = assembler.label()?;
+    assembler.bind(capture_next_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    x86_capture_load_rsp_rax(&mut assembler, STATE_BYTES)?;
+    x86_capture_load_rsp_rdi(&mut assembler, STATE_BYTES + 8)?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x39, 0xf8])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x39, 0xef])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0xbb, 1, 0, 0, 0])?;
+    for group in 1..group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        x86_capture_load_rsp_rax(&mut assembler, STATE_BYTES + group * 16)?;
+        x86_capture_load_rsp_rdi(&mut assembler, STATE_BYTES + group * 16 + 8)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x39, 0xf8])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, STATE_BYTES as u8])?;
+        assembler.instruction(&[0x4c, 0x39, 0xc0])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, (STATE_BYTES + 8) as u8])?;
+        assembler.instruction(&[0x4c, 0x39, 0xc7])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.branch(&[0xe9], valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.bind(valid)?;
+    }
+    assembler.instruction(&[0x49, 0x01, 0xdf])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    x86_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let capture_next_call = finished.label_offset(capture_next_call)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code: finished.code,
+        local_calls: vec![(
+            capture_next_call,
+            NativeCaptureReducerCallTargetV1::CaptureNext,
+        )]
+        .into_boxed_slice(),
+        bundle_relocations: Box::new([]),
+    })
+}
+
+fn lower_x86_64_native_capture_grep_wrapper_v1(
+) -> Result<(Vec<u8>, usize), ObjectError> {
+    const FRAME_BYTES: u8 = 16;
+    const LINE_START_OFFSET: u8 = 8;
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    assembler.instruction(&[0x4d, 0x31, 0xff])?;
+    assembler.instruction(&[0x48, 0x31, 0xdb])?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x48, 0x89, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x1c, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x49, 0x89, 0xdb])?; // line end
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x48, 0x8b, 0x6c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x49, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x43, 0x80, 0x7c, 0x1c, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x49, 0x83, 0xeb, 1])?;
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x49, 0x89, 0xdb])?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x48, 0x8b, 0x6c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x49, 0x29, 0xeb])?; // line length
+    assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?;
+    assembler.instruction(&[0x4c, 0x89, 0xde])?;
+    assembler.instruction(&[0x48, 0x8d, 0x14, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let private_call = assembler.label()?;
+    assembler.bind(private_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    assembler.instruction(&[0x4c, 0x03, 0x3c, 0x24])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let private_call = finished.label_offset(private_call)?;
+    Ok((finished.code, private_call))
+}
+
+fn lower_x86_64_native_capture_reducer_v1(
+    domain: NativeCaptureReducerDomainV1,
+    source: NativeCaptureReducerSourceV1<'_>,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let lowered = match source {
+        NativeCaptureReducerSourceV1::ExactSpanParticipation { group_count, .. } => {
+            lower_x86_64_native_participation_reducer_domain_v1(group_count)?
+        }
+        NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
+            lower_x86_64_native_capture_next_reducer_domain_v1(group_count)?
+        }
+    };
+    if domain == NativeCaptureReducerDomainV1::WholeHaystack {
+        return Ok(lowered);
+    }
+    let (mut code, private_call) = lower_x86_64_native_capture_grep_wrapper_v1()?;
+    let private_offset = code
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer private alignment"))?
+        & !15;
+    code.try_reserve_exact(
+        private_offset
+            .checked_sub(code.len())
+            .and_then(|padding| padding.checked_add(lowered.code.len()))
+            .ok_or(ObjectError::ArithmeticOverflow("capture reducer private extent"))?,
+    )
+    .map_err(|_| ObjectError::Allocation("capture reducer private code"))?;
+    code.resize(private_offset, 0x90);
+    push_bytes(&mut code, &lowered.code)?;
+    let mut local_calls = Vec::new();
+    local_calls
+        .try_reserve_exact(
+            1_usize
+                .checked_add(lowered.local_calls.len())
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer calls"))?,
+        )
+        .map_err(|_| ObjectError::Allocation("capture reducer calls"))?;
+    local_calls.push((
+        private_call,
+        NativeCaptureReducerCallTargetV1::PrivateDomain(private_offset),
+    ));
+    for &(offset, target) in lowered.local_calls.iter() {
+        local_calls.push((
+            private_offset
+                .checked_add(offset)
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer child call"))?,
+            target,
+        ));
+    }
+    let mut bundle_relocations = Vec::new();
+    bundle_relocations
+        .try_reserve_exact(lowered.bundle_relocations.len())
+        .map_err(|_| ObjectError::Allocation("capture reducer bundle relocations"))?;
+    for &(offset, kind, addend) in lowered.bundle_relocations.iter() {
+        bundle_relocations.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("capture reducer bundle relocation"),
+            )?,
+            kind,
+            addend,
+        ));
+    }
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: local_calls.into_boxed_slice(),
+        bundle_relocations: bundle_relocations.into_boxed_slice(),
+    })
+}
+
 /// Scale one transactional native Count result by a compiler-proved uniform
 /// participating-group count. The local Count entry remains authoritative for
 /// handle identity, source-domain validation, and exhaustive empty progress.
@@ -37752,6 +38643,514 @@ fn lower_aarch64_prepared_grep_count(
                 page_offset: offsets[2],
             },
         ),
+    })
+}
+
+fn aarch64_native_capture_reducer_boundary(
+    assembler: &mut Aarch64Assembler,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 2, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    Ok(())
+}
+
+fn aarch64_native_capture_reducer_save(
+    assembler: &mut Aarch64Assembler,
+    frame_bytes: u16,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    Ok(())
+}
+
+fn aarch64_native_capture_reducer_epilogue(
+    assembler: &mut Aarch64Assembler,
+    frame_bytes: u16,
+) -> Result<(), ObjectError> {
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact selector progress, private replay request, and transactional reduction form one AAPCS64 closure"
+)]
+fn lower_aarch64_native_participation_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const FRAME_BYTES: u16 = 208;
+    const SPAN_OFFSET: u16 = 96;
+    const REQUEST_OFFSET: u16 = 112;
+    const SCRATCH_OFFSET: u16 = 176;
+    const COUNT_OFFSET: u16 = 192;
+    if !(1..=64).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 participation reducer group cardinality",
+        ));
+    }
+    let group_count = u16::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 participation groups"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let participation_matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_w(25, 0)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.branch_bit_clear_w(25, 1, search)?;
+    assembler.instruction(aarch64_movz_w(5, 2)?)?;
+    assembler.instruction(aarch64_eor_w(25, 25, 5)?)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 23)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, SPAN_OFFSET)?)?;
+    let selector_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_pair_x(
+        5,
+        6,
+        31,
+        i16::try_from(SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reducer span"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(5, 23)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 5)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_NE, nonempty)?;
+    assembler.branch_bit_clear_w(25, 0, accepted_empty)?;
+    assembler.instruction(aarch64_cmp_x(6, 24)?)?;
+    assembler.branch_cond(AARCH64_NE, accepted_empty)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(aarch64_movz_w(25, 1)?)?;
+    assembler.branch(accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(aarch64_movz_w(25, 3)?)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(aarch64_mov_x(23, 6)?)?;
+    assembler.instruction(aarch64_mov_x(24, 6)?)?;
+
+    let bundle_page = assembler.instruction(0x9000_0007)?; // adrp x7, bundle
+    let bundle_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(19, 31, REQUEST_OFFSET + 8)?)?;
+    assembler.instruction(aarch64_store_x(20, 31, REQUEST_OFFSET + 16)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, REQUEST_OFFSET + 24)?)?;
+    assembler.instruction(aarch64_store_x(6, 31, REQUEST_OFFSET + 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, SCRATCH_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
+    assembler.instruction(aarch64_movz_x(7, 16, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, COUNT_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(0, 31, REQUEST_OFFSET)?)?;
+    let participation_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, participation_matched)?;
+    assembler.branch_zero_w(0, runtime_failure)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(participation_matched)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_OFFSET)?)?;
+    assembler.branch_zero_x(5, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x_imm(5, group_count)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 5)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [
+        selector_call,
+        participation_call,
+        bundle_page,
+        bundle_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: vec![
+            (offsets[0], NativeCaptureReducerCallTargetV1::Selector),
+            (
+                offsets[1],
+                NativeCaptureReducerCallTargetV1::Participation,
+            ),
+        ]
+        .into_boxed_slice(),
+        bundle_relocations: vec![
+            (offsets[2], RelocationKind::Aarch64Page21, 0),
+            (offsets[3], RelocationKind::Aarch64PageOff12, 0),
+        ]
+        .into_boxed_slice(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "private iterator state, exact capture schema validation, and transactional reduction form one generated AAPCS64 closure"
+)]
+fn lower_aarch64_native_capture_next_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const STATE_OFFSET: u16 = 96;
+    const SLOT_OFFSET: u16 = 120;
+    if !(1..=16).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 capture-next reducer group cardinality",
+        ));
+    }
+    let frame_bytes = group_count
+        .checked_mul(16)
+        .and_then(|bytes| bytes.checked_add(128))
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .filter(|bytes| bytes.is_multiple_of(16))
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture reducer frame"))?;
+    let group_count_u64 = u64::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture reducer groups"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        31,
+        31,
+        31,
+        i16::try_from(STATE_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture state"))?,
+    )?)?;
+    assembler.instruction(aarch64_store_x(31, 31, STATE_OFFSET + 16)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 31, STATE_OFFSET)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 31, SLOT_OFFSET)?)?;
+    aarch64_load_u64_constant(&mut assembler, 4, group_count_u64)?;
+    let capture_next_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    aarch64_load_u64_constant(&mut assembler, 7, u64::MAX)?;
+    assembler.instruction(aarch64_load_pair_x(
+        5,
+        6,
+        31,
+        i16::try_from(SLOT_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group zero"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(23, 1, 0)?)?;
+    for group in 1..group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        let offset = SLOT_OFFSET
+            .checked_add(
+                u16::try_from(group * 16)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture slot"))?,
+            )
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture slot"))?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture slot"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, unset)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            8,
+            9,
+            31,
+            i16::try_from(SLOT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group zero"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 8)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 9)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+        assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+        assembler.branch(valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.bind(valid)?;
+    }
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 23)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [capture_next_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: vec![(
+            offsets[0],
+            NativeCaptureReducerCallTargetV1::CaptureNext,
+        )]
+        .into_boxed_slice(),
+        bundle_relocations: Box::new([]),
+    })
+}
+
+fn lower_aarch64_native_capture_grep_wrapper_v1(
+) -> Result<(Vec<u8>, usize), ObjectError> {
+    const FRAME_BYTES: u16 = 112;
+    const COUNT_OFFSET: u16 = 96;
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(24, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(5, 19, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(5, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_cmp_x(25, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 25, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 19, 5)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(6, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(25, 25, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
+    assembler.instruction(aarch64_sub_x_reg(1, 25, 24)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    let private_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_OFFSET)?)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 5)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [private_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok((code, offsets[0]))
+}
+
+fn lower_aarch64_native_capture_reducer_v1(
+    domain: NativeCaptureReducerDomainV1,
+    source: NativeCaptureReducerSourceV1<'_>,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let lowered = match source {
+        NativeCaptureReducerSourceV1::ExactSpanParticipation { group_count, .. } => {
+            lower_aarch64_native_participation_reducer_domain_v1(group_count)?
+        }
+        NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
+            lower_aarch64_native_capture_next_reducer_domain_v1(group_count)?
+        }
+    };
+    if domain == NativeCaptureReducerDomainV1::WholeHaystack {
+        return Ok(lowered);
+    }
+    let (mut code, private_call) = lower_aarch64_native_capture_grep_wrapper_v1()?;
+    if !code.len().is_multiple_of(4) || !lowered.code.len().is_multiple_of(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 capture reducer instruction alignment",
+        ));
+    }
+    let private_offset = code.len();
+    push_bytes(&mut code, &lowered.code)?;
+    let mut local_calls = Vec::new();
+    local_calls
+        .try_reserve_exact(
+            1_usize
+                .checked_add(lowered.local_calls.len())
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture reducer calls"))?,
+        )
+        .map_err(|_| ObjectError::Allocation("AArch64 capture reducer calls"))?;
+    local_calls.push((
+        private_call,
+        NativeCaptureReducerCallTargetV1::PrivateDomain(private_offset),
+    ));
+    for &(offset, target) in lowered.local_calls.iter() {
+        local_calls.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 capture reducer child call"),
+            )?,
+            target,
+        ));
+    }
+    let mut bundle_relocations = Vec::new();
+    bundle_relocations
+        .try_reserve_exact(lowered.bundle_relocations.len())
+        .map_err(|_| ObjectError::Allocation("AArch64 capture reducer relocations"))?;
+    for &(offset, kind, addend) in lowered.bundle_relocations.iter() {
+        bundle_relocations.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 capture reducer relocation"),
+            )?,
+            kind,
+            addend,
+        ));
+    }
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: local_calls.into_boxed_slice(),
+        bundle_relocations: bundle_relocations.into_boxed_slice(),
     })
 }
 

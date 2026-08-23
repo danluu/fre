@@ -314,11 +314,17 @@ pub use regex_set::{
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
     REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_SINGLE_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN,
     RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotError, RebarSingleCaptureAotReceiptV1,
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureCardinalityError,
     RebarSingleCaptureEmptyProgressV1, RebarSingleCaptureParticipationAotArtifactV1,
     RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureParticipationAotReceiptV1,
-    compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
+    RebarSingleCaptureReducerAotArtifactV1, RebarSingleCaptureReducerAotErrorV1,
+    RebarSingleCaptureReducerAotReceiptV1, RebarSingleCaptureReducerDomainV1,
+    RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    RebarSingleCaptureReducerSourceRouteV1, compile_rebar_single_capture_aot_v1,
+    compile_rebar_single_capture_participation_aot_v1,
+    compile_rebar_single_capture_reducer_aot_v1,
 };
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureReducer,
