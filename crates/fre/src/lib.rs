@@ -888,10 +888,10 @@ use fre_kernels::{
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
     LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
     LiteralSetError, LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan,
-    LiteralSetSearchLimits, PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
-    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-    PackedLiteralSetOrdinaryExecutor, PackedLiteralSetRetainedIterBuildAccounting,
-    PackedLiteralSetSearchLimits,
+    LiteralSetSearchLimits, LiteralSetUniformStandardOrdinaryExecutor,
+    PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
+    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetOrdinaryExecutor,
+    PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
     RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
     RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
@@ -11089,10 +11089,13 @@ impl PortableRegex {
     /// immutable start-filter policy during this call. Unanchored
     /// required-literal matchers bind their value-only projection alongside
     /// the canonical span session. An attachment-free, positive-width
-    /// leftmost-first literal set binds its immutable direct executor. Other
-    /// selected plan families bind only the existing canonical session with
-    /// unlimited setup limits. The returned owner retains no haystack and may
-    /// be reused across unrelated inputs by one mutable worker.
+    /// leftmost-first literal set binds its immutable direct executor. A
+    /// uniform-standard literal set additionally starts with one cleared
+    /// performance-only route bit; near acceptances may spend that bit on one
+    /// bounded direct same-DFA probe. Other selected plan families bind
+    /// only the existing canonical session with unlimited setup limits. The
+    /// returned owner retains no haystack and may be reused across unrelated
+    /// inputs by one mutable worker.
     ///
     /// This is deliberately separate from [`Self::search_session`]: ordinary
     /// methods accept no finite limits and construct no facade accounting.
@@ -11146,7 +11149,14 @@ impl PortableRegex {
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 if let Some(executor) = literal_set.ordinary_executor() {
-                    PortableOrdinarySessionPlan::LiteralSetDfa { executor }
+                    if let Some(executor) = executor.uniform_standard_executor() {
+                        PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                            executor,
+                            direct_next: false,
+                        }
+                    } else {
+                        PortableOrdinarySessionPlan::LiteralSetDfa { executor }
+                    }
                 } else {
                     PortableOrdinarySessionPlan::Canonical(Box::new(
                         self.search_session(SearchSessionLimits::unlimited())?,
@@ -14490,7 +14500,12 @@ pub struct PortableSearchSession<'a> {
 /// either contract should use [`PortableSearchSession`] instead.
 ///
 /// A session never retains a haystack. It can therefore be reused across
-/// unrelated sources by one mutable, thread-confined worker.
+/// unrelated sources by one mutable, thread-confined worker. An eligible
+/// uniform-standard literal-set owner retains one performance-only boolean
+/// saying that the immediately preceding endpoint or selected-span call
+/// observed a near acceptance. It retains neither that endpoint nor any source
+/// identity, and a miss, far acceptance, error, or span-iteration operation
+/// clears it.
 #[derive(Debug)]
 pub struct PortableOrdinarySession<'a> {
     plan: PortableOrdinarySessionPlan<'a>,
@@ -14513,7 +14528,19 @@ enum PortableOrdinarySessionPlan<'a> {
     LiteralSetDfa {
         executor: LiteralSetOrdinaryExecutor<'a>,
     },
+    LiteralSetUniformStandardDfa {
+        executor: LiteralSetUniformStandardOrdinaryExecutor<'a>,
+        direct_next: bool,
+    },
 }
+
+// One mistaken density promotion can scan at most one byte alphabet and eight
+// fixed-width words before returning to the construction-selected prefilter.
+// A near acceptance within two words is enough evidence to spend that bounded
+// probe on the next ordinary call, independent of its remaining window size.
+const LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES: usize = 256;
+const LITERAL_SET_DFA_DIRECT_NEAR_WIDTHS: usize = 2;
+const LITERAL_SET_DFA_DIRECT_PROBE_WIDTHS: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum PortableOrdinaryRequiredLiteral<'a> {
@@ -14583,6 +14610,34 @@ mod required_literal_ordinary_session_probe {
 
     pub(super) fn endpoint_calls() -> usize {
         ENDPOINT_CALLS.get()
+    }
+}
+
+#[cfg(test)]
+mod literal_set_dfa_ordinary_route_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static PREFILTERED_CALLS: Cell<usize> = const { Cell::new(0) };
+        static DIRECT_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        PREFILTERED_CALLS.set(0);
+        DIRECT_CALLS.set(0);
+    }
+
+    pub(super) fn record(direct: bool) {
+        let counter = if direct {
+            &DIRECT_CALLS
+        } else {
+            &PREFILTERED_CALLS
+        };
+        counter.set(counter.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> (usize, usize) {
+        (PREFILTERED_CALLS.get(), DIRECT_CALLS.get())
     }
 }
 
@@ -19951,6 +20006,134 @@ fn execute_k0_exists_incumbent_general(
     result
 }
 
+#[inline]
+fn ordinary_literal_set_dfa_first_acceptance_at(
+    executor: &LiteralSetUniformStandardOrdinaryExecutor<'_>,
+    direct_next: &mut bool,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<usize>, SearchError> {
+    let window = LiteralWindow::new(start, haystack.len());
+    let Some(window_bytes) = haystack.len().checked_sub(start) else {
+        *direct_next = false;
+        #[cfg(test)]
+        literal_set_dfa_ordinary_route_probe::record(false);
+        return executor
+            .ordinary_executor()
+            .selected_end_window_value(haystack, window)
+            .map_err(SearchError::from);
+    };
+    let direct = *direct_next;
+    // Every attempted call consumes the prior observation. Only this call's
+    // own near acceptance can promote its successor.
+    *direct_next = false;
+    #[cfg(test)]
+    literal_set_dfa_ordinary_route_probe::record(direct);
+    let ordinary = executor.ordinary_executor();
+    let selected_end = if direct {
+        let probe_bytes = executor
+            .pattern_bytes()
+            .saturating_mul(LITERAL_SET_DFA_DIRECT_PROBE_WIDTHS)
+            .min(LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES)
+            .min(window_bytes);
+        let probe_end = start.saturating_add(probe_bytes).min(haystack.len());
+        match executor
+            .first_acceptance_without_prefilter_window_value(
+                haystack,
+                LiteralWindow::new(start, probe_end),
+            )
+            .map_err(SearchError::from)?
+        {
+            Some(end) => Some(end),
+            None => ordinary
+                .selected_end_window_value(haystack, window)
+                .map_err(SearchError::from)?,
+        }
+    } else {
+        ordinary
+            .selected_end_window_value(haystack, window)
+            .map_err(SearchError::from)?
+    };
+    if let Some(distance) = selected_end.and_then(|end| end.checked_sub(start)) {
+        let near_bytes = executor
+            .pattern_bytes()
+            .saturating_mul(LITERAL_SET_DFA_DIRECT_NEAR_WIDTHS);
+        *direct_next = distance <= near_bytes;
+    }
+    Ok(selected_end)
+}
+
+#[inline]
+fn ordinary_literal_set_dfa_find_at(
+    executor: &LiteralSetUniformStandardOrdinaryExecutor<'_>,
+    direct_next: &mut bool,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<Match>, SearchError> {
+    let window = LiteralWindow::new(start, haystack.len());
+    let ordinary = executor.ordinary_executor();
+    let Some(window_bytes) = haystack.len().checked_sub(start) else {
+        *direct_next = false;
+        #[cfg(test)]
+        literal_set_dfa_ordinary_route_probe::record(false);
+        return ordinary
+            .find_window_value(haystack, window)
+            .map(|matched| matched.map(|(start, end)| Match { start, end }))
+            .map_err(SearchError::from);
+    };
+    let direct = *direct_next;
+    *direct_next = false;
+    #[cfg(test)]
+    literal_set_dfa_ordinary_route_probe::record(direct);
+    let matched = if direct {
+        let probe_bytes = executor
+            .pattern_bytes()
+            .saturating_mul(LITERAL_SET_DFA_DIRECT_PROBE_WIDTHS)
+            .min(LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES)
+            .min(window_bytes);
+        let probe_end = start.saturating_add(probe_bytes).min(haystack.len());
+        match executor
+            .first_acceptance_without_prefilter_window_value(
+                haystack,
+                LiteralWindow::new(start, probe_end),
+            )
+            .map_err(SearchError::from)?
+        {
+            Some(end) => {
+                let pattern_bytes = executor.pattern_bytes();
+                debug_assert!(
+                    end.checked_sub(pattern_bytes)
+                        .is_some_and(|matched_start| matched_start >= start),
+                    "a selected fixed-width literal must begin within its search window",
+                );
+                Some(Match {
+                    start: end - pattern_bytes,
+                    end,
+                })
+            }
+            None => ordinary
+                .find_window_value(haystack, window)
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from)?,
+        }
+    } else {
+        ordinary
+            .find_window_value(haystack, window)
+            .map(|matched| matched.map(|(start, end)| Match { start, end }))
+            .map_err(SearchError::from)?
+    };
+    if let Some(distance) = matched
+        .as_ref()
+        .and_then(|matched| matched.end.checked_sub(start))
+    {
+        let near_bytes = executor
+            .pattern_bytes()
+            .saturating_mul(LITERAL_SET_DFA_DIRECT_NEAR_WIDTHS);
+        *direct_next = distance <= near_bytes;
+    }
+    Ok(matched)
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists at or after `start`.
     ///
@@ -19985,6 +20168,16 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                executor,
+                direct_next,
+            } => ordinary_literal_set_dfa_first_acceptance_at(
+                executor,
+                direct_next,
+                haystack,
+                start,
+            )
+            .map(|endpoint| endpoint.is_some()),
         }
     }
 
@@ -20026,6 +20219,15 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                executor,
+                direct_next,
+            } => ordinary_literal_set_dfa_first_acceptance_at(
+                executor,
+                direct_next,
+                haystack,
+                start,
+            ),
         }
     }
 
@@ -20049,8 +20251,11 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Return the selected leftmost-first span at or after `start`.
     ///
     /// K0 selects the endpoint first and performs reverse start recovery only
-    /// after a positive result requires it. Packed and DFA literal sets use
-    /// their bound selected-span engines. Canonical fallback plans retain
+    /// after a positive result requires it. On a promoted direct hit, a bound
+    /// uniform-standard literal set likewise selects its endpoint first, then
+    /// subtracts its sealed common width; its ordinary route and direct misses
+    /// retain the canonical selected span. Other packed and DFA literal sets
+    /// use their bound selected-span engines. Canonical fallback plans retain
     /// their existing selected-span implementation with unlimited limits.
     /// Assertions inspect the complete original haystack and offsets remain
     /// relative to it.
@@ -20089,6 +20294,15 @@ impl<'r> PortableOrdinarySession<'r> {
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                executor,
+                direct_next,
+            } => ordinary_literal_set_dfa_find_at(
+                executor,
+                direct_next,
+                haystack,
+                start,
+            ),
         }
     }
 
@@ -20206,6 +20420,20 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from)
                 .map_err(PortableFindIterError::Search)
             }
+            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                executor,
+                direct_next,
+            } => {
+                *direct_next = false;
+                let mut visitor = visitor;
+                executor.try_visit_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    |(start, end)| visitor(Match { start, end }),
+                )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search)
+            }
         }
     }
 
@@ -20268,6 +20496,12 @@ impl<'r> PortableOrdinarySession<'r> {
                 )
                 .map(Some)
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                direct_next, ..
+            } => {
+                *direct_next = false;
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -38983,6 +39217,240 @@ mod tests {
                 haystack_len: 7,
             })),
         ));
+    }
+
+    #[test]
+    fn ordinary_uniform_standard_dfa_bounds_session_local_direct_probes() {
+        let source = (0..=128)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let regex = PortableBuilder::new(&source)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let direct_next = |session: &super::PortableOrdinarySession<'_>| match &session.plan {
+            super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                executor,
+                direct_next,
+            } => {
+                assert_eq!(executor.pattern_bytes(), 4);
+                *direct_next
+            }
+            other => panic!("uniform literal set did not bind its sealed executor: {other:?}"),
+        };
+
+        let near = b"p000zzzz";
+        let nonzero = b"xxp001zz";
+        let distinct = b"p002yyyy";
+        let miss = b"zzzzzzzz";
+        let far = b"zzzzzzzzp000";
+        let mut exact_probe_edge = vec![b'z'; 36];
+        exact_probe_edge[28..32].copy_from_slice(b"p003");
+        let mut crossing_probe_edge = vec![b'z'; 36];
+        crossing_probe_edge[29..33].copy_from_slice(b"p004");
+        let mut long = vec![b'z'; super::LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES + 1];
+        long[..4].copy_from_slice(b"p000");
+        let mut long_crossing = vec![b'z'; super::LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES + 1];
+        long_crossing[29..33].copy_from_slice(b"p005");
+        let long_miss = vec![b'z'; super::LITERAL_SET_DFA_DIRECT_MAX_PROBE_BYTES + 1];
+
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert!(!direct_next(&ordinary));
+
+        // A first near result is prefiltered and promotes exactly its
+        // successor. Another near result may re-promote the following call.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (1, 0));
+        assert_eq!(ordinary.is_match_at(near, 0), Ok(true));
+        assert!(direct_next(&ordinary));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (1, 1));
+
+        // The route bit contains no source identity. It is safe to spend and
+        // refresh across distinct haystacks and a nonzero search start.
+        assert_eq!(
+            ordinary.find_at(nonzero, 2),
+            Ok(Some(Match { start: 2, end: 6 }))
+        );
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.find_at(distinct, 0),
+            Ok(Some(Match { start: 0, end: 4 }))
+        );
+        assert!(direct_next(&ordinary));
+
+        // A direct miss replays the authoritative prefiltered search and
+        // immediately demotes.
+        assert_eq!(ordinary.first_acceptance_at(miss, 0), Ok(None));
+        assert!(!direct_next(&ordinary));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (1, 4));
+
+        // An acceptance exactly at 8W is inside the direct probe. An
+        // acceptance at 8W+1 crosses its edge and is recovered by replaying
+        // the canonical selected-span search from the original start.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert_eq!(
+            ordinary.find_at(&exact_probe_edge, 0),
+            Ok(Some(Match { start: 28, end: 32 }))
+        );
+        assert!(!direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert_eq!(
+            ordinary.find_at(&crossing_probe_edge, 0),
+            Ok(Some(Match { start: 29, end: 33 }))
+        );
+        assert!(!direct_next(&ordinary));
+
+        // A far direct result is semantically authoritative but does not
+        // promote another direct probe.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(far, 0), Ok(Some(12)));
+        assert!(!direct_next(&ordinary));
+
+        // A long remaining window may spend prior evidence, but its direct
+        // work is still bounded by 8W and 256 bytes. A near direct hit may
+        // refresh the bit; a bounded miss replays canonically and demotes.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(&long, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.find_at(&long_crossing, 0),
+            Ok(Some(Match { start: 29, end: 33 }))
+        );
+        assert!(!direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(ordinary.first_acceptance_at(&long_miss, 0), Ok(None));
+        assert!(!direct_next(&ordinary));
+
+        // Errors discard stale evidence.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert!(matches!(
+            ordinary.first_acceptance_at(near, near.len() + 1),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::InvalidWindow { .. }
+            )),
+        ));
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.find_at(near, 0),
+            Ok(Some(Match { start: 0, end: 4 }))
+        );
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.find_at(far, 0),
+            Ok(Some(Match { start: 8, end: 12 }))
+        );
+        assert!(!direct_next(&ordinary));
+
+        // Explicit span iteration and unsupported count projection clear the
+        // endpoint/one-span route observation before returning.
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(near, |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(spans, [(0, 4)]);
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        let mut stopped = 0;
+        assert_eq!(
+            ordinary
+                .try_visit_spans(near, |_| {
+                    stopped += 1;
+                    Ok::<bool, ()>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, 1);
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert_eq!(
+            ordinary
+                .try_visit_spans(near, |_| Err::<bool, _>("callback"))
+                .unwrap(),
+            Err("callback"),
+        );
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        let mut callback_called = false;
+        assert!(ordinary
+            .try_visit_spans_at(near, near.len() + 1, |_| {
+                callback_called = true;
+                Ok::<bool, ()>(true)
+            })
+            .is_err());
+        assert!(!callback_called);
+        assert!(!direct_next(&ordinary));
+
+        assert_eq!(ordinary.first_acceptance_at(near, 0), Ok(Some(4)));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(near, usize::MAX),
+            Ok(None),
+        );
+        assert!(!direct_next(&ordinary));
+    }
+
+    #[test]
+    fn ordinary_nonuniform_and_unprefiltered_dfas_never_bind_direct_route() {
+        let nonuniform = PortableBuilder::new("ab|a|ba")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        let mut ordinary = nonuniform.ordinary_session().unwrap();
+        assert!(matches!(
+            ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+        ));
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert_eq!(ordinary.first_acceptance_at(b"zzab", 0), Ok(Some(4)));
+        assert_eq!(ordinary.is_match_at(b"zzab", 0), Ok(true));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 0));
+
+        let source = (0_u8..=u8::MAX)
+            .map(|byte| format!(r"\x{byte:02X}\x{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let no_prefilter = PortableBuilder::new(&source)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(no_prefilter.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = no_prefilter.ordinary_session().unwrap();
+        assert!(matches!(
+            ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+        ));
+        super::literal_set_dfa_ordinary_route_probe::reset();
+        assert_eq!(ordinary.first_acceptance_at(b"z\x01\x01", 0), Ok(Some(3)));
+        assert_eq!(ordinary.is_match_at(b"z\x01\x01", 0), Ok(true));
+        assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 0));
     }
 
     #[test]

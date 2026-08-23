@@ -259,6 +259,48 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
 }
 
+/// Construction-bound capability for deliberately bypassing the optional
+/// prefilter of a positive, fixed-width standard DFA.
+///
+/// This is obtainable only from an already admitted ordinary executor whose
+/// immutable plan proves that first acceptance is its selected endpoint.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct LiteralSetUniformStandardOrdinaryExecutor<'a> {
+    plan: &'a LiteralSetPlan,
+}
+
+#[cfg(test)]
+mod ordinary_direct_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static SPECIAL_CHECKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+        SPECIAL_CHECKS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record_special_check() {
+        SPECIAL_CHECKS.set(SPECIAL_CHECKS.get().saturating_add(1));
+    }
+
+    pub(super) fn special_checks() -> usize {
+        SPECIAL_CHECKS.get()
+    }
+}
+
 /// Construction-sealed opportunity to attach one folded accelerator.
 ///
 /// This wrapper owns the exact DFA built from `patterns` while borrowing that
@@ -1312,7 +1354,23 @@ impl LiteralSetPlan {
     }
 }
 
-impl LiteralSetOrdinaryExecutor<'_> {
+impl<'a> LiteralSetOrdinaryExecutor<'a> {
+    /// Bind the capability to select first acceptance by scanning this same
+    /// DFA without consulting its construction-selected prefilter.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn uniform_standard_executor(
+        self,
+    ) -> Option<LiteralSetUniformStandardOrdinaryExecutor<'a>> {
+        let build = self.plan.build;
+        (self.plan.automaton.match_kind() == MatchKind::Standard
+            && self.plan.automaton.prefilter().is_some()
+            && build.minimum_pattern_bytes > 0
+            && build.minimum_pattern_bytes.checked_mul(build.patterns) == Some(build.pattern_bytes))
+        .then_some(LiteralSetUniformStandardOrdinaryExecutor { plan: self.plan })
+    }
+
     /// Return the selected leftmost-first span wholly inside `window` without
     /// finite-search accounting.
     ///
@@ -1394,10 +1452,10 @@ impl LiteralSetOrdinaryExecutor<'_> {
         validate_window(window, haystack.len())?;
         let mut cursor = window.start();
         loop {
-            let Some(matched) = self
+            let matched = self
                 .plan
-                .try_find_window_value(haystack, Window::new(cursor, window.end()))?
-            else {
+                .try_find_window_value(haystack, Window::new(cursor, window.end()))?;
+            let Some(matched) = matched else {
                 return Ok(Ok(()));
             };
             debug_assert!(
@@ -1412,6 +1470,191 @@ impl LiteralSetOrdinaryExecutor<'_> {
             }
         }
     }
+}
+
+impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
+    /// Recover the ordinary selected-span executor for operations that retain
+    /// the construction-selected prefilter unconditionally.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn ordinary_executor(self) -> LiteralSetOrdinaryExecutor<'a> {
+        LiteralSetOrdinaryExecutor { plan: self.plan }
+    }
+
+    /// Return the construction-proved common positive literal width.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn pattern_bytes(self) -> usize {
+        self.plan.build.minimum_pattern_bytes
+    }
+
+    /// Return the first accepting boundary while deliberately bypassing the
+    /// DFA's optional prefilter.
+    ///
+    /// This sealed capability proves that first acceptance is identical to the
+    /// selected leftmost-first endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` is outside the
+    /// original haystack.
+    #[doc(hidden)]
+    #[inline]
+    pub fn first_acceptance_without_prefilter_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<usize>, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        Ok(first_acceptance_end_without_prefilter(
+            self.plan, haystack, window,
+        ))
+    }
+
+    /// Visit every non-overlapping selected span with one bounded direct probe
+    /// after an early prefiltered acceptance.
+    ///
+    /// A direct miss replays the authoritative prefiltered search from the
+    /// original cursor, preserving matches that cross the probe boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`LiteralSetOrdinaryExecutor::try_visit_spans_window_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_visit_spans_window_value<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        validate_window(window, haystack.len())?;
+        let uniform_width = self.pattern_bytes();
+        let mut cursor = window.start();
+        let mut direct_probe_bytes = None;
+        loop {
+            let search_start = cursor;
+            let matched = if let Some(probe_bytes) = direct_probe_bytes {
+                let probe_end = cursor.saturating_add(probe_bytes).min(window.end());
+                match first_acceptance_end_without_prefilter(
+                    self.plan,
+                    haystack,
+                    Window::new(cursor, probe_end),
+                ) {
+                    Some(end) => {
+                        debug_assert!(
+                            end.checked_sub(uniform_width)
+                                .is_some_and(|matched_start| matched_start >= cursor),
+                            "a selected fixed-width literal must begin within its search window",
+                        );
+                        Some((end - uniform_width, end))
+                    }
+                    None => {
+                        // A miss costs at most one bounded direct probe. The
+                        // authoritative prefiltered search restarts at the
+                        // original cursor so a match crossing the probe edge
+                        // cannot be skipped.
+                        direct_probe_bytes = None;
+                        self.plan.try_find_window_value(
+                            haystack,
+                            Window::new(cursor, window.end()),
+                        )?
+                    }
+                }
+            } else {
+                self.plan
+                    .try_find_window_value(haystack, Window::new(cursor, window.end()))?
+            };
+            let Some(matched) = matched else {
+                return Ok(Ok(()));
+            };
+            debug_assert!(
+                matched.1 > cursor,
+                "a positive-width literal-set match must advance its search cursor",
+            );
+            cursor = matched.1;
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+            if direct_probe_bytes.is_none() {
+                // An end within 2W places the selected start in the first W
+                // bytes. Once promoted, bound a mistaken density prediction
+                // to eight pattern widths before authoritative replay.
+                let promotion_bytes = uniform_width.saturating_mul(2);
+                if cursor.saturating_sub(search_start) <= promotion_bytes {
+                    direct_probe_bytes = Some(uniform_width.saturating_mul(8));
+                }
+            }
+        }
+    }
+}
+
+/// Return the first accepting endpoint while deliberately bypassing a
+/// retained heuristic prefilter.
+///
+/// This is restricted to the stable uniform Standard construction used by
+/// the ordinary executor. Its DFA can retain prefilter restart states; those
+/// states are search hints rather than semantic states and are therefore
+/// ignored by this direct loop.
+#[inline]
+fn first_acceptance_end_without_prefilter(
+    plan: &LiteralSetPlan,
+    haystack: &[u8],
+    window: Window,
+) -> Option<usize> {
+    #[cfg(test)]
+    ordinary_direct_probe::record();
+    let automaton = plan.automaton.as_ref();
+    debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
+    debug_assert!(automaton.prefilter().is_some());
+    debug_assert!(plan.build.minimum_pattern_bytes > 0);
+    let anchored = Anchored::No;
+    let mut state = automaton
+        .start_state(anchored)
+        .expect("the literal-set DFA retains its unanchored start state");
+    let mut at = window.start();
+    debug_assert!(!automaton.is_match(state));
+    let pattern_bytes = plan.build.minimum_pattern_bytes;
+    let window_bytes = window.end() - window.start();
+    if window_bytes < pattern_bytes {
+        return None;
+    }
+    // A fixed-width literal cannot accept before its Wth consumed byte.
+    // Advance the first W-1 transitions without inspecting special-state
+    // metadata, then begin the ordinary acceptance loop at byte W.
+    let first_acceptance_check = window.start() + pattern_bytes - 1;
+    while at < first_acceptance_check {
+        state = automaton.next_state(anchored, state, haystack[at]);
+        at += 1;
+    }
+    while at < window.end() {
+        state = automaton.next_state(anchored, state, haystack[at]);
+        at += 1;
+        #[cfg(test)]
+        ordinary_direct_probe::record_special_check();
+        if !automaton.is_special(state) {
+            continue;
+        }
+        if automaton.is_dead(state) {
+            return None;
+        }
+        if automaton.is_match(state) {
+            return Some(at);
+        }
+        debug_assert!(
+            automaton.is_start(state),
+            "a prefiltered literal-set DFA has no other special states",
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3896,7 +4139,7 @@ mod tests {
 
     use super::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetMatchSemantics, LiteralSetPlan,
-        LiteralSetSearchLimits,
+        LiteralSetSearchLimits, first_acceptance_end_without_prefilter, ordinary_direct_probe,
     };
     use crate::Window;
 
@@ -3968,6 +4211,15 @@ mod tests {
                             Ok(expected.map(|(_, matched_end)| matched_end)),
                             "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
                         );
+                        if let Some(uniform) = ordinary.uniform_standard_executor() {
+                            assert_eq!(
+                                uniform.first_acceptance_without_prefilter_window_value(
+                                    &haystack, window,
+                                ),
+                                Ok(expected.map(|(_, matched_end)| matched_end)),
+                                "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                            );
+                        }
 
                         let mut expected_spans = Vec::new();
                         let mut cursor = window.start();
@@ -3996,6 +4248,24 @@ mod tests {
                             actual_spans, expected_spans,
                             "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
                         );
+                        if let Some(uniform) = ordinary.uniform_standard_executor() {
+                            let mut uniform_spans = Vec::new();
+                            assert_eq!(
+                                uniform.try_visit_spans_window_value(
+                                    &haystack,
+                                    window,
+                                    |matched| {
+                                        uniform_spans.push(matched);
+                                        Ok::<bool, ()>(true)
+                                    },
+                                ),
+                                Ok(Ok(())),
+                            );
+                            assert_eq!(
+                                uniform_spans, expected_spans,
+                                "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                            );
+                        }
                     }
                 }
             }
@@ -4080,6 +4350,226 @@ mod tests {
         )
         .unwrap();
         assert_eq!(generic.automaton.match_kind(), MatchKind::LeftmostFirst);
+    }
+
+    #[test]
+    fn uniform_standard_span_iteration_bounds_direct_dense_probes() {
+        let patterns = (0_u16..256)
+            .map(|id| {
+                vec![
+                    if id & 1 == 0 { b'q' } else { b'z' },
+                    (id >> 1) as u8,
+                    b'!',
+                    b'@',
+                    b'#',
+                    b'$',
+                    b'%',
+                    b'^',
+                ]
+            })
+            .collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default())
+            .expect("uniform plan");
+        assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
+        assert!(plan.automaton.prefilter().is_some());
+        let ordinary = plan.ordinary_executor().expect("ordinary executor");
+        let uniform = ordinary
+            .uniform_standard_executor()
+            .expect("prefiltered uniform standard capability");
+        assert_eq!(uniform.pattern_bytes(), 8);
+
+        let mut haystack = b"PP".to_vec();
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.push(b'x');
+        haystack.extend_from_slice(&patterns[1]);
+        haystack.extend_from_slice(&[b'x'; 61]);
+        haystack.extend_from_slice(&patterns[2]);
+        haystack.extend_from_slice(b"SS");
+        let window = Window::new(2, haystack.len() - 2);
+        let reference = DFA::builder()
+            .match_kind(MatchKind::LeftmostFirst)
+            .build(patterns.iter().map(Vec::as_slice))
+            .unwrap();
+        let mut expected = Vec::new();
+        let mut cursor = window.start();
+        while let Some(matched) = reference_find(
+            &reference,
+            &haystack,
+            Window::new(cursor, window.end()),
+        ) {
+            cursor = matched.1;
+            expected.push(matched);
+        }
+        assert_eq!(
+            uniform.first_acceptance_without_prefilter_window_value(&haystack, window),
+            Ok(expected.first().map(|matched| matched.1)),
+        );
+
+        ordinary_direct_probe::reset();
+        let mut actual = Vec::new();
+        assert_eq!(
+            uniform.try_visit_spans_window_value(
+                &haystack,
+                window,
+                |matched| {
+                    actual.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 3);
+        assert!(actual[2].0 < actual[1].1 + 64);
+        assert!(actual[2].1 > actual[1].1 + 64);
+        assert!(ordinary_direct_probe::calls() >= 2);
+
+        let mut far = vec![b'x'; 32];
+        far.extend_from_slice(&patterns[0]);
+        far.extend_from_slice(&[b'x'; 32]);
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value(
+                &far,
+                Window::full(&far),
+                |_| Ok::<bool, ()>(true),
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 0);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value(
+                &haystack,
+                window,
+                |_| Ok::<bool, ()>(false),
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 0);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            uniform.try_visit_spans_window_value(
+                &haystack,
+                window,
+                |_| Err::<bool, _>("callback"),
+            ),
+            Ok(Err("callback")),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 0);
+
+        let no_prefilter_patterns = (0_u8..=u8::MAX)
+            .map(|byte| vec![byte, byte])
+            .collect::<Vec<_>>();
+        let no_prefilter = LiteralSetPlan::new_stable(
+            &no_prefilter_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(no_prefilter.automaton.match_kind(), MatchKind::Standard);
+        assert!(no_prefilter.automaton.prefilter().is_none());
+        assert!(
+            no_prefilter
+                .ordinary_executor()
+                .unwrap()
+                .uniform_standard_executor()
+                .is_none(),
+        );
+        let mut dense = no_prefilter_patterns[1].clone();
+        dense.extend_from_slice(&no_prefilter_patterns[2]);
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            no_prefilter
+                .ordinary_executor()
+                .unwrap()
+                .try_visit_spans_window_value(
+                    &dense,
+                    Window::full(&dense),
+                    |_| Ok::<bool, ()>(true),
+                ),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_direct_probe::calls(), 0);
+    }
+
+    #[test]
+    fn uniform_standard_direct_acceptance_respects_width_floor_in_every_window() {
+        for uniform_width in [1_usize, 2, 8] {
+            let q = vec![b'q'; uniform_width];
+            let z = vec![b'z'; uniform_width];
+            let patterns = vec![q.clone(), z.clone(), q.clone()];
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
+            assert!(plan.automaton.prefilter().is_some());
+            let reference = DFA::builder()
+                .match_kind(MatchKind::LeftmostFirst)
+                .build(patterns.iter().map(Vec::as_slice))
+                .unwrap();
+
+            let mut haystacks = vec![
+                Vec::new(),
+                vec![b'q'; uniform_width.saturating_sub(1)],
+                q.clone(),
+                z.clone(),
+                vec![b'x'; uniform_width],
+            ];
+            let mut framed = b"PP".to_vec();
+            framed.extend_from_slice(&vec![b'q'; uniform_width.saturating_sub(1)]);
+            framed.push(b'x');
+            framed.extend_from_slice(&q);
+            framed.extend_from_slice(b"SS");
+            haystacks.push(framed);
+
+            for haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = Window::new(start, end);
+                        let expected = reference_find(&reference, &haystack, window)
+                            .map(|(_, matched_end)| matched_end);
+                        let actual = first_acceptance_end_without_prefilter(
+                            &plan,
+                            &haystack,
+                            window,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "width={uniform_width}, haystack={haystack:?}, window={window:?}",
+                        );
+                    }
+                }
+            }
+
+            ordinary_direct_probe::reset();
+            let short = vec![b'q'; uniform_width.saturating_sub(1)];
+            assert_eq!(
+                first_acceptance_end_without_prefilter(
+                    &plan,
+                    &short,
+                    Window::full(&short),
+                ),
+                None,
+            );
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::special_checks(), 0);
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                first_acceptance_end_without_prefilter(
+                    &plan,
+                    &q,
+                    Window::full(&q),
+                ),
+                Some(uniform_width),
+            );
+            assert_eq!(ordinary_direct_probe::calls(), 1);
+            assert_eq!(ordinary_direct_probe::special_checks(), 1);
+        }
     }
 
     #[test]
