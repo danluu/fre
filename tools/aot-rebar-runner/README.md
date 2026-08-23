@@ -34,14 +34,19 @@ capture offsets.
 If that theorem specifically declines for an exact one-pattern job, the build
 next tries an independently authenticated native exact-span participation
 artifact. The ordinary Span selector remains authoritative for match choice;
-one helper-free DFA export replays that selected span and publishes only its
-participating group count into caller-owned storage. An authenticated semantic
-negative retains the pre-existing strict `capture_next` fallback. Parse,
-lowering, allocation, unrelated resource, emission, and authentication failures
-are terminal and are never converted into fallback. The adapter permits one
-fixed numeric retry only after the exact default participation DFA-state cap;
-that retry changes the state and dependent construction-work ceilings and
-nothing else.
+one helper-free DFA export replays that selected span and proves its exact
+participating group count. A selected participation artifact is then sealed
+into a new helper-free reducer that owns the complete match traversal and, for
+`grep-captures`, the exact `bstr::ByteSlice::lines` LF/CRLF domain. An
+authenticated participation semantic negative may independently select the
+strict `capture_next` source; that source is sealed into the same typed
+whole-operation ABI with private receipt-sized iterator state and result slots.
+The retained source route remains explicit in the final receipt. Parse,
+lowering, allocation, unrelated resource, emission, arithmetic, finalization,
+and authentication failures are terminal and are never converted into another
+source route. The adapter permits one fixed numeric retry only after the exact
+default participation DFA-state cap; that retry changes the state and
+dependent construction-work ceilings and nothing else.
 If that fixed retry itself exhausts exactly its `DfaStates` or `BuildWork`
 ceiling for a one-source `grep-captures` operation, one final mixed adapter may
 retain the helper-free ordinary Span selector already emitted by the uniform
@@ -132,22 +137,22 @@ timing belongs to a separately named compiler-stage benchmark.
   hashes. An independently constructed Rust captures oracle remains
   authoritative for the final value.
   After a uniform-proof decline, an exact one-pattern job may instead select a
-  helper-free exact-span participation DFA. Rust iterates spans through the
-  authenticated ordinary selector, passes each exact selected span to the
-  paired replay entry, and adds the returned nonzero count only after a
-  transactional `MATCH` status. The exact 16-byte aligned caller-owned scratch
-  area is reserved and must remain byte-for-byte untouched; non-`MATCH` status
-  must leave the count untouched and fails the operation. `grep-captures`
-  restarts the same checked loop for every Rebar byte-line domain. The stock
-  Rust captures oracle remains authoritative for the final value.
+  helper-free exact-span participation DFA. The final native reducer owns the
+  selector iteration, exact-span replay, empty-match byte progress, checked
+  accumulation, and transactional output. Its private participation scratch is
+  exactly the receipt's 16 bytes and is never caller-owned. `grep-captures`
+  performs LF splitting, strips one preceding CR, emits no line for empty input,
+  and emits no extra line after a final LF inside that same native call.
   An authenticated participation semantic decline may select the stricter
-  native `capture_next` route instead. That iterator publishes every
-  group-zero-inclusive slot into one caller-owned allocation, and the adapter
-  validates continuation state, fused exhaustion, slot completeness,
-  containment, progress, and checked participation totals on every result.
-  The route admits at most 4,096 capture groups, exposes no runtime helper, and
-  remains a native search/capture core with a checked Rust adapter loop rather
-  than a wholly fused operation.
+  native `capture_next` source instead. Its final reducer owns private iterator
+  state and the exact checked `group_count * slot_width` allocation, validates
+  every participating slot internally, and publishes only the complete scalar.
+  Both source routes expose zero runtime helpers and use the non-handle
+  `fre_aot_regex_{count,grep}_captures_v1_<identity>` ABI exactly once per
+  benchmark operation. The runner authenticates the final symbol hash, source
+  and final object identities, operation/domain, route-private schema, and
+  fixed object cap before dispatch. The independent stock Rust captures oracle
+  remains authoritative for the final value.
   If the fixed direct-participation construction envelope is exhausted, the
   one-source grep-only selector-first adapter instead calls that exact native
   selector once per line. Negative lines are complete native certificates;
@@ -252,6 +257,13 @@ The mixed selector-first route uses schema `fre.aot.rebar-runner.v4` and also
 publishes `selector_capture_fallback_bridge`, `capture_resolution`, the stock
 positive-fallback profile/symbol, and the exact direct-participation resource,
 required value, and limit that selected the route.
+The helper-free nonuniform one-source reducer uses schema
+`fre.aot.rebar-runner.v5`. It publishes one reducer operation entry plus the
+retained participation or `capture_next` child closure as identity inventory,
+keeps source-object and final-object hashes distinct, and seals the operation,
+LF/CRLF domain, empty progress, private schema, reducer-symbol hash, fixed
+object cap, and final artifact identity. Child entries are never counted as
+benchmark operation entries.
 
 ## Qualification before using results
 

@@ -1089,6 +1089,200 @@ def synthetic_strict_capture_qualification_receipt(
     return CENSUS.add_digest(receipt, "receipt_sha256")
 
 
+def single_capture_reducer_provenance_fields(
+    source_route: str = "exact-span-participation-v1",
+    model: str = "count-captures",
+) -> dict[str, str]:
+    if model == "count-captures":
+        operation = "count-captures"
+        domain = "whole-haystack"
+        benchmark = "runtime-job-000"
+        reducer = f"fre_aot_regex_count_captures_v1_{'e' * 64}"
+    elif model == "grep-captures":
+        operation = "grep-captures"
+        domain = "byte-slice-lines-lf-crlf"
+        benchmark = "runtime-job-002"
+        reducer = f"fre_aot_regex_grep_captures_v1_{'e' * 64}"
+    else:
+        raise AssertionError(f"unsupported synthetic capture reducer model {model!r}")
+    if source_route == "exact-span-participation-v1":
+        adapter = {
+            "count-captures": (
+                "general-aot-native-exact-span-participation-count-reducer-v1"
+            ),
+            "grep-captures": (
+                "general-aot-native-exact-span-participation-grep-reducer-v1"
+            ),
+        }[model]
+        engine = "NativeExactSpanParticipationDfaV1"
+        aggregate = (
+            "native-exact-span-participation-whole-operation-reducer-v1"
+        )
+        private = (16, 0, 0, 0)
+    elif source_route == "capture-next-v1":
+        adapter = {
+            "count-captures": (
+                "general-aot-native-single-capture-next-count-reducer-v1"
+            ),
+            "grep-captures": (
+                "general-aot-native-single-capture-next-grep-reducer-v1"
+            ),
+        }[model]
+        engine = "NativeOnePassCaptureV1"
+        aggregate = "native-single-capture-next-whole-operation-reducer-v1"
+        private = (0, 24, 3, 48)
+    else:
+        raise AssertionError(f"unsupported synthetic reducer source route {source_route!r}")
+    fields = {
+        "schema": "fre.aot.rebar-runner.v5",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": adapter,
+        "model": model,
+        "benchmark": benchmark,
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": "aarch64-linux",
+        "feature_bits": "0000000100000000",
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": engine,
+        "aggregate_strategy": aggregate,
+        "native_row_bridge": "false",
+        "capture_reducer_bridge": "true",
+        "source_pattern_count": "1",
+        "operation": operation,
+        "domain": domain,
+        "source_route": source_route,
+        "source_cardinality": "1",
+        "source_bytes": "4",
+        "source_pattern_sha256": "4" * 64,
+        "source_sha256": "1" * 64,
+        "group_count": "3",
+        "can_match_empty": "false",
+        "empty_progress": "byte",
+        "semantic_runtime_calls": "0",
+        "private_participation_scratch_bytes": str(private[0]),
+        "private_iterator_state_bytes": str(private[1]),
+        "private_result_slot_count": str(private[2]),
+        "private_result_slot_bytes": str(private[3]),
+        "selector_sha256": "2" * 64,
+        "capture_sha256": "3" * 64,
+        "source_artifact_identity_sha256": "7" * 64,
+        "source_object_sha256": "c" * 64,
+        "reducer_symbol": reducer,
+        "reducer_symbol_sha256": CENSUS.sha_bytes(reducer.encode()),
+        "object_sha256": "d" * 64,
+        "object_bytes": "123",
+        "max_object_bytes": str(CENSUS.MAX_NATIVE_ROW_OBJECT_BYTES),
+        "artifact_identity_sha256": "f" * 64,
+        "required_runtime_symbols": "",
+        "operation_entry_symbol": reducer,
+        "boundary": (
+            "single-call-helper-free-single-capture-whole-operation-reducer"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+    if source_route == "exact-span-participation-v1":
+        selector = f"fre_aot_regex_search_v1_{'a' * 64}"
+        export_identity = CENSUS.participation_export_identity(
+            "6" * 64,
+            fields["target"],
+            fields["feature_bits"],
+            "5" * 64,
+            selector,
+        )
+        fields.update({
+            "participation_algorithm_id": (
+                "fre-aot-regex.exact-span-participation-dfa.v1"
+            ),
+            "participation_strategy": "2",
+            "participation_assertions": "0",
+            "participation_assertion_signatures": "1",
+            "participation_byte_classes": "8",
+            "participation_dfa_states": "17",
+            "participation_transition_cells": "136",
+            "participation_build_work": "999",
+            "participation_scratch_bytes": "16",
+            "participation_plan_bytes": str(
+                CENSUS.participation_plan_bytes(0, 1, 17, 136)
+            ),
+            "participation_selector_object_sha256": "5" * 64,
+            "participation_bundle_sha256": "6" * 64,
+            "participation_export_identity_sha256": export_identity,
+            "participation_bundle_symbol": (
+                f"fre_aot_regex_participation_bundle_v1_{export_identity}"
+            ),
+            "participation_selector_symbol": selector,
+            "participation_entry_symbol": (
+                f"fre_aot_regex_participation_exact_v1_{export_identity}"
+            ),
+        })
+    else:
+        fields.update({
+            "capture_plan_sha256": "5" * 64,
+            "capture_bundle_sha256": "6" * 64,
+            "capture_next_symbol": f"fre_aot_regex_capture_next_v1_{'a' * 64}",
+            "capture_materialize_symbol": (
+                f"fre_aot_regex_capture_materialize_v1_{'b' * 64}"
+            ),
+            "capture_selector_symbol": f"fre_aot_regex_search_v1_{'c' * 64}",
+        })
+    return fields
+
+
+def synthetic_single_capture_reducer_qualification_receipt(
+    plan: dict[str, object],
+    source_route: str = "exact-span-participation-v1",
+    model: str = "count-captures",
+) -> dict[str, object]:
+    receipt = copy.deepcopy(synthetic_qualification_receipt(plan))
+    receipt.pop("receipt_sha256")
+    job = plan["jobs"][33 if model == "count-captures" else 35]
+    fields = single_capture_reducer_provenance_fields(source_route, model)
+    encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+    parsed = CENSUS.parse_provenance(encoded)
+    provenance = CENSUS.provenance_receipt(parsed)
+    reducer = fields["reducer_symbol"]
+    receipt["job"] = {
+        "job_id": job["job_id"],
+        "point_ids": job["point_ids"],
+        "model": job["model"],
+        "input": job["input"],
+        "candidate_klv": job["candidate_klv"],
+    }
+    artifact = {
+        "runner_sha256": "8" * 64,
+        "objects": [{"ordinal": 0, "sha256": "d" * 64, "bytes": 123}],
+    }
+    receipt["artifacts"] = {
+        "primary": artifact,
+        "replica": artifact,
+        "reproducible": True,
+        "compiled_artifact_present": True,
+        "runtime_execution_authenticated_separately": True,
+        "provenance": provenance,
+    }
+    receipt["route"]["operation_entry_symbols"] = [reducer]
+    receipt["route"]["operation_entry_symbols_sha256"] = CENSUS.sha_bytes(
+        CENSUS.canonical([reducer]).encode()
+    )
+    receipt["route"]["adapter_route"] = "linked-native-single-capture-reducer"
+    negative = receipt["phases"]["claimed_entry_negative_traps"][0]
+    negative["symbol"] = reducer
+    negative["marker"]["armed"][0]["symbol"] = reducer
+    negative["marker"]["triggered"] = reducer
+    receipt["classification"] = CENSUS.classification_from_qualification_evidence(
+        True,
+        [reducer],
+        receipt["route"]["adapter_route"],
+        [],
+        receipt["phases"],
+        "aarch64",
+    )
+    return CENSUS.add_digest(receipt, "receipt_sha256")
+
+
 class TrueNativeCensusTests(unittest.TestCase):
     def test_exact_adapter_includes_ordered_many_grep_and_uniform_capture_rows(self) -> None:
         self.assertTrue(CENSUS.has_exact_adapter("count", 1))
@@ -1163,6 +1357,21 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertIn(
             "participation-capture-v4",
             definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        reducer = definitions["captureReducerProvenance"]
+        self.assertFalse(reducer["additionalProperties"])
+        self.assertIn("source_pattern_sha256", reducer["required"])
+        self.assertIn("source_object_sha256", reducer["required"])
+        self.assertIn("object_sha256", reducer["required"])
+        self.assertIn("participation_source", reducer["required"])
+        self.assertIn("capture_next_source", reducer["required"])
+        self.assertIn(
+            "single-capture-reducer-v5",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        self.assertIn(
+            "single-capture-whole-operation-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
         self.assertIn(
             "exact-span-participation-v1",
@@ -1280,6 +1489,9 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-uniform-capture-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-single-capture-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-uniform-capture-helper-backed-reducer": (
@@ -2171,6 +2383,208 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertEqual(
             validated["classification"]["reason"],
             "native-search-core-with-static-uniform-capture-adapter-loop",
+        )
+
+    def test_single_capture_reducer_v5_is_whole_and_reducer_only(self) -> None:
+        plan = synthetic_plan()
+        for source_route in (
+            "exact-span-participation-v1", "capture-next-v1"
+        ):
+            for model in ("count-captures", "grep-captures"):
+                with self.subTest(source_route=source_route, model=model):
+                    fields = single_capture_reducer_provenance_fields(
+                        source_route, model
+                    )
+                    encoded = " ".join(
+                        f"{key}={value}" for key, value in fields.items()
+                    ).encode()
+                    parsed = CENSUS.parse_provenance(encoded)
+                    provenance = CENSUS.provenance_receipt(parsed)
+                    CENSUS.validate_provenance_record(
+                        provenance, "synthetic single-capture reducer"
+                    )
+                    reducer = fields["reducer_symbol"]
+                    expected_route = (
+                        [reducer], "linked-native-single-capture-reducer"
+                    )
+                    self.assertEqual(
+                        CENSUS.selected_operation_entries(parsed), expected_route
+                    )
+                    self.assertEqual(
+                        CENSUS.operation_route_from_provenance_record(provenance),
+                        expected_route,
+                    )
+                    identity_symbols = (
+                        CENSUS.identity_defined_symbols_from_provenance(provenance)
+                    )
+                    self.assertEqual(len(identity_symbols), 3)
+                    self.assertNotIn(reducer, identity_symbols)
+                    self.assertEqual(
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            provenance, set(identity_symbols), set(identity_symbols)
+                        ),
+                        identity_symbols,
+                    )
+                    with self.assertRaisesRegex(
+                        CENSUS.CensusError, "identity symbols are absent"
+                    ):
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            provenance,
+                            set(identity_symbols[1:]),
+                            set(identity_symbols),
+                        )
+                    receipt = synthetic_single_capture_reducer_qualification_receipt(
+                        plan, source_route, model
+                    )
+                    validated = CENSUS.validate_receipt(receipt, plan)
+                    self.assertEqual(
+                        validated["route"]["operation_entry_symbols"], [reducer]
+                    )
+                    self.assertTrue(
+                        validated["classification"][
+                            "whole_operation_native_authenticated"
+                        ]
+                    )
+                    self.assertFalse(
+                        validated["classification"]["adapter_outer_loop"]
+                    )
+                    self.assertEqual(
+                        validated["classification"]["reason"],
+                        "whole-operation-native-authenticated",
+                    )
+
+    def test_single_capture_reducer_v5_fails_closed(self) -> None:
+        base = single_capture_reducer_provenance_fields()
+
+        def parse(fields: dict[str, str]) -> dict[str, str]:
+            return CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+            )
+
+        mutations = []
+        wrong_prefix = dict(base)
+        wrong_prefix["reducer_symbol"] = (
+            f"fre_aot_regex_count_captures_exclusive_v1_{'e' * 64}"
+        )
+        wrong_prefix["operation_entry_symbol"] = wrong_prefix["reducer_symbol"]
+        wrong_prefix["reducer_symbol_sha256"] = CENSUS.sha_bytes(
+            wrong_prefix["reducer_symbol"].encode()
+        )
+        mutations.append((wrong_prefix, "symbol is not canonical"))
+
+        wrong_symbol_digest = dict(base)
+        wrong_symbol_digest["reducer_symbol_sha256"] = "9" * 64
+        mutations.append((wrong_symbol_digest, "symbol digest does not authenticate"))
+
+        wrong_domain = dict(base)
+        wrong_domain["domain"] = "byte-slice-lines-lf-crlf"
+        mutations.append((wrong_domain, "operation/domain differs"))
+
+        wrong_source_route = dict(base)
+        wrong_source_route["source_route"] = "capture-next-v1"
+        mutations.append((wrong_source_route, "private schema differs"))
+
+        zero_source_receipt = dict(base)
+        zero_source_receipt["source_sha256"] = "0" * 64
+        mutations.append((zero_source_receipt, "zero SHA-256 digest"))
+
+        aliased_source_digests = dict(base)
+        aliased_source_digests["source_sha256"] = base["source_pattern_sha256"]
+        mutations.append((aliased_source_digests, "digests are not distinct"))
+
+        swapped_objects = dict(base)
+        swapped_objects["source_object_sha256"] = base["object_sha256"]
+        mutations.append((swapped_objects, "source and final objects are not distinct"))
+
+        zero_identity = dict(base)
+        zero_identity["artifact_identity_sha256"] = "0" * 64
+        mutations.append((zero_identity, "zero SHA-256 digest"))
+
+        reused_identity = dict(base)
+        reused_identity["artifact_identity_sha256"] = base[
+            "source_artifact_identity_sha256"
+        ]
+        mutations.append((reused_identity, "source and final identities are not distinct"))
+
+        wrong_private = dict(base)
+        wrong_private["private_iterator_state_bytes"] = "24"
+        mutations.append((wrong_private, "private schema differs"))
+
+        runtime_backed = dict(base)
+        runtime_backed["required_runtime_symbols"] = (
+            "fre_aot_regex_runtime_search_v1"
+        )
+        mutations.append((runtime_backed, "noncanonical route"))
+
+        missing_child = dict(base)
+        missing_child.pop("participation_entry_symbol")
+        mutations.append((missing_child, "child symbols are not canonical"))
+
+        for fields, message in mutations:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(CENSUS.CensusError, message):
+                    parse(fields)
+
+        plan = synthetic_plan()
+        receipt = synthetic_single_capture_reducer_qualification_receipt(plan)
+
+        source_object_substitution = copy.deepcopy(receipt)
+        source_object_substitution.pop("receipt_sha256")
+        for label in ("primary", "replica"):
+            source_object_substitution["artifacts"][label]["objects"][0][
+                "sha256"
+            ] = base["source_object_sha256"]
+        source_object_substitution = CENSUS.add_digest(
+            source_object_substitution, "receipt_sha256"
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "object files differ"):
+            CENSUS.validate_receipt(source_object_substitution, plan)
+
+        wrong_pattern_source = copy.deepcopy(receipt)
+        wrong_pattern_source.pop("receipt_sha256")
+        wrong_pattern_source["artifacts"]["provenance"]["capture_reducer"][
+            "source_pattern_sha256"
+        ] = "9" * 64
+        wrong_pattern_source = CENSUS.add_digest(
+            wrong_pattern_source, "receipt_sha256"
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "pattern digest differs"):
+            CENSUS.validate_receipt(wrong_pattern_source, plan)
+
+        wrong_receipt_source = copy.deepcopy(receipt)
+        wrong_receipt_source.pop("receipt_sha256")
+        wrong_receipt_source["artifacts"]["provenance"]["capture_reducer"][
+            "source_sha256"
+        ] = "0" * 64
+        wrong_receipt_source = CENSUS.add_digest(
+            wrong_receipt_source, "receipt_sha256"
+        )
+        with self.assertRaisesRegex(CENSUS.CensusError, "zero SHA-256 digest"):
+            CENSUS.validate_receipt(wrong_receipt_source, plan)
+
+        missing_reducer_trap = copy.deepcopy(receipt)
+        missing_reducer_trap.pop("receipt_sha256")
+        missing_reducer_trap["phases"]["claimed_entry_negative_traps"] = []
+        missing_reducer_trap["classification"] = (
+            CENSUS.classification_from_qualification_evidence(
+                True,
+                missing_reducer_trap["route"]["operation_entry_symbols"],
+                missing_reducer_trap["route"]["adapter_route"],
+                [],
+                missing_reducer_trap["phases"],
+                "aarch64",
+            )
+        )
+        missing_reducer_trap = CENSUS.add_digest(
+            missing_reducer_trap, "receipt_sha256"
+        )
+        validated = CENSUS.validate_receipt(missing_reducer_trap, plan)
+        self.assertFalse(
+            validated["classification"]["whole_operation_native_authenticated"]
+        )
+        self.assertEqual(
+            validated["classification"]["reason"],
+            "claimed-entry-negative-control-failure",
         )
 
     def test_participation_capture_v4_closes_both_native_operation_entries(self) -> None:

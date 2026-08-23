@@ -226,6 +226,7 @@ dependencies = [
  "fre-lower",
  "fre-syntax",
  "regex-automata 0.4.15",
+ "sha2",
 ]
 
 [[package]]
