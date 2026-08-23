@@ -12929,6 +12929,13 @@ impl PortableRegex {
             PortablePlan::PureByteClassRepeat(plan) => {
                 Ok(plan.ordinary_is_match_full_unmetered(haystack))
             }
+            PortablePlan::UnicodeFoldedLiteral(plan) => plan
+                .is_match_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(SearchLimits::unlimited()),
+                )
+                .map_err(SearchError::from),
             PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
                 .is_match_window_value(
                     haystack,
@@ -13506,12 +13513,11 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::UnicodeFoldedLiteral(plan) => plan
-                .is_match_window(
+                .is_match_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     unicode_folded_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Exists,
@@ -14579,6 +14585,19 @@ impl PortableRegex {
             PortablePlan::PureByteClassRepeat(plan) => {
                 Ok(plan.ordinary_find_full_unmetered(haystack))
             }
+            PortablePlan::UnicodeFoldedLiteral(plan) => plan
+                .find_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(SearchLimits::unlimited()),
+                )
+                .map(|matched| {
+                    matched.map(|candidate| Match {
+                        start: candidate.start(),
+                        end: candidate.end(),
+                    })
+                })
+                .map_err(SearchError::from),
             PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
                 .find_window_value(
                     haystack,
@@ -15597,12 +15616,12 @@ impl PortableRegex {
                     .map_err(SearchError::from),
             },
             PortablePlan::UnicodeFoldedLiteral(plan) => plan
-                .find_window(
+                .find_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     unicode_folded_literal_limits(limits),
                 )
-                .map(|(matched, _)| {
+                .map(|matched| {
                     matched.map(|candidate| Match {
                         start: candidate.start(),
                         end: candidate.end(),

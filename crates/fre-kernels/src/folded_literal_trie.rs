@@ -11,10 +11,11 @@ use core::{fmt, marker::PhantomData, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_simd_kernels::{
-    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
-    DispatchPolicy, SelectionReceipt, SimdDispatchContext,
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, BYTE_SET_WIDE_BLOCK_BYTES,
+    ByteBucketClassifier, ByteBucketTables, DispatchPolicy, SelectionReceipt, SimdDispatchContext,
+    classify_byte_set1_32, classify_byte_set2_32, classify_byte_set3_32,
 };
-use memchr::{memchr_iter, memchr2_iter, memchr3_iter};
+use memchr::{memchr, memchr_iter, memchr2, memchr2_iter, memchr3, memchr3_iter};
 
 use crate::{
     Window,
@@ -857,6 +858,79 @@ impl RootPrefilter {
             correlated_reads: 0,
         })
     }
+
+    #[inline(never)]
+    fn scan_value(&self, source: &[u8], hit: &mut ValueHitState<'_, '_>) {
+        let first = match self.needle_count {
+            1 => memchr(self.needles[0], source),
+            2 => memchr2(self.needles[0], self.needles[1], source),
+            3 => memchr3(self.needles[0], self.needles[1], self.needles[2], source),
+            _ => unreachable!("value folded scan only admits memchr-width prefilters"),
+        };
+        let Some(first) = first else {
+            return;
+        };
+        if !hit.on_hit(first) {
+            return;
+        }
+        let Some(mut block_start) = first.checked_add(1) else {
+            hit.declined = true;
+            return;
+        };
+        let remaining = source.len().saturating_sub(block_start);
+        let complete_bytes = remaining.saturating_sub(remaining % BYTE_SET_WIDE_BLOCK_BYTES);
+        let Some(block_limit) = block_start.checked_add(complete_bytes) else {
+            hit.declined = true;
+            return;
+        };
+        while block_start < block_limit {
+            let Some(block_end) = block_start.checked_add(BYTE_SET_WIDE_BLOCK_BYTES) else {
+                hit.declined = true;
+                return;
+            };
+            let Ok(block) =
+                <&[u8; BYTE_SET_WIDE_BLOCK_BYTES]>::try_from(&source[block_start..block_end])
+            else {
+                hit.declined = true;
+                return;
+            };
+            let mut members = match self.needle_count {
+                1 => classify_byte_set1_32(self.needles[0], block).member_mask(),
+                2 => classify_byte_set2_32([self.needles[0], self.needles[1]], block).member_mask(),
+                3 => classify_byte_set3_32(
+                    [self.needles[0], self.needles[1], self.needles[2]],
+                    block,
+                )
+                .member_mask(),
+                _ => unreachable!("value folded scan only admits memchr-width prefilters"),
+            };
+            while members != 0 {
+                let lane = usize::try_from(members.trailing_zeros())
+                    .expect("a 32-byte classifier lane fits usize");
+                let Some(position) = block_start.checked_add(lane) else {
+                    hit.declined = true;
+                    return;
+                };
+                if !hit.on_hit(position) {
+                    return;
+                }
+                members &= members.saturating_sub(1);
+            }
+            block_start = block_end;
+        }
+        for (tail_offset, &byte) in source[block_limit..].iter().enumerate() {
+            if !self.primary_matches(byte) {
+                continue;
+            }
+            let Some(position) = block_limit.checked_add(tail_offset) else {
+                hit.declined = true;
+                return;
+            };
+            if !hit.on_hit(position) {
+                return;
+            }
+        }
+    }
 }
 
 trait LiteralCandidateSink {
@@ -1338,6 +1412,39 @@ impl FoldedLiteralTriePlan {
         Ok((selected, receipt))
     }
 
+    /// Return the leftmost candidate without retaining successful execution
+    /// accounting.
+    ///
+    /// Admitted memchr-width plans preserve the reporting path's complete
+    /// pre-source envelope and refusal order, then verify candidate starts
+    /// without updating diagnostic counters. Structurally unsupported plans
+    /// and impossible value arithmetic decline to the reporting implementation
+    /// so its exact partial-error receipt remains authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range, resource and accounting failures as
+    /// [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+    ) -> Result<Option<LiteralCandidate>, ScanAttemptError> {
+        match self.scan_window_prefiltered_value(
+            haystack,
+            window,
+            limits,
+            ScanStop::AfterMatchingStart,
+        )? {
+            ValueScanAttempt::Complete(selected) => Ok(selected),
+            ValueScanAttempt::Declined => self
+                .find_window(haystack, window, limits)
+                .map(|(selected, _)| selected),
+        }
+    }
+
     /// Find the leftmost candidate while bounding false-candidate density.
     ///
     /// The retained fixed-column prefilter visits candidate starts in byte
@@ -1484,6 +1591,98 @@ impl FoldedLiteralTriePlan {
             },
         )?;
         Ok((selected.is_some(), receipt))
+    }
+
+    /// Return whether any folded candidate exists without retaining
+    /// successful execution accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range, resource and accounting failures as
+    /// [`Self::is_match_window`].
+    #[inline]
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+    ) -> Result<bool, ScanAttemptError> {
+        match self.scan_window_prefiltered_value(
+            haystack,
+            window,
+            limits,
+            ScanStop::AfterFirstEvent,
+        )? {
+            ValueScanAttempt::Complete(selected) => Ok(selected.is_some()),
+            ValueScanAttempt::Declined => self
+                .is_match_window(haystack, window, limits)
+                .map(|(matched, _)| matched),
+        }
+    }
+
+    fn scan_window_prefiltered_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+        stop: ScanStop,
+    ) -> Result<ValueScanAttempt, ScanAttemptError> {
+        let Some(prefilter) = self.root_prefilter.as_ref() else {
+            return Ok(ValueScanAttempt::Declined);
+        };
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(ScanAttemptError {
+                source: ScanError::InvalidWindow {
+                    start: window.start(),
+                    end: window.end(),
+                    haystack_len: haystack.len(),
+                },
+                actual: ScanActual::default(),
+            });
+        }
+        let input_bytes =
+            window
+                .end()
+                .checked_sub(window.start())
+                .ok_or_else(|| ScanAttemptError {
+                    source: ScanError::ArithmeticOverflow {
+                        computation: "folded window length",
+                    },
+                    actual: ScanActual::default(),
+                })?;
+        let upper = self
+            .scan_upper_bounds(input_bytes)
+            .map_err(|source| ScanAttemptError {
+                source,
+                actual: ScanActual::default(),
+            })?;
+        enforce_scan_limits(upper, limits).map_err(|source| ScanAttemptError {
+            source,
+            actual: ScanActual::default(),
+        })?;
+        if !matches!(prefilter.needle_count, 1..=3)
+            || usize::from(prefilter.guard_needle_count) > ROOT_PREFILTER_BYTE_VALUES
+        {
+            return Ok(ValueScanAttempt::Declined);
+        }
+
+        scan_source_probe::record();
+        let source = &haystack[window.start()..window.end()];
+        let mut state = ValueHitState {
+            plan: self,
+            source,
+            absolute_base: window.start(),
+            offset: usize::from(prefilter.offset),
+            prefilter,
+            stop,
+            selected: None,
+            declined: false,
+        };
+        prefilter.scan_value(source, &mut state);
+        if state.declined {
+            return Ok(ValueScanAttempt::Declined);
+        }
+        Ok(ValueScanAttempt::Complete(state.selected))
     }
 
     fn scan_window_mode<F>(
@@ -2095,6 +2294,11 @@ enum ScanStop {
     AfterFirstEvent,
 }
 
+enum ValueScanAttempt {
+    Complete(Option<LiteralCandidate>),
+    Declined,
+}
+
 impl ScanStop {
     const fn after_matching_start(self) -> bool {
         !matches!(self, Self::Never)
@@ -2199,6 +2403,55 @@ where
             self.emit,
         )?;
         Ok(!self.stop.after_matching_start() || self.actual.candidate_events == events_before)
+    }
+}
+
+struct ValueHitState<'plan, 'source> {
+    plan: &'plan FoldedLiteralTriePlan,
+    source: &'source [u8],
+    absolute_base: usize,
+    offset: usize,
+    prefilter: &'plan RootPrefilter,
+    stop: ScanStop,
+    selected: Option<LiteralCandidate>,
+    declined: bool,
+}
+
+impl ValueHitState<'_, '_> {
+    #[inline(always)]
+    fn on_hit(&mut self, hit: usize) -> bool {
+        let Some(relative_start) = hit.checked_sub(self.offset) else {
+            return true;
+        };
+        if self.prefilter.has_guard() {
+            let Some(guard_position) =
+                relative_start.checked_add(usize::from(self.prefilter.guard_offset))
+            else {
+                self.declined = true;
+                return false;
+            };
+            let Some(&guard_byte) = self.source.get(guard_position) else {
+                return true;
+            };
+            if !self.prefilter.guard_matches(guard_byte) {
+                return true;
+            }
+        }
+        let Some(selected) = scan_folded_start_value(
+            self.plan,
+            self.source,
+            self.absolute_base,
+            relative_start,
+            self.stop.after_first_event(),
+        ) else {
+            self.declined = true;
+            return false;
+        };
+        if let Some(selected) = selected {
+            self.selected = Some(selected);
+            return false;
+        }
+        true
     }
 }
 
@@ -3601,6 +3854,46 @@ fn scale_classifier_volume(mut volume: u128, dimensions: usize) -> Option<u128> 
     Some(volume)
 }
 
+fn scan_folded_start_value(
+    plan: &FoldedLiteralTriePlan,
+    source: &[u8],
+    absolute_base: usize,
+    relative_start: usize,
+    stop_after_first_event: bool,
+) -> Option<Option<LiteralCandidate>> {
+    let start = absolute_base.checked_add(relative_start)?;
+    let mut selected = None::<LiteralCandidate>;
+    let mut state = 0_usize;
+    let mut cursor = relative_start;
+    let mut depth = 0_usize;
+    while cursor < source.len() && depth < plan.build.max_pattern_scalars {
+        let decoded = decode_scalar(&source[cursor..]);
+        let Some(scalar) = decoded.scalar else {
+            break;
+        };
+        let Some(next) = transition_value(&plan.nodes, &plan.edges, state, scalar) else {
+            break;
+        };
+        state = next;
+        cursor = cursor.checked_add(decoded.width)?;
+        depth = depth.checked_add(1)?;
+        let end = absolute_base.checked_add(cursor)?;
+        let mut output = plan.nodes[state].first_output;
+        while output != NONE {
+            let terminal = plan.outputs[output];
+            let candidate = LiteralCandidate::new(terminal.pattern_index, start, end);
+            if selected.is_none_or(|best| candidate.pattern_index() < best.pattern_index()) {
+                selected = Some(candidate);
+            }
+            if stop_after_first_event {
+                return Some(selected);
+            }
+            output = terminal.next;
+        }
+    }
+    Some(selected)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the early-stop bit joins the established explicit scan-accounting boundary"
@@ -4305,6 +4598,18 @@ fn transition(
     (None, probes)
 }
 
+fn transition_value(nodes: &[Node], edges: &[Edge], state: usize, scalar: u32) -> Option<usize> {
+    let mut edge = nodes[state].first_edge;
+    while edge != NONE {
+        let candidate = edges[edge];
+        if u32::from(candidate.scalar) == scalar {
+            return Some(candidate.target);
+        }
+        edge = candidate.next;
+    }
+    None
+}
+
 fn transition_with_actual(
     nodes: &[Node],
     edges: &[Edge],
@@ -4764,8 +5069,8 @@ mod tests {
     };
     use crate::{LiteralCandidate, Window};
     use fre_simd_kernels::{
-        BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
-        DispatchPolicy, SimdDispatchContext,
+        BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, BYTE_SET_WIDE_BLOCK_BYTES,
+        ByteBucketClassifier, ByteBucketTables, DispatchPolicy, SimdDispatchContext,
     };
 
     const KELVIN: [char; 3] = ['K', 'k', '\u{212A}'];
@@ -4823,6 +5128,52 @@ mod tests {
             max_work: upper.work,
             max_scratch_bytes: upper.scratch_bytes,
         }
+    }
+
+    fn assert_value_projection_parity(
+        plan: &FoldedLiteralTriePlan,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+        expected_recorded_source_accesses: usize,
+        expected_value_source_accesses: usize,
+    ) -> (
+        Result<Option<LiteralCandidate>, super::ScanAttemptError>,
+        Result<bool, super::ScanAttemptError>,
+    ) {
+        scan_source_probe::reset();
+        let recorded_find = plan
+            .find_window(haystack, window, limits)
+            .map(|(candidate, _receipt)| candidate);
+        let recorded_find_accesses = scan_source_probe::accesses();
+
+        scan_source_probe::reset();
+        let value_find = plan.find_window_value(haystack, window, limits);
+        let value_find_accesses = scan_source_probe::accesses();
+        assert_eq!(value_find, recorded_find);
+        assert_eq!(
+            recorded_find_accesses,
+            expected_recorded_source_accesses
+        );
+        assert_eq!(value_find_accesses, expected_value_source_accesses);
+
+        scan_source_probe::reset();
+        let recorded_is_match = plan
+            .is_match_window(haystack, window, limits)
+            .map(|(matched, _receipt)| matched);
+        let recorded_is_match_accesses = scan_source_probe::accesses();
+
+        scan_source_probe::reset();
+        let value_is_match = plan.is_match_window_value(haystack, window, limits);
+        let value_is_match_accesses = scan_source_probe::accesses();
+        assert_eq!(value_is_match, recorded_is_match);
+        assert_eq!(
+            recorded_is_match_accesses,
+            expected_recorded_source_accesses
+        );
+        assert_eq!(value_is_match_accesses, expected_value_source_accesses);
+
+        (recorded_find, recorded_is_match)
     }
 
     fn synthetic_primary(
@@ -5947,6 +6298,361 @@ mod tests {
                 .0,
             Some(LiteralCandidate::new(0, 0, 1))
         );
+    }
+
+    #[test]
+    fn value_projections_match_recorded_prefilter_forms_and_edge_cases() {
+        let kelvin = FoldedScalarClass::new(&KELVIN);
+        let one = [kelvin];
+        let two = [kelvin, kelvin];
+        let patterns = [
+            FoldedLiteral::new(&two),
+            FoldedLiteral::new(&one),
+            FoldedLiteral::new(&two),
+            FoldedLiteral::new(&one),
+        ];
+        let narrow = admitted(&patterns);
+        let narrow_prefilter = narrow.root_prefilter.as_ref().unwrap();
+        assert_eq!(narrow_prefilter.needle_count, 3);
+        assert!(narrow_prefilter.classifier.is_none());
+        let (found, matched) = assert_value_projection_parity(
+            &narrow,
+            b"xKKKK",
+            Window::new(1, 5),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 1, 3)));
+        assert!(matched.unwrap());
+
+        let mut malformed = vec![0xFF, 0xC0, 0xAF, 0xED, 0xA0, 0x80];
+        let valid_start = malformed.len();
+        malformed.extend_from_slice("\u{212A}".as_bytes());
+        malformed.extend_from_slice(&[0xE2, 0x84]);
+        let (found, matched) = assert_value_projection_parity(
+            &narrow,
+            &malformed,
+            Window::full(&malformed),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(
+            found.unwrap(),
+            Some(LiteralCandidate::new(
+                1,
+                valid_start,
+                valid_start + "\u{212A}".len()
+            ))
+        );
+        assert!(matched.unwrap());
+
+        let split = "\u{212A}".as_bytes();
+        for window in [Window::new(0, 2), Window::new(1, 3)] {
+            let (found, matched) = assert_value_projection_parity(
+                &narrow,
+                split,
+                window,
+                ScanLimits::unlimited(),
+                1,
+                1,
+            );
+            assert_eq!(found.unwrap(), None);
+            assert!(!matched.unwrap());
+        }
+
+        let russian_classes = [
+            FoldedScalarClass::new(&CYRILLIC_SHA),
+            FoldedScalarClass::new(&CYRILLIC_IE),
+        ];
+        let russian_patterns = [FoldedLiteral::new(&russian_classes)];
+        let guarded = admitted(&russian_patterns);
+        let guarded_prefilter = guarded.root_prefilter.as_ref().unwrap();
+        assert_eq!(guarded_prefilter.needle_count, 2);
+        assert_ne!(guarded_prefilter.guard_needle_count, 0);
+        let framed = "xxШЕшеШЕyy".as_bytes();
+        let (found, matched) = assert_value_projection_parity(
+            &guarded,
+            framed,
+            Window::new(2, framed.len() - 2),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 2, 6)));
+        assert!(matched.unwrap());
+
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let wide_classes = one_class(&FOUR);
+        let wide_patterns = [FoldedLiteral::new(&wide_classes)];
+        let wide = admitted(&wide_patterns);
+        assert_eq!(wide.build.root_prefilter_needles, 4);
+        assert_eq!(wide.root_prefilter_classifier_columns(), 1);
+        let (found, matched) = assert_value_projection_parity(
+            &wide,
+            b"xxqD!",
+            Window::new(2, 5),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 3, 4)));
+        assert!(matched.unwrap());
+
+        let correlated = correlated_ascii_plan();
+        assert_eq!(correlated.root_prefilter_classifier_columns(), 2);
+        let (found, matched) = assert_value_projection_parity(
+            &correlated,
+            b"xxq\x01az",
+            Window::new(2, 6),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 3, 5)));
+        assert!(matched.unwrap());
+    }
+
+    #[test]
+    fn value_projections_continue_after_rejected_root_hits() {
+        let check = |plan: &FoldedLiteralTriePlan, literal: &[u8], needle_count| {
+            let prefilter = plan.root_prefilter.as_ref().unwrap();
+            assert_eq!(prefilter.needle_count, needle_count);
+            assert!(prefilter.classifier.is_none());
+
+            let mut haystack = vec![b'!'; 2 * BYTE_SET_WIDE_BLOCK_BYTES + 11];
+            haystack[usize::from(prefilter.offset)] = prefilter.needles[0];
+            let (found, matched) = assert_value_projection_parity(
+                plan,
+                &haystack,
+                Window::full(&haystack),
+                ScanLimits::unlimited(),
+                1,
+                1,
+            );
+            assert_eq!(found.unwrap(), None);
+            assert!(!matched.unwrap());
+
+            let expected_start = haystack.len();
+            haystack.extend_from_slice(literal);
+            let (found, matched) = assert_value_projection_parity(
+                plan,
+                &haystack,
+                Window::full(&haystack),
+                ScanLimits::unlimited(),
+                1,
+                1,
+            );
+            assert_eq!(
+                found.unwrap(),
+                Some(LiteralCandidate::new(
+                    0,
+                    expected_start,
+                    expected_start + literal.len()
+                ))
+            );
+            assert!(matched.unwrap());
+        };
+
+        const ASCII_Q: [char; 1] = ['Q'];
+        const ASCII_Z: [char; 1] = ['Z'];
+        let ascii_classes = [
+            FoldedScalarClass::new(&ASCII_Q),
+            FoldedScalarClass::new(&ASCII_Z),
+        ];
+        check(&admitted(&[FoldedLiteral::new(&ascii_classes)]), b"QZ", 1);
+
+        let russian_classes = [
+            FoldedScalarClass::new(&CYRILLIC_SHA),
+            FoldedScalarClass::new(&CYRILLIC_IE),
+        ];
+        check(
+            &admitted(&[FoldedLiteral::new(&russian_classes)]),
+            "ШЕ".as_bytes(),
+            2,
+        );
+
+        let kelvin = FoldedScalarClass::new(&KELVIN);
+        let kelvin_classes = [kelvin, kelvin];
+        check(&admitted(&[FoldedLiteral::new(&kelvin_classes)]), b"KK", 3);
+    }
+
+    #[test]
+    fn value_projections_keep_exact_preflight_failures() {
+        let classes = one_class(&KELVIN);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        let haystack = "Kk\u{212A}".as_bytes();
+        let upper = plan.scan_upper_bounds(haystack.len()).unwrap();
+
+        let (found, matched) = assert_value_projection_parity(
+            &plan,
+            haystack,
+            Window::full(haystack),
+            exact_scan_limits(upper),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 0, 1)));
+        assert!(matched.unwrap());
+
+        for window in [
+            Window::new(2, 1),
+            Window::new(0, haystack.len().checked_add(1).unwrap()),
+        ] {
+            let expected = super::ScanAttemptError {
+                source: ScanError::InvalidWindow {
+                    start: window.start(),
+                    end: window.end(),
+                    haystack_len: haystack.len(),
+                },
+                actual: ScanActual::default(),
+            };
+            let (found, matched) =
+                assert_value_projection_parity(
+                    &plan,
+                    haystack,
+                    window,
+                    ScanLimits::unlimited(),
+                    0,
+                    0,
+                );
+            assert_eq!(found.unwrap_err(), expected);
+            assert_eq!(matched.unwrap_err(), expected);
+        }
+
+        let cases = [
+            (
+                ScanResource::InputBytes,
+                upper.input_bytes,
+                ScanLimits {
+                    max_input_bytes: upper.input_bytes.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::CandidateStarts,
+                upper.candidate_starts,
+                ScanLimits {
+                    max_candidate_starts: upper.candidate_starts.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::ScalarDecodes,
+                upper.scalar_decodes,
+                ScanLimits {
+                    max_scalar_decodes: upper.scalar_decodes.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::DecodedScalars,
+                upper.decoded_scalars,
+                ScanLimits {
+                    max_decoded_scalars: upper.decoded_scalars.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::InvalidBytes,
+                upper.invalid_bytes,
+                ScanLimits {
+                    max_invalid_bytes: upper.invalid_bytes.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::SourceByteReads,
+                upper.source_byte_reads,
+                ScanLimits {
+                    max_source_byte_reads: upper.source_byte_reads.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::TransitionProbes,
+                upper.transition_probes,
+                ScanLimits {
+                    max_transition_probes: upper.transition_probes.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::CandidateEvents,
+                upper.candidate_events,
+                ScanLimits {
+                    max_candidate_events: upper.candidate_events.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::Work,
+                upper.work,
+                ScanLimits {
+                    max_work: upper.work.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+            (
+                ScanResource::ScratchBytes,
+                upper.scratch_bytes,
+                ScanLimits {
+                    max_scratch_bytes: upper.scratch_bytes.saturating_sub(1),
+                    ..ScanLimits::unlimited()
+                },
+            ),
+        ];
+        let mut checked = 0;
+        for (resource, needed, limits) in cases {
+            if needed == 0 {
+                assert_eq!(resource, ScanResource::ScratchBytes);
+                continue;
+            }
+            let expected = super::ScanAttemptError {
+                source: ScanError::Resource {
+                    resource,
+                    needed,
+                    limit: needed - 1,
+                },
+                actual: ScanActual::default(),
+            };
+            let (found, matched) =
+                assert_value_projection_parity(
+                    &plan,
+                    haystack,
+                    Window::full(haystack),
+                    limits,
+                    0,
+                    0,
+                );
+            assert_eq!(found.unwrap_err(), expected);
+            assert_eq!(matched.unwrap_err(), expected);
+            checked += 1;
+        }
+        assert_eq!(checked, 9);
+    }
+
+    #[test]
+    fn value_projections_match_direct_kernel_without_a_retained_prefilter() {
+        let classes = one_class(&KELVIN);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let mut plan = admitted(&patterns);
+        assert!(plan.root_prefilter.is_some());
+        plan.root_prefilter = None;
+
+        let haystack = [0xFF, b'x', b'K', 0xE2, 0x84];
+        let (found, matched) = assert_value_projection_parity(
+            &plan,
+            &haystack,
+            Window::full(&haystack),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 2, 3)));
+        assert!(matched.unwrap());
     }
 
     #[test]

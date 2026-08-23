@@ -385,6 +385,16 @@ impl UnicodeFoldedLiteralSearchPlan {
         self.trie.find_window(haystack, window, limits)
     }
 
+    #[inline]
+    pub(crate) fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: fre_kernels::Window,
+        limits: FoldedLiteralTrieScanLimits,
+    ) -> Result<Option<LiteralCandidate>, FoldedLiteralTrieScanAttemptError> {
+        self.trie.find_window_value(haystack, window, limits)
+    }
+
     pub(crate) fn is_match_window(
         &self,
         haystack: &[u8],
@@ -392,6 +402,16 @@ impl UnicodeFoldedLiteralSearchPlan {
         limits: FoldedLiteralTrieScanLimits,
     ) -> Result<(bool, FoldedLiteralTrieScanReceipt), FoldedLiteralTrieScanAttemptError> {
         self.trie.is_match_window(haystack, window, limits)
+    }
+
+    #[inline]
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: fre_kernels::Window,
+        limits: FoldedLiteralTrieScanLimits,
+    ) -> Result<bool, FoldedLiteralTrieScanAttemptError> {
+        self.trie.is_match_window_value(haystack, window, limits)
     }
 
     pub(crate) fn shortest_window(

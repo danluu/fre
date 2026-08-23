@@ -261,6 +261,19 @@ fn arbitrary_bytes_windows_and_iteration_match_oracle_and_force_k0() {
                 .unwrap();
             assert_eq!(span(found), expected_find, "{name}, window {start}..{end}");
             assert_eq!(
+                span(
+                    regex
+                        .find_window_value(
+                            &haystack,
+                            SearchWindow::new(start, end),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                ),
+                expected_find,
+                "{name}, value window {start}..{end}"
+            );
+            assert_eq!(
                 regex
                     .is_match_window(
                         &haystack,
@@ -271,6 +284,17 @@ fn arbitrary_bytes_windows_and_iteration_match_oracle_and_force_k0() {
                     .0,
                 expected_find.is_some(),
                 "{name}, existence window {start}..{end}"
+            );
+            assert_eq!(
+                regex
+                    .is_match_window_value(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                expected_find.is_some(),
+                "{name}, value existence window {start}..{end}"
             );
             assert_eq!(
                 regex
@@ -303,10 +327,21 @@ fn arbitrary_bytes_windows_and_iteration_match_oracle_and_force_k0() {
         SearchWindow::new(2, 1),
         SearchWindow::new(0, haystack.len() + 1),
     ] {
-        assert!(
+        assert_eq!(
+            automatic
+                .find_window_value(&haystack, invalid, SearchLimits::unlimited())
+                .unwrap_err(),
             automatic
                 .find_window(&haystack, invalid, SearchLimits::unlimited())
-                .is_err()
+                .unwrap_err()
+        );
+        assert_eq!(
+            automatic
+                .is_match_window_value(&haystack, invalid, SearchLimits::unlimited())
+                .unwrap_err(),
+            automatic
+                .is_match_window(&haystack, invalid, SearchLimits::unlimited())
+                .unwrap_err()
         );
         assert!(
             forced
@@ -356,6 +391,14 @@ fn early_stop_actuals_exclude_later_candidates_and_limits_preflight() {
     ));
     assert_eq!(error.actual_work, 0);
     assert_eq!(error.actual_source_byte_reads, 0);
+    assert_eq!(
+        regex.find_value(&haystack, below).unwrap_err(),
+        regex.find_accounted(&haystack, below).unwrap_err()
+    );
+    assert_eq!(
+        regex.is_match_value(&haystack, below).unwrap_err(),
+        regex.is_match_accounted(&haystack, below).unwrap_err()
+    );
 }
 
 #[test]
@@ -369,10 +412,20 @@ fn repeated_portable_folded_search_and_iteration_allocate_nothing() {
         .unwrap();
     assert_eq!(span(first), Some((0, RUSSIAN.len())));
     for _ in 0..32 {
+        assert!(regex.is_match(haystack));
+        assert_eq!(span(regex.find(haystack)), span(first));
         assert!(
             regex
                 .is_match_value(haystack, SearchLimits::unlimited())
                 .unwrap()
+        );
+        assert_eq!(
+            span(
+                regex
+                    .find_value(haystack, SearchLimits::unlimited())
+                    .unwrap()
+            ),
+            span(first)
         );
         let (found, accounting) = regex
             .find_accounted(haystack, SearchLimits::unlimited())
