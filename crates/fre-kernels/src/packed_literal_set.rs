@@ -52,6 +52,9 @@ const LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES: usize = 8;
 // bytes are the smallest exact fragment whose occurrence stream can prove
 // strictly more impossible starts than that byte-set route.
 const SHARED_FRAGMENT_MIN_BYTES: usize = 2;
+const SHARED_FRAGMENT_DISPATCH_GROUPS: usize = 256;
+const SHARED_FRAGMENT_DISPATCH_TABLE_BYTES: usize =
+    SHARED_FRAGMENT_DISPATCH_GROUPS * size_of::<u16>();
 /// Stable identity of the incumbent packed literal-set implementation.
 pub const RUNTIME_IMPLEMENTATION_ID: &str = "packed-literal-set";
 /// Stable identity of the equal-width scalar Shift-And search implementation.
@@ -402,7 +405,7 @@ struct SparseAnchor {
 struct SharedFragment {
     offset: usize,
     width: usize,
-    minimum_pattern_width: usize,
+    minimum_pattern_width: u16,
     maximum_candidate_verification_work: usize,
     // Exclusive start boundary proved by the native prefix search.
     native_start_budget: usize,
@@ -412,9 +415,13 @@ struct SharedFragment {
     // computes it once so an early native match has no arithmetic tail.
     native_prefix_bytes: usize,
     finder: Finder<'static>,
-    // Source-order patterns encoded as a little-endian u16 width followed by
-    // the bytes. The retained-byte and candidate-work proofs are shared with
-    // `SparseAnchor`.
+    // An exact byte outside the fragment. `None` keeps the incumbent
+    // source-order verifier and authenticates the absence of a group table.
+    dispatch_offset: Option<u16>,
+    // Patterns encoded as a little-endian u16 width followed by the bytes.
+    // With dispatch they retain source order within each byte bucket and are
+    // followed by 256 cumulative u16 group ends. Without dispatch they retain
+    // global source order.
     patterns: Box<[u8]>,
 }
 
@@ -526,8 +533,35 @@ impl SparseAnchor {
 }
 
 impl SharedFragment {
+    #[allow(
+        clippy::as_conversions,
+        reason = "every retained pattern width is proved to fit u16 before construction"
+    )]
+    const fn minimum_pattern_width(&self) -> usize {
+        self.minimum_pattern_width as usize
+    }
+
+    fn dispatch_parts(&self) -> Option<(usize, &[u8], &[u8])> {
+        let dispatch_offset = usize::from(self.dispatch_offset?);
+        let trailer_start = self
+            .patterns
+            .len()
+            .checked_sub(SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)?;
+        let encoded = self.patterns.get(..trailer_start)?;
+        let group_ends = self.patterns.get(trailer_start..)?;
+        Some((dispatch_offset, encoded, group_ends))
+    }
+
+    fn dispatch_group_end(group_ends: &[u8], group: usize) -> Option<usize> {
+        let byte_start = group.checked_mul(size_of::<u16>())?;
+        let &[low, high] = group_ends.get(byte_start..byte_start.checked_add(2)?)? else {
+            return None;
+        };
+        Some(usize::from(u16::from_le_bytes([low, high])))
+    }
+
     fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
-        let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
+        let last_start = haystack.len().checked_sub(self.minimum_pattern_width())?;
         if minimum_start > last_start {
             return None;
         }
@@ -541,7 +575,23 @@ impl SharedFragment {
 
     fn verify_at(&self, haystack: &[u8], start: usize) -> Option<usize> {
         let fragment_end = self.offset.checked_add(self.width)?;
-        let mut encoded = self.patterns.as_ref();
+        let dispatch = self.dispatch_parts();
+        let mut encoded = if let Some((dispatch_offset, encoded, group_ends)) = dispatch {
+            let byte = *haystack.get(start.checked_add(dispatch_offset)?)?;
+            let group = usize::from(byte);
+            let group_start = if group == 0 {
+                0
+            } else {
+                Self::dispatch_group_end(group_ends, group.checked_sub(1)?)?
+            };
+            let group_end = Self::dispatch_group_end(group_ends, group)?;
+            if group_start == group_end {
+                return None;
+            }
+            encoded.get(group_start..group_end)?
+        } else {
+            self.patterns.as_ref()
+        };
         while !encoded.is_empty() {
             let (&low, rest) = encoded.split_first()?;
             let (&high, rest) = rest.split_first()?;
@@ -552,9 +602,25 @@ impl SharedFragment {
             let Some(candidate) = haystack.get(start..end) else {
                 continue;
             };
-            if candidate.get(..self.offset) == pattern.get(..self.offset)
-                && candidate.get(fragment_end..) == pattern.get(fragment_end..)
-            {
+            let matches = if let Some((dispatch_offset, _, _)) = dispatch {
+                if dispatch_offset < self.offset {
+                    candidate.get(..dispatch_offset) == pattern.get(..dispatch_offset)
+                        && candidate.get(dispatch_offset.checked_add(1)?..self.offset)
+                            == pattern.get(dispatch_offset.checked_add(1)?..self.offset)
+                        && candidate.get(fragment_end..) == pattern.get(fragment_end..)
+                } else {
+                    debug_assert!(dispatch_offset >= fragment_end);
+                    candidate.get(..self.offset) == pattern.get(..self.offset)
+                        && candidate.get(fragment_end..dispatch_offset)
+                            == pattern.get(fragment_end..dispatch_offset)
+                        && candidate.get(dispatch_offset.checked_add(1)?..)
+                            == pattern.get(dispatch_offset.checked_add(1)?..)
+                }
+            } else {
+                candidate.get(..self.offset) == pattern.get(..self.offset)
+                    && candidate.get(fragment_end..) == pattern.get(fragment_end..)
+            };
+            if matches {
                 return Some(end);
             }
         }
@@ -1033,7 +1099,15 @@ impl PackedLiteralSetPlan {
                 let shared_fragment = if sparse_anchor.is_some() || shared_columns.is_some() {
                     None
                 } else {
-                    select_shared_fragment(patterns, native_searcher.minimum_len()).map(Box::new)
+                    let maximum_sidecar_bytes = limits
+                        .max_persistent_bytes
+                        .saturating_sub(native_searcher.memory_usage());
+                    select_shared_fragment_with_max_persistent_bytes(
+                        patterns,
+                        native_searcher.minimum_len(),
+                        maximum_sidecar_bytes,
+                    )
+                    .map(Box::new)
                 };
                 let sidecar_bytes = sparse_anchor.as_ref().map_or_else(
                     || {
@@ -1117,7 +1191,7 @@ impl PackedLiteralSetPlan {
             capability_id: LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
             fragment_offset: shared_fragment.offset,
             fragment_bytes: shared_fragment.width,
-            minimum_pattern_bytes: shared_fragment.minimum_pattern_width,
+            minimum_pattern_bytes: shared_fragment.minimum_pattern_width(),
             maximum_candidate_verification_work: shared_fragment
                 .maximum_candidate_verification_work,
             native_prefix_bytes: shared_fragment.native_prefix_bytes,
@@ -2136,9 +2210,22 @@ fn select_shared_columns<P: AsRef<[u8]>>(
     })
 }
 
+#[cfg(test)]
 fn select_shared_fragment<P: AsRef<[u8]>>(
     patterns: &[P],
     native_minimum_haystack_bytes: usize,
+) -> Option<SharedFragment> {
+    select_shared_fragment_with_max_persistent_bytes(
+        patterns,
+        native_minimum_haystack_bytes,
+        usize::MAX,
+    )
+}
+
+fn select_shared_fragment_with_max_persistent_bytes<P: AsRef<[u8]>>(
+    patterns: &[P],
+    native_minimum_haystack_bytes: usize,
+    maximum_sidecar_bytes: usize,
 ) -> Option<SharedFragment> {
     if patterns.len() < 2 {
         return None;
@@ -2221,25 +2308,132 @@ fn select_shared_fragment<P: AsRef<[u8]>>(
         .checked_sub(1)?
         .checked_add(native_start_budget)?;
 
+    let fragment_end = best_offset.checked_add(best_width)?;
+    let selected_dispatch_offset = select_shared_fragment_dispatch_offset(
+        patterns,
+        minimum_pattern_width,
+        best_offset,
+        fragment_end,
+    );
     let mut retained = Vec::with_capacity(retained_pattern_bytes);
     for pattern in patterns {
         let pattern = pattern.as_ref();
         retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
         retained.extend_from_slice(pattern);
     }
-    let fragment_end = best_offset.checked_add(best_width)?;
+    let incumbent_sidecar_bytes = size_of::<SharedFragment>()
+        .checked_add(retained_pattern_bytes)?
+        .checked_add(best_width)?;
+    let dispatch_sidecar_bytes =
+        incumbent_sidecar_bytes.checked_add(SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)?;
+    let dispatch_fits = dispatch_sidecar_bytes <= maximum_sidecar_bytes;
+    let mut retained_dispatch = false;
+    if dispatch_fits && selected_dispatch_offset.is_some() {
+        #[cfg(test)]
+        let allocation_allowed = !shared_fragment_dispatch_allocation_probe::take_failure();
+        #[cfg(not(test))]
+        let allocation_allowed = true;
+        retained_dispatch = allocation_allowed
+            && retained
+                .try_reserve_exact(SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)
+                .is_ok();
+    }
+    if retained_dispatch {
+        let dispatch_offset = selected_dispatch_offset?;
+        let mut group_ends = [0_u16; SHARED_FRAGMENT_DISPATCH_GROUPS];
+        retained.clear();
+        for dispatch_byte in 0_u16..=u16::from(u8::MAX) {
+            let dispatch_byte = u8::try_from(dispatch_byte).ok()?;
+            for pattern in patterns {
+                let pattern = pattern.as_ref();
+                if pattern[dispatch_offset] != dispatch_byte {
+                    continue;
+                }
+                retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
+                retained.extend_from_slice(pattern);
+            }
+            group_ends[usize::from(dispatch_byte)] = u16::try_from(retained.len()).ok()?;
+        }
+        debug_assert_eq!(retained.len(), retained_pattern_bytes);
+        for group_end in group_ends {
+            retained.extend_from_slice(&group_end.to_le_bytes());
+        }
+    }
+    let dispatch_offset = if retained_dispatch {
+        Some(u16::try_from(selected_dispatch_offset?).ok()?)
+    } else {
+        None
+    };
     let mut needle = Vec::with_capacity(best_width);
     needle.extend_from_slice(first.get(best_offset..fragment_end)?);
     Some(SharedFragment {
         offset: best_offset,
         width: best_width,
-        minimum_pattern_width,
+        minimum_pattern_width: u16::try_from(minimum_pattern_width).ok()?,
         maximum_candidate_verification_work,
         native_start_budget,
         native_prefix_bytes,
         finder: FinderBuilder::new().build_forward_owned(needle),
+        dispatch_offset,
         patterns: retained.into_boxed_slice(),
     })
+}
+
+fn select_shared_fragment_dispatch_offset<P: AsRef<[u8]>>(
+    patterns: &[P],
+    minimum_pattern_width: usize,
+    fragment_start: usize,
+    fragment_end: usize,
+) -> Option<usize> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut best = None;
+    let mut best_score = (usize::MAX, usize::MAX, u64::MAX, usize::MAX);
+    for offset in 0..minimum_pattern_width {
+        if (fragment_start..fragment_end).contains(&offset) {
+            continue;
+        }
+        let mut bucket_counts = [0_usize; 256];
+        for pattern in patterns {
+            let byte = *pattern.as_ref().get(offset)?;
+            bucket_counts[usize::from(byte)] = bucket_counts[usize::from(byte)].checked_add(1)?;
+        }
+        let (maximum_bucket, collision_work, frequency_score) =
+            bucket_counts.iter().enumerate().try_fold(
+                (0_usize, 0_usize, 0_u64),
+                |(maximum, collisions, frequency), (byte, &bucket)| {
+                    if bucket == 0 {
+                        return Some((maximum, collisions, frequency));
+                    }
+                    let collisions = collisions.checked_add(bucket.checked_mul(bucket)?)?;
+                    let rank = u64::from(
+                        crate::packed_ordered_literal_aggregate::byte_frequency_rank(
+                            u8::try_from(byte).ok()?,
+                        ),
+                    );
+                    Some((
+                        maximum.max(bucket),
+                        collisions,
+                        frequency.checked_add(rank.checked_add(1)?)?,
+                    ))
+                },
+            )?;
+        // Minimize the worst surviving bucket first, then the average
+        // source-alternative work under a uniform source-pattern prior. When
+        // two columns partition the language equally, prefer the rarer byte
+        // set and finally the lower fixed offset.
+        let score = (maximum_bucket, collision_work, frequency_score, offset);
+        if score < best_score {
+            best_score = score;
+            best = Some(offset);
+        }
+    }
+    if best_score.0 < patterns.len() {
+        best
+    } else {
+        None
+    }
 }
 
 fn factor_complete_columns<P: AsRef<[u8]>>(
@@ -2488,6 +2682,34 @@ mod retained_iter_owner_allocation_probe {
 }
 
 #[cfg(test)]
+mod shared_fragment_dispatch_allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|fail| fail.set(false));
+        }
+    }
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|fail| {
+            assert!(!fail.replace(true));
+        });
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|fail| fail.replace(false))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BUILD_FACTOR, LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
@@ -2499,6 +2721,7 @@ mod tests {
         find_bounded_long_shared_fragment,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         search_work_upper_bound, select_shared_fragment, select_sparse_anchor,
+        shared_fragment_dispatch_allocation_probe,
         shared_fragment_native_start_budget,
     };
     #[cfg(not(feature = "static-dispatch"))]
@@ -2508,6 +2731,21 @@ mod tests {
         retained_iter_owner_allocation_probe, uniform_word64_allocation_probe,
     };
     use crate::Window;
+
+    #[allow(
+        dead_code,
+        reason = "exact e030 SharedFragment layout witness for fallback accounting compatibility"
+    )]
+    struct E030SharedFragmentLayout {
+        offset: usize,
+        width: usize,
+        minimum_pattern_width: usize,
+        maximum_candidate_verification_work: usize,
+        native_start_budget: usize,
+        native_prefix_bytes: usize,
+        finder: super::Finder<'static>,
+        patterns: Box<[u8]>,
+    }
 
     fn plan(patterns: &[&[u8]]) -> Option<PackedLiteralSetPlan> {
         match PackedLiteralSetPlan::new(patterns, PackedLiteralSetBuildLimits::default()) {
@@ -2542,6 +2780,21 @@ mod tests {
         [
             b"aa00x", b"aa11", b"aa22", b"aa33", b"aa44", b"aa55", b"aa66", b"aa77",
         ]
+    }
+
+    fn shared_fragment_dispatch_group(fragment: &super::SharedFragment, byte: u8) -> &[u8] {
+        let (_, encoded, group_ends) = fragment
+            .dispatch_parts()
+            .expect("shared fragment has no dispatch table");
+        let group = usize::from(byte);
+        let start = if group == 0 {
+            0
+        } else {
+            super::SharedFragment::dispatch_group_end(group_ends, group.checked_sub(1).unwrap())
+                .unwrap()
+        };
+        let end = super::SharedFragment::dispatch_group_end(group_ends, group).unwrap();
+        &encoded[start..end]
     }
 
     fn cartesian_patterns() -> Vec<Vec<u8>> {
@@ -3356,6 +3609,206 @@ mod tests {
         assert!(
             select_shared_fragment(&[b"ab".as_slice(), b"ac".as_slice()], 1).is_none()
         );
+        assert_eq!(
+            super::select_shared_fragment_dispatch_offset(
+                &[b"abX0".as_slice(), b"abX1".as_slice()],
+                3,
+                0,
+                2,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn shared_fragment_dispatch_selects_the_strongest_column_for_variable_widths() {
+        let patterns = [
+            b"common__C1q".as_slice(),
+            b"common__A0q0".as_slice(),
+            b"common__A0q11".as_slice(),
+            b"common__B0q222".as_slice(),
+            b"common__B1q3333".as_slice(),
+        ];
+        let fragment = select_shared_fragment(&patterns, 1).unwrap();
+        assert_eq!((fragment.offset, fragment.width), (0, 8));
+        let (dispatch_offset, _, group_ends) = fragment.dispatch_parts().unwrap();
+        assert_eq!(dispatch_offset, 8);
+        assert_eq!(group_ends.len(), 256 * core::mem::size_of::<u16>());
+        // Offset 8 has buckets 2/2/1. Offset 9 has buckets 3/2 and offset 10
+        // is constant, so the worst-bucket and collision score is unique.
+        assert_eq!(shared_fragment_dispatch_group(&fragment, b'A').len(), 29);
+        assert_eq!(shared_fragment_dispatch_group(&fragment, b'B').len(), 33);
+        assert_eq!(shared_fragment_dispatch_group(&fragment, b'C').len(), 13);
+        assert!(shared_fragment_dispatch_group(&fragment, b'Z').is_empty());
+
+        for pattern in patterns {
+            let expected = patterns
+                .iter()
+                .find(|candidate| pattern.starts_with(candidate))
+                .map(|candidate| candidate.len());
+            assert_eq!(fragment.verify_at(pattern, 0), expected, "{pattern:?}");
+        }
+        // The common fragment is present, but an absent dispatch byte is an
+        // exact zero-mask rejection before any retained pattern comparison.
+        assert_eq!(fragment.verify_at(b"common__Z0q999", 0), None);
+        assert_eq!(fragment.verify_at(b"common__", 0), None);
+        assert_eq!(fragment.verify_at(b"common__A", 0), None);
+        assert_eq!(fragment.verify_at(b"xxcommon__A0q0", 2), Some(14));
+    }
+
+    #[test]
+    fn shared_fragment_dispatch_preserves_four_pattern_source_priority() {
+        let long_first_patterns = [
+            b"common__A0".as_slice(),
+            b"common__A".as_slice(),
+            b"common__B1".as_slice(),
+            b"common__C22".as_slice(),
+        ];
+        let long_first = select_shared_fragment(&long_first_patterns, 1).unwrap();
+        assert_eq!(long_first.dispatch_parts().unwrap().0, 8);
+        assert_eq!(shared_fragment_dispatch_group(&long_first, b'A').len(), 23);
+        assert_eq!(long_first.verify_at(b"common__A0", 0), Some(10));
+
+        let short_first_patterns = [
+            b"common__A".as_slice(),
+            b"common__A0".as_slice(),
+            b"common__B1".as_slice(),
+            b"common__C22".as_slice(),
+        ];
+        let short_first = select_shared_fragment(&short_first_patterns, 1).unwrap();
+        assert_eq!(short_first.verify_at(b"common__A0", 0), Some(9));
+        for pattern in short_first_patterns {
+            let expected = short_first_patterns
+                .iter()
+                .find(|candidate| pattern.starts_with(candidate))
+                .map(|candidate| candidate.len());
+            assert_eq!(short_first.verify_at(pattern, 0), expected, "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn shared_fragment_dispatch_handles_64k_windows_seams_and_dense_decoys() {
+        const BUFFER_BYTES: usize = 64 * 1024;
+
+        let patterns = shared_prefix_patterns();
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("eight-pattern variable-width language lost its shared fragment")
+        };
+        let (dispatch_offset, _, group_ends) = shared_fragment.dispatch_parts().unwrap();
+        assert_eq!(dispatch_offset, 2);
+        assert_eq!(group_ends.len(), 256 * core::mem::size_of::<u16>());
+        for pattern in patterns {
+            assert_eq!(
+                shared_fragment_dispatch_group(shared_fragment, pattern[2]).len(),
+                pattern.len().checked_add(2).unwrap()
+            );
+            assert_eq!(shared_fragment.verify_at(pattern, 0), Some(pattern.len()));
+        }
+        assert!(shared_fragment_dispatch_group(shared_fragment, b'a').is_empty());
+
+        let match_pattern = patterns[6];
+        let match_start = BUFFER_BYTES.checked_sub(match_pattern.len()).unwrap();
+        let mut dense = vec![b'a'; BUFFER_BYTES];
+        dense[match_start..].copy_from_slice(match_pattern);
+        let expected = searcher
+            .find(&dense)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((match_start, BUFFER_BYTES)));
+        assert_eq!(
+            plan.find(&dense, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected
+        );
+
+        let seam = BUFFER_BYTES / 2;
+        let seam_pattern = patterns[3];
+        let seam_start = seam.checked_sub(2).unwrap();
+        let seam_end = seam_start.checked_add(seam_pattern.len()).unwrap();
+        let mut seam_haystack = vec![b'.'; BUFFER_BYTES];
+        seam_haystack[seam_start..seam_end].copy_from_slice(seam_pattern);
+        assert_eq!(
+            plan.find(&seam_haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((seam_start, seam_end))
+        );
+        for window in [Window::new(0, seam), Window::new(seam, BUFFER_BYTES)] {
+            assert_eq!(
+                plan.find_window(
+                    &seam_haystack,
+                    window,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                None
+            );
+        }
+        assert_eq!(
+            plan.find_window(
+                &dense,
+                Window::new(seam, BUFFER_BYTES),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((match_start, BUFFER_BYTES))
+        );
+        assert_eq!(
+            plan.find_window(
+                &dense,
+                Window::new(seam, BUFFER_BYTES - 1),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            None
+        );
+    }
+
+    #[test]
+    fn shared_fragment_dispatch_allocation_failure_keeps_incumbent_fallback() {
+        let patterns = [
+            b"longpref0".as_slice(),
+            b"longpref11".as_slice(),
+            b"longpref222".as_slice(),
+            b"longpref3333".as_slice(),
+        ];
+        let _failure = shared_fragment_dispatch_allocation_probe::fail_next();
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("dispatch allocation failure changed the incumbent engine")
+        };
+        assert!(shared_fragment.dispatch_parts().is_none());
+        for haystack in [
+            b"longprefx..longpref3333".as_slice(),
+            b"no shared fragment here".as_slice(),
+            b"longpref".as_slice(),
+        ] {
+            let expected = searcher
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                plan.find(haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3377,13 +3830,21 @@ mod tests {
             panic!("long common fragment did not select its shared-fragment engine")
         };
         assert!(shared_fragment.width >= LONG_SHARED_FRAGMENT_RECEIPT_MIN_BYTES);
+        let (dispatch_offset, _, group_ends) = shared_fragment.dispatch_parts().unwrap();
+        assert_eq!(dispatch_offset, 8);
+        assert_eq!(group_ends.len(), 256 * core::mem::size_of::<u16>());
+        assert!(shared_fragment_dispatch_group(shared_fragment, b'x').is_empty());
+        assert_eq!(shared_fragment.verify_at(b"longprefx", 0), None);
+        for pattern in patterns {
+            assert_eq!(shared_fragment.verify_at(pattern, 0), Some(pattern.len()));
+        }
         assert_eq!(
             plan.long_shared_fragment_build_receipt(),
             Some(PackedLiteralSetLongSharedFragmentBuildReceipt {
                 capability_id: LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
                 fragment_offset: shared_fragment.offset,
                 fragment_bytes: shared_fragment.width,
-                minimum_pattern_bytes: shared_fragment.minimum_pattern_width,
+                minimum_pattern_bytes: shared_fragment.minimum_pattern_width(),
                 maximum_candidate_verification_work: shared_fragment
                     .maximum_candidate_verification_work,
                 native_prefix_bytes: shared_fragment.native_prefix_bytes,
@@ -3908,7 +4369,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test closes coupled cost, persistence, downgrade, and refusal boundaries"
+    )]
     fn native_shared_fragment_cost_and_persistence_are_bounded() {
+        assert_eq!(
+            core::mem::size_of::<super::SharedFragment>(),
+            core::mem::size_of::<E030SharedFragmentLayout>(),
+        );
         let patterns = shared_prefix_patterns();
         let Some(plan) = plan(&patterns) else {
             return;
@@ -3952,6 +4421,38 @@ mod tests {
                 .unwrap()
         );
         let persistent = plan.build_accounting().persistent_bytes;
+        let (dispatch_offset, _, group_ends) = fragment.dispatch_parts().unwrap();
+        assert_eq!(dispatch_offset, 2);
+        assert_eq!(
+            group_ends.len(),
+            super::SHARED_FRAGMENT_DISPATCH_TABLE_BYTES
+        );
+        let encoded_pattern_bytes = patterns
+            .iter()
+            .map(|pattern| {
+                pattern
+                    .len()
+                    .checked_add(core::mem::size_of::<u16>())
+                    .unwrap()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            fragment.patterns.len(),
+            encoded_pattern_bytes
+                .checked_add(super::SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)
+                .unwrap()
+        );
+        let exact_sidecar_bytes = core::mem::size_of::<super::SharedFragment>()
+            .checked_add(fragment.patterns.len())
+            .and_then(|bytes| bytes.checked_add(fragment.width))
+            .unwrap();
+        assert_eq!(
+            persistent,
+            searcher
+                .memory_usage()
+                .checked_add(exact_sidecar_bytes)
+                .unwrap()
+        );
         assert_eq!(
             PackedLiteralSetPlan::new(
                 &patterns,
@@ -3965,16 +4466,52 @@ mod tests {
             .persistent_bytes,
             persistent
         );
+        let incumbent_persistent = persistent
+            .checked_sub(super::SHARED_FRAGMENT_DISPATCH_TABLE_BYTES)
+            .unwrap();
+        let downgraded = PackedLiteralSetPlan::new(
+            &patterns,
+            PackedLiteralSetBuildLimits {
+                max_persistent_bytes: persistent - 1,
+                ..PackedLiteralSetBuildLimits::default()
+            },
+        )
+        .unwrap();
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment: downgraded_fragment,
+            ..
+        } = &downgraded.engine
+        else {
+            panic!("tight cap did not retain the incumbent shared-fragment plan")
+        };
+        assert!(downgraded_fragment.dispatch_parts().is_none());
+        assert_eq!(
+            downgraded.build_accounting().persistent_bytes,
+            incumbent_persistent
+        );
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: incumbent_persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            incumbent_persistent
+        );
         assert!(matches!(
             PackedLiteralSetPlan::new(
                 &patterns,
                 PackedLiteralSetBuildLimits {
-                    max_persistent_bytes: persistent - 1,
+                    max_persistent_bytes: incumbent_persistent - 1,
                     ..PackedLiteralSetBuildLimits::default()
                 },
             ),
             Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
-                if needed == persistent && limit == persistent - 1
+                if needed == incumbent_persistent && limit == incumbent_persistent - 1
         ));
     }
 
@@ -4245,6 +4782,14 @@ mod tests {
         else {
             panic!("shared-interior language did not retain its common fragment")
         };
+        assert_eq!((shared_fragment.offset, shared_fragment.width), (1, 2));
+        let dispatch_offset = shared_fragment
+            .dispatch_parts()
+            .expect("interior shared fragment lost its outside-byte dispatch")
+            .0;
+        assert!(!(1..3).contains(&dispatch_offset));
+        assert!(shared_fragment_dispatch_group(shared_fragment, b'!').is_empty());
+        assert_eq!(shared_fragment.verify_at(b"!QRx", 0), None);
         let interior_budget = shared_fragment.native_start_budget;
         let decoy_start = interior_budget.checked_add(32).unwrap();
         let decoy_end = decoy_start.checked_add(4).unwrap();
