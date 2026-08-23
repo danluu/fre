@@ -1603,7 +1603,16 @@ fn print_provenance() {
                 FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
             )
         };
-    let boundary = if linked::SHARED_ORDERED_MANY_AGGREGATE {
+    let boundary = if linked::UNIFORM_CAPTURE_BRIDGE
+        && !linked::NATIVE_ROW_BRIDGE
+        && !linked::REDUCER_SYMBOL.is_empty()
+    {
+        if linked::REQUIRED_RUNTIME_SYMBOLS.is_empty() {
+            "single-call-native-uniform-capture-reducer"
+        } else {
+            "single-call-native-uniform-capture-helper-backed-reducer"
+        }
+    } else if linked::SHARED_ORDERED_MANY_AGGREGATE {
         "single-call-shared-ordered-many-helper-backed-reducer"
     } else {
         "runtime-klv-warmup-schedule"
@@ -1687,10 +1696,11 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
-    let prepared_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
+    let scalar_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
+    let native_uniform_capture = scalar_uniform_capture && !linked::REDUCER_SYMBOL.is_empty();
+    let prepared_uniform_capture = scalar_uniform_capture && linked::REDUCER_SYMBOL.is_empty();
     if linked::SHARED_ORDERED_MANY_AGGREGATE
-        != (linked::ORDERED_MANY_RECEIPT_SCHEMA
-            == fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
+        != (linked::ORDERED_MANY_RECEIPT_SCHEMA == fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
             && linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32])
     {
         return Err("shared ordered-many route disagrees with its source receipt".to_owned());
@@ -1710,8 +1720,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     {
         return Err("shared ordered-many route overlaps another adapter route".to_owned());
     }
-    if ((!prepared_uniform_capture && linked::UNIFORM_CAPTURE_BRIDGE)
-        || linked::STRICT_CAPTURE_BRIDGE
+    if (linked::STRICT_CAPTURE_BRIDGE
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE)
         && !linked::NATIVE_ROW_BRIDGE
@@ -1817,7 +1826,106 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
     }
     let native_scalar_reducer = authenticate_linked_native_scalar_reducer(benchmark.model)?;
-    if prepared_uniform_capture {
+    if native_uniform_capture {
+        let reducer_prefix = match benchmark.model {
+            shared::Model::CountCaptures => "fre_aot_regex_count_captures_exclusive_v1_",
+            shared::Model::GrepCaptures => "fre_aot_regex_grep_captures_exclusive_v1_",
+            _ => return Err("native uniform-capture reducer has a non-capture model".to_owned()),
+        };
+        let expected_adapter = match benchmark.model {
+            shared::Model::CountCaptures => "general-aot-native-uniform-capture-count-reducer-v1",
+            shared::Model::GrepCaptures => "general-aot-native-uniform-capture-grep-reducer-v1",
+            _ => unreachable!("capture model was checked above"),
+        };
+        let expected_grep = if benchmark.model == shared::Model::GrepCaptures {
+            "linked-native-uniform-capture-reducer-v1"
+        } else {
+            "not-applicable"
+        };
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_v1_")
+            .ok_or_else(|| "native uniform-capture selector symbol is not canonical".to_owned())?;
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_")
+            .ok_or_else(|| "native uniform-capture program symbol is not canonical".to_owned())?;
+        native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix)
+            .ok_or_else(|| "native uniform-capture reducer symbol is not canonical".to_owned())?;
+        let ordered = linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)";
+        let direct = linked::AGGREGATE_STRATEGY == "Some(NativeFused)";
+        let ordered_span_fill_is_canonical = ordered
+            && native_symbol_identity(
+                linked::SPAN_FILL_SYMBOL,
+                "fre_aot_regex_fill_spans_exclusive_v1_",
+            )
+            .is_some();
+        let runtime_symbols = linked::REQUIRED_RUNTIME_SYMBOLS
+            .split(',')
+            .filter(|symbol| !symbol.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_ordered_symbols = [
+            "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+            "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+            "fre_aot_regex_runtime_search_exclusive_v1",
+            "fre_aot_regex_runtime_search_v1",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        if benchmark.patterns.len() != 1
+            || linked::ADAPTER != expected_adapter
+            || linked::NATIVE_SCALAR_REDUCER
+            || linked::SHARED_ORDERED_MANY_AGGREGATE
+            || linked::PREPARE_OPERATION_FLAGS != shared::Model::Count.prepare_operation_flags()
+            || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
+            || linked::GREP_ITERATION_STRATEGY != expected_grep
+            || linked::ROW_ARTIFACT_COUNT != 1
+            || linked::SOURCE_PATTERN_COUNT != 1
+            || linked::SOURCE_TO_ARTIFACT != [0]
+            || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+            || linked::ROW_ENTRY_SYMBOLS != [linked::ENTRY_SYMBOL]
+            || linked::ROW_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+            || linked::ROW_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+            || linked::PROGRAM_LEN == 0
+            || linked::PROGRAM_SHA256 == [0; 32]
+            || linked::OBJECT_SHA256 == [0; 32]
+            || linked::OBJECT_BYTES.is_empty()
+            || linked::ROW_PARTICIPATING_GROUPS.len() != 1
+            || linked::SOURCE_PARTICIPATING_GROUPS.len() != 1
+            || linked::ROW_PARTICIPATING_GROUPS != linked::SOURCE_PARTICIPATING_GROUPS
+            || linked::SOURCE_PARTICIPATING_GROUPS.contains(&0)
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.len() != 1
+            || linked::SOURCE_MINIMUM_MATCH_BYTES.contains(&0)
+            || linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len() != 1
+            || linked::SOURCE_PROOF_WORK.len() != 1
+            || linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len() != 1
+            || linked::SOURCE_SELECTOR_AUTOMATON_SHA256 != linked::ROW_AUTOMATON_SHA256
+            || linked::SOURCE_SELECTOR_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+            || linked::SOURCE_SELECTOR_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+            || linked::UNIFORM_CAPTURE_ALGORITHM_VERSION
+                != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION
+            || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION
+                != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
+            || linked::REDUCER_SYMBOL == linked::ENTRY_SYMBOL
+            || linked::REDUCER_SYMBOL == linked::PROGRAM_SYMBOL
+            || (direct
+                && (linked::REQUIRED_PREPARE_CAPABILITIES != 0
+                    || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V2_VERSION
+                    || linked::PREPARED_BULK_STRATEGY != "None"
+                    || linked::HAS_SPAN_FILL
+                    || !linked::SPAN_FILL_SYMBOL.is_empty()
+                    || !runtime_symbols.is_empty()))
+            || (ordered
+                && (linked::REQUIRED_PREPARE_CAPABILITIES != PREPARE_CAPABILITY_ORDERED_NFA_V15
+                    || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION
+                    || linked::ENGINE != "OrderedNfa"
+                    || linked::PREPARED_BULK_STRATEGY != "Some(NativeOrderedNfaLoop)"
+                    || !linked::HAS_SPAN_FILL
+                    || !ordered_span_fill_is_canonical
+                    || runtime_symbols != expected_ordered_symbols))
+            || !(direct || ordered)
+        {
+            return Err(
+                "native uniform-capture reducer identity closure is inconsistent".to_owned(),
+            );
+        }
+    } else if prepared_uniform_capture {
         if benchmark.patterns.len() != 1
             || !benchmark.model.is_capture()
             || linked::STRICT_CAPTURE_BRIDGE
@@ -1899,7 +2007,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if benchmark.model == shared::Model::Count && linked::AGGREGATE_STRATEGY == "None" {
         return Err("count artifact has no aggregate strategy".to_owned());
     }
-    if prepared_uniform_capture {
+    if scalar_uniform_capture {
         // The exact per-line or whole-domain route was authenticated above.
     } else if benchmark.model == shared::Model::GrepCount {
         let direct = authenticate_linked_direct_native_grep();
@@ -2804,6 +2912,13 @@ fn run_operation(
             ExclusiveSession::strict_span_sum_with_direct_entry,
         ),
         shared::Model::GrepCount => {
+            run_operation_route(benchmark, session, ExclusiveSession::reduce)
+        }
+        shared::Model::CountCaptures | shared::Model::GrepCaptures
+            if linked::UNIFORM_CAPTURE_BRIDGE
+                && !linked::NATIVE_ROW_BRIDGE
+                && !linked::REDUCER_SYMBOL.is_empty() =>
+        {
             run_operation_route(benchmark, session, ExclusiveSession::reduce)
         }
         shared::Model::CountCaptures | shared::Model::GrepCaptures

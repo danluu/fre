@@ -93,6 +93,50 @@ fn main() {
         return;
     }
     if benchmark.uses_uniform_capture_bridge() {
+        if benchmark.patterns.len() == 1 {
+            let disposition =
+                shared::try_compile_native_uniform_capture_reducer(&benchmark, target)
+                    .expect("compile native public Rebar uniform-capture reducer");
+            if let fre_aot_regex::UniformCaptureReducerCompileDisposition::Selected(selected) =
+                disposition
+            {
+                let compiled = selected.compiled();
+                let capture_receipt = selected.receipt();
+                let (program_symbol, program_len) = compiled
+                    .module()
+                    .required_runtime_program()
+                    .expect("uniform-capture reducer publishes its exact runtime program");
+                fs::write(&object_path, compiled.object())
+                    .expect("write linked native uniform-capture reducer object");
+                fs::write(
+                    &generated_path,
+                    configured_source(
+                        &benchmark,
+                        compiled,
+                        None,
+                        Some(&capture_receipt),
+                        None,
+                        &object_path,
+                        program_symbol,
+                        program_len,
+                        compiled.module().entry_symbol(),
+                        compiled.module().prepared_span_fill_symbol(),
+                        Some(selected.reducer_symbol()),
+                        &architecture,
+                        &operating_system,
+                        feature_bits,
+                        &source_commit,
+                        &source_tree,
+                    ),
+                )
+                .expect("write linked native uniform-capture reducer bindings");
+                println!(
+                    "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                    object_path.display()
+                );
+                return;
+            }
+        }
         match shared::try_compile_uniform_capture_bridge(&benchmark, target)
             .expect("compile helper-free public Rebar uniform-capture bridge")
         {
@@ -148,6 +192,7 @@ fn main() {
                         &benchmark,
                         compiled,
                         Some(&bridge.receipt),
+                        None,
                         None,
                         &object_path,
                         program_symbol,
@@ -288,6 +333,7 @@ fn main() {
                         &benchmark,
                         compiled,
                         None,
+                        None,
                         Some(&artifact.receipt()),
                         &object_path,
                         program_symbol,
@@ -380,6 +426,7 @@ fn main() {
             &compiled,
             None,
             None,
+            None,
             &object_path,
             program_symbol,
             program_len,
@@ -430,6 +477,7 @@ fn configured_source(
     benchmark: &shared::Benchmark,
     compiled: &fre_aot_regex::CompiledRegex,
     uniform_capture_receipt: Option<&fre_aot_regex::UniformCapturePreparedSpanFillCompileReceipt>,
+    uniform_capture_reducer_receipt: Option<&fre_aot_regex::UniformCaptureReducerCompileReceipt>,
     ordered_many_receipt: Option<&fre_aot_regex::OrderedManyAotReceipt>,
     object_path: &std::path::Path,
     program_symbol: &str,
@@ -445,10 +493,13 @@ fn configured_source(
 ) -> String {
     let receipt = compiled.receipt();
     let prepared_uniform_capture = uniform_capture_receipt.is_some();
+    let native_uniform_capture = uniform_capture_reducer_receipt.is_some();
+    let uniform_capture = prepared_uniform_capture || native_uniform_capture;
     let shared_ordered_many = ordered_many_receipt.is_some();
-    assert_eq!(prepared_uniform_capture, benchmark.model.is_capture());
+    assert!(!(prepared_uniform_capture && native_uniform_capture));
+    assert_eq!(uniform_capture, benchmark.model.is_capture());
     assert_eq!(shared_ordered_many, benchmark.patterns.len() > 1);
-    assert!(!prepared_uniform_capture || !shared_ordered_many);
+    assert!(!uniform_capture || !shared_ordered_many);
     if let Some(ordered) = ordered_many_receipt {
         assert_eq!(ordered.rows, benchmark.patterns.len());
         assert_eq!(
@@ -463,8 +514,11 @@ fn configured_source(
             receipt.prepared_aggregate_strategy
         );
     }
-    assert_eq!(prepared_uniform_capture, reducer_symbol.is_none());
-    assert!(!prepared_uniform_capture || benchmark.patterns.len() == 1);
+    assert_eq!(
+        native_uniform_capture,
+        uniform_capture && reducer_symbol.is_some()
+    );
+    assert!(!uniform_capture || benchmark.patterns.len() == 1);
     assert!(!prepared_uniform_capture || span_fill_symbol.is_some());
     assert_eq!(
         receipt.required_prepare_capabilities,
@@ -494,8 +548,9 @@ fn configured_source(
     let native_scalar_reducer =
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
             .expect("compiled native scalar reducer failed build-time authentication");
-    let span_iteration_strategy = if shared_ordered_many && benchmark.model == shared::Model::SpanSum
-    {
+    let span_iteration_strategy = if native_uniform_capture {
+        "not-applicable".to_owned()
+    } else if shared_ordered_many && benchmark.model == shared::Model::SpanSum {
         "linked-shared-ordered-many-native-span-sum-reducer-v1".to_owned()
     } else if prepared_uniform_capture {
         format!("linked-prepared-span-fill-uniform-capture-64::{prepared_bulk_strategy}")
@@ -509,7 +564,9 @@ fn configured_source(
         "linked-direct-entry-loop".to_owned()
     };
     let grep_iteration_strategy =
-        if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
+        if native_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
+            "linked-native-uniform-capture-reducer-v1".to_owned()
+        } else if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "per-line-linked-prepared-span-fill-uniform-capture-v1".to_owned()
         } else if benchmark.model == shared::Model::GrepCount {
             "linked-native-grep-count-reducer-v1".to_owned()
@@ -553,7 +610,7 @@ fn configured_source(
     .unwrap();
     writeln!(
         source,
-        "pub const UNIFORM_CAPTURE_BRIDGE: bool = {prepared_uniform_capture};"
+        "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
     )
     .unwrap();
     writeln!(
@@ -562,10 +619,16 @@ fn configured_source(
         if shared_ordered_many {
             match benchmark.model {
                 shared::Model::Count => "general-aot-shared-ordered-many-native-count-v1",
-                shared::Model::SpanSum => {
-                    "general-aot-shared-ordered-many-native-span-sum-v1"
-                }
+                shared::Model::SpanSum => "general-aot-shared-ordered-many-native-span-sum-v1",
                 _ => unreachable!("shared ordered-many binding has a non-scalar model"),
+            }
+        } else if native_uniform_capture {
+            match benchmark.model {
+                shared::Model::CountCaptures => {
+                    "general-aot-native-uniform-capture-count-reducer-v1"
+                }
+                shared::Model::GrepCaptures => "general-aot-native-uniform-capture-grep-reducer-v1",
+                _ => unreachable!("native uniform-capture binding has a non-capture model"),
             }
         } else if prepared_uniform_capture {
             "general-aot-uniform-capture-prepared-span-fill-v1"
@@ -591,7 +654,7 @@ fn configured_source(
     writeln!(
         source,
         "pub const PREPARE_OPERATION_FLAGS: u64 = {};",
-        if prepared_uniform_capture {
+        if uniform_capture {
             shared::Model::Count.prepare_operation_flags()
         } else {
             benchmark
@@ -673,8 +736,28 @@ fn configured_source(
         receipt.object_sha256
     )
     .unwrap();
-    if let Some(uniform) = uniform_capture_receipt {
-        let participation = uniform.participation();
+    let uniform_proof = uniform_capture_receipt
+        .map(|uniform| {
+            (
+                uniform.participation(),
+                uniform.selector_automaton_sha256(),
+                uniform.selector_program_sha256(),
+                uniform.selector_object_sha256(),
+            )
+        })
+        .or_else(|| {
+            uniform_capture_reducer_receipt.map(|uniform| {
+                (
+                    uniform.participation(),
+                    uniform.selector_automaton_sha256(),
+                    uniform.selector_program_sha256(),
+                    uniform.selector_object_sha256(),
+                )
+            })
+        });
+    if let Some((participation, selector_automaton, selector_program, selector_object)) =
+        uniform_proof
+    {
         let identity = participation.identity();
         let groups = u64::try_from(participation.participating_groups_per_match().get())
             .expect("capture multiplier fits u64");
@@ -727,19 +810,19 @@ fn configured_source(
         writeln!(
             source,
             "pub const SOURCE_SELECTOR_AUTOMATON_SHA256: &[[u8; 32]] = &[{:?}];",
-            uniform.selector_automaton_sha256()
+            selector_automaton
         )
         .unwrap();
         writeln!(
             source,
             "pub const SOURCE_SELECTOR_PROGRAM_SHA256: &[[u8; 32]] = &[{:?}];",
-            uniform.selector_program_sha256()
+            selector_program
         )
         .unwrap();
         writeln!(
             source,
             "pub const SOURCE_SELECTOR_OBJECT_SHA256: &[[u8; 32]] = &[{:?}];",
-            uniform.selector_object_sha256()
+            selector_object
         )
         .unwrap();
     } else {

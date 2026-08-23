@@ -18,9 +18,16 @@ no KLV remains a harmless unconfigured workspace binary.
 
 `count-captures` and `grep-captures` have an additional all-or-nothing route.
 The compiler proves from the same canonical HIR that every nonempty match has
-one uniform group-zero-inclusive participation count, then seals that proof to
-the exact ordinary native Span selector. Rust selects spans and adds the
-winning row's compile-time count; it does not materialize capture offsets.
+one uniform group-zero-inclusive participation count. For an exact one-pattern
+job, a generated reducer then owns the complete match traversal (and, for
+`grep-captures`, the LF/CRLF line traversal), multiplies the checked match count
+by that proved participation count, and publishes one transactional result.
+The helper-free `NativeFused` form is a strict whole-operation-native route;
+the one-call `NativeOrderedNfaFused` form remains separately classified as
+semantic-helper-backed. If the one-call reducer declines, the existing route
+seals the same proof to the exact ordinary native Span selector. Rust selects
+spans and adds the winning row's compile-time count; it does not materialize
+capture offsets.
 If that theorem specifically declines for an exact one-pattern job, the build
 next tries an independently authenticated native exact-span participation
 artifact. The ordinary Span selector remains authoritative for match choice;
@@ -98,7 +105,21 @@ timing belongs to a separately named compiler-stage benchmark.
   still invokes every retained row's corresponding direct or prepared search
   entry per line and counts lines for which any row reports a match. Prepared
   handles are constructed before warmup and timed loops.
-- `count-captures` repeatedly invokes the helper-free Span row table and adds
+- An exact one-pattern `count-captures` or `grep-captures` job first attempts
+  one identity-suffixed uniform-capture reducer. The reducer owns the complete
+  operation and returns a checked `u64` through the same exclusive-session
+  scalar ABI as Count, SpanSum, and GrepCount. Runtime authentication binds the
+  exact uniform-language proof, operation, aggregate strategy, reducer symbol,
+  program/object identities, preparation caps, and dependency surface before
+  the call. A helper-free `NativeFused` reducer has no Rust adapter loop and is
+  admitted to the strict whole-operation-native census numerator. An ordered
+  V15 reducer also removes the Rust loop, but its declared semantic helpers
+  keep it out of that strict numerator. Typed semantic or exact lower-work
+  decline alone may continue into the pre-existing capture portfolio; parse,
+  allocation, emission, authentication, and unrelated resource failures are
+  terminal. The independent stock Rust captures oracle remains authoritative
+  for the published benchmark value.
+- The fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
   every Rebar line domain. Every source must prove a positive minimum width and

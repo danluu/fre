@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, fmt, time::Duration};
 use fre_aot_regex::{
     compile, compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
-    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_selector,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
+    compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
     compile_with_prepared_ordered_nfa_v15_reported, compile_with_slow_aot_limits, Architecture,
     CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1, CompileMode,
@@ -19,7 +20,9 @@ use fre_aot_regex::{
     SymbolKind, Target, UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
     UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
     UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
-    UniformCapturePreparedSpanFillCompileReceipt, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    UniformCapturePreparedSpanFillCompileReceipt, UniformCaptureReducerCompileDisposition,
+    UniformCaptureReducerCompileError, UniformCaptureReducerOperation,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15,
 };
 use fre_lower::{LowerError, LowerResource};
 use fre_syntax::{parse, CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
@@ -124,6 +127,22 @@ fn is_uniform_lower_work_limit(error: &UniformCaptureCompileError) -> bool {
             resource: LowerResource::Work,
             ..
         })
+    )
+}
+
+fn is_uniform_reducer_lower_work_limit(error: &UniformCaptureReducerCompileError) -> bool {
+    matches!(
+        error,
+        UniformCaptureReducerCompileError::Ordinary(source)
+            if is_uniform_lower_work_limit(source)
+    ) || matches!(
+        error,
+        UniformCaptureReducerCompileError::Prepared(
+            UniformCapturePreparedSpanFillCompileError::Lower(LowerError::ResourceLimit {
+                resource: LowerResource::Work,
+                ..
+            })
+        )
     )
 }
 
@@ -2078,6 +2097,78 @@ pub fn compile_strict_capture_bridge(
     Ok(StrictCaptureBridge { artifact })
 }
 
+/// Compile one single-source capture operation into one native reducer call.
+///
+/// A conservative uniform-language decline is the only nonterminal outcome.
+/// Parse, allocation, lowering, object, and authentication failures remain
+/// terminal. The adapter-local recovery retry is restricted to the same exact
+/// lowering-work exhaustion already admitted for public Rebar selectors.
+pub fn try_compile_native_uniform_capture_reducer(
+    benchmark: &Benchmark,
+    target: Target,
+) -> Result<UniformCaptureReducerCompileDisposition, String> {
+    if benchmark.patterns.len() != 1 || !benchmark.model.is_capture() {
+        return Err(
+            "native uniform-capture reducer requires one CountCaptures/GrepCaptures source"
+                .to_owned(),
+        );
+    }
+    let mut profile = RustProfile::rebar_1_12_4();
+    profile.options.unicode = benchmark.unicode;
+    profile.options.case_insensitive = benchmark.case_insensitive;
+    let pattern = benchmark.pattern();
+    let parsed = parse(ParseRequest::rust(
+        pattern,
+        CompatibilityProfile::RustBytes(profile.clone()),
+    ))
+    .map_err(|error| format!("native uniform-capture reducer parse failed: {error}"))?;
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        return Err("native uniform-capture reducer did not produce Rust HIR".to_owned());
+    };
+    let operation = match benchmark.model {
+        Model::CountCaptures => UniformCaptureReducerOperation::CountCaptures,
+        Model::GrepCaptures => UniformCaptureReducerOperation::GrepCaptures,
+        _ => unreachable!("capture gate accepted a non-capture model"),
+    };
+    let compile_with_limits = |limits, slow_aot_limits| {
+        compile_uniform_capture_reducer(
+            &parsed,
+            UniformCaptureCompileRequest::new(pattern.len(), target)
+                .profile(profile.clone())
+                .selector_limits(limits)
+                .selector_slow_aot_limits(slow_aot_limits),
+            operation,
+        )
+    };
+    let disposition =
+        match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
+            Ok(disposition) => disposition,
+            Err(error) if is_uniform_reducer_lower_work_limit(&error) => compile_with_limits(
+                rebar_recovery_compile_limits(),
+                rebar_recovery_slow_aot_limits(),
+            )
+            .map_err(|error| format!("native uniform-capture reducer recovery failed: {error}"))?,
+            Err(error) => {
+                return Err(format!(
+                    "native uniform-capture reducer compilation failed: {error}"
+                ));
+            }
+        };
+    if let Some(selected) = disposition.selected() {
+        selected
+            .authenticate()
+            .map_err(|error| format!("native uniform-capture reducer seal failed: {error}"))?;
+        if selected.compiled().object().is_empty()
+            || selected.compiled().object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        {
+            return Err(format!(
+                "native uniform-capture reducer object is empty or exceeds {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(disposition)
+}
+
 /// Build-time result that keeps a semantic theorem decline distinct from a
 /// terminal parse, lowering, allocation, authentication, or object failure.
 ///
@@ -3526,6 +3617,55 @@ mod tests {
         let parsed = Benchmark::parse(&multi_grep).expect("multi-pattern GrepCount");
         assert_eq!(parsed.patterns, ["a", "b"]);
         assert!(parsed.uses_native_row_bridge());
+    }
+
+    #[test]
+    fn single_uniform_capture_jobs_select_one_authenticated_reducer() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, expected_operation, prefix) in [
+            (
+                "count-captures",
+                UniformCaptureReducerOperation::CountCaptures,
+                "fre_aot_regex_count_captures_exclusive_v1_",
+            ),
+            (
+                "grep-captures",
+                UniformCaptureReducerOperation::GrepCaptures,
+                "fre_aot_regex_grep_captures_exclusive_v1_",
+            ),
+        ] {
+            let benchmark = Benchmark::parse(&fixture(model, b"(a+)", b"aa\r\nb\na"))
+                .expect("uniform capture fixture");
+            let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
+                .expect("native uniform capture reducer");
+            let selected = disposition
+                .selected()
+                .expect("uniform capture fixture proves one multiplier");
+            selected.authenticate().expect("fresh reducer seal");
+            assert_eq!(selected.receipt().operation(), expected_operation);
+            assert!(selected.reducer_symbol().starts_with(prefix));
+            assert_eq!(selected.receipt().multiplier().get(), 2);
+        }
+    }
+
+    #[test]
+    fn nonuniform_capture_job_declines_before_adapter_selection() {
+        let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab b"))
+            .expect("nonuniform capture fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
+            .expect("conservative uniform capture disposition");
+        assert!(disposition.decline().is_some());
     }
 
     #[test]

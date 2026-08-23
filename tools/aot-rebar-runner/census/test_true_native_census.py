@@ -392,6 +392,79 @@ def direct_scalar_grep_provenance_fields() -> dict[str, str]:
     return fields
 
 
+def native_uniform_capture_provenance_fields(
+    model: str = "grep-captures", ordered: bool = False,
+) -> dict[str, str]:
+    fields = prepared_scalar_grep_provenance_fields()
+    entry_identity = "d" * 64
+    program_identity = "e" * 64
+    reducer_identity = "f" * 64
+    if model == "count-captures":
+        adapter = "general-aot-native-uniform-capture-count-reducer-v1"
+        reducer = (
+            f"fre_aot_regex_count_captures_exclusive_v1_{reducer_identity}"
+        )
+        grep_iteration = "not-applicable"
+    elif model == "grep-captures":
+        adapter = "general-aot-native-uniform-capture-grep-reducer-v1"
+        reducer = (
+            f"fre_aot_regex_grep_captures_exclusive_v1_{reducer_identity}"
+        )
+        grep_iteration = "linked-native-uniform-capture-reducer-v1"
+    else:
+        raise AssertionError(f"unsupported synthetic capture model {model!r}")
+    fields.update({
+        "adapter": adapter,
+        "model": model,
+        "benchmark": f"synthetic/native-uniform-{model}",
+        "engine": "OrderedNfa" if ordered else "OrderedDfa",
+        "aggregate_strategy": (
+            "Some(NativeOrderedNfaFused)" if ordered else "Some(NativeFused)"
+        ),
+        "prepared_bulk_strategy": (
+            "Some(NativeOrderedNfaLoop)" if ordered else "None"
+        ),
+        "span_iteration_strategy": "not-applicable",
+        "grep_iteration_strategy": grep_iteration,
+        "prepare_config_version": (
+            str(CENSUS.PREPARED_V15_CONFIG_VERSION) if ordered else "2"
+        ),
+        "prepare_operation_flags": "0000000000000002",
+        "required_prepare_capabilities": (
+            f"{CENSUS.PREPARED_V15_CAPABILITY:016x}"
+            if ordered else "0000000000000000"
+        ),
+        "max_handle_bytes": (
+            str(CENSUS.PREPARED_V15_MAX_HANDLE_BYTES) if ordered else "0"
+        ),
+        "max_ordered_nfa_scratch_bytes": (
+            str(CENSUS.PREPARED_V15_MAX_SCRATCH_BYTES) if ordered else "0"
+        ),
+        "max_ordered_nfa_setup_work": (
+            str(CENSUS.PREPARED_V15_MAX_SETUP_WORK) if ordered else "0"
+        ),
+        "program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{program_identity}"
+        ),
+        "program_len": "512",
+        "entry_symbol": f"fre_aot_regex_search_v1_{entry_identity}",
+        "reducer_symbol": reducer,
+        "span_fill_symbol": (
+            f"fre_aot_regex_fill_spans_exclusive_v1_{entry_identity}"
+            if ordered else ""
+        ),
+        "required_runtime_symbols": (
+            ",".join(CENSUS.PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS)
+            if ordered else ""
+        ),
+        "boundary": (
+            "single-call-native-uniform-capture-helper-backed-reducer"
+            if ordered else "single-call-native-uniform-capture-reducer"
+        ),
+    })
+    return fields
+
+
 def shared_ordered_many_provenance_fields(
     model: str = "count",
 ) -> dict[str, str]:
@@ -1143,6 +1216,14 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-native-grep-count-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
+            "linked-native-uniform-capture-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-uniform-capture-helper-backed-reducer": (
+                False,
+                False,
+                "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
             "linked-span-fill": (
                 True,
                 False,
@@ -1560,6 +1641,93 @@ class TrueNativeCensusTests(unittest.TestCase):
                         " ".join(
                             f"{key}={item}" for key, item in poisoned.items()
                         ).encode()
+                    )
+
+    def test_native_uniform_capture_closes_single_call_route(self) -> None:
+        for model in ("count-captures", "grep-captures"):
+            for ordered in (False, True):
+                with self.subTest(model=model, ordered=ordered):
+                    fields = native_uniform_capture_provenance_fields(
+                        model, ordered
+                    )
+                    parsed = CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={value}" for key, value in fields.items()
+                        ).encode()
+                    )
+                    receipt = CENSUS.provenance_receipt(parsed)
+                    CENSUS.validate_provenance_record(
+                        receipt, "synthetic native uniform capture"
+                    )
+                    route = (
+                        "linked-native-uniform-capture-helper-backed-reducer"
+                        if ordered
+                        else "linked-native-uniform-capture-reducer"
+                    )
+                    self.assertEqual(receipt["kind"], "scalar-v2")
+                    self.assertEqual(
+                        receipt["uniform_capture"]["route_variant"],
+                        "ordered-v15" if ordered else "direct-v1",
+                    )
+                    self.assertEqual(
+                        CENSUS.selected_operation_entries(parsed),
+                        ([fields["reducer_symbol"]], route),
+                    )
+                    self.assertEqual(
+                        CENSUS.operation_route_from_provenance_record(receipt),
+                        ([fields["reducer_symbol"]], route),
+                    )
+                    identity_symbols = [
+                        fields["entry_symbol"], fields["program_symbol"]
+                    ]
+                    if ordered:
+                        identity_symbols.append(fields["span_fill_symbol"])
+                    self.assertEqual(
+                        CENSUS.identity_defined_symbols_from_provenance(receipt),
+                        sorted(identity_symbols),
+                    )
+
+        raw_poisons = {
+            "adapter": "general-aot-native-uniform-capture-grep-reducer-v2",
+            "boundary": "runtime-klv-warmup-schedule",
+            "max_handle_bytes": "1",
+            "required_runtime_symbols": "fre_aot_regex_runtime_search_v1",
+            "reducer_symbol": (
+                f"fre_aot_regex_grep_captures_exclusive_v1_{'0' * 63}g"
+            ),
+        }
+        fields = native_uniform_capture_provenance_fields()
+        for name, value in raw_poisons.items():
+            with self.subTest(raw_poison=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+        receipt = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}" for key, value in fields.items()
+                ).encode()
+            )
+        )
+        for name, value in {
+            "route_variant": "ordered-v15",
+            "prepare_config_version": 3,
+            "runtime_program_len": 0,
+            "reducer_identity_sha256": "0" * 64,
+        }.items():
+            with self.subTest(receipt_poison=name):
+                poisoned = dict(receipt)
+                poisoned["uniform_capture"] = dict(receipt["uniform_capture"])
+                poisoned["uniform_capture"][name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned, "poisoned native uniform capture"
                     )
 
     def test_shared_ordered_many_closes_one_reducer_route_and_receipt(self) -> None:

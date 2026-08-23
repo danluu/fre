@@ -1,0 +1,12 @@
+name:22:native-uniform-capture
+model:13:grep-captures
+case-insensitive:5:false
+unicode:5:false
+max-iters:1:1
+max-warmup-iters:1:0
+max-time:10:1000000000
+max-warmup-time:1:0
+pattern:4:(a+)
+haystack:6:aa
+b
+a
