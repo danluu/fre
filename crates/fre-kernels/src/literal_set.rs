@@ -1811,6 +1811,44 @@ macro_rules! first_acceptance_special_state {
     };
 }
 
+// Keep the dead-first find/span expansion scalar. Only the count-only
+// match-first leaf pairs its pre-acceptance transitions.
+macro_rules! first_acceptance_prefix {
+    (
+        dead_first,
+        $automaton:ident,
+        $anchored:ident,
+        $state:ident,
+        $haystack:ident,
+        $at:ident,
+        $end:ident
+    ) => {
+        while $at < $end {
+            $state = $automaton.next_state($anchored, $state, $haystack[$at]);
+            $at += 1;
+        }
+    };
+    (
+        match_first,
+        $automaton:ident,
+        $anchored:ident,
+        $state:ident,
+        $haystack:ident,
+        $at:ident,
+        $end:ident
+    ) => {
+        while $end - $at >= 2 {
+            $state = $automaton.next_state($anchored, $state, $haystack[$at]);
+            $state = $automaton.next_state($anchored, $state, $haystack[$at + 1]);
+            $at += 2;
+        }
+        while $at < $end {
+            $state = $automaton.next_state($anchored, $state, $haystack[$at]);
+            $at += 1;
+        }
+    };
+}
+
 macro_rules! first_acceptance_end_body {
     ($plan:ident, $haystack:ident, $window:ident, $order:ident) => {{
         #[cfg(test)]
@@ -1834,10 +1872,15 @@ macro_rules! first_acceptance_end_body {
         // Advance the first W-1 transitions without inspecting special-state
         // metadata, then begin the ordinary acceptance loop at byte W.
         let first_acceptance_check = $window.start() + pattern_bytes - 1;
-        while at < first_acceptance_check {
-            state = automaton.next_state(anchored, state, $haystack[at]);
-            at += 1;
-        }
+        first_acceptance_prefix!(
+            $order,
+            automaton,
+            anchored,
+            state,
+            $haystack,
+            at,
+            first_acceptance_check
+        );
         while at < $window.end() {
             state = automaton.next_state(anchored, state, $haystack[at]);
             at += 1;
@@ -5191,7 +5234,7 @@ mod tests {
 
     #[test]
     fn uniform_standard_direct_acceptance_respects_width_floor_in_every_window() {
-        for uniform_width in [1_usize, 2, 8] {
+        for uniform_width in [1_usize, 2, 7, 8] {
             let q = vec![b'q'; uniform_width];
             let z = vec![b'z'; uniform_width];
             let patterns = vec![q.clone(), z.clone(), q.clone()];
