@@ -185,6 +185,12 @@ pub(super) struct Aarch64OrderedNfaNativeEntry {
     pub(super) bulk_gate_entry_offset: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedNfaEntrySurface {
+    Compatibility,
+    OperationOnly,
+}
+
 fn scratch_bytes(layout: NativeOrderedNfaObjectLayout) -> Result<usize, ObjectError> {
     if FROZEN_ORDERED_NFA_SCRATCH_V1_BYTES != 176 {
         return Err(ObjectError::InvalidModule("Ordered-NFA scratch ABI drift"));
@@ -2597,6 +2603,23 @@ fn emit_semantic_body(
 pub(super) fn lower_aarch64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface(image, OrderedNfaEntrySurface::Compatibility)
+}
+
+/// Emit only the private V15 search and its source-free capability gate.
+///
+/// The compatibility public entry and semantic fallback branch are omitted,
+/// leaving a closed fragment for an enclosing whole-operation reducer.
+pub(super) fn lower_aarch64_operation_only(
+    image: &NativeOrderedNfaObjectImage<'_>,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface(image, OrderedNfaEntrySurface::OperationOnly)
+}
+
+fn lower_aarch64_with_surface(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    surface: OrderedNfaEntrySurface,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     // The fragmented terminal proof is aggregate-only. Revalidate it here so
     // a forged compiler-only receipt still fails closed, but do not let it
     // change the shared/public/private one-Span entry.
@@ -2632,13 +2655,18 @@ pub(super) fn lower_aarch64(
         None
     };
 
-    let public_table = emit_prologue_and_raw_checks(&mut asm, invalid_argument, invalid_handle)?;
-    {
-        let mut a = A { asm: &mut asm };
-        emit_exact_object_auth(&mut a, layout, runtime_failure)?;
-        emit_common_header_identity_auth(&mut a, runtime_failure)?;
-        emit_v15_claim_classifier(&mut a, shared_auth, public_fallback)?;
-    }
+    let public_table = if surface == OrderedNfaEntrySurface::Compatibility {
+        let table = emit_prologue_and_raw_checks(&mut asm, invalid_argument, invalid_handle)?;
+        {
+            let mut a = A { asm: &mut asm };
+            emit_exact_object_auth(&mut a, layout, runtime_failure)?;
+            emit_common_header_identity_auth(&mut a, runtime_failure)?;
+            emit_v15_claim_classifier(&mut a, shared_auth, public_fallback)?;
+        }
+        Some(table)
+    } else {
+        None
+    };
 
     asm.bind(private_entry)?;
     let private_table = emit_prologue_and_raw_checks(&mut asm, invalid_argument, invalid_handle)?;
@@ -2699,8 +2727,8 @@ pub(super) fn lower_aarch64(
         a.branch(after_generation_clear)?;
     }
 
-    asm.bind(public_fallback)?;
-    let fallback_branch = {
+    let fallback_branch = if surface == OrderedNfaEntrySurface::Compatibility {
+        asm.bind(public_fallback)?;
         let mut a = A { asm: &mut asm };
         for (register, local) in [
             (0, L_HEADER),
@@ -2713,7 +2741,9 @@ pub(super) fn lower_aarch64(
             a.load_x(register, 31, usize::from(local))?;
         }
         emit_epilogue(&mut a)?;
-        a.raw(0x1400_0000)?
+        Some(a.raw(0x1400_0000)?)
+    } else {
+        None
     };
 
     asm.bind(clear_generation)?;
@@ -2836,20 +2866,38 @@ pub(super) fn lower_aarch64(
             .ok_or(ObjectError::InvalidModule(
                 "AArch64 Ordered-NFA bulk gate entry is unbound",
             ))?;
-    let mut offsets = [
-        public_table[0],
-        public_table[1],
-        private_table[0],
-        private_table[1],
-        bulk_gate_table[0],
-        bulk_gate_table[1],
-        fallback_branch,
-        private_offset,
-        bulk_gate_offset,
-    ];
+    let mut offsets = Vec::with_capacity(if surface == OrderedNfaEntrySurface::Compatibility {
+        9
+    } else {
+        6
+    });
+    let public_indices = public_table.map(|table| {
+        let page = offsets.len();
+        offsets.push(table[0]);
+        let page_offset = offsets.len();
+        offsets.push(table[1]);
+        [page, page_offset]
+    });
+    let private_page = offsets.len();
+    offsets.push(private_table[0]);
+    let private_page_offset = offsets.len();
+    offsets.push(private_table[1]);
+    let bulk_gate_page = offsets.len();
+    offsets.push(bulk_gate_table[0]);
+    let bulk_gate_page_offset = offsets.len();
+    offsets.push(bulk_gate_table[1]);
+    let fallback_index = fallback_branch.map(|fallback| {
+        let index = offsets.len();
+        offsets.push(fallback);
+        index
+    });
+    let private_entry_index = offsets.len();
+    offsets.push(private_offset);
+    let bulk_gate_entry_index = offsets.len();
+    offsets.push(bulk_gate_offset);
     let code = asm.finish_with_offsets(&mut offsets)?;
-    let [public_page, public_page_offset, private_page, private_page_offset, bulk_gate_page, bulk_gate_page_offset, fallback, private_entry_offset, bulk_gate_entry_offset] =
-        offsets;
+    let private_entry_offset = offsets[private_entry_index];
+    let bulk_gate_entry_offset = offsets[bulk_gate_entry_index];
     let relocation = |offset: usize,
                       kind: RelocationKind,
                       symbol: usize,
@@ -2863,52 +2911,60 @@ pub(super) fn lower_aarch64(
             addend: 0,
         })
     };
+    let mut relocations = Vec::with_capacity(if surface == OrderedNfaEntrySurface::Compatibility {
+        7
+    } else {
+        4
+    });
+    if let Some([public_page, public_page_offset]) = public_indices {
+        relocations.push(relocation(
+            offsets[public_page],
+            RelocationKind::Aarch64Page21,
+            PARTIAL_TABLE_SYMBOL,
+            "AArch64 Ordered-NFA public table ADRP",
+        )?);
+        relocations.push(relocation(
+            offsets[public_page_offset],
+            RelocationKind::Aarch64PageOff12,
+            PARTIAL_TABLE_SYMBOL,
+            "AArch64 Ordered-NFA public table ADD",
+        )?);
+    }
+    relocations.push(relocation(
+        offsets[private_page],
+        RelocationKind::Aarch64Page21,
+        PARTIAL_TABLE_SYMBOL,
+        "AArch64 Ordered-NFA private table ADRP",
+    )?);
+    relocations.push(relocation(
+        offsets[private_page_offset],
+        RelocationKind::Aarch64PageOff12,
+        PARTIAL_TABLE_SYMBOL,
+        "AArch64 Ordered-NFA private table ADD",
+    )?);
+    relocations.push(relocation(
+        offsets[bulk_gate_page],
+        RelocationKind::Aarch64Page21,
+        PARTIAL_TABLE_SYMBOL,
+        "AArch64 Ordered-NFA bulk-gate table ADRP",
+    )?);
+    relocations.push(relocation(
+        offsets[bulk_gate_page_offset],
+        RelocationKind::Aarch64PageOff12,
+        PARTIAL_TABLE_SYMBOL,
+        "AArch64 Ordered-NFA bulk-gate table ADD",
+    )?);
+    if let Some(fallback) = fallback_index {
+        relocations.push(relocation(
+            offsets[fallback],
+            RelocationKind::Aarch64Branch26,
+            PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            "AArch64 Ordered-NFA fallback branch",
+        )?);
+    }
     Ok(Aarch64OrderedNfaNativeEntry {
         code,
-        relocations: vec![
-            relocation(
-                public_page,
-                RelocationKind::Aarch64Page21,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA public table ADRP",
-            )?,
-            relocation(
-                public_page_offset,
-                RelocationKind::Aarch64PageOff12,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA public table ADD",
-            )?,
-            relocation(
-                private_page,
-                RelocationKind::Aarch64Page21,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA private table ADRP",
-            )?,
-            relocation(
-                private_page_offset,
-                RelocationKind::Aarch64PageOff12,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA private table ADD",
-            )?,
-            relocation(
-                bulk_gate_page,
-                RelocationKind::Aarch64Page21,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA bulk-gate table ADRP",
-            )?,
-            relocation(
-                bulk_gate_page_offset,
-                RelocationKind::Aarch64PageOff12,
-                PARTIAL_TABLE_SYMBOL,
-                "AArch64 Ordered-NFA bulk-gate table ADD",
-            )?,
-            relocation(
-                fallback,
-                RelocationKind::Aarch64Branch26,
-                PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                "AArch64 Ordered-NFA fallback branch",
-            )?,
-        ],
+        relocations,
         private_entry_offset,
         bulk_gate_entry_offset,
     })
@@ -3275,6 +3331,34 @@ mod tests {
                 _ => panic!("unexpected Ordered-NFA relocation"),
             }
         }
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_operation_only_entry_has_closed_local_relocations() {
+        let compatibility = lower_aarch64(&minimal_image()).unwrap();
+        let operation = lower_aarch64_operation_only(&minimal_image()).unwrap();
+
+        assert!(!operation.code.is_empty());
+        assert!(operation.code.len() < compatibility.code.len());
+        assert!(operation.code.len().is_multiple_of(4));
+        assert_eq!(operation.private_entry_offset, 0);
+        assert!(operation.bulk_gate_entry_offset > operation.private_entry_offset);
+        assert!(operation.bulk_gate_entry_offset < operation.code.len());
+        assert!(operation.bulk_gate_entry_offset.is_multiple_of(4));
+        assert_eq!(operation.relocations.len(), 4);
+        assert!(operation.relocations.iter().all(|relocation| {
+            relocation.section == TEXT_SECTION
+                && matches!(
+                    relocation.kind,
+                    RelocationKind::Aarch64Page21 | RelocationKind::Aarch64PageOff12
+                )
+                && relocation.symbol == PARTIAL_TABLE_SYMBOL
+                && relocation.addend == 0
+        }));
+        assert!(operation
+            .relocations
+            .iter()
+            .all(|relocation| relocation.symbol != PREPARED_FALLBACK_RUNTIME_SYMBOL));
     }
 
     #[test]
