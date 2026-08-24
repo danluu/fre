@@ -4,6 +4,7 @@ use fre_aot_regex::{
     compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
     compile_rebar_single_capture_reducer_aot_v1,
+    compile_rebar_weighted_capture_reducer_aot_v1,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
     compile_uniform_capture_selector,
     compile_with_prepared_aggregate_exports_and_slow_aot_limits,
@@ -20,6 +21,10 @@ use fre_aot_regex::{
     RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
     RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureReducerAotArtifactV1,
     RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    RebarWeightedCaptureReducerAotArtifactV1,
+    RebarWeightedCaptureReducerAotCompileDeclineV1,
+    RebarWeightedCaptureReducerAotCompileDispositionV1,
+    RebarWeightedCaptureReducerAotRequestV1,
     SectionKind, SharedUniformCaptureReducerAotArtifact,
     SharedUniformCaptureReducerAotCompileDecline,
     SharedUniformCaptureReducerAotCompileDisposition, SlowAotLimits, SymbolBinding, SymbolKind,
@@ -56,6 +61,9 @@ pub const MAX_NATIVE_ROW_BRIDGE_PATTERNS: usize = 4_096;
 /// Maximum combined bytes of distinct relocatable row objects linked into one
 /// job-specialized bridge binary.
 pub const MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES: usize = 256 * 1_048_576;
+/// Serialized-object cap for the separately linked straight-line weighted
+/// capture reducer. Row objects retain their independent aggregate cap above.
+pub const MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES: usize = 16 * 1_048_576;
 /// Maximum group-zero-inclusive slot count accepted by the strict capture
 /// adapter. This keeps its one caller-owned result allocation inside the same
 /// deliberately small cardinality envelope as the native-row bridge.
@@ -2058,7 +2066,7 @@ fn authenticate_shared_uniform_capture_reducer(
     Ok(())
 }
 
-fn ordered_many_source_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
+pub fn ordered_many_source_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
     let mut digest = Sha256::new();
     digest.update(b"fre.ordered-many-aot.sources.v1\0");
     digest.update(
@@ -2293,6 +2301,20 @@ fn authenticate_shared_ordered_many_aggregate(
 pub struct UniformCaptureBridge {
     pub rows: NativeRowBridge,
     pub source_receipts: Vec<UniformCaptureCompileReceipt>,
+}
+
+/// One separately linked helper-free native reducer over the already
+/// authenticated ordinary Span rows of a proven uniform-capture bridge.
+#[derive(Clone, Debug)]
+pub struct WeightedCaptureReducerBridge {
+    pub artifact: RebarWeightedCaptureReducerAotArtifactV1,
+}
+
+/// The exact wrapper or its sole nonterminal serialized-object-cap result.
+#[derive(Clone, Debug)]
+pub enum WeightedCaptureReducerBridgeDisposition {
+    Compiled(WeightedCaptureReducerBridge),
+    Declined(RebarWeightedCaptureReducerAotCompileDeclineV1),
 }
 
 /// One positive uniform-participation proof paired with the exact prepared
@@ -3002,6 +3024,118 @@ pub fn compile_uniform_capture_bridge(
         } => Err(format!(
             "uniform-capture proof declined at source ordinal {source_ordinal}: {reason}"
         )),
+    }
+}
+
+/// Close the remaining unequal-multiplier bridge with one helper-free native
+/// reducer over its independently authenticated ordinary Span components.
+///
+/// Allocation, arithmetic, lowering, object formation and authentication
+/// failures are terminal. Only the reducer object's exact numeric cap may
+/// preserve the existing Rust row bridge.
+pub fn try_compile_weighted_capture_reducer_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+    bridge: &UniformCaptureBridge,
+) -> Result<WeightedCaptureReducerBridgeDisposition, String> {
+    if !benchmark.uses_uniform_capture_bridge()
+        || !benchmark.model.is_capture()
+        || benchmark.patterns.len() <= 1
+        || bridge.source_receipts.len() != benchmark.patterns.len()
+        || bridge.rows.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.rows.artifacts.is_empty()
+        || bridge
+            .rows
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.route != NativeRowRoute::Ordinary)
+    {
+        return Err("weighted capture reducer requires a multi-source ordinary uniform-capture bridge"
+            .to_owned());
+    }
+    let first_multiplier = bridge.source_receipts[0]
+        .participation()
+        .participating_groups_per_match();
+    if bridge.source_receipts.iter().all(|receipt| {
+        receipt
+            .participation()
+            .participating_groups_per_match()
+            == first_multiplier
+    }) {
+        return Err(
+            "weighted capture reducer requires the shared reducer's unequal-multiplier decline"
+                .to_owned(),
+        );
+    }
+
+    let mut components = Vec::new();
+    components
+        .try_reserve_exact(bridge.rows.artifacts.len())
+        .map_err(|_| "weighted capture component-reference allocation failed".to_owned())?;
+    let mut first_ordinals = Vec::new();
+    first_ordinals
+        .try_reserve_exact(bridge.rows.artifacts.len())
+        .map_err(|_| "weighted capture first-ordinal allocation failed".to_owned())?;
+    for artifact in &bridge.rows.artifacts {
+        components.push(&artifact.compiled);
+        first_ordinals.push(artifact.first_source_ordinal);
+    }
+    let pattern_bytes = benchmark.patterns.iter().try_fold(0_usize, |total, pattern| {
+        total
+            .checked_add(pattern.len())
+            .ok_or_else(|| "weighted capture pattern-byte total overflowed".to_owned())
+    })?;
+    let operation = match benchmark.model {
+        Model::CountCaptures => UniformCaptureReducerOperation::CountCaptures,
+        Model::GrepCaptures => UniformCaptureReducerOperation::GrepCaptures,
+        _ => return Err("weighted capture reducer received a non-capture model".to_owned()),
+    };
+    let disposition = compile_rebar_weighted_capture_reducer_aot_v1(
+        RebarWeightedCaptureReducerAotRequestV1::new(
+            operation,
+            target,
+            pattern_bytes,
+            ordered_many_source_sha256(&benchmark.patterns)?,
+            &components,
+            &bridge.rows.source_to_artifact,
+            &first_ordinals,
+            &bridge.source_receipts,
+            MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES,
+        ),
+    )
+    .map_err(|error| format!("weighted capture reducer compilation failed: {error}"))?;
+    match disposition {
+        RebarWeightedCaptureReducerAotCompileDispositionV1::Compiled(artifact) => {
+            artifact
+                .authenticate(&components)
+                .map_err(|error| format!("weighted capture reducer authentication failed: {error}"))?;
+            let receipt = artifact.receipt();
+            if receipt.operation() != operation
+                || receipt.domain() != operation.domain()
+                || receipt.target() != target
+                || receipt.source_count() != benchmark.patterns.len()
+                || receipt.pattern_bytes() != pattern_bytes
+                || receipt.source_to_component() != bridge.rows.source_to_artifact
+                || receipt.component_first_source_ordinals() != first_ordinals
+                || receipt.max_object_bytes() != MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+                || receipt.reducer_object_bytes() == 0
+            {
+                return Err("weighted capture reducer receipt disagrees with its Rebar bridge"
+                    .to_owned());
+            }
+            Ok(WeightedCaptureReducerBridgeDisposition::Compiled(
+                WeightedCaptureReducerBridge { artifact },
+            ))
+        }
+        RebarWeightedCaptureReducerAotCompileDispositionV1::Declined(decline) => {
+            if decline.limit != MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+                || decline.required <= decline.limit
+            {
+                return Err("weighted capture reducer returned a malformed object-cap decline"
+                    .to_owned());
+            }
+            Ok(WeightedCaptureReducerBridgeDisposition::Declined(decline))
+        }
     }
 }
 
@@ -5204,6 +5338,45 @@ mod tests {
                     .expect("each source proof binds the retained selector");
             }
         }
+    }
+
+    #[test]
+    fn weighted_capture_reducer_closes_the_unequal_uniform_row_bridge() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut klv = fixture("count-captures", b"(a+)", b"aa bbb aa");
+        let insertion = b"pattern:2:a+\npattern:6:((b+))\n";
+        let offset = klv
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        klv.splice(offset..offset, insertion.iter().copied());
+        let benchmark = Benchmark::parse(&klv).expect("weighted capture fixture");
+        let bridge =
+            compile_uniform_capture_bridge(&benchmark, target).expect("uniform capture bridge");
+        assert_eq!(bridge.rows.source_to_artifact, [0, 0, 1]);
+        assert_eq!(bridge.rows.artifacts.len(), 2);
+        let WeightedCaptureReducerBridgeDisposition::Compiled(weighted) =
+            try_compile_weighted_capture_reducer_bridge(&benchmark, target, &bridge)
+                .expect("compile weighted capture reducer")
+        else {
+            panic!("small weighted wrapper must fit its explicit cap")
+        };
+        let receipt = weighted.artifact.receipt();
+        assert_eq!(
+            receipt.operation(),
+            UniformCaptureReducerOperation::CountCaptures
+        );
+        assert_eq!(receipt.source_to_component(), [0, 0, 1]);
+        assert_eq!(receipt.component_first_source_ordinals(), [0, 2]);
+        assert_eq!(receipt.component_weights(), [2, 3]);
+        assert_eq!(receipt.max_object_bytes(), MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES);
+        assert_eq!(receipt.relocations().len(), 2);
+        assert!(receipt.reducer_object_bytes() > 0);
     }
 
     #[test]

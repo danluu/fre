@@ -162,11 +162,18 @@ timing belongs to a separately named compiler-stage benchmark.
   pre-wrapper object into one composite proof identity. It then appends one
   Count/GrepCaptures wrapper to the full shared ordered-many Count portfolio.
   Only helper-free `NativeFused` or scalar-operation-only V15 closure is
-  published: no SpanFill, runtime helper, or Rust row loop remains. Typed
-  semantic, unequal-multiplier, unsupported, native-data, and object-cap
-  declines retain the pre-existing row adapter; all other failures are
+  published: no SpanFill, runtime helper, or Rust row loop remains. A typed
+  unequal-multiplier decline next retains the independently authenticated
+  ordinary Span rows and emits a separate helper-free weighted reducer. That
+  reducer resolves leftmost/first-source priority, checked-adds each winning
+  component's proved multiplier, and owns the whole CountCaptures or exact
+  LF/CRLF GrepCaptures traversal in one call. Its receipt closes the source
+  map, first ordinals, weights, component program/object hashes, reducer
+  identities, and exact PLT32/Branch26 component relocations. Only its fixed
+  numeric object-cap decline preserves the pre-existing Rust row adapter;
+  allocation, arithmetic, lowering, object, and authentication failures are
   terminal.
-- The fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
+- The final fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
   every Rebar line domain. Every source must prove a positive minimum width and

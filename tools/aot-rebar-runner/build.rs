@@ -215,9 +215,39 @@ fn main() {
             .expect("compile helper-free public Rebar uniform-capture bridge")
         {
             shared::UniformCaptureBridgeDisposition::Proven(bridge) => {
+                let unequal_multipliers = bridge.source_receipts.windows(2).any(|pair| {
+                    pair[0]
+                        .participation()
+                        .participating_groups_per_match()
+                        != pair[1]
+                            .participation()
+                            .participating_groups_per_match()
+                });
+                let weighted = if unequal_multipliers {
+                    match shared::try_compile_weighted_capture_reducer_bridge(
+                        &benchmark,
+                        target,
+                        &bridge,
+                    )
+                    .expect("compile helper-free weighted capture reducer")
+                    {
+                        shared::WeightedCaptureReducerBridgeDisposition::Compiled(weighted) => {
+                            Some(weighted)
+                        }
+                        shared::WeightedCaptureReducerBridgeDisposition::Declined(_) => None,
+                    }
+                } else {
+                    None
+                };
                 let mut object_paths = Vec::new();
                 object_paths
-                    .try_reserve_exact(bridge.rows.artifacts.len())
+                    .try_reserve_exact(
+                        bridge
+                            .rows
+                            .artifacts
+                            .len()
+                            .saturating_add(usize::from(weighted.is_some())),
+                    )
                     .expect("reserve uniform-capture object paths");
                 for (index, artifact) in bridge.rows.artifacts.iter().enumerate() {
                     let row_path = output.join(format!("aot-rebar-capture-row-{index}.o"));
@@ -225,13 +255,20 @@ fn main() {
                         .expect("write linked uniform-capture selector object");
                     object_paths.push(row_path);
                 }
-                fs::write(&object_path, []).expect("write unused scalar object sentinel");
+                if let Some(weighted) = &weighted {
+                    fs::write(&object_path, weighted.artifact.object())
+                        .expect("write linked weighted capture reducer object");
+                    object_paths.push(object_path.clone());
+                } else {
+                    fs::write(&object_path, []).expect("write unused scalar object sentinel");
+                }
                 fs::write(
                     &generated_path,
                     configured_native_row_source(
                         &benchmark,
                         &bridge.rows,
                         Some(&bridge.source_receipts),
+                        weighted.as_ref(),
                         None,
                         &architecture,
                         &operating_system,
@@ -310,6 +347,7 @@ fn main() {
                             configured_native_row_source(
                                 &benchmark,
                                 &bridge.rows,
+                                None,
                                 None,
                                 Some(&bridge),
                                 &architecture,
@@ -470,6 +508,7 @@ fn main() {
             configured_native_row_source(
                 &benchmark,
                 &bridge,
+                None,
                 None,
                 None,
                 &architecture,
@@ -1465,6 +1504,7 @@ fn configured_source(
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 1);
     push_empty_single_capture_reducer_bindings(&mut source);
+    push_empty_weighted_capture_reducer_bindings(&mut source);
     source
 }
 
@@ -1833,6 +1873,7 @@ fn configured_regex_redux_source(
     push_empty_selector_capture_fallback_bindings(&mut source);
     push_empty_prepared_row_bindings(&mut source, 0);
     push_empty_single_capture_reducer_bindings(&mut source);
+    push_empty_weighted_capture_reducer_bindings(&mut source);
     push_empty_shared_uniform_capture_bindings(&mut source);
     source
 }
@@ -2179,6 +2220,7 @@ fn configured_participation_capture_source(
     push_empty_prepared_row_bindings(&mut source, 0);
     push_empty_shared_uniform_capture_bindings(&mut source);
     push_single_capture_reducer_receipt(&mut source, reducer);
+    push_empty_weighted_capture_reducer_bindings(&mut source);
     source
 }
 
@@ -2460,6 +2502,7 @@ fn configured_strict_capture_source(
     push_empty_prepared_row_bindings(&mut source, 0);
     push_empty_shared_uniform_capture_bindings(&mut source);
     push_single_capture_reducer_receipt(&mut source, reducer);
+    push_empty_weighted_capture_reducer_bindings(&mut source);
     source
 }
 
@@ -2471,6 +2514,7 @@ fn configured_native_row_source(
     benchmark: &shared::Benchmark,
     bridge: &shared::NativeRowBridge,
     uniform_capture_receipts: Option<&[fre_aot_regex::UniformCaptureCompileReceipt]>,
+    weighted_capture_reducer: Option<&shared::WeightedCaptureReducerBridge>,
     selector_capture_fallback: Option<&shared::SelectorCaptureFallbackBridge>,
     architecture: &str,
     operating_system: &str,
@@ -2486,6 +2530,8 @@ fn configured_native_row_source(
     assert!(!bridge.artifacts.is_empty());
     assert_eq!(bridge.source_to_artifact.len(), benchmark.patterns.len());
     assert!(!(uniform_capture_receipts.is_some() && selector_capture_fallback.is_some()));
+    assert!(weighted_capture_reducer.is_none() || uniform_capture_receipts.is_some());
+    assert!(weighted_capture_reducer.is_none() || selector_capture_fallback.is_none());
     assert_eq!(
         uniform_capture_receipts.is_some() || selector_capture_fallback.is_some(),
         benchmark.uses_uniform_capture_bridge()
@@ -2599,6 +2645,12 @@ fn configured_native_row_source(
             (shared::Model::GrepCount, true) => {
                 "general-aot-native-row-bridge-grep-mixed-prepared-ordered-nfa-v15-v1"
             }
+            (shared::Model::CountCaptures, false) if weighted_capture_reducer.is_some() => {
+                "general-aot-native-weighted-capture-count-reducer-v1"
+            }
+            (shared::Model::GrepCaptures, false) if weighted_capture_reducer.is_some() => {
+                "general-aot-native-weighted-capture-grep-reducer-v1"
+            }
             (shared::Model::CountCaptures, false) => {
                 "general-aot-uniform-capture-native-row-count-adapter-loop-v1"
             }
@@ -2625,6 +2677,8 @@ fn configured_native_row_source(
     };
     let aggregate_strategy = if selector_fallback {
         "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1"
+    } else if weighted_capture_reducer.is_some() {
+        "native-weighted-capture-row-reducer-v1"
     } else if uniform_capture {
         "native-row-static-uniform-capture-multiplier-v1"
     } else if benchmark.model == shared::Model::GrepCount {
@@ -2642,6 +2696,9 @@ fn configured_native_row_source(
     } else {
         match benchmark.model {
             shared::Model::GrepCount => grep_row_strategy,
+            shared::Model::GrepCaptures if weighted_capture_reducer.is_some() => {
+                "linked-native-weighted-capture-reducer-v1"
+            }
             shared::Model::GrepCaptures => "per-line-native-row-static-uniform-capture-v1",
             _ => "not-applicable",
         }
@@ -2757,6 +2814,7 @@ fn configured_native_row_source(
     let mut proof_accounting_version = 0_u32;
     let mut source_participating_groups = Vec::<u64>::new();
     let mut source_minimum_match_bytes = Vec::<usize>::new();
+    let mut source_participating_user_captures = Vec::<usize>::new();
     let mut source_canonical_capture_annotations = Vec::<usize>::new();
     let mut source_proof_work = Vec::<u64>::new();
     let mut source_proof_peak_stack_items = Vec::<usize>::new();
@@ -2775,6 +2833,8 @@ fn configured_native_row_source(
                     .expect("capture multiplier fits u64"),
             );
             source_minimum_match_bytes.push(participation.minimum_match_bytes().get());
+            source_participating_user_captures
+                .push(participation.participating_user_captures());
             source_canonical_capture_annotations
                 .push(participation.canonical_capture_annotations());
             source_proof_work.push(participation.work());
@@ -2796,6 +2856,12 @@ fn configured_native_row_source(
     let mut source = String::new();
     writeln!(source, "pub const CONFIGURED: bool = true;").unwrap();
     writeln!(source, "pub const NATIVE_ROW_BRIDGE: bool = true;").unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_BRIDGE: bool = {};",
+        weighted_capture_reducer.is_some()
+    )
+    .unwrap();
     writeln!(source, "pub const NATIVE_SCALAR_REDUCER: bool = false;").unwrap();
     writeln!(
         source,
@@ -3002,7 +3068,11 @@ fn configured_native_row_source(
         "pub const SOURCE_MINIMUM_MATCH_BYTES: &[usize] = &{source_minimum_match_bytes:?};"
     )
     .unwrap();
-    source.push_str("pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &[];\n");
+    writeln!(
+        source,
+        "pub const SOURCE_PARTICIPATING_USER_CAPTURES: &[usize] = &{source_participating_user_captures:?};"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const SOURCE_CANONICAL_CAPTURE_ANNOTATIONS: &[usize] = &{source_canonical_capture_annotations:?};"
@@ -3052,7 +3122,14 @@ fn configured_native_row_source(
     writeln!(source, "pub const SOURCE_TREE: &str = {source_tree:?};").unwrap();
     writeln!(source, "pub const PROGRAM_LEN: usize = 0;").unwrap();
     writeln!(source, "pub const PROGRAM_SYMBOL: &str = \"\";").unwrap();
-    writeln!(source, "pub const REDUCER_SYMBOL: &str = \"\";").unwrap();
+    writeln!(
+        source,
+        "pub const REDUCER_SYMBOL: &str = {:?};",
+        weighted_capture_reducer
+            .map(|weighted| weighted.artifact.reducer_symbol())
+            .unwrap_or("")
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const ENTRY_SYMBOL: &str = \"native-row-table\";"
@@ -3098,11 +3175,10 @@ fn configured_native_row_source(
         "pub const PROGRAM_SHA256: [u8; 32] = {first_program_sha256:?};"
     )
     .unwrap();
-    writeln!(
-        source,
-        "pub const OBJECT_SHA256: [u8; 32] = {first_object_sha256:?};"
-    )
-    .unwrap();
+    let object_sha256 = weighted_capture_reducer
+        .map(|weighted| weighted.artifact.receipt().reducer_object_sha256())
+        .unwrap_or(first_object_sha256);
+    writeln!(source, "pub const OBJECT_SHA256: [u8; 32] = {object_sha256:?};").unwrap();
     source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
     source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
     source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
@@ -3110,8 +3186,25 @@ fn configured_native_row_source(
     source.push_str("pub const REGEX_REDUX_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
     source.push_str("pub const REGEX_REDUX_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
     push_empty_native_regex_redux_bindings(&mut source);
-    writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
+    if weighted_capture_reducer.is_some() {
+        writeln!(
+            source,
+            "pub static OBJECT_BYTES: &[u8] = include_bytes!({OBJECT_FILE:?});"
+        )
+        .unwrap();
+    } else {
+        writeln!(source, "pub static OBJECT_BYTES: &[u8] = &[];").unwrap();
+    }
     source.push_str("unsafe extern \"C\" {\n");
+    if let Some(weighted) = weighted_capture_reducer {
+        writeln!(
+            source,
+            "    #[link_name = {:?}]",
+            weighted.artifact.reducer_symbol()
+        )
+        .unwrap();
+        source.push_str("    fn LINKED_WEIGHTED_CAPTURE_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+    }
     for (index, artifact) in bridge.artifacts.iter().enumerate() {
         let entry_symbol = artifact.entry_symbol();
         writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
@@ -3132,6 +3225,11 @@ fn configured_native_row_source(
         }
     }
     source.push_str("}\n");
+    if weighted_capture_reducer.is_some() {
+        source.push_str("pub unsafe fn weighted_capture_reduce(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_WEIGHTED_CAPTURE_REDUCER(haystack, haystack_len, value_out) } }\n");
+    } else {
+        source.push_str("pub unsafe fn weighted_capture_reduce(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    }
     if has_prepared_v15 {
         source.push_str("pub unsafe fn search_row(row: usize, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    match row {\n");
         for (index, artifact) in bridge.artifacts.iter().enumerate() {
@@ -3185,7 +3283,221 @@ fn configured_native_row_source(
     push_empty_participation_capture_bindings(&mut source);
     push_empty_single_capture_reducer_bindings(&mut source);
     push_empty_shared_uniform_capture_bindings(&mut source);
+    if let Some(weighted) = weighted_capture_reducer {
+        push_weighted_capture_reducer_receipt(&mut source, &weighted.artifact);
+    } else {
+        push_empty_weighted_capture_reducer_receipt(&mut source);
+    }
     source
+}
+
+fn push_weighted_capture_reducer_receipt(
+    source: &mut String,
+    artifact: &fre_aot_regex::RebarWeightedCaptureReducerAotArtifactV1,
+) {
+    let receipt = artifact.receipt();
+    let operation = match receipt.operation() {
+        fre_aot_regex::UniformCaptureReducerOperation::CountCaptures => 1_u8,
+        fre_aot_regex::UniformCaptureReducerOperation::GrepCaptures => 2_u8,
+    };
+    let domain = match receipt.domain() {
+        fre_aot_regex::UniformCaptureReducerDomain::WholeHaystack => 1_u8,
+        fre_aot_regex::UniformCaptureReducerDomain::ByteSliceLinesLfCrLf => 2_u8,
+    };
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA: u32 = {};",
+        receipt.schema_version()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_OPERATION: u8 = {operation};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = {domain};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE: &str = {:?};",
+        format!("{:?}", receipt.target().architecture)
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM: &str = {:?};",
+        format!("{:?}", receipt.target().operating_system)
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ABI: &str = {:?};",
+        format!("{:?}", receipt.target().abi)
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_TARGET_FEATURE_BITS: u64 = {};",
+        receipt.target().features.bits()
+    )
+    .unwrap();
+    for (name, value) in [
+        ("SOURCE_COUNT", receipt.source_count()),
+        ("PATTERN_BYTES", receipt.pattern_bytes()),
+        ("OBJECT_BYTES", receipt.reducer_object_bytes()),
+        ("MAX_OBJECT_BYTES", receipt.max_object_bytes()),
+    ] {
+        writeln!(
+            source,
+            "pub const WEIGHTED_CAPTURE_REDUCER_{name}: usize = {value};"
+        )
+        .unwrap();
+    }
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = {:?};",
+        receipt.ordered_sources_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT: &[usize] = &{:?};",
+        receipt.source_to_component()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS: &[usize] = &{:?};",
+        receipt.component_first_source_ordinals()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS: &[u64] = &{:?};",
+        receipt.component_weights()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS: &[&str] = &{:?};",
+        receipt.component_entry_symbols()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256: &[[u8; 32]] = &{:?};",
+        receipt.component_program_sha256()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256: &[[u8; 32]] = &{:?};",
+        receipt.component_object_sha256()
+    )
+    .unwrap();
+    for (name, digest) in [
+        ("OPERATION_IDENTITY", receipt.operation_identity_sha256()),
+        ("SYMBOL", receipt.reducer_symbol_sha256()),
+        ("CODE", receipt.reducer_code_sha256()),
+        ("OBJECT", receipt.reducer_object_sha256()),
+        ("ARTIFACT_IDENTITY", receipt.artifact_identity_sha256()),
+    ] {
+        writeln!(
+            source,
+            "pub const WEIGHTED_CAPTURE_REDUCER_{name}_SHA256: [u8; 32] = {digest:?};"
+        )
+        .unwrap();
+    }
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL: &str = {:?};",
+        receipt.reducer_symbol()
+    )
+    .unwrap();
+    let relocation_components = receipt
+        .relocations()
+        .iter()
+        .map(|relocation| relocation.component)
+        .collect::<Vec<_>>();
+    let relocation_offsets = receipt
+        .relocations()
+        .iter()
+        .map(|relocation| relocation.offset)
+        .collect::<Vec<_>>();
+    let relocation_kinds = receipt
+        .relocations()
+        .iter()
+        .map(|relocation| match relocation.kind {
+            fre_aot_regex::RelocationKind::X86PltRelative32 => 2_u8,
+            fre_aot_regex::RelocationKind::Aarch64Branch26 => 5_u8,
+            _ => unreachable!("weighted reducer emits only exact external calls"),
+        })
+        .collect::<Vec<_>>();
+    let relocation_addends = receipt
+        .relocations()
+        .iter()
+        .map(|relocation| relocation.addend)
+        .collect::<Vec<_>>();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS: &[usize] = &{relocation_components:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS: &[u64] = &{relocation_offsets:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS: &[u8] = &{relocation_kinds:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS: &[i64] = &{relocation_addends:?};"
+    )
+    .unwrap();
+}
+
+fn push_empty_weighted_capture_reducer_receipt(source: &mut String) {
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OPERATION: u8 = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE: &str = \"\";\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM: &str = \"\";\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ABI: &str = \"\";\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_FEATURE_BITS: u64 = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT: usize = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES: usize = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT: &[usize] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS: &[u64] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS: &[&str] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL: &str = \"\";\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS: &[usize] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS: &[u64] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS: &[u8] = &[];\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS: &[i64] = &[];\n");
+}
+
+fn push_empty_weighted_capture_reducer_bindings(source: &mut String) {
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_BRIDGE: bool = false;\n");
+    source.push_str("pub unsafe fn weighted_capture_reduce(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    push_empty_weighted_capture_reducer_receipt(source);
 }
 
 fn push_empty_shared_uniform_capture_bindings(source: &mut String) {
@@ -3541,6 +3853,35 @@ pub const SINGLE_CAPTURE_REDUCER_SOURCE_OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];
 pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_BRIDGE: bool = false;
+pub const WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA: u32 = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_OPERATION: u8 = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE: &str = "";
+pub const WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM: &str = "";
+pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ABI: &str = "";
+pub const WEIGHTED_CAPTURE_REDUCER_TARGET_FEATURE_BITS: u64 = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT: usize = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES: usize = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES: usize = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT: &[usize] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS: &[usize] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS: &[u64] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS: &[&str] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256: &[[u8; 32]] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256: &[[u8; 32]] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL: &str = "";
+pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS: &[usize] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS: &[u64] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS: &[u8] = &[];
+pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS: &[i64] = &[];
 pub const SELECTOR_CAPTURE_FALLBACK_BRIDGE: bool = false;
 pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_SYMBOL: &str = "";
 pub const SELECTOR_CAPTURE_POSITIVE_FALLBACK_PROFILE: &str = "";
@@ -3707,6 +4048,11 @@ pub unsafe fn capture_reduce(
     _haystack_len: usize,
     _scratch: *mut u8,
     _scratch_len: usize,
+    _value_out: *mut u64,
+) -> u32 { 2 }
+pub unsafe fn weighted_capture_reduce(
+    _haystack: *const u8,
+    _haystack_len: usize,
     _value_out: *mut u64,
 ) -> u32 { 2 }
 "#

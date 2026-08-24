@@ -868,6 +868,44 @@ fn strict_uniform_capture_reduce(model: shared::Model, haystack: &[u8]) -> Resul
 
 #[allow(
     unsafe_code,
+    reason = "the generated binding is the authenticated three-argument weighted reducer ABI"
+)]
+fn strict_weighted_capture_reducer_reduce(haystack: &[u8]) -> Result<u64, String> {
+    strict_weighted_capture_reducer_reduce_with(haystack, |haystack, haystack_len, value_out| {
+        // SAFETY: the complete readable haystack and aligned disjoint output
+        // remain live for the authenticated linked reducer call.
+        unsafe { linked::weighted_capture_reduce(haystack, haystack_len, value_out) }
+    })
+}
+
+fn strict_weighted_capture_reducer_reduce_with(
+    haystack: &[u8],
+    invoke: impl FnOnce(*const u8, usize, *mut u64) -> u32,
+) -> Result<u64, String> {
+    const TRANSACTION_SENTINEL: u64 = 0x7765_6967_6874_6564;
+    let mut value = TRANSACTION_SENTINEL;
+    let status = invoke(haystack.as_ptr(), haystack.len(), &raw mut value);
+    if status != STATUS_SUCCESS {
+        if value != TRANSACTION_SENTINEL {
+            return Err(format!(
+                "weighted capture reducer status {status} modified its transactional output"
+            ));
+        }
+        return Err(format!(
+            "weighted capture whole-operation reducer returned status {status}"
+        ));
+    }
+    if value == TRANSACTION_SENTINEL {
+        return Err(
+            "weighted capture whole-operation reducer succeeded without publishing output"
+                .to_owned(),
+        );
+    }
+    Ok(value)
+}
+
+#[allow(
+    unsafe_code,
     reason = "the generated whole-operation reducer is the exact authenticated statically linked C ABI boundary"
 )]
 fn strict_single_capture_reducer_reduce(
@@ -1350,6 +1388,13 @@ fn main() -> Result<(), DynError> {
     let (samples, regex_redux_receipt) = if benchmark.model == shared::Model::RegexRedux {
         let run = run_regex_redux(&benchmark)?;
         (run.samples, Some(run.receipt))
+    } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        (
+            run_operation_route_without_session(&benchmark, |haystack| {
+                strict_weighted_capture_reducer_reduce(haystack)
+            })?,
+            None,
+        )
     } else if linked::SINGLE_CAPTURE_REDUCER_BRIDGE {
         (run_single_capture_reducer_operation(&benchmark)?, None)
     } else if linked::NATIVE_ROW_BRIDGE {
@@ -1755,6 +1800,73 @@ fn print_provenance() {
         );
         return;
     }
+    if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        let source_map = linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let first_ordinals = linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let weights = linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "schema=fre.aot.rebar-runner.v6 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=true weighted_capture_reducer_bridge=true source_pattern_count={} component_count={} source_to_component={} component_first_source_ordinals={} component_weights={} component_entry_symbols={} component_program_sha256={} component_object_sha256={} operation={} domain={} ordered_sources_sha256={} operation_identity_sha256={} reducer_symbol={} reducer_symbol_sha256={} reducer_code_sha256={} reducer_object_sha256={} reducer_object_bytes={} reducer_object_cap={} reducer_artifact_identity_sha256={} external_relocation_count={} external_relocation_kinds={} semantic_runtime_symbols= boundary=single-call-helper-free-native-multi-component-weighted-row-reducer required_comparators={required_comparators} {validation_binding}",
+            linked::CONFIGURED,
+            linked::ADAPTER,
+            linked::EXPECTED_MODEL,
+            linked::EXPECTED_NAME,
+            linked::SOURCE_COMMIT,
+            linked::SOURCE_TREE,
+            linked::TARGET_ARCH,
+            linked::TARGET_OS,
+            linked::FEATURE_BITS,
+            linked::COMPILER_VERSION,
+            linked::OPTIMIZER_VERSION,
+            linked::ENGINE,
+            linked::AGGREGATE_STRATEGY,
+            linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT,
+            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS.len(),
+            source_map,
+            first_ordinals,
+            weights,
+            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS.join(","),
+            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(","),
+            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(","),
+            linked::WEIGHTED_CAPTURE_REDUCER_OPERATION,
+            linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN,
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256),
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256),
+            linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL,
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256),
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_CODE_SHA256),
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256),
+            linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES,
+            linked::WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES,
+            hex(&linked::WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256),
+            linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS.len(),
+            linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        return;
+    }
     if linked::NATIVE_ROW_BRIDGE {
         let source_to_artifact = linked::SOURCE_TO_ARTIFACT
             .iter()
@@ -2100,6 +2212,174 @@ fn single_capture_reducer_provenance_is_empty() -> bool {
         && linked::SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256 == [0; 32]
         && linked::SINGLE_CAPTURE_REDUCER_OBJECT_SHA256 == [0; 32]
         && linked::SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256 == [0; 32]
+}
+
+fn weighted_capture_reducer_provenance_is_empty() -> bool {
+    linked::WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_OPERATION == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ABI.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_FEATURE_BITS == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_CODE_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256 == [0; 32]
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS.is_empty()
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS.is_empty()
+}
+
+fn authenticate_linked_weighted_capture_reducer_route(
+    benchmark: &shared::Benchmark,
+) -> Result<bool, String> {
+    if !linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        if !weighted_capture_reducer_provenance_is_empty() {
+            return Err(
+                "non-weighted route advertises a weighted capture reducer receipt".to_owned(),
+            );
+        }
+        return Ok(false);
+    }
+    let (operation, domain, prefix, adapter, grep_strategy) = match benchmark.model {
+        shared::Model::CountCaptures => (
+            1_u8,
+            1_u8,
+            "fre_aot_regex_weighted_count_captures_v1_",
+            "general-aot-native-weighted-capture-count-reducer-v1",
+            "not-applicable",
+        ),
+        shared::Model::GrepCaptures => (
+            2_u8,
+            2_u8,
+            "fre_aot_regex_weighted_grep_captures_v1_",
+            "general-aot-native-weighted-capture-grep-reducer-v1",
+            "linked-native-weighted-capture-reducer-v1",
+        ),
+        _ => {
+            return Err(
+                "weighted capture reducer is bound to a non-capture operation".to_owned(),
+            );
+        }
+    };
+    let target = shared::target_from_parts(
+        linked::TARGET_ARCH,
+        linked::TARGET_OS,
+        linked::FEATURE_BITS,
+    )?;
+    let component_count = linked::ROW_ARTIFACT_COUNT;
+    let source_count = benchmark.patterns.len();
+    let pattern_bytes = benchmark.patterns.iter().try_fold(0_usize, |total, pattern| {
+        total
+            .checked_add(pattern.len())
+            .ok_or_else(|| "weighted capture runtime pattern-byte total overflowed".to_owned())
+    })?;
+    let expected_source_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)?;
+    let expected_kind = match linked::TARGET_ARCH {
+        "x86_64" => 2_u8,
+        "aarch64" => 5_u8,
+        _ => return Err("weighted capture reducer target architecture is unsupported".to_owned()),
+    };
+    let expected_addend = if expected_kind == 2 { -4_i64 } else { 0_i64 };
+    let identity = hex(&linked::WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256);
+    let symbol_identity = native_symbol_identity(linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL, prefix);
+    let relocation_count = linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS.len();
+    let exact_relocations = relocation_count == component_count
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS.len() == component_count
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS.len() == component_count
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS.len() == component_count
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS
+            .iter()
+            .copied()
+            .eq(0..component_count)
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS
+            .iter()
+            .all(|&offset| usize::try_from(offset).is_ok_and(|offset| offset < linked::OBJECT_BYTES.len()))
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS
+            .iter()
+            .all(|&kind| kind == expected_kind)
+        && linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS
+            .iter()
+            .all(|&addend| addend == expected_addend);
+    if source_count <= 1
+        || component_count == 0
+        || linked::WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA
+            != fre_aot_regex::REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_RECEIPT_VERSION
+        || linked::WEIGHTED_CAPTURE_REDUCER_OPERATION != operation
+        || linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN != domain
+        || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE
+            != format!("{:?}", target.architecture)
+        || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM
+            != format!("{:?}", target.operating_system)
+        || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ABI != format!("{:?}", target.abi)
+        || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_FEATURE_BITS != target.features.bits()
+        || linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT != source_count
+        || linked::WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES != pattern_bytes
+        || linked::WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256 != expected_source_sha256
+        || linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT != linked::SOURCE_TO_ARTIFACT
+        || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS
+            != linked::ROW_FIRST_SOURCE_ORDINALS
+        || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS
+            != linked::ROW_PARTICIPATING_GROUPS
+        || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS != linked::ROW_ENTRY_SYMBOLS
+        || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256
+            != linked::ROW_PROGRAM_SHA256
+        || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256 != linked::ROW_OBJECT_SHA256
+        || linked::SOURCE_PARTICIPATING_GROUPS.len() != source_count
+        || linked::SOURCE_PARTICIPATING_GROUPS
+            .iter()
+            .all(|weight| *weight == linked::SOURCE_PARTICIPATING_GROUPS[0])
+        || linked::WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256 == [0; 32]
+        || symbol_identity != Some(identity.as_str())
+        || linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL != linked::REDUCER_SYMBOL
+        || sha256(linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL.as_bytes())
+            != linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256
+        || linked::WEIGHTED_CAPTURE_REDUCER_CODE_SHA256 == [0; 32]
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256 == [0; 32]
+        || linked::WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256 == [0; 32]
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES == 0
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES != linked::OBJECT_BYTES.len()
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256 != sha256(linked::OBJECT_BYTES)
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256 != linked::OBJECT_SHA256
+        || linked::WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES
+            != shared::MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+        || linked::WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+            > linked::WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES
+        || !exact_relocations
+        || linked::ADAPTER != adapter
+        || linked::AGGREGATE_STRATEGY != "native-weighted-capture-row-reducer-v1"
+        || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
+        || linked::GREP_ITERATION_STRATEGY != grep_strategy
+        || !linked::NATIVE_ROW_BRIDGE
+        || !linked::UNIFORM_CAPTURE_BRIDGE
+        || linked::NATIVE_SCALAR_REDUCER
+        || linked::SHARED_ORDERED_MANY_AGGREGATE
+        || linked::SINGLE_CAPTURE_REDUCER_BRIDGE
+        || linked::STRICT_CAPTURE_BRIDGE
+        || linked::PARTICIPATION_CAPTURE_BRIDGE
+        || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+    {
+        return Err("weighted capture reducer linked receipt is inconsistent".to_owned());
+    }
+    Ok(true)
 }
 
 fn authenticate_linked_single_capture_reducer_route(
@@ -2459,6 +2739,8 @@ fn authenticate_linked_capture_next_reducer_source() -> Result<(), String> {
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     let single_capture_reducer = authenticate_linked_single_capture_reducer_route(benchmark)?;
+    let weighted_capture_reducer =
+        authenticate_linked_weighted_capture_reducer_route(benchmark)?;
     let scalar_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
     let native_uniform_capture = scalar_uniform_capture && !linked::REDUCER_SYMBOL.is_empty();
     let prepared_uniform_capture = scalar_uniform_capture && linked::REDUCER_SYMBOL.is_empty();
@@ -2658,6 +2940,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     }
     if single_capture_reducer {
         return Ok(());
+    }
+    if weighted_capture_reducer {
+        return authenticate_native_row_route(benchmark);
     }
     if linked::NATIVE_ROW_BRIDGE {
         return authenticate_native_row_route(benchmark);
@@ -3449,6 +3734,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const PARTICIPATION_STRATEGY: &str = "native-exact-span-participation-dfa-v1";
     const GREP_PARTICIPATION_STRATEGY: &str = "per-line-native-exact-span-participation-dfa-v1";
     const GREP_CAPTURE_STRATEGY: &str = "per-line-native-row-static-uniform-capture-v1";
+    const WEIGHTED_CAPTURE_STRATEGY: &str = "native-weighted-capture-row-reducer-v1";
+    const GREP_WEIGHTED_CAPTURE_STRATEGY: &str = "linked-native-weighted-capture-reducer-v1";
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
     const MIXED_GREP_ROW_STRATEGY: &str =
         "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1";
@@ -3544,7 +3831,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         || linked::REQUIRED_PREPARE_CAPABILITIES != 0
         || linked::HAS_SPAN_FILL
         || !linked::SPAN_FILL_SYMBOL.is_empty()
-        || !linked::REDUCER_SYMBOL.is_empty()
+        || if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+            linked::REDUCER_SYMBOL != linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL
+        } else {
+            !linked::REDUCER_SYMBOL.is_empty()
+        }
         || !linked::PROGRAM_SYMBOL.is_empty()
         || linked::PROGRAM_LEN != 0
         || linked::PREPARED_BULK_STRATEGY != "None"
@@ -3552,7 +3843,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden global prepared route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+    let expected_aggregate_strategy = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        WEIGHTED_CAPTURE_STRATEGY
+    } else if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         SELECTOR_FALLBACK_STRATEGY
     } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
         PARTICIPATION_STRATEGY
@@ -3580,7 +3873,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else {
         "not-applicable"
     };
-    let expected_grep_strategy = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+    let expected_grep_strategy = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE
+        && benchmark.model == shared::Model::GrepCaptures
+    {
+        GREP_WEIGHTED_CAPTURE_STRATEGY
+    } else if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         GREP_SELECTOR_FALLBACK_STRATEGY
     } else if linked::PARTICIPATION_CAPTURE_BRIDGE && benchmark.model == shared::Model::GrepCaptures
     {
@@ -3604,7 +3901,17 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
     }
-    let expected_adapter = if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
+    let expected_adapter = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        match benchmark.model {
+            shared::Model::CountCaptures => {
+                "general-aot-native-weighted-capture-count-reducer-v1"
+            }
+            shared::Model::GrepCaptures => {
+                "general-aot-native-weighted-capture-grep-reducer-v1"
+            }
+            _ => return Err("weighted capture bridge has a non-capture adapter".to_owned()),
+        }
+    } else if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         "general-aot-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
     } else if linked::PARTICIPATION_CAPTURE_BRIDGE {
         match benchmark.model {
@@ -5012,6 +5319,58 @@ mod tests {
         assert_eq!(
             expected_native_scalar_adapter(shared::Model::GrepCount, false, 0),
             None,
+        );
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test closure models the generated reducer's writable scalar output ABI"
+    )]
+    fn weighted_capture_reducer_wrapper_calls_once_and_enforces_transactional_errors() {
+        let calls = std::cell::Cell::new(0_usize);
+        let haystack = b"b\r\nab\n";
+        let value = strict_weighted_capture_reducer_reduce_with(
+            haystack,
+            |pointer, length, value_out| {
+                calls.set(calls.get().saturating_add(1));
+                assert_eq!(pointer, haystack.as_ptr());
+                assert_eq!(length, haystack.len());
+                // SAFETY: the wrapper supplies one aligned live `u64` output.
+                unsafe { value_out.write(7) };
+                STATUS_SUCCESS
+            },
+        );
+        assert_eq!(value, Ok(7));
+        assert_eq!(calls.get(), 1);
+
+        let status_error = strict_weighted_capture_reducer_reduce_with(
+            haystack,
+            |_, _, _| STATUS_INVALID_ARGUMENT,
+        )
+        .expect_err("non-success reducer status");
+        assert!(status_error.contains("returned status"), "{status_error}");
+
+        let missing_publication =
+            strict_weighted_capture_reducer_reduce_with(haystack, |_, _, _| STATUS_SUCCESS)
+                .expect_err("successful reducer must publish");
+        assert!(
+            missing_publication.contains("without publishing output"),
+            "{missing_publication}"
+        );
+
+        let publication_error = strict_weighted_capture_reducer_reduce_with(
+            haystack,
+            |_, _, value_out| {
+                // SAFETY: the wrapper supplies one aligned live `u64` output.
+                unsafe { value_out.write(9) };
+                STATUS_INVALID_ARGUMENT
+            },
+        )
+        .expect_err("failed reducer must not publish");
+        assert!(
+            publication_error.contains("transactional output"),
+            "{publication_error}"
         );
     }
 

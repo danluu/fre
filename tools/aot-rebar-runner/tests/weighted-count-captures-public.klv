@@ -1,0 +1,11 @@
+name:21:test/weighted-capture
+model:14:count-captures
+case-insensitive:5:false
+unicode:5:false
+max-iters:1:2
+max-warmup-iters:1:1
+max-time:4:1000
+max-warmup-time:3:100
+pattern:4:(a+)
+pattern:2:b+
+haystack:9:aa bbb aa
