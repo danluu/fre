@@ -2,7 +2,7 @@ use core::mem::size_of;
 
 use fre_automata::{Automaton, EdgeKind, RawPlan, StateRole};
 use regex_syntax::{
-    hir::{Class, ClassUnicode, Hir, HirKind, Look},
+    hir::{Class, ClassBytes, ClassUnicode, Hir, HirKind, Look},
     utf8::{Utf8Range, Utf8Sequences},
 };
 
@@ -70,9 +70,225 @@ struct Utf8ClassState {
 
 #[derive(Clone, Copy, Debug)]
 struct LiteralTrieTransition {
-    byte: u8,
+    start: u8,
+    end: u8,
     next: usize,
     following: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LiteralTrieByteSet {
+    words: [u64; 4],
+}
+
+impl LiteralTrieByteSet {
+    fn singleton(byte: u8) -> Self {
+        let mut set = Self::default();
+        let byte = usize::from(byte);
+        set.words[byte / 64] |= 1_u64 << (byte % 64);
+        set
+    }
+
+    fn insert_range(&mut self, start: u8, end: u8) -> Result<(), LowerError> {
+        if start > end {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie membership range was reversed",
+            });
+        }
+        let first = usize::from(start) / 64;
+        let last = usize::from(end) / 64;
+        let first_mask = u64::MAX << (usize::from(start) % 64);
+        let last_shift = 63usize.saturating_sub(usize::from(end) % 64);
+        let last_mask = u64::MAX >> last_shift;
+        if first == last {
+            self.words[first] |= first_mask & last_mask;
+            return Ok(());
+        }
+        self.words[first] |= first_mask;
+        self.words[first.saturating_add(1)..last].fill(u64::MAX);
+        self.words[last] |= last_mask;
+        Ok(())
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.words
+            .into_iter()
+            .zip(other.words)
+            .any(|(left, right)| left & right != 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LiteralTrieByteToken<'a> {
+    Literal(u8),
+    Bytes(&'a ClassBytes),
+    UnicodeAscii(&'a ClassUnicode),
+}
+
+const LITERAL_TRIE_MAX_SOURCE_NESTING: usize = 64;
+const LITERAL_TRIE_SOURCE_STACK_ITEMS: usize = LITERAL_TRIE_MAX_SOURCE_NESTING + 2;
+
+#[derive(Clone, Copy, Debug)]
+enum LiteralTrieSourceFrame<'a> {
+    Node {
+        hir: &'a Hir,
+        depth: usize,
+    },
+    ConcatTail {
+        parts: &'a [Hir],
+        next: usize,
+        depth: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LiteralTrieSourceStep<'a> {
+    Node(&'a Hir),
+    End,
+    TooDeep,
+}
+
+struct LiteralTrieSourceWalk<'a> {
+    frames: [Option<LiteralTrieSourceFrame<'a>>; LITERAL_TRIE_SOURCE_STACK_ITEMS],
+    len: usize,
+}
+
+impl<'a> LiteralTrieSourceWalk<'a> {
+    fn new(hir: &'a Hir) -> Self {
+        let mut frames = [None; LITERAL_TRIE_SOURCE_STACK_ITEMS];
+        frames[0] = Some(LiteralTrieSourceFrame::Node { hir, depth: 0 });
+        Self { frames, len: 1 }
+    }
+
+    fn push(&mut self, frame: LiteralTrieSourceFrame<'a>) -> bool {
+        let Some(next_len) = self.len.checked_add(1) else {
+            return false;
+        };
+        let Some(slot) = self.frames.get_mut(self.len) else {
+            return false;
+        };
+        *slot = Some(frame);
+        self.len = next_len;
+        true
+    }
+
+    fn next(&mut self) -> Result<LiteralTrieSourceStep<'a>, LowerError> {
+        loop {
+            let Some(index) = self.len.checked_sub(1) else {
+                return Ok(LiteralTrieSourceStep::End);
+            };
+            self.len = index;
+            let frame = self.frames[index]
+                .take()
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie source stack contained an empty live slot",
+                })?;
+            match frame {
+                LiteralTrieSourceFrame::Node { hir, depth } => {
+                    if depth > LITERAL_TRIE_MAX_SOURCE_NESTING {
+                        return Ok(LiteralTrieSourceStep::TooDeep);
+                    }
+                    let child_depth =
+                        depth.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                            computation: "literal-trie source-walk nesting",
+                        })?;
+                    match hir.kind() {
+                        HirKind::Capture(capture) => {
+                            if !self.push(LiteralTrieSourceFrame::Node {
+                                hir: &capture.sub,
+                                depth: child_depth,
+                            }) {
+                                return Ok(LiteralTrieSourceStep::TooDeep);
+                            }
+                        }
+                        HirKind::Concat(parts) if !parts.is_empty() => {
+                            if parts.len() > 1
+                                && !self.push(LiteralTrieSourceFrame::ConcatTail {
+                                    parts,
+                                    next: 1,
+                                    depth: child_depth,
+                                })
+                            {
+                                return Ok(LiteralTrieSourceStep::TooDeep);
+                            }
+                            if !self.push(LiteralTrieSourceFrame::Node {
+                                hir: &parts[0],
+                                depth: child_depth,
+                            }) {
+                                return Ok(LiteralTrieSourceStep::TooDeep);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Ok(LiteralTrieSourceStep::Node(hir));
+                }
+                LiteralTrieSourceFrame::ConcatTail { parts, next, depth } => {
+                    let hir = parts.get(next).ok_or(LowerError::InternalInvariant {
+                        detail: "literal-trie concatenation cursor escaped its source",
+                    })?;
+                    let following = next.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                        computation: "literal-trie concatenation cursor",
+                    })?;
+                    if following < parts.len()
+                        && !self.push(LiteralTrieSourceFrame::ConcatTail {
+                            parts,
+                            next: following,
+                            depth,
+                        })
+                    {
+                        return Ok(LiteralTrieSourceStep::TooDeep);
+                    }
+                    if !self.push(LiteralTrieSourceFrame::Node { hir, depth }) {
+                        return Ok(LiteralTrieSourceStep::TooDeep);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl LiteralTrieByteToken<'_> {
+    fn membership(self) -> Result<LiteralTrieByteSet, LowerError> {
+        if let Self::Literal(byte) = self {
+            return Ok(LiteralTrieByteSet::singleton(byte));
+        }
+        let mut set = LiteralTrieByteSet::default();
+        self.visit_ranges(|start, end| {
+            set.insert_range(start, end)
+        })?;
+        Ok(set)
+    }
+
+    fn visit_ranges(
+        self,
+        mut visit: impl FnMut(u8, u8) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        match self {
+            Self::Literal(byte) => visit(byte, byte),
+            Self::Bytes(class) => {
+                for range in class.ranges() {
+                    visit(range.start(), range.end())?;
+                }
+                Ok(())
+            }
+            Self::UnicodeAscii(class) => {
+                for range in class.ranges() {
+                    let start = u8::try_from(u32::from(range.start())).map_err(|_| {
+                        LowerError::InternalInvariant {
+                            detail: "classified literal-trie Unicode token was not ASCII",
+                        }
+                    })?;
+                    let end = u8::try_from(u32::from(range.end())).map_err(|_| {
+                        LowerError::InternalInvariant {
+                            detail: "classified literal-trie Unicode token was not ASCII",
+                        }
+                    })?;
+                    visit(start, end)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// One source-order-preserving prefix-trie state.
@@ -115,6 +331,16 @@ struct LiteralTrieCapacity {
     transitions: usize,
     chunks: usize,
     outs: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LiteralTrieSourceMetrics {
+    nodes: usize,
+    tokens: usize,
+    transition_ranges: usize,
+    maximum_token_ranges: usize,
+    continuation_patches: usize,
+    extended: bool,
 }
 
 const fn assertion_edge_kind(look: Look) -> EdgeKind {
@@ -995,8 +1221,8 @@ impl<'h> Compiler<'h> {
         Ok(hir)
     }
 
-    /// Compile a direct literal alternation as a source-order-preserving
-    /// prefix trie.
+    /// Compile a fixed-width byte-token alternation as a source-order-
+    /// preserving prefix trie.
     ///
     /// A terminal prefix freezes the current outgoing transition chunk. Any
     /// later alternative is inserted into a new chunk. During graph emission,
@@ -1004,7 +1230,15 @@ impl<'h> Compiler<'h> {
     /// expressions such as `zapper|z|zap` as `z(?:apper||ap)` instead of
     /// reordering the terminal `z` around either longer alternative. The
     /// continuation itself remains an ordinary fragment patch owned by the
-    /// enclosing expression.
+    /// enclosing expression. Capture and concatenation wrappers are
+    /// transparent. At one trie node, byte-token siblings may be equal or
+    /// disjoint. An overlap that is not equality declines before graph
+    /// publication because splitting such a token could change ordered branch
+    /// priority.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the optional transaction keeps census, admission, and publication in one scope"
+    )]
     fn try_literal_trie_alternation(
         &mut self,
         branches: &'h [Hir],
@@ -1012,43 +1246,72 @@ impl<'h> Compiler<'h> {
         if branches.len() <= 1 {
             return Ok(None);
         }
-        let mut total_bytes = 0usize;
+        if !literal_trie_test_enabled() {
+            return self.literal_trie_legacy_decline(branches);
+        }
+        let mut source = LiteralTrieSourceMetrics::default();
         let mut ordinary = LiteralTrieTopology {
             states: 1,
             edges: branches.len(),
         };
         for branch in branches {
             self.charge(1, "literal-trie branch classification")?;
-            let bytes = match branch.kind() {
-                HirKind::Empty => 0,
-                HirKind::Literal(literal) => literal.0.len(),
-                _ => return Ok(None),
-            };
-            total_bytes = total_bytes.checked_add(bytes).ok_or(
+            let tokens_before = source.tokens;
+            let transitions_before = source.transition_ranges;
+            let mut terminal_ranges = 0usize;
+            if !self.literal_trie_classify_node(branch, &mut source, &mut terminal_ranges)? {
+                return Ok(self.literal_trie_decline());
+            }
+            let branch_tokens =
+                source
+                    .tokens
+                    .checked_sub(tokens_before)
+                    .ok_or(LowerError::InternalInvariant {
+                        detail: "literal-trie source token census moved backwards",
+                    })?;
+            let branch_transitions = source
+                .transition_ranges
+                .checked_sub(transitions_before)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie source transition census moved backwards",
+                })?;
+            if (branch_tokens == 0) != (branch_transitions == 0) {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie empty branch census was inconsistent",
+                });
+            }
+            source.continuation_patches = source
+                .continuation_patches
+                .checked_add(terminal_ranges.max(1))
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie continuation-patch census",
+                })?;
+            ordinary.states = ordinary.states.checked_add(branch_tokens.max(1)).ok_or(
                 LowerError::ArithmeticOverflow {
-                    computation: "literal-trie source byte count",
+                    computation: "ordinary byte-token-alternation state count",
                 },
             )?;
-            let ordinary_branch = bytes.max(1);
-            ordinary.states = ordinary.states.checked_add(ordinary_branch).ok_or(
-                LowerError::ArithmeticOverflow {
-                    computation: "ordinary literal-alternation state count",
-                },
-            )?;
-            ordinary.edges = ordinary.edges.checked_add(ordinary_branch).ok_or(
-                LowerError::ArithmeticOverflow {
-                    computation: "ordinary literal-alternation edge count",
-                },
-            )?;
+            ordinary.edges = ordinary
+                .edges
+                .checked_add(branch_transitions.max(1))
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "ordinary byte-token-alternation edge count",
+                })?;
         }
 
-        let Some(capacity) = Self::literal_trie_capacity(total_bytes, branches.len())? else {
-            return Ok(None);
+        let Some(capacity) = Self::literal_trie_capacity(
+            source.tokens,
+            source.transition_ranges,
+            source.continuation_patches,
+            branches.len(),
+        )?
+        else {
+            return Ok(self.literal_trie_decline());
         };
         let construction_work =
-            Self::literal_trie_construction_work_upper_bound(total_bytes, branches.len())?;
+            Self::literal_trie_construction_work_upper_bound(source, branches.len())?;
         if !self.try_precharge_literal_trie_work(construction_work)? {
-            return Ok(None);
+            return Ok(self.literal_trie_decline());
         }
         let mut trie = Vec::new();
         let mut transitions = Vec::new();
@@ -1063,19 +1326,9 @@ impl<'h> Compiler<'h> {
         reserve_exact(&mut chunks, capacity.chunks, "literal-trie chunk arena")?;
         self.push_literal_trie_state(&mut trie)?;
         for branch in branches {
-            let bytes = match branch.kind() {
-                HirKind::Empty => &[][..],
-                HirKind::Literal(literal) => literal.0.as_ref(),
-                _ => {
-                    return Err(LowerError::InternalInvariant {
-                        detail: "classified literal-trie branch changed kind",
-                    });
-                }
-            };
             let mut state = 0usize;
-            for &byte in bytes {
-                self.charge(1, "literal-trie byte insertion")?;
-                state = self.literal_trie_step(&mut trie, &mut transitions, state, byte)?;
+            if !self.literal_trie_insert_node(branch, &mut trie, &mut transitions, &mut state)? {
+                return Ok(self.literal_trie_decline());
             }
             self.literal_trie_add_match(&mut trie, &mut chunks, state)?;
         }
@@ -1083,7 +1336,7 @@ impl<'h> Compiler<'h> {
         self.finish_literal_trie_work_credit()?;
         if compact.states > ordinary.states || compact.edges > ordinary.edges || compact == ordinary
         {
-            return Ok(None);
+            return Ok(self.literal_trie_decline());
         }
         let compilation_work = self.literal_trie_compilation_work_upper_bound(
             transitions.len(),
@@ -1092,7 +1345,7 @@ impl<'h> Compiler<'h> {
             compact,
         )?;
         if !self.try_precharge_literal_trie_work(compilation_work)? {
-            return Ok(None);
+            return Ok(self.literal_trie_decline());
         }
         let fragment =
             self.compile_literal_trie(&trie, &transitions, &chunks, capacity.outs, compact)?;
@@ -1100,11 +1353,197 @@ impl<'h> Compiler<'h> {
         Ok(Some(fragment))
     }
 
+    fn literal_trie_classify_node(
+        &mut self,
+        hir: &'h Hir,
+        source: &mut LiteralTrieSourceMetrics,
+        terminal_ranges: &mut usize,
+    ) -> Result<bool, LowerError> {
+        if matches!(hir.kind(), HirKind::Empty | HirKind::Literal(_)) {
+            Self::literal_trie_classify_direct_node(hir, source, terminal_ranges)?;
+            return Ok(true);
+        }
+        source.extended = true;
+        let mut walk = LiteralTrieSourceWalk::new(hir);
+        loop {
+            let hir = match walk.next()? {
+                LiteralTrieSourceStep::Node(hir) => hir,
+                LiteralTrieSourceStep::End => return Ok(true),
+                LiteralTrieSourceStep::TooDeep => return Ok(false),
+            };
+            self.charge(1, "literal-trie source-node classification")?;
+            match hir.kind() {
+                HirKind::Empty | HirKind::Literal(_) => {
+                    Self::literal_trie_classify_direct_node(hir, source, terminal_ranges)?;
+                }
+                HirKind::Class(Class::Bytes(class)) => {
+                    Self::literal_trie_increment_source_nodes(source)?;
+                    let ranges = class.ranges().len();
+                    if ranges == 0 {
+                        return Ok(false);
+                    }
+                    Self::literal_trie_add_source_tokens(source, 1, ranges, ranges)?;
+                    *terminal_ranges = ranges;
+                }
+                HirKind::Class(Class::Unicode(class)) => {
+                    Self::literal_trie_increment_source_nodes(source)?;
+                    let ranges = class.ranges();
+                    if ranges.is_empty() {
+                        return Ok(false);
+                    }
+                    self.charge_usize(ranges.len(), "literal-trie ASCII scalar-range proof")?;
+                    if ranges.iter().any(|range| range.end() > '\u{7F}') {
+                        return Ok(false);
+                    }
+                    Self::literal_trie_add_source_tokens(source, 1, ranges.len(), ranges.len())?;
+                    *terminal_ranges = ranges.len();
+                }
+                HirKind::Capture(_) | HirKind::Concat(_) => {
+                    Self::literal_trie_increment_source_nodes(source)?;
+                }
+                HirKind::Look(_) | HirKind::Alternation(_) | HirKind::Repetition(_) => {
+                    Self::literal_trie_increment_source_nodes(source)?;
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    fn literal_trie_classify_direct_node(
+        hir: &Hir,
+        source: &mut LiteralTrieSourceMetrics,
+        terminal_ranges: &mut usize,
+    ) -> Result<(), LowerError> {
+        Self::literal_trie_increment_source_nodes(source)?;
+        if let HirKind::Literal(literal) = hir.kind() {
+            Self::literal_trie_add_source_tokens(source, literal.0.len(), literal.0.len(), 1)?;
+            if !literal.0.is_empty() {
+                *terminal_ranges = 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn literal_trie_increment_source_nodes(
+        source: &mut LiteralTrieSourceMetrics,
+    ) -> Result<(), LowerError> {
+        source.nodes = source
+            .nodes
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie source node count",
+            })?;
+        Ok(())
+    }
+
+    fn literal_trie_add_source_tokens(
+        source: &mut LiteralTrieSourceMetrics,
+        tokens: usize,
+        transition_ranges: usize,
+        maximum_token_ranges: usize,
+    ) -> Result<(), LowerError> {
+        source.tokens =
+            source
+                .tokens
+                .checked_add(tokens)
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie source token count",
+                })?;
+        source.transition_ranges = source
+            .transition_ranges
+            .checked_add(transition_ranges)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie source transition-range count",
+            })?;
+        source.maximum_token_ranges = source.maximum_token_ranges.max(maximum_token_ranges);
+        Ok(())
+    }
+
+    fn literal_trie_insert_node(
+        &mut self,
+        hir: &'h Hir,
+        trie: &mut Vec<LiteralTrieState>,
+        transitions: &mut Vec<LiteralTrieTransition>,
+        state: &mut usize,
+    ) -> Result<bool, LowerError> {
+        let mut walk = LiteralTrieSourceWalk::new(hir);
+        loop {
+            let hir = match walk.next()? {
+                LiteralTrieSourceStep::Node(hir) => hir,
+                LiteralTrieSourceStep::End => return Ok(true),
+                LiteralTrieSourceStep::TooDeep => {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "classified literal-trie source exceeded its nesting bound",
+                    });
+                }
+            };
+            match hir.kind() {
+                HirKind::Empty => {}
+                HirKind::Literal(literal) => {
+                    for &byte in &literal.0 {
+                        self.charge(1, "literal-trie byte insertion")?;
+                        let Some(next) = self.literal_trie_step(
+                            trie,
+                            transitions,
+                            *state,
+                            LiteralTrieByteToken::Literal(byte),
+                        )?
+                        else {
+                            return Ok(false);
+                        };
+                        *state = next;
+                    }
+                }
+                HirKind::Class(Class::Bytes(class)) if !class.ranges().is_empty() => {
+                    self.charge(2, "literal-trie byte-class replay and insertion")?;
+                    let Some(next) = self.literal_trie_step(
+                        trie,
+                        transitions,
+                        *state,
+                        LiteralTrieByteToken::Bytes(class),
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    *state = next;
+                }
+                HirKind::Class(Class::Unicode(class))
+                    if !class.ranges().is_empty()
+                        && class.ranges().iter().all(|range| range.end() <= '\u{7F}') =>
+                {
+                    self.charge(2, "literal-trie Unicode-class replay and insertion")?;
+                    let Some(next) = self.literal_trie_step(
+                        trie,
+                        transitions,
+                        *state,
+                        LiteralTrieByteToken::UnicodeAscii(class),
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    *state = next;
+                }
+                HirKind::Capture(_) => self.charge(1, "literal-trie capture replay")?,
+                HirKind::Concat(_) => self.charge(1, "literal-trie concatenation replay")?,
+                HirKind::Class(_)
+                | HirKind::Look(_)
+                | HirKind::Alternation(_)
+                | HirKind::Repetition(_) => {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "classified literal-trie source changed shape",
+                    });
+                }
+            }
+        }
+    }
+
     fn literal_trie_capacity(
-        total_bytes: usize,
+        total_tokens: usize,
+        total_transitions: usize,
+        continuation_patches: usize,
         branches: usize,
     ) -> Result<Option<LiteralTrieCapacity>, LowerError> {
-        let states = total_bytes
+        let states = total_tokens
             .checked_add(1)
             .ok_or(LowerError::ArithmeticOverflow {
                 computation: "literal-trie state capacity",
@@ -1119,21 +1558,21 @@ impl<'h> Compiler<'h> {
             .ok_or(LowerError::ArithmeticOverflow {
                 computation: "literal-trie state scratch",
             })?;
-        let transition_bytes = total_bytes
+        let transition_bytes = total_transitions
             .checked_mul(size_of::<LiteralTrieTransition>())
             .ok_or(LowerError::ArithmeticOverflow {
                 computation: "literal-trie transition scratch",
             })?;
-        let chunk_bytes = branches
-            .checked_mul(size_of::<LiteralTrieChunk>())
-            .ok_or(LowerError::ArithmeticOverflow {
+        let chunk_bytes = branches.checked_mul(size_of::<LiteralTrieChunk>()).ok_or(
+            LowerError::ArithmeticOverflow {
                 computation: "literal-trie chunk scratch",
-            })?;
-        let out_bytes = branches
-            .checked_mul(size_of::<Patch>())
-            .ok_or(LowerError::ArithmeticOverflow {
+            },
+        )?;
+        let out_bytes = continuation_patches.checked_mul(size_of::<Patch>()).ok_or(
+            LowerError::ArithmeticOverflow {
                 computation: "literal-trie continuation scratch",
-            })?;
+            },
+        )?;
         let scratch = state_bytes
             .checked_add(transition_bytes)
             .and_then(|value| value.checked_add(chunk_bytes))
@@ -1146,13 +1585,81 @@ impl<'h> Compiler<'h> {
         }
         Ok(Some(LiteralTrieCapacity {
             states,
-            transitions: total_bytes,
+            transitions: total_transitions,
             chunks: branches,
-            outs: branches,
+            outs: continuation_patches,
         }))
     }
 
     fn literal_trie_construction_work_upper_bound(
+        source: LiteralTrieSourceMetrics,
+        branches: usize,
+    ) -> Result<u64, LowerError> {
+        if !source.extended {
+            return Self::literal_trie_legacy_construction_work_upper_bound(
+                source.tokens,
+                branches,
+            );
+        }
+        let tokens = u64::try_from(source.tokens).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "literal-trie construction token count",
+        })?;
+        let transitions = u64::try_from(source.transition_ranges).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie construction transition count",
+            }
+        })?;
+        let nodes = u64::try_from(source.nodes).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "literal-trie construction source-node count",
+        })?;
+        let branches = u64::try_from(branches).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "literal-trie construction branch count",
+        })?;
+        let maximum_token_ranges = u64::try_from(source.maximum_token_ranges).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie maximum token-range count",
+            }
+        })?;
+        // Equal siblings reuse one child and disjoint siblings cover at most
+        // the byte alphabet. Thus an active search examines no more than one
+        // token's ranges per source branch and never more than 256 ranges.
+        // Five token units cover classification replay, insertion, state
+        // publication, and both topology censuses. Two transition units cover
+        // range publication and the topology chain census. Three branch units
+        // cover terminal publication and the chunk census. The constant covers
+        // arena attempts, root publication, and root census.
+        let search_fanout = branches
+            .checked_mul(maximum_token_ranges)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie construction search fanout",
+            })?
+            .min(256);
+        tokens
+            .checked_mul(
+                search_fanout
+                    .checked_add(5)
+                    .ok_or(LowerError::ArithmeticOverflow {
+                        computation: "literal-trie construction token factor",
+                    })?,
+            )
+            .and_then(|value| {
+                transitions
+                    .checked_mul(2)
+                    .and_then(|tail| value.checked_add(tail))
+            })
+            .and_then(|value| value.checked_add(nodes))
+            .and_then(|value| {
+                branches
+                    .checked_mul(3)
+                    .and_then(|tail| value.checked_add(tail))
+            })
+            .and_then(|value| value.checked_add(5))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie construction work bound",
+            })
+    }
+
+    fn literal_trie_legacy_construction_work_upper_bound(
         total_bytes: usize,
         branches: usize,
     ) -> Result<u64, LowerError> {
@@ -1162,20 +1669,20 @@ impl<'h> Compiler<'h> {
         let branches = u64::try_from(branches).map_err(|_| LowerError::ArithmeticOverflow {
             computation: "literal-trie construction branch count",
         })?;
-        // Every active chunk has unique byte labels, so one lookup examines
-        // at most one transition per source branch and never more than all
-        // 256 byte values. The other five byte units cover insertion, at most
-        // two arena publications, and both topology censuses. Three branch
-        // units cover terminal publication and the chunk census. The constant
-        // covers the arena attempts, root publication, and root census.
         let search_fanout = branches.min(256);
         bytes
-            .checked_mul(search_fanout.checked_add(5).ok_or(
-                LowerError::ArithmeticOverflow {
-                    computation: "literal-trie construction byte factor",
-                },
-            )?)
-            .and_then(|value| branches.checked_mul(3).and_then(|tail| value.checked_add(tail)))
+            .checked_mul(
+                search_fanout
+                    .checked_add(5)
+                    .ok_or(LowerError::ArithmeticOverflow {
+                        computation: "literal-trie construction byte factor",
+                    })?,
+            )
+            .and_then(|value| {
+                branches
+                    .checked_mul(3)
+                    .and_then(|tail| value.checked_add(tail))
+            })
             .and_then(|value| value.checked_add(5))
             .ok_or(LowerError::ArithmeticOverflow {
                 computation: "literal-trie construction work bound",
@@ -1284,6 +1791,26 @@ impl<'h> Compiler<'h> {
         Ok(())
     }
 
+    fn literal_trie_decline(&mut self) -> Option<Fragment> {
+        self.literal_trie_work_credit = None;
+        None
+    }
+
+    fn literal_trie_legacy_decline(
+        &mut self,
+        branches: &'h [Hir],
+    ) -> Result<Option<Fragment>, LowerError> {
+        for branch in branches {
+            self.charge(1, "literal-trie branch classification")?;
+            if !matches!(branch.kind(), HirKind::Empty | HirKind::Literal(_)) {
+                return Ok(None);
+            }
+        }
+        Err(LowerError::InternalInvariant {
+            detail: "literal-trie legacy-decline replay reached a selecting source",
+        })
+    }
+
     fn push_literal_trie_state(
         &mut self,
         trie: &mut Vec<LiteralTrieState>,
@@ -1305,26 +1832,88 @@ impl<'h> Compiler<'h> {
         trie: &mut Vec<LiteralTrieState>,
         transitions: &mut Vec<LiteralTrieTransition>,
         from: usize,
-        byte: u8,
-    ) -> Result<usize, LowerError> {
+        token: LiteralTrieByteToken<'_>,
+    ) -> Result<Option<usize>, LowerError> {
+        let incoming = token.membership()?;
         let state = *trie.get(from).ok_or(LowerError::InternalInvariant {
             detail: "literal-trie transition source was absent",
         })?;
         let mut cursor = state.active;
         let mut after = state.active;
         while let Some(index) = cursor {
-            self.charge(1, "literal-trie transition search")?;
-            let transition = *transitions.get(index).ok_or(LowerError::InternalInvariant {
-                detail: "literal-trie transition search escaped its arena",
-            })?;
-            if transition.byte == byte {
-                return Ok(transition.next);
+            let first = *transitions
+                .get(index)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie transition search escaped its arena",
+                })?;
+            let child = first.next;
+            let mut existing = LiteralTrieByteSet::default();
+            while let Some(group_index) = cursor {
+                let transition =
+                    *transitions
+                        .get(group_index)
+                        .ok_or(LowerError::InternalInvariant {
+                            detail: "literal-trie token group escaped its transition arena",
+                        })?;
+                if transition.next != child {
+                    break;
+                }
+                self.charge(1, "literal-trie transition search")?;
+                existing.insert_range(transition.start, transition.end)?;
+                after = Some(group_index);
+                cursor = transition.following;
             }
-            after = Some(index);
-            cursor = transition.following;
+            if incoming.intersects(existing) {
+                return Ok((incoming == existing).then_some(child));
+            }
         }
 
         let next = self.push_literal_trie_state(trie)?;
+        let mut emitted = 0usize;
+        token.visit_ranges(|start, end| {
+            self.push_literal_trie_transition(
+                trie,
+                transitions,
+                from,
+                &mut after,
+                start,
+                end,
+                next,
+            )?;
+            emitted = emitted
+                .checked_add(1)
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie emitted token-range count",
+                })?;
+            Ok(())
+        })?;
+        if emitted == 0 {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie admitted an empty byte token",
+            });
+        }
+        Ok(Some(next))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the checked arena publication keeps its source and chain state explicit"
+    )]
+    fn push_literal_trie_transition(
+        &mut self,
+        trie: &mut [LiteralTrieState],
+        transitions: &mut Vec<LiteralTrieTransition>,
+        from: usize,
+        after: &mut Option<usize>,
+        start: u8,
+        end: u8,
+        next: usize,
+    ) -> Result<(), LowerError> {
+        if start > end {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie token range was reversed",
+            });
+        }
         if transitions.len() == transitions.capacity() {
             return Err(LowerError::InternalInvariant {
                 detail: "literal-trie transition census was exceeded",
@@ -1339,11 +1928,12 @@ impl<'h> Compiler<'h> {
         reserve(transitions, 1, "literal-trie transition arena")?;
         let transition = transitions.len();
         transitions.push(LiteralTrieTransition {
-            byte,
+            start,
+            end,
             next,
             following: None,
         });
-        if let Some(previous) = after {
+        if let Some(previous) = *after {
             let previous = transitions.get_mut(previous).ok_or(
                 LowerError::InternalInvariant {
                     detail: "literal-trie previous transition disappeared",
@@ -1365,7 +1955,8 @@ impl<'h> Compiler<'h> {
             .ok_or(LowerError::ArithmeticOverflow {
                 computation: "literal-trie node transition count",
             })?;
-        Ok(next)
+        *after = Some(transition);
+        Ok(())
     }
 
     fn literal_trie_add_match(
@@ -1802,8 +2393,8 @@ impl<'h> Compiler<'h> {
             let patch = self.add_edge(
                 consume,
                 EdgeKind::ByteRange,
-                transition.byte,
-                transition.byte,
+                transition.start,
+                transition.end,
                 target,
             )?;
             if target.is_none() {
@@ -3091,11 +3682,104 @@ fn preflight_final_tables(
     Ok(())
 }
 
+#[cfg(not(test))]
+const fn literal_trie_test_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn literal_trie_test_enabled() -> bool {
+    literal_trie_test_probe::enabled()
+}
+
+#[cfg(test)]
+mod literal_trie_test_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct DisableGuard;
+
+    impl Drop for DisableGuard {
+        fn drop(&mut self) {
+            DISABLED.set(false);
+        }
+    }
+
+    pub(super) fn disable() -> DisableGuard {
+        assert!(
+            !DISABLED.replace(true),
+            "literal-trie test probe already disabled"
+        );
+        DisableGuard
+    }
+
+    pub(super) fn enabled() -> bool {
+        !DISABLED.get()
+    }
+}
+
+#[cfg(test)]
+mod allocation_test_probe {
+    use core::cell::Cell;
+
+    use crate::LowerError;
+
+    std::thread_local! {
+        static TARGET: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static FAILED: Cell<bool> = const { Cell::new(false) };
+        static CALLS_AFTER_FAILURE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct FailureGuard;
+
+    impl Drop for FailureGuard {
+        fn drop(&mut self) {
+            TARGET.set(None);
+            FAILED.set(false);
+            CALLS_AFTER_FAILURE.set(0);
+        }
+    }
+
+    pub(super) fn fail_structure(structure: &'static str) -> FailureGuard {
+        assert!(
+            TARGET.replace(Some(structure)).is_none(),
+            "allocation probe already armed"
+        );
+        FAILED.set(false);
+        CALLS_AFTER_FAILURE.set(0);
+        FailureGuard
+    }
+
+    pub(super) fn before(structure: &'static str, additional: usize) -> Result<(), LowerError> {
+        if FAILED.get() {
+            CALLS_AFTER_FAILURE.set(CALLS_AFTER_FAILURE.get().saturating_add(1));
+            return Ok(());
+        }
+        if TARGET.get() == Some(structure) {
+            FAILED.set(true);
+            return Err(LowerError::AllocationFailed {
+                structure,
+                additional,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn calls_after_failure() -> usize {
+        CALLS_AFTER_FAILURE.get()
+    }
+}
+
 fn reserve<T>(
     values: &mut Vec<T>,
     additional: usize,
     structure: &'static str,
 ) -> Result<(), LowerError> {
+    #[cfg(test)]
+    allocation_test_probe::before(structure, additional)?;
     values
         .try_reserve(additional)
         .map_err(|_| LowerError::AllocationFailed {
@@ -3109,6 +3793,8 @@ fn reserve_exact<T>(
     additional: usize,
     structure: &'static str,
 ) -> Result<(), LowerError> {
+    #[cfg(test)]
+    allocation_test_probe::before(structure, additional)?;
     values
         .try_reserve_exact(additional)
         .map_err(|_| LowerError::AllocationFailed {
@@ -3136,4 +3822,277 @@ fn lower_index(value: u32) -> Result<usize, LowerError> {
     usize::try_from(value).map_err(|_| LowerError::ArithmeticOverflow {
         computation: "lowering state index conversion",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use regex_syntax::hir::{Capture, Class, ClassBytes, ClassBytesRange, Hir};
+
+    use super::{allocation_test_probe, compile, literal_trie_test_probe};
+    use crate::{LowerError, LowerLimits, OperationSemantics};
+
+    fn byte_class(bytes: &[u8]) -> Hir {
+        Hir::class(Class::Bytes(ClassBytes::new(
+            bytes
+                .iter()
+                .copied()
+                .map(|byte| ClassBytesRange::new(byte, byte)),
+        )))
+    }
+
+    fn capture(index: u32, parts: Vec<Hir>) -> Hir {
+        Hir::capture(Capture {
+            index,
+            name: None,
+            sub: Box::new(Hir::concat(parts)),
+        })
+    }
+
+    #[test]
+    fn partially_overlapping_token_sets_are_object_identical_to_the_disabled_incumbent() {
+        let hir = Hir::alternation(vec![
+            capture(1, vec![byte_class(b"ab"), Hir::literal(*b"x")]),
+            capture(2, vec![byte_class(b"bc"), Hir::literal(*b"y")]),
+            capture(3, vec![byte_class(b"de"), Hir::literal(*b"z")]),
+        ]);
+        let (declined, _) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("partial overlap takes the ordinary incumbent");
+        let disabled = literal_trie_test_probe::disable();
+        let (incumbent, _) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("disabled trie produces the pre-feature incumbent");
+        drop(disabled);
+        assert_eq!(declined, incumbent);
+    }
+
+    #[test]
+    fn source_nesting_decline_is_object_identical_to_the_disabled_incumbent() {
+        fn nested(mut hir: Hir, first_capture: u32) -> Hir {
+            for offset in 0..66_u32 {
+                hir = Hir::capture(Capture {
+                    index: first_capture + offset,
+                    name: None,
+                    sub: Box::new(hir),
+                });
+            }
+            hir
+        }
+
+        let hir = Hir::alternation(vec![
+            nested(Hir::literal(*b"alpha"), 1),
+            nested(Hir::literal(*b"alpine"), 100),
+            Hir::literal(*b"omega"),
+        ]);
+        let (declined, _) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("deep optional trie proof retains ordinary lowering");
+        let disabled = literal_trie_test_probe::disable();
+        let (incumbent, _) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("disabled trie produces the deep pre-feature incumbent");
+        drop(disabled);
+        assert_eq!(declined, incumbent);
+    }
+
+    #[test]
+    fn nested_concat_tails_select_at_the_boundary_and_decline_identically_beyond_it() {
+        fn nested_concat_tail(mut hir: Hir, depth: u32, first_capture: u32) -> Hir {
+            for offset in 0..depth {
+                hir = Hir::concat(vec![
+                    Hir::capture(Capture {
+                        index: first_capture + offset,
+                        name: None,
+                        sub: Box::new(hir),
+                    }),
+                    Hir::literal(*b"x"),
+                ]);
+            }
+            hir
+        }
+
+        fn fixture(depth: u32) -> Hir {
+            Hir::alternation(vec![
+                nested_concat_tail(Hir::literal(*b"shared-alpha"), depth, 1),
+                nested_concat_tail(Hir::literal(*b"shared-beta"), depth, 100),
+                nested_concat_tail(Hir::literal(*b"other"), depth, 200),
+            ])
+        }
+
+        let boundary = fixture(32);
+        let (compact, compact_stats) = compile(
+            &boundary,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("64-level concat-tail source selects the trie");
+        let disabled = literal_trie_test_probe::disable();
+        let (ordinary, ordinary_stats) = compile(
+            &boundary,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("disabled trie produces the boundary incumbent");
+        drop(disabled);
+        assert_ne!(compact, ordinary);
+        assert!(compact_stats.states() < ordinary_stats.states());
+        assert!(compact_stats.edges() < ordinary_stats.edges());
+
+        let beyond = fixture(33);
+        let (declined, _) = compile(
+            &beyond,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("over-bound concat-tail proof retains ordinary lowering");
+        let disabled = literal_trie_test_probe::disable();
+        let (incumbent, _) = compile(
+            &beyond,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("disabled trie produces the over-bound incumbent");
+        drop(disabled);
+        assert_eq!(declined, incumbent);
+    }
+
+    #[test]
+    fn optional_work_decline_is_object_identical_to_the_legacy_incumbent() {
+        let folded = byte_class(b"Aa");
+        let branches = (0_u8..16)
+            .map(|suffix| {
+                let mut parts = vec![folded.clone(); 16];
+                parts.push(Hir::literal(vec![suffix]));
+                capture(u32::from(suffix) + 1, parts)
+            })
+            .collect();
+        let hir = Hir::alternation(branches);
+
+        let disabled = literal_trie_test_probe::disable();
+        let (incumbent, incumbent_stats) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("disabled trie produces the work-limited incumbent");
+        drop(disabled);
+
+        let (declined, declined_stats) = compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                // Enough for the bounded extension proof plus the incumbent,
+                // but below this fixture's conservative trie-build precharge.
+                max_work: incumbent_stats
+                    .work()
+                    .checked_add(400)
+                    .expect("fixture work allowance fits u64"),
+                ..LowerLimits::default()
+            },
+            false,
+        )
+        .expect("optional trie work decline retains the incumbent");
+        assert_eq!(declined, incumbent);
+        assert!(declined_stats.work() > incumbent_stats.work());
+    }
+
+    #[test]
+    fn extended_source_walk_is_charged_at_a_tight_work_limit() {
+        let parts = (0_u32..512)
+            .map(|index| capture(index + 2, vec![Hir::literal(*b"a")]))
+            .collect();
+        let hir = Hir::alternation(vec![capture(1, parts), Hir::literal(*b"omega")]);
+        assert!(matches!(
+            compile(
+                &hir,
+                OperationSemantics::CaptureFree,
+                LowerLimits {
+                    max_work: 64,
+                    ..LowerLimits::default()
+                },
+                false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: crate::LowerResource::Work,
+                needed: 65,
+                limit: 64,
+            })
+        ));
+    }
+
+    #[test]
+    fn byte_token_trie_allocation_failures_are_terminal_without_fresh_reserves() {
+        let folded = byte_class(b"Aa");
+        let branches = (0_u8..8)
+            .map(|suffix| {
+                let mut parts = vec![folded.clone(); 12];
+                parts.push(Hir::literal(vec![suffix]));
+                capture(u32::from(suffix) + 1, parts)
+            })
+            .collect();
+        let hir = Hir::alternation(branches);
+        compile(
+            &hir,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+            false,
+        )
+        .expect("allocation fixture selects a compact byte-token trie");
+
+        for structure in [
+            "literal-trie state arena",
+            "literal-trie transition arena",
+            "literal-trie chunk arena",
+            "compiled literal-trie state arena",
+            "compiled literal-trie starts",
+            "literal-trie continuation patches",
+            "compiled literal-trie edge arena",
+        ] {
+            let guard = allocation_test_probe::fail_structure(structure);
+            let error = compile(
+                &hir,
+                OperationSemantics::CaptureFree,
+                LowerLimits::default(),
+                false,
+            )
+            .expect_err("injected trie allocation failure must remain terminal");
+            assert!(
+                matches!(
+                    &error,
+                    LowerError::AllocationFailed {
+                        structure: actual,
+                        ..
+                    } if *actual == structure
+                ),
+                "structure={structure}, error={error:?}",
+            );
+            assert_eq!(
+                allocation_test_probe::calls_after_failure(),
+                0,
+                "fresh reserve after allocator failure at {structure}",
+            );
+            drop(guard);
+        }
+    }
 }

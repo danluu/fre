@@ -47,6 +47,18 @@ fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String
     pattern
 }
 
+fn generated_folded_captured_dictionary(arms: usize) -> String {
+    let mut pattern = String::from("(?i-u:");
+    for arm in 0..arms {
+        if arm != 0 {
+            pattern.push('|');
+        }
+        write!(&mut pattern, "(shared-prefix-{arm:04x})").expect("writing to a String cannot fail");
+    }
+    pattern.push(')');
+    pattern
+}
+
 fn parsed_rust_bytes(pattern: &str) -> fre_syntax::RustParsed {
     let parsed = fre_syntax::parse(ParseRequest::rust(
         pattern,
@@ -1983,6 +1995,45 @@ fn embedded_literal_trie_matches_rust_across_modes_outputs_and_windows() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "one generated 1,024-arm AOT receipt and object gate"]
+fn generated_folded_byte_token_trie_emits_a_compact_authenticated_aot_object() {
+    const ARMS: usize = 1_024;
+    let pattern = generated_folded_captured_dictionary(ARMS);
+    let compiled = compile(
+        CompileRequest::new(&pattern, Target::aarch64_macos())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+    )
+    .expect("generated folded-arm AOT compilation");
+    let receipt = compiled.receipt();
+    assert_eq!(receipt.source_bytes, pattern.len());
+    assert!(receipt.thompson_states < 4_096, "{receipt:#?}");
+    assert!(receipt.thompson_edges < 8_192, "{receipt:#?}");
+    assert!(!compiled.object().is_empty());
+    assert_eq!(receipt.object_bytes, compiled.object().len());
+    let object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
+    assert_eq!(receipt.object_sha256, object_sha256);
+    assert_eq!(
+        compiled
+            .search(
+                b"xxSHARED-PREFIX-03FFyy",
+                SearchWindow::full(b"xxSHARED-PREFIX-03FFyy"),
+            )
+            .expect("generated folded positive search"),
+        MatchResult::Exists(true),
+    );
+    assert_eq!(
+        compiled
+            .search(
+                b"xxshared-prefix-zzzz",
+                SearchWindow::full(b"xxshared-prefix-zzzz"),
+            )
+            .expect("generated folded negative search"),
+        MatchResult::Exists(false),
+    );
 }
 
 #[test]

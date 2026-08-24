@@ -94,6 +94,14 @@ declared limits. Large finite repeats or expanded classes can therefore fail on
 stack, work, state, edge, or storage limits before constructing an unbounded
 graph. No lowering pass uses recursion or unsafe code.
 
+An optional source-order-preserving prefix trie compacts direct alternations of
+capture-transparent concatenations of byte literals and nonempty byte classes.
+Sibling token sets must be exactly equal or disjoint; a partial overlap keeps
+the ordinary Thompson lowering before graph publication. The proof uses a
+fixed bounded source stack, fallible scratch arenas, and the same work and
+automaton limits as the incumbent path. This includes the two-member byte sets
+produced by ASCII case folding without recognizing any source-text recipe.
+
 Unicode scalar ranges are partitioned with `regex-syntax`'s pinned
 `Utf8Sequences` iterator. Each resulting one-to-four-byte sequence becomes a
 concatenation of byte-range states, and the sequences form an alternation.
