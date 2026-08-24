@@ -11193,17 +11193,28 @@ impl K0ExclusivePlan {
         }
     }
 
-    fn line_prefix_tail(&self) -> Option<&k0_line_prefix_tail::Plan> {
-        match self {
-            Self::LinePrefixTail(plan) => Some(plan),
-            Self::None | Self::Correlated(_) | Self::Packed(_) | Self::LineTokenLoop(_) => None,
-        }
-    }
-
     fn line_token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::LineTokenLoop(plan) => Some(plan),
             Self::None | Self::Correlated(_) | Self::Packed(_) | Self::LinePrefixTail(_) => None,
+        }
+    }
+
+    #[inline]
+    fn try_ordinary_is_match_full(&self, haystack: &[u8]) -> Option<bool> {
+        match self {
+            Self::LinePrefixTail(plan) => Some(plan.is_match_full(haystack)),
+            Self::LineTokenLoop(plan) => plan.try_is_match_full(haystack),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
+        }
+    }
+
+    #[inline]
+    fn try_ordinary_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
+        match self {
+            Self::LinePrefixTail(plan) => Some(plan.find_full(haystack)),
+            Self::LineTokenLoop(plan) => plan.try_find_full(haystack),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
 }
@@ -14011,14 +14022,8 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
-                if haystack.len() >= k0_line_prefix_tail::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line_prefix_tail()
-                {
-                    return Ok(plan.is_match_full(haystack));
-                }
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line_token_loop()
-                    && let Some(matched) = plan.try_is_match_full(haystack)
+                    && let Some(matched) = k0.exclusive.try_ordinary_is_match_full(haystack)
                 {
                     return Ok(matched);
                 }
@@ -15741,16 +15746,8 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
-                if haystack.len() >= k0_line_prefix_tail::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line_prefix_tail()
-                {
-                    return Ok(plan
-                        .find_full(haystack)
-                        .map(|(start, end)| Match { start, end }));
-                }
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line_token_loop()
-                    && let Some(matched) = plan.try_find_full(haystack)
+                    && let Some(matched) = k0.exclusive.try_ordinary_find_full(haystack)
                 {
                     return Ok(matched.map(|(start, end)| Match { start, end }));
                 }

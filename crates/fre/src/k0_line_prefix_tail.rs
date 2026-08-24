@@ -10,7 +10,6 @@ use memchr::{memchr, memchr2};
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 const MAX_PREFIX_BYTES: usize = 32;
-pub(crate) const MIN_INPUT_BYTES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Plan {
@@ -123,6 +122,8 @@ impl Budget {
     }
 }
 
+#[cold]
+#[inline(never)]
 pub(crate) fn inspect(
     hir: &Hir,
     unicode: bool,
