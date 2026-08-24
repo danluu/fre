@@ -1049,27 +1049,35 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
             .limits(selected_limits),
         PreparedAggregateExports::GREP_COUNT,
     );
-    let selected = require_grep_operation_only_candidate(attempt)?;
+    let selected = select_grep_operation_only_candidate(compiled, attempt)?;
     authenticate_prepared_ordered_nfa_scalar(Model::GrepCount, &selected)?;
     Ok(selected)
 }
 
-/// Require the operation-only replacement after an authenticated ordinary
-/// Grep artifact has exposed the exact RuntimeHelper compatibility surface.
+/// Select the operation-only replacement after a Grep artifact has exposed
+/// either the exact RuntimeHelper compatibility surface or an authenticated
+/// legacy V15 native reducer.
 ///
 /// The current runner has no authenticated non-native Grep execution route:
 /// its linked boundary accepts only direct `NativeFused` or operation-only
-/// V15. A typed V15 resource/representation decline therefore remains a
-/// useful compiler diagnostic, but it cannot authorize emitting the stale
-/// RuntimeHelper incumbent that runtime authentication would reject.
-fn require_grep_operation_only_candidate(
+/// V15. A typed V15 resource/representation decline may preserve only the
+/// independently re-authenticated legacy V15 native incumbent. It cannot
+/// authorize emitting a stale RuntimeHelper incumbent that runtime
+/// authentication would reject.
+fn select_grep_operation_only_candidate(
+    incumbent: CompiledRegex,
     attempt: Result<PreparedOrderedNfaV15CompileDisposition, CompileError>,
 ) -> Result<CompiledRegex, String> {
     match attempt {
         Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => Ok(compiled),
-        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)) => Err(format!(
-            "general AOT operation-only prepared V15 grep compilation declined: {decline:?}; refusing the unauthenticated RuntimeHelper incumbent",
-        )),
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)) => {
+            authenticate_prepared_v15_grep(&incumbent).map_err(|_| {
+                format!(
+                    "general AOT operation-only prepared V15 grep compilation declined: {decline:?}; refusing the unauthenticated RuntimeHelper incumbent",
+                )
+            })?;
+            Ok(incumbent)
+        }
         Err(error) => Err(format!(
             "general AOT operation-only prepared V15 grep compilation failed: {error}"
         )),
@@ -4326,8 +4334,42 @@ mod tests {
     }
 
     #[test]
-    fn operation_only_v15_grep_declines_and_errors_are_terminal() {
+    fn operation_only_v15_grep_declines_preserve_only_exact_native_v15() {
         use fre_aot_regex::{ObjectError, PreparedOrderedNfaV15CompileDecline};
+
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = true;
+        let runtime_helper = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(r"\b\w{25,}\b", target)
+                .profile(profile.clone())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(rebar_recovery_compile_limits()),
+            PreparedAggregateExports::GREP_COUNT,
+            rebar_recovery_slow_aot_limits(),
+        )
+        .expect("ordinary RuntimeHelper grep incumbent");
+        assert!(ordinary_grep_requires_prepared_v15(&runtime_helper));
+        assert!(authenticate_prepared_v15_grep(&runtime_helper).is_err());
+
+        let legacy_v15 = compile_with_prepared_ordered_nfa_v15_reported(
+            CompileRequest::new(r"\b\w+\b", target)
+                .profile(profile)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::GREP_COUNT,
+        )
+        .expect("legacy V15 grep compilation")
+        .into_compiled()
+        .expect("legacy V15 grep fixture is supported");
+        authenticate_prepared_v15_grep(&legacy_v15)
+            .expect("legacy V15 grep incumbent is independently authenticated");
 
         for decline in [
             PreparedOrderedNfaV15CompileDecline::Unsupported,
@@ -4340,17 +4382,31 @@ mod tests {
                 required: 12,
             },
         ] {
-            let error = require_grep_operation_only_candidate(Ok(
-                PreparedOrderedNfaV15CompileDisposition::Declined(decline),
-            ))
+            let error = select_grep_operation_only_candidate(
+                runtime_helper.clone(),
+                Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)),
+            )
             .expect_err("typed operation-only grep decline must be terminal");
             assert!(error.contains(&format!("{decline:?}")));
             assert!(error.contains("refusing the unauthenticated RuntimeHelper incumbent"));
+
+            let preserved = select_grep_operation_only_candidate(
+                legacy_v15.clone(),
+                Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)),
+            )
+            .expect("typed decline preserves exact legacy V15");
+            assert_eq!(preserved.object(), legacy_v15.object());
+            assert_eq!(preserved.receipt(), legacy_v15.receipt());
+            authenticate_prepared_v15_grep(&preserved)
+                .expect("preserved incumbent remains exact legacy V15");
         }
 
-        let error = require_grep_operation_only_candidate(Err(CompileError::Object(
-            ObjectError::Allocation("injected operation-only GrepCount allocation"),
-        )))
+        let error = select_grep_operation_only_candidate(
+            legacy_v15,
+            Err(CompileError::Object(ObjectError::Allocation(
+                "injected operation-only GrepCount allocation",
+            ))),
+        )
         .expect_err("allocator failure must remain terminal");
         assert!(error.contains("injected operation-only GrepCount allocation"));
     }
