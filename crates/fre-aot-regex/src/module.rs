@@ -28957,11 +28957,7 @@ fn lower_x86_64_ordered_nfa_participation_v1(
         (8, header_word),
         (12, 7),
         (32, native_participation_target_word(target)?),
-        (
-            36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
-        ),
+        (36, native_participation_feature_word_v1(target)?),
         (
             40,
             u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaX86_64 as u16),
@@ -29737,11 +29733,7 @@ fn lower_aarch64_ordered_nfa_participation_v1(
         (8_u16, header_word),
         (12, 7),
         (32, native_participation_target_word(target)?),
-        (
-            36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
-        ),
+        (36, native_participation_feature_word_v1(target)?),
         (
             40,
             u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaAarch64 as u16),
