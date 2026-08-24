@@ -4,7 +4,7 @@ use core::fmt;
 use core::mem;
 use std::sync::Arc;
 
-use aho_corasick::automaton::Automaton;
+use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
 use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind};
 use fre_exact_alloc::try_box_preserve;
@@ -257,6 +257,19 @@ pub struct LiteralSetPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
+}
+
+/// Stateful selected-end scan used only by ordinary literal-set counting.
+///
+/// Binding the immutable automaton, haystack, terminal boundary and start
+/// state once lets count restart at each selected endpoint without crossing
+/// the ordinary one-shot scanner's non-inlined call boundary per match.
+struct LiteralSetCountScanner<'a, 'h> {
+    automaton: &'a DFA,
+    haystack: &'h [u8],
+    start_state: StateID,
+    restart: usize,
+    end: usize,
 }
 
 /// Construction-bound capability for deliberately bypassing the optional
@@ -1389,7 +1402,65 @@ impl LiteralSetPlan {
     }
 }
 
+impl<'a, 'h> LiteralSetCountScanner<'a, 'h> {
+    #[inline]
+    fn new(plan: &'a LiteralSetPlan, haystack: &'h [u8], window: Window) -> Option<Self> {
+        let automaton = plan.automaton.as_ref();
+        if automaton.prefilter().is_some() || automaton.match_kind() != MatchKind::LeftmostFirst {
+            return None;
+        }
+        let anchored = Anchored::No;
+        let start_state = automaton
+            .start_state(anchored)
+            .expect("the literal-set DFA retains its unanchored start state");
+        debug_assert!(!automaton.is_match(start_state));
+        Some(Self {
+            automaton,
+            haystack,
+            start_state,
+            restart: window.start(),
+            end: window.end(),
+        })
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<usize> {
+        let anchored = Anchored::No;
+        let mut state = self.start_state;
+        let mut at = self.restart;
+        let mut selected = None;
+        while at < self.end {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            if self.automaton.is_special(state) {
+                if self.automaton.is_dead(state) {
+                    break;
+                }
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                if self.automaton.is_match(state) {
+                    selected = Some(at);
+                }
+            }
+        }
+        self.restart = selected.unwrap_or(self.end);
+        selected
+    }
+}
+
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
+    /// Return whether ordinary counting can seed this plan's bound direct DFA
+    /// scanner from one canonical selected match.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn direct_count_scanner_supported(&self) -> bool {
+        self.plan.automaton.prefilter().is_none()
+            && self.plan.automaton.match_kind() == MatchKind::LeftmostFirst
+    }
+
     /// Bind the capability to select first acceptance by scanning this same
     /// DFA without consulting its construction-selected prefilter.
     #[doc(hidden)]
@@ -1542,6 +1613,67 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                 Err(error) => return Ok(Err(error)),
             }
         }
+    }
+
+    /// Count every non-overlapping positive-width selected span wholly inside
+    /// `window` without finite-search accounting or an exposed span callback.
+    ///
+    /// The ordinary-executor capability proves that every selected span has
+    /// positive width. Each selected endpoint therefore becomes the next
+    /// search start while preserving the visitor's leftmost-first,
+    /// non-overlapping semantics. A DFA that retains a prefilter or Standard
+    /// match semantics may still recover its selected start internally; the
+    /// ordinary endpoint loop does not materialize an FRE match value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same exact invalid-window and offset-arithmetic errors as
+    /// [`Self::find_window_value`], or an arithmetic error if the `u64` match
+    /// count overflows.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn count_spans_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<u64, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let mut count = 0_usize;
+        if let Some(mut scanner) = LiteralSetCountScanner::new(self.plan, haystack, window) {
+            let mut previous_end = window.start();
+            while let Some(selected_end) = scanner.next() {
+                debug_assert!(
+                    selected_end > previous_end,
+                    "a positive-width literal-set count must advance",
+                );
+                previous_end = selected_end;
+                // Positive-width, non-overlapping spans bound the final count
+                // by this already-validated window's `usize` byte length.
+                count += 1;
+            }
+        } else {
+            let mut cursor = window.start();
+            loop {
+                let Some(selected_end) = self
+                    .plan
+                    .try_find_window_value(haystack, Window::new(cursor, window.end()))?
+                    .map(|(_, end)| end)
+                else {
+                    break;
+                };
+                if selected_end <= cursor {
+                    return Err(LiteralSetError::ArithmeticOverflow {
+                        computation: "ordinary positive-width literal-set count progress",
+                    });
+                }
+                cursor = selected_end;
+                // The same positive-width/window proof bounds this branch.
+                count += 1;
+            }
+        }
+        u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
+            computation: "positive-width literal-set match count",
+        })
     }
 }
 
@@ -5548,6 +5680,80 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_count_matches_selected_span_iteration_across_mixed_width_windows() {
+        fn assert_differential(patterns: &[&[u8]], haystacks: &[&[u8]]) {
+            let plan = LiteralSetPlan::new(patterns, LiteralSetBuildLimits::default()).unwrap();
+            assert!(plan.build.minimum_pattern_bytes < plan.automaton.max_pattern_len());
+            let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+            for &haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = Window::new(start, end);
+                        let mut visited = 0_u64;
+                        assert_eq!(
+                            ordinary.try_visit_spans_window_value(haystack, window, |_| {
+                                visited += 1;
+                                Ok::<bool, ()>(true)
+                            }),
+                            Ok(Ok(())),
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                        assert_eq!(
+                            ordinary.count_spans_window_value(haystack, window),
+                            Ok(visited),
+                            "patterns={patterns:?}, haystack={haystack:?}, window={window:?}",
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_differential(
+            &[b"ab", b"a", b"ba"],
+            &[b"", b"a", b"ab", b"zzababa", b"abababa"],
+        );
+        assert_differential(
+            &[b"a", b"ab", b"bab"],
+            &[b"ab", b"babab", b"zzabababzz"],
+        );
+        assert_differential(
+            &[b"b", b"abc", b"ab"],
+            &[b"abc", b"zabcabc", b"ababc"],
+        );
+
+        // Exercise the count-only direct selected-end scanner as well as the
+        // prefiltered `try_find` projection above. Broad byte coverage
+        // prevents this mixed-width DFA from retaining a prefilter.
+        let mut dense_patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        dense_patterns[0] = vec![1; 4];
+        let dense_pattern_refs = dense_patterns
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let dense_plan = LiteralSetPlan::new(
+            &dense_pattern_refs,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(dense_plan.automaton.prefilter().is_none());
+        assert_differential(
+            &dense_pattern_refs,
+            &[
+                b"",
+                &[1, 1, 1],
+                &[1, 1, 1, 1],
+                // Proving the first four-byte selection consumes lookahead;
+                // the scanner must restart at endpoint four so the trailing
+                // three-byte alternative remains visible.
+                &[1, 1, 1, 1, 1, 1, 1],
+                &[0, 0, 0, 1, 1, 1, 1],
+            ],
+        );
+    }
+
+    #[test]
     fn ordinary_first_acceptance_is_distinct_from_the_selected_endpoint() {
         // The prefiltered DFA first accepts `b`/`ab` at end 2, while
         // LeftmostFirst must retain the earlier-start `abc` through end 3.
@@ -5712,6 +5918,10 @@ mod tests {
             );
             assert_eq!(
                 ordinary.selected_end_window_value(b"abcd", window),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                ordinary.count_spans_window_value(b"abcd", window),
                 Err(expected.clone()),
             );
             let mut callback_called = false;

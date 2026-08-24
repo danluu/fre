@@ -22017,6 +22017,33 @@ fn ordinary_literal_set_dfa_find_at(
     Ok(matched)
 }
 
+#[inline(never)]
+fn count_ordinary_literal_set_dfa_with_selected_seed(
+    executor: &LiteralSetOrdinaryExecutor<'_>,
+    haystack: &[u8],
+    start: usize,
+) -> Result<u64, LiteralSetError> {
+    if start == haystack.len() {
+        return Ok(0);
+    }
+    let Some((_, first_end)) = executor.find_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+    )?
+    else {
+        return Ok(0);
+    };
+    executor
+        .count_spans_window_value(
+            haystack,
+            LiteralWindow::new(first_end, haystack.len()),
+        )?
+        .checked_add(1)
+        .ok_or(LiteralSetError::ArithmeticOverflow {
+            computation: "positive-width literal-set match count",
+        })
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists at or after `start`.
     ///
@@ -22335,9 +22362,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Count selected positive-width matches at or after `start` using only
     /// their ordered endpoints.
     ///
-    /// `Ok(Some(count))` is returned for a positive-width K0 plan, a packed
-    /// literal-set plan, or a uniform-standard literal-set plan, whose
-    /// constructions admit only nonempty literals.
+    /// `Ok(Some(count))` is returned for a positive-width K0 plan or an
+    /// ordinary literal-set plan whose construction admits only nonempty
+    /// literals.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -22346,12 +22373,15 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Each successful search resumes at the selected endpoint. K0 reports a
     /// failure to advance despite its positive-width proof as an invariant
     /// error rather than risking an infinite loop. Packed literal sets use
-    /// their bound non-overlapping span iterator. A uniform-standard literal
-    /// set consumes any preceding near-acceptance observation on the first
-    /// bounded tail probe and counts through its adaptive span visitor. After
-    /// exhaustive success that accepts a current-call span, near final
-    /// selected-end spacing and a near terminal gap may recommend one bounded
-    /// probe for the next session operation.
+    /// their bound non-overlapping span iterator. An ordinary non-uniform
+    /// literal set advances through its construction-selected DFA endpoints.
+    /// When that DFA seals direct leftmost-first counting, one canonical
+    /// selected match seeds the direct scanner at the selected endpoint.
+    /// A uniform-standard literal set consumes any preceding near-acceptance
+    /// observation on the first bounded tail probe and counts through its
+    /// adaptive span visitor. After exhaustive success that accepts a
+    /// current-call span, near final selected-end spacing and a near terminal
+    /// gap may recommend one bounded probe for the next session operation.
     ///
     /// # Errors
     ///
@@ -22397,6 +22427,23 @@ impl<'r> PortableOrdinarySession<'r> {
                 )
                 .map(Some)
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetDfa { executor } => {
+                if executor.direct_count_scanner_supported() {
+                    count_ordinary_literal_set_dfa_with_selected_seed(
+                        executor, haystack, start,
+                    )
+                    .map(Some)
+                    .map_err(SearchError::from)
+                } else {
+                    executor
+                        .count_spans_window_value(
+                            haystack,
+                            LiteralWindow::new(start, haystack.len()),
+                        )
+                        .map(Some)
+                        .map_err(SearchError::from)
+                }
+            }
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
                 direct_next,
@@ -42744,6 +42791,14 @@ mod tests {
             Ok(None),
         );
 
+        let nullable_literal_set = literal_set_dfa_fixture("a|");
+        let mut nullable_literal_set = nullable_literal_set.ordinary_session().unwrap();
+        assert_eq!(
+            nullable_literal_set
+                .count_positive_width_selected_ends_at(b"aaa", usize::MAX),
+            Ok(None),
+        );
+
         let positive = PortableBuilder::new("a+")
             .unicode(false)
             .plan_selection(PlanSelection::ForceK0)
@@ -43134,6 +43189,10 @@ mod tests {
                 Ok(()),
             );
             assert_eq!(actual_spans, expected_spans);
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
+            );
         }
 
         let mut stopped = Vec::new();
@@ -43170,10 +43229,14 @@ mod tests {
         ));
         assert!(!callback_called);
 
-        assert_eq!(
+        assert!(matches!(
             ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
-            Ok(None),
-        );
+            Err(SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
+                start: usize::MAX,
+                end: 7,
+                haystack_len: 7,
+            })),
+        ));
         assert!(matches!(
             ordinary.find_at(haystack, haystack.len() + 1),
             Err(SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
@@ -43573,6 +43636,10 @@ mod tests {
             ordinary.find_at(b"zzab", 0),
             Ok(Some(Match { start: 2, end: 4 })),
         );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(b"zzababa", 0),
+            Ok(Some(3)),
+        );
         assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 0));
 
         let source = (0_u8..=u8::MAX)
@@ -43592,6 +43659,10 @@ mod tests {
         super::literal_set_dfa_ordinary_route_probe::reset();
         assert_eq!(ordinary.first_acceptance_at(b"z\x01\x01", 0), Ok(Some(3)));
         assert_eq!(ordinary.is_match_at(b"z\x01\x01", 0), Ok(true));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(b"z\x01\x01\x02\x02", 0),
+            Ok(Some(2)),
+        );
         assert_eq!(super::literal_set_dfa_ordinary_route_probe::calls(), (0, 0));
     }
 
