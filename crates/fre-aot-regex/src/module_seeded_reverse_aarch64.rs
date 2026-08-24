@@ -132,9 +132,23 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     // An Accept seed starts at base + minimum_width. Requiring the last byte
     // before that boundary to be in-bounds makes every reverse load safe.
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
+    let exact_pair_primary_cold_filter =
+        aarch64_exact_pair_primary_cold_filter(suffix, use_asimd, use_asimd_batch)?;
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
-            if let Some(pair_filter) = exact_pair_filter {
+            if let Some(primary_filter) = exact_pair_primary_cold_filter {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    primary_filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            } else if let Some(pair_filter) = exact_pair_filter {
                 aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
             } else if let Some(vector_filter) = lazy_vector_filter {
                 let mut first_register = AARCH64_VECTOR_FILTER_FIRST_CONSTANT;
@@ -180,6 +194,40 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
 
     let mut batch_first_candidates = None;
     if use_asimd {
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+                "AArch64 seeded exact-pair primary vector label is absent",
+            ))?;
+            let relation_activate =
+                exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                    "AArch64 seeded exact-pair relation activation label is absent",
+                ))?;
+            let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+                "AArch64 seeded exact-pair primary phase lost its relation",
+            ))?;
+            assembler.bind(primary_vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let batch_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_BATCH_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 seeded exact-pair primary width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, relation_activate)?;
+            let primary_candidates = aarch64_emit_start_filter_batch_candidates(
+                assembler,
+                primary_filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
+            assembler.branch_cond(AARCH64_NE, relation_activate)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(relation_activate)?;
+            aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            assembler.branch(vector)?;
+        }
         assembler.bind(vector)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         if use_asimd_batch {

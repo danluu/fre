@@ -54386,6 +54386,42 @@ fn aarch64_emit_exact_pair_scalar_test(
     Ok(())
 }
 
+/// Select a cheap primary-only ASIMD phase ahead of the exact pair relation.
+///
+/// The phase is deliberately one-way. Its standalone candidate masks occupy
+/// V0..V3, overlapping the exact relation's V1..V6 constant bank, while the
+/// relation subsequently clobbers the standalone V16..V23 constant bank.
+/// Materializing relation constants only after the first primary hit keeps a
+/// projection-absent scan cheap and makes every later retry unambiguously
+/// relation-owned.
+fn aarch64_exact_pair_primary_cold_filter(
+    suffix: NativeSuffixFilter,
+    use_asimd: bool,
+    use_asimd_batch: bool,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if !use_asimd || !use_asimd_batch || suffix.minimum_width < 2 {
+        return Ok(None);
+    }
+    let Some(pair_filter) = suffix.exact_pair_filter else {
+        return Ok(None);
+    };
+    let filter = suffix.filter;
+    if filter.scan_offset > 1 {
+        return Ok(None);
+    }
+    let membership = start_filter_membership(filter)?;
+    let projection_is_covered = pair_filter.pairs().iter().all(|pair| {
+        let byte = if filter.scan_offset == 0 {
+            *pair as u8
+        } else {
+            (*pair >> 8) as u8
+        };
+        let index = usize::from(byte);
+        membership[index / 64] & (1_u64 << (index % 64)) != 0
+    });
+    Ok(projection_is_covered.then_some(filter))
+}
+
 /// `AArch64` counterpart of the exact-product probe at the untouched window
 /// start. It explicitly validates the anchored column omitted from the normal
 /// prefix bitmap guard because no moving scanner has run yet.
@@ -59700,6 +59736,14 @@ fn aarch64_emit_suffix_prepass(
         || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
         |_| 1,
     );
+    let exact_pair_primary_cold_filter =
+        aarch64_exact_pair_primary_cold_filter(suffix, use_asimd, use_asimd_batch)?;
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
     if suffix.minimum_width == 0 {
         return Err(ObjectError::InvalidModule(
             "AArch64 suffix filter has zero minimum width",
@@ -59708,7 +59752,13 @@ fn aarch64_emit_suffix_prepass(
     let mut batch_first_candidates = None;
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
-            if let Some(pair_filter) = exact_pair_filter {
+            if let Some(primary_filter) = exact_pair_primary_cold_filter {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    primary_filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            } else if let Some(pair_filter) = exact_pair_filter {
                 aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
             } else if let Some(vector_filter) = lazy_vector_filter {
                 let mut first_register = AARCH64_VECTOR_FILTER_FIRST_CONSTANT;
@@ -59801,6 +59851,40 @@ fn aarch64_emit_suffix_prepass(
         if let Some(mixed_asimd_setup) = mixed_asimd_setup {
             assembler.bind(mixed_asimd_setup)?;
             emit_constants(assembler)?;
+        }
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary vector label is absent",
+            ))?;
+            let relation_activate =
+                exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                    "AArch64 exact-pair relation activation label is absent",
+                ))?;
+            let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary phase lost its relation",
+            ))?;
+            assembler.bind(primary_vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let batch_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_BATCH_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-pair primary width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, relation_activate)?;
+            let primary_candidates = aarch64_emit_start_filter_batch_candidates(
+                assembler,
+                primary_filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
+            assembler.branch_cond(AARCH64_NE, relation_activate)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(relation_activate)?;
+            aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            assembler.branch(vector)?;
         }
         assembler.bind(vector)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
@@ -122523,6 +122607,86 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn aarch64_exact_pair_object_limit_restores_exact_incumbent() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+
+        let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let object_format = ObjectFormat::for_target(target);
+        let incumbent_object = emit_object(&incumbent, object_format, usize::MAX).unwrap();
+        assert!(!incumbent.has_exact_pair_suffix());
+        assert!(incumbent_object.len() < selected.object().len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                object_format,
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(incumbent_object.len()) else {
+            panic!("AArch64 exact incumbent object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert_eq!(object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(&incumbent, object_format, undersized_cap).unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized AArch64 exact-pair incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, object_format, usize::MAX).unwrap(),
+            incumbent_object
+        );
+    }
+
+    #[test]
     fn exact_pair_and_synchronizing_object_retries_are_compositional() {
         let target = Target::x86_64_linux();
         let pattern = r"(?:ee|f)*?(?:q!|a@|b#)";
@@ -129086,6 +129250,225 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cold-switch test owns its authenticated gate, phase order, and continuation edges"
+    )]
+    fn aarch64_exact_pair_primary_cold_switch_is_authenticated_and_relation_owned() {
+        let features = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let layout_for = |pattern| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                compiled.program().native_dfa_view().unwrap(),
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap()
+            .1
+        };
+        let ordinary = layout_for(r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)");
+        assert!(ordinary.seeded_reverse.is_none());
+        let suffix = ordinary.suffix_filter.unwrap();
+        let pair = suffix.exact_pair_filter.unwrap();
+        assert!(use_aarch64_filter_batch(suffix.filter));
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, true, true),
+            Ok(Some(suffix.filter))
+        );
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, false, true),
+            Ok(None)
+        );
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, true, false),
+            Ok(None)
+        );
+
+        let mut outside_pair = suffix;
+        outside_pair.filter.scan_offset = 2;
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(outside_pair, true, true),
+            Ok(None)
+        );
+        let projected = |pair: u16| {
+            if suffix.filter.scan_offset == 0 {
+                pair as u8
+            } else {
+                (pair >> 8) as u8
+            }
+        };
+        let uncovered = (u8::MIN..=u8::MAX)
+            .find(|byte| !pair.pairs().iter().any(|pair| projected(*pair) == *byte))
+            .unwrap();
+        let mut uncovered_projection = suffix;
+        uncovered_projection.filter = NativeStartFilter {
+            ranges: {
+                let mut ranges = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+                ranges[0] = NativeByteRange {
+                    start: uncovered,
+                    end: uncovered,
+                };
+                ranges
+            },
+            range_count: 1,
+            candidate_bytes: 1,
+            scan_offset: suffix.filter.scan_offset,
+            from_anchored_prefix: false,
+        };
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(uncovered_projection, true, true),
+            Ok(None),
+            "a coverage mismatch must retain the direct relation"
+        );
+        let common_projection = layout_for(r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)");
+        let common_suffix = common_projection.suffix_filter.unwrap();
+        assert!(common_suffix.exact_pair_filter.is_some());
+        assert!(!use_aarch64_filter_batch(common_suffix.filter));
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(common_suffix, true, false),
+            Ok(None),
+            "a non-batched exact relation must retain the direct relation emitter"
+        );
+
+        let emit = |layout: NativeDfaLayout| {
+            let suffix = layout.suffix_filter.unwrap();
+            let mut assembler = Aarch64Assembler::new();
+            let no_match = assembler.label().unwrap();
+            let matched = assembler.label().unwrap();
+            // The relation vector remains the first label allocated by the
+            // suffix emitter, even when a later optional primary phase exists.
+            let relation_vector = assembler.labels.len();
+            aarch64_emit_suffix_prepass(
+                &mut assembler,
+                suffix,
+                None,
+                true,
+                use_aarch64_filter_batch(suffix.filter),
+                true,
+                features,
+                OperatingSystem::Linux,
+                layout,
+                no_match,
+                matched,
+            )
+            .unwrap();
+            (assembler, relation_vector)
+        };
+        let (ordinary_emission, relation_vector) = emit(ordinary);
+        let words = ordinary_emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(suffix.filter.is_exact());
+        let primary_constant = aarch64_movi_16b(
+            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            suffix.filter.ranges()[0].start,
+        )
+        .unwrap();
+        let primary_candidates = aarch64_cmeq_16b(0, 24, 16).unwrap();
+        let first_relation_predicate = pair
+            .vector_plan
+            .rectangles()
+            .iter()
+            .flat_map(|rectangle| [rectangle.first, rectangle.second])
+            .find(|predicate| !predicate.any)
+            .unwrap();
+        let relation_constant = aarch64_movi_16b(
+            first_relation_predicate.first_constant,
+            first_relation_predicate.filter.ranges()[0].start,
+        )
+        .unwrap();
+        let primary_constant_at = words
+            .iter()
+            .position(|word| *word == primary_constant)
+            .unwrap();
+        let primary_candidates_at = words
+            .iter()
+            .position(|word| *word == primary_candidates)
+            .unwrap();
+        let relation_constant_at = words
+            .iter()
+            .position(|word| *word == relation_constant)
+            .unwrap();
+        let relation_batch_at = words
+            .iter()
+            .position(|word| *word == aarch64_ext_16b(16, 24, 25, 1).unwrap())
+            .unwrap();
+        assert!(primary_constant_at < primary_candidates_at);
+        assert!(primary_candidates_at < relation_constant_at);
+        assert!(relation_constant_at < relation_batch_at);
+        let advance_batch = aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)
+            .unwrap()
+            .to_le_bytes();
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            fixup.label != relation_vector
+                && fixup.instruction < relation_constant_at * 4
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_batch[..])
+        }));
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            fixup.label == relation_vector
+                && fixup.instruction > relation_batch_at * 4
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_batch[..])
+        }));
+        let rewind = aarch64_sub_x_imm(2, 2, AARCH64_BATCH_BYTES)
+            .unwrap()
+            .to_le_bytes();
+        assert!(
+            !ordinary_emission
+                .code
+                .chunks_exact(4)
+                .any(|word| word == rewind),
+            "the primary hit edge keeps X2 at the unchanged batch base"
+        );
+
+        let retry = layout_for(r"Z.{0,4}(?:q!|a@|b#)");
+        assert!(retry.seeded_reverse.is_none());
+        assert!(retry.suffix_filter.unwrap().retry.is_some());
+        let (retry_emission, retry_relation_vector) = emit(retry);
+        let retry_base = aarch64_mov_x(2, 7).unwrap().to_le_bytes();
+        assert!(retry_emission.fixups.iter().any(|fixup| {
+            fixup.label == retry_relation_vector
+                && fixup.instruction >= 4
+                && retry_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&retry_base[..])
+        }));
+
+        let seeded = layout_for(r"(?s:.+)(?:q!|a@|b#)(?s:.*)");
+        assert!(seeded.seeded_reverse.is_some());
+        assert!(seeded.suffix_filter.unwrap().exact_pair_filter.is_some());
+        let (seeded_emission, seeded_relation_vector) = emit(seeded);
+        // X15 is the child emitter's audited REVERSE_NEXT_BASE register.
+        let seeded_next = aarch64_mov_x(2, 15).unwrap().to_le_bytes();
+        assert!(seeded_emission.fixups.iter().any(|fixup| {
+            fixup.label == seeded_relation_vector
+                && fixup.instruction >= 4
+                && seeded_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&seeded_next[..])
+        }));
+    }
+
+    #[test]
     fn exact_pair_policy_declines_preserve_incumbent_objects_and_sve_fails_closed() {
         let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
@@ -129323,6 +129706,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let patterns = [
             r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)",
             r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)(?-u:[\x00-\xFF])*",
+            r"(?:ee|f)*?(?:q!|a@|b#)",
+            r"Z.{0,4}(?:q!|a@|b#)",
+            r"(?s:.+)(?:q!|a@|b#)(?s:.*)",
+            r"(?-u:[\x00-\xFF])*(?:!q|@a|#b)",
+            r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)",
         ];
         let mut tail_15 = vec![b'x'; 15];
         tail_15[13..].copy_from_slice(b"q@");
@@ -129350,6 +129738,28 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector_decoys.extend_from_slice(b"q@a!b@");
         }
         vector_decoys.truncate(129);
+        let projection_absent = vec![b'x'; 257];
+        let mut late_batch_boundary = vec![b'x'; 257];
+        late_batch_boundary[255..].copy_from_slice(b"q!");
+        let mut false_then_late = vec![b'x'; 257];
+        false_then_late[7..9].copy_from_slice(b"q@");
+        false_then_late[191..193].copy_from_slice(b"a@");
+        let mut dense_false_then_match = Vec::new();
+        while dense_false_then_match.len() < 257 {
+            dense_false_then_match.extend_from_slice(b"q@a!b@");
+        }
+        dense_false_then_match.truncate(257);
+        dense_false_then_match[255..].copy_from_slice(b"b#");
+        let mut retry_reject_then_match = vec![b'x'; 257];
+        retry_reject_then_match[7..9].copy_from_slice(b"q!");
+        retry_reject_then_match[120] = b'Z';
+        retry_reject_then_match[123..125].copy_from_slice(b"a@");
+        let mut seeded_reject_then_match = vec![b'x'; 257];
+        seeded_reject_then_match[..2].copy_from_slice(b"q!");
+        seeded_reject_then_match[193..195].copy_from_slice(b"b#");
+        let mut reversed_boundary = vec![b'x'; 129];
+        reversed_boundary[63..65].copy_from_slice(b"!q");
+        reversed_boundary[127..129].copy_from_slice(b"@a");
         let haystacks = [
             b"q".to_vec(),
             tail_15,
@@ -129361,8 +129771,21 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector_end,
             vector_boundary,
             vector_decoys,
+            projection_absent,
+            late_batch_boundary,
+            false_then_late,
+            dense_false_then_match,
+            retry_reject_then_match,
+            seeded_reject_then_match,
+            reversed_boundary,
         ];
-        assert_eq!(haystacks.iter().map(Vec::len).collect::<Vec<_>>(), [1, 15, 16, 17, 17, 17, 17, 128, 129, 129]);
+        assert_eq!(
+            haystacks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [
+                1, 15, 16, 17, 17, 17, 17, 128, 129, 129, 257, 257, 257, 257, 257, 257,
+                129
+            ]
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-exact-pair-short-{}-{}",
@@ -129414,6 +129837,43 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     compiled.module().has_exact_pair_suffix(),
                     output == OutputContract::Exists,
                 );
+                if pattern_index == 2 && output == OutputContract::Exists {
+                    assert!(
+                        layout.seeded_reverse.is_some(),
+                        "the third fixture must exercise the seeded-reverse continuation"
+                    );
+                }
+                if pattern_index == 3 && output == OutputContract::Exists {
+                    assert!(
+                        layout
+                            .suffix_filter
+                            .is_some_and(|suffix| suffix.retry.is_some()),
+                        "the fourth fixture must execute bounded verifier rejection"
+                    );
+                }
+                if pattern_index == 4 && output == OutputContract::Exists {
+                    assert!(
+                        layout
+                            .seeded_reverse
+                            .is_some_and(|reverse| !reverse.proves_match),
+                        "the fifth fixture must execute root-seeded reverse rejection"
+                    );
+                }
+                if pattern_index == 5 && output == OutputContract::Exists {
+                    assert_eq!(
+                        layout.suffix_filter.unwrap().filter.scan_offset,
+                        0,
+                        "the sixth fixture must exercise chronological pair-byte projection"
+                    );
+                }
+                if pattern_index == 6 && output == OutputContract::Exists {
+                    let suffix = layout.suffix_filter.unwrap();
+                    assert!(suffix.exact_pair_filter.is_some());
+                    assert!(
+                        !use_aarch64_filter_batch(suffix.filter),
+                        "the seventh fixture must retain the direct non-batched relation"
+                    );
+                }
                 assert!(compiled.module().required_runtime_symbol().is_none());
                 let symbol = compiled.module().entry_symbol().to_owned();
                 writeln!(
