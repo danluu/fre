@@ -980,26 +980,24 @@ fn direct_native_is_match_batch(
     debug_assert!(!haystacks.is_empty());
     debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
 
-    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const();
-    let mut descriptors = [AbiHaystack {
-        ptr: dangling,
-        len: 0,
-    }; EXISTS_BATCH_CAPACITY];
+    let mut descriptors =
+        [const { MaybeUninit::<AbiHaystack>::uninit() }; EXISTS_BATCH_CAPACITY];
     for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
-        *descriptor = AbiHaystack {
+        descriptor.write(AbiHaystack {
             ptr: haystack.as_ptr(),
             len: haystack.len(),
-        };
+        });
     }
     let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
     let mut processed = 0;
-    // SAFETY: every descriptor names a live readable slice for this call;
-    // `encoded` has `count` writable bytes. The generated entry retains no
-    // pointer and initializes exactly the prefix published through
-    // `processed`.
+    // SAFETY: `zip` initialized exactly the first `count` descriptors and
+    // every one names a live readable slice. The batch ABI reads only that
+    // prefix and retains no pointer, so the uninitialized capacity tail is
+    // unobservable. `encoded` has `count` writable bytes, and the generated
+    // entry initializes exactly the prefix published through `processed`.
     let status = unsafe {
         batch(
-            descriptors.as_ptr(),
+            descriptors.as_ptr().cast::<AbiHaystack>(),
             haystacks.len(),
             encoded.as_mut_ptr(),
             &raw mut processed,
@@ -1022,27 +1020,26 @@ fn prepared_native_is_match_batch(
     debug_assert!(!haystacks.is_empty());
     debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
 
-    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const();
-    let mut descriptors = [AbiHaystack {
-        ptr: dangling,
-        len: 0,
-    }; EXISTS_BATCH_CAPACITY];
+    let mut descriptors =
+        [const { MaybeUninit::<AbiHaystack>::uninit() }; EXISTS_BATCH_CAPACITY];
     for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
-        *descriptor = AbiHaystack {
+        descriptor.write(AbiHaystack {
             ptr: haystack.as_ptr(),
             len: haystack.len(),
-        };
+        });
     }
     let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
     let mut processed = 0;
-    // SAFETY: `PreparedNative` exclusively owns `handle`; every descriptor
-    // names a live readable slice for this call; `encoded` has `count`
-    // writable bytes. The generated entry retains no pointer and initializes
-    // exactly the prefix it publishes through `processed`.
+    // SAFETY: `PreparedNative` exclusively owns `handle`; `zip` initialized
+    // exactly the first `count` descriptors and every one names a live
+    // readable slice. The batch ABI reads only that prefix and retains no
+    // pointer, so the uninitialized capacity tail is unobservable. `encoded`
+    // has `count` writable bytes, and the generated entry initializes exactly
+    // the prefix it publishes through `processed`.
     let status = unsafe {
         batch(
             handle,
-            descriptors.as_ptr(),
+            descriptors.as_ptr().cast::<AbiHaystack>(),
             haystacks.len(),
             encoded.as_mut_ptr(),
             &raw mut processed,
