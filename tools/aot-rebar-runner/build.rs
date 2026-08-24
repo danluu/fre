@@ -3296,6 +3296,17 @@ fn push_weighted_capture_reducer_receipt(
     artifact: &fre_aot_regex::RebarWeightedCaptureReducerAotArtifactV1,
 ) {
     let receipt = artifact.receipt();
+    let line_terminator = receipt
+        .source_proofs()
+        .first()
+        .expect("weighted reducer has source proofs")
+        .line_terminator();
+    assert!(
+        receipt
+            .source_proofs()
+            .iter()
+            .all(|proof| proof.line_terminator() == line_terminator)
+    );
     let operation = match receipt.operation() {
         fre_aot_regex::UniformCaptureReducerOperation::CountCaptures => 1_u8,
         fre_aot_regex::UniformCaptureReducerOperation::GrepCaptures => 2_u8,
@@ -3318,6 +3329,11 @@ fn push_weighted_capture_reducer_receipt(
     writeln!(
         source,
         "pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = {domain};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR: u8 = {line_terminator};"
     )
     .unwrap();
     writeln!(
@@ -3467,6 +3483,7 @@ fn push_empty_weighted_capture_reducer_receipt(source: &mut String) {
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA: u32 = 0;\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OPERATION: u8 = 0;\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = 0;\n");
+    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR: u8 = 0;\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE: &str = \"\";\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM: &str = \"\";\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ABI: &str = \"\";\n");
@@ -3857,6 +3874,7 @@ pub const WEIGHTED_CAPTURE_REDUCER_BRIDGE: bool = false;
 pub const WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA: u32 = 0;
 pub const WEIGHTED_CAPTURE_REDUCER_OPERATION: u8 = 0;
 pub const WEIGHTED_CAPTURE_REDUCER_DOMAIN: u8 = 0;
+pub const WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR: u8 = 0;
 pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE: &str = "";
 pub const WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM: &str = "";
 pub const WEIGHTED_CAPTURE_REDUCER_TARGET_ABI: &str = "";

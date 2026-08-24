@@ -76,6 +76,16 @@ route-specific selector/replay/bundle or `capture_next`/materializer/selector
 symbols remain required defined-symbol inventory bound to the retained source
 receipt; they are not counted as additional operation entries.
 
+The v6 weighted-capture reducer likewise closes the complete operation after
+an unequal-multiplier shared-reducer decline. It calls each independently
+authenticated positive-width ordinary Span component inside one native
+leftmost/first-source reducer, applies the winning component's sealed capture
+weight with checked arithmetic, and owns either the whole haystack or the
+exact LF/CRLF byte-line traversal. Its final reducer is the sole operation
+entry. Component entries remain identity-defined link targets, not Rust
+adapter-loop entries, and the closed receipt binds their priority map, proof
+facts, object identities, and every external call relocation.
+
 `grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
 are exact adapter *shapes*. This admits them to the sealed qualification
 population; it does not turn either build-time proof into an assumption. A
@@ -318,6 +328,11 @@ supplies its one final reducer object, not its retained source object. That
 reducer is likewise the sole operation entry; its retained source symbols are
 independently inventoried identities inside the object, not adapter-loop
 entries.
+A v6 weighted-capture reducer instead supplies every ordinary component object
+in component order followed by its final reducer object. The reducer remains
+the sole operation entry; component entries are authenticated linked
+identities. Both reproducible builds must preserve that exact object order and
+the separately sealed component-byte and reducer-byte extents.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
@@ -370,6 +385,15 @@ receipt keeps the final object hash separate from the retained source-object
 hash; the supplied `aot-rebar-artifact.o` must match the final reducer object.
 The route-specific nested source proof is reauthenticated on receipt read-back,
 and all three child identity symbols must exist in both final binaries.
+
+Weighted-capture reducer v6 publishes the ordinary helper-free component list
+plus one final reducer proof. The record recomputes the exact operation and
+artifact identities, source-to-component map, first-source priority,
+per-component weights, uniform-capture proof fields, LF terminator, fixed
+16 MiB reducer-object cap, and the complete ordered relocation arrays. The
+only accepted relocations are one increasing PLT32 `-4` edge per x86-64
+component or one increasing Branch26 `0` edge per AArch64 component. Missing,
+malformed, reordered, or target-inconsistent arrays fail closed.
 
 The closed selector-capture-fallback v4 variant is deliberately narrower. It
 binds one helper-free native Span selector, the exact fixed-cap
@@ -442,6 +466,11 @@ Three fresh processes authenticate each job:
    reducer trap, the exact
    `linked-native-single-capture-reducer` policy enters the strict
    whole-operation numerator.
+   Weighted-capture reducer v6 applies the same operation-boundary rule: it
+   traps exactly the final weighted Count/Grep reducer, inventories every child
+   selector as an identity-defined symbol, and enters through
+   `linked-native-weighted-capture-reducer` only when the helper surface is
+   empty and the complete v6 proof authenticates.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:

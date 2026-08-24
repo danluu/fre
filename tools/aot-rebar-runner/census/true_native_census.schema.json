@@ -1063,6 +1063,83 @@
         }
       ]
     },
+    "weightedCaptureRelocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "offset", "kind", "addend"],
+      "properties": {
+        "component": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "offset": {
+          "type": "integer", "minimum": 0, "maximum": 16777215
+        },
+        "kind": { "enum": [2, 5] },
+        "addend": { "enum": [-4, 0] }
+      }
+    },
+    "weightedCaptureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_schema", "pattern_bytes", "component_first_source_ordinals",
+        "component_weights", "source_participating_user_captures",
+        "line_terminator", "operation", "domain", "ordered_sources_sha256",
+        "operation_identity_sha256", "reducer_symbol", "reducer_symbol_sha256",
+        "reducer_code_sha256", "reducer_object_sha256", "reducer_object_bytes",
+        "reducer_object_cap", "artifact_identity_sha256", "external_relocations"
+      ],
+      "properties": {
+        "receipt_schema": { "const": 1 },
+        "pattern_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 67108864
+        },
+        "component_first_source_ordinals": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": { "type": "integer", "minimum": 0, "maximum": 4095 }
+        },
+        "component_weights": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": {
+            "type": "integer", "minimum": 1,
+            "maximum": 18446744073709551615
+          }
+        },
+        "source_participating_user_captures": {
+          "type": "array", "minItems": 2, "maxItems": 4096,
+          "items": {
+            "type": "integer", "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "line_terminator": { "const": 10 },
+        "operation": { "enum": [1, 2] },
+        "domain": { "enum": [1, 2] },
+        "ordered_sources_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "operation_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "oneOf": [
+            {
+              "pattern": "^fre_aot_regex_weighted_count_captures_v1_[0-9a-f]{64}$"
+            },
+            {
+              "pattern": "^fre_aot_regex_weighted_grep_captures_v1_[0-9a-f]{64}$"
+            }
+          ]
+        },
+        "reducer_symbol_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_code_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 16777216
+        },
+        "reducer_object_cap": { "const": 16777216 },
+        "artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "external_relocations": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": { "$ref": "#/$defs/weightedCaptureRelocation" }
+        }
+      }
+    },
     "selectorCaptureFallbackProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -1174,7 +1251,8 @@
         "schema": {
           "enum": [
             "fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3",
-            "fre.aot.rebar-runner.v4", "fre.aot.rebar-runner.v5"
+            "fre.aot.rebar-runner.v4", "fre.aot.rebar-runner.v5",
+            "fre.aot.rebar-runner.v6"
           ]
         },
         "adapter": { "type": "string" },
@@ -1195,7 +1273,7 @@
             "scalar-v2", "composite-v3", "strict-capture-v4",
             "participation-capture-v4", "selector-capture-fallback-v4",
             "prepared-grep-v15-v2", "shared-ordered-many-v2",
-            "single-capture-reducer-v5"
+            "single-capture-reducer-v5", "weighted-capture-reducer-v6"
           ]
         },
         "composite_kind": {
@@ -1205,7 +1283,8 @@
             "exact-span-participation-v1", "selector-negative-certificate-v1",
             "mixed-prepared-native-row-bridge-v15",
             "shared-ordered-many-native-reducer-v1",
-            "single-capture-whole-operation-reducer-v1"
+            "single-capture-whole-operation-reducer-v1",
+            "weighted-capture-whole-operation-reducer-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -1234,6 +1313,9 @@
           "$ref": "#/$defs/participationCaptureProvenance"
         },
         "capture_reducer": { "$ref": "#/$defs/captureReducerProvenance" },
+        "weighted_capture_reducer": {
+          "$ref": "#/$defs/weightedCaptureReducerProvenance"
+        },
         "selector_capture_fallback": {
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
@@ -1303,6 +1385,67 @@
             }
           },
           "else": { "not": { "required": ["capture_reducer"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "weighted-capture-reducer-v6" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["weighted_capture_reducer"],
+            "properties": {
+              "schema": { "const": "fre.aot.rebar-runner.v6" },
+              "composite_kind": {
+                "const": "weighted-capture-whole-operation-reducer-v1"
+              },
+              "source_pattern_count": { "type": "integer", "minimum": 2 },
+              "source_to_artifact": { "minItems": 2, "maxItems": 4096 },
+              "row_total_object_bytes": {
+                "type": "integer", "minimum": 1, "maximum": 268435456
+              },
+              "uniform_capture": { "$ref": "#/$defs/uniformCaptureProvenance" },
+              "shared_ordered_many": { "type": "null" },
+              "components": {
+                "minItems": 1, "maxItems": 4096,
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/componentProvenance" },
+                    {
+                      "properties": {
+                        "entry_symbol": {
+                          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+                        },
+                        "required_runtime_symbols": { "maxItems": 0 },
+                        "automaton_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+                        "program_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+                        "object_sha256": { "$ref": "#/$defs/nonzeroSha256" }
+                      }
+                    }
+                  ]
+                }
+              },
+              "required_runtime_symbols": { "maxItems": 0 },
+              "prepared_bulk_strategy": { "type": "null" },
+              "span_iteration_strategy": { "type": "null" },
+              "grep_iteration_strategy": { "type": "null" },
+              "program_sha256": { "type": "null" },
+              "program_symbol": { "type": "null" },
+              "entry_symbol": { "type": "null" },
+              "span_fill_symbol": { "type": "null" },
+              "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+              "reducer_symbol": {
+                "oneOf": [
+                  {
+                    "pattern": "^fre_aot_regex_weighted_count_captures_v1_[0-9a-f]{64}$"
+                  },
+                  {
+                    "pattern": "^fre_aot_regex_weighted_grep_captures_v1_[0-9a-f]{64}$"
+                  }
+                ]
+              }
+            }
+          },
+          "else": { "not": { "required": ["weighted_capture_reducer"] } }
         },
         {
           "if": {

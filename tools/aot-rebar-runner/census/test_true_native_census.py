@@ -1474,6 +1474,163 @@ def single_capture_reducer_provenance_fields(
     return fields
 
 
+def weighted_capture_reducer_provenance_fields(
+    model: str = "count-captures", target: str = "aarch64-linux"
+) -> dict[str, str]:
+    if model == "count-captures":
+        operation, domain = 1, 1
+        adapter = "general-aot-native-weighted-capture-count-reducer-v1"
+        symbol_prefix = "fre_aot_regex_weighted_count_captures_v1_"
+    elif model == "grep-captures":
+        operation, domain = 2, 2
+        adapter = "general-aot-native-weighted-capture-grep-reducer-v1"
+        symbol_prefix = "fre_aot_regex_weighted_grep_captures_v1_"
+    else:
+        raise AssertionError(f"unsupported synthetic weighted model {model!r}")
+    if target.startswith("aarch64-"):
+        feature_bits = "0000000100000000"
+        relocation_kind, relocation_addend = 5, 0
+    elif target.startswith("x86_64-"):
+        feature_bits = "0000000000000001"
+        relocation_kind, relocation_addend = 2, -4
+    else:
+        raise AssertionError(f"unsupported synthetic weighted target {target!r}")
+
+    entries = [
+        f"fre_aot_regex_search_v1_{'7' * 64}",
+        f"fre_aot_regex_search_v1_{'8' * 64}",
+    ]
+    automata = ["1" * 64, "4" * 64]
+    programs = ["2" * 64, "5" * 64]
+    objects = ["3" * 64, "6" * 64]
+    components = [
+        {
+            "ordinal": index,
+            "native": True,
+            "source_ordinal": index,
+            "entry_symbol": entries[index],
+            "required_runtime_symbols": [],
+            "automaton_sha256": automata[index],
+            "program_sha256": programs[index],
+            "object_sha256": objects[index],
+        }
+        for index in range(2)
+    ]
+    source_map = [0, 1, 0]
+    first_ordinals = [0, 1]
+    weights = [2, 3]
+    user_captures = [1, 2, 1]
+    proof = {
+        "capture_resolution": "static-uniform-multiplier",
+        "capture_proof_algorithm_version": 1,
+        "capture_proof_accounting_version": 1,
+        "source_participating_groups": [2, 3, 2],
+        "source_minimum_match_bytes": [1, 2, 1],
+        "source_capture_annotations": [1, 2, 1],
+        "source_proof_work": [7, 9, 7],
+        "source_proof_peak_stack_items": [3, 4, 3],
+        "source_selector_automaton_sha256": [automata[0], automata[1], automata[0]],
+        "source_selector_program_sha256": [programs[0], programs[1], programs[0]],
+        "source_selector_object_sha256": [objects[0], objects[1], objects[0]],
+    }
+    fields = {
+        **frozen_validation_fields(),
+        "schema": "fre.aot.rebar-runner.v6",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": adapter,
+        "model": model,
+        "benchmark": f"synthetic/{model}/weighted",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": target,
+        "feature_bits": feature_bits,
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedContextDfa)",
+        "aggregate_strategy": "native-weighted-capture-row-reducer-v1",
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "true",
+        "weighted_capture_reducer_bridge": "true",
+        "weighted_receipt_schema": "1",
+        "source_pattern_count": "3",
+        "pattern_bytes": "8",
+        "row_total_object_bytes": "246",
+        "component_count": "2",
+        "source_to_component": "0,1,0",
+        "component_first_source_ordinals": "0,1",
+        "component_weights": "2,3",
+        "component_entry_symbols": ",".join(entries),
+        "component_automaton_sha256": ",".join(automata),
+        "component_program_sha256": ",".join(programs),
+        "component_object_sha256": ",".join(objects),
+        "capture_resolution": "static-uniform-multiplier",
+        "capture_proof_algorithm_version": "1",
+        "capture_proof_accounting_version": "1",
+        "source_participating_groups": "2,3,2",
+        "source_minimum_match_bytes": "1,2,1",
+        "source_participating_user_captures": "1,2,1",
+        "source_capture_annotations": "1,2,1",
+        "source_proof_work": "7,9,7",
+        "source_proof_peak_stack_items": "3,4,3",
+        "source_selector_automaton_sha256": ",".join(
+            proof["source_selector_automaton_sha256"]
+        ),
+        "source_selector_program_sha256": ",".join(
+            proof["source_selector_program_sha256"]
+        ),
+        "source_selector_object_sha256": ",".join(
+            proof["source_selector_object_sha256"]
+        ),
+        "line_terminator": "10",
+        "operation": str(operation),
+        "domain": str(domain),
+        "ordered_sources_sha256": "9" * 64,
+        "operation_identity_sha256": "0" * 64,
+        "reducer_symbol": "",
+        "reducer_symbol_sha256": "0" * 64,
+        "reducer_code_sha256": "a" * 64,
+        "reducer_object_sha256": "b" * 64,
+        "reducer_object_bytes": "1234",
+        "reducer_object_cap": str(CENSUS.MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES),
+        "reducer_artifact_identity_sha256": "0" * 64,
+        "external_relocation_count": "2",
+        "external_relocation_components": "0,1",
+        "external_relocation_offsets": "16,32",
+        "external_relocation_kinds": f"{relocation_kind},{relocation_kind}",
+        "external_relocation_addends": f"{relocation_addend},{relocation_addend}",
+        "semantic_runtime_symbols": "",
+        "boundary": (
+            "single-call-helper-free-native-multi-component-weighted-row-reducer"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+    operation_identity = CENSUS.weighted_capture_operation_identity(
+        fields, components, source_map, first_ordinals, weights, proof, user_captures
+    )
+    reducer_symbol = f"{symbol_prefix}{operation_identity}"
+    relocations = [
+        {
+            "component": index,
+            "offset": offset,
+            "kind": relocation_kind,
+            "addend": relocation_addend,
+        }
+        for index, offset in enumerate((16, 32))
+    ]
+    fields["operation_identity_sha256"] = operation_identity
+    fields["reducer_symbol"] = reducer_symbol
+    fields["reducer_symbol_sha256"] = CENSUS.sha_bytes(reducer_symbol.encode())
+    fields["reducer_artifact_identity_sha256"] = (
+        CENSUS.weighted_capture_artifact_identity(
+            operation_identity, reducer_symbol, fields["reducer_code_sha256"],
+            fields["reducer_object_sha256"], int(fields["reducer_object_bytes"]),
+            int(fields["reducer_object_cap"]), relocations,
+        )
+    )
+    return fields
+
+
 def synthetic_single_capture_reducer_qualification_receipt(
     plan: dict[str, object],
     source_route: str = "exact-span-participation-v1",
@@ -1669,6 +1826,19 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertIn(
             "single-capture-whole-operation-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        weighted = definitions["weightedCaptureReducerProvenance"]
+        self.assertFalse(weighted["additionalProperties"])
+        self.assertIn("external_relocations", weighted["required"])
+        self.assertIn("operation_identity_sha256", weighted["required"])
+        self.assertEqual(weighted["properties"]["reducer_object_cap"]["const"], 16 * 1024 * 1024)
+        self.assertIn(
+            "weighted-capture-reducer-v6",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        self.assertIn(
+            "weighted-capture-whole-operation-reducer-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
         self.assertIn(
@@ -2392,6 +2562,9 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-single-capture-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-weighted-capture-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-uniform-capture-helper-backed-reducer": (
@@ -3655,6 +3828,104 @@ class TrueNativeCensusTests(unittest.TestCase):
                             validated["classification"]["reason"],
                             "whole-operation-native-authenticated",
                         )
+
+    def test_weighted_capture_reducer_v6_closes_one_helper_free_call(self) -> None:
+        for model in ("count-captures", "grep-captures"):
+            for target in ("aarch64-linux", "x86_64-macos"):
+                with self.subTest(model=model, target=target):
+                    fields = weighted_capture_reducer_provenance_fields(model, target)
+                    encoded = " ".join(
+                        f"{key}={value}" for key, value in fields.items()
+                    ).encode()
+                    parsed = CENSUS.parse_provenance(encoded)
+                    provenance = CENSUS.provenance_receipt(parsed)
+                    CENSUS.validate_provenance_record(
+                        provenance, "synthetic weighted capture reducer"
+                    )
+                    reducer = fields["reducer_symbol"]
+                    expected_route = (
+                        [reducer], "linked-native-weighted-capture-reducer"
+                    )
+                    self.assertEqual(
+                        CENSUS.selected_operation_entries(parsed), expected_route
+                    )
+                    self.assertEqual(
+                        CENSUS.operation_route_from_provenance_record(provenance),
+                        expected_route,
+                    )
+                    self.assertEqual(
+                        provenance["kind"], "weighted-capture-reducer-v6"
+                    )
+                    self.assertEqual(
+                        provenance["composite_kind"],
+                        "weighted-capture-whole-operation-reducer-v1",
+                    )
+                    self.assertEqual(provenance["source_to_artifact"], [0, 1, 0])
+                    self.assertEqual(
+                        provenance["weighted_capture_reducer"]["component_weights"],
+                        [2, 3],
+                    )
+                    self.assertEqual(
+                        CENSUS.identity_defined_symbols_from_provenance(provenance),
+                        sorted(fields["component_entry_symbols"].split(",")),
+                    )
+                    policy = CENSUS.OPERATION_ROUTE_POLICIES[expected_route[1]]
+                    self.assertEqual(
+                        policy.boundary, CENSUS.OperationBoundary.WHOLE_OPERATION
+                    )
+
+    def test_weighted_capture_reducer_v6_fails_closed_on_receipt_mutation(self) -> None:
+        base = weighted_capture_reducer_provenance_fields()
+
+        def parse(fields: dict[str, str]) -> dict[str, str]:
+            return CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+            )
+
+        mutations: list[tuple[str, dict[str, str]]] = []
+        for field, value in (
+            ("operation_identity_sha256", "f" * 64),
+            ("source_participating_user_captures", "0,2,1"),
+            ("component_weights", "3,3"),
+            ("source_selector_object_sha256", f"{'3' * 64},{'3' * 64},{'3' * 64}"),
+            ("external_relocation_components", "1,0"),
+            ("external_relocation_components", "0"),
+            ("external_relocation_offsets", "32,16"),
+            ("external_relocation_offsets", "16,not-a-number"),
+            ("external_relocation_kinds", "2,2"),
+            ("external_relocation_addends", "-4,-4"),
+            ("reducer_artifact_identity_sha256", "f" * 64),
+            ("line_terminator", "13"),
+        ):
+            poisoned = dict(base)
+            poisoned[field] = value
+            mutations.append((field, poisoned))
+        extra = dict(base)
+        extra["unbound_weighted_fact"] = "1"
+        mutations.append(("extra_field", extra))
+        for field, poisoned in mutations:
+            with self.subTest(mutation=field):
+                with self.assertRaises(CENSUS.CensusError):
+                    parse(poisoned)
+        for field in (
+            "external_relocation_components", "external_relocation_offsets",
+            "external_relocation_kinds", "external_relocation_addends",
+        ):
+            with self.subTest(missing=field):
+                missing = dict(base)
+                missing.pop(field)
+                with self.assertRaisesRegex(CENSUS.CensusError, "omits"):
+                    parse(missing)
+
+        normalized = CENSUS.provenance_receipt(parse(base))
+        poisoned_normalized = copy.deepcopy(normalized)
+        poisoned_normalized["weighted_capture_reducer"]["external_relocations"][0][
+            "offset"
+        ] = 33
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                poisoned_normalized, "mutated normalized weighted capture reducer"
+            )
 
     def test_single_capture_reducer_v5_fails_closed(self) -> None:
         base = single_capture_reducer_provenance_fields()

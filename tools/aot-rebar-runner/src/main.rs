@@ -1801,6 +1801,27 @@ fn print_provenance() {
         return;
     }
     if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+        let decimal_list = |values: &[usize]| {
+            values
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let u64_list = |values: &[u64]| {
+            values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let digest_list = |values: &[[u8; 32]]| {
+            values
+                .iter()
+                .map(|digest| hex(digest))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let source_map = linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT
             .iter()
             .map(usize::to_string)
@@ -1816,8 +1837,28 @@ fn print_provenance() {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        let relocation_components = linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let relocation_offsets = linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let relocation_kinds = linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let relocation_addends = linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_ADDENDS
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "schema=fre.aot.rebar-runner.v6 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=true weighted_capture_reducer_bridge=true source_pattern_count={} component_count={} source_to_component={} component_first_source_ordinals={} component_weights={} component_entry_symbols={} component_program_sha256={} component_object_sha256={} operation={} domain={} ordered_sources_sha256={} operation_identity_sha256={} reducer_symbol={} reducer_symbol_sha256={} reducer_code_sha256={} reducer_object_sha256={} reducer_object_bytes={} reducer_object_cap={} reducer_artifact_identity_sha256={} external_relocation_count={} external_relocation_kinds={} semantic_runtime_symbols= boundary=single-call-helper-free-native-multi-component-weighted-row-reducer required_comparators={required_comparators} {validation_binding}",
+            "schema=fre.aot.rebar-runner.v6 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} native_row_bridge=true uniform_capture_bridge=true weighted_capture_reducer_bridge=true weighted_receipt_schema={} source_pattern_count={} pattern_bytes={} row_total_object_bytes={} component_count={} source_to_component={} component_first_source_ordinals={} component_weights={} component_entry_symbols={} component_automaton_sha256={} component_program_sha256={} component_object_sha256={} capture_resolution=static-uniform-multiplier capture_proof_algorithm_version={} capture_proof_accounting_version={} source_participating_groups={} source_minimum_match_bytes={} source_participating_user_captures={} source_capture_annotations={} source_proof_work={} source_proof_peak_stack_items={} source_selector_automaton_sha256={} source_selector_program_sha256={} source_selector_object_sha256={} line_terminator={} operation={} domain={} ordered_sources_sha256={} operation_identity_sha256={} reducer_symbol={} reducer_symbol_sha256={} reducer_code_sha256={} reducer_object_sha256={} reducer_object_bytes={} reducer_object_cap={} reducer_artifact_identity_sha256={} external_relocation_count={} external_relocation_components={} external_relocation_offsets={} external_relocation_kinds={} external_relocation_addends={} semantic_runtime_symbols= boundary=single-call-helper-free-native-multi-component-weighted-row-reducer required_comparators={required_comparators} {validation_binding}",
             linked::CONFIGURED,
             linked::ADAPTER,
             linked::EXPECTED_MODEL,
@@ -1831,22 +1872,30 @@ fn print_provenance() {
             linked::OPTIMIZER_VERSION,
             linked::ENGINE,
             linked::AGGREGATE_STRATEGY,
+            linked::WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA,
             linked::WEIGHTED_CAPTURE_REDUCER_SOURCE_COUNT,
+            linked::WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES,
+            linked::ROW_TOTAL_OBJECT_BYTES,
             linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS.len(),
             source_map,
             first_ordinals,
             weights,
             linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS.join(","),
-            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256
-                .iter()
-                .map(|digest| hex(digest))
-                .collect::<Vec<_>>()
-                .join(","),
-            linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256
-                .iter()
-                .map(|digest| hex(digest))
-                .collect::<Vec<_>>()
-                .join(","),
+            digest_list(linked::ROW_AUTOMATON_SHA256),
+            digest_list(linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256),
+            digest_list(linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256),
+            linked::UNIFORM_CAPTURE_ALGORITHM_VERSION,
+            linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION,
+            u64_list(linked::SOURCE_PARTICIPATING_GROUPS),
+            decimal_list(linked::SOURCE_MINIMUM_MATCH_BYTES),
+            decimal_list(linked::SOURCE_PARTICIPATING_USER_CAPTURES),
+            decimal_list(linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS),
+            u64_list(linked::SOURCE_PROOF_WORK),
+            decimal_list(linked::SOURCE_PROOF_PEAK_STACK_ITEMS),
+            digest_list(linked::SOURCE_SELECTOR_AUTOMATON_SHA256),
+            digest_list(linked::SOURCE_SELECTOR_PROGRAM_SHA256),
+            digest_list(linked::SOURCE_SELECTOR_OBJECT_SHA256),
+            linked::WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR,
             linked::WEIGHTED_CAPTURE_REDUCER_OPERATION,
             linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN,
             hex(&linked::WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256),
@@ -1859,11 +1908,10 @@ fn print_provenance() {
             linked::WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES,
             hex(&linked::WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256),
             linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS.len(),
-            linked::WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
+            relocation_components,
+            relocation_offsets,
+            relocation_kinds,
+            relocation_addends,
         );
         return;
     }
@@ -2218,6 +2266,7 @@ fn weighted_capture_reducer_provenance_is_empty() -> bool {
     linked::WEIGHTED_CAPTURE_REDUCER_RECEIPT_SCHEMA == 0
         && linked::WEIGHTED_CAPTURE_REDUCER_OPERATION == 0
         && linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN == 0
+        && linked::WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR == 0
         && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE.is_empty()
         && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM.is_empty()
         && linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ABI.is_empty()
@@ -2325,6 +2374,7 @@ fn authenticate_linked_weighted_capture_reducer_route(
             != fre_aot_regex::REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_RECEIPT_VERSION
         || linked::WEIGHTED_CAPTURE_REDUCER_OPERATION != operation
         || linked::WEIGHTED_CAPTURE_REDUCER_DOMAIN != domain
+        || linked::WEIGHTED_CAPTURE_REDUCER_LINE_TERMINATOR != b'\n'
         || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_ARCHITECTURE
             != format!("{:?}", target.architecture)
         || linked::WEIGHTED_CAPTURE_REDUCER_TARGET_OPERATING_SYSTEM

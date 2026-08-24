@@ -418,11 +418,17 @@ and component-link surfaces, empty semantic-helper surface, request/receipt/
 report extents, scratch formula, and report/receipt schemas. The census counts
 this route as whole-operation native only when the one reducer entry and all
 of those closures authenticate.
-Uniform-capture routes additionally publish `capture_resolution` as
+Uniform-capture v3 row-adapter routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to
 the retained row. They are reported separately from capture-materializing
 engines and remain outside the strict wholly-native-operation numerator.
+The v6 weighted-capture record carries those same per-source proofs but closes
+them into one helper-free operation entry. It additionally seals source and
+component priority, unequal weights, the LF terminator, final reducer and
+artifact identities, fixed object cap, and every architecture-specific child
+call relocation; the census therefore admits that exact route to the strict
+whole-operation numerator.
 The additive v4 strict-capture record instead binds the native `capture_next`,
 materializer, and selector symbols plus the source, selector, capture program,
 plan, bundle, object, and complete artifact identities. It reports
