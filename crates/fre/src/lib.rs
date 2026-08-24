@@ -29384,6 +29384,84 @@ mod tests {
 
     #[cfg(target_has_atomic = "64")]
     #[test]
+    fn bounded_literal_repeat_benchmark_boundary_1024_warms_early_span_receipt() {
+        const PATTERN: &str = r"(?:ab){2,5}c";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("benchmark-boundary bounded repeat builds");
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        // Keep this byte-for-byte identical to the benchmark case named
+        // `bounded_repeat_boundary_1024`. The boundary is the admitted window
+        // length; its retained `ababc` suffix begins at offset 6.
+        let mut haystack = b"abababababc".to_vec();
+        haystack.resize(1_024, b'x');
+        let expected = upstream
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((0, 11)));
+
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+            "the cold complete leaf must preserve the benchmark boundary",
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("benchmark-boundary bounded repeat must retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("benchmark-boundary bounded repeat retains its suffix");
+        assert_eq!(
+            suffix.pooled_finite_consumption_span_early_prefix_offset(
+                &haystack,
+                SearchWindow::full(&haystack),
+            ),
+            Some(6),
+            "the inclusive 1,024-byte window must retain its early receipt",
+        );
+
+        super::finite_consumption_span_facade_probe::reset();
+        super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 1,
+                declines: 0,
+            },
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+            "the hot benchmark-boundary find must close through the early leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts::default(),
+            "the hot benchmark-boundary find must not rescan the complete leaf",
+        );
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
     fn bounded_literal_repeat_span_ignores_unneeded_foreign_feedback_owner() {
         const PATTERN: &str = r"(?:ab){2,5}c";
         let regex = PortableBuilder::new(PATTERN)
