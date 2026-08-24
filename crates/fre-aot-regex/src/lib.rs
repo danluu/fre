@@ -1056,11 +1056,14 @@ fn append_prepared_aggregate_exports_to_compiled(
         module,
         format,
         max_object_bytes,
-        || {
-            let without_reverse = CompiledModule::lower_without_synchronizing_accept_reverse(
+        |allow_synchronizing_accept_reverse, allow_exact_pair| {
+            let without_reverse =
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                 &program,
                 target,
                 effective_native_data_limit_bytes,
+                allow_synchronizing_accept_reverse,
+                allow_exact_pair,
             )?;
             Ok(without_reverse.append_prepared_aggregate_exports(
                 exports,
@@ -1773,7 +1776,7 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         initial,
         format,
         limits.max_object_bytes,
-        || {
+        |_, _| {
             Err(CompileError::InternalInvariant(
                 "prepared Ordered-NFA unexpectedly selected a synchronizing reverse prepass",
             ))
@@ -2191,7 +2194,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     mut module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
-    rebuild_without_synchronizing_accept_reverse: impl FnOnce()
+    mut rebuild_complete_dfa_with_suffix_policy: impl FnMut(bool, bool)
         -> Result<CompiledModule, CompileError>,
     rebuild_without_terminal_exact_set: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_whole_window_width_gate: impl FnOnce() -> Result<CompiledModule, CompileError>,
@@ -2205,14 +2208,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     rebuild_scalar_ordered_nfa: impl FnOnce() -> Result<CompiledModule, CompileError>,
 ) -> Result<FinalObjectAttempt, CompileError> {
     let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
-    let selected_synchronizing_accept_reverse = module.has_synchronizing_accept_reverse();
-    let selected_terminal_exact_set = module.has_ordered_nfa_terminal_exact_set();
-    let selected_width_gate = module.has_ordered_nfa_whole_window_width_gate();
-    let selected_start_prefix = module.has_ordered_nfa_start_prefix();
-    let selected_start_closure = module.has_ordered_nfa_start_closure_dispatch();
-    let selected_terminal_range = module.has_ordered_nfa_terminal_range_object();
-    let selected_edge_dispatch = module.has_ordered_edge_dispatch_object();
-    let first_error = match emit_object(&module, format, max_object_bytes) {
+    let mut first_error = match emit_object(&module, format, max_object_bytes) {
         Ok(object) => return Ok(FinalObjectAttempt::Fit { module, object }),
         Err(error @ ObjectError::Resource {
             resource: CompileResource::ObjectBytes,
@@ -2221,10 +2217,56 @@ fn emit_with_ordered_nfa_accelerator_retries(
         Err(error) => return Err(error.into()),
     };
 
+    // A final retry may remove an already-selected additive route, but must
+    // never re-admit one that the initial native-data/target policy declined.
+    let mut exact_pair_permitted = module.has_exact_pair_suffix();
+    if module.has_exact_pair_suffix() {
+        let without_pair = rebuild_complete_dfa_with_suffix_policy(true, false)?
+            .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        if without_pair.has_exact_pair_suffix()
+            || without_pair.slow_aot_report().is_some()
+            || without_pair.compiler_k0_aot_report().is_some()
+            || without_pair.required_runtime_symbols().next().is_some()
+            || without_pair.required_prepare_capabilities() != 0
+            || without_pair.start_accelerator() != module.start_accelerator()
+        {
+            return Err(CompileError::InternalInvariant(
+                "exact-pair final-object retry changed its complete-DFA route",
+            ));
+        }
+        match emit_object(&without_pair, format, max_object_bytes) {
+            Ok(object) => {
+                return Ok(FinalObjectAttempt::Fit {
+                    module: without_pair,
+                    object,
+                });
+            }
+            Err(error @ ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) => {
+                module = without_pair;
+                first_error = error;
+                exact_pair_permitted = false;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let selected_synchronizing_accept_reverse = module.has_synchronizing_accept_reverse();
+    let selected_terminal_exact_set = module.has_ordered_nfa_terminal_exact_set();
+    let selected_width_gate = module.has_ordered_nfa_whole_window_width_gate();
+    let selected_start_prefix = module.has_ordered_nfa_start_prefix();
+    let selected_start_closure = module.has_ordered_nfa_start_closure_dispatch();
+    let selected_terminal_range = module.has_ordered_nfa_terminal_range_object();
+    let selected_edge_dispatch = module.has_ordered_edge_dispatch_object();
+
     if selected_synchronizing_accept_reverse {
-        let without_reverse = rebuild_without_synchronizing_accept_reverse()?
+        let without_reverse =
+            rebuild_complete_dfa_with_suffix_policy(false, exact_pair_permitted)?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
         if without_reverse.has_synchronizing_accept_reverse()
+            || without_reverse.has_exact_pair_suffix() != module.has_exact_pair_suffix()
             || without_reverse.slow_aot_report().is_some()
             || without_reverse.compiler_k0_aot_report().is_some()
             || without_reverse.required_runtime_symbols().next().is_some()
@@ -2469,11 +2511,13 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         enabled,
         format,
         max_object_bytes,
-        || {
-            CompiledModule::lower_without_synchronizing_accept_reverse(
+        |allow_synchronizing_accept_reverse, allow_exact_pair| {
+            CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                 program,
                 target,
                 max_native_data_bytes,
+                allow_synchronizing_accept_reverse,
+                allow_exact_pair,
             )
         },
         || {
@@ -2539,11 +2583,13 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 second,
                 format,
                 max_object_bytes,
-                || {
-                    CompiledModule::lower_without_synchronizing_accept_reverse(
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                         program,
                         target,
                         max_native_data_bytes,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
                     )
                 },
                 || {
@@ -2706,11 +2752,13 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 optimized,
                 format,
                 limits.max_object_bytes,
-                || {
-                    CompiledModule::lower_without_synchronizing_accept_reverse(
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                         &program,
                         target,
                         effective_native_data_limit_bytes,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
                     )
                 },
                 || {
@@ -2770,11 +2818,13 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             k0_fallback,
                             format,
                             limits.max_object_bytes,
-                            || {
-                                CompiledModule::lower_without_synchronizing_accept_reverse(
+                            |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                                     &program,
                                     target,
                                     effective_native_data_limit_bytes,
+                                    allow_synchronizing_accept_reverse,
+                                    allow_exact_pair,
                                 )
                             },
                             || {

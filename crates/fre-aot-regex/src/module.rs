@@ -1653,6 +1653,10 @@ pub struct CompiledModule {
     /// synchronizing-accept reverse prepass. This compiler-only bit drives a
     /// same-route final-object retry and never enters frozen data.
     synchronizing_accept_reverse_lowered: bool,
+    /// Whether the ordinary complete-DFA text owns the optional exact
+    /// correlated two-byte suffix scanner. This compiler-only bit drives an
+    /// exact-incumbent final-object retry and never enters frozen data.
+    exact_pair_suffix_lowered: bool,
     /// Whether this exact Ordered-NFA text specializes the canonical start
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
@@ -1920,6 +1924,10 @@ struct NativeLowering {
     /// prepass. This never enters frozen data and drives its exact
     /// final-object retry.
     synchronizing_accept_reverse_lowered: bool,
+    /// Compiler-only receipt for an exact correlated two-byte suffix scanner.
+    /// This drives a final-object retry to the exact pre-feature complete-DFA
+    /// portfolio and never enters frozen data.
+    exact_pair_suffix_lowered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2877,23 +2885,49 @@ impl CompiledModule {
         target: Target,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_ordinary_complete_dfa_with_suffix_policy(
+            program,
+            target,
+            max_native_data_bytes,
+            false,
+            true,
+        )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA portfolio while independently
+    /// selecting its two additive suffix accelerators. Final object-size
+    /// retries first remove the exact-pair scanner while preserving a selected
+    /// synchronizing reverse proof, then remove that proof if necessary.
+    pub(crate) fn lower_ordinary_complete_dfa_with_suffix_policy(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        allow_synchronizing_accept_reverse: bool,
+        allow_exact_pair: bool,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let native = program.native_dfa_view().ok_or(CompileError::InternalInvariant(
-            "synchronizing reverse retry has no ordinary complete DFA",
+            "suffix-accelerator retry has no ordinary complete DFA",
         ))?;
-        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             native,
             target,
             NativeDfaEntryContract::Public,
             max_native_data_bytes,
-            false,
+            allow_synchronizing_accept_reverse,
+            allow_exact_pair,
         )?
         .ok_or(CompileError::InternalInvariant(
-            "synchronizing reverse retry did not restore its complete DFA",
+            "suffix-accelerator retry did not restore its complete DFA",
         ))?;
-        if lowering.synchronizing_accept_reverse_lowered {
+        if !allow_synchronizing_accept_reverse && lowering.synchronizing_accept_reverse_lowered {
             return Err(CompileError::InternalInvariant(
                 "synchronizing reverse retry retained the disabled prepass",
+            ));
+        }
+        if !allow_exact_pair && lowering.exact_pair_suffix_lowered {
+            return Err(CompileError::InternalInvariant(
+                "exact-pair retry retained the disabled scanner",
             ));
         }
         Self::lower_serialized_with_prelowered(
@@ -6147,6 +6181,7 @@ impl CompiledModule {
             bit_parallel_exact_endpoint_lowered,
             synchronizing_accept_reverse_lowered: lowering
                 .synchronizing_accept_reverse_lowered,
+            exact_pair_suffix_lowered: lowering.exact_pair_suffix_lowered,
             ordered_nfa_start_closure_dispatch_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -6401,6 +6436,10 @@ impl CompiledModule {
 
     pub(crate) const fn has_synchronizing_accept_reverse(&self) -> bool {
         self.synchronizing_accept_reverse_lowered
+    }
+
+    pub(crate) const fn has_exact_pair_suffix(&self) -> bool {
+        self.exact_pair_suffix_lowered
     }
 
     /// Carry the selected scheduler transaction's fallback permission onto a
@@ -10258,6 +10297,7 @@ fn lower_runtime_adapter(
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10471,6 +10511,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10899,6 +10940,7 @@ fn lower_native_endpoint_oracle_prepared(
             start_accelerator: bit.start_accelerator,
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         composed_prepared,
         Some(mode),
@@ -11244,6 +11286,7 @@ fn lower_native_dynamic_rows_prepared(
             start_accelerator,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -11464,6 +11507,7 @@ fn lower_native_slow_partial_with_data_limit(
         start_accelerator: native.start_accelerator,
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
     }))
 }
 
@@ -12756,6 +12800,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -13509,6 +13554,7 @@ fn lower_native_partial_prepared(
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -18218,6 +18264,7 @@ fn build_native_ordinal_retry(
     comparison: Option<NativeDefaultExceptionPlan>,
     permit_asimd_candidate_mask: bool,
     permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
     ranking_target: Option<Target>,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     if !is_optional_native_table_decline(dense_error) {
@@ -18245,6 +18292,7 @@ fn build_native_ordinal_retry(
             None,
             permit_asimd_candidate_mask,
             permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         )
         .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
         match retry {
@@ -18280,6 +18328,7 @@ fn build_native_ordinal_retry(
                 None,
                 permit_asimd_candidate_mask,
                 permit_synchronizing_accept_reverse,
+                permit_exact_pair,
             )
             .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
             match retry {
@@ -18486,6 +18535,7 @@ fn build_native_dense_candidate(
     column_quotient: Option<&NativeColumnQuotientPlan>,
     permit_asimd_candidate_mask: bool,
     permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     let force_class_mapped_applicable = || {
         let class_count = view.dfa.class_count;
@@ -18559,6 +18609,7 @@ fn build_native_dense_candidate(
             None,
             permit_asimd_candidate_mask,
             permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         )?;
     require_native_start_scanner(view, max_native_data_bytes, lowering).map(Some)
 }
@@ -20946,6 +20997,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             start_accelerator: report.scanner,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         report,
     )))
@@ -21017,6 +21069,7 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         report,
     )))
@@ -21068,11 +21121,12 @@ fn lower_exact_finite_teddy_incumbent_with_data_limit(
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     exact_finite_teddy_incumbent_outcome(
-        lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+        lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             view,
             target,
             NativeDfaEntryContract::Public,
             max_native_data_bytes,
+            true,
             true,
         ),
         max_native_data_bytes,
@@ -21389,13 +21443,31 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
     max_native_data_bytes: usize,
     allow_synchronizing_accept_reverse: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        false,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
     let (mut data, mut layout) =
-        build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+        build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
             view,
             target,
             vector_cost_model,
@@ -21403,6 +21475,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
             maximum_native_data_bytes,
             allow_synchronizing_accept_reverse
                 && entry_contract == NativeDfaEntryContract::Public,
+            allow_exact_pair && entry_contract == NativeDfaEntryContract::Public,
         )?;
     let synchronizing_accept_reverse_lowered = layout.seeded_reverse.is_some()
         && layout.suffix_filter.is_some_and(|suffix| {
@@ -21531,6 +21604,15 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
         sve_suffix_kind,
         emission.scanner,
     );
+    // Compute this compiler-only receipt after every target-specific scanner
+    // installation. A subsequently installed mandatory Teddy route supersedes
+    // the pair scanner even when the target-neutral suffix candidate carried
+    // both portfolios.
+    let exact_pair_suffix_lowered = entry_contract == NativeDfaEntryContract::Public
+        && layout.mandatory_teddy.is_none()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some());
     Ok(Some(NativeLowering {
         code: emission.code,
         data,
@@ -21542,6 +21624,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
         synchronizing_accept_reverse_lowered,
+        exact_pair_suffix_lowered,
     }))
 }
 
@@ -22012,7 +22095,8 @@ fn retained_suffix_scanner_is_preserved(
     let (Some(emission), Some(suffix)) = (emission, suffix) else {
         return false;
     };
-    emission.vectorized
+    suffix.exact_pair_filter.is_none()
+        && emission.vectorized
         && emission.scan_offset == requirement.scan_offset
         && emission.membership == requirement.membership
         && suffix.minimum_width == requirement.minimum_width
@@ -22225,7 +22309,10 @@ fn selected_aarch64_sve_suffix_kind_with_policy(
     let sve_route_supported = layout.seeded_reverse.is_none()
         && layout
             .suffix_filter
-            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter));
+            .is_some_and(|suffix| {
+                suffix.exact_pair_filter.is_none()
+                    && aarch64_base_sve_filter_supported(suffix.filter)
+            });
     let isa = aarch64_primary_scanner_isa_with_policy(
         operating_system,
         features,
@@ -22638,6 +22725,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         architecture == Architecture::Aarch64,
         None,
         true,
+        true,
     )
 }
 
@@ -22672,6 +22760,26 @@ fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
     max_native_data_bytes: usize,
     allow_synchronizing_accept_reverse: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+        view,
+        target,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        true,
+    )
+}
+
+fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         view,
         target.architecture,
@@ -22681,6 +22789,7 @@ fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
         target.features.has(CpuFeature::Aarch64Asimd),
         Some(target),
         allow_synchronizing_accept_reverse,
+        allow_exact_pair,
     )
 }
 
@@ -22693,11 +22802,19 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     permit_asimd_candidate_mask: bool,
     ranking_target: Option<Target>,
     allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     // Seeded reverse currently has scalar and ASIMD AArch64 scanners, but no
     // SVE lowering. Preserve every pure or mixed SVE suffix incumbent until
     // that route has an independently measured seeded implementation.
     let permit_synchronizing_accept_reverse = allow_synchronizing_accept_reverse
+        && ranking_target.is_none_or(|target| {
+            target.architecture == Architecture::X86_64
+                || (target.features.has(CpuFeature::Aarch64Asimd)
+                    && !target.features.has(CpuFeature::Aarch64Sve))
+        });
+    let permit_exact_pair = allow_exact_pair
+        && view.output == OutputContract::Exists
         && ranking_target.is_none_or(|target| {
             target.architecture == Architecture::X86_64
                 || (target.features.has(CpuFeature::Aarch64Asimd)
@@ -22729,6 +22846,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
             permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         ) {
             Ok(Some(lowering)) => {
                 let cost = if let Some(target) = ranking_target {
@@ -22777,6 +22895,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
             permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         ) {
             Ok(Some(lowering)) => return Ok(lowering),
             Ok(None) => {}
@@ -22812,6 +22931,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         comparison_plan,
         permit_asimd_candidate_mask,
         permit_synchronizing_accept_reverse,
+        permit_exact_pair,
         ranking_target,
     )? {
         return Ok(lowering);
@@ -22844,6 +22964,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                     None,
                     permit_asimd_candidate_mask,
                     permit_synchronizing_accept_reverse,
+                    permit_exact_pair,
                 )
                 .and_then(|lowering| {
                     require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -22870,6 +22991,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                         Some(plan),
                         permit_asimd_candidate_mask,
                         permit_synchronizing_accept_reverse,
+                        permit_exact_pair,
                     )
                     .and_then(|lowering| {
                         require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -22980,6 +23102,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
         None,
         permit_asimd_candidate_mask,
         true,
+        true,
     )
 }
 
@@ -23014,6 +23137,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         None,
         architecture == Architecture::Aarch64,
         true,
+        true,
     )
 }
 
@@ -23036,6 +23160,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     hybrid_sparse: Option<&NativeHybridSparsePlan>,
     permit_asimd_candidate_mask: bool,
     permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if usize::from(default_exceptions.is_some())
@@ -23520,7 +23645,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         } else if let Some(requirement) = view.retained_suffix_requirement {
             derive_retained_terminal_suffix_filter(view, requirement)?
         } else {
-            derive_suffix_filter(view)?
+            derive_suffix_filter_with_exact_pair_policy(view, permit_exact_pair)?
         };
     let coalesced_start_filter = if view.retained_prefix_requirement.is_none()
         && ENABLE_NATIVE_COALESCED_INITIAL_FILTER
@@ -25625,13 +25750,22 @@ fn derive_start_filter(
 fn derive_suffix_filter(
     view: NativeProgramView<'_>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_suffix_filter_with_exact_pair_policy(view, true)
+}
+
+fn derive_suffix_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    permit_exact_pair: bool,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     if view.dfa.initial_pending {
         return Ok(None);
     }
-    let mut best = derive_terminal_suffix_filter(view)?;
+    let mut best = derive_terminal_suffix_filter_with_exact_pair_policy(view, permit_exact_pair)?;
     let mut best_is_terminal = best.is_some();
     for candidate in view.required_literals.interior().candidates() {
-        let Some(interior) = derive_interior_filter(view, candidate)? else {
+        let Some(interior) =
+            derive_interior_filter_with_exact_pair_policy(view, candidate, permit_exact_pair)?
+        else {
             continue;
         };
         let replace = best.is_none_or(|current| {
@@ -25708,7 +25842,7 @@ fn derive_retained_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
-        matching_exact_pair_filter(view.required_literals.suffix(), minimum_width),
+        None,
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -25868,6 +26002,13 @@ fn seeded_reverse_build_outcome(
 fn derive_terminal_suffix_filter(
     view: NativeProgramView<'_>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_terminal_suffix_filter_with_exact_pair_policy(view, true)
+}
+
+fn derive_terminal_suffix_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    permit_exact_pair: bool,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let suffix_sets = view.anchored_suffix.sets();
     if suffix_sets.is_empty() {
         return Ok(None);
@@ -25891,7 +26032,9 @@ fn derive_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
-        matching_exact_pair_filter(view.required_literals.suffix(), minimum_width),
+        permit_exact_pair
+            .then(|| matching_exact_pair_filter(view.required_literals.suffix(), minimum_width))
+            .flatten(),
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -25986,6 +26129,14 @@ fn derive_interior_filter(
     view: NativeProgramView<'_>,
     candidate: &RequiredInteriorCandidate,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_interior_filter_with_exact_pair_policy(view, candidate, true)
+}
+
+fn derive_interior_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    candidate: &RequiredInteriorCandidate,
+    permit_exact_pair: bool,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let forward_sets = aligned_sets_from_required_literals(candidate.literal_set())?;
     let minimum_width = u8::try_from(forward_sets.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("native interior-filter width"))?;
@@ -26038,10 +26189,9 @@ fn derive_interior_filter(
         vector_filter,
         scalar_filter,
         scalar_projection_dependent,
-        exact_pair_filter: matching_exact_pair_filter(
-            candidate.literal_set(),
-            minimum_width,
-        ),
+        exact_pair_filter: permit_exact_pair
+            .then(|| matching_exact_pair_filter(candidate.literal_set(), minimum_width))
+            .flatten(),
         teddy_portfolio: matching_mandatory_teddy_portfolio(
             candidate.literal_set(),
             minimum_width,
@@ -27704,6 +27854,7 @@ fn native_regex_redux_module(
         bit_parallel_endpoint_oracle_lowered: false,
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
@@ -39672,7 +39823,11 @@ fn lower_x86_64_dfa_with_entry_contract(
     // layout itself; accelerator accounting reads that receipt directly.
     // Retained fallback publication authenticates that correlated receipt
     // separately instead of fabricating a one-column scanner emission.
-    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+    let suffix_scanner = if layout.mandatory_teddy.is_some()
+        || layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
         None
     } else {
         layout
@@ -59976,6 +60131,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             "AArch64 fixed candidate retained a moving Teddy scanner",
         ));
     }
+    if sve_suffix_kind.is_some()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair suffix retained an SVE scanner receipt",
+        ));
+    }
     let mut assembler = Aarch64Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -61232,7 +61396,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     // Correlated Teddy is authenticated separately against the exact suffix
     // portfolio. Its split-nibble projection may contain false-positive bytes
     // and therefore must not masquerade as an exact one-column receipt.
-    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+    let suffix_scanner = if layout.mandatory_teddy.is_some()
+        || layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
         None
     } else {
         layout
@@ -73749,6 +73917,7 @@ mod tests {
             Some(&plan),
             architecture == Architecture::Aarch64,
             true,
+            true,
         )
     }
 
@@ -73831,6 +74000,7 @@ mod tests {
                 .prefix_filter
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         })
     }
 
@@ -74224,6 +74394,7 @@ mod tests {
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -74474,6 +74645,7 @@ mod tests {
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -74643,6 +74815,7 @@ mod tests {
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -74796,6 +74969,7 @@ mod tests {
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -75292,6 +75466,7 @@ mod tests {
             None,
             architecture == Architecture::Aarch64,
             true,
+            true,
         )
     }
 
@@ -75357,6 +75532,7 @@ mod tests {
             Some(plan),
             None,
             architecture == Architecture::Aarch64,
+            true,
             true,
         )
     }
@@ -81231,8 +81407,22 @@ mod tests {
         assert_eq!(suffix.filter.scan_offset, scan_offset);
         assert_eq!(start_filter_membership(suffix.filter).unwrap(), membership);
         assert!(
-            lower_native_dfa(view, target).unwrap().is_some(),
-            "an exact emitted receipt should publish the carried terminal primary"
+            suffix.exact_pair_filter.is_none(),
+            "a retained one-column receipt must never acquire pair semantics"
+        );
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+            view,
+            target,
+            NativeDfaEntryContract::Public,
+            usize::MAX,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("an exact emitted receipt should publish the carried terminal primary");
+        assert!(
+            !lowering.exact_pair_suffix_lowered,
+            "retained publication must keep the generic scanner receipt truthful"
         );
     }
 
@@ -95278,6 +95468,7 @@ int main(void){{
                 start_accelerator: StartAccelerator::None,
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -98946,6 +99137,7 @@ int main(void){{
                 None,
                 permit_asimd_candidate_mask,
                 true,
+                true,
             )
             .unwrap()
         };
@@ -99113,6 +99305,7 @@ int main(void){{
                     None,
                     permit_asimd_candidate_mask,
                     true,
+                    true,
                 )
                 .unwrap()
             };
@@ -99146,6 +99339,7 @@ int main(void){{
                 None,
                 permit_asimd_candidate_mask,
                 true,
+                true,
             )
             .unwrap();
             let comparison = derive_native_default_exception_plan(
@@ -99168,6 +99362,7 @@ int main(void){{
                     None,
                     None,
                     permit_asimd_candidate_mask,
+                    true,
                     true,
                 )
                 .ok()
@@ -102947,6 +103142,7 @@ int main(void){{
             None,
             false,
             false,
+            true,
         )
         .unwrap()
         .expect("direct exact-row candidate");
@@ -102961,6 +103157,7 @@ int main(void){{
             None,
             false,
             false,
+            true,
         )
         .unwrap()
         .expect("mapped exact-row candidate");
@@ -112216,6 +112413,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 bit_parallel_endpoint_oracle_lowered: false,
                 bit_parallel_exact_endpoint_lowered: false,
                 synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
                 ordered_nfa_terminal_exact_set_lowered: None,
@@ -112543,6 +112741,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             bit_parallel_endpoint_oracle_lowered: false,
             bit_parallel_exact_endpoint_lowered: false,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
             ordered_nfa_terminal_exact_set_lowered: None,
@@ -122127,11 +122326,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             initial,
             ObjectFormat::for_target(target),
             incumbent_object.len(),
-            || {
-                CompiledModule::lower_without_synchronizing_accept_reverse(
+            |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                     selected.program(),
                     target,
                     usize::MAX,
+                    allow_synchronizing_accept_reverse,
+                    allow_exact_pair,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -122169,11 +122370,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             initial,
             ObjectFormat::for_target(target),
             undersized_cap,
-            || {
-                CompiledModule::lower_without_synchronizing_accept_reverse(
+            |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
                     selected.program(),
                     target,
                     usize::MAX,
+                    allow_synchronizing_accept_reverse,
+                    allow_exact_pair,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -122220,6 +122423,209 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(
             constrained.module().required_runtime_symbols().count(),
             selected.module().required_runtime_symbols().count(),
+        );
+    }
+
+    #[test]
+    fn exact_pair_object_limit_restores_exact_incumbent() {
+        let target = Target::x86_64_linux();
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+        assert!(!selected.module().has_synchronizing_accept_reverse());
+
+        let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let incumbent_object =
+            emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert!(!incumbent.has_exact_pair_suffix());
+        assert!(incumbent_object.len() < selected.object().len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                ObjectFormat::for_target(target),
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(incumbent_object.len()) else {
+            panic!("exact incumbent object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert_eq!(object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(
+            &incumbent,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized exact-pair incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            incumbent_object
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = incumbent_object.len();
+        let constrained = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(!constrained.module().has_exact_pair_suffix());
+        assert_eq!(constrained.object(), incumbent_object);
+    }
+
+    #[test]
+    fn exact_pair_and_synchronizing_object_retries_are_compositional() {
+        let target = Target::x86_64_linux();
+        let pattern = r"(?:ee|f)*?(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+        assert!(selected.module().has_synchronizing_accept_reverse());
+
+        let pair_off = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let both_off = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pair_off.has_exact_pair_suffix());
+        assert!(pair_off.has_synchronizing_accept_reverse());
+        assert!(!both_off.has_exact_pair_suffix());
+        assert!(!both_off.has_synchronizing_accept_reverse());
+        let pair_off_object =
+            emit_object(&pair_off, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        let both_off_object =
+            emit_object(&both_off, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert!(pair_off_object.len() < selected.object().len());
+        assert!(both_off_object.len() < pair_off_object.len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            assert!(initial.has_synchronizing_accept_reverse());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                ObjectFormat::for_target(target),
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(pair_off_object.len()) else {
+            panic!("pair-off/sync-on object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert!(module.has_synchronizing_accept_reverse());
+        assert_eq!(object, pair_off_object);
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(both_off_object.len()) else {
+            panic!("pair-off/sync-off object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert!(!module.has_synchronizing_accept_reverse());
+        assert_eq!(object, both_off_object);
+
+        let undersized_cap = both_off_object.len() - 1;
+        let incumbent_error = emit_object(
+            &both_off,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized pair/sync incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            both_off_object
         );
     }
 
@@ -124137,6 +124543,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
@@ -128522,7 +128929,6 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         .with(CpuFeature::X86Avx512Bw),
                 )
                 .unwrap(),
-            Target::aarch64_linux(),
             Target::aarch64_linux()
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .unwrap(),
@@ -128537,7 +128943,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 )
                 .unwrap();
                 let view = compiled.program().native_dfa_view().unwrap();
-                let lowering = lower_native_dfa(view, target)
+                let lowering =
+                    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        usize::MAX,
+                        true,
+                        true,
+                    )
                     .unwrap()
                     .expect("exact-pair fixture must retain native lowering");
                 let (_, layout) = build_native_dfa_table_for_architecture(
@@ -128552,6 +128966,29 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 assert_eq!(pair.pairs(), expected, "{pattern:?}/{target:?}");
                 assert_eq!(suffix.minimum_width, 2);
                 assert_eq!(suffix.teddy_portfolio, None);
+                let generic_suffix_scanner = match target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa_with_emission(layout, target.features)
+                            .unwrap()
+                            .suffix_scanner
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                            layout,
+                            target.features,
+                            target.operating_system,
+                            None,
+                            None,
+                            NativeDfaEntryContract::Public,
+                        )
+                        .unwrap()
+                        .suffix_scanner
+                    }
+                };
+                assert!(
+                    generic_suffix_scanner.is_none(),
+                    "the exact-pair route must not publish a one-column scanner receipt"
+                );
                 assert_eq!(
                     matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary),
                     terminal_factor,
@@ -128571,14 +129008,22 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         );
                     }
                 }
-                let exactly_bounded = lower_native_dfa_with_data_limit(
-                    view,
-                    target,
-                    lowering.data.len(),
-                )
-                .unwrap()
-                .expect("the exact selected data cap remains sufficient");
+                let exactly_bounded =
+                    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        lowering.data.len(),
+                        true,
+                        true,
+                    )
+                    .unwrap()
+                    .expect("the exact selected data cap remains sufficient");
                 assert_eq!(exactly_bounded.data, lowering.data);
+                assert!(
+                    lowering.exact_pair_suffix_lowered,
+                    "explicit pair fixture must publish the compiler-only receipt: {pattern:?}/{target:?}"
+                );
                 match target.architecture {
                     Architecture::X86_64 => assert!(
                         lowering
@@ -128638,6 +129083,210 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 "full and three-of-four Cartesian projections must retain the incumbent route"
             );
         }
+    }
+
+    #[test]
+    fn exact_pair_policy_declines_preserve_incumbent_objects_and_sve_fails_closed() {
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let targets = [
+            Target::aarch64_linux(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux()
+                .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    asimd
+                        .with(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ];
+        for target in targets {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert!(
+                !compiled.module().has_exact_pair_suffix(),
+                "scheduler published a policy-disabled pair route: {target:?}"
+            );
+            let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap();
+            let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                false,
+            )
+            .unwrap();
+            assert!(!enabled.has_exact_pair_suffix(), "{target:?}");
+            assert_eq!(
+                emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                "SVE policy-off lowering must be the exact incumbent: {target:?}"
+            );
+            assert_eq!(enabled.start_accelerator(), incumbent.start_accelerator());
+            assert_eq!(
+                enabled.required_runtime_symbols().collect::<Vec<_>>(),
+                incumbent.required_runtime_symbols().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                enabled.required_prepare_capabilities(),
+                incumbent.required_prepare_capabilities()
+            );
+        }
+
+        let target = Target::x86_64_linux();
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .unwrap();
+            let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap();
+            let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                false,
+            )
+            .unwrap();
+            assert!(!enabled.has_exact_pair_suffix(), "{output:?}");
+            assert_eq!(
+                emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                "non-Exists pair policy must be byte-inert: {output:?}"
+            );
+        }
+
+        let fast = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(!fast.module().has_exact_pair_suffix());
+        let fast_incumbent = CompiledModule::lower(fast.program(), target).unwrap();
+        assert_eq!(
+            fast.object(),
+            emit_object(
+                &fast_incumbent,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap()
+        );
+
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let terminal = derive_terminal_suffix_filter(view)
+            .unwrap()
+            .expect("exact-pair terminal factor");
+        assert!(terminal.exact_pair_filter.is_some());
+        let requirement = NativeRetainedSuffixRequirement {
+            scan_offset: terminal.filter.scan_offset,
+            membership: start_filter_membership(terminal.filter).unwrap(),
+            minimum_width: terminal.minimum_width,
+        };
+        let retained_view = NativeProgramView {
+            retained_suffix_requirement: Some(requirement),
+            ..view
+        };
+        let (_, retained_layout) =
+            build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                retained_view,
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(
+            retained_layout
+                .suffix_filter
+                .is_some_and(|suffix| suffix.exact_pair_filter.is_none())
+        );
+        let retained_emission =
+            lower_x86_64_dfa_with_emission(retained_layout, target.features).unwrap();
+        assert!(retained_suffix_scanner_is_preserved(
+            retained_emission.suffix_scanner,
+            retained_layout.suffix_filter,
+            requirement,
+        ));
+        let retained_lowering =
+            lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                retained_view,
+                target,
+                NativeDfaEntryContract::Public,
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap()
+            .expect("retained exact scanner lowering");
+        assert!(!retained_lowering.exact_pair_suffix_lowered);
+
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::aarch64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let layout = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap()
+        .1;
+        assert!(
+            layout
+                .suffix_filter
+                .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+        );
+        assert!(matches!(
+            lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                sve,
+                OperatingSystem::Linux,
+                None,
+                Some(Aarch64SveFilterKind::Sve),
+                NativeDfaEntryContract::Public,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 exact-pair suffix retained an SVE scanner receipt"
+            ))
+        ));
     }
 
     #[cfg(all(
@@ -128755,9 +129404,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 )
                 .unwrap()
                 .1;
-                assert!(layout
-                    .suffix_filter
-                    .is_some_and(|suffix| suffix.exact_pair_filter.is_some()));
+                assert_eq!(
+                    layout
+                        .suffix_filter
+                        .is_some_and(|suffix| suffix.exact_pair_filter.is_some()),
+                    output == OutputContract::Exists,
+                );
+                assert_eq!(
+                    compiled.module().has_exact_pair_suffix(),
+                    output == OutputContract::Exists,
+                );
                 assert!(compiled.module().required_runtime_symbol().is_none());
                 let symbol = compiled.module().entry_symbol().to_owned();
                 writeln!(

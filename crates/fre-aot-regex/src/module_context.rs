@@ -3220,7 +3220,8 @@ fn try_lower_context_reverse_primary(
         needs_runtime: false,
         start_accelerator: StartAccelerator::None,
         anchored_prefix_filter_bytes: 0,
-        synchronizing_accept_reverse_lowered: false,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
     }))
 }
 
@@ -3608,6 +3609,7 @@ fn lower_native_context_impl(
             |search| Ok(search.guarded_bytes),
         )?,
         synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
     })
 }
 

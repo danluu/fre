@@ -306,6 +306,7 @@ fn lower_native_bit_parallel_layout(
             start_accelerator,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         matched_cursor: emission.matched_cursor,
     }))
