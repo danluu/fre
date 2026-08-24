@@ -14336,6 +14336,10 @@ const MAX_X86_PREFIX_RELATION_CONSTANTS: u8 = 8;
 const MAX_AARCH64_PREFIX_RELATION_CONSTANTS: u8 = 6;
 const MAX_X86_PREFIX_RELATION_INSTRUCTION_UNITS: u16 = 32;
 const MAX_AARCH64_PREFIX_RELATION_INSTRUCTION_UNITS: u16 = 24;
+/// Exact depth-two mandatory factors stay inline. Eight pairs cover the
+/// direct-comparison/vector-rectangle sweet spot while bounding code size and
+/// scalar-tail work independently of the source expression.
+const MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS: usize = 8;
 const MAX_NATIVE_PREFIX_PREDICATES: usize = MAX_ANCHORED_PREFIX_BYTES;
 const ENABLE_NATIVE_PREFIX_FAST_FORWARD: bool = true;
 
@@ -19684,6 +19688,10 @@ struct NativeSuffixFilter {
     /// independent product estimate could otherwise dominate a no-retry
     /// terminal candidate.
     scalar_projection_dependent: bool,
+    /// Exact correlation retained from a complete depth-two required-literal
+    /// set. When present, native suffix scanners use this relation instead of
+    /// the independent aligned-column projection above.
+    exact_pair_filter: Option<NativeExactPairFilter>,
     /// Correlated alternatives at this exact graph boundary. The portfolio is
     /// target-neutral and remains dormant unless target finalization installs
     /// one complete lookup-table plan beside the immutable DFA.
@@ -19859,6 +19867,25 @@ struct NativePrefixRelationVectorPlan {
     rectangle_count: u8,
     constant_count: u8,
     instruction_units: u16,
+}
+
+/// Complete graph-authenticated depth-two mandatory relation.
+///
+/// The vector form is admitted under the stricter budget shared by both
+/// native targets. The canonical little-endian pair list independently owns
+/// scalar tails, so no bitmap allocation or target data payload is required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactPairFilter {
+    vector_plan: NativePrefixRelationVectorPlan,
+    pairs: [u16; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS],
+    pair_count: u8,
+    candidate_frequency_upper_bound: u64,
+}
+
+impl NativeExactPairFilter {
+    fn pairs(&self) -> &[u16] {
+        &self.pairs[..usize::from(self.pair_count)]
+    }
 }
 
 const EMPTY_NATIVE_PREFIX_RELATION_PREDICATE: NativePrefixRelationPredicate =
@@ -24992,6 +25019,188 @@ fn derive_native_prefix_relation_vector(
     Some(plan)
 }
 
+/// Retain an exact two-byte relation from the already authenticated mandatory
+/// literal set. This derivation is allocation-free and all-or-nothing: any
+/// depth disagreement, pair/rectangle ceiling, target-common constant budget,
+/// or incomplete reconstruction declines to the pre-feature suffix layout.
+fn derive_native_exact_pair_filter(
+    literals: &RequiredLiteralSet,
+) -> Option<NativeExactPairFilter> {
+    if literals.depth() != 2 || literals.literals().len() < 2 {
+        return None;
+    }
+
+    let mut pairs = [0_u16; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut pair_count = 0_usize;
+    let mut first_words = [0_u64; 4];
+    let mut second_words = [0_u64; 4];
+    let mut candidate_frequency_upper_bound = 0_u64;
+    for literal in literals.literals() {
+        let [first, second] = literal.as_bytes() else {
+            return None;
+        };
+        let pair = u16::from(*first) | (u16::from(*second) << 8);
+        if pairs[..pair_count].contains(&pair) {
+            continue;
+        }
+        let slot = pairs.get_mut(pair_count)?;
+        *slot = pair;
+        pair_count = pair_count.checked_add(1)?;
+        let first_index = usize::from(*first);
+        let second_index = usize::from(*second);
+        first_words[first_index / 64] |= 1_u64 << (first_index % 64);
+        second_words[second_index / 64] |= 1_u64 << (second_index % 64);
+        candidate_frequency_upper_bound = candidate_frequency_upper_bound.checked_add(
+            u64::from(estimated_byte_frequency_units(*first))
+                .checked_mul(u64::from(estimated_byte_frequency_units(*second)))?,
+        )?;
+    }
+    if pair_count < 2 {
+        return None;
+    }
+    pairs[..pair_count].sort_unstable();
+
+    let first_cardinality = first_words.iter().map(|word| word.count_ones()).sum::<u32>();
+    let second_cardinality = second_words
+        .iter()
+        .map(|word| word.count_ones())
+        .sum::<u32>();
+    let independent_pairs = first_cardinality.checked_mul(second_cardinality)?;
+    let exact_pairs = u32::try_from(pair_count).ok()?;
+    if exact_pairs >= independent_pairs
+        || exact_pairs.checked_mul(4)? >= independent_pairs.checked_mul(3)?
+    {
+        return None;
+    }
+    let independent_first_frequency = (u8::MIN..=u8::MAX)
+        .filter(|byte| {
+            let index = usize::from(*byte);
+            first_words[index / 64] & (1_u64 << (index % 64)) != 0
+        })
+        .try_fold(0_u64, |sum, byte| {
+            sum.checked_add(u64::from(estimated_byte_frequency_units(byte)))
+        })?;
+    let independent_second_frequency = (u8::MIN..=u8::MAX)
+        .filter(|byte| {
+            let index = usize::from(*byte);
+            second_words[index / 64] & (1_u64 << (index % 64)) != 0
+        })
+        .try_fold(0_u64, |sum, byte| {
+            sum.checked_add(u64::from(estimated_byte_frequency_units(byte)))
+        })?;
+    let independent_frequency =
+        independent_first_frequency.checked_mul(independent_second_frequency)?;
+    if candidate_frequency_upper_bound.checked_mul(4)?
+        >= independent_frequency.checked_mul(3)?
+    {
+        return None;
+    }
+
+    // First build one exact second-byte row for every distinct first byte.
+    // Pair count bounds both fixed arrays, so this remains allocation-free.
+    let mut row_first = [0_u8; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut row_second = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut row_count = 0_usize;
+    for &pair in &pairs[..pair_count] {
+        let first = pair as u8;
+        let second = (pair >> 8) as u8;
+        let row = if let Some(index) = row_first[..row_count]
+            .iter()
+            .position(|candidate| *candidate == first)
+        {
+            index
+        } else {
+            let slot = row_first.get_mut(row_count)?;
+            *slot = first;
+            row_count = row_count.checked_add(1)?;
+            row_count.checked_sub(1)?
+        };
+        let second_index = usize::from(second);
+        row_second[row][second_index / 64] |= 1_u64 << (second_index % 64);
+    }
+
+    // Merge first-byte rows with identical second sets into disjoint exact
+    // rectangles, matching the canonical graph relation representation.
+    let mut group_first = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut group_second = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut group_count = 0_usize;
+    for row in 0..row_count {
+        let group = if let Some(index) = group_second[..group_count]
+            .iter()
+            .position(|candidate| *candidate == row_second[row])
+        {
+            index
+        } else {
+            let slot = group_second.get_mut(group_count)?;
+            *slot = row_second[row];
+            group_count = group_count.checked_add(1)?;
+            group_count.checked_sub(1)?
+        };
+        let first_index = usize::from(row_first[row]);
+        group_first[group][first_index / 64] |= 1_u64 << (first_index % 64);
+    }
+
+    let mut rectangles =
+        [EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE; MAX_NATIVE_PREFIX_RELATION_RECTANGLES];
+    let mut constant_count = 0_u8;
+    let mut instruction_units = 0_u16;
+    for index in 0..group_count {
+        let mut first = native_prefix_relation_predicate(
+            AnchoredByteSet::from_words(group_first[index]),
+            0,
+        )?;
+        let mut second = native_prefix_relation_predicate(
+            AnchoredByteSet::from_words(group_second[index]),
+            1,
+        )?;
+        for predicate in [&mut first, &mut second] {
+            if predicate.any {
+                continue;
+            }
+            predicate.first_constant = constant_count.checked_add(1)?;
+            constant_count = constant_count
+                .checked_add(u8::try_from(predicate.filter.constant_count()).ok()?)?;
+            instruction_units = instruction_units
+                .checked_add(vector_filter_instruction_units(predicate.filter))?
+                .checked_add(u16::from(predicate.negated))?;
+        }
+        if !first.any && !second.any {
+            instruction_units = instruction_units.checked_add(1)?;
+        }
+        if index != 0 {
+            instruction_units = instruction_units.checked_add(1)?;
+        }
+        rectangles[index] = NativePrefixRelationRectangle { first, second };
+    }
+    if constant_count > MAX_AARCH64_PREFIX_RELATION_CONSTANTS
+        || instruction_units > MAX_AARCH64_PREFIX_RELATION_INSTRUCTION_UNITS
+    {
+        return None;
+    }
+    let vector_plan = NativePrefixRelationVectorPlan {
+        rectangles,
+        rectangle_count: u8::try_from(group_count).ok()?,
+        constant_count,
+        instruction_units,
+    };
+    for first in u8::MIN..=u8::MAX {
+        for second in u8::MIN..=u8::MAX {
+            let pair = u16::from(first) | (u16::from(second) << 8);
+            if native_prefix_relation_vector_contains(vector_plan, first, second)
+                != pairs[..pair_count].binary_search(&pair).is_ok()
+            {
+                return None;
+            }
+        }
+    }
+    Some(NativeExactPairFilter {
+        vector_plan,
+        pairs,
+        pair_count: u8::try_from(pair_count).ok()?,
+        candidate_frequency_upper_bound,
+    })
+}
+
 fn append_native_prefix_relation(
     bytes: &mut Vec<u8>,
     relation: &PrefixRelation,
@@ -25499,6 +25708,7 @@ fn derive_retained_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        matching_exact_pair_filter(view.required_literals.suffix(), minimum_width),
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -25681,6 +25891,7 @@ fn derive_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        matching_exact_pair_filter(view.required_literals.suffix(), minimum_width),
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -25698,12 +25909,22 @@ fn matching_mandatory_teddy_portfolio(
         .flatten()
 }
 
+fn matching_exact_pair_filter(
+    literals: &RequiredLiteralSet,
+    minimum_width: u8,
+) -> Option<NativeExactPairFilter> {
+    (literals.depth() == usize::from(minimum_width))
+        .then(|| derive_native_exact_pair_filter(literals))
+        .flatten()
+}
+
 fn finish_terminal_suffix_filter(
     view: NativeProgramView<'_>,
     minimum_width: u8,
     filter: NativeStartFilter,
     vector_filter: Option<NativeVectorFilter>,
     scalar_filter: Option<NativeVectorFilter>,
+    exact_pair_filter: Option<NativeExactPairFilter>,
     teddy_portfolio: Option<MandatoryTeddyPortfolio>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let restart = if let Some(maximum_width) = view.max_match_width {
@@ -25751,6 +25972,7 @@ fn finish_terminal_suffix_filter(
         vector_filter,
         scalar_filter,
         scalar_projection_dependent: false,
+        exact_pair_filter,
         teddy_portfolio,
         minimum_width,
         restart,
@@ -25816,6 +26038,10 @@ fn derive_interior_filter(
         vector_filter,
         scalar_filter,
         scalar_projection_dependent,
+        exact_pair_filter: matching_exact_pair_filter(
+            candidate.literal_set(),
+            minimum_width,
+        ),
         teddy_portfolio: matching_mandatory_teddy_portfolio(
             candidate.literal_set(),
             minimum_width,
@@ -26026,27 +26252,32 @@ fn derive_unbounded_mandatory_restart(
 fn mandatory_filter_selection_key(
     filter: NativeSuffixFilter,
 ) -> (u64, bool, u64, (u16, u16, u16, u8, u8)) {
-    let mut probability = 1_u64;
-    // A retry-free interior factor whose exact retained tuples are dependent
-    // can make its scalar-column product look arbitrarily selective on
-    // repetitive input. Rank that proven shape by its primary hit rate so an
-    // independently safe terminal factor is not displaced by a false
-    // Cartesian estimate. Vector-refined and bounded-retry routes retain the
-    // established product model.
-    let refinement = if filter.scalar_projection_dependent {
-        None
+    let (mut probability, column_count) = if let Some(pair) = filter.exact_pair_filter {
+        (pair.candidate_frequency_upper_bound, 2)
     } else {
-        filter.vector_filter.or(filter.scalar_filter)
-    };
-    let column_count = if let Some(vector) = refinement {
-        for &column in vector.columns() {
-            probability =
-                probability.saturating_mul(u64::from(estimated_filter_frequency_units(column)));
-        }
-        vector.columns().len()
-    } else {
-        probability = u64::from(estimated_filter_frequency_units(filter.filter));
-        1
+        let mut probability = 1_u64;
+        // A retry-free interior factor whose exact retained tuples are
+        // dependent can make its scalar-column product look arbitrarily
+        // selective on repetitive input. Rank that proven shape by its
+        // primary hit rate so an independently safe terminal factor is not
+        // displaced by a false Cartesian estimate. Exact-pair, vector-refined
+        // and bounded-retry routes retain their established models.
+        let refinement = if filter.scalar_projection_dependent {
+            None
+        } else {
+            filter.vector_filter.or(filter.scalar_filter)
+        };
+        let column_count = if let Some(vector) = refinement {
+            for &column in vector.columns() {
+                probability = probability
+                    .saturating_mul(u64::from(estimated_filter_frequency_units(column)));
+            }
+            vector.columns().len()
+        } else {
+            probability = u64::from(estimated_filter_frequency_units(filter.filter));
+            1
+        };
+        (probability, column_count)
     };
     for _ in column_count..MAX_VECTOR_FILTER_COLUMNS {
         probability = probability.saturating_mul(u64::from(BYTE_FREQUENCY_DENOMINATOR));
@@ -36876,14 +37107,23 @@ fn x86_emit_seeded_reverse_prepass(
         ));
     }
 
-    let lazy_vector_filter = suffix.vector_filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_filter_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let exact_pair_filter = suffix.exact_pair_filter;
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_filter_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
-    let use_sparse_batch = x86_use_sparse_filter_mask_batch(filter, kind);
+    let use_sparse_batch =
+        exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(vector_filter) = lazy_vector_filter {
+        if let Some(pair_filter) = exact_pair_filter {
+            x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
             for &column in vector_filter.columns() {
                 x86_emit_start_filter_constants(assembler, column, kind, first_register)?;
@@ -36941,7 +37181,21 @@ fn x86_emit_seeded_reverse_prepass(
         assembler.branch(&[0x0f, 0x85], sparse_batch_hit)?;
     } else {
         for _ in 0..X86_MASK_BATCH_VECTORS {
-            x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+            if let Some(pair_filter) = exact_pair_filter {
+                x86_emit_prefix_relation_vector_test(
+                    assembler,
+                    pair_filter.vector_plan,
+                    kind,
+                )?;
+                assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            } else {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    filter,
+                    kind,
+                    vector_candidate_hit,
+                )?;
+            }
             assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
         }
     }
@@ -36960,28 +37214,37 @@ fn x86_emit_seeded_reverse_prepass(
             ))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
-    x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0x0f, 0x85], vector_hit)?;
+    } else {
+        x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    }
     assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(scalar)?;
     x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, finalize)?;
-    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
     } else {
-        candidate
-    };
-    for range in filter.ranges() {
-        assembler.instruction(&[0x3c, range.start])?;
-        if range.start == range.end {
-            assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+        x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch(&[0x0f, 0x82], next_range)?;
-            assembler.instruction(&[0x3c, range.end])?;
-            assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
-            assembler.bind(next_range)?;
+            candidate
+        };
+        for range in filter.ranges() {
+            assembler.instruction(&[0x3c, range.start])?;
+            if range.start == range.end {
+                assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch(&[0x0f, 0x82], next_range)?;
+                assembler.instruction(&[0x3c, range.end])?;
+                assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -37017,7 +37280,7 @@ fn x86_emit_seeded_reverse_prepass(
     }
 
     assembler.bind(vector_hit)?;
-    let vector_hit_mask = if lazy_vector_filter.is_some() {
+    let vector_hit_mask = if exact_pair_filter.is_some() || lazy_vector_filter.is_some() {
         X86CandidateMask::for_intersection(kind)
     } else {
         X86CandidateMask::for_filter(filter, kind)
@@ -37681,11 +37944,18 @@ fn x86_emit_suffix_prepass(
     // Every retained column is a graph-required aligned predicate. AVX-512
     // keeps their 64-lane intersection in k5, so the same proof used by the
     // SSE2/AVX2 lazy-secondary path applies without scalar refinement.
-    let lazy_vector_filter = suffix.vector_filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_scan_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
-    let use_sparse_batch = x86_use_sparse_filter_mask_batch(filter, kind);
+    let exact_pair_filter = suffix.exact_pair_filter;
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_scan_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
+    let use_sparse_batch =
+        exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
     // The initial suffix scan is exactly the baseline primary-only sparse
     // batch. Only a witnessed scalar secondary rejection after such a hit
     // changes CFG mode: subsequent complete groups use all retained columns.
@@ -37694,7 +37964,9 @@ fn x86_emit_suffix_prepass(
         .then_some(lazy_vector_filter)
         .flatten();
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(vector_filter) = lazy_vector_filter {
+        if let Some(pair_filter) = exact_pair_filter {
+            x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
             for &column in vector_filter.columns() {
                 x86_emit_start_filter_constants(assembler, column, kind, first_register)?;
@@ -37745,7 +38017,21 @@ fn x86_emit_suffix_prepass(
         assembler.branch(&[0x0f, 0x85], sparse_batch_hit)?;
     } else {
         for _ in 0..X86_MASK_BATCH_VECTORS {
-            x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+            if let Some(pair_filter) = exact_pair_filter {
+                x86_emit_prefix_relation_vector_test(
+                    assembler,
+                    pair_filter.vector_plan,
+                    kind,
+                )?;
+                assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            } else {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    filter,
+                    kind,
+                    vector_candidate_hit,
+                )?;
+            }
             assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
         }
     }
@@ -37769,28 +38055,37 @@ fn x86_emit_suffix_prepass(
         .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
-    x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0x0f, 0x85], vector_hit)?;
+    } else {
+        x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    }
     assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(scalar)?;
     x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
-    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
     } else {
-        apply
-    };
-    for range in filter.ranges() {
-        assembler.instruction(&[0x3c, range.start])?;
-        if range.start == range.end {
-            assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+        x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch(&[0x0f, 0x82], next_range)?;
-            assembler.instruction(&[0x3c, range.end])?;
-            assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
-            assembler.bind(next_range)?;
+            apply
+        };
+        for range in filter.ranges() {
+            assembler.instruction(&[0x3c, range.start])?;
+            if range.start == range.end {
+                assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch(&[0x0f, 0x82], next_range)?;
+                assembler.instruction(&[0x3c, range.end])?;
+                assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -37826,7 +38121,7 @@ fn x86_emit_suffix_prepass(
     }
 
     assembler.bind(vector_hit)?;
-    let vector_hit_mask = if lazy_vector_filter.is_some() {
+    let vector_hit_mask = if exact_pair_filter.is_some() || lazy_vector_filter.is_some() {
         X86CandidateMask::for_intersection(kind)
     } else {
         X86CandidateMask::for_filter(filter, kind)
@@ -37953,6 +38248,26 @@ fn x86_emit_prefix_relation(
     test.extend_from_slice(&relation.bitmap_offset.to_le_bytes());
     assembler.instruction(&test)?;
     assembler.branch(&[0x0f, 0x83], failed)?; // jnc
+    Ok(())
+}
+
+fn x86_emit_exact_pair_scalar_test(
+    assembler: &mut X86Assembler,
+    pair_filter: NativeExactPairFilter,
+    matched: X86Label,
+) -> Result<(), ObjectError> {
+    if pair_filter.pairs().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-pair scalar filter is empty",
+        ));
+    }
+    assembler.instruction(&[0x0f, 0xb7, 0x04, 0x17])?; // movzx eax, word [rdi+rdx]
+    for &pair in pair_filter.pairs() {
+        let [low, high] = pair.to_le_bytes();
+        let compare = [0x66, 0x3d, low, high]; // cmp ax, imm16
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x84], matched)?;
+    }
     Ok(())
 }
 
@@ -53893,6 +54208,29 @@ fn aarch64_emit_scalar_filter_membership(
     Ok(())
 }
 
+fn aarch64_emit_exact_pair_scalar_test(
+    assembler: &mut Aarch64Assembler,
+    pair_filter: NativeExactPairFilter,
+    matched: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if pair_filter.pairs().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair scalar filter is empty",
+        ));
+    }
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_load_halfword_imm(8, 12, 0)?)?;
+    for &pair in pair_filter.pairs() {
+        // X9 retains the immutable search-window start for OriginalStart and
+        // synchronizing suffix restarts. X12 is dead after the halfword load
+        // and is the ordinary scalar-filter scratch register.
+        assembler.instruction(aarch64_movz_w(12, pair)?)?;
+        assembler.instruction(aarch64_cmp_w(8, 12)?)?;
+        assembler.branch_cond(AARCH64_EQ, matched)?;
+    }
+    Ok(())
+}
+
 /// `AArch64` counterpart of the exact-product probe at the untouched window
 /// start. It explicitly validates the anchored column omitted from the normal
 /// prefix bitmap guard because no moving scanner has run yet.
@@ -59146,7 +59484,11 @@ fn aarch64_emit_suffix_prepass(
             matched,
         );
     }
-    let use_sve = sve_kind.is_some();
+    let exact_pair_filter = suffix.exact_pair_filter;
+    // The exact relation has an ASIMD lowering. Targets that also advertise
+    // SVE keep the complete ASIMD relation instead of reintroducing the
+    // independent-column projection in a second runtime branch.
+    let use_sve = sve_kind.is_some() && exact_pair_filter.is_none();
     let use_runtime_vl_dispatch = use_sve && use_asimd;
     if let Some(reverse) = layout.seeded_reverse {
         return module_seeded_reverse_aarch64::aarch64_emit_seeded_reverse_prepass(
@@ -59194,9 +59536,15 @@ fn aarch64_emit_suffix_prepass(
     };
     let retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
     let filter = suffix.filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_scan_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_scan_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
     if suffix.minimum_width == 0 {
         return Err(ObjectError::InvalidModule(
             "AArch64 suffix filter has zero minimum width",
@@ -59205,7 +59553,9 @@ fn aarch64_emit_suffix_prepass(
     let mut batch_first_candidates = None;
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
-            if let Some(vector_filter) = suffix.vector_filter {
+            if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            } else if let Some(vector_filter) = lazy_vector_filter {
                 let mut first_register = AARCH64_VECTOR_FILTER_FIRST_CONSTANT;
                 for &column in vector_filter.columns() {
                     aarch64_emit_start_filter_constants(assembler, column, first_register)?;
@@ -59307,20 +59657,26 @@ fn aarch64_emit_suffix_prepass(
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
             assembler.branch_cond(AARCH64_LO, single_vector)?;
-            let first_register = if suffix.vector_filter.is_some() {
-                AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+            let first_candidates = if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_batch_candidates(
+                    assembler,
+                    pair_filter.vector_plan,
+                )?
             } else {
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                let first_register = if lazy_vector_filter.is_some() {
+                    AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+                } else {
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                };
+                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?
             };
-            let first_candidates =
-                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?;
             batch_first_candidates = Some(first_candidates);
             aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
-                if suffix.vector_filter.is_some() {
+                if lazy_vector_filter.is_some() {
                     batch_primary_hit
-                } else if use_exact_asimd_lane {
+                } else if use_exact_asimd_lane || exact_pair_filter.is_some() {
                     batch_hit
                 } else {
                     scalar
@@ -59336,9 +59692,12 @@ fn aarch64_emit_suffix_prepass(
         )?;
         assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, scalar)?;
-        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-        assembler.instruction(aarch64_load_q(0, 12)?)?;
-        if suffix.vector_filter.is_some() {
+        if let Some(pair_filter) = exact_pair_filter {
+            aarch64_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan)?;
+            assembler.branch_cond(AARCH64_NE, single_hit)?;
+        } else if lazy_vector_filter.is_some() {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             aarch64_emit_start_filter_vector_candidates(
                 assembler,
                 filter,
@@ -59349,6 +59708,8 @@ fn aarch64_emit_suffix_prepass(
             aarch64_emit_candidate_any(assembler, 24)?;
             assembler.branch_cond(AARCH64_NE, single_primary_hit)?;
         } else {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             let first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT;
             aarch64_emit_start_filter_vector_candidates(assembler, filter, 0, 24, first_register)?;
             aarch64_emit_candidate_any(assembler, 24)?;
@@ -59364,7 +59725,7 @@ fn aarch64_emit_suffix_prepass(
         assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
         assembler.branch(vector)?;
 
-        if let Some(vector_filter) = suffix.vector_filter {
+        if let Some(vector_filter) = lazy_vector_filter {
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
                 aarch64_emit_vector_filter_secondary_batch(assembler, vector_filter)?;
@@ -59403,20 +59764,25 @@ fn aarch64_emit_suffix_prepass(
             assembler.branch(scalar)?;
         }
 
-        let selected = if suffix.vector_filter.is_some() || suffix.scalar_filter.is_none() {
+        let selected = if exact_pair_filter.is_some()
+            || lazy_vector_filter.is_some()
+            || suffix.scalar_filter.is_none()
+        {
             apply
         } else {
             scalar_columns
         };
         assembler.bind(batch_hit)?;
-        if use_exact_asimd_lane && let Some(first_candidates) = batch_first_candidates {
+        if (use_exact_asimd_lane || exact_pair_filter.is_some())
+            && let Some(first_candidates) = batch_first_candidates
+        {
             aarch64_emit_first_candidate_in_batch(assembler, first_candidates)?;
             assembler.branch(selected)?;
         } else {
             assembler.branch(scalar)?;
         }
         assembler.bind(single_hit)?;
-        if use_exact_asimd_lane {
+        if use_exact_asimd_lane || exact_pair_filter.is_some() {
             aarch64_emit_first_candidate_lane(assembler, 24)?;
             assembler.branch(selected)?;
         } else {
@@ -59453,22 +59819,26 @@ fn aarch64_emit_suffix_prepass(
 
     assembler.bind(scalar)?;
     aarch64_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
-    aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
     } else {
-        apply
-    };
-    for range in filter.ranges() {
-        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
-        if range.start == range.end {
-            assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+        aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch_cond(AARCH64_LO, next_range)?;
-            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
-            assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
-            assembler.bind(next_range)?;
+            apply
+        };
+        for range in filter.ranges() {
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+            if range.start == range.end {
+                assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch_cond(AARCH64_LO, next_range)?;
+                assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
+                assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
@@ -128126,6 +128496,360 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .is_some_and(|columns| columns.columns().len() >= 2),
             "expensive SIMD constants should retain a cold aligned scalar refinement"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact-pair receipt test owns graph correlation, target lowering, and resource invariants"
+    )]
+    fn exact_pair_suffix_filter_is_graph_exact_target_common_and_data_free() {
+        let terminal = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let interior = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)(?-u:[\x00-\xFF])*";
+        let expected = [
+            u16::from_le_bytes([b'q', b'!']),
+            u16::from_le_bytes([b'b', b'#']),
+            u16::from_le_bytes([b'a', b'@']),
+        ];
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+
+        for (pattern, terminal_factor) in [(terminal, true), (interior, false)] {
+            for target in targets {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Exists),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let lowering = lower_native_dfa(view, target)
+                    .unwrap()
+                    .expect("exact-pair fixture must retain native lowering");
+                let (_, layout) = build_native_dfa_table_for_architecture(
+                    view,
+                    target.architecture,
+                )
+                .unwrap();
+                let suffix = layout.suffix_filter.expect("exact mandatory factor");
+                let pair = suffix
+                    .exact_pair_filter
+                    .expect("non-Cartesian depth-two factor");
+                assert_eq!(pair.pairs(), expected, "{pattern:?}/{target:?}");
+                assert_eq!(suffix.minimum_width, 2);
+                assert_eq!(suffix.teddy_portfolio, None);
+                assert_eq!(
+                    matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary),
+                    terminal_factor,
+                    "candidate base must name the terminal or interior graph boundary"
+                );
+                for first in u8::MIN..=u8::MAX {
+                    for second in u8::MIN..=u8::MAX {
+                        let encoded = u16::from_le_bytes([first, second]);
+                        assert_eq!(
+                            native_prefix_relation_vector_contains(
+                                pair.vector_plan,
+                                first,
+                                second,
+                            ),
+                            expected.contains(&encoded),
+                            "relation byte order {first:#04x}/{second:#04x}"
+                        );
+                    }
+                }
+                let exactly_bounded = lower_native_dfa_with_data_limit(
+                    view,
+                    target,
+                    lowering.data.len(),
+                )
+                .unwrap()
+                .expect("the exact selected data cap remains sufficient");
+                assert_eq!(exactly_bounded.data, lowering.data);
+                match target.architecture {
+                    Architecture::X86_64 => assert!(
+                        lowering
+                            .code
+                            .windows(4)
+                            .any(|bytes| bytes == [0x0f, 0xb7, 0x04, 0x17]),
+                        "x86 scalar tail must read the chronological pair at base+0/base+1"
+                    ),
+                    Architecture::Aarch64 => {
+                        let halfword = aarch64_load_halfword_imm(8, 12, 0)
+                            .unwrap()
+                            .to_le_bytes();
+                        assert!(
+                            lowering
+                                .code
+                                .chunks_exact(4)
+                                .any(|bytes| bytes == halfword),
+                            "AArch64 scalar tail must read the chronological pair at base+0/base+1"
+                        );
+                        let mut scalar = Aarch64Assembler::new();
+                        let matched = scalar.label().unwrap();
+                        aarch64_emit_exact_pair_scalar_test(&mut scalar, pair, matched).unwrap();
+                        scalar.bind(matched).unwrap();
+                        let scalar = scalar.finish().unwrap();
+                        for expected_pair in expected {
+                            let safe = aarch64_movz_w(12, expected_pair).unwrap().to_le_bytes();
+                            let clobber = aarch64_movz_w(9, expected_pair).unwrap().to_le_bytes();
+                            assert!(scalar.chunks_exact(4).any(|bytes| bytes == safe));
+                            assert!(
+                                !scalar.chunks_exact(4).any(|bytes| bytes == clobber),
+                                "pair immediates must not clobber the X9 original-start anchor"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for declined in [
+            r"(?-u:[\x00-\xFF])*(?:a!|a@|q!|q@)",
+            r"(?-u:[\x00-\xFF])*(?:a!|a@|q!)",
+        ] {
+            let compiled = compile(
+                CompileRequest::new(declined, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            assert_eq!(derive_native_exact_pair_filter(view.required_literals.suffix()), None);
+            assert!(
+                build_native_dfa_table(view)
+                    .unwrap()
+                    .1
+                    .suffix_filter
+                    .is_some_and(|suffix| suffix.exact_pair_filter.is_none()),
+                "full and three-of-four Cartesian projections must retain the incumbent route"
+            );
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes exact terminal/interior pair scanners over every short window"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the host differential keeps machine-code objects, all short tails, and the portable oracle together"
+    )]
+    fn linked_host_exact_pair_suffix_all_short_windows_agrees_with_portable() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let base = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let target = if cfg!(target_arch = "x86_64") {
+            base.with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap()
+        } else {
+            base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
+        };
+        let patterns = [
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)(?-u:[\x00-\xFF])*",
+        ];
+        let mut tail_15 = vec![b'x'; 15];
+        tail_15[13..].copy_from_slice(b"q@");
+        let mut tail_16 = vec![b'x'; 16];
+        tail_16[14..].copy_from_slice(b"q!");
+        let mut offset_0 = vec![b'x'; 17];
+        offset_0[..2].copy_from_slice(b"b#");
+        let mut offset_1 = vec![b'x'; 17];
+        offset_1[1..3].copy_from_slice(b"a@");
+        let mut late = vec![b'x'; 17];
+        late[15..].copy_from_slice(b"q!");
+        let mut false_cartesian = Vec::new();
+        while false_cartesian.len() < 17 {
+            false_cartesian.extend_from_slice(b"q@a!b@");
+        }
+        false_cartesian.truncate(17);
+        let mut vector_end = vec![b'x'; 128];
+        vector_end[126..].copy_from_slice(b"q!");
+        let mut vector_boundary = vec![b'x'; 129];
+        for (offset, pair) in [(0, b"b#"), (15, b"a@"), (63, b"q!"), (127, b"a@")] {
+            vector_boundary[offset..offset + 2].copy_from_slice(pair);
+        }
+        let mut vector_decoys = Vec::new();
+        while vector_decoys.len() < 129 {
+            vector_decoys.extend_from_slice(b"q@a!b@");
+        }
+        vector_decoys.truncate(129);
+        let haystacks = [
+            b"q".to_vec(),
+            tail_15,
+            tail_16,
+            offset_0,
+            offset_1,
+            late,
+            false_cartesian,
+            vector_end,
+            vector_boundary,
+            vector_decoys,
+        ];
+        assert_eq!(haystacks.iter().map(Vec::len).collect::<Vec<_>>(), [1, 15, 16, 17, 17, 17, 17, 128, 129, 129]);
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-exact-pair-short-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") { "x86" } else { "arm" }
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut source =
+            String::from("#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n");
+        for (index, haystack) in haystacks.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{index}[]={{{bytes}}};").unwrap();
+        }
+        let mut objects = Vec::new();
+        let mut programs = Vec::new();
+        let mut symbols = Vec::new();
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            for (output_index, output) in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let compiled = compile(
+                    CompileRequest::new(*pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let layout = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().unwrap(),
+                    target.architecture,
+                )
+                .unwrap()
+                .1;
+                assert!(layout
+                    .suffix_filter
+                    .is_some_and(|suffix| suffix.exact_pair_filter.is_some()));
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                let symbol = compiled.module().entry_symbol().to_owned();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+                )
+                .unwrap();
+                let object = directory.join(format!("pair-{pattern_index}-{output_index}.o"));
+                fs::write(&object, compiled.object()).unwrap();
+                objects.push(object);
+                programs.push(compiled);
+                symbols.push(symbol);
+            }
+        }
+
+        source.push_str("int main(void){size_t r[2];uint32_t s;\n");
+        let mut failure = 10_usize;
+        for (program_index, (program, symbol)) in programs.iter().zip(&symbols).enumerate() {
+            for (haystack_index, haystack) in haystacks.iter().enumerate() {
+                let mut windows = Vec::new();
+                if haystack.len() <= 17 {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            windows.push((start, end));
+                        }
+                    }
+                } else {
+                    windows.extend([
+                        (0, haystack.len()),
+                        (0, 127.min(haystack.len())),
+                        (1, haystack.len()),
+                        (14, haystack.len()),
+                        (15, haystack.len()),
+                        (16, haystack.len()),
+                        (62, haystack.len()),
+                        (63, haystack.len()),
+                        (64, haystack.len()),
+                        (126, haystack.len()),
+                        (127, haystack.len()),
+                        (haystack.len(), haystack.len()),
+                    ]);
+                    windows.sort_unstable();
+                    windows.dedup();
+                }
+                for (start, end) in windows {
+                    let expected = program
+                        .search(haystack, SearchWindow::new(start, end))
+                        .unwrap();
+                    let (status, result_start, result_end) = match expected {
+                        MatchResult::Exists(found) => (u8::from(found), 0, 0),
+                        MatchResult::SelectedEnd(Some(end)) => (1, end, end),
+                        MatchResult::Span(Some((start, end))) => (1, start, end),
+                        MatchResult::SelectedEnd(None) | MatchResult::Span(None) => (0, 0, 0),
+                    };
+                    writeln!(
+                        source,
+                        "r[0]=99;r[1]=99;s={symbol}(h{haystack_index},{},{start},{end},r);if(s!={status}||r[0]!={result_start}||r[1]!={result_end}){{fprintf(stderr,\"failure={failure} program={program_index} haystack={haystack_index} window={start}..{end} expected=%u/%zu/%zu got=%u/%zu/%zu\\n\",(unsigned){status},(size_t){result_start},(size_t){result_end},(unsigned)s,r[0],r[1]);return 1;}}",
+                        haystack.len(),
+                    )
+                    .unwrap();
+                    failure += 1;
+                }
+            }
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("pair.c");
+        let executable = directory.join("pair");
+        fs::write(&c_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let output = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

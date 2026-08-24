@@ -118,17 +118,25 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             "AArch64 seeded reverse selected an ASIMD batch on a scalar target",
         ));
     }
-    let lazy_vector_filter = suffix.vector_filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_filter_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let exact_pair_filter = suffix.exact_pair_filter;
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_filter_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
     let proven_exists = reverse.proves_match && layout.output == OutputContract::Exists;
     // An Accept seed starts at base + minimum_width. Requiring the last byte
     // before that boundary to be in-bounds makes every reverse load safe.
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
-            if let Some(vector_filter) = lazy_vector_filter {
+            if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            } else if let Some(vector_filter) = lazy_vector_filter {
                 let mut first_register = AARCH64_VECTOR_FILTER_FIRST_CONSTANT;
                 for &column in vector_filter.columns() {
                     aarch64_emit_start_filter_constants(assembler, column, first_register)?;
@@ -182,20 +190,26 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
             assembler.branch_cond(AARCH64_LO, single_vector)?;
-            let first_register = if lazy_vector_filter.is_some() {
-                AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+            let first_candidates = if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_batch_candidates(
+                    assembler,
+                    pair_filter.vector_plan,
+                )?
             } else {
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                let first_register = if lazy_vector_filter.is_some() {
+                    AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+                } else {
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                };
+                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?
             };
-            let first_candidates =
-                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?;
             batch_first_candidates = Some(first_candidates);
             aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
                 if lazy_vector_filter.is_some() {
                     batch_primary_hit
-                } else if use_exact_asimd_lane {
+                } else if use_exact_asimd_lane || exact_pair_filter.is_some() {
                     batch_hit
                 } else {
                     scalar
@@ -211,9 +225,12 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         )?;
         assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, scalar)?;
-        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-        assembler.instruction(aarch64_load_q(0, 12)?)?;
-        if lazy_vector_filter.is_some() {
+        if let Some(pair_filter) = exact_pair_filter {
+            aarch64_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan)?;
+            assembler.branch_cond(AARCH64_NE, single_hit)?;
+        } else if lazy_vector_filter.is_some() {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             aarch64_emit_start_filter_vector_candidates(
                 assembler,
                 filter,
@@ -224,6 +241,8 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             aarch64_emit_candidate_any(assembler, 24)?;
             assembler.branch_cond(AARCH64_NE, single_primary_hit)?;
         } else {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             aarch64_emit_start_filter_vector_candidates(
                 assembler,
                 filter,
@@ -283,20 +302,25 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             assembler.branch(scalar)?;
         }
 
-        let selected = if lazy_vector_filter.is_some() || suffix.scalar_filter.is_none() {
+        let selected = if exact_pair_filter.is_some()
+            || lazy_vector_filter.is_some()
+            || suffix.scalar_filter.is_none()
+        {
             candidate
         } else {
             scalar_columns
         };
         assembler.bind(batch_hit)?;
-        if use_exact_asimd_lane && let Some(first_candidates) = batch_first_candidates {
+        if (use_exact_asimd_lane || exact_pair_filter.is_some())
+            && let Some(first_candidates) = batch_first_candidates
+        {
             aarch64_emit_first_candidate_in_batch(assembler, first_candidates)?;
             assembler.branch(selected)?;
         } else {
             assembler.branch(scalar)?;
         }
         assembler.bind(single_hit)?;
-        if use_exact_asimd_lane {
+        if use_exact_asimd_lane || exact_pair_filter.is_some() {
             aarch64_emit_first_candidate_lane(assembler, 24)?;
             assembler.branch(selected)?;
         } else {
@@ -324,22 +348,26 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         maximum_scan_offset,
         if proven_exists { no_match } else { finalize },
     )?;
-    aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
     } else {
-        candidate
-    };
-    for range in filter.ranges() {
-        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
-        if range.start == range.end {
-            assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+        aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch_cond(AARCH64_LO, next_range)?;
-            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
-            assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
-            assembler.bind(next_range)?;
+            candidate
+        };
+        for range in filter.ranges() {
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+            if range.start == range.end {
+                assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch_cond(AARCH64_LO, next_range)?;
+                assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
+                assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
@@ -490,6 +518,7 @@ mod tests {
             vector_filter: None,
             scalar_filter: None,
             scalar_projection_dependent: false,
+            exact_pair_filter: None,
             teddy_portfolio: None,
             minimum_width: 1,
             restart,
