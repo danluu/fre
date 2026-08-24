@@ -216,6 +216,12 @@ const ROOT_RUN_WINDOW_BYTES: usize = 64;
 // DFA row and source position into the complete warm executor, so neither
 // scanner nor transition work is repeated when the prefix is inconclusive.
 const WARM_EXISTS_INLINE_BYTES: usize = BYTE_SET_BLOCK_BYTES;
+// A fully warmed Span can use the prepared small-byte scanner without a work
+// ledger over the same structural compact band already bounded by two
+// classifier blocks and the reverse-loop admission floor. Within this band,
+// scanner plus forward/reverse progress cannot approach `u64` overflow, while
+// longer searches retain the adaptive scanner's accounting and probe policy.
+const WARM_COMPACT_SPAN_MIN_WINDOW_BYTES: usize = BYTE_SET_BLOCK_BYTES * 2 - 1;
 // Contextual value projection is worthwhile only on windows large enough to
 // amortize its immutable cache probes. A first unpublished contextual record
 // hands its exact invocation-local frontier to the mutable executor, so there
@@ -19530,6 +19536,55 @@ fn complete_warm_direct_span(
     Ok(WarmDirectSpan::Complete(found))
 }
 
+#[inline(never)]
+fn next_unmetered_small_warm_span_candidate(
+    scanner: &StartPositionScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+) -> Result<usize, SearchError> {
+    let scanner_offset = usize::from(scanner.offset);
+    let scan_start =
+        position
+            .checked_add(scanner_offset)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compact warm Span scanner position",
+            })?;
+    if scan_start >= end {
+        return Ok(end);
+    }
+    let remaining = haystack
+        .get(scan_start..end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "compact warm Span scanner exceeded its window",
+        })?;
+    let relative = match scanner.scanner {
+        StartScanner::One(byte) => memchr(byte, remaining),
+        StartScanner::Two(first, second) => memchr2(first, second, remaining),
+        StartScanner::Three(first, second, third) => memchr3(first, second, third, remaining),
+        _ => {
+            return Err(SearchError::InternalInvariant {
+                detail: "compact warm Span received a non-small scanner",
+            });
+        }
+    };
+    let scan_position = relative.map_or(Ok(end), |relative| {
+        scan_start
+            .checked_add(relative)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compact warm Span scanner candidate",
+            })
+    })?;
+    if scan_position == end {
+        return Ok(end);
+    }
+    scan_position
+        .checked_sub(scanner_offset)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "compact warm Span scanner matched before its exact offset",
+        })
+}
+
 /// Read one complete assertion-free Span through already-filled direct rows.
 ///
 /// The forward half selects the same endpoint as the ordinary ordered loop
@@ -19623,6 +19678,17 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     let mut pending_start = initial_pending.then_some(window.start());
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut engine_candidate = None;
+    let window_bytes = window.end().saturating_sub(window.start());
+    let compact_small_scanner = (WARM_COMPACT_SPAN_MIN_WINDOW_BYTES..REVERSE_LOOP_SKIP_MIN_BYTES)
+        .contains(&window_bytes)
+        && proof.guard().is_none()
+        && proof.probe().is_none()
+        && proof.scanner.as_ref().is_some_and(|scanner| {
+            matches!(
+                scanner.scanner,
+                StartScanner::One(_) | StartScanner::Two(_, _) | StartScanner::Three(_, _, _)
+            )
+        });
 
     let (selected_end, selected_start) = loop {
         if pending_end.is_none() && state == initial_row && active_start == Some(position) {
@@ -19642,17 +19708,30 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
                 } else {
                     engine_candidate = None;
                 }
-                position = next_start_candidate_adaptive(
-                    scanner,
-                    haystack,
-                    position,
-                    window.end(),
-                    proof.guard(),
-                    proof.probe(),
-                    &mut meter,
-                    retained_start_mask,
-                    &mut adaptive_probe,
-                )?;
+                position = if compact_small_scanner {
+                    // The compact band bounds omitted scanner work well below
+                    // `u64` overflow. Small-byte scanners do not retain a
+                    // classifier cursor, so iterator-owned source state is
+                    // unchanged as well.
+                    next_unmetered_small_warm_span_candidate(
+                        scanner,
+                        haystack,
+                        position,
+                        window.end(),
+                    )?
+                } else {
+                    next_start_candidate_adaptive(
+                        scanner,
+                        haystack,
+                        position,
+                        window.end(),
+                        proof.guard(),
+                        proof.probe(),
+                        &mut meter,
+                        retained_start_mask,
+                        &mut adaptive_probe,
+                    )?
+                };
                 if position == window.end() {
                     return complete_warm_direct_span(
                         lazy,
