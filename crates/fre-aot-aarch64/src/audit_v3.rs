@@ -1389,7 +1389,7 @@ fn audit_impl_v3(
                 ),
             )
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::PeriodicRun {
-            (1, 1, 0)
+            (1, 1, 1)
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::SparseRareColumns
             && literal_len == 5
             && audit_recipe.tuning_class == CountV3TuningClass::AppleMSeries
@@ -5910,9 +5910,9 @@ fn policy_multi_specialized_v3(
     branch_v3(policy, scalar_loop)
 }
 
-/// Independent policy for the compact periodic NEON graph. Unlike the generic
-/// sparse policy, no one-column absence classifier is permitted: all selected
-/// period columns contribute to the candidate mask before lane recovery.
+/// Independent policy for the compact periodic NEON graph. One-column absence
+/// may skip the second load stream, but every surviving batch must intersect
+/// all selected period columns before lane recovery.
 #[allow(
     clippy::too_many_lines,
     reason = "the independent periodic mask and successor graph is intentionally explicit"
@@ -5930,6 +5930,7 @@ fn policy_periodic_neon_v3(
         return Err(invalid_v3("invalid periodic NEON policy stride"));
     }
     let wide = policy.new_label(LabelKindV3::VectorLoop)?;
+    let wide_empty = policy.new_label(LabelKindV3::Internal)?;
     let wide_hit = policy.new_label(LabelKindV3::Internal)?;
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
@@ -6035,10 +6036,9 @@ fn policy_periodic_neon_v3(
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
     add_immediate64_v3(policy, X9, X15, u16::from(filter.offsets[1]))?;
-    for (group, (first_base, second_base)) in [(X8, X9), (X16, X5)].into_iter().enumerate() {
+    for (group, first_base) in [X8, X16].into_iter().enumerate() {
         if group != 0 {
             add_immediate64_v3(policy, first_base, X8, 64)?;
-            add_immediate64_v3(policy, second_base, X9, 64)?;
         }
         let mask_base =
             SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
@@ -6059,6 +6059,48 @@ fn policy_periodic_neon_v3(
                 },
             )?;
         }
+    }
+    for (destination, left, right) in [
+        (0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1),
+        (1, SPARSE_BLOCK_MASK_BASE_V3 + 2, SPARSE_BLOCK_MASK_BASE_V3 + 3),
+        (0, 0, 1),
+        (1, SPARSE_BLOCK_MASK_BASE_V3 + 4, SPARSE_BLOCK_MASK_BASE_V3 + 5),
+        (2, SPARSE_BLOCK_MASK_BASE_V3 + 6, SPARSE_BLOCK_MASK_BASE_V3 + 7),
+        (1, 1, 2),
+        (0, 0, 1),
+    ] {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination,
+                left,
+                right,
+            },
+        )?;
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+            destination: 0,
+            source: 0,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::MoveVectorByteTo32 {
+            destination: X6,
+            source: 0,
+        },
+    )?;
+    compare_immediate64_v3(policy, X6, 0)?;
+    condition_v3(policy, ConditionV3::Equal, wide_empty)?;
+
+    for (group, second_base) in [X9, X5].into_iter().enumerate() {
+        if group != 0 {
+            add_immediate64_v3(policy, second_base, X9, 64)?;
+        }
+        let mask_base =
+            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
         exact_v3(
             policy,
             DecodedInstructionV3::LoadVectors4x128 {
@@ -6157,6 +6199,7 @@ fn policy_periodic_neon_v3(
     )?;
     compare_immediate64_v3(policy, X8, 0)?;
     condition_v3(policy, ConditionV3::NotEqual, wide_hit)?;
+    policy.bind(wide_empty)?;
     add_immediate64_v3(policy, X3, X3, SPARSE_SCAN_STARTS_V3)?;
     branch_v3(policy, wide)?;
 
