@@ -108,9 +108,11 @@ enum CompactPreflight {
 /// that state. Nonterminal states strictly deeper than the maximum pairwise
 /// LCP have one literal transition and can use Aho's `KIND_ONE`
 /// representation; terminal match states have zero literal transitions.
-/// Equal patterns, or pairs equal through the bounded probe, conservatively
-/// retain the legacy maximum. The stable radix pass sorts only stack-local
-/// source indices, so construction input and its priority stay intact.
+/// Equal patterns, pairs equal through the bounded probe, and source orders
+/// with an inversion conservatively retain the legacy maximum. For an
+/// already-sorted source, the deepest pairwise LCP is witnessed by adjacent
+/// patterns, so one bounded pass finds the exact depth without copying or
+/// sorting construction input.
 fn deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> Option<usize> {
     debug_assert!(patterns.iter().all(|pattern| pattern.len() == width));
     let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
@@ -121,64 +123,22 @@ fn deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> Option<usize>
         return None;
     }
 
-    let pattern_count = patterns.len();
-    let mut order = [0_usize; MAX_PATTERNS];
-    let mut scratch = [0_usize; MAX_PATTERNS];
-    for (index, slot) in order.get_mut(..pattern_count)?.iter_mut().enumerate() {
-        *slot = index;
-    }
-
-    // Stable LSD counting passes put equal bounded prefixes next to each
-    // other. Alternating the fixed arrays avoids copying either the patterns
-    // or one complete order after every byte.
-    let mut counters = [0_usize; ALPHABET_LEN];
-    let mut order_is_source = true;
-    for byte_index in (0..probe_depth).rev() {
-        let (source, target): (&[usize], &mut [usize]) = if order_is_source {
-            (&order[..pattern_count], &mut scratch[..pattern_count])
-        } else {
-            (&scratch[..pattern_count], &mut order[..pattern_count])
-        };
-        debug_assert!(counters.iter().all(|&count| count == 0));
-        for &pattern_index in source {
-            let byte = usize::from(*patterns.get(pattern_index)?.get(byte_index)?);
-            counters[byte] = counters[byte].checked_add(1)?;
-        }
-        let mut next = 0_usize;
-        for count in &mut counters {
-            let bucket_len = *count;
-            *count = next;
-            next = next.checked_add(bucket_len)?;
-        }
-        if next != pattern_count {
-            return None;
-        }
-        for &pattern_index in source {
-            let byte = usize::from(*patterns.get(pattern_index)?.get(byte_index)?);
-            let slot = counters[byte];
-            *target.get_mut(slot)? = pattern_index;
-            counters[byte] = slot.checked_add(1)?;
-        }
-        if byte_index != 0 {
-            counters.fill(0);
-        }
-        order_is_source = !order_is_source;
-    }
-
-    let sorted = if order_is_source {
-        &order[..pattern_count]
-    } else {
-        &scratch[..pattern_count]
-    };
     let mut deepest = 0_usize;
-    for adjacent in sorted.windows(2) {
-        let left = patterns.get(adjacent[0])?.get(..probe_depth)?;
-        let right = patterns.get(adjacent[1])?.get(..probe_depth)?;
-        let lcp = left
-            .iter()
-            .zip(right)
-            .take_while(|(left, right)| left == right)
-            .count();
+    for adjacent in patterns.windows(2) {
+        let left = adjacent[0].get(..probe_depth)?;
+        let right = adjacent[1].get(..probe_depth)?;
+        let mut lcp = 0_usize;
+        while lcp < probe_depth {
+            let left_byte = *left.get(lcp)?;
+            let right_byte = *right.get(lcp)?;
+            if left_byte < right_byte {
+                break;
+            }
+            if left_byte > right_byte {
+                return Some(probe_depth);
+            }
+            lcp = lcp.checked_add(1)?;
+        }
         deepest = deepest.max(lcp);
         if deepest == probe_depth {
             return Some(probe_depth);
@@ -192,22 +152,12 @@ fn deepest_branch_build_work_upper_bound(patterns: usize, width: usize) -> Optio
         return None;
     }
     let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
-    // Cover zero-initialization of both fixed index arrays plus the active
-    // source-index sequence. Each stable byte pass initializes and prefixes
-    // all counters, then counts and places every active index. Finally, every
-    // adjacent bounded prefix can require `probe_depth` byte comparisons plus
-    // one unit for window formation and maximum bookkeeping.
-    let index_initialization = MAX_PATTERNS.checked_mul(2)?.checked_add(patterns)?;
-    let counter_work_per_byte = ALPHABET_LEN.checked_mul(2)?;
-    let index_work_per_byte = patterns.checked_mul(2)?;
-    let radix_work =
-        probe_depth.checked_mul(counter_work_per_byte.checked_add(index_work_per_byte)?)?;
-    let adjacent_work = patterns
+    // Every adjacent bounded prefix can require `probe_depth` byte comparisons
+    // plus one unit for pair formation, order selection and maximum
+    // bookkeeping.
+    patterns
         .saturating_sub(1)
-        .checked_mul(probe_depth.checked_add(1)?)?;
-    index_initialization
-        .checked_add(radix_work)?
-        .checked_add(adjacent_work)
+        .checked_mul(probe_depth.checked_add(1)?)
 }
 
 fn compact_preflight(
@@ -232,7 +182,7 @@ fn compact_preflight(
     // Contiguous conversion writes every encoded transition and then remaps
     // every encoded state ID in a second pass. Charge those two complete cell
     // traversals, state-map and pattern-vector setup, and the complete bounded
-    // radix-selector charge. Together with the canonical receipt this also
+    // topology-selector charge. Together with the canonical receipt this also
     // covers a complete compact attempt followed by same-shared-NFA canonical
     // fallback.
     let Some(compact_build_work) = canonical_build
@@ -252,7 +202,7 @@ fn compact_preflight(
         return Ok(CompactPreflight::Canonical(canonical_build));
     };
     // Retain the established three-owner envelope. It conservatively covers
-    // both the dual owner and the ordinary policy's radix construction:
+    // both the dual owner and the ordinary policy's topology selection:
     // shared+compact followed, on refusal, by shared+canonical.
     let Some(dense_states_upper_bound) = canonical_build
         .patterns
@@ -861,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn radix_deepest_branch_matches_pairwise_oracle_across_seeded_orders() {
+    fn sorted_gate_matches_pairwise_oracle_and_unsorted_input_retains_legacy_depth() {
         fn next(seed: &mut u64) -> u64 {
             *seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -902,25 +852,77 @@ mod tests {
                 patterns[pattern_count - 1] = patterns[0].clone();
             }
 
-            {
-                let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                assert_eq!(
-                    deepest_branch_dense_depth(&borrowed, width),
-                    Some(brute_deepest_branch_dense_depth(&borrowed, width)),
-                    "source order, case={case}",
-                );
-            }
+            let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
+            patterns.sort_by(|left, right| left[..probe_depth].cmp(&right[..probe_depth]));
+            let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            assert_eq!(
+                deepest_branch_dense_depth(&borrowed, width),
+                Some(brute_deepest_branch_dense_depth(&borrowed, width)),
+                "sorted source order, case={case}",
+            );
             for end in (1..pattern_count).rev() {
                 let other = below(&mut seed, end + 1);
                 patterns.swap(end, other);
             }
             let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let nondecreasing = borrowed
+                .windows(2)
+                .all(|pair| pair[0][..probe_depth] <= pair[1][..probe_depth]);
+            let expected = if nondecreasing {
+                brute_deepest_branch_dense_depth(&borrowed, width)
+            } else {
+                probe_depth
+            };
             assert_eq!(
                 deepest_branch_dense_depth(&borrowed, width),
-                Some(brute_deepest_branch_dense_depth(&borrowed, width)),
+                Some(expected),
                 "permuted order, case={case}",
             );
         }
+    }
+
+    #[test]
+    fn source_order_gate_covers_sorted_inverted_and_equal_prefixes() {
+        fn patterns(values: &[u16]) -> Vec<Vec<u8>> {
+            values
+                .iter()
+                .map(|&value| {
+                    let mut pattern = vec![b'q'; MIN_PATTERN_BYTES];
+                    pattern[MAX_DENSE_DEPTH - 1] = u8::try_from(value).unwrap();
+                    pattern
+                })
+                .collect()
+        }
+
+        let sorted = patterns(&(0_u16..256).collect::<Vec<_>>());
+        let borrowed = sorted.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(23),
+        );
+
+        let reverse = patterns(&(0_u16..256).rev().collect::<Vec<_>>());
+        let borrowed = reverse.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
+
+        let mut late_values = (0_u16..254).collect::<Vec<_>>();
+        late_values.extend([255, 254]);
+        let late = patterns(&late_values);
+        let borrowed = late.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
+
+        let equal = vec![vec![b'a'; MIN_PATTERN_BYTES]; MAX_PATTERNS];
+        let borrowed = equal.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
     }
 
     #[test]
@@ -968,15 +970,12 @@ mod tests {
     }
 
     #[test]
-    fn radix_selector_work_bound_covers_fixed_and_active_operations() {
+    fn source_order_probe_work_bound_covers_every_adjacent_prefix() {
         assert_eq!(
             deepest_branch_build_work_upper_bound(MAX_PATTERNS, MIN_PATTERN_BYTES),
-            Some(31_719),
+            Some(6_375),
         );
-        assert_eq!(
-            deepest_branch_build_work_upper_bound(129, 254),
-            Some(22_321),
-        );
+        assert_eq!(deepest_branch_build_work_upper_bound(129, 254), Some(3_200),);
         assert_eq!(
             deepest_branch_build_work_upper_bound(MAX_PATTERNS + 1, MIN_PATTERN_BYTES),
             None,
@@ -999,7 +998,7 @@ mod tests {
         assert_eq!(dense_depth, 9);
         assert_eq!(
             deepest_branch_build_work_upper_bound(MAX_PATTERNS, width),
-            Some(31_719),
+            Some(6_375),
         );
         let dense_states = canonical_build.patterns * width.min(MAX_DENSE_DEPTH) + 1;
         let expected = canonical_build.build_bytes_upper_bound
@@ -1118,7 +1117,7 @@ mod tests {
             .expect("129x254 crosses the compact work floor");
         assert_eq!(
             selected.build_accounting().build_work_upper_bound,
-            25_253_168
+            25_234_047
         );
 
         let below_width = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES - 1);
@@ -1136,7 +1135,7 @@ mod tests {
             .expect("256x128 crosses both compact floors");
         assert_eq!(
             selected.build_accounting().build_work_upper_bound,
-            25_264_360
+            25_239_016
         );
 
         let mut nonuniform = at_width;
