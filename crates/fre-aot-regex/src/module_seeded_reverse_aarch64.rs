@@ -449,6 +449,7 @@ mod tests {
             filter,
             vector_filter: None,
             scalar_filter: None,
+            scalar_projection_dependent: false,
             teddy_portfolio: None,
             minimum_width: 1,
             restart: NativeSuffixRestart::OriginalStart,

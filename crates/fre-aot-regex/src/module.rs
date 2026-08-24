@@ -19552,6 +19552,12 @@ struct NativeSuffixFilter {
     /// Extra aligned columns checked after a primary SIMD hit when their
     /// constants are too expensive to keep live in the vector loop.
     scalar_filter: Option<NativeVectorFilter>,
+    /// The exact literal projection on the retained scalar columns is a
+    /// strict subset of their Cartesian byte-set product. This bounded,
+    /// allocation-free proof is recorded only for an interior factor whose
+    /// independent product estimate could otherwise dominate a no-retry
+    /// terminal candidate.
+    scalar_projection_dependent: bool,
     /// Correlated alternatives at this exact graph boundary. The portfolio is
     /// target-neutral and remains dormant unless target finalization installs
     /// one complete lookup-table plan beside the immutable DFA.
@@ -25423,6 +25429,7 @@ fn finish_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        scalar_projection_dependent: false,
         teddy_portfolio,
         minimum_width,
         restart,
@@ -25478,10 +25485,16 @@ fn derive_interior_filter(
         ),
         _ => None,
     };
+    let scalar_projection_dependent = retry.is_none()
+        && vector_filter.is_none()
+        && scalar_filter.is_some_and(|scalar| {
+            exact_scalar_projection_is_dependent(candidate.literal_set(), scalar)
+        });
     Ok(Some(NativeSuffixFilter {
         filter,
         vector_filter,
         scalar_filter,
+        scalar_projection_dependent,
         teddy_portfolio: matching_mandatory_teddy_portfolio(
             candidate.literal_set(),
             minimum_width,
@@ -25519,6 +25532,65 @@ fn aligned_sets_from_required_literals(
         }
     }
     Ok(words.into_iter().map(AnchoredByteSet::from_words).collect())
+}
+
+/// Prove that the exact literal tuples retained by `columns` do not fill the
+/// Cartesian product of their byte memberships. The literal analysis is
+/// bounded at 2,048 rows; an allocation-free quadratic walk is capped at the
+/// same abstract work ceiling and conservatively declines on exhaustion.
+fn exact_scalar_projection_is_dependent(
+    literals: &RequiredLiteralSet,
+    columns: NativeVectorFilter,
+) -> bool {
+    const MAX_PROJECTION_COMPARISONS: u64 = 2_000_000;
+
+    let columns = columns.columns();
+    if columns.len() < 2 || literals.literals().is_empty() {
+        return false;
+    }
+    let mut product = 1_usize;
+    for (index, column) in columns.iter().enumerate() {
+        let offset = usize::from(column.scan_offset);
+        if offset >= literals.depth()
+            || column.candidate_bytes == 0
+            || columns[..index]
+                .iter()
+                .any(|prior| prior.scan_offset == column.scan_offset)
+        {
+            return false;
+        }
+        product = match product.checked_mul(usize::from(column.candidate_bytes)) {
+            Some(product) => product,
+            None => return false,
+        };
+    }
+    if product > literals.literals().len() {
+        return true;
+    }
+
+    let mut distinct = 0_usize;
+    let mut comparisons = 0_u64;
+    'literal: for (index, literal) in literals.literals().iter().enumerate() {
+        let bytes = literal.as_bytes();
+        for prior in &literals.literals()[..index] {
+            comparisons = comparisons.saturating_add(1);
+            if comparisons > MAX_PROJECTION_COMPARISONS {
+                return false;
+            }
+            let prior = prior.as_bytes();
+            if columns.iter().all(|column| {
+                let offset = usize::from(column.scan_offset);
+                bytes.get(offset) == prior.get(offset)
+            }) {
+                continue 'literal;
+            }
+        }
+        distinct = distinct.saturating_add(1);
+        if distinct >= product {
+            return false;
+        }
+    }
+    distinct < product
 }
 
 #[allow(
@@ -25634,7 +25706,17 @@ fn mandatory_filter_selection_key(
     filter: NativeSuffixFilter,
 ) -> (u64, bool, u64, (u16, u16, u16, u8, u8)) {
     let mut probability = 1_u64;
-    let refinement = filter.vector_filter.or(filter.scalar_filter);
+    // A retry-free interior factor whose exact retained tuples are dependent
+    // can make its scalar-column product look arbitrarily selective on
+    // repetitive input. Rank that proven shape by its primary hit rate so an
+    // independently safe terminal factor is not displaced by a false
+    // Cartesian estimate. Vector-refined and bounded-retry routes retain the
+    // established product model.
+    let refinement = if filter.scalar_projection_dependent {
+        None
+    } else {
+        filter.vector_filter.or(filter.scalar_filter)
+    };
     let column_count = if let Some(vector) = refinement {
         for &column in vector.columns() {
             probability =
@@ -69122,6 +69204,112 @@ mod tests {
                 .contains(&crate::OptimizationPass::ExactFiniteExistsByteSetLowering),
         );
         compiled
+    }
+
+    #[test]
+    fn scalar_only_correlated_no_retry_prefers_endpoint_provable_terminal() {
+        let targets = [
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+        for target in targets {
+          for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile(
+                CompileRequest::new("(?:yy|z){2,6}?Q", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            let terminal = derive_terminal_suffix_filter(view)
+                .unwrap()
+                .expect("terminal factor");
+            assert!(!terminal.scalar_projection_dependent);
+            let interior = view
+                .required_literals
+                .interior()
+                .candidates()
+                .iter()
+                .filter_map(|candidate| derive_interior_filter(view, candidate).unwrap())
+                .find(|filter| filter.scalar_projection_dependent)
+                .expect("dependent scalar-only interior factor");
+            assert!(interior.retry.is_none());
+            assert!(interior.vector_filter.is_none());
+            assert!(interior.scalar_filter.is_some());
+            assert!(matches!(
+                interior.reverse_seed,
+                NativeSuffixReverseSeed::RootState(_)
+            ));
+            let mut independent_product = interior;
+            independent_product.scalar_projection_dependent = false;
+            assert!(
+                mandatory_filter_selection_key(independent_product)
+                    < mandatory_filter_selection_key(terminal),
+                "the former independent-product score must prefer the interior",
+            );
+            assert!(
+                mandatory_filter_selection_key(terminal)
+                    < mandatory_filter_selection_key(interior),
+                "the exact dependency proof must preserve the terminal",
+            );
+            let (_, layout) =
+                build_native_dfa_table_for_architecture(view, target.architecture).unwrap();
+            let suffix = layout.suffix_filter.expect("selected terminal factor");
+            assert!(suffix.retry.is_none());
+            assert!(suffix.vector_filter.is_some());
+            assert!(suffix.scalar_filter.is_none());
+            assert_eq!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary);
+            let reverse = layout.seeded_reverse.expect("endpoint reverse proof");
+            assert!(reverse.proves_match);
+            assert!(reverse.first_endpoint_proves_no_earlier_match);
+          }
+
+          let compiled = compile(
+              CompileRequest::new("(?:yy|z){2,6}?Q", target)
+                  .mode(CompileMode::Optimizing)
+                  .output(OutputContract::Exists),
+          )
+          .unwrap();
+          let view = compiled.program().native_dfa_view().unwrap();
+          let retrying = view
+              .required_literals
+              .interior()
+              .candidates()
+              .iter()
+              .filter_map(|candidate| derive_interior_filter(view, candidate).unwrap())
+              .find(|filter| filter.retry.is_some() && filter.scalar_filter.is_some())
+              .expect("bounded Exists scalar retry");
+          assert!(!retrying.scalar_projection_dependent);
+        }
+    }
+
+    #[test]
+    fn full_cartesian_literal_projection_is_not_dependent() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new("(?:aa|ab|ba|bb)Q", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let literals = view.required_literals.suffix();
+        assert_eq!(literals.literals().len(), 4);
+        assert_eq!(literals.depth(), 3);
+        let sets = aligned_sets_from_required_literals(literals).unwrap();
+        let (primary, _, _) = derive_aligned_mandatory_filter(&sets)
+            .unwrap()
+            .expect("Cartesian mandatory filter");
+        let scalar = derive_scalar_aligned_filter(primary, &sets)
+            .unwrap()
+            .expect("Cartesian scalar columns");
+        assert!(!exact_scalar_projection_is_dependent(literals, scalar));
     }
 
     fn lower_forced_runtime_adapter(output: OutputContract, target: Target) -> CompiledModule {
