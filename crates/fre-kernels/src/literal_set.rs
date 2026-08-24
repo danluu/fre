@@ -22,9 +22,9 @@ use crate::folded_literal_trie::{
 // admitted by useful structural work rather than by a benchmark boundary.
 const FOLDED_SHORT_MIN_CLASSIFIER_BLOCKS: usize = 1;
 
-const ALPHABET_LEN: usize = 256;
-const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
-const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
+pub(super) const ALPHABET_LEN: usize = 256;
+pub(super) const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
+pub(super) const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
 const BYTES_PER_PATTERN_ENVELOPE: usize = 128;
 // Keep the published build envelope and its exact limit decisions stable
 // after replacing the type-erased owner with a smaller `Arc<DFA>`.
@@ -542,7 +542,7 @@ impl LiteralSetPlan {
         limits: LiteralSetBuildLimits,
         match_semantics: LiteralSetMatchSemantics,
     ) -> Result<Self, LiteralSetError> {
-        let mut build = preflight(patterns, limits, match_semantics)?;
+        let build = preflight(patterns, limits, match_semantics)?;
         let match_kind = match match_semantics {
             LiteralSetMatchSemantics::LeftmostFirst => MatchKind::LeftmostFirst,
             LiteralSetMatchSemantics::StreamingAny => MatchKind::Standard,
@@ -553,6 +553,14 @@ impl LiteralSetPlan {
             .map_err(|error| LiteralSetError::AutomatonBuild {
                 detail: error.to_string(),
             })?;
+        Self::from_preflight_dfa(build, automaton, limits)
+    }
+
+    pub(super) fn from_preflight_dfa(
+        mut build: LiteralSetBuildAccounting,
+        automaton: DFA,
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
         build.persistent_bytes = automaton.memory_usage();
         if build.persistent_bytes > limits.max_persistent_bytes {
             return Err(LiteralSetError::PersistentBytesLimit {
@@ -2354,7 +2362,10 @@ fn search_accounting(
 }
 
 #[inline]
-fn validate_window(window: Window, haystack_len: usize) -> Result<(), LiteralSetError> {
+pub(super) fn validate_window(
+    window: Window,
+    haystack_len: usize,
+) -> Result<(), LiteralSetError> {
     if window.start() > window.end() || window.end() > haystack_len {
         return Err(LiteralSetError::InvalidWindow {
             start: window.start(),
@@ -2365,7 +2376,7 @@ fn validate_window(window: Window, haystack_len: usize) -> Result<(), LiteralSet
     Ok(())
 }
 
-fn preflight<P: AsRef<[u8]>>(
+pub(super) fn preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
     match_semantics: LiteralSetMatchSemantics,
@@ -2562,19 +2573,7 @@ impl LiteralSetPlan {
             .map_err(|error| LiteralSetError::AutomatonBuild {
                 detail: error.to_string(),
             })?;
-        let mut build = build;
-        build.persistent_bytes = automaton.memory_usage();
-        if build.persistent_bytes > limits.max_persistent_bytes {
-            return Err(LiteralSetError::PersistentBytesLimit {
-                needed: build.persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        Ok(Self {
-            automaton: Arc::new(automaton),
-            build,
-            folded_long_tail: None,
-        })
+        Self::from_preflight_dfa(build, automaton, limits)
     }
 }
 
