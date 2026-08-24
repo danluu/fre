@@ -172,12 +172,13 @@ use crate::{
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES,
         STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
+        NfaTerminalSuffixBarrierOutcome, nfa_terminal_suffix_barrier_outcome,
         nfa_terminal_suffix_is_barrier,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
-        SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
-        build_seeded_reverse_exact,
+        SeededReverseBuild, SeededReverseDeclineReason, SeededReverseDfa,
+        SeededReverseLimits, SeededReverseSeed, build_seeded_reverse_exact,
     },
 };
 
@@ -1648,6 +1649,10 @@ pub struct CompiledModule {
     optimizing_fallbacks_may_continue: bool,
     bit_parallel_endpoint_oracle_lowered: bool,
     bit_parallel_exact_endpoint_lowered: bool,
+    /// Whether the ordinary complete-DFA text owns the additive
+    /// synchronizing-accept reverse prepass. This compiler-only bit drives a
+    /// same-route final-object retry and never enters frozen data.
+    synchronizing_accept_reverse_lowered: bool,
     /// Whether this exact Ordered-NFA text specializes the canonical start
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
@@ -1911,6 +1916,10 @@ struct NativeLowering {
     needs_runtime: bool,
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
+    /// Compiler-only receipt for the additive synchronizing-accept reverse
+    /// prepass. This never enters frozen data and drives its exact
+    /// final-object retry.
+    synchronizing_accept_reverse_lowered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2857,6 +2866,55 @@ impl CompiledModule {
             true,
             max_native_data_bytes,
         )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA route while omitting only the
+    /// additive synchronizing-accept reverse prepass. A final object-size
+    /// retry uses this after the enabled text exceeds its byte ceiling; the
+    /// semantic graph, target policy, and native-data ceiling are unchanged.
+    pub(crate) fn lower_without_synchronizing_accept_reverse(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        target.validate()?;
+        let native = program.native_dfa_view().ok_or(CompileError::InternalInvariant(
+            "synchronizing reverse retry has no ordinary complete DFA",
+        ))?;
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+            native,
+            target,
+            NativeDfaEntryContract::Public,
+            max_native_data_bytes,
+            false,
+        )?
+        .ok_or(CompileError::InternalInvariant(
+            "synchronizing reverse retry did not restore its complete DFA",
+        ))?;
+        if lowering.synchronizing_accept_reverse_lowered {
+            return Err(CompileError::InternalInvariant(
+                "synchronizing reverse retry retained the disabled prepass",
+            ));
+        }
+        Self::lower_serialized_with_prelowered(
+            program.serialize()?,
+            Some(lowering),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )
+        .map_err(CompileError::from)
     }
 
     /// Rebuild the ordinary portfolio while independently selecting the
@@ -6087,6 +6145,8 @@ impl CompiledModule {
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered,
             bit_parallel_exact_endpoint_lowered,
+            synchronizing_accept_reverse_lowered: lowering
+                .synchronizing_accept_reverse_lowered,
             ordered_nfa_start_closure_dispatch_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -6337,6 +6397,10 @@ impl CompiledModule {
 
     pub(crate) const fn optimizing_fallbacks_may_continue(&self) -> bool {
         self.optimizing_fallbacks_may_continue
+    }
+
+    pub(crate) const fn has_synchronizing_accept_reverse(&self) -> bool {
+        self.synchronizing_accept_reverse_lowered
     }
 
     /// Carry the selected scheduler transaction's fallback permission onto a
@@ -10193,6 +10257,7 @@ fn lower_runtime_adapter(
             needs_runtime: true,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10405,6 +10470,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             needs_runtime: surface == PreparedOrderedNfaV15Surface::Compatibility,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10832,6 +10898,7 @@ fn lower_native_endpoint_oracle_prepared(
             needs_runtime: true,
             start_accelerator: bit.start_accelerator,
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
         },
         composed_prepared,
         Some(mode),
@@ -11176,6 +11243,7 @@ fn lower_native_dynamic_rows_prepared(
             needs_runtime: true,
             start_accelerator,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -11395,6 +11463,7 @@ fn lower_native_slow_partial_with_data_limit(
         needs_runtime: true,
         start_accelerator: native.start_accelerator,
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+        synchronizing_accept_reverse_lowered: false,
     }))
 }
 
@@ -12686,6 +12755,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             needs_runtime: true,
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -13438,6 +13508,7 @@ fn lower_native_partial_prepared(
             needs_runtime: true,
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -14166,6 +14237,18 @@ const NO_DFA_STATE: u32 = u32::MAX;
 /// memory and emitted cold data proportional without consulting regex source.
 const MAX_NATIVE_SEEDED_REVERSE_CELLS: usize = 4 * 1024 * 1024;
 const MAX_NATIVE_SEEDED_REVERSE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Synchronizing reverse proofs are considered by a fixed representation
+/// portfolio, so one logical proof can be rebuilt several times while costs
+/// are ranked. Keep this newly admitted slice cache-sized and give the graph
+/// proof an allocation-free shape gate. These caps bound aggregate compiler
+/// work without changing the established optional reverse portfolio.
+const MAX_SYNCHRONIZING_REVERSE_GRAPH_STATES: usize = 4 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_GRAPH_EDGES: usize = 16 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_STATES: usize = 512;
+const MAX_SYNCHRONIZING_REVERSE_CELLS: usize = 8 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_WORK: u64 = 500_000;
+const MAX_SYNCHRONIZING_REVERSE_MEMORY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_ADDRESS_BYTES: usize = 64 * 1024;
 /// Storage for exact fragmented byte sets. The vector lowering has eight
 /// dedicated constant registers on x86-64 and an equivalent bounded ASIMD
 /// allocation. Non-exact inclusive ranges retain the former four-range cap
@@ -17884,15 +17967,53 @@ fn require_native_start_scanner(
     Ok(lowering)
 }
 
-const fn is_optional_native_table_decline(error: &ObjectError) -> bool {
-    matches!(
-        error,
-        ObjectError::Allocation(_)
-            | ObjectError::Resource {
-                resource: crate::CompileResource::ProgramBytes,
-                ..
-            }
-    )
+const SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse construction";
+const SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse terminal barrier";
+const SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse native table";
+
+fn is_optional_native_table_decline(error: &ObjectError) -> bool {
+    match error {
+        ObjectError::Allocation(site) => {
+            *site != SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE
+                && *site != SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+                && *site != SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE
+        }
+        ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Reserve the complete native image exactly once when a synchronizing
+/// accept proof is present. After that candidate's combined reservation has
+/// failed, rebuilding the ordinary table would perform a fresh allocation
+/// after an allocator failure. Established optional reverse sidecars retain
+/// their transactional baseline retry.
+fn reserve_native_dfa_table_with(
+    bytes: &mut Vec<u8>,
+    total: usize,
+    baseline_total: usize,
+    has_seeded_reverse: bool,
+    synchronizing_accept_reverse: bool,
+    mut reserve: impl FnMut(&mut Vec<u8>, usize) -> bool,
+) -> Result<bool, ObjectError> {
+    if reserve(bytes, total) {
+        return Ok(has_seeded_reverse);
+    }
+    if synchronizing_accept_reverse {
+        return Err(ObjectError::Allocation(
+            SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE,
+        ));
+    }
+    if !has_seeded_reverse || !reserve(bytes, baseline_total) {
+        return Err(ObjectError::Allocation("native DFA table"));
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -18092,6 +18213,7 @@ fn build_native_ordinal_retry(
     column_quotient: Option<&NativeColumnQuotientPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
     ranking_target: Option<Target>,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     if !is_optional_native_table_decline(dense_error) {
@@ -18118,6 +18240,7 @@ fn build_native_ordinal_retry(
             Some(plan),
             None,
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
         )
         .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
         match retry {
@@ -18152,6 +18275,7 @@ fn build_native_ordinal_retry(
                 None,
                 None,
                 permit_asimd_candidate_mask,
+                permit_synchronizing_accept_reverse,
             )
             .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
             match retry {
@@ -18357,6 +18481,7 @@ fn build_native_dense_candidate(
     exact_rows: Option<&NativeExactRowInternPlan>,
     column_quotient: Option<&NativeColumnQuotientPlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     let force_class_mapped_applicable = || {
         let class_count = view.dfa.class_count;
@@ -18429,6 +18554,7 @@ fn build_native_dense_candidate(
             None,
             None,
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
         )?;
     require_native_start_scanner(view, max_native_data_bytes, lowering).map(Some)
 }
@@ -20792,6 +20918,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             needs_runtime: false,
             start_accelerator: report.scanner,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         report,
     )))
@@ -20862,6 +20989,7 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             needs_runtime: false,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         report,
     )))
@@ -20902,14 +21030,24 @@ fn lower_native_dfa_with_data_limit(
 
 /// A numeric native-data miss declines only the speculative Teddy composite.
 /// Allocator failure and every backend/invariant error remain terminal, so a
-/// decline may safely re-enter the established optimizer portfolio.
+/// decline may safely re-enter the established optimizer portfolio. This is
+/// also the one ordinary complete-DFA transaction shared by the finite/Teddy
+/// endpoint portfolio. Enabling the synchronizing reverse policy here is
+/// inert for Span and SelectedEnd because its deeper proof admits only Exists;
+/// every other ordinary lowering keeps the pre-feature policy disabled.
 fn lower_exact_finite_teddy_incumbent_with_data_limit(
     view: NativeProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     exact_finite_teddy_incumbent_outcome(
-        lower_native_dfa_with_data_limit(view, target, max_native_data_bytes),
+        lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+            view,
+            target,
+            NativeDfaEntryContract::Public,
+            max_native_data_bytes,
+            true,
+        ),
         max_native_data_bytes,
     )
 }
@@ -21208,18 +21346,42 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
     entry_contract: NativeDfaEntryContract,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        false,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
-    let (mut data, mut layout) = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
-        view,
-        target,
-        vector_cost_model,
-        relation_vector_owns_route,
-        maximum_native_data_bytes,
-    )?;
+    let (mut data, mut layout) =
+        build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+            view,
+            target,
+            vector_cost_model,
+            relation_vector_owns_route,
+            maximum_native_data_bytes,
+            allow_synchronizing_accept_reverse
+                && entry_contract == NativeDfaEntryContract::Public,
+        )?;
+    let synchronizing_accept_reverse_lowered = layout.seeded_reverse.is_some()
+        && layout.suffix_filter.is_some_and(|suffix| {
+            matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+        });
     // An optional exact-set allocation may decline transactionally. A
     // mandatory retained program must never reach a backend with the
     // corresponding accelerated cell bits but no installed primary scanner.
@@ -21352,6 +21514,7 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
         anchored_prefix_filter_bytes: layout
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
+        synchronizing_accept_reverse_lowered,
     }))
 }
 
@@ -22447,6 +22610,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         max_native_data_bytes,
         architecture == Architecture::Aarch64,
         None,
+        true,
     )
 }
 
@@ -22463,6 +22627,24 @@ fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+        view,
+        target,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        true,
+    )
+}
+
+fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         view,
         target.architecture,
@@ -22471,6 +22653,7 @@ fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
         max_native_data_bytes,
         target.features.has(CpuFeature::Aarch64Asimd),
         Some(target),
+        allow_synchronizing_accept_reverse,
     )
 }
 
@@ -22482,7 +22665,17 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     max_native_data_bytes: usize,
     permit_asimd_candidate_mask: bool,
     ranking_target: Option<Target>,
+    allow_synchronizing_accept_reverse: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    // Seeded reverse currently has scalar and ASIMD AArch64 scanners, but no
+    // SVE lowering. Preserve every pure or mixed SVE suffix incumbent until
+    // that route has an independently measured seeded implementation.
+    let permit_synchronizing_accept_reverse = allow_synchronizing_accept_reverse
+        && ranking_target.is_none_or(|target| {
+            target.architecture == Architecture::X86_64
+                || (target.features.has(CpuFeature::Aarch64Asimd)
+                    && !target.features.has(CpuFeature::Aarch64Sve))
+        });
     let exact_rows = native_exact_row_intern_candidate_plan(view, architecture);
     // Derivation retains only maps and representative class ordinals. The
     // selected candidate reads representative cells directly from the graph;
@@ -22508,6 +22701,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             exact_rows.as_ref(),
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
         ) {
             Ok(Some(lowering)) => {
                 let cost = if let Some(target) = ranking_target {
@@ -22555,6 +22749,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             exact_rows.as_ref(),
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
         ) {
             Ok(Some(lowering)) => return Ok(lowering),
             Ok(None) => {}
@@ -22589,6 +22784,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         column_quotient.as_ref(),
         comparison_plan,
         permit_asimd_candidate_mask,
+        permit_synchronizing_accept_reverse,
         ranking_target,
     )? {
         return Ok(lowering);
@@ -22620,6 +22816,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                     None,
                     None,
                     permit_asimd_candidate_mask,
+                    permit_synchronizing_accept_reverse,
                 )
                 .and_then(|lowering| {
                     require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -22645,6 +22842,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                         None,
                         Some(plan),
                         permit_asimd_candidate_mask,
+                        permit_synchronizing_accept_reverse,
                     )
                     .and_then(|lowering| {
                         require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -22754,6 +22952,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
         None,
         None,
         permit_asimd_candidate_mask,
+        true,
     )
 }
 
@@ -22787,6 +22986,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         None,
         None,
         architecture == Architecture::Aarch64,
+        true,
     )
 }
 
@@ -22808,6 +23008,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     ordinal_map: Option<NativeOrdinalMapPlan>,
     hybrid_sparse: Option<&NativeHybridSparsePlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if usize::from(default_exceptions.is_some())
@@ -23567,11 +23768,23 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     seeded_limits.max_addressable_bytes = seeded_limits
         .max_addressable_bytes
         .min(remaining_sidecar_bytes);
-    let mut seeded_reverse_machine = suffix_filter.and_then(|suffix| {
-        (seeded_limits.max_cells != 0 && seeded_limits.max_memory_bytes != 0)
-            .then(|| build_native_seeded_reverse(view, suffix, seeded_limits))
+    let mut seeded_reverse_machine = if seeded_limits.max_cells != 0
+        && seeded_limits.max_memory_bytes != 0
+    {
+        suffix_filter
+            .map(|suffix| {
+                build_native_seeded_reverse_with_policy(
+                    view,
+                    suffix,
+                    seeded_limits,
+                    permit_synchronizing_accept_reverse,
+                )
+            })
+            .transpose()?
             .flatten()
-    });
+    } else {
+        None
+    };
     // Preserve the target- and output-independent graph fact even when this
     // output contract never requested the optional native reverse sidecar.
     let declined_redundant_root_reverse = suffix_filter.is_some_and(|suffix| {
@@ -23659,6 +23872,17 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         } else {
             (None, 0)
         };
+    let synchronizing_accept_reverse = permit_synchronizing_accept_reverse
+        && suffix_filter.is_some_and(|suffix| {
+            matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                && suffix.retry.is_none()
+                && seeded_reverse_machine.as_ref().is_some_and(|machine| {
+                    machine.proves_match
+                        && machine.first_endpoint_proves_no_earlier_match
+                        && machine.boundary_offset == suffix.minimum_width
+                })
+        });
     let mut total = auxiliary_total
         .checked_add(seeded_reverse_bytes)
         .ok_or(ObjectError::ArithmeticOverflow("native DFA data bytes"))?;
@@ -23678,20 +23902,21 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     }
 
     let mut bytes = Vec::new();
-    if bytes.try_reserve_exact(total).is_err() {
-        if seeded_reverse.is_some() {
-            // The sidecar is optional. Retry the exact baseline reservation
-            // transactionally instead of converting optimizer memory pressure
-            // into a compilation failure.
-            seeded_reverse_machine = None;
-            seeded_reverse = None;
-            total = auxiliary_total;
-            bytes
-                .try_reserve_exact(total)
-                .map_err(|_| ObjectError::Allocation("native DFA table"))?;
-        } else {
-            return Err(ObjectError::Allocation("native DFA table"));
-        }
+    let retained_seeded_reverse = reserve_native_dfa_table_with(
+        &mut bytes,
+        total,
+        auxiliary_total,
+        seeded_reverse.is_some(),
+        synchronizing_accept_reverse,
+        |bytes, bytes_to_reserve| bytes.try_reserve_exact(bytes_to_reserve).is_ok(),
+    )?;
+    if !retained_seeded_reverse && seeded_reverse.is_some() {
+        // Established optional sidecars retry the exact baseline reservation
+        // transactionally. The synchronizing accept candidate is terminal at
+        // this seam and can never reach this branch.
+        seeded_reverse_machine = None;
+        seeded_reverse = None;
+        total = auxiliary_total;
     }
     let table_byte_classes = column_quotient
         .map(|plan| plan.byte_to_quotient.as_slice())
@@ -25285,30 +25510,93 @@ fn derive_retained_terminal_suffix_filter(
 /// has the independent graph-barrier proof: after completely tracing the first
 /// verified endpoint, its minimum start is globally leftmost and the ordinary
 /// forward DFA remains authoritative for endpoint priority. A proven
-/// synchronizing restart remains on its cheaper bounded backward scan.
+/// synchronizing restart remains authoritative except for an `Exists`
+/// Accept seed whose terminal byte is a graph barrier: that complete reverse
+/// proof can return on its first accepting transition instead of rewinding and
+/// replaying a potentially long body-byte corridor through the forward DFA.
 fn build_native_seeded_reverse(
     view: NativeProgramView<'_>,
     suffix: NativeSuffixFilter,
     limits: SeededReverseLimits,
 ) -> Option<NativeSeededReverseMachine> {
+    build_native_seeded_reverse_with_policy(view, suffix, limits, true)
+        .ok()
+        .flatten()
+}
+
+fn build_native_seeded_reverse_with_policy(
+    view: NativeProgramView<'_>,
+    suffix: NativeSuffixFilter,
+    limits: SeededReverseLimits,
+    permit_synchronizing_accept_reverse: bool,
+) -> Result<Option<NativeSeededReverseMachine>, ObjectError> {
+    build_native_seeded_reverse_with_policy_and_barrier_proof(
+        view,
+        suffix,
+        limits,
+        permit_synchronizing_accept_reverse,
+        |terminal| nfa_terminal_suffix_barrier_outcome(view.raw, terminal),
+    )
+}
+
+fn synchronizing_terminal_barrier_outcome(
+    outcome: NfaTerminalSuffixBarrierOutcome,
+) -> Result<bool, ObjectError> {
+    match outcome {
+        NfaTerminalSuffixBarrierOutcome::Proven => Ok(true),
+        NfaTerminalSuffixBarrierOutcome::Declined => Ok(false),
+        NfaTerminalSuffixBarrierOutcome::Allocation => Err(ObjectError::Allocation(
+            SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE,
+        )),
+    }
+}
+
+fn build_native_seeded_reverse_with_policy_and_barrier_proof(
+    view: NativeProgramView<'_>,
+    suffix: NativeSuffixFilter,
+    limits: SeededReverseLimits,
+    permit_synchronizing_accept_reverse: bool,
+    mut barrier_proof: impl FnMut(AnchoredByteSet) -> NfaTerminalSuffixBarrierOutcome,
+) -> Result<Option<NativeSeededReverseMachine>, ObjectError> {
     if suffix.retry.is_some()
         || suffix.filter.candidate_bytes == 0
         || suffix.filter.ranges().is_empty()
-        || matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
     {
-        return None;
+        return Ok(None);
     }
+    let synchronizing = matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. });
+    let terminal_barrier = if synchronizing {
+        if !permit_synchronizing_accept_reverse
+            || view.output != OutputContract::Exists
+            || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+        {
+            return Ok(None);
+        }
+        if view.raw.roles.len() > MAX_SYNCHRONIZING_REVERSE_GRAPH_STATES
+            || view.raw.edge_kinds.len() > MAX_SYNCHRONIZING_REVERSE_GRAPH_EDGES
+        {
+            return Ok(None);
+        }
+        let Some(terminal) = view.anchored_suffix.sets().first().copied() else {
+            return Ok(None);
+        };
+        if !synchronizing_terminal_barrier_outcome(barrier_proof(terminal))? {
+            return Ok(None);
+        }
+        true
+    } else {
+        matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+            && view
+                .anchored_suffix
+                .sets()
+                .first()
+                .copied()
+                .is_some_and(|terminal| nfa_terminal_suffix_is_barrier(view.raw, terminal))
+    };
+    let synchronizing_accept_exists = synchronizing;
     let (seed, boundary_offset, proves_match, first_endpoint_proves_no_earlier_match) =
         match suffix.reverse_seed {
             NativeSuffixReverseSeed::AcceptBoundary => {
-                let terminal_barrier = view
-                    .anchored_suffix
-                    .sets()
-                    .first()
-                    .copied()
-                    .is_some_and(|terminal| {
-                        nfa_terminal_suffix_is_barrier(view.raw, terminal)
-                    });
                 (
                     SeededReverseSeed::AcceptStates,
                     suffix.minimum_width,
@@ -25320,17 +25608,50 @@ fn build_native_seeded_reverse(
                 (SeededReverseSeed::RootState(root), 0, false, false)
             }
         };
+    let limits = if synchronizing {
+        SeededReverseLimits {
+            max_states: limits.max_states.min(MAX_SYNCHRONIZING_REVERSE_STATES),
+            max_cells: limits.max_cells.min(MAX_SYNCHRONIZING_REVERSE_CELLS),
+            max_work: limits.max_work.min(MAX_SYNCHRONIZING_REVERSE_WORK),
+            max_memory_bytes: limits
+                .max_memory_bytes
+                .min(MAX_SYNCHRONIZING_REVERSE_MEMORY_BYTES),
+            max_addressable_bytes: limits
+                .max_addressable_bytes
+                .min(MAX_SYNCHRONIZING_REVERSE_ADDRESS_BYTES),
+        }
+    } else {
+        limits
+    };
     if view.output != OutputContract::Exists && !first_endpoint_proves_no_earlier_match {
-        return None;
+        return Ok(None);
     }
-    match build_seeded_reverse_exact(view.raw, seed, limits) {
-        SeededReverseBuild::Complete(dfa) => Some(NativeSeededReverseMachine {
+    let build = build_seeded_reverse_exact(view.raw, seed, limits);
+    seeded_reverse_build_outcome(build, synchronizing_accept_exists).map(|dfa| {
+        dfa.map(|dfa| NativeSeededReverseMachine {
             dfa,
             boundary_offset,
             proves_match,
             first_endpoint_proves_no_earlier_match,
-        }),
-        SeededReverseBuild::Declined(_) => None,
+        })
+    })
+}
+
+fn seeded_reverse_build_outcome(
+    build: SeededReverseBuild,
+    synchronizing_accept_exists: bool,
+) -> Result<Option<SeededReverseDfa>, ObjectError> {
+    match build {
+        SeededReverseBuild::Complete(dfa) => Ok(Some(dfa)),
+        SeededReverseBuild::Declined(decline)
+            if synchronizing_accept_exists
+                && matches!(decline.reason, SeededReverseDeclineReason::Allocation(_)) =>
+        {
+            Err(ObjectError::Allocation(
+                SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE,
+            ))
+        }
+        SeededReverseBuild::Declined(_) => Ok(None),
     }
 }
 
@@ -27151,6 +27472,7 @@ fn native_regex_redux_module(
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
         bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
@@ -36529,9 +36851,28 @@ fn x86_emit_seeded_reverse_prepass(
             || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary));
     let endpoint_without_certificate = layout.output != OutputContract::Exists
         && (!reverse.proves_match || !reverse.first_endpoint_proves_no_earlier_match);
-    if malformed_certificate || endpoint_without_certificate {
+    let malformed_seed = match suffix.reverse_seed {
+        NativeSuffixReverseSeed::AcceptBoundary => {
+            reverse.boundary_offset != suffix.minimum_width || !reverse.proves_match
+        }
+        NativeSuffixReverseSeed::RootState(_) => {
+            reverse.boundary_offset != 0 || reverse.proves_match
+        }
+    };
+    let unsupported_synchronizing_reverse =
+        matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+            && !(layout.output == OutputContract::Exists
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                && reverse.proves_match
+                && reverse.first_endpoint_proves_no_earlier_match);
+    if malformed_certificate
+        || endpoint_without_certificate
+        || malformed_seed
+        || suffix.retry.is_some()
+        || unsupported_synchronizing_reverse
+    {
         return Err(ObjectError::InvalidModule(
-            "x86 endpoint seeded reverse has no terminal-barrier proof",
+            "x86 seeded reverse escaped its graph admission gate",
         ));
     }
 
@@ -73037,6 +73378,7 @@ mod tests {
             None,
             Some(&plan),
             architecture == Architecture::Aarch64,
+            true,
         )
     }
 
@@ -73118,6 +73460,7 @@ mod tests {
             anchored_prefix_filter_bytes: layout
                 .prefix_filter
                 .map_or(0, |filter| filter.guaranteed_bytes),
+            synchronizing_accept_reverse_lowered: false,
         })
     }
 
@@ -73510,6 +73853,7 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -73759,6 +74103,7 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -73927,6 +74272,7 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -74079,6 +74425,7 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -74574,6 +74921,7 @@ mod tests {
             Some(plan),
             None,
             architecture == Architecture::Aarch64,
+            true,
         )
     }
 
@@ -74639,6 +74987,7 @@ mod tests {
             Some(plan),
             None,
             architecture == Architecture::Aarch64,
+            true,
         )
     }
 
@@ -94558,6 +94907,7 @@ int main(void){{
                 needs_runtime: true,
                 start_accelerator: StartAccelerator::None,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -98225,6 +98575,7 @@ int main(void){{
                 Some(plan),
                 None,
                 permit_asimd_candidate_mask,
+                true,
             )
             .unwrap()
         };
@@ -98391,6 +98742,7 @@ int main(void){{
                     Some(plan),
                     None,
                     permit_asimd_candidate_mask,
+                    true,
                 )
                 .unwrap()
             };
@@ -98423,6 +98775,7 @@ int main(void){{
                 None,
                 None,
                 permit_asimd_candidate_mask,
+                true,
             )
             .unwrap();
             let comparison = derive_native_default_exception_plan(
@@ -98445,6 +98798,7 @@ int main(void){{
                     None,
                     None,
                     permit_asimd_candidate_mask,
+                    true,
                 )
                 .ok()
             });
@@ -102222,6 +102576,7 @@ int main(void){{
             Some(&exact_rows),
             None,
             false,
+            false,
         )
         .unwrap()
         .expect("direct exact-row candidate");
@@ -102234,6 +102589,7 @@ int main(void){{
             usize::MAX,
             Some(&exact_rows),
             None,
+            false,
             false,
         )
         .unwrap()
@@ -103117,6 +103473,12 @@ int main(void){{
         assert!(is_optional_native_table_decline(&ObjectError::Allocation(
             "synthetic candidate allocation"
         )));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE)
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE)
+        ));
         assert!(is_optional_native_table_decline(&ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             limit: 1,
@@ -111483,6 +111845,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 optimizing_fallbacks_may_continue: true,
                 bit_parallel_endpoint_oracle_lowered: false,
                 bit_parallel_exact_endpoint_lowered: false,
+                synchronizing_accept_reverse_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
                 ordered_nfa_terminal_exact_set_lowered: None,
@@ -111809,6 +112172,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered: false,
             bit_parallel_exact_endpoint_lowered: false,
+            synchronizing_accept_reverse_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
             ordered_nfa_terminal_exact_set_lowered: None,
@@ -121015,6 +121379,481 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn synchronizing_seeded_reverse_allocation_is_terminal() {
+        let allocation = || {
+            SeededReverseBuild::Declined(crate::seeded_reverse::SeededReverseDecline {
+                reason: SeededReverseDeclineReason::Allocation(
+                    crate::seeded_reverse::SeededReverseAllocation::States,
+                ),
+                stats: crate::seeded_reverse::SeededReverseStats::default(),
+            })
+        };
+        assert!(
+            seeded_reverse_build_outcome(allocation(), false)
+                .unwrap()
+                .is_none(),
+            "established optional reverse allocation remains a decline",
+        );
+        assert!(matches!(
+            seeded_reverse_build_outcome(allocation(), true),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE),
+        ));
+        assert_eq!(
+            synchronizing_terminal_barrier_outcome(
+                NfaTerminalSuffixBarrierOutcome::Declined,
+            )
+            .unwrap(),
+            false,
+        );
+        assert!(matches!(
+            synchronizing_terminal_barrier_outcome(
+                NfaTerminalSuffixBarrierOutcome::Allocation,
+            ),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(
+                SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE,
+            ),
+        ));
+
+        let compiled = compile(
+            CompileRequest::new("(?:ee|f)+?R", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let suffix = derive_suffix_filter(view)
+            .unwrap()
+            .expect("synchronizing suffix");
+        let mut barrier_calls = 0usize;
+        assert!(
+            build_native_seeded_reverse_with_policy_and_barrier_proof(
+                view,
+                suffix,
+                SeededReverseLimits::default(),
+                false,
+                |_| {
+                    barrier_calls += 1;
+                    NfaTerminalSuffixBarrierOutcome::Allocation
+                },
+            )
+            .unwrap()
+            .is_none(),
+        );
+        assert_eq!(
+            barrier_calls, 0,
+            "disabled/Fast policy must decline before the allocating proof",
+        );
+        assert!(matches!(
+            build_native_seeded_reverse_with_policy_and_barrier_proof(
+                view,
+                suffix,
+                SeededReverseLimits::default(),
+                true,
+                |_| NfaTerminalSuffixBarrierOutcome::Allocation,
+            ),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+        ));
+
+        let mut bytes = Vec::new();
+        let mut reservations = 0usize;
+        let result = reserve_native_dfa_table_with(
+            &mut bytes,
+            64,
+            32,
+            true,
+            true,
+            |_, _| {
+                reservations += 1;
+                false
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE
+        ));
+        assert_eq!(reservations, 1, "allocator failure must not be retried");
+
+        let mut legacy_bytes = Vec::new();
+        let mut legacy_reservations = 0usize;
+        let result = reserve_native_dfa_table_with(
+            &mut legacy_bytes,
+            64,
+            32,
+            true,
+            false,
+            |_, _| {
+                legacy_reservations += 1;
+                legacy_reservations == 2
+            },
+        );
+        assert_eq!(result.unwrap(), false);
+        assert_eq!(legacy_reservations, 2);
+    }
+
+    #[test]
+    fn synchronizing_accept_seeded_reverse_is_scoped_to_exists_on_both_isas() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), true),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                true,
+            ),
+            (Target::aarch64_linux(), false),
+            (
+                Target::aarch64_linux().with_features(asimd).unwrap(),
+                true,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        asimd
+                            .with(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                false,
+            ),
+        ];
+        for (target, target_admits_reverse) in targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new("(?:ee|f)+?R", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let suffix = derive_suffix_filter(view)
+                    .unwrap()
+                    .expect("synchronizing terminal suffix");
+                assert!(matches!(
+                    suffix.restart,
+                    NativeSuffixRestart::Synchronizing { .. }
+                ));
+                assert_eq!(
+                    build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                        .is_some_and(|reverse| reverse.proves_match),
+                    output == OutputContract::Exists,
+                );
+                let layout = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                    view,
+                    target,
+                    native_vector_filter_cost_model_for_target(target, true),
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                )
+                .unwrap()
+                .1;
+                assert_eq!(
+                    layout
+                        .seeded_reverse
+                        .is_some_and(|reverse| reverse.proves_match),
+                    output == OutputContract::Exists && target_admits_reverse,
+                    "synchronizing reverse scope changed for {target:?} {output:?}",
+                );
+            }
+        }
+
+        let target = Target::x86_64_linux();
+        let fast = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(!fast.module().has_synchronizing_accept_reverse());
+        let fast_baseline = CompiledModule::lower(fast.program(), target).unwrap();
+        let fast_baseline_object =
+            emit_object(&fast_baseline, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert_eq!(fast.object(), fast_baseline_object);
+
+        let optimizing = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(
+            optimizing.module().has_synchronizing_accept_reverse(),
+            "optimizing sync route: {:?}",
+            optimizing.receipt(),
+        );
+
+        let body_overlap = compile(
+            CompileRequest::new("(?:aa|Z)+?Z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let overlap_view = body_overlap.program().native_dfa_view().unwrap();
+        let overlap_suffix = derive_suffix_filter(overlap_view)
+            .unwrap()
+            .expect("body-overlap synchronizing suffix");
+        assert!(matches!(
+            overlap_suffix.restart,
+            NativeSuffixRestart::Synchronizing { .. }
+        ));
+        assert!(
+            build_native_seeded_reverse(
+                overlap_view,
+                overlap_suffix,
+                SeededReverseLimits::default(),
+            )
+            .is_none(),
+            "a productive terminal byte has no terminal-barrier certificate",
+        );
+        assert!(!body_overlap.module().has_synchronizing_accept_reverse());
+    }
+
+    #[test]
+    fn synchronizing_accept_reverse_backends_reauthenticate_every_layout_fact() {
+        let compiled = compile(
+            CompileRequest::new("(?:ee|f)+?R", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let valid = build_native_dfa_table_for_architecture(view, architecture)
+                .unwrap()
+                .1;
+            assert!(valid.seeded_reverse.is_some_and(|reverse| {
+                reverse.proves_match && reverse.first_endpoint_proves_no_earlier_match
+            }));
+            match architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa(valid, FeatureSet::EMPTY).unwrap();
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_dfa(valid, FeatureSet::EMPTY).unwrap();
+                }
+            }
+
+            let mut corruptions = Vec::new();
+
+            let mut missing_barrier = valid;
+            let mut reverse = missing_barrier.seeded_reverse.unwrap();
+            reverse.first_endpoint_proves_no_earlier_match = false;
+            missing_barrier.seeded_reverse = Some(reverse);
+            corruptions.push(missing_barrier);
+
+            let mut non_proving = valid;
+            let mut reverse = non_proving.seeded_reverse.unwrap();
+            reverse.proves_match = false;
+            non_proving.seeded_reverse = Some(reverse);
+            corruptions.push(non_proving);
+
+            let mut wrong_boundary = valid;
+            let mut reverse = wrong_boundary.seeded_reverse.unwrap();
+            reverse.boundary_offset = reverse.boundary_offset.saturating_add(1);
+            wrong_boundary.seeded_reverse = Some(reverse);
+            corruptions.push(wrong_boundary);
+
+            let mut wrong_seed = valid;
+            let mut suffix = wrong_seed.suffix_filter.unwrap();
+            suffix.reverse_seed = NativeSuffixReverseSeed::RootState(0);
+            wrong_seed.suffix_filter = Some(suffix);
+            corruptions.push(wrong_seed);
+
+            let mut retry = valid;
+            let mut suffix = retry.suffix_filter.unwrap();
+            suffix.retry = Some(
+                select_bounded_suffix_retry(
+                    OutputContract::Exists,
+                    false,
+                    2,
+                    Some(9),
+                    14,
+                )
+                .unwrap(),
+            );
+            retry.suffix_filter = Some(suffix);
+            corruptions.push(retry);
+
+            for corrupted in corruptions {
+                let result = match architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa(corrupted, FeatureSet::EMPTY).map(|_| ())
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa(corrupted, FeatureSet::EMPTY).map(|_| ())
+                    }
+                };
+                assert!(matches!(result, Err(ObjectError::InvalidModule(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn synchronizing_accept_reverse_object_limit_restores_exact_incumbent() {
+        let target = Target::x86_64_linux();
+        let selected = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(
+            selected.module().has_synchronizing_accept_reverse(),
+            "selected sync route: {:?}",
+            selected.receipt(),
+        );
+        let incumbent = CompiledModule::lower_without_synchronizing_accept_reverse(
+            selected.program(),
+            target,
+            usize::MAX,
+        )
+        .unwrap();
+        let incumbent_object =
+            emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert!(incumbent_object.len() < selected.object().len());
+        assert!(
+            selected.receipt().data_bytes <= incumbent_object.len(),
+            "the final-object ceiling must still admit the selected native data",
+        );
+
+        let initial = CompiledModule::lower_optimizing_with_limits(
+            selected.program(),
+            target,
+            SlowAotLimits::default(),
+        )
+        .unwrap();
+        assert!(initial.has_synchronizing_accept_reverse());
+        let direct_retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            initial,
+            ObjectFormat::for_target(target),
+            incumbent_object.len(),
+            || {
+                CompiledModule::lower_without_synchronizing_accept_reverse(
+                    selected.program(),
+                    target,
+                    usize::MAX,
+                )
+            },
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+        )
+        .unwrap();
+        let crate::FinalObjectAttempt::Fit {
+            module: direct_module,
+            object: direct_object,
+        } = direct_retry
+        else {
+            panic!("direct final-object retry did not restore the incumbent");
+        };
+        assert!(!direct_module.has_synchronizing_accept_reverse());
+        assert_eq!(direct_object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(
+            &incumbent,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let initial = CompiledModule::lower_optimizing_with_limits(
+            selected.program(),
+            target,
+            SlowAotLimits::default(),
+        )
+        .unwrap();
+        let direct_decline = crate::emit_with_ordered_nfa_accelerator_retries(
+            initial,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+            || {
+                CompiledModule::lower_without_synchronizing_accept_reverse(
+                    selected.program(),
+                    target,
+                    usize::MAX,
+                )
+            },
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+        )
+        .unwrap();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module: direct_module,
+            first_error,
+        } = direct_decline
+        else {
+            panic!("undersized final-object retry unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(
+                &direct_module,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap(),
+            incumbent_object,
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = incumbent_object.len();
+        let constrained = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(!constrained.module().has_synchronizing_accept_reverse());
+        assert_eq!(constrained.object(), incumbent_object);
+        assert_eq!(
+            constrained.module().start_accelerator(),
+            selected.module().start_accelerator(),
+        );
+        assert_eq!(
+            constrained.module().required_runtime_symbols().count(),
+            selected.module().required_runtime_symbols().count(),
+        );
+    }
+
+    #[test]
     fn terminal_barrier_admits_seeded_reverse_for_endpoint_contracts_on_both_isas() {
         const BARRIER: &str = r"(?-u:[^Z])+Z";
         const BODY_OVERLAP: &str = r"(?s:.+)Z";
@@ -122927,6 +123766,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             needs_runtime: false,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
@@ -132679,6 +133519,162 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes AArch64 and Rosetta synchronizing-accept Exists objects"]
+    fn linked_macos_synchronizing_accept_exists_agrees_with_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let targets = [
+            (asimd, "arm64", "aarch64-asimd"),
+            (Target::x86_64_macos(), "x86_64", "x86-sse2"),
+        ];
+
+        let mut mixed = vec![b'x'; 192];
+        mixed[0] = b'f';
+        mixed[1] = b'R';
+        for position in [16_usize, 32, 96, 128] {
+            mixed[position] = b'R';
+        }
+        mixed[62..65].copy_from_slice(b"eeR");
+        mixed[129..191].fill(b'f');
+        mixed[191] = b'R';
+        let absent = vec![b'f'; 192];
+        let mut dense_end = vec![b'f'; 192];
+        dense_end[191] = b'R';
+        let mut fixtures = vec![
+            Vec::new(),
+            b"R".to_vec(),
+            b"fR".to_vec(),
+            b"eeR".to_vec(),
+            b"eR".to_vec(),
+            b"fffR".to_vec(),
+        ];
+        for body in [14_usize, 15, 16, 17] {
+            let mut haystack = vec![b'f'; body];
+            haystack.push(b'R');
+            fixtures.push(haystack);
+        }
+        fixtures.extend([mixed, absent, dense_end]);
+
+        for (target_index, (target, architecture, tag)) in targets.into_iter().enumerate() {
+            let compiled = compile(
+                CompileRequest::new("(?:ee|f)+?R", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert!(compiled.module().has_synchronizing_accept_reverse());
+
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-sync-accept-exists-{}-{target_index}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let object = directory.join("case.o");
+            fs::write(&object, compiled.object()).unwrap();
+            let symbol = compiled.module().entry_symbol();
+            let mut source = format!(
+                "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\n"
+            );
+            let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+            let mut call_index = 0usize;
+
+            for (fixture, haystack) in fixtures.iter().enumerate() {
+                let bytes = if haystack.is_empty() {
+                    String::from("0")
+                } else {
+                    haystack
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const unsigned char h{fixture}[] = {{{bytes}}};"
+                )
+                .unwrap();
+                let mut windows = Vec::new();
+                if haystack.len() <= 18 {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            windows.push((start, end));
+                        }
+                    }
+                } else {
+                    let boundaries = [
+                        0_usize, 1, 2, 14, 15, 16, 17, 31, 32, 33, 62, 63, 64, 65, 95,
+                        96, 97, 127, 128, 129, 130, 159, 160, 191, 192,
+                    ];
+                    for &start in &boundaries {
+                        for &end in &boundaries {
+                            if start <= end && end <= haystack.len() {
+                                windows.push((start, end));
+                            }
+                        }
+                    }
+                }
+                windows.sort_unstable();
+                windows.dedup();
+                for (start, end) in windows {
+                    let MatchResult::Exists(expected) = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .unwrap()
+                    else {
+                        unreachable!("Exists fixture returned an endpoint result");
+                    };
+                    let failure = 10 + call_index % 200;
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(h{fixture},{},{start},{end},r);if(s!={}||r[0]!=0||r[1]!=0)return {failure};",
+                        haystack.len(),
+                        u8::from(expected),
+                    )
+                    .unwrap();
+                    call_index += 1;
+                }
+            }
+            calls.push_str("return 0;}\n");
+            source.push_str(&calls);
+            let c_path = directory.join("differential.c");
+            let executable = directory.join("differential");
+            fs::write(&c_path, source).unwrap();
+            let status = Command::new("clang")
+                .arg("-arch")
+                .arg(architecture)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .args((architecture == "x86_64").then_some("-Wl,-adhoc_codesign"))
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to link {tag}");
+            let output = if architecture == "x86_64" {
+                Command::new("arch")
+                    .arg("-x86_64")
+                    .arg(&executable)
+                    .output()
+                    .unwrap()
+            } else {
+                Command::new(&executable).output().unwrap()
+            };
+            assert!(
+                output.status.success(),
+                "{tag}: status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 

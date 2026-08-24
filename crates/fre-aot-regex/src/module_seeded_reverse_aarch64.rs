@@ -85,13 +85,30 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary));
     let endpoint_without_certificate = layout.output != OutputContract::Exists
         && (!reverse.proves_match || !reverse.first_endpoint_proves_no_earlier_match);
-    if malformed_certificate || endpoint_without_certificate {
+    let malformed_seed = match suffix.reverse_seed {
+        NativeSuffixReverseSeed::AcceptBoundary => {
+            reverse.boundary_offset != suffix.minimum_width || !reverse.proves_match
+        }
+        NativeSuffixReverseSeed::RootState(_) => {
+            reverse.boundary_offset != 0 || reverse.proves_match
+        }
+    };
+    let unsupported_synchronizing_reverse =
+        matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+            && !(layout.output == OutputContract::Exists
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                && reverse.proves_match
+                && reverse.first_endpoint_proves_no_earlier_match);
+    if malformed_certificate
+        || endpoint_without_certificate
+        || malformed_seed
+        || unsupported_synchronizing_reverse
+    {
         return Err(ObjectError::InvalidModule(
-            "AArch64 endpoint seeded reverse has no terminal-barrier proof",
+            "AArch64 seeded reverse escaped its graph admission gate",
         ));
     }
-    if suffix.retry.is_some() || matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
-    {
+    if suffix.retry.is_some() {
         return Err(ObjectError::InvalidModule(
             "AArch64 seeded reverse escaped its graph admission gate",
         ));
@@ -105,6 +122,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
     let maximum_filter_offset =
         scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let proven_exists = reverse.proves_match && layout.output == OutputContract::Exists;
     // An Accept seed starts at base + minimum_width. Requiring the last byte
     // before that boundary to be in-bounds makes every reverse load safe.
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
@@ -142,7 +160,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     assembler.instruction(aarch64_cmp_x_imm(12, SUFFIX_PREFILTER_MIN_WINDOW_BYTES)?)?;
     assembler.branch_cond(AARCH64_LO, done)?;
     assembler.instruction(aarch64_mov_x(REVERSE_FUEL, 12)?)?;
-    assembler.instruction(aarch64_movn_zero_x(REVERSE_MINIMUM)?)?;
+    if !proven_exists {
+        assembler.instruction(aarch64_movn_zero_x(REVERSE_MINIMUM)?)?;
+    }
     if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS {
         emit_constants(assembler)?;
     }
@@ -299,7 +319,11 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     }
 
     assembler.bind(scalar)?;
-    aarch64_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, finalize)?;
+    aarch64_emit_start_filter_scalar_bound(
+        assembler,
+        maximum_scan_offset,
+        if proven_exists { no_match } else { finalize },
+    )?;
     aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
     let scalar_candidate = if scalar_filter.is_some() {
         scalar_columns
@@ -354,7 +378,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     // entering the table loop. It must not flow through `reverse_continue`,
     // whose W8 cell exists only after a table load.
     if reverse.initial_reaches_start {
-        if reverse.proves_match && layout.output == OutputContract::Exists {
+        if proven_exists {
             assembler.branch(matched)?;
         } else {
             assembler.instruction(aarch64_cmp_x(REVERSE_CURSOR, REVERSE_MINIMUM)?)?;
@@ -364,7 +388,6 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             assembler.branch_cond(AARCH64_EQ, global_minimum)?;
         }
     }
-
     assembler.bind(reverse_loop)?;
     assembler.instruction(aarch64_cmp_x(REVERSE_CURSOR, 9)?)?;
     assembler.branch_cond(AARCH64_LS, reverse_done)?;
@@ -387,7 +410,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     assembler.branch(reverse_loop)?;
 
     assembler.bind(record_start)?;
-    if reverse.proves_match && layout.output == OutputContract::Exists {
+    if proven_exists {
         assembler.branch(matched)?;
     } else {
         assembler.instruction(aarch64_and_low_31(8, 8)?)?;
@@ -400,7 +423,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     }
 
     assembler.bind(reverse_done)?;
-    if reverse.first_endpoint_proves_no_earlier_match {
+    if !proven_exists && reverse.first_endpoint_proves_no_earlier_match {
         // The reverse trace is complete at this label. A non-sentinel minimum
         // is therefore the globally leftmost start proved by the first
         // terminal-barrier endpoint; endpoint priority remains with the
@@ -413,12 +436,17 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     assembler.branch(vector)?;
 
     assembler.bind(finalize)?;
-    assembler.instruction(aarch64_add_x_imm(12, REVERSE_MINIMUM, 1)?)?;
-    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, no_match)?;
-    assembler.bind(global_minimum)?;
-    assembler.instruction(aarch64_mov_x(2, REVERSE_MINIMUM)?)?;
-    assembler.branch(done)?;
+    if proven_exists {
+        assembler.bind(global_minimum)?;
+        assembler.branch(no_match)?;
+    } else {
+        assembler.instruction(aarch64_add_x_imm(12, REVERSE_MINIMUM, 1)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.bind(global_minimum)?;
+        assembler.instruction(aarch64_mov_x(2, REVERSE_MINIMUM)?)?;
+        assembler.branch(done)?;
+    }
 
     assembler.bind(fallback)?;
     assembler.instruction(aarch64_mov_x(2, 9)?)?;
@@ -445,6 +473,18 @@ mod tests {
         };
         filter.range_count = 1;
         filter.candidate_bytes = 1;
+        let reverse_seed = if proves_match {
+            NativeSuffixReverseSeed::AcceptBoundary
+        } else {
+            NativeSuffixReverseSeed::RootState(0)
+        };
+        let restart = if proves_match {
+            NativeSuffixRestart::Synchronizing {
+                non_reset: EMPTY_NATIVE_RESET_FILTER,
+            }
+        } else {
+            NativeSuffixRestart::OriginalStart
+        };
         let suffix = NativeSuffixFilter {
             filter,
             vector_filter: None,
@@ -452,18 +492,18 @@ mod tests {
             scalar_projection_dependent: false,
             teddy_portfolio: None,
             minimum_width: 1,
-            restart: NativeSuffixRestart::OriginalStart,
+            restart,
             retry: None,
             retry_cost_rejected: false,
-            reverse_seed: NativeSuffixReverseSeed::AcceptBoundary,
+            reverse_seed,
         };
         let reverse = NativeSeededReverseLayout {
             class_map_offset: 0x100,
             initial_row_offset: 0x200,
-            boundary_offset: 1,
+            boundary_offset: u8::from(proves_match),
             initial_reaches_start: false,
             proves_match,
-            first_endpoint_proves_no_earlier_match: false,
+            first_endpoint_proves_no_earlier_match: proves_match,
         };
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::DirectByte,
@@ -579,6 +619,8 @@ mod tests {
         let ordinary = emitted_words(false, false, false);
         let proving = emitted_words(false, false, true);
         assert!(proving.len() < ordinary.len());
+        assert!(ordinary.contains(&aarch64_movn_zero_x(REVERSE_MINIMUM).unwrap()));
+        assert!(!proving.contains(&aarch64_movn_zero_x(REVERSE_MINIMUM).unwrap()));
     }
 
     #[test]

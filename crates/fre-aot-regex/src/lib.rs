@@ -1057,6 +1057,18 @@ fn append_prepared_aggregate_exports_to_compiled(
         format,
         max_object_bytes,
         || {
+            let without_reverse = CompiledModule::lower_without_synchronizing_accept_reverse(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+            )?;
+            Ok(without_reverse.append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?)
+        },
+        || {
             let without_exact_set = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, true, true, true, false,
                 effective_native_data_limit_bytes,
@@ -1761,6 +1773,11 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         initial,
         format,
         limits.max_object_bytes,
+        || {
+            Err(CompileError::InternalInvariant(
+                "prepared Ordered-NFA unexpectedly selected a synchronizing reverse prepass",
+            ))
+        },
         || append_exports(lower_terminal(true, true, true, true, true, false)?),
         || append_exports(lower_terminal(true, true, true, true, false, false)?),
         || append_exports(lower_terminal(true, true, true, false, false, false)?),
@@ -2174,6 +2191,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
     mut module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
+    rebuild_without_synchronizing_accept_reverse: impl FnOnce()
+        -> Result<CompiledModule, CompileError>,
     rebuild_without_terminal_exact_set: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_whole_window_width_gate: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_width_gate_or_start_prefix: impl FnOnce() -> Result<CompiledModule, CompileError>,
@@ -2186,6 +2205,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     rebuild_scalar_ordered_nfa: impl FnOnce() -> Result<CompiledModule, CompileError>,
 ) -> Result<FinalObjectAttempt, CompileError> {
     let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
+    let selected_synchronizing_accept_reverse = module.has_synchronizing_accept_reverse();
     let selected_terminal_exact_set = module.has_ordered_nfa_terminal_exact_set();
     let selected_width_gate = module.has_ordered_nfa_whole_window_width_gate();
     let selected_start_prefix = module.has_ordered_nfa_start_prefix();
@@ -2200,6 +2220,40 @@ fn emit_with_ordered_nfa_accelerator_retries(
         }) => error,
         Err(error) => return Err(error.into()),
     };
+
+    if selected_synchronizing_accept_reverse {
+        let without_reverse = rebuild_without_synchronizing_accept_reverse()?
+            .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        if without_reverse.has_synchronizing_accept_reverse()
+            || without_reverse.slow_aot_report().is_some()
+            || without_reverse.compiler_k0_aot_report().is_some()
+            || without_reverse.required_runtime_symbols().next().is_some()
+            || without_reverse.required_prepare_capabilities() != 0
+            || without_reverse.start_accelerator() != module.start_accelerator()
+        {
+            return Err(CompileError::InternalInvariant(
+                "synchronizing reverse final-object retry changed its complete-DFA route",
+            ));
+        }
+        match emit_object(&without_reverse, format, max_object_bytes) {
+            Ok(object) => {
+                return Ok(FinalObjectAttempt::Fit {
+                    module: without_reverse,
+                    object,
+                });
+            }
+            Err(error @ ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) => {
+                return Ok(FinalObjectAttempt::ObjectBytes {
+                    module: without_reverse,
+                    first_error: error,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 
     if selected_terminal_exact_set {
         let without_exact_set = rebuild_without_terminal_exact_set()?
@@ -2416,6 +2470,13 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         format,
         max_object_bytes,
         || {
+            CompiledModule::lower_without_synchronizing_accept_reverse(
+                program,
+                target,
+                max_native_data_bytes,
+            )
+        },
+        || {
             CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 program, target, false, allow_ordered_nfa, true, true, true, true, true, false,
                 max_native_data_bytes,
@@ -2478,6 +2539,13 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 second,
                 format,
                 max_object_bytes,
+                || {
+                    CompiledModule::lower_without_synchronizing_accept_reverse(
+                        program,
+                        target,
+                        max_native_data_bytes,
+                    )
+                },
                 || {
                     CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                         program, target, second_endpoint, second_ordered_route, true, true, true, true, true, false,
@@ -2639,6 +2707,13 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 format,
                 limits.max_object_bytes,
                 || {
+                    CompiledModule::lower_without_synchronizing_accept_reverse(
+                        &program,
+                        target,
+                        effective_native_data_limit_bytes,
+                    )
+                },
+                || {
                     CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                         &program, target, false, true, true, true, true, true, true, false,
                         effective_native_data_limit_bytes,
@@ -2695,6 +2770,13 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             k0_fallback,
                             format,
                             limits.max_object_bytes,
+                            || {
+                                CompiledModule::lower_without_synchronizing_accept_reverse(
+                                    &program,
+                                    target,
+                                    effective_native_data_limit_bytes,
+                                )
+                            },
                             || {
                                 CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                                     &program, target, false, true, true, true, true, true, true, false,

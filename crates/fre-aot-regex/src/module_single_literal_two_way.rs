@@ -349,6 +349,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             needs_runtime: false,
             start_accelerator: scanner,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
         },
         report,
     )))
