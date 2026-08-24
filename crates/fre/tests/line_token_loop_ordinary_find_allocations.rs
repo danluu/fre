@@ -42,6 +42,21 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
     dense_inline.push(b'Z');
     assert!(dense_regex.is_match(&dense_inline));
 
+    let unanchored = PortableBuilder::new(r"(?-u:(?:ab+c|de?f)+Z)")
+        .build()
+        .unwrap();
+    assert_eq!(unanchored.build_report().plan, PlanKind::K0);
+    let mut unanchored_late = vec![b'!'; 4_087];
+    unanchored_late.extend_from_slice(b"abbbcdefZ");
+    let unanchored_absent = vec![b'!'; 4_096];
+    let unanchored_dense = vec![b'Z'; 4_096];
+    let mut unanchored_rejected_then_late = vec![b'!'; 4_080];
+    unanchored_rejected_then_late.extend_from_slice(b"qbcZ!abcZ");
+    assert!(unanchored.is_match(&unanchored_late));
+    assert!(!unanchored.is_match(&unanchored_absent));
+    assert!(!unanchored.is_match(&unanchored_dense));
+    assert!(unanchored.is_match(&unanchored_rejected_then_late));
+
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
         assert!(black_box(regex.is_match(black_box(&late))));
@@ -60,6 +75,34 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
             black_box(regex.find(black_box(&rejected_then_late)))
                 .map(|matched| (matched.start(), matched.end())),
             Some((4_083, 4_092)),
+        );
+        assert!(black_box(unanchored.is_match(black_box(&unanchored_late))));
+        assert!(!black_box(
+            unanchored.is_match(black_box(&unanchored_absent))
+        ));
+        assert!(!black_box(
+            unanchored.is_match(black_box(&unanchored_dense))
+        ));
+        assert!(black_box(
+            unanchored.is_match(black_box(&unanchored_rejected_then_late))
+        ));
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_late)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((4_087, 4_096)),
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_absent))),
+            None,
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_dense))),
+            None,
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_rejected_then_late)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((4_085, 4_089)),
         );
     }
     assert_eq!(measured.change(), Stats::default());

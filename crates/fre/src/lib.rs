@@ -10257,6 +10257,16 @@ impl PortableBuilder {
             }
         };
         let deferred_short_unbounded = mandatory_suffix.deferred_short_unbounded;
+        // Preserve the exact one-byte suffix certificate after the deferred
+        // transaction consumes its copy. The final ordinary token-loop proof
+        // cross-checks its HIR terminal against this independently analyzed
+        // byte instead of relying on shape alone.
+        let deferred_short_terminal = deferred_short_unbounded.as_ref().and_then(|candidate| {
+            let [terminal] = candidate.as_bytes() else {
+                return None;
+            };
+            Some(*terminal)
+        });
         fallback_planner_work = mandatory_suffix.planner_work;
         let packed_frontier = if k0_absolute_end_proof.is_none()
             && matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
@@ -10996,6 +11006,60 @@ impl PortableBuilder {
         } else {
             None
         };
+        // The exact unanchored language `(BRANCH | ...)+ BYTE` fills the
+        // remaining one-byte-terminal gap. A globally unique token alphabet
+        // makes reverse decoding deterministic, while the disjoint terminal
+        // is a barrier between candidate regions. Keep this ordinary-only
+        // proof at the same final, boxed priority as the disjoint line owners.
+        let unanchored_token_loop_inspection = if line_token_loop_inspection.is_none()
+            && line_prefix_tail_inspection.is_none()
+            && let Some(deferred_short_terminal) = deferred_short_terminal
+            && mandatory_suffix_plan.is_none()
+            && correlated_terminal.is_none()
+            && k0_absolute_end_proof.is_none()
+            && packed_frontier_plan.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_line_token_loop_exists::inspect_unanchored(
+                &rust.hir,
+                deferred_short_terminal,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_line_token_loop_exists::UnanchoredInspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_line_token_loop_exists::UnanchoredInspectionOutcome::Ineligible {
+                            ..
+                        } => None,
+                    }
+                }
+                Err(k0_line_token_loop_exists::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_line_token_loop_exists::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "unanchored token-loop planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let incumbent_optional_bytes = mandatory_suffix_storage_bytes
             .checked_add(mandatory_cut_storage_bytes)
             .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
@@ -11003,13 +11067,18 @@ impl PortableBuilder {
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
-        let line_inspection = match (line_token_loop_inspection, line_prefix_tail_inspection) {
-            (Some(plan), None) => Some(K0LinePlan::TokenLoop(plan)),
-            (None, Some(plan)) => Some(K0LinePlan::PrefixTail(plan)),
-            (None, None) => None,
-            (Some(_), Some(_)) => {
+        let line_inspection = match (
+            line_token_loop_inspection,
+            line_prefix_tail_inspection,
+            unanchored_token_loop_inspection,
+        ) {
+            (Some(plan), None, None) => Some(K0LinePlan::TokenLoop(plan)),
+            (None, Some(plan), None) => Some(K0LinePlan::PrefixTail(plan)),
+            (None, None, Some(plan)) => Some(K0LinePlan::UnanchoredTokenLoop(plan)),
+            (None, None, None) => None,
+            _ => {
                 return Err(BuildError::InternalInvariant(
-                    "exclusive K0 line sidecars were inspected together",
+                    "exclusive K0 compact sidecars were inspected together",
                 ));
             }
         };
@@ -11399,6 +11468,7 @@ impl K0AbsoluteEndProof {
 enum K0LinePlan {
     PrefixTail(k0_line_prefix_tail::Plan),
     TokenLoop(k0_line_token_loop_exists::Plan),
+    UnanchoredTokenLoop(k0_line_token_loop_exists::UnanchoredPlan),
 }
 
 impl K0LinePlan {
@@ -11410,7 +11480,26 @@ impl K0LinePlan {
     const fn token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::TokenLoop(plan) => Some(plan),
-            Self::PrefixTail(_) => None,
+            Self::PrefixTail(_) | Self::UnanchoredTokenLoop(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn unanchored_token_loop(
+        &self,
+    ) -> Option<&k0_line_token_loop_exists::UnanchoredPlan> {
+        match self {
+            Self::UnanchoredTokenLoop(plan) => Some(plan),
+            Self::PrefixTail(_) | Self::TokenLoop(_) => None,
+        }
+    }
+
+    const fn minimum_input_bytes(&self) -> usize {
+        match self {
+            Self::PrefixTail(_) | Self::TokenLoop(_) => k0_line_token_loop_exists::MIN_INPUT_BYTES,
+            Self::UnanchoredTokenLoop(_) => {
+                k0_line_token_loop_exists::UNANCHORED_MIN_INPUT_BYTES
+            }
         }
     }
 
@@ -11419,6 +11508,7 @@ impl K0LinePlan {
         match self {
             Self::PrefixTail(plan) => Some(plan.is_match_full(haystack)),
             Self::TokenLoop(plan) => plan.try_is_match_full(haystack),
+            Self::UnanchoredTokenLoop(plan) => plan.try_is_match_full(haystack),
         }
     }
 
@@ -11427,6 +11517,7 @@ impl K0LinePlan {
         match self {
             Self::PrefixTail(plan) => Some(plan.find_full(haystack)),
             Self::TokenLoop(plan) => plan.try_find_full(haystack),
+            Self::UnanchoredTokenLoop(plan) => plan.try_find_full(haystack),
         }
     }
 }
@@ -11458,6 +11549,14 @@ impl K0ExclusivePlan {
     fn line_token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::Line(plan) => plan.token_loop(),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn unanchored_token_loop(&self) -> Option<&k0_line_token_loop_exists::UnanchoredPlan> {
+        match self {
+            Self::Line(plan) => plan.unanchored_token_loop(),
             Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
@@ -14358,8 +14457,8 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
-                if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line()
+                if let Some(plan) = k0.exclusive.line()
+                    && haystack.len() >= plan.minimum_input_bytes()
                     && let Some(matched) = plan.try_ordinary_is_match_full(haystack)
                 {
                     return Ok(matched);
@@ -16093,8 +16192,8 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
-                if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(plan) = k0.exclusive.line()
+                if let Some(plan) = k0.exclusive.line()
+                    && haystack.len() >= plan.minimum_input_bytes()
                     && let Some(matched) = plan.try_ordinary_find_full(haystack)
                 {
                     return Ok(matched.map(|(start, end)| Match { start, end }));
