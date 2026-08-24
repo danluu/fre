@@ -13951,6 +13951,9 @@ impl PortableRegex {
                     unicode_folded_literal_limits(SearchLimits::unlimited()),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::LineDomainByteAtoms(plan) => plan
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .map_err(SearchError::from),
             PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
                 .is_match_window_value(
                     haystack,
