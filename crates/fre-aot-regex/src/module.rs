@@ -1688,7 +1688,11 @@ pub(crate) enum PreparedOrderedNfaV15LoweringDisposition {
 pub(crate) struct DirectExactSingletonCountPatchRollback {
     original_text: Box<[u8]>,
     old_count_symbol_name: String,
+    old_count_symbol_size: u64,
 }
+
+const DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES: usize = 8;
+const DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedOrderedNfaV15Surface {
@@ -9227,26 +9231,74 @@ impl CompiledModule {
                 "direct Count-v3 incumbent body is not instruction aligned",
             ));
         }
+        if short_fallback_max_bytes.is_some() && count_end != original_text_bytes {
+            return Ok(None);
+        }
+        if short_fallback_max_bytes.is_some() {
+            for (symbol_index, symbol) in self.symbols.iter().enumerate() {
+                if symbol_index == count_index || symbol.section != Some(TEXT_SECTION) {
+                    continue;
+                }
+                let symbol_offset = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol offset",
+                    )
+                })?;
+                if symbol_offset >= authenticated_body_offset {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count-v3 incumbent body has an unaudited symbol",
+                    ));
+                }
+            }
+        }
         let copied_incumbent_body_offset = short_fallback_max_bytes
-            .map(|_| original_text_bytes);
+            .map(|_| {
+                authenticated_body_offset
+                    .checked_add(DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 relocated incumbent body offset",
+                    ))
+            })
+            .transpose()?;
         let copied_incumbent_body_bytes = short_fallback_max_bytes
             .map(|_| incumbent_body_bytes);
-        let appended_incumbent_end = copied_incumbent_body_offset
+        let relocated_incumbent_end = copied_incumbent_body_offset
             .zip(copied_incumbent_body_bytes)
             .map_or(Ok(original_text_bytes), |(offset, bytes)| {
                 offset.checked_add(bytes).ok_or(ObjectError::ArithmeticOverflow(
-                    "direct Count-v3 copied incumbent body extent",
+                    "direct Count-v3 relocated incumbent body extent",
                 ))
             })?;
-        let core_offset = appended_incumbent_end
-            .checked_add(3)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "direct Count-v3 core alignment",
-            ))?
-            & !3;
+        let direct_thunk_offset = short_fallback_max_bytes
+            .map(|_| relocated_incumbent_end);
+        let core_offset = if let Some(thunk_offset) = direct_thunk_offset {
+            thunk_offset
+                .checked_add(DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 short direct thunk extent",
+                ))?
+        } else {
+            original_text_bytes
+                .checked_add(3)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 core alignment",
+                ))?
+                & !3
+        };
         let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
             ObjectError::ArithmeticOverflow("direct Count-v3 core extent"),
         )?;
+        let selected_count_size = core_offset.checked_sub(count_start).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 selected Count extent is invalid"),
+        )?;
+        let selected_count_symbol_size = u64::try_from(selected_count_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 selected Count symbol size")
+        })?;
+        if short_fallback_max_bytes.is_none() && selected_count_size != count_size {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 ungated Count symbol extent changed",
+            ));
+        }
         let incumbent_code_bytes = u32::try_from(count_size).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Count-v3 incumbent code bytes")
         })?;
@@ -9289,22 +9341,17 @@ impl CompiledModule {
             return Ok(None);
         }
 
-        let direct_branch_relative = if short_fallback_max_bytes.is_some() {
-            20
-        } else {
-            12
-        };
-        let branch_offset = authenticated_body_offset.checked_add(direct_branch_relative).ok_or(
-            ObjectError::ArithmeticOverflow("direct Count-v3 tail branch offset"),
-        )?;
+        let branch_offset = direct_thunk_offset
+            .unwrap_or(authenticated_body_offset)
+            .checked_add(12)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 core branch offset",
+            ))?;
         let Some(branch) = aarch64_local_branch_instruction(branch_offset, core_offset)? else {
             return Ok(None);
         };
-        let mut patch = [0xd503_201f_u32; 6];
-        let patch_instructions: usize = if let (
-            Some(short_max),
-            Some(copied_offset),
-        ) = (short_fallback_max_bytes, copied_incumbent_body_offset)
+        let (gate, direct_patch) = if let (Some(short_max), Some(thunk_offset)) =
+            (short_fallback_max_bytes, direct_thunk_offset)
         {
             let direct_min = short_max.checked_add(1).ok_or(
                 ObjectError::ArithmeticOverflow("direct Count-v3 short threshold"),
@@ -9320,49 +9367,52 @@ impl CompiledModule {
             let gate_branch_offset = authenticated_body_offset.checked_add(4).ok_or(
                 ObjectError::ArithmeticOverflow("direct Count-v3 short branch offset"),
             )?;
-            let Some(short_branch) = aarch64_local_cond_branch_instruction(
+            let Some(direct_branch) = aarch64_local_cond_branch_instruction(
                 gate_branch_offset,
-                copied_offset,
-                AARCH64_LO,
+                thunk_offset,
+                AARCH64_HS,
             )? else {
                 return Ok(None);
             };
-            patch = [
-                aarch64_cmp_x_imm_lsl12(2, pages)?,
-                short_branch,
-                aarch64_mov_x(0, 1)?,
-                aarch64_mov_x(1, 2)?,
-                aarch64_mov_x(2, 3)?,
-                branch,
-            ];
-            6
+            (
+                Some([
+                    aarch64_cmp_x_imm_lsl12(2, pages)?,
+                    direct_branch,
+                ]),
+                [
+                    aarch64_mov_x(0, 1)?,
+                    aarch64_mov_x(1, 2)?,
+                    aarch64_mov_x(2, 3)?,
+                    branch,
+                ],
+            )
         } else {
-            patch[..4].copy_from_slice(&[
-                aarch64_mov_x(0, 1)?,
-                aarch64_mov_x(1, 2)?,
-                aarch64_mov_x(2, 3)?,
-                branch,
-            ]);
-            4
+            (
+                None,
+                [
+                    aarch64_mov_x(0, 1)?,
+                    aarch64_mov_x(1, 2)?,
+                    aarch64_mov_x(2, 3)?,
+                    branch,
+                ],
+            )
         };
-        let patch_bytes_len = patch_instructions.checked_mul(4).ok_or(
-            ObjectError::ArithmeticOverflow("direct Count-v3 wrapper patch bytes"),
-        )?;
-        if authenticated_body_offset
-            .checked_add(patch_bytes_len)
-            .is_none_or(|end| end > count_end)
+        let mut direct_patch_bytes =
+            [0_u8; DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES];
+        for (slot, instruction) in direct_patch_bytes
+            .chunks_exact_mut(4)
+            .zip(direct_patch)
+        {
+            slot.copy_from_slice(&instruction.to_le_bytes());
+        }
+        if direct_thunk_offset.is_none()
+            && authenticated_body_offset
+                .checked_add(direct_patch_bytes.len())
+                .is_none_or(|end| end > count_end)
         {
             return Err(ObjectError::InvalidModule(
                 "direct Count-v3 wrapper patch escapes its incumbent body",
             ));
-        }
-        let mut patch_bytes = [0_u8; 24];
-        for (slot, instruction) in patch_bytes
-            .chunks_exact_mut(4)
-            .zip(patch.into_iter())
-            .take(patch_instructions)
-        {
-            slot.copy_from_slice(&instruction.to_le_bytes());
         }
         let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Count-v3 literal width")
@@ -9370,71 +9420,122 @@ impl CompiledModule {
         let mut text = Vec::new();
         text.try_reserve_exact(final_text_bytes)
             .map_err(|_| ObjectError::Allocation("direct Count-v3 module text"))?;
-        text.extend_from_slice(&self.sections[TEXT_SECTION].data);
-        if let Some(copied_offset) = copied_incumbent_body_offset {
-            while text.len() < copied_offset {
-                text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+        if let (Some(gate), Some(copied_offset), Some(thunk_offset)) =
+            (gate, copied_incumbent_body_offset, direct_thunk_offset)
+        {
+            text.extend_from_slice(&self.sections[TEXT_SECTION].data[..authenticated_body_offset]);
+            for instruction in gate {
+                text.extend_from_slice(&instruction.to_le_bytes());
             }
             text.extend_from_slice(
                 &self.sections[TEXT_SECTION].data[authenticated_body_offset..count_end],
             );
-            let copied_call_offset = copied_offset
-                .checked_add(call_offset.checked_sub(authenticated_body_offset).ok_or(
-                    ObjectError::InvalidModule(
-                        "direct Count-v3 incumbent call precedes authenticated body",
-                    ),
-                )?)
+            let expected_copied_offset = authenticated_body_offset
+                .checked_add(DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES)
                 .ok_or(ObjectError::ArithmeticOverflow(
-                    "direct Count-v3 copied incumbent call offset",
+                    "direct Count-v3 relocated incumbent body offset",
                 ))?;
-            let copied_call_end = copied_call_offset.checked_add(4).ok_or(
-                ObjectError::ArithmeticOverflow("direct Count-v3 copied incumbent call extent"),
-            )?;
-            let Some(copied_call) = aarch64_local_call_instruction(
-                copied_call_offset,
-                ordinary_offset,
-            )? else {
-                return Ok(None);
-            };
-            text.get_mut(copied_call_offset..copied_call_end)
-                .ok_or(ObjectError::InvalidModule(
-                    "direct Count-v3 copied incumbent call escapes text",
-                ))?
-                .copy_from_slice(&copied_call.to_le_bytes());
-            let copied_relative_call = copied_call_offset.checked_sub(copied_offset).ok_or(
-                ObjectError::InvalidModule("direct Count-v3 copied call precedes its body"),
-            )?;
-            let copied_relative_call_end = copied_relative_call.checked_add(4).ok_or(
-                ObjectError::ArithmeticOverflow("direct Count-v3 copied relative call extent"),
-            )?;
-            let original_body = &self.sections[TEXT_SECTION].data
-                [authenticated_body_offset..count_end];
-            let copied_body = text
-                .get(copied_offset..appended_incumbent_end)
-                .ok_or(ObjectError::InvalidModule(
-                    "direct Count-v3 copied incumbent body escapes text",
-                ))?;
-            if copied_body.get(..copied_relative_call)
-                != original_body.get(..copied_relative_call)
-                || copied_body.get(copied_relative_call..copied_relative_call_end)
-                    != Some(copied_call.to_le_bytes().as_slice())
-                || copied_body.get(copied_relative_call_end..)
-                    != original_body.get(copied_relative_call_end..)
+            if text.len() != relocated_incumbent_end
+                || copied_offset != expected_copied_offset
             {
                 return Err(ObjectError::InvalidModule(
-                    "direct Count-v3 copied incumbent body disagrees",
+                    "direct Count-v3 relocated incumbent body extent disagrees",
                 ));
             }
+            for original_offset in (count_start..count_end).step_by(4) {
+                let original_end = original_offset.checked_add(4).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent instruction extent",
+                    ),
+                )?;
+                let original_instruction = u32::from_le_bytes(
+                    self.sections[TEXT_SECTION].data[original_offset..original_end]
+                        .try_into()
+                        .map_err(|_| {
+                            ObjectError::InvalidModule(
+                                "direct Count-v3 incumbent instruction is truncated",
+                            )
+                        })?,
+                );
+                let selected_offset = if original_offset >= authenticated_body_offset {
+                    original_offset
+                        .checked_add(DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 relocated instruction offset",
+                        ))?
+                } else {
+                    original_offset
+                };
+                if let Some(original_target) =
+                    aarch64_direct_branch_target(original_offset, original_instruction)?
+                {
+                    let selected_target = if (authenticated_body_offset..count_end)
+                        .contains(&original_target)
+                    {
+                        original_target
+                            .checked_add(DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "direct Count-v3 relocated branch target",
+                            ))?
+                    } else {
+                        original_target
+                    };
+                    if !(count_start..count_end).contains(&original_target)
+                        && (original_target != ordinary_offset
+                            || original_offset != call_offset
+                            || original_instruction & 0xfc00_0000 != 0x9400_0000)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "direct Count-v3 incumbent has an unaudited escaping branch",
+                        ));
+                    }
+                    let Some(selected_instruction) =
+                        aarch64_relocate_direct_branch_instruction(
+                            selected_offset,
+                            selected_target,
+                            original_instruction,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let selected_end = selected_offset.checked_add(4).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 selected instruction extent",
+                        ),
+                    )?;
+                    text.get_mut(selected_offset..selected_end)
+                        .ok_or(ObjectError::InvalidModule(
+                            "direct Count-v3 relocated branch escapes text",
+                        ))?
+                        .copy_from_slice(&selected_instruction.to_le_bytes());
+                } else if original_offset >= authenticated_body_offset
+                    && aarch64_is_pc_relative_address_or_literal(original_instruction)
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count-v3 incumbent body has an unaudited PC-relative instruction",
+                    ));
+                }
+            }
+            if text.len() != thunk_offset {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 direct thunk offset disagrees",
+                ));
+            }
+            text.extend_from_slice(&direct_patch_bytes);
+        } else {
+            text.extend_from_slice(&self.sections[TEXT_SECTION].data);
+            let patch_end = authenticated_body_offset
+                .checked_add(direct_patch_bytes.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 wrapper patch extent",
+                ))?;
+            text[authenticated_body_offset..patch_end]
+                .copy_from_slice(&direct_patch_bytes);
         }
         while text.len() < core_offset {
             text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
         }
         text.extend_from_slice(&candidate.code);
-        let patch_end = authenticated_body_offset.checked_add(patch_bytes_len).ok_or(
-            ObjectError::ArithmeticOverflow("direct Count-v3 wrapper patch extent"),
-        )?;
-        text[authenticated_body_offset..patch_end]
-            .copy_from_slice(&patch_bytes[..patch_bytes_len]);
         let embedded_sha256: [u8; 32] =
             Sha256::digest(&text[core_offset..final_text_bytes]).into();
         if text.get(core_offset..final_text_bytes) != Some(candidate.code.as_ref())
@@ -9454,7 +9555,7 @@ impl CompiledModule {
             DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
         };
         let mut selected_identity = Sha256::new();
-        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v2\0");
+        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v3\0");
         selected_identity.update(incumbent_module_identity);
         selected_identity.update(artifact_identity);
         selected_identity.update(candidate.recipe_identity);
@@ -9495,6 +9596,7 @@ impl CompiledModule {
                 })?
                 .to_le_bytes(),
         );
+        selected_identity.update(selected_count_symbol_size.to_le_bytes());
         selected_identity.update(
             u64::try_from(candidate.code.len())
                 .map_err(|_| {
@@ -9517,6 +9619,10 @@ impl CompiledModule {
         let old_count_symbol_name = std::mem::replace(
             &mut self.symbols[count_index].name,
             count_name,
+        );
+        let old_count_symbol_size = std::mem::replace(
+            &mut self.symbols[count_index].size,
+            selected_count_symbol_size,
         );
         self.direct_exact_singleton_count_aot_report = Some(
             DirectExactSingletonCountAotReport {
@@ -9543,6 +9649,7 @@ impl CompiledModule {
         Ok(Some(DirectExactSingletonCountPatchRollback {
             original_text,
             old_count_symbol_name,
+            old_count_symbol_size,
         }))
     }
 
@@ -9558,14 +9665,48 @@ impl CompiledModule {
             .ok_or(ObjectError::InvalidModule(
                 "direct Count-v3 rollback has no selected report",
             ))?;
-        let original_text_bytes = report
-            .copied_incumbent_body_offset
-            .unwrap_or(report.core_offset);
+        let original_text_bytes = rollback.original_text.len();
+        let gated = match (
+            report.copied_incumbent_body_offset,
+            report.copied_incumbent_body_bytes,
+        ) {
+            (Some(copied_offset), Some(copied_bytes)) => {
+                let expected_copied_offset = report
+                    .authenticated_wrapper_body_offset
+                    .checked_add(DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES);
+                let expected_copied_bytes = original_text_bytes
+                    .checked_sub(report.authenticated_wrapper_body_offset);
+                let expected_core_offset = copied_offset
+                    .checked_add(copied_bytes)
+                    .and_then(|end| {
+                        end.checked_add(DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES)
+                    });
+                if expected_copied_offset != Some(copied_offset)
+                    || expected_copied_bytes != Some(copied_bytes)
+                    || expected_core_offset != Some(report.core_offset)
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count-v3 rollback relocated body disagrees",
+                    ));
+                }
+                true
+            }
+            (None, None) => {
+                if report.core_offset != original_text_bytes {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count-v3 rollback ungated core offset disagrees",
+                    ));
+                }
+                false
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 rollback relocated body fields disagree",
+                ));
+            }
+        };
         if report.core_offset.checked_add(report.core_bytes)
             != Some(self.sections[TEXT_SECTION].data.len())
-            || rollback.original_text.len() != original_text_bytes
-            || report.copied_incumbent_body_offset.is_some()
-                != report.copied_incumbent_body_bytes.is_some()
         {
             return Err(ObjectError::InvalidModule(
                 "direct Count-v3 rollback checkpoint disagrees",
@@ -9574,13 +9715,36 @@ impl CompiledModule {
         let count_index = self.prepared_count_symbol_index.ok_or(
             ObjectError::InvalidModule("direct Count-v3 rollback lost Count symbol"),
         )?;
-        if self.symbols.get(count_index).is_none() {
+        let count = self.symbols.get(count_index).ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 rollback Count symbol is invalid",
+        ))?;
+        let selected_size_delta = if gated {
+            u64::try_from(
+                DIRECT_EXACT_SINGLETON_COUNT_SHORT_GATE_BYTES
+                    + DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 rollback selected Count size delta",
+                )
+            })?
+        } else {
+            0
+        };
+        let expected_selected_count_size = rollback
+            .old_count_symbol_size
+            .checked_add(selected_size_delta)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 rollback selected Count symbol size",
+            ))?;
+        if count.size != expected_selected_count_size {
             return Err(ObjectError::InvalidModule(
-                "direct Count-v3 rollback Count symbol is invalid",
+                "direct Count-v3 rollback Count symbol size disagrees",
             ));
         }
         self.sections[TEXT_SECTION].data = rollback.original_text;
         self.symbols[count_index].name = rollback.old_count_symbol_name;
+        self.symbols[count_index].size = rollback.old_count_symbol_size;
         self.direct_exact_singleton_count_aot_report = None;
         Ok(())
     }
@@ -66345,6 +66509,91 @@ fn aarch64_local_cond_branch_instruction(
     Ok(Some(
         0x5400_0000 | (immediate << 5) | u32::from(condition),
     ))
+}
+
+/// Return the immediate-field shift and width for every direct AArch64 branch
+/// shape whose target is encoded relative to the instruction address.
+fn aarch64_direct_branch_immediate_shape(instruction: u32) -> Option<(u8, u8)> {
+    if instruction & 0xfc00_0000 == 0x1400_0000
+        || instruction & 0xfc00_0000 == 0x9400_0000
+    {
+        Some((0, 26)) // B or BL.
+    } else if instruction & 0xff00_0010 == 0x5400_0000
+        || instruction & 0x7e00_0000 == 0x3400_0000
+    {
+        Some((5, 19)) // B.cond or CBZ/CBNZ.
+    } else if instruction & 0x7e00_0000 == 0x3600_0000 {
+        Some((5, 14)) // TBZ/TBNZ.
+    } else {
+        None
+    }
+}
+
+/// Decode one direct AArch64 branch target from a module-relative instruction
+/// offset. This is deliberately limited to the complete immediate branch
+/// family above; register-indirect branches are position independent.
+pub(crate) fn aarch64_direct_branch_target(
+    instruction_offset: usize,
+    instruction: u32,
+) -> Result<Option<usize>, ObjectError> {
+    let Some((shift, bits)) = aarch64_direct_branch_immediate_shape(instruction) else {
+        return Ok(None);
+    };
+    let immediate_mask = (1_u32 << bits) - 1;
+    let immediate = (instruction >> shift) & immediate_mask;
+    let sign_bit = 1_u32 << (bits - 1);
+    let signed_words = if immediate & sign_bit == 0 {
+        i64::from(immediate)
+    } else {
+        i64::from(immediate) - (1_i64 << bits)
+    };
+    let instruction_offset = i64::try_from(instruction_offset).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 direct branch instruction offset")
+    })?;
+    let displacement = signed_words.checked_mul(4).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 direct branch displacement"),
+    )?;
+    let target = instruction_offset.checked_add(displacement).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 direct branch target"),
+    )?;
+    Ok(Some(usize::try_from(target).map_err(|_| {
+        ObjectError::InvalidModule("AArch64 direct branch target is negative")
+    })?))
+}
+
+/// Preserve an authenticated direct-branch opcode while retargeting its
+/// immediate from a relocated instruction address. `None` is the ordinary
+/// numeric-range decline; malformed/non-branch input is terminal.
+pub(crate) fn aarch64_relocate_direct_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+    instruction: u32,
+) -> Result<Option<u32>, ObjectError> {
+    let Some((shift, bits)) = aarch64_direct_branch_immediate_shape(instruction) else {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct branch relocation received a non-branch",
+        ));
+    };
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, bits)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << bits;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 relocated direct branch immediate")
+    })?;
+    let immediate_mask = ((1_u32 << bits) - 1) << shift;
+    Ok(Some(
+        (instruction & !immediate_mask) | (immediate << shift),
+    ))
+}
+
+/// Identify the remaining AArch64 instruction classes whose result depends on
+/// their address. A relocated authenticated body must reject these unless a
+/// dedicated relocation rule is added.
+pub(crate) const fn aarch64_is_pc_relative_address_or_literal(instruction: u32) -> bool {
+    instruction & 0x1f00_0000 == 0x1000_0000 // ADR or ADRP.
+        || instruction & 0x3b00_0000 == 0x1800_0000 // Load literal family.
 }
 
 fn aarch64_local_call_instruction(

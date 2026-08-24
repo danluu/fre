@@ -789,7 +789,7 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         .expect("incumbent text")
         .bytes();
     let authenticated = report.authenticated_wrapper_body_offset;
-    let gate = selected_text[authenticated..authenticated + 24]
+    let gate = selected_text[authenticated..authenticated + 8]
         .chunks_exact(4)
         .map(|word| u32::from_le_bytes(word.try_into().expect("instruction")))
         .collect::<Vec<_>>();
@@ -799,17 +799,59 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         gate[0],
         0xf140_001f | ((direct_min >> 12) << 10) | (2 << 5),
     );
-    assert_eq!(gate[1] & 0xff00_001f, 0x5400_0003);
+    assert_eq!(gate[1] & 0xff00_001f, 0x5400_0002);
+    let direct_thunk_offset = report
+        .core_offset
+        .checked_sub(16)
+        .expect("direct thunk precedes core");
     assert_eq!(
         signed_target(authenticated + 4, (gate[1] >> 5) & 0x7ffff, 19),
-        copied_offset,
+        direct_thunk_offset,
     );
-    assert_eq!(gate[2], 0xaa01_03e0);
-    assert_eq!(gate[3], 0xaa02_03e1);
-    assert_eq!(gate[4], 0xaa03_03e2);
-    assert_eq!(gate[5] & 0xfc00_0000, 0x1400_0000);
+    assert_eq!(copied_offset, authenticated + 8);
+
+    let direct_thunk = selected_text[direct_thunk_offset..report.core_offset]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("instruction")))
+        .collect::<Vec<_>>();
+    assert_eq!(direct_thunk[0], 0xaa01_03e0);
+    assert_eq!(direct_thunk[1], 0xaa02_03e1);
+    assert_eq!(direct_thunk[2], 0xaa03_03e2);
+    assert_eq!(direct_thunk[3] & 0xfc00_0000, 0x1400_0000);
     assert_eq!(
-        signed_target(authenticated + 20, gate[5] & 0x03ff_ffff, 26),
+        signed_target(
+            direct_thunk_offset + 12,
+            direct_thunk[3] & 0x03ff_ffff,
+            26,
+        ),
+        report.core_offset,
+    );
+
+    let selected_count_name = selected
+        .module()
+        .prepared_count_symbol()
+        .expect("selected Count symbol");
+    let selected_count = selected
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == selected_count_name)
+        .expect("selected Count symbol record");
+    let incumbent_count_name = incumbent
+        .module()
+        .prepared_count_symbol()
+        .expect("incumbent Count symbol");
+    let incumbent_count = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == incumbent_count_name)
+        .expect("incumbent Count symbol record");
+    assert_eq!(selected_count.offset, incumbent_count.offset);
+    assert_eq!(selected_count.size, incumbent_count.size + 24);
+    assert_eq!(
+        usize::try_from(selected_count.offset + selected_count.size)
+            .expect("selected Count extent"),
         report.core_offset,
     );
 
@@ -878,6 +920,69 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         }
     }
     assert_eq!(escaping_calls, 1, "the ordinary BL is the sole escaping branch");
+}
+
+#[test]
+fn direct_count_aarch64_relocation_covers_every_immediate_branch_family() {
+    let fixtures = [
+        (0x1400_0000_u32, 0x03ff_ffff_u32), // B.
+        (0x9400_0000_u32, 0x03ff_ffff_u32), // BL.
+        (0x5400_0001_u32, 0x00ff_ffe0_u32), // B.ne.
+        (0x3400_0005_u32, 0x00ff_ffe0_u32), // CBZ w5.
+        (0xb500_0006_u32, 0x00ff_ffe0_u32), // CBNZ x6.
+        (0x3600_0007_u32, 0x0007_ffe0_u32), // TBZ w7.
+        (0xb700_0008_u32, 0x0007_ffe0_u32), // TBNZ x8, #63.
+    ];
+    for (opcode, immediate_mask) in fixtures {
+        let forward = crate::module::aarch64_relocate_direct_branch_instruction(
+            0x100,
+            0x180,
+            opcode,
+        )
+        .expect("encode forward direct branch")
+        .expect("forward branch is in range");
+        assert_eq!(forward & !immediate_mask, opcode & !immediate_mask);
+        assert_eq!(
+            crate::module::aarch64_direct_branch_target(0x100, forward)
+                .expect("decode forward direct branch"),
+            Some(0x180),
+        );
+
+        let backward = crate::module::aarch64_relocate_direct_branch_instruction(
+            0x280,
+            0x180,
+            forward,
+        )
+        .expect("encode backward direct branch")
+        .expect("backward branch is in range");
+        assert_eq!(backward & !immediate_mask, opcode & !immediate_mask);
+        assert_eq!(
+            crate::module::aarch64_direct_branch_target(0x280, backward)
+                .expect("decode backward direct branch"),
+            Some(0x180),
+        );
+    }
+    assert!(
+        crate::module::aarch64_relocate_direct_branch_instruction(
+            0,
+            1_usize << 30,
+            0x1400_0000,
+        )
+        .expect("numeric branch range check")
+        .is_none(),
+    );
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x1000_0000,
+    ));
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x9000_0000,
+    ));
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x5800_0000,
+    ));
+    assert!(!crate::module::aarch64_is_pc_relative_address_or_literal(
+        0xaa01_03e0,
+    ));
 }
 
 #[cfg(all(

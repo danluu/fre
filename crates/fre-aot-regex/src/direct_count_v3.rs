@@ -27,7 +27,7 @@ use crate::{
     PreparedAggregateStrategy, Target,
 };
 
-pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 2;
+pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 3;
 
 /// Largest source length routed to the authenticated incumbent body for the
 /// short-input periodic schedule. The focused core starts at one complete
@@ -108,7 +108,8 @@ pub struct DirectExactSingletonCountAotReport {
     /// Inclusive source-length ceiling for the byte-identical incumbent arm.
     /// `None` means the selected core owns every authenticated source length.
     pub short_fallback_max_bytes: Option<u32>,
-    /// Text extent of the relocated incumbent body used by the short arm.
+    /// Text extent of the incumbent body relocated after the fall-through
+    /// length gate. The short arm executes this body without taking a branch.
     pub copied_incumbent_body_offset: Option<usize>,
     pub copied_incumbent_body_bytes: Option<usize>,
     pub core_offset: usize,
