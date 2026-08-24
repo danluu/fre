@@ -27,11 +27,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, CompileLimitsV1, CompileMode, CompileResource, CompiledRegex, DeterminizeLimits,
-    MatchResult, ObjectError, OutputContract, PreparedAggregateExports, PreparedAggregateStrategy,
+    EngineKind, EntryAbi, MatchResult, ObjectError, OutputContract,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, ProgramWorkspace, SearchWindow, SectionKind, SlowAotLimits,
     SymbolBinding, SymbolKind, Target, finite_language::NativeFiniteLanguageCandidate,
-    program::CompiledProgram,
-    rust_profile_compiled_size_limit, set_rust_profile_compiled_size_limit,
+    program::CompiledProgram, rust_profile_compiled_size_limit,
+    set_rust_profile_compiled_size_limit,
 };
 
 /// Maximum owner count represented by the current tagged quotient.
@@ -1439,19 +1440,21 @@ pub fn compile_ordered_many_aot(
 /// and numeric V15 refusals as typed declines.
 ///
 /// Count, SpanSum, and GrepCount are fused native whole-operation reducers.
-/// The complete ordinary optimizer transaction runs first and is selected
-/// only when its model-specific reducer is an authenticated helper-free
-/// function. A known helper-backed ordinary strategy defers to the explicit
-/// reported V15 transaction against the same raw plan. A module that claims
-/// `NativeFused` but fails that exact authentication is malformed and remains
+/// The complete ordinary optimizer transaction runs first and is selected only
+/// when its model-specific reducer is an authenticated helper-free `NativeFused`
+/// function. A known helper-backed ordinary strategy, or the exact legacy V15
+/// compatibility surface, defers to the explicit reported V15 transaction
+/// against the same raw plan. A module that claims a native strategy but does
+/// not authenticate as one of those exact surfaces is malformed and remains
 /// terminal.
 ///
 /// # Errors
 ///
-/// A well-formed ordinary candidate with a known helper-backed strategy merely
-/// selects the explicit V15 transaction. An ordinary `ProgramBytes` or final
-/// `ObjectBytes` representation cap also permits that exact prior backend to
-/// report its own success, typed decline, or terminal error. Every parse,
+/// A well-formed ordinary candidate with a known helper-backed strategy or an
+/// authenticated legacy V15 compatibility surface merely selects the explicit
+/// V15 transaction. An ordinary `ProgramBytes` or final `ObjectBytes`
+/// representation cap also permits that exact prior backend to report its own
+/// success, typed decline, or terminal error. Every parse,
 /// lower, allocation, overflow, invariant, other numeric resource, codegen,
 /// semantic-identity, and final-artifact authentication failure remains
 /// terminal. Only [`OrderedManyAotCompileDecline`] authorizes retaining an
@@ -1595,11 +1598,16 @@ pub fn compile_ordered_many_aot_reported(
     if let Some(ordinary) = ordinary.as_ref() {
         authenticate_ordered_many_aggregate_entries(ordinary, exports)?;
     }
-    let compiled = match ordinary {
-        Some(ordinary)
-            if ordinary.module().prepared_aggregate_strategy()
-                == Some(PreparedAggregateStrategy::NativeFused) =>
-        {
+    let ordinary_strategy = ordinary
+        .as_ref()
+        .map(|compiled| compiled.module().prepared_aggregate_strategy());
+    let ordinary_v15_compatibility = ordinary.as_ref().is_some_and(|compiled| {
+        ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(compiled, exports)
+    });
+    let ordinary_action =
+        classify_ordinary_ordered_many_strategy(ordinary_strategy, ordinary_v15_compatibility)?;
+    let compiled = match (ordinary, ordinary_action) {
+        (Some(ordinary), OrdinaryOrderedManyAction::SelectNativeFused) => {
             if !helper_free_ordered_many_aggregate_is_authenticated(&ordinary, exports) {
                 return Err(OrderedManyAotCompileError::InternalInvariant(
                     "ordinary NativeFused ordered-many aggregate failed authentication",
@@ -1607,7 +1615,7 @@ pub fn compile_ordered_many_aot_reported(
             }
             ordinary
         }
-        ordinary => {
+        (ordinary, OrdinaryOrderedManyAction::TryExplicitV15) => {
             #[cfg(test)]
             EXPLICIT_V15_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let scalar_operation_only = exports == PreparedAggregateExports::COUNT
@@ -1664,6 +1672,11 @@ pub fn compile_ordered_many_aot_reported(
                 }
             }
         }
+        (None, OrdinaryOrderedManyAction::SelectNativeFused) => {
+            return Err(OrderedManyAotCompileError::InternalInvariant(
+                "ordered-many strategy classifier selected an absent ordinary candidate",
+            ));
+        }
     };
     let strategy = compiled.module().prepared_aggregate_strategy();
     let aggregate_shape_is_exact = matches!(
@@ -1696,6 +1709,216 @@ pub fn compile_ordered_many_aot_reported(
             receipt,
         },
     ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrdinaryOrderedManyAction {
+    SelectNativeFused,
+    TryExplicitV15,
+}
+
+fn classify_ordinary_ordered_many_strategy(
+    candidate: Option<Option<PreparedAggregateStrategy>>,
+    native_ordered_nfa_v15_compatibility_authenticated: bool,
+) -> Result<OrdinaryOrderedManyAction, OrderedManyAotCompileError> {
+    match candidate {
+        None => Ok(OrdinaryOrderedManyAction::TryExplicitV15),
+        Some(Some(PreparedAggregateStrategy::NativeFused)) => {
+            Ok(OrdinaryOrderedManyAction::SelectNativeFused)
+        }
+        Some(Some(
+            PreparedAggregateStrategy::RuntimeHelper
+            | PreparedAggregateStrategy::NativeFusedWithRuntimeHelper
+            | PreparedAggregateStrategy::NativeOrderedNfaFusedWithRuntimeHelper,
+        )) => Ok(OrdinaryOrderedManyAction::TryExplicitV15),
+        Some(Some(PreparedAggregateStrategy::NativeOrderedNfaFused))
+            if native_ordered_nfa_v15_compatibility_authenticated =>
+        {
+            Ok(OrdinaryOrderedManyAction::TryExplicitV15)
+        }
+        Some(Some(PreparedAggregateStrategy::NativeOrderedNfaFused)) => {
+            Err(OrderedManyAotCompileError::InternalInvariant(
+                "ordinary ordered-many aggregate claimed an unauthenticated native Ordered-NFA surface",
+            ))
+        }
+        Some(None) => Err(OrderedManyAotCompileError::InternalInvariant(
+            "ordinary ordered-many aggregate omitted its strategy",
+        )),
+    }
+}
+
+const ORDERED_NFA_V15_ROW_RUNTIME_SYMBOLS: [&str; 3] = [
+    "fre_aot_regex_runtime_search_v1",
+    "fre_aot_regex_runtime_search_exclusive_v1",
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+];
+const ORDERED_NFA_V15_COUNT_RUNTIME_SYMBOL: &str =
+    "fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
+const ORDERED_NFA_V15_SPAN_SUM_RUNTIME_SYMBOL: &str =
+    "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
+
+fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
+    compiled: &CompiledRegex,
+    exports: PreparedAggregateExports,
+) -> bool {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let Some(prepared_entry) = module.prepared_entry_symbol() else {
+        return false;
+    };
+    let Some(span_fill) = module.prepared_span_fill_symbol() else {
+        return false;
+    };
+    let Some((program, program_len)) = module.required_runtime_program() else {
+        return false;
+    };
+    let count = exports.contains(PreparedAggregateExports::COUNT);
+    let span_sum = exports.contains(PreparedAggregateExports::SPAN_SUM);
+    let symbols = [
+        Some(module.entry_symbol()),
+        Some(prepared_entry),
+        Some(span_fill),
+        count.then(|| module.prepared_count_symbol()).flatten(),
+        span_sum
+            .then(|| module.prepared_span_sum_symbol())
+            .flatten(),
+        Some(program),
+    ];
+    let symbols_are_distinct = symbols.iter().enumerate().all(|(index, symbol)| match symbol {
+        Some(symbol) => symbols[index + 1..]
+            .iter()
+            .flatten()
+            .all(|other| other != symbol),
+        None => (!count && index == 3) || (!span_sum && index == 4),
+    });
+    receipt.output == OutputContract::Span
+        && receipt.entry_abi == EntryAbi::SpanSearchV1
+        && receipt.engine == EngineKind::OrderedNfa
+        && receipt.runtime_helper_required
+        && receipt.prepared_aggregate_exports == exports
+        && receipt.prepared_aggregate_strategy
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        && module.prepared_aggregate_exports() == exports
+        && module.prepared_aggregate_strategy()
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+        && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
+        && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        && module.prepared_grep_count_symbol().is_none()
+        && program_len != 0
+        && exact_ordered_nfa_v15_runtime_symbol_closure(compiled, exports)
+        && defined_global_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
+        && defined_global_symbol(compiled, prepared_entry, SymbolKind::Function, None)
+        && defined_global_symbol(compiled, span_fill, SymbolKind::Function, None)
+        && module.prepared_count_symbol().is_none_or(|symbol| {
+            defined_global_symbol(compiled, symbol, SymbolKind::Function, None)
+        })
+        && module.prepared_span_sum_symbol().is_none_or(|symbol| {
+            defined_global_symbol(compiled, symbol, SymbolKind::Function, None)
+        })
+        && defined_global_symbol(compiled, program, SymbolKind::Object, Some(program_len))
+        && prepared_ordered_nfa_v15_symbol_identities_are_closed(
+            module.entry_symbol(),
+            prepared_entry,
+            span_fill,
+            program,
+        )
+        && symbols_are_distinct
+}
+
+fn exact_ordered_nfa_v15_runtime_symbol_closure(
+    compiled: &CompiledRegex,
+    exports: PreparedAggregateExports,
+) -> bool {
+    let expected = |name: &str| {
+        ORDERED_NFA_V15_ROW_RUNTIME_SYMBOLS.contains(&name)
+            || (exports.contains(PreparedAggregateExports::COUNT)
+                && name == ORDERED_NFA_V15_COUNT_RUNTIME_SYMBOL)
+            || (exports.contains(PreparedAggregateExports::SPAN_SUM)
+                && name == ORDERED_NFA_V15_SPAN_SUM_RUNTIME_SYMBOL)
+    };
+    let expected_count = ORDERED_NFA_V15_ROW_RUNTIME_SYMBOLS.len()
+        + usize::from(exports.contains(PreparedAggregateExports::COUNT))
+        + usize::from(exports.contains(PreparedAggregateExports::SPAN_SUM));
+    let module = compiled.module();
+    let mut actual_count = 0usize;
+    for (index, symbol) in module.symbols().iter().enumerate() {
+        let referenced = module
+            .relocations()
+            .iter()
+            .any(|relocation| relocation.symbol == index);
+        if symbol.section.is_some() || !referenced {
+            continue;
+        }
+        if symbol.binding != SymbolBinding::Global
+            || symbol.kind != SymbolKind::Function
+            || !expected(&symbol.name)
+        {
+            return false;
+        }
+        actual_count += 1;
+    }
+    actual_count == expected_count
+        && ORDERED_NFA_V15_ROW_RUNTIME_SYMBOLS.iter().all(|expected| {
+            module
+                .required_runtime_symbols()
+                .filter(|actual| actual == expected)
+                .count()
+                == 1
+        })
+        && (!exports.contains(PreparedAggregateExports::COUNT)
+            || module
+                .required_runtime_symbols()
+                .filter(|actual| *actual == ORDERED_NFA_V15_COUNT_RUNTIME_SYMBOL)
+                .count()
+                == 1)
+        && (!exports.contains(PreparedAggregateExports::SPAN_SUM)
+            || module
+                .required_runtime_symbols()
+                .filter(|actual| *actual == ORDERED_NFA_V15_SPAN_SUM_RUNTIME_SYMBOL)
+                .count()
+                == 1)
+}
+
+fn prepared_ordered_nfa_v15_symbol_identities_are_closed(
+    ordinary_entry: &str,
+    prepared_entry: &str,
+    span_fill: &str,
+    program: &str,
+) -> bool {
+    let Some(ordinary_identity) =
+        canonical_aggregate_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    canonical_aggregate_symbol_identity(prepared_entry, "fre_aot_regex_search_exclusive_v1_")
+        == Some(ordinary_identity)
+        && canonical_aggregate_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
+            == Some(ordinary_identity)
+        && canonical_aggregate_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+            == Some(ordinary_identity)
+}
+
+fn defined_global_symbol(
+    compiled: &CompiledRegex,
+    name: &str,
+    kind: SymbolKind,
+    exact_size: Option<usize>,
+) -> bool {
+    let mut matches = compiled
+        .module()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == name);
+    let Some(symbol) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && symbol.binding == SymbolBinding::Global
+        && symbol.kind == kind
+        && symbol.section.is_some()
+        && symbol.size != 0
+        && exact_size.is_none_or(|size| usize::try_from(symbol.size).ok() == Some(size))
 }
 
 fn ordinary_aggregate_representation_cap_may_try_v15(error: &CompileError) -> bool {
@@ -1748,6 +1971,15 @@ fn authenticate_ordered_many_aggregate_entries(
     Ok(())
 }
 
+fn canonical_aggregate_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
+    let identity = symbol.strip_prefix(prefix)?;
+    (identity.len() == 64
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(identity)
+}
+
 fn helper_free_ordered_many_aggregate_is_authenticated(
     compiled: &CompiledRegex,
     exports: PreparedAggregateExports,
@@ -1759,12 +1991,10 @@ fn helper_free_ordered_many_aggregate_is_authenticated(
     let module = compiled.module();
     let bulk_shape_is_exact = match module.prepared_bulk_strategy() {
         None => {
-            module.prepared_entry_symbol().is_none()
-                && module.prepared_span_fill_symbol().is_none()
+            module.prepared_entry_symbol().is_none() && module.prepared_span_fill_symbol().is_none()
         }
         Some(PreparedBulkStrategy::NativePreparedLoop | PreparedBulkStrategy::NativeFrozenLoop) => {
-            module.prepared_entry_symbol().is_some()
-                && module.prepared_span_fill_symbol().is_some()
+            module.prepared_entry_symbol().is_some() && module.prepared_span_fill_symbol().is_some()
         }
         Some(_) => false,
     };
@@ -2142,16 +2372,16 @@ fn reserve_exact<T, E>(
 mod tests {
     use super::{
         EXPLICIT_V15_ATTEMPTS, INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE,
-        OrderedManyCompileLimits, OrderedManyCompileRequest, OrderedManyMatch,
         OrderedManyAotCompileError, OrderedManyAotCompileLimits, OrderedManyAotCompileRequest,
+        OrderedManyCompileLimits, OrderedManyCompileRequest, OrderedManyMatch,
         OrderedManyPatternId, OrderedManyProgram, OrderedManyRow, OrderedManySessionLimits,
-        OrderedManyStrategy, compile_ordered_many, compile_ordered_many_aot_reported,
-        ordinary_aggregate_representation_cap_may_try_v15, reserve_exact,
-        tagged_build_may_decline,
+        OrderedManyStrategy, OrdinaryOrderedManyAction, classify_ordinary_ordered_many_strategy,
+        compile_ordered_many, compile_ordered_many_aot_reported,
+        ordinary_aggregate_representation_cap_may_try_v15, reserve_exact, tagged_build_may_decline,
     };
     use crate::{
         CompileError as AotCompileError, CompileMode, CompileResource, DeterminizeLimits,
-        ObjectError, PreparedAggregateExports, SlowAotLimits, Target,
+        ObjectError, PreparedAggregateExports, PreparedAggregateStrategy, SlowAotLimits, Target,
     };
     use fre_automata::{CompileError, TaggedManyBuildError};
 
@@ -2424,6 +2654,55 @@ mod tests {
             EXPLICIT_V15_ATTEMPTS.with(std::cell::Cell::get),
             "terminal NativeFused authentication failure reached the V15 transaction",
         );
+    }
+
+    #[test]
+    fn only_absent_helper_backed_or_authenticated_v15_ordinary_routes_defer() {
+        assert_eq!(
+            classify_ordinary_ordered_many_strategy(None, false).unwrap(),
+            OrdinaryOrderedManyAction::TryExplicitV15,
+        );
+        assert_eq!(
+            classify_ordinary_ordered_many_strategy(
+                Some(Some(PreparedAggregateStrategy::NativeFused)),
+                false,
+            )
+            .unwrap(),
+            OrdinaryOrderedManyAction::SelectNativeFused,
+        );
+        for strategy in [
+            PreparedAggregateStrategy::RuntimeHelper,
+            PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
+            PreparedAggregateStrategy::NativeOrderedNfaFusedWithRuntimeHelper,
+        ] {
+            assert_eq!(
+                classify_ordinary_ordered_many_strategy(Some(Some(strategy)), false).unwrap(),
+                OrdinaryOrderedManyAction::TryExplicitV15,
+            );
+        }
+        assert_eq!(
+            classify_ordinary_ordered_many_strategy(
+                Some(Some(PreparedAggregateStrategy::NativeOrderedNfaFused)),
+                true,
+            )
+            .unwrap(),
+            OrdinaryOrderedManyAction::TryExplicitV15,
+        );
+        assert!(matches!(
+            classify_ordinary_ordered_many_strategy(
+                Some(Some(PreparedAggregateStrategy::NativeOrderedNfaFused)),
+                false,
+            ),
+            Err(OrderedManyAotCompileError::InternalInvariant(
+                "ordinary ordered-many aggregate claimed an unauthenticated native Ordered-NFA surface"
+            ))
+        ));
+        assert!(matches!(
+            classify_ordinary_ordered_many_strategy(Some(None), false),
+            Err(OrderedManyAotCompileError::InternalInvariant(
+                "ordinary ordered-many aggregate omitted its strategy"
+            ))
+        ));
     }
 
     #[test]
