@@ -35835,6 +35835,43 @@ fn x86_use_sparse_filter_mask_batch(filter: NativeStartFilter, kind: X86StartFil
     )
 }
 
+/// Select the incumbent sparse primary as a one-way front end for an exact
+/// two-byte relation. The relation is materialized only after the first false
+/// projected candidate; a true pair keeps the existing verifier contract.
+fn x86_exact_pair_primary_cold_filter(
+    suffix: NativeSuffixFilter,
+    _kind: X86StartFilterKind,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if suffix.minimum_width < 2 {
+        return Ok(None);
+    }
+    let Some(pair_filter) = suffix.exact_pair_filter else {
+        return Ok(None);
+    };
+    let filter = suffix.filter;
+    // Keep admission independent of the selected vector tier. The SSE2-sized
+    // four-vector group is the stable 64-byte density check; after admission,
+    // each tier still uses its incumbent batching decision below. In
+    // particular, this avoids making an otherwise identical language change
+    // routes merely because AVX2 or AVX-512 widened the primary scan.
+    if filter.scan_offset > 1
+        || !x86_use_sparse_filter_mask_batch(filter, X86StartFilterKind::Sse2)
+    {
+        return Ok(None);
+    }
+    let membership = start_filter_membership(filter)?;
+    let projection_is_covered = pair_filter.pairs().iter().all(|pair| {
+        let byte = if filter.scan_offset == 0 {
+            *pair as u8
+        } else {
+            (*pair >> 8) as u8
+        };
+        let index = usize::from(byte);
+        membership[index / 64] & (1_u64 << (index % 64)) != 0
+    });
+    Ok(projection_is_covered.then_some(filter))
+}
+
 fn x86_filter_constant_register(
     first_register: u8,
     logical_index: usize,
@@ -37272,8 +37309,39 @@ fn x86_emit_seeded_reverse_prepass(
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
     let use_sparse_batch =
         exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
+    let exact_pair_primary_cold_filter = x86_exact_pair_primary_cold_filter(suffix, kind)?;
+    let exact_pair_primary_uses_sparse_batch = exact_pair_primary_cold_filter
+        .is_some_and(|primary| x86_use_sparse_filter_mask_batch(primary, kind));
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary phase escaped Exists admission",
+        ));
+    }
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(pair_filter) = exact_pair_filter {
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            x86_emit_start_filter_constants(assembler, primary_filter, kind, 1)?;
+        } else if let Some(pair_filter) = exact_pair_filter {
             x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
         } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
@@ -37310,15 +37378,115 @@ fn x86_emit_seeded_reverse_prepass(
         emit_constants(assembler)?;
     }
 
-    assembler.bind(vector)?;
-    assembler.instruction(&[0x48, 0x89, 0xc8])?;
-    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let unrolled_bytes = u32::from(kind.width())
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(u32::from(maximum_scan_offset)))
         .ok_or(ObjectError::ArithmeticOverflow(
             "x86 seeded reverse filter width",
         ))?;
+    let single_vector_bytes = kind
+        .width()
+        .checked_add(maximum_scan_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 seeded reverse filter width",
+        ))?;
+    if let Some(primary_filter) = exact_pair_primary_cold_filter {
+        let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary vector label is absent",
+        ))?;
+        let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+            ObjectError::InvalidModule(
+                "x86 seeded exact-pair primary single-vector label is absent",
+            ),
+        )?;
+        let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary scalar label is absent",
+        ))?;
+        let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary batch-hit label is absent"),
+        )?;
+        let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary single-hit label is absent"),
+        )?;
+        let primary_candidate = exact_pair_primary_candidate.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary candidate label is absent"),
+        )?;
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair activation label is absent"),
+        )?;
+        let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary phase lost its relation",
+        ))?;
+        assembler.instruction(&[0x31, 0xdb])?; // relation phase = primary
+        assembler.bind(primary_vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        let mut compare_primary_unrolled = vec![0x48, 0x3d];
+        compare_primary_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
+        assembler.instruction(&compare_primary_unrolled)?;
+        assembler.branch(&[0x0f, 0x82], primary_single_vector)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_sparse_filter_mask_batch(assembler, primary_filter, kind)?;
+            assembler.branch(&[0x0f, 0x85], primary_batch_hit)?;
+        } else {
+            for _ in 0..X86_MASK_BATCH_VECTORS {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    primary_filter,
+                    kind,
+                    primary_single_hit,
+                )?;
+                assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+            }
+        }
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_batch_hit)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_rewind_sparse_filter_mask_batch(assembler, kind)?;
+        }
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_single_vector)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
+        assembler.branch(&[0x0f, 0x82], primary_scalar)?;
+        x86_emit_start_filter_vector_candidate(
+            assembler,
+            primary_filter,
+            kind,
+            primary_single_hit,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_single_hit)?;
+        x86_emit_first_candidate_lane(
+            assembler,
+            X86CandidateMask::for_filter(primary_filter, kind),
+        )?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?;
+        assembler.branch(&[0xe9], primary_candidate)?;
+
+        assembler.bind(primary_scalar)?;
+        x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, finalize)?;
+        x86_emit_start_filter_scalar_candidate(assembler, primary_filter, primary_candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_candidate)?;
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], relation_activate)?;
+
+        assembler.bind(relation_activate)?;
+        assembler.instruction(&[0xbb, 1, 0, 0, 0])?; // relation phase = active
+        x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0xe9], vector)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let mut compare_unrolled = vec![0x48, 0x3d];
     compare_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
     assembler.instruction(&compare_unrolled)?;
@@ -37358,12 +37526,6 @@ fn x86_emit_seeded_reverse_prepass(
     assembler.branch(&[0xe9], scalar)?;
 
     assembler.bind(single_vector)?;
-    let single_vector_bytes =
-        kind.width()
-            .checked_add(maximum_scan_offset)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "x86 seeded reverse filter width",
-            ))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
     if let Some(pair_filter) = exact_pair_filter {
@@ -37514,6 +37676,15 @@ fn x86_emit_seeded_reverse_prepass(
         assembler.branch(&[0x0f, 0x85], global_minimum)?;
     }
     assembler.instruction(&[0x4c, 0x89, 0xf2])?; // position = next base
+    if exact_pair_primary_cold_filter.is_some() {
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule(
+                "x86 seeded exact-pair reverse retry lost its activation label",
+            ),
+        )?;
+        assembler.instruction(&[0x85, 0xdb])?; // relation phase active?
+        assembler.branch(&[0x0f, 0x84], relation_activate)?;
+    }
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(finalize)?;
@@ -38108,15 +38279,51 @@ fn x86_emit_suffix_prepass(
     );
     let use_sparse_batch =
         exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
-    // The initial suffix scan is exactly the baseline primary-only sparse
-    // batch. Only a witnessed scalar secondary rejection after such a hit
-    // changes CFG mode: subsequent complete groups use all retained columns.
-    // No runtime mode flag or additional live register is required.
+    let exact_pair_primary_cold_filter = x86_exact_pair_primary_cold_filter(suffix, kind)?;
+    let exact_pair_primary_uses_sparse_batch = exact_pair_primary_cold_filter
+        .is_some_and(|primary| x86_use_sparse_filter_mask_batch(primary, kind));
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_retry_dispatch = exact_pair_primary_cold_filter
+        .filter(|_| suffix.retry.is_some())
+        .map(|_| assembler.label())
+        .transpose()?;
+    let retry_scan = exact_pair_retry_dispatch.unwrap_or(vector);
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-pair primary phase escaped Exists admission",
+        ));
+    }
+    // The initial suffix scan is exactly the incumbent primary-only scan:
+    // sparse four-vector batching where that tier admits it, otherwise the
+    // existing unrolled vectors. Only a witnessed scalar relation rejection
+    // changes CFG mode; subsequent complete groups use the exact relation.
     let adaptive_joint_filter = (layout.declined_redundant_root_reverse && use_sparse_batch)
         .then_some(lazy_vector_filter)
         .flatten();
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(pair_filter) = exact_pair_filter {
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            x86_emit_start_filter_constants(assembler, primary_filter, kind, 1)?;
+        } else if let Some(pair_filter) = exact_pair_filter {
             x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
         } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
@@ -38148,13 +38355,115 @@ fn x86_emit_suffix_prepass(
         emit_constants(assembler)?;
     }
 
-    assembler.bind(vector)?;
-    assembler.instruction(&[0x48, 0x89, 0xc8])?;
-    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let unrolled_bytes = u32::from(kind.width())
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(u32::from(maximum_scan_offset)))
         .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
+    let single_vector_bytes = kind
+        .width()
+        .checked_add(maximum_scan_offset)
+        .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
+    if exact_pair_retry_dispatch.is_some() {
+        assembler.instruction(&[0x31, 0xdb])?; // relation phase = primary
+    }
+    if let Some(primary_filter) = exact_pair_primary_cold_filter {
+        let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary vector label is absent",
+        ))?;
+        let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+            ObjectError::InvalidModule(
+                "x86 exact-pair primary single-vector label is absent",
+            ),
+        )?;
+        let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary scalar label is absent",
+        ))?;
+        let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary batch-hit label is absent"),
+        )?;
+        let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary single-hit label is absent"),
+        )?;
+        let primary_candidate = exact_pair_primary_candidate.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary candidate label is absent"),
+        )?;
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair activation label is absent"),
+        )?;
+        let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary phase lost its relation",
+        ))?;
+        assembler.bind(primary_vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        let mut compare_primary_unrolled = vec![0x48, 0x3d];
+        compare_primary_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
+        assembler.instruction(&compare_primary_unrolled)?;
+        assembler.branch(&[0x0f, 0x82], primary_single_vector)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_sparse_filter_mask_batch(assembler, primary_filter, kind)?;
+            assembler.branch(&[0x0f, 0x85], primary_batch_hit)?;
+        } else {
+            for _ in 0..X86_MASK_BATCH_VECTORS {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    primary_filter,
+                    kind,
+                    primary_single_hit,
+                )?;
+                assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+            }
+        }
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_batch_hit)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_rewind_sparse_filter_mask_batch(assembler, kind)?;
+        }
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_single_vector)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
+        assembler.branch(&[0x0f, 0x82], primary_scalar)?;
+        x86_emit_start_filter_vector_candidate(
+            assembler,
+            primary_filter,
+            kind,
+            primary_single_hit,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_single_hit)?;
+        x86_emit_first_candidate_lane(
+            assembler,
+            X86CandidateMask::for_filter(primary_filter, kind),
+        )?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?;
+        assembler.branch(&[0xe9], primary_candidate)?;
+
+        assembler.bind(primary_scalar)?;
+        x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
+        x86_emit_start_filter_scalar_candidate(assembler, primary_filter, primary_candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_candidate)?;
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], relation_activate)?;
+
+        assembler.bind(relation_activate)?;
+        if exact_pair_retry_dispatch.is_some() {
+            assembler.instruction(&[0xbb, 1, 0, 0, 0])?; // relation phase = active
+        }
+        x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0xe9], vector)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let mut compare_unrolled = vec![0x48, 0x3d];
     compare_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
     assembler.instruction(&compare_unrolled)?;
@@ -38201,10 +38510,6 @@ fn x86_emit_suffix_prepass(
     )?;
 
     assembler.bind(single_vector)?;
-    let single_vector_bytes = kind
-        .width()
-        .checked_add(maximum_scan_offset)
-        .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
     if let Some(pair_filter) = exact_pair_filter {
@@ -38285,10 +38590,21 @@ fn x86_emit_suffix_prepass(
     assembler.bind(apply)?;
     if let Some(retry) = suffix.retry {
         module_suffix_retry::x86_emit_bounded_suffix_retry(
-            assembler, layout, retry, kind, vector, no_match, matched,
+            assembler, layout, retry, kind, retry_scan, no_match, matched,
         )?;
     } else {
         x86_emit_suffix_restart(assembler, suffix.restart)?;
+    }
+    if let Some(retry_dispatch) = exact_pair_retry_dispatch {
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule(
+                "x86 exact-pair retry dispatch lost its activation label",
+            ),
+        )?;
+        assembler.bind(retry_dispatch)?;
+        assembler.instruction(&[0x85, 0xdb])?; // relation phase active?
+        assembler.branch(&[0x0f, 0x84], relation_activate)?;
+        assembler.branch(&[0xe9], vector)?;
     }
     assembler.bind(done)?;
     Ok(
@@ -38419,6 +38735,32 @@ fn x86_emit_exact_pair_scalar_test(
         let compare = [0x66, 0x3d, low, high]; // cmp ax, imm16
         assembler.instruction(&compare)?;
         assembler.branch(&[0x0f, 0x84], matched)?;
+    }
+    Ok(())
+}
+
+fn x86_emit_start_filter_scalar_candidate(
+    assembler: &mut X86Assembler,
+    filter: NativeStartFilter,
+    candidate: X86Label,
+) -> Result<(), ObjectError> {
+    if filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 scalar candidate filter is empty",
+        ));
+    }
+    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+    for range in filter.ranges() {
+        assembler.instruction(&[0x3c, range.start])?;
+        if range.start == range.end {
+            assembler.branch(&[0x0f, 0x84], candidate)?;
+        } else {
+            let next_range = assembler.label()?;
+            assembler.branch(&[0x0f, 0x82], next_range)?;
+            assembler.instruction(&[0x3c, range.end])?;
+            assembler.branch(&[0x0f, 0x86], candidate)?;
+            assembler.bind(next_range)?;
+        }
     }
     Ok(())
 }
@@ -38907,6 +39249,21 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     let uses_seeded_reverse = layout.seeded_reverse.is_some();
     let retains_teddy_candidates = layout.mandatory_teddy.is_some();
+    let uses_exact_pair_phase_register = if !fixed_candidate && layout.mandatory_teddy.is_none() {
+        if let Some(suffix) = layout.suffix_filter {
+            x86_exact_pair_primary_cold_filter(suffix, table_lookup_kind)?.is_some()
+                && (suffix.retry.is_some() || uses_seeded_reverse)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if uses_exact_pair_phase_register {
+        // RBX is otherwise unused by this lowering. Preserve the caller's
+        // value while it records the one-way primary-to-relation transition.
+        assembler.instruction(&[0x53])?; // push rbx
+    }
     if retain_vector_candidates || uses_seeded_reverse || retains_teddy_candidates {
         // R12/R13 are callee-saved under both supported x86-64 ABIs. Every
         // status exit converges on `done`, which restores them in reverse.
@@ -39751,6 +40108,9 @@ fn lower_x86_64_dfa_with_entry_contract(
     if retain_vector_candidates || uses_seeded_reverse || retains_teddy_candidates {
         assembler.instruction(&[0x41, 0x5d])?; // pop r13
         assembler.instruction(&[0x41, 0x5c])?; // pop r12
+    }
+    if uses_exact_pair_phase_register {
+        assembler.instruction(&[0x5b])?; // pop rbx
     }
     if (filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
         && (!fixed_candidate || probe_exact_product && layout.prefix_block.is_some()))
@@ -129399,6 +129759,314 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     .is_some_and(|suffix| suffix.exact_pair_filter.is_none()),
                 "full and three-of-four Cartesian projections must retain the incumbent route"
             );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-tier test owns the x86 cold gate, phase register, and cursor model"
+    )]
+    fn x86_exact_pair_primary_cold_switch_is_authenticated_and_relation_owned() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+        ];
+        let layout_for = |pattern, target| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                compiled.program().native_dfa_view().unwrap(),
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap()
+            .1
+        };
+
+        for target in targets {
+            let kind = x86_start_filter_kind(target.features);
+            let ordinary = layout_for(r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)", target);
+            assert!(ordinary.seeded_reverse.is_none(), "{target:?}");
+            let suffix = ordinary.suffix_filter.unwrap();
+            let pair = suffix.exact_pair_filter.unwrap();
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(suffix, kind),
+                Ok(Some(suffix.filter)),
+                "{target:?}"
+            );
+
+            let mut outside_pair = suffix;
+            outside_pair.filter.scan_offset = 2;
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(outside_pair, kind),
+                Ok(None),
+                "{target:?}"
+            );
+            let projected = |encoded: u16| {
+                if suffix.filter.scan_offset == 0 {
+                    encoded as u8
+                } else {
+                    (encoded >> 8) as u8
+                }
+            };
+            let uncovered = (u8::MIN..=u8::MAX)
+                .find(|byte| !pair.pairs().iter().any(|encoded| projected(*encoded) == *byte))
+                .unwrap();
+            let mut uncovered_projection = suffix;
+            uncovered_projection.filter = NativeStartFilter {
+                ranges: {
+                    let mut ranges = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+                    ranges[0] = NativeByteRange {
+                        start: uncovered,
+                        end: uncovered,
+                    };
+                    ranges
+                },
+                range_count: 1,
+                candidate_bytes: 1,
+                scan_offset: suffix.filter.scan_offset,
+                from_anchored_prefix: false,
+            };
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(uncovered_projection, kind),
+                Ok(None),
+                "{target:?}"
+            );
+
+            let common = layout_for(r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)", target);
+            let common_suffix = common.suffix_filter.unwrap();
+            assert!(common_suffix.exact_pair_filter.is_some(), "{target:?}");
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(common_suffix, kind),
+                Ok(None),
+                "a non-sparse primary must retain the direct relation: {target:?}"
+            );
+
+            let mut wrong_output = ordinary;
+            wrong_output.output = OutputContract::SelectedEnd;
+            let mut wrong_output_assembler = X86Assembler::new();
+            let wrong_output_no_match = wrong_output_assembler.label().unwrap();
+            let wrong_output_matched = wrong_output_assembler.label().unwrap();
+            assert!(matches!(
+                x86_emit_suffix_prepass(
+                    &mut wrong_output_assembler,
+                    wrong_output.suffix_filter.unwrap(),
+                    kind,
+                    wrong_output,
+                    wrong_output_no_match,
+                    wrong_output_matched,
+                ),
+                Err(ObjectError::InvalidModule(
+                    "x86 exact-pair primary phase escaped Exists admission"
+                ))
+            ));
+
+            let mut emission = X86Assembler::new();
+            let no_match = emission.label().unwrap();
+            let matched = emission.label().unwrap();
+            let relation_vector = emission.labels.len();
+            assert_eq!(
+                x86_emit_suffix_prepass(
+                    &mut emission,
+                    suffix,
+                    kind,
+                    ordinary,
+                    no_match,
+                    matched,
+                )
+                .unwrap(),
+                None
+            );
+            emission.bind(no_match).unwrap();
+            emission.bind(matched).unwrap();
+
+            let mut primary_constants = X86Assembler::new();
+            x86_emit_start_filter_constants(&mut primary_constants, suffix.filter, kind, 1)
+                .unwrap();
+            let mut primary_batch = X86Assembler::new();
+            x86_emit_sparse_filter_mask_batch(&mut primary_batch, suffix.filter, kind).unwrap();
+            let mut primary_candidates = X86Assembler::new();
+            x86_emit_start_filter_vector_candidates(
+                &mut primary_candidates,
+                suffix.filter,
+                kind,
+                1,
+            )
+            .unwrap();
+            let mut relation_constants = X86Assembler::new();
+            x86_emit_prefix_relation_constants(
+                &mut relation_constants,
+                pair.vector_plan,
+                kind,
+            )
+            .unwrap();
+            let locate = |needle: &[u8]| {
+                emission
+                    .code
+                    .windows(needle.len())
+                    .position(|bytes| bytes == needle)
+                    .unwrap()
+            };
+            let primary_constants_at = locate(&primary_constants.code);
+            let primary_scan_at = locate(&primary_candidates.code);
+            let pair_at = locate(&[0x0f, 0xb7, 0x04, 0x17]);
+            let relation_constants_at = locate(&relation_constants.code);
+            let relation_vector_at = emission.labels[relation_vector].unwrap();
+            assert!(primary_constants_at < primary_scan_at, "{target:?}");
+            assert!(primary_scan_at < pair_at, "{target:?}");
+            assert!(pair_at < relation_constants_at, "{target:?}");
+            assert!(relation_constants_at < relation_vector_at, "{target:?}");
+            let rewind = {
+                let mut assembler = X86Assembler::new();
+                x86_emit_rewind_sparse_filter_mask_batch(&mut assembler, kind).unwrap();
+                assembler.code
+            };
+            if x86_use_sparse_filter_mask_batch(suffix.filter, kind) {
+                let primary_batch_at = locate(&primary_batch.code);
+                assert!(primary_constants_at < primary_batch_at, "{target:?}");
+                assert!(primary_batch_at < pair_at, "{target:?}");
+                assert!(
+                    emission.code[primary_batch_at..pair_at]
+                        .windows(rewind.len())
+                        .any(|bytes| bytes == rewind.as_slice()),
+                    "a rare primary batch hit must replay from its exact group base: {target:?}"
+                );
+            } else {
+                assert!(
+                    emission.code[primary_scan_at..pair_at]
+                        .windows(primary_candidates.code.len())
+                        .filter(|bytes| *bytes == primary_candidates.code.as_slice())
+                        .count()
+                        >= usize::from(X86_MASK_BATCH_VECTORS),
+                    "the primary phase must retain four incumbent unrolled vectors: {target:?}"
+                );
+                assert!(
+                    !emission.code[primary_scan_at..pair_at]
+                        .windows(rewind.len())
+                        .any(|bytes| bytes == rewind.as_slice()),
+                    "a non-batched primary must not manufacture a batch rewind: {target:?}"
+                );
+            }
+            assert!(emission.fixups.iter().any(|fixup| {
+                emission.labels[fixup.label] == Some(relation_constants_at)
+                    && fixup.instruction >= 3
+                    && emission.code.get(fixup.instruction - 3..fixup.instruction)
+                        == Some(&[0x48, 0xff, 0xc2][..])
+            }));
+            assert!(!emission.code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+            assert!(!emission
+                .code
+                .windows(5)
+                .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+            assert_ne!(
+                lower_x86_64_dfa_with_emission(ordinary, target.features)
+                    .unwrap()
+                    .code
+                    .first(),
+                Some(&0x53),
+                "a no-retry exact pair must not borrow the phase register: {target:?}"
+            );
+        }
+
+        let target = targets[1];
+        let retry = layout_for(r"Z.{0,4}(?:q!|a@|b#)", target);
+        let retry_suffix = retry.suffix_filter.unwrap();
+        assert!(retry.seeded_reverse.is_none());
+        assert!(retry_suffix.retry.is_some());
+        let retry_code = lower_x86_64_dfa_with_emission(retry, target.features)
+            .unwrap()
+            .code;
+        assert_eq!(retry_code.first(), Some(&0x53), "the phase must preserve RBX");
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+        assert!(retry_code
+            .windows(5)
+            .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x85, 0xdb]));
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x5b, 0xc5]));
+
+        let seeded = layout_for(r"(?s:.+)(?:q!|a@|b#)(?s:.*)", target);
+        assert!(seeded.seeded_reverse.is_some());
+        let seeded_code = lower_x86_64_dfa_with_emission(seeded, target.features)
+            .unwrap()
+            .code;
+        assert!(seeded_code.starts_with(&[0x53, 0x41, 0x54, 0x41, 0x55]));
+        assert!(seeded_code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+        assert!(seeded_code
+            .windows(5)
+            .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+        assert!(seeded_code.windows(2).any(|bytes| bytes == [0x85, 0xdb]));
+        assert!(seeded_code
+            .windows(4)
+            .any(|bytes| bytes == [0x41, 0x5c, 0x5b, 0xc5]));
+
+        let pairs = [
+            u16::from_le_bytes([b'q', b'!']),
+            u16::from_le_bytes([b'a', b'@']),
+            u16::from_le_bytes([b'b', b'#']),
+        ];
+        let alphabet = [b'q', b'!', b'a', b'@', b'b', b'#', b'x'];
+        let exact_first = |haystack: &[u8]| {
+            haystack
+                .windows(2)
+                .position(|bytes| pairs.contains(&u16::from_le_bytes([bytes[0], bytes[1]])))
+        };
+        for scan_offset in [0_usize, 1] {
+            for length in 0_usize..=6 {
+                let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+                for ordinal in 0..cases {
+                    let mut value = ordinal;
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    let mut base = 0_usize;
+                    let mut relation_active = false;
+                    let candidate_first = loop {
+                        if base.checked_add(1).is_none_or(|end| end >= haystack.len()) {
+                            break None;
+                        }
+                        let encoded = u16::from_le_bytes([haystack[base], haystack[base + 1]]);
+                        if relation_active {
+                            if pairs.contains(&encoded) {
+                                break Some(base);
+                            }
+                        } else {
+                            let projected = haystack[base + scan_offset];
+                            let projected_member = pairs.iter().any(|pair| {
+                                pair.to_le_bytes()[scan_offset] == projected
+                            });
+                            if projected_member {
+                                if pairs.contains(&encoded) {
+                                    break Some(base);
+                                }
+                                relation_active = true;
+                            }
+                        }
+                        base += 1;
+                    };
+                    assert_eq!(
+                        candidate_first,
+                        exact_first(&haystack),
+                        "scan_offset={scan_offset} haystack={haystack:?}"
+                    );
+                }
+            }
         }
     }
 
