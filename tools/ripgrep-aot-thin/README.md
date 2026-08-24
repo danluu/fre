@@ -72,8 +72,10 @@ keep the checked scalar compatibility loop.
 
 The generated registry authenticates the advertised route before publishing
 it. The Rust adapter still constructs the bounded descriptor array and
-validates the returned status, initialized prefix, and Boolean results; the
-native entry owns the per-haystack search loop. A one-haystack request uses the
-scalar entry directly. This changes neither match semantics nor the default
-compiler API: callers must explicitly request the additive direct batch entry,
-and an object-byte-cap decline returns the exact ordinary artifact.
+validates the returned status and initialized prefix. The independently
+authenticated compiler entry is responsible for writing only the canonical
+Boolean bytes 0 and 1 while it owns the per-haystack search loop. A
+one-haystack request uses the scalar entry directly. This changes neither match
+semantics nor the default compiler API: callers must explicitly request the
+additive direct batch entry, and an object-byte-cap decline returns the exact
+ordinary artifact.

@@ -39,8 +39,13 @@ EXPECTED_ROUTE = {
     "candidate": {
         "route": "direct-native",
         "api": "direct-exists-batch-v1",
-        "bulk": "native-direct-public-loop",
+        "bulk": "native-direct-trusted-full-window-loop",
     },
+}
+DIRECT_BATCH_ROUTE = {
+    "route": "direct-native",
+    "api": "direct-exists-batch-v1",
+    "bulk": "native-direct-trusted-full-window-loop",
 }
 DEFAULT_PAIRS = 61
 DEFAULT_WARMUP_PAIRS = 4
@@ -108,6 +113,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS)
     parser.add_argument("--batches", nargs="+", type=positive_int, default=BATCHES)
     parser.add_argument("--bytes", nargs="+", type=positive_int, default=BYTE_SIZES)
+    parser.add_argument(
+        "--baseline-route",
+        choices=("per-haystack", "direct-batch"),
+        default="per-haystack",
+        help="authenticated API route expected from the baseline binary",
+    )
     return parser.parse_args()
 
 
@@ -158,6 +169,7 @@ def validate_result(
     batch: int,
     byte_size: int,
     iterations: int,
+    expected_routes: dict[str, dict[str, str]],
 ) -> None:
     if set(result) != RESULT_KEYS:
         missing = sorted(RESULT_KEYS - set(result))
@@ -195,7 +207,7 @@ def validate_result(
     if not isinstance(description, str):
         raise BenchmarkError(f"{side} returned invalid route={description!r}")
     fields = route_fields(description)
-    for field, expected in EXPECTED_ROUTE[side].items():
+    for field, expected in expected_routes[side].items():
         if fields.get(field) != expected:
             raise BenchmarkError(
                 f"{side} route has {field}={fields.get(field)!r}, expected {expected!r}: {description}"
@@ -215,6 +227,7 @@ def invoke(
     pair: int | None,
     order: str,
     event_log: EventLog,
+    expected_routes: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     command = [
         str(binary),
@@ -279,6 +292,7 @@ def invoke(
             batch=batch,
             byte_size=byte_size,
             iterations=iterations,
+            expected_routes=expected_routes,
         )
     except BenchmarkError:
         event["result"] = result
@@ -326,6 +340,7 @@ def run_pair(
     pair: int | None,
     order: str,
     event_log: EventLog,
+    expected_routes: dict[str, dict[str, str]],
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for letter in order:
@@ -342,6 +357,7 @@ def run_pair(
             pair=pair,
             order=order,
             event_log=event_log,
+            expected_routes=expected_routes,
         )
     validate_pair(results["baseline"], results["candidate"])
     return results
@@ -357,6 +373,7 @@ def calibrate(
     target_ns: int,
     cell_index: int,
     event_log: EventLog,
+    expected_routes: dict[str, dict[str, str]],
 ) -> int:
     iterations = 1
     for ordinal in range(16):
@@ -372,6 +389,7 @@ def calibrate(
             pair=None,
             order=order,
             event_log=event_log,
+            expected_routes=expected_routes,
         )
         fastest_ns = min(result["elapsed_ns"] for result in results.values())
         if fastest_ns >= minimum_ns:
@@ -512,6 +530,14 @@ def main() -> int:
             "baseline": validate_binary(arguments.baseline_bin, "baseline binary"),
             "candidate": validate_binary(arguments.candidate_bin, "candidate binary"),
         }
+        expected_routes = {
+            "baseline": (
+                EXPECTED_ROUTE["baseline"]
+                if arguments.baseline_route == "per-haystack"
+                else DIRECT_BATCH_ROUTE
+            ),
+            "candidate": EXPECTED_ROUTE["candidate"],
+        }
         event_log = EventLog(arguments.output)
         event_log.write(
             {
@@ -532,6 +558,12 @@ def main() -> int:
                 "sample_policy": "retain-all",
                 "process_policy": "fresh-process-per-invocation",
                 "order_policy": "alternating-AB-BA",
+                "expected_routes": expected_routes,
+                "route_evidence": {
+                    "description_scope": "linked-artifact-capability-not-dynamic-call-counter",
+                    "singleton_dispatch": "batch=1-source-audited-scalar-entry",
+                    "larger_dispatch": "batch=2..64-authenticated-direct-entry",
+                },
             }
         )
         summaries = []
@@ -556,6 +588,7 @@ def main() -> int:
                 target_ns=target_ns,
                 cell_index=cell_index,
                 event_log=event_log,
+                expected_routes=expected_routes,
             )
             event_log.write(
                 {
@@ -579,6 +612,7 @@ def main() -> int:
                     pair=None,
                     order=order,
                     event_log=event_log,
+                    expected_routes=expected_routes,
                 )
             measured = []
             for pair in range(arguments.pairs):
@@ -597,6 +631,7 @@ def main() -> int:
                             pair=pair,
                             order=order,
                             event_log=event_log,
+                            expected_routes=expected_routes,
                         ),
                     )
                 )
