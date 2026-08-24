@@ -9,7 +9,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 #[test]
-fn exact_literal_ordinary_facades_allocate_nothing() {
+fn exact_literal_ordinary_facades_and_worker_allocate_nothing() {
     let literal = PortableBuilder::new("needle")
         .unicode(false)
         .build()
@@ -47,6 +47,43 @@ fn exact_literal_ordinary_facades_allocate_nothing() {
             black_box(empty.find(black_box(b"\xff")))
                 .map(|matched| (matched.start(), matched.end())),
             Some((0, 0)),
+        );
+
+        let mut ordinary = black_box(literal.ordinary_session().unwrap());
+        assert!(black_box(
+            ordinary
+                .is_match_at(black_box(b"--needle--needle"), 0)
+                .unwrap()
+        ));
+        assert_eq!(
+            black_box(
+                ordinary
+                    .first_acceptance_at(black_box(b"--needle--needle"), 0)
+                    .unwrap()
+            ),
+            Some(8),
+        );
+        assert_eq!(
+            black_box(ordinary.find_at(black_box(b"--needle--needle"), 0).unwrap())
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8)),
+        );
+        let mut visits = 0;
+        assert_eq!(
+            ordinary
+                .try_visit_spans(black_box(b"--needle--needle"), |_| {
+                    visits += 1;
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(visits, 2);
+        assert_eq!(
+            ordinary
+                .count_positive_width_selected_ends_at(black_box(b"--needle--needle"), 0)
+                .unwrap(),
+            Some(2),
         );
     }
     assert_eq!(measured.change(), Stats::default());

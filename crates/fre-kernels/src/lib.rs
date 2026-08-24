@@ -37,6 +37,7 @@ mod byte_start_map;
 mod determinize_state_codec;
 mod delimiter_field_spans;
 mod direct_build_attempt;
+mod exact_literal_ordinary;
 mod exact_literal_span;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
@@ -64,6 +65,11 @@ mod url_aggregate;
 
 pub use direct_build_attempt::{
     DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError,
+};
+
+pub use exact_literal_ordinary::{
+    ExactLiteralOrdinaryExecutor, Identity as ExactLiteralOrdinaryIdentity,
+    ORDINARY_CAPABILITY_ID as EXACT_LITERAL_ORDINARY_CAPABILITY_ID,
 };
 
 pub use exact_literal_span::{
@@ -994,6 +1000,8 @@ fn preflight_literal_terms(
     searched_bytes: usize,
     limits: LiteralSearchLimits,
 ) -> Result<LiteralAccounting, LiteralError> {
+    #[cfg(test)]
+    literal_preflight_probe::record();
     let linear_terms =
         searched_bytes
             .checked_add(needle_bytes)
@@ -1012,6 +1020,27 @@ fn preflight_literal_terms(
         linear_terms,
         scratch_bytes: 0,
     })
+}
+
+#[cfg(test)]
+mod literal_preflight_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
 }
 
 /// Immutable exact-literal plan with an owned preprocessed finder.

@@ -886,10 +886,11 @@ use fre_kernels::{
     DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
     ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
-    LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
-    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan,
-    LiteralSetSearchLimits, LiteralSetUniformStandardOrdinaryExecutor,
+    ExactLiteralOrdinaryExecutor, LiteralAccounting, LiteralBuildLimits,
+    LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan, LiteralError, LiteralPlan,
+    LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
+    LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
+    LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetOrdinaryExecutor,
     PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
@@ -12516,8 +12517,10 @@ impl PortableRegex {
 
     /// Bind reusable worker-owned state for ordinary unlimited searches.
     ///
-    /// A K0 matcher authenticates one source-free executor and settles its
-    /// immutable start-filter policy during this call. Unanchored
+    /// A positive exact literal binds its retained finder and needle without
+    /// allocating a canonical worker. A K0 matcher authenticates one
+    /// source-free executor and settles its immutable start-filter policy
+    /// during this call. Unanchored
     /// required-literal matchers bind their value-only projection alongside
     /// the canonical span session. An attachment-free, positive-width
     /// leftmost-first literal set binds its immutable direct executor. A
@@ -12538,6 +12541,15 @@ impl PortableRegex {
     /// the same setup failures as [`Self::search_session`].
     pub fn ordinary_session(&self) -> Result<PortableOrdinarySession<'_>, SearchError> {
         let plan = match &self.plan {
+            PortablePlan::ExactLiteral(literal) => {
+                if let Some(executor) = literal.ordinary_executor() {
+                    PortableOrdinarySessionPlan::ExactLiteral { executor }
+                } else {
+                    PortableOrdinarySessionPlan::Canonical(Box::new(
+                        self.search_session(SearchSessionLimits::unlimited())?,
+                    ))
+                }
+            }
             PortablePlan::K0(k0) => {
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
@@ -12882,10 +12894,16 @@ impl PortableRegex {
             PortablePlan::ExactLiteral(literal) => {
                 #[cfg(test)]
                 exact_literal_ordinary_facade_probe::record_exists();
-                literal
-                    .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
-                    .map(|matched| matched.is_some())
-                    .map_err(SearchError::from)
+                if let Some(executor) = literal.ordinary_executor() {
+                    executor
+                        .exists_window_value(haystack, LiteralWindow::full(haystack))
+                        .map_err(SearchError::from)
+                } else {
+                    literal
+                        .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
+                        .map(|matched| matched.is_some())
+                        .map_err(SearchError::from)
+                }
             }
             PortablePlan::K0(k0) => {
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
@@ -14578,10 +14596,17 @@ impl PortableRegex {
             PortablePlan::ExactLiteral(literal) => {
                 #[cfg(test)]
                 exact_literal_ordinary_facade_probe::record_span();
-                literal
-                    .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
-                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
-                    .map_err(SearchError::from)
+                if let Some(executor) = literal.ordinary_executor() {
+                    executor
+                        .find_window_value(haystack, LiteralWindow::full(haystack))
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from)
+                } else {
+                    literal
+                        .find_full_value(haystack, literal_limits(SearchLimits::unlimited()))
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from)
+                }
             }
             PortablePlan::K0(k0) => match k0.pooled_value(
                 K0PooledValueOperation::Span,
@@ -16370,13 +16395,14 @@ pub struct PortableSearchSession<'a> {
 
 /// Worker-owned state for ordinary unlimited portable searches.
 ///
-/// K0 matchers bind one source-free executor, including its immutable
-/// capabilities and reusable workspace, when this session is constructed.
-/// Unanchored required-literal matchers bind their value-only projection once
-/// while retaining the existing canonical search session for spans. Other
-/// matcher families retain only that canonical session. No method on this
-/// type accepts finite limits or publishes accounting; callers that need
-/// either contract should use [`PortableSearchSession`] instead.
+/// Positive exact literals bind their already prepared finder without a worker
+/// allocation. K0 matchers bind one source-free executor, including its
+/// immutable capabilities and reusable workspace, when this session is
+/// constructed. Unanchored required-literal matchers bind their value-only
+/// projection once while retaining the existing canonical search session for
+/// spans. Other matcher families retain only that canonical session. No method
+/// on this type accepts finite limits or publishes accounting; callers that
+/// need either contract should use [`PortableSearchSession`] instead.
 ///
 /// A session never retains a haystack. It can therefore be reused across
 /// unrelated sources by one mutable, thread-confined worker. An eligible
@@ -16414,6 +16440,11 @@ enum PortableOrdinarySessionPlan<'a> {
     LiteralSetUniformStandardDfa {
         executor: LiteralSetUniformStandardOrdinaryExecutor<'a>,
         direct_next: bool,
+    },
+    /// Append this direct binding so established ordinary-session variant
+    /// discriminants and their common dispatch order remain stable.
+    ExactLiteral {
+        executor: ExactLiteralOrdinaryExecutor<'a>,
     },
 }
 
@@ -22047,10 +22078,11 @@ fn count_ordinary_literal_set_dfa_with_selected_seed(
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists at or after `start`.
     ///
-    /// K0 uses its endpoint-only engine. An unanchored required-literal owner
-    /// consumes a complete suffix witness without recovering the beginning of
-    /// the greedy class run. Packed and DFA literal sets use their bound
-    /// ordinary executors. Other canonical owners retain the boolean
+    /// A positive exact literal uses its retained finder without reconstructing
+    /// a span. K0 uses its endpoint-only engine. An unanchored required-literal
+    /// owner consumes a complete suffix witness without recovering the
+    /// beginning of the greedy class run. Packed and DFA literal sets use their
+    /// bound ordinary executors. Other canonical owners retain the boolean
     /// projection of [`Self::first_acceptance_at`].
     ///
     /// # Errors
@@ -22060,6 +22092,9 @@ impl<'r> PortableOrdinarySession<'r> {
     #[inline]
     pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
         match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+                .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .first_acceptance_at(haystack, start)
                 .map(|endpoint| endpoint.is_some())
@@ -22093,12 +22128,13 @@ impl<'r> PortableOrdinarySession<'r> {
 
     /// Return the first accepting boundary at or after `start`.
     ///
-    /// K0 executes its endpoint-only engine. An unanchored required-literal
-    /// owner selects the first suffix witness without recovering its greedy
-    /// start. Packed literal sets return the selected endpoint. A nonuniform
-    /// DFA literal set stops at its first accepting endpoint through its bound
-    /// ordinary executor. Other canonical fallback plans use the existing
-    /// value-only shortest-match projection with unlimited limits.
+    /// Positive exact literals and K0 execute endpoint-only engines. An
+    /// unanchored required-literal owner selects the first suffix witness
+    /// without recovering its greedy start. Packed literal sets return the
+    /// selected endpoint. A nonuniform DFA literal set stops at its first
+    /// accepting endpoint through its bound ordinary executor. Other canonical
+    /// fallback plans use the existing value-only shortest-match projection
+    /// with unlimited limits.
     /// Assertions inspect the complete original haystack and the returned
     /// boundary is relative to it.
     ///
@@ -22113,6 +22149,9 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<usize>, SearchError> {
         match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+                .first_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .first_acceptance_at(haystack, start)
                 .map_err(SearchError::from),
@@ -22161,7 +22200,8 @@ impl<'r> PortableOrdinarySession<'r> {
 
     /// Return the selected leftmost-first span at or after `start`.
     ///
-    /// K0 selects the endpoint first and performs reverse start recovery only
+    /// A positive exact literal selects the endpoint first and subtracts its
+    /// sealed width only after a hit. K0 performs reverse start recovery only
     /// after a positive result requires it. On a promoted direct hit, a bound
     /// uniform-standard literal set likewise selects its endpoint first, then
     /// subtracts its sealed common width; its ordinary route and direct misses
@@ -22182,6 +22222,10 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .selected_span_at(haystack, start)
                 .map(|matched| {
@@ -22250,10 +22294,10 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// This is the ranged companion to [`Self::try_visit_spans`]. Assertions
     /// retain complete original-haystack context and offsets remain absolute.
-    /// K0 passes the first selected item directly to the callback without an
-    /// accounting iterator, result buffer, or search-call cap. Canonical
-    /// fallback plans preserve their existing unlimited value iterator and
-    /// any construction-selected native source cursor.
+    /// Positive exact literals and K0 pass selected items directly to the
+    /// callback without an accounting iterator, result buffer, or search-call
+    /// cap. Canonical fallback plans preserve their existing unlimited value
+    /// iterator and any construction-selected native source cursor.
     ///
     /// # Errors
     ///
@@ -22271,6 +22315,22 @@ impl<'r> PortableOrdinarySession<'r> {
         F: FnMut(Match) -> Result<bool, E>,
     {
         match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor } => {
+                let mut visitor = visitor;
+                executor
+                    .try_visit_spans_window_value(
+                        haystack,
+                        LiteralWindow::new(start, haystack.len()),
+                        |(matched_start, end)| {
+                            visitor(Match {
+                                start: matched_start,
+                                end,
+                            })
+                        },
+                    )
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)
+            }
             PortableOrdinarySessionPlan::K0 { executor, .. } => {
                 let mut source = K0SpanSourceCursor::new(haystack);
                 try_visit_ordinary_spans_at(
@@ -22362,9 +22422,10 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Count selected positive-width matches at or after `start` using only
     /// their ordered endpoints.
     ///
-    /// `Ok(Some(count))` is returned for a positive-width K0 plan or an
-    /// ordinary literal-set plan whose construction admits only nonempty
-    /// literals.
+    /// `Ok(Some(count))` is returned for a positive exact literal, a
+    /// positive-width K0 plan, or a packed, ordinary non-uniform, or
+    /// uniform-standard literal-set plan. Each construction seals nonempty
+    /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -22394,6 +22455,13 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<u64>, SearchError> {
         match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+                .count_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                )
+                .map(Some)
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 {
                 executor,
                 positive: true,
@@ -42783,11 +42851,15 @@ mod tests {
             Ok(None),
         );
 
-        let canonical = PortableRegex::new("literal").unwrap();
-        assert_ne!(canonical.build_report().plan, PlanKind::K0);
-        let mut canonical = canonical.ordinary_session().unwrap();
+        let nullable_exact = PortableRegex::new("").unwrap();
+        assert_eq!(nullable_exact.build_report().plan, PlanKind::ExactLiteral);
+        let mut nullable_exact = nullable_exact.ordinary_session().unwrap();
+        assert!(matches!(
+            &nullable_exact.plan,
+            super::PortableOrdinarySessionPlan::Canonical(_)
+        ));
         assert_eq!(
-            canonical.count_positive_width_selected_ends_at(b"literal", usize::MAX),
+            nullable_exact.count_positive_width_selected_ends_at(b"literal", usize::MAX),
             Ok(None),
         );
 
@@ -42798,6 +42870,21 @@ mod tests {
                 .count_positive_width_selected_ends_at(b"aaa", usize::MAX),
             Ok(None),
         );
+
+        let exact = PortableRegex::new("literal").unwrap();
+        let mut exact = exact.ordinary_session().unwrap();
+        assert_eq!(
+            exact.count_positive_width_selected_ends_at(b"literal-literal", 0),
+            Ok(Some(2)),
+        );
+        assert!(matches!(
+            exact.count_positive_width_selected_ends_at(b"literal", usize::MAX),
+            Err(SearchError::ExactLiteral(fre_kernels::LiteralError::InvalidWindow {
+                start: usize::MAX,
+                end: 7,
+                haystack_len: 7,
+            }))
+        ));
 
         let positive = PortableBuilder::new("a+")
             .unicode(false)
@@ -42834,16 +42921,20 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_session_canonical_fallback_preserves_unlimited_value_semantics() {
+    fn ordinary_session_binds_positive_exact_literal_value_engines() {
         let regex = PortableBuilder::new("needle")
             .unicode(false)
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
         let mut ordinary = regex.ordinary_session().unwrap();
+        let PortablePlan::ExactLiteral(literal) = &regex.plan else {
+            unreachable!("exact-literal fixture changed plan")
+        };
         assert!(matches!(
             &ordinary.plan,
-            super::PortableOrdinarySessionPlan::Canonical(_)
+            super::PortableOrdinarySessionPlan::ExactLiteral { executor }
+                if executor.is_bound_to(literal)
         ));
 
         let haystack = b"xxneedle--needle";
@@ -42855,6 +42946,10 @@ mod tests {
             assert_eq!(
                 ordinary.find_at(haystack, start),
                 regex.find_at_value(haystack, start, SearchLimits::unlimited())
+            );
+            assert_eq!(
+                ordinary.is_match_at(haystack, start),
+                regex.is_match_value_at(haystack, start, SearchLimits::unlimited())
             );
         }
 
@@ -42878,6 +42973,73 @@ mod tests {
             })
             .is_err());
         assert!(!callback_called);
+
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(2)),
+        );
+
+        let empty = PortableRegex::new("").unwrap();
+        let empty = empty.ordinary_session().unwrap();
+        assert!(matches!(
+            &empty.plan,
+            super::PortableOrdinarySessionPlan::Canonical(_)
+        ));
+    }
+
+    #[test]
+    fn ordinary_exact_literal_session_exhaustively_matches_checked_values() {
+        for pattern in words(3).into_iter().filter(|pattern| !pattern.is_empty()) {
+            let pattern = core::str::from_utf8(&pattern).unwrap();
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for haystack in words(5) {
+                for start in 0..=haystack.len() {
+                    let expected = regex
+                        .find_at_value(&haystack, start, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(
+                        ordinary.is_match_at(&haystack, start),
+                        Ok(expected.is_some()),
+                    );
+                    assert_eq!(
+                        ordinary.first_acceptance_at(&haystack, start),
+                        Ok(expected.map(Match::end)),
+                    );
+                    assert_eq!(ordinary.find_at(&haystack, start), Ok(expected));
+
+                    let mut expected_spans = Vec::new();
+                    let mut cursor = start;
+                    while let Some(matched) = regex
+                        .find_at_value(&haystack, cursor, SearchLimits::unlimited())
+                        .unwrap()
+                    {
+                        expected_spans.push((matched.start(), matched.end()));
+                        cursor = matched.end();
+                    }
+                    let mut spans = Vec::new();
+                    assert_eq!(
+                        ordinary
+                            .try_visit_spans_at(&haystack, start, |matched| {
+                                spans.push((matched.start(), matched.end()));
+                                Ok::<bool, ()>(true)
+                            })
+                            .unwrap(),
+                        Ok(()),
+                    );
+                    assert_eq!(spans, expected_spans);
+                    assert_eq!(
+                        ordinary
+                            .count_positive_width_selected_ends_at(&haystack, start),
+                        Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
+                    );
+                }
+            }
+        }
     }
 
     fn literal_set_dfa_fixture(pattern: &str) -> PortableRegex {
@@ -44705,7 +44867,7 @@ mod tests {
         assert_eq!(
             super::exact_literal_ordinary_facade_probe::snapshot(),
             (0, 0),
-            "finite, accounted, windowed, session, and capture APIs stay canonical",
+            "finite, accounted, windowed, explicit-session, and capture APIs stay canonical",
         );
 
         assert!(regex.is_match(haystack));
