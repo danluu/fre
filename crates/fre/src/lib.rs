@@ -95,6 +95,7 @@ mod k0_anchored_scalar_corridor_exists;
 mod k0_bounded_delimited_exists;
 mod k0_casefold_prefix_class_span;
 mod k0_class_delimiter_exists;
+mod k0_line_prefix_tail;
 mod k0_line_token_loop_exists;
 mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
@@ -10689,6 +10690,66 @@ impl PortableBuilder {
         } else {
             None
         };
+        // A fixed literal at an LF line start followed by the complete open
+        // line byte domain has an exact allocation-free ordinary projection.
+        // Keep this final proof beside the existing deterministic line-loop
+        // owner: their canonical grammars are disjoint, and both are boxed
+        // only from residual optional storage.
+        let line_prefix_tail_inspection = if line_token_loop_inspection.is_none()
+            && correlated_terminal.is_none()
+            && k0_absolute_end_proof.is_none()
+            && packed_frontier_plan.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+            && rust
+                .hir
+                .properties()
+                .look_set_prefix()
+                .contains(Look::StartLF)
+            && rust
+                .hir
+                .properties()
+                .look_set_suffix()
+                .contains(Look::EndLF)
+        {
+            match k0_line_prefix_tail::inspect(
+                &rust.hir,
+                self.profile.options.unicode,
+                self.profile.options.case_insensitive,
+                self.profile.options.line_terminator,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_line_prefix_tail::InspectionOutcome::Eligible { plan, .. } => {
+                            Some(plan)
+                        }
+                        k0_line_prefix_tail::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_line_prefix_tail::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_line_prefix_tail::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "line prefix-tail planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let incumbent_optional_bytes = mandatory_suffix_storage_bytes
             .checked_add(mandatory_cut_storage_bytes)
             .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
@@ -10716,6 +10777,26 @@ impl PortableBuilder {
         let line_token_loop_storage_bytes = line_token_loop_exists
             .as_deref()
             .map_or(0, |_| k0_line_token_loop_exists::Plan::storage_bytes());
+        let line_prefix_tail = match line_prefix_tail_inspection {
+            Some(plan)
+                if k0_line_prefix_tail::Plan::storage_bytes()
+                    <= available_optional_bytes.saturating_sub(incumbent_optional_bytes) =>
+            {
+                match fre_exact_alloc::try_box_preserve(plan) {
+                    Ok(plan) => Some(plan),
+                    Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => None,
+                    Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+                        return Err(BuildError::InternalInvariant(
+                            "line prefix-tail owner layout overflowed",
+                        ));
+                    }
+                }
+            }
+            Some(_) | None => None,
+        };
+        let line_prefix_tail_storage_bytes = line_prefix_tail
+            .as_deref()
+            .map_or(0, |_| k0_line_prefix_tail::Plan::storage_bytes());
         // Spend only residual planner authority on the compact ordinary Span
         // proof after every incumbent K0 owner has been retained. Success
         // mutates no layout or storage accounting: an all-ASCII consumption
@@ -10742,16 +10823,19 @@ impl PortableBuilder {
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
             .and_then(|bytes| bytes.checked_add(line_token_loop_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(line_prefix_tail_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
         let exclusive = match (
             correlated_terminal,
             packed_frontier_plan,
             line_token_loop_exists,
+            line_prefix_tail,
         ) {
-            (Some(plan), None, None) => K0ExclusivePlan::Correlated(plan),
-            (None, Some(plan), None) => K0ExclusivePlan::Packed(plan),
-            (None, None, Some(plan)) => K0ExclusivePlan::LineTokenLoop(plan),
-            (None, None, None) => K0ExclusivePlan::None,
+            (Some(plan), None, None, None) => K0ExclusivePlan::Correlated(plan),
+            (None, Some(plan), None, None) => K0ExclusivePlan::Packed(plan),
+            (None, None, Some(plan), None) => K0ExclusivePlan::LineTokenLoop(plan),
+            (None, None, None, Some(plan)) => K0ExclusivePlan::LinePrefixTail(plan),
+            (None, None, None, None) => K0ExclusivePlan::None,
             _ => {
                 return Err(BuildError::InternalInvariant(
                     "exclusive K0 sidecars were published together",
@@ -11087,6 +11171,7 @@ enum K0ExclusivePlan {
     None,
     Correlated(correlated_bounded_alternation::Plan),
     Packed(Box<K0PackedFrontierPlan>),
+    LinePrefixTail(Box<k0_line_prefix_tail::Plan>),
     LineTokenLoop(Box<k0_line_token_loop_exists::Plan>),
 }
 
@@ -11094,21 +11179,31 @@ impl K0ExclusivePlan {
     fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
         match self {
             Self::Correlated(plan) => Some(plan),
-            Self::None | Self::Packed(_) | Self::LineTokenLoop(_) => None,
+            Self::None | Self::Packed(_) | Self::LinePrefixTail(_) | Self::LineTokenLoop(_) => None,
         }
     }
 
     fn packed_frontier(&self) -> Option<&K0PackedFrontierPlan> {
         match self {
             Self::Packed(plan) => Some(plan),
-            Self::None | Self::Correlated(_) | Self::LineTokenLoop(_) => None,
+            Self::None
+            | Self::Correlated(_)
+            | Self::LinePrefixTail(_)
+            | Self::LineTokenLoop(_) => None,
+        }
+    }
+
+    fn line_prefix_tail(&self) -> Option<&k0_line_prefix_tail::Plan> {
+        match self {
+            Self::LinePrefixTail(plan) => Some(plan),
+            Self::None | Self::Correlated(_) | Self::Packed(_) | Self::LineTokenLoop(_) => None,
         }
     }
 
     fn line_token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::LineTokenLoop(plan) => Some(plan),
-            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
+            Self::None | Self::Correlated(_) | Self::Packed(_) | Self::LinePrefixTail(_) => None,
         }
     }
 }
@@ -13916,6 +14011,11 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
+                if haystack.len() >= k0_line_prefix_tail::MIN_INPUT_BYTES
+                    && let Some(plan) = k0.exclusive.line_prefix_tail()
+                {
+                    return Ok(plan.is_match_full(haystack));
+                }
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
                     && let Some(plan) = k0.exclusive.line_token_loop()
                     && let Some(matched) = plan.try_is_match_full(haystack)
@@ -15641,6 +15741,13 @@ impl PortableRegex {
                 }
             }
             PortablePlan::K0(k0) => {
+                if haystack.len() >= k0_line_prefix_tail::MIN_INPUT_BYTES
+                    && let Some(plan) = k0.exclusive.line_prefix_tail()
+                {
+                    return Ok(plan
+                        .find_full(haystack)
+                        .map(|(start, end)| Match { start, end }));
+                }
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
                     && let Some(plan) = k0.exclusive.line_token_loop()
                     && let Some(matched) = plan.try_find_full(haystack)
@@ -18954,7 +19061,9 @@ impl K0ExclusiveRouteState {
         match plan {
             K0ExclusivePlan::Packed(_) => Self::Packed(K0PackedFrontierExistsState::default()),
             K0ExclusivePlan::Correlated(_) => Self::Correlated(K0CorrelatedRouteStates::default()),
-            K0ExclusivePlan::None | K0ExclusivePlan::LineTokenLoop(_) => Self::NoneUnknown,
+            K0ExclusivePlan::None
+            | K0ExclusivePlan::LinePrefixTail(_)
+            | K0ExclusivePlan::LineTokenLoop(_) => Self::NoneUnknown,
         }
     }
 
