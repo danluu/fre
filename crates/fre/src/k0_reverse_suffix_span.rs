@@ -763,12 +763,19 @@ mod tests {
             panic!("fixed-bound multi-byte-tail repeat was refused");
         };
         assert_eq!((fixed.token_bytes(), fixed.tail_bytes()), (2, 3));
+
+        let lazy = parse_bytes(r"(?-u:(?:ab){2,5}?c)");
+        let BoundedLiteralRepeatInspectionOutcome::Eligible(lazy) =
+            inspect_bounded_literal_repeat(&lazy, b"ababc", 5, 11, 0, u64::MAX).unwrap()
+        else {
+            panic!("barrier-authenticated lazy repeat was refused");
+        };
+        assert_eq!((lazy.token_bytes(), lazy.tail_bytes()), (2, 1));
     }
 
     #[test]
     fn bounded_literal_repeat_nearby_languages_fail_closed() {
         for (pattern, suffix, minimum, maximum) in [
-            (r"(?-u:(?:ab){2,5}?c)", b"ababc".as_slice(), 5, 11),
             (r"(?-u:(?:ab){0,5}c)", b"c".as_slice(), 1, 11),
             (r"(?-u:(?:ab){2,}c)", b"ababc".as_slice(), 5, 11),
             (r"(?-u:(?:ab){2,5}a)", b"ababa".as_slice(), 5, 11),

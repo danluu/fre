@@ -29130,10 +29130,9 @@ mod tests {
             },
         );
 
-        // A suffix close to the incumbent floor is exact but not economical.
-        // The outlined route records its exact prefix position before touching
-        // reverse workspace; subsequent calls revalidate that receipt and
-        // complete this exact literal-repeat shape without pooled workspace.
+        // The exact literal-repeat owner completes a suffix close to the
+        // incumbent floor without touching reverse workspace or publishing a
+        // source receipt.
         let early_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -29155,8 +29154,8 @@ mod tests {
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
                 attempts: 1,
-                completions: 0,
-                declines: 1,
+                completions: 1,
+                declines: 0,
             },
         );
         let PortablePlan::K0(early_plan) = &early_regex.plan else {
@@ -29181,24 +29180,23 @@ mod tests {
         assert_eq!(
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
-                attempts: 1,
-                completions: 0,
-                declines: 1,
+                attempts: 73,
+                completions: 73,
+                declines: 0,
             },
-            "the direct receipt path must not re-enter the pooled finite facade",
+            "every exact source must complete before pooled workspace",
         );
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
-                attempts: 72,
-                completions: 72,
+                attempts: 73,
+                completions: 73,
             },
-            "a revalidated exact receipt must complete through the direct leaf",
+            "every ordinary call must complete through the direct leaf",
         );
 
-        // Changing the recorded suffix bytes invalidates the old receipt
-        // immediately. A successful late match clears the hint and keeps the
-        // exact route available without waiting through a cooldown.
+        // Changing source bytes cannot stale the immutable proof. Both the
+        // changed early source and a later match complete directly.
         let recover_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -29243,9 +29241,9 @@ mod tests {
         assert_eq!(
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
-                attempts: 3,
-                completions: 2,
-                declines: 1,
+                attempts: 11,
+                completions: 11,
+                declines: 0,
             },
         );
 
@@ -29294,15 +29292,15 @@ mod tests {
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
                 attempts: 1,
-                completions: 0,
-                declines: 1,
+                completions: 1,
+                declines: 0,
             },
         );
     }
 
     #[cfg(target_has_atomic = "64")]
     #[test]
-    fn pooled_finite_consumption_suffix_span_foreign_owner_falls_back_exactly() {
+    fn bounded_literal_repeat_span_ignores_unneeded_foreign_feedback_owner() {
         const PATTERN: &str = r"(?:ab){2,5}c";
         let regex = PortableBuilder::new(PATTERN)
             .unicode(false)
@@ -29352,8 +29350,12 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(
             counts,
-            super::finite_consumption_span_facade_probe::Counts::default(),
-            "an in-flight foreign owner must leave this invocation on incumbent K0",
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 1,
+                declines: 0,
+            },
+            "the read-only exact owner must not wait for a feedback token",
         );
         drop(admission);
     }
@@ -29399,13 +29401,17 @@ mod tests {
             assert_eq!(
                 super::bounded_literal_repeat_span_probe::snapshot(),
                 expected_counts,
-                "warm exact receipt did not close directly: {label}",
+                "complete exact owner did not close directly: {label}",
             );
             if expected_direct {
                 assert_eq!(
                     super::finite_consumption_span_facade_probe::snapshot(),
-                    super::finite_consumption_span_facade_probe::Counts::default(),
-                    "warm exact receipt re-entered pooled workspace: {label}",
+                    super::finite_consumption_span_facade_probe::Counts {
+                        attempts: 1,
+                        completions: 1,
+                        declines: 0,
+                    },
+                    "complete exact owner did not terminate the finite facade: {label}",
                 );
             }
         }
@@ -29425,6 +29431,13 @@ mod tests {
                 b"q".as_slice(),
                 3,
                 6,
+            ),
+            (
+                r"(?:ab){2,5}?c",
+                b"ab".as_slice(),
+                b"c".as_slice(),
+                2,
+                5,
             ),
         ] {
             let descriptor_regex = PortableBuilder::new(pattern)
@@ -29457,7 +29470,7 @@ mod tests {
                             &regex,
                             &upstream,
                             &haystack,
-                            start == 0,
+                            true,
                             &format!(
                                 "pattern={pattern:?} length={length} start={start} repeats={repeats}"
                             ),
@@ -29493,7 +29506,7 @@ mod tests {
                 super::bounded_literal_repeat_span_probe::snapshot(),
                 super::bounded_literal_repeat_span_probe::Counts {
                     attempts: 1,
-                    completions: 0,
+                    completions: 1,
                 },
             );
         }
@@ -29515,14 +29528,13 @@ mod tests {
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
                 attempts: 1,
-                completions: 0,
+                completions: 1,
             },
-            "a receipt implying max+1 repeats must decline to shifted incumbent K0",
+            "an overlong run must shift to the leftmost accepted bounded suffix",
         );
 
-        // Reuse one allocation after publishing a receipt. A changed prefix
-        // with the authenticated suffix still present must decline read-only;
-        // changing the suffix itself clears the hint before entering the leaf.
+        // Reuse one matcher across changed sources. Both a changed prefix and
+        // a changed former suffix must be evaluated from immutable metadata.
         let mut reused = vec![b'!'; 4_093];
         reused[..11].copy_from_slice(b"abababababc");
         reused[64..71].copy_from_slice(b"abababc");
@@ -29540,7 +29552,7 @@ mod tests {
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
                 attempts: 1,
-                completions: 0,
+                completions: 1,
             },
         );
         reused[6] = b'!';
@@ -29553,8 +29565,11 @@ mod tests {
         );
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
-            super::bounded_literal_repeat_span_probe::Counts::default(),
-            "changed receipt bytes must invalidate before the direct leaf",
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+            "changed source bytes must be searched directly without stale state",
         );
 
         // The existing structural window and width boundaries remain exact.
@@ -29609,7 +29624,8 @@ mod tests {
             super::bounded_literal_repeat_span_probe::Counts::default(),
         );
 
-        // Late and absent sources never manufacture an early-prefix receipt.
+        // Late and absent sources both complete through the same immutable
+        // owner without manufacturing a source receipt.
         for maybe_start in [None, Some(1_500)] {
             let late_regex = PortableBuilder::new(PATTERN)
                 .unicode(false)
@@ -29630,7 +29646,10 @@ mod tests {
             }
             assert_eq!(
                 super::bounded_literal_repeat_span_probe::snapshot(),
-                super::bounded_literal_repeat_span_probe::Counts::default(),
+                super::bounded_literal_repeat_span_probe::Counts {
+                    attempts: 2,
+                    completions: 2,
+                },
             );
         }
 
@@ -29665,7 +29684,6 @@ mod tests {
         for pattern in [
             r"(?:ab){0,5}c",
             r"(?:ab){2,}c",
-            r"(?:ab){2,5}?c",
             r"(?:ab){2,5}a",
             r"(?:[ab]){2,5}c",
             r"x(?:ab){2,5}c",
