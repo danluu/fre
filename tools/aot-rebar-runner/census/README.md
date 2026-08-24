@@ -43,15 +43,19 @@ schedule's selected comparator remains authoritative even when another pinned
 comparator has a known semantic defect; the candidate never supplies its own
 expected value.
 
-Fallback `count-spans` direct-entry or Span-fill iteration, multi-pattern
-per-line `grep`, the static uniform capture multiplier route, the helper-free
+Fallback `count-spans` direct-entry or Span-fill iteration, prepared/cap-
+declined multi-pattern per-line `grep`, the static uniform capture multiplier
+route, the helper-free
 legacy v4 exact-span participation route, the selector-negative/stock-positive
 capture route, and the legacy v4 strict native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. Single-pattern `grep` instead enters the authenticated generated
 whole-operation reducer once, so its LF/CRLF split and checked scalar reduction
-do not retain that Rust outer loop. The uniform route is labelled separately
+do not retain that Rust outer loop. An all-ordinary multi-pattern `grep` table
+now does the same through `linked-native-multi-grep-reducer`; its child rows
+remain authenticated identities, while the single wrapper owns both line and
+row loops. The uniform route is labelled separately
 from both a fused capture
 operation and capture-offset materialization: its native entries select spans;
 the adapter applies an independently sealed per-row participation count. The
@@ -333,6 +337,12 @@ in component order followed by its final reducer object. The reducer remains
 the sole operation entry; component entries are authenticated linked
 identities. Both reproducible builds must preserve that exact object order and
 the separately sealed component-byte and reducer-byte extents.
+For `native-multi-grep-reducer-v1`, supply the ordinary row objects in
+component order followed by `aot-rebar-artifact.o`. The latter is the sole
+claimed operation entry. Its receipt authenticates the ordered raw-source
+digest, source map, first ordinals, every row automaton/program/object identity,
+exact relocation closure, wrapper code/object identities, empty semantic
+runtime-call surface, and the row-plus-wrapper object envelope.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
@@ -444,6 +454,9 @@ Three fresh processes authenticate each job:
    per-component runtime-symbol lists, and program/object hashes; the
    controller runs 15 independent negative controls so a trap in the first
    stage cannot stand in for proof that the other 14 entries execute.
+   `native-multi-grep-reducer-v1` instead traps exactly its final wrapper; its
+   ordinary row entries are inventoried as required defined identities and are
+   not substituted as Rust-loop operation entries.
    The variable-width native-row bridge and uniform-capture row bridge receive
    the same independent negative control for every retained row artifact. The
    exact-span participation v4 runs two independent negative controls: one for

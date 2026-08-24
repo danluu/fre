@@ -18,6 +18,11 @@ native objects. Each row is either an ordinary helper-free native entry or,
 only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
 independently authenticated V15 prepared native search entry. A build with
 no KLV remains a harmless unconfigured workspace binary.
+For multi-pattern `grep`, an all-ordinary row table additionally selects a
+helper-free native wrapper that owns the complete LF/CRLF line traversal,
+calls and validates every distinct row on every line, and publishes the
+checked line count transactionally. A prepared V15 row or the wrapper's typed
+object-byte cap decline retains the exact pre-existing Rust line/row adapter.
 
 A configured build has two validation modes. With both
 `FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` absent,
@@ -132,10 +137,16 @@ timing belongs to a separately named compiler-stage benchmark.
   gate are object-local, and it has no unresolved runtime functions. Only a
   typed unsupported, native-data-byte, or object-byte decline preserves the
   exact incumbent; allocation, lowering, emission, and authentication errors
-  remain terminal. For multiple patterns the runner
-  still invokes every retained row's corresponding direct or prepared search
-  entry per line and counts lines for which any row reports a match. Prepared
-  handles are constructed before warmup and timed loops.
+  remain terminal. For multiple patterns, an all-ordinary table instead links
+  one identity-suffixed helper-free reducer. It implements the same LF/CRLF
+  line domain, invokes and validates every retained row even after a prior row
+  matches, and stores its `u64` result only after all lines succeed. Its exact
+  source map, row identities, relocations, code/object identities, and total
+  object envelope are sealed at build time; runtime reauthenticates the source
+  and artifact identities, and formal qualification rehashes every object. A
+  prepared V15 row or typed reducer object-cap decline retains the older
+  per-line/per-row adapter;
+  prepared handles are constructed before warmup and timed loops.
 - An exact one-pattern `count-captures` or `grep-captures` job first attempts
   one identity-suffixed uniform-capture reducer. The reducer owns the complete
   operation and returns a checked `u64` through the same exclusive-session
@@ -231,6 +242,17 @@ endpoint is authoritative. The outer iterator then applies the same byte-wise
 empty progress and adjacent-empty suppression as pinned
 `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in local
 checked state and are published only after the complete traversal.
+
+Multi-pattern Grep uses the same ordered, deduplicated row table but does not
+apply the ordered-many match-selection reduction: only whether any row matches
+each byte line is relevant. When every row is ordinary, its native reducer
+owns that complete line/row loop in one call while still invoking every row so
+a losing row's malformed status or span remains terminal. Its child relocation
+closure is exactly the distinct row entries. Prepared V15 rows retain the old
+adapter because handle lifecycle is not part of this reducer ABI; the only
+other safe decline is the exact remaining `ObjectBytes` ceiling after charging
+all row objects. Allocation, arithmetic, lowering, emission, and
+authentication failures are terminal.
 
 Count and SpanSum first attempt an additive shared ordered-many route for
 2..=4,096 rows. That route independently parses every source, preserves source
@@ -398,11 +420,13 @@ admitted only by its typed zero-pattern model and exact fixed public stage
 table; it is not recognized by benchmark name.
 
 Multi-pattern `grep` uses the same authenticated direct/prepared native rows,
-restarts their ordered selector for each Rebar byte-line, and reduces only
-whether any row matched that line. Its provenance distinguishes the ordinary
-`per-line-native-independent-span-row-exists-v1` loop from the mixed prepared
-V15 loop. It never scans across a line boundary and never substitutes one
-whole-haystack match stream for Rebar's per-line model.
+restarts every selector for each Rebar byte-line, and reduces only whether any
+row matched that line. An all-ordinary table selects
+`native-independent-span-row-whole-grep-reducer-v1`, with one native wrapper
+owning both loops. A prepared V15 row or typed wrapper object-cap decline is
+reported as the corresponding `per-line-native-independent-*` Rust adapter.
+Neither route scans across a line boundary or substitutes one whole-haystack
+match stream for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
 prepared program/entry and no semantic runtime-helper relocation, and unless

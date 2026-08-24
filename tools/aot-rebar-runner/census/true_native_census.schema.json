@@ -1211,6 +1211,35 @@
         }
       }
     },
+    "multiGrepReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_version", "source_cardinality", "source_bytes",
+        "ordered_sources_sha256", "operation_identity_sha256",
+        "reducer_symbol", "code_sha256", "object_sha256",
+        "relocation_count", "semantic_runtime_calls", "object_bytes",
+        "max_object_bytes", "artifact_identity_sha256"
+      ],
+      "properties": {
+        "abi_version": { "const": 1 },
+        "source_cardinality": { "type": "integer", "minimum": 2 },
+        "source_bytes": { "type": "integer", "minimum": 0 },
+        "ordered_sources_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "operation_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_rebar_multi_grep_v1_[0-9a-f]{64}$"
+        },
+        "code_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "relocation_count": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "semantic_runtime_calls": { "const": 0 },
+        "object_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "max_object_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" }
+      }
+    },
     "frozenValidation": {
       "type": "object",
       "additionalProperties": false,
@@ -1279,6 +1308,7 @@
         "composite_kind": {
           "enum": [
             null, "native-row-bridge-v1", "uniform-capture-row-bridge-v1",
+            "native-multi-grep-reducer-v1",
             "regex-redux-fixed-v1", "strict-capture-next-v1",
             "exact-span-participation-v1", "selector-negative-certificate-v1",
             "mixed-prepared-native-row-bridge-v15",
@@ -1320,6 +1350,7 @@
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
         "regex_redux": { "$ref": "#/$defs/regexReduxProvenance" },
+        "multi_grep_reducer": { "$ref": "#/$defs/multiGrepReducerProvenance" },
         "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
         "scalar_native_reducer": {
           "$ref": "#/$defs/scalarNativeReducerProvenance"
@@ -1367,6 +1398,16 @@
           },
           "then": { "required": ["regex_redux"] },
           "else": { "not": { "required": ["regex_redux"] } }
+        },
+        {
+          "if": {
+            "properties": {
+              "composite_kind": { "const": "native-multi-grep-reducer-v1" }
+            },
+            "required": ["composite_kind"]
+          },
+          "then": { "required": ["multi_grep_reducer"] },
+          "else": { "not": { "required": ["multi_grep_reducer"] } }
         },
         {
           "if": {

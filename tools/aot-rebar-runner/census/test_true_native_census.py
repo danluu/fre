@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -1770,6 +1771,15 @@ class TrueNativeCensusTests(unittest.TestCase):
             "uniform-capture-row-bridge-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
+        self.assertIn(
+            "native-multi-grep-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        multi_grep = definitions["multiGrepReducerProvenance"]
+        self.assertFalse(multi_grep["additionalProperties"])
+        self.assertEqual(
+            multi_grep["properties"]["semantic_runtime_calls"]["const"], 0
+        )
         self.assertIn("uniform_capture", definitions["provenance"]["required"])
         proof = definitions["uniformCaptureProvenance"]
         self.assertFalse(proof["additionalProperties"])
@@ -2591,6 +2601,9 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-native-row-adapter-loop": (
                 True, False, "native-search-core-with-adapter-outer-loop"
             ),
+            "linked-native-multi-grep-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
             "linked-uniform-capture-row-adapter-loop": (
                 True,
                 False,
@@ -3119,6 +3132,92 @@ class TrueNativeCensusTests(unittest.TestCase):
                 "linked-native-row-adapter-loop",
             ),
         )
+
+        reducer_fields = dict(grep_fields)
+        reducer_fields.update({
+            "adapter": "general-aot-native-multi-grep-whole-operation-reducer-v1",
+            "aggregate_strategy": "native-independent-span-row-whole-grep-reducer-v1",
+            "boundary": "single-call-helper-free-native-multi-grep-reducer",
+            "native_multi_grep_reducer": "true",
+            "multi_grep_reducer_abi_version": "1",
+            "multi_grep_reducer_source_cardinality": "3",
+            "multi_grep_reducer_source_bytes": "12",
+            "multi_grep_reducer_ordered_sources_sha256": "a" * 64,
+            "multi_grep_reducer_code_sha256": "b" * 64,
+            "multi_grep_reducer_object_sha256": "c" * 64,
+            "multi_grep_reducer_relocation_count": "2",
+            "multi_grep_reducer_semantic_runtime_calls": "0",
+            "multi_grep_reducer_object_bytes": "1208",
+            "multi_grep_reducer_max_object_bytes": str(268435456 - 4096),
+        })
+        operation = hashlib.sha256()
+        operation.update(b"fre-aot-regex/rebar-multi-grep-reducer/v1\0")
+        operation.update((1).to_bytes(4, "little"))
+        operation.update(bytes((0, 0, 0)))
+        operation.update((0).to_bytes(8, "little"))
+        operation.update((3).to_bytes(8, "little"))
+        operation.update((12).to_bytes(8, "little"))
+        operation.update(bytes.fromhex("a" * 64))
+        operation.update((3).to_bytes(8, "little"))
+        for row in (0, 1, 0):
+            operation.update(row.to_bytes(8, "little"))
+        operation.update((2).to_bytes(8, "little"))
+        for index, first_source in enumerate((0, 1)):
+            operation.update(first_source.to_bytes(8, "little"))
+            entry = reducer_fields[f"component_{index}_entry_symbol"].encode("ascii")
+            operation.update(len(entry).to_bytes(8, "little"))
+            operation.update(entry)
+            for suffix in ("automaton_sha256", "program_sha256", "object_sha256"):
+                operation.update(bytes.fromhex(reducer_fields[f"component_{index}_{suffix}"]))
+        operation_identity = operation.hexdigest()
+        reducer_symbol = f"fre_aot_regex_rebar_multi_grep_v1_{operation_identity}"
+        reducer_fields["multi_grep_reducer_operation_identity_sha256"] = (
+            operation_identity
+        )
+        reducer_fields["multi_grep_reducer_symbol"] = reducer_symbol
+        artifact = hashlib.sha256()
+        artifact.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0")
+        artifact.update(bytes.fromhex(operation_identity))
+        reducer_symbol_bytes = reducer_symbol.encode("ascii")
+        artifact.update(len(reducer_symbol_bytes).to_bytes(8, "little"))
+        artifact.update(reducer_symbol_bytes)
+        artifact.update(bytes.fromhex("b" * 64))
+        artifact.update(bytes.fromhex("c" * 64))
+        artifact.update((2).to_bytes(8, "little"))
+        artifact.update((1208).to_bytes(8, "little"))
+        artifact.update((268435456 - 4096).to_bytes(8, "little"))
+        reducer_fields["multi_grep_reducer_artifact_identity_sha256"] = (
+            artifact.hexdigest()
+        )
+        reducer_encoded = " ".join(
+            f"{key}={value}" for key, value in reducer_fields.items()
+        ).encode()
+        reducer_receipt = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(reducer_encoded)
+        )
+        CENSUS.validate_provenance_record(
+            reducer_receipt, "synthetic native multi-Grep reducer"
+        )
+        self.assertEqual(
+            reducer_receipt["composite_kind"], "native-multi-grep-reducer-v1"
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(reducer_receipt),
+            ([reducer_symbol], "linked-native-multi-grep-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(reducer_receipt),
+            sorted(
+                reducer_fields[f"component_{index}_entry_symbol"]
+                for index in range(2)
+            ),
+        )
+        poisoned_reducer = copy.deepcopy(reducer_receipt)
+        poisoned_reducer["multi_grep_reducer"]["source_bytes"] = 13
+        with self.assertRaisesRegex(CENSUS.CensusError, "operation identity"):
+            CENSUS.validate_provenance_record(
+                poisoned_reducer, "poisoned native multi-Grep reducer"
+            )
 
         poisoned_grep = dict(grep_fields)
         poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"
