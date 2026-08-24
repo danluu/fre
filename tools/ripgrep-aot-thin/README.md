@@ -58,6 +58,35 @@ This emits only Optimizing/Exists for every selected row. Requests for Fast or
 Span then return a runtime error that names the build policy and available
 variant. Unset, empty, or `all` retains the default four-variant registry.
 
+## Opt-in aggregate GrepCount endpoint
+
+An integration that needs only ripgrep's whole-haystack matching-line count
+can build the additive aggregate-only registry:
+
+```sh
+FRE_RIPGREP_AOT_VARIANTS=optimizing-grep-count \
+  cargo build -p fre-ripgrep-aot-thin
+```
+
+This policy emits no ordinary `AotMatcher` variants. It asks the compiler for
+an Optimizing/SelectedEnd native GrepCount reducer only after an independent
+`fre-syntax`/`fre-lower` pass proves a non-empty, non-nullable, assertion-free
+exact finite byte language whose members contain neither CR nor LF. The build
+then authenticates the compiler report, semantic-program identity, exclusive
+GrepCount export, and `NativeFused` strategy before linking an entry. A
+compiler structural decline simply omits that tuple.
+
+Call `AotGrepCountFactory::select` before acquiring or inspecting a haystack.
+`None` is the complete structural decline. `prepare` creates the separate
+exclusive `AotGrepCount` handle, and `count_matching_lines` returns the exact
+LF/CRLF semantic line count. Preparation and native-call errors are terminal;
+the handle never falls back after source access. This aggregate API exposes no
+spans or captures, so integrations needing those results must keep their
+ordinary matcher authoritative for them.
+
+Unset, empty, and `all` continue to emit exactly the original four variants
+and an empty GrepCount registry.
+
 ## Exists batching
 
 Exists variants request an optional one-call native batch entry at build time.

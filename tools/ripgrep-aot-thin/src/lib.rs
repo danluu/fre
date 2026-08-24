@@ -8,13 +8,19 @@ use std::mem::MaybeUninit;
 use fre_aot_regex::{MatchResult, SearchWindow};
 pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
-    FreAotRegexExclusiveExistsBatchV1, FreAotRegexExclusiveHandleV1,
+    FreAotRegexExclusiveExistsBatchV1, FreAotRegexExclusiveGrepCountV1,
+    FreAotRegexExclusiveHandleV1,
     FreAotRegexExclusiveSpanFillV1, FreAotRegexHaystackV1,
     FreAotRegexIndependentExistsBatchV1, FreAotRegexIterStateV1, FreAotRegexResultV1,
     ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PreparedAotMatches,
     PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
     fre_aot_regex_runtime_prepare_exclusive_v1,
 };
+
+#[path = "../registry_key.rs"]
+mod registry_key;
+
+use registry_key::manifest_profile_key;
 
 /// Explicit general-AOT compilation policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +114,7 @@ type PreparedCompatSpanFill = fn(
 ) -> NativeFillOutcome;
 type PreparedSpanFill = FreAotRegexExclusiveSpanFillV1;
 type PreparedExistsBatch = FreAotRegexExclusiveExistsBatchV1;
+type PreparedGrepCount = FreAotRegexExclusiveGrepCountV1;
 type PreparedSearch = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
     *const u8,
@@ -140,6 +147,10 @@ enum PreparedSpanFillFactory {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "the explicit aggregate-only build profile constructs no ordinary matcher backend"
+)]
 enum BackendFactory {
     Native {
         search: NativeSearch,
@@ -169,6 +180,16 @@ struct CompiledSpec {
     backend: BackendFactory,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GrepCountSpec {
+    mode: AotMode,
+    pattern: &'static str,
+    case_insensitive: bool,
+    description: &'static str,
+    entry: PreparedGrepCount,
+    program: &'static [u8],
+}
+
 #[allow(
     unsafe_code,
     reason = "generated declarations are bound to compiler-produced objects with the stable V1 ABI"
@@ -184,6 +205,14 @@ mod generated {
 )]
 #[path = "../build_support.rs"]
 mod build_support_tests;
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the library test target includes the build-time proof for its focused unit tests"
+)]
+#[path = "../build_proof.rs"]
+mod build_proof_tests;
 
 #[cfg(test)]
 #[allow(
@@ -275,6 +304,10 @@ trait NativeIterStateExt {
     fn has_last_match(self) -> bool;
     fn pending_empty_progress(self) -> bool;
     fn finished(self) -> bool;
+    #[allow(
+        dead_code,
+        reason = "the aggregate-only build profile omits every span-iteration caller"
+    )]
     fn set_pending_empty_progress(&mut self, pending: bool);
     fn finish(&mut self);
 }
@@ -324,8 +357,9 @@ struct NativeFillOutcome {
 #[inline(always)]
 #[allow(
     clippy::inline_always,
+    dead_code,
     unsafe_code,
-    reason = "generated monomorphic shims must inline this loop so their AOT entry calls remain direct; status 1 guarantees an initialized result"
+    reason = "generated monomorphic shims must inline this loop so their AOT entry calls remain direct; the aggregate-only profile emits no shim; status 1 guarantees an initialized result"
 )]
 unsafe fn fill_native_spans<Search>(
     haystack: &[u8],
@@ -508,6 +542,163 @@ fn fill_prepared_spans(
         state.finish();
     }
     NativeFillOutcome { written, error }
+}
+
+/// Build-time-authenticated factory for one aggregate-only native `GrepCount`
+/// artifact.
+///
+/// Selection is structural: a missing tuple means the build did not emit the
+/// endpoint or one of its two independent exact-language admissions declined.
+/// No haystack is inspected during selection.
+#[derive(Clone, Copy, Debug)]
+pub struct AotGrepCountFactory {
+    spec: &'static GrepCountSpec,
+}
+
+impl AotGrepCountFactory {
+    /// Select an exact pattern/profile tuple from the opt-in `GrepCount`
+    /// registry.
+    ///
+    /// Only [`AotMode::Optimizing`] can be present. `None` is the complete
+    /// structural decline; callers may choose another implementation before
+    /// acquiring or inspecting a haystack.
+    #[must_use]
+    pub fn select(mode: AotMode, pattern: &str, case_insensitive: bool) -> Option<Self> {
+        generated::GREP_COUNT_SPECS
+            .iter()
+            .find(|spec| {
+                spec.mode == mode
+                    && spec.pattern == pattern
+                    && spec.case_insensitive == case_insensitive
+            })
+            .map(|spec| Self { spec })
+    }
+
+    /// Structural compiler and effective aggregate-route description.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        self.spec.description
+    }
+
+    /// Validate the embedded exact program and allocate its exclusive runtime
+    /// handle.
+    ///
+    /// # Errors
+    ///
+    /// A preparation failure is terminal for the selected endpoint. It is
+    /// never converted into a late structural decline.
+    #[allow(
+        unsafe_code,
+        reason = "preparation validates and owns the exact compiler-exported immutable program"
+    )]
+    pub fn prepare(self) -> Result<AotGrepCount, String> {
+        let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+        // SAFETY: the generated spec borrows the complete immutable program
+        // symbol exported by the same authenticated object as `entry`, and
+        // `handle` is aligned, writable, and disjoint.
+        let status = unsafe {
+            fre_aot_regex_runtime_prepare_exclusive_v1(
+                self.spec.program.as_ptr(),
+                self.spec.program.len(),
+                &raw mut handle,
+            )
+        };
+        if status != 0 || handle.is_invalid() {
+            return Err(format!(
+                "prepare compiled AOT GrepCount handle failed with status {status}"
+            ));
+        }
+        Ok(AotGrepCount {
+            description: self.spec.description,
+            entry: self.spec.entry,
+            handle,
+        })
+    }
+}
+
+/// Exclusively prepared aggregate-only matching-line counter.
+///
+/// The build admits this handle only after independent `fre-syntax`/
+/// `fre-lower` proof and compiler report/identity/export authentication of a
+/// non-empty, non-nullable, assertion-free exact finite byte language with no
+/// CR or LF member. It intentionally exposes no match spans or captures.
+#[derive(Debug)]
+pub struct AotGrepCount {
+    description: &'static str,
+    entry: PreparedGrepCount,
+    handle: FreAotRegexExclusiveHandleV1,
+}
+
+// SAFETY: this owner moves only while idle. Every native call requires
+// `&mut self`, and Drop also requires exclusive ownership, so no operation can
+// overlap a cross-thread move or destruction.
+#[allow(
+    unsafe_code,
+    reason = "the exclusive GrepCount ABI permits moving an idle uniquely owned handle"
+)]
+unsafe impl Send for AotGrepCount {}
+
+impl AotGrepCount {
+    /// Structural compiler and effective aggregate-route description.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// Count LF/CRLF semantic line domains containing at least one match.
+    ///
+    /// # Errors
+    ///
+    /// Any native status failure is terminal and returned directly. This
+    /// selected handle never retries through the ordinary matcher.
+    pub fn count_matching_lines(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        native_grep_count(self.entry, self.handle, haystack)
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for a compiler-produced prepared GrepCount entry"
+)]
+fn native_grep_count(
+    entry: PreparedGrepCount,
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack: &[u8],
+) -> Result<u64, String> {
+    let mut value = MaybeUninit::<u64>::uninit();
+    // SAFETY: the prepared owner exclusively holds the live handle; the
+    // haystack is readable for its complete extent; `value` is aligned,
+    // writable, disjoint, and read only after status zero publishes it.
+    let status = unsafe {
+        entry(
+            handle,
+            haystack.as_ptr(),
+            haystack.len(),
+            value.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "compiled AOT GrepCount entry failed with status {status}"
+        ));
+    }
+    // The compiler-produced ABI initializes the output exactly on status zero.
+    Ok(unsafe { value.assume_init() })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this owner destroys its live exclusive GrepCount handle exactly once"
+)]
+impl Drop for AotGrepCount {
+    fn drop(&mut self) {
+        let handle = std::mem::replace(&mut self.handle, FreAotRegexExclusiveHandleV1::INVALID);
+        if !handle.is_invalid() {
+            // SAFETY: this value exclusively owns the live handle, and Drop's
+            // mutable borrow excludes an overlapping aggregate call.
+            let _status = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+        }
+    }
 }
 
 /// One prepared matcher selected from the fixed ripgrep-suite registry.
@@ -960,6 +1151,7 @@ fn missing_spec_error(
 ) -> String {
     missing_spec_error_from(
         generated::SPECS,
+        generated::ALL_MANIFEST_PROFILE_KEYS,
         generated::BUILD_VARIANT_POLICY,
         mode,
         output,
@@ -970,12 +1162,20 @@ fn missing_spec_error(
 
 fn missing_spec_error_from(
     specs: &[CompiledSpec],
+    all_manifest_profile_keys: &[[u8; 32]],
     build_variant_policy: &str,
     mode: AotMode,
     output: AotOutput,
     pattern: &str,
     case_insensitive: bool,
 ) -> String {
+    let known_manifest_profile = all_manifest_profile_keys
+        .contains(&manifest_profile_key(pattern, case_insensitive));
+    if build_variant_policy == "optimizing-grep-count" && known_manifest_profile {
+        return format!(
+            "requested ordinary AOT variant was not emitted by this aggregate-only build: mode={mode:?} output={output:?} case_insensitive={case_insensitive} pattern={pattern:?}; build_variant_policy=optimizing-grep-count; ordinary_available_variants=none; rebuild with FRE_RIPGREP_AOT_VARIANTS=all to emit ordinary Fast/Optimizing Exists/Span variants"
+        );
+    }
     let available = specs
         .iter()
         .filter(|spec| spec.pattern == pattern && spec.case_insensitive == case_insensitive)
@@ -1368,6 +1568,7 @@ mod tests {
     const fn assert_send<T: Send>() {}
 
     const _: () = assert_send::<AotMatcher>();
+    const _: () = assert_send::<AotGrepCount>();
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1378,6 +1579,29 @@ mod tests {
     static EXISTS_BATCH_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn successful_grep_count(
+        _handle: FreAotRegexExclusiveHandleV1,
+        _haystack: *const u8,
+        _haystack_len: usize,
+        value: *mut u64,
+    ) -> u32 {
+        unsafe { value.write(17) };
+        0
+    }
+
+    unsafe extern "C" fn failing_grep_count(
+        _handle: FreAotRegexExclusiveHandleV1,
+        _haystack: *const u8,
+        _haystack_len: usize,
+        value: *mut u64,
+    ) -> u32 {
+        // Deliberately violate the success-only publication rule. The safe
+        // boundary must still treat the status as terminal and never read or
+        // expose this value.
+        unsafe { value.write(99) };
+        7
+    }
 
     unsafe extern "C" fn one_byte_search(
         _haystack: *const u8,
@@ -1914,6 +2138,26 @@ mod tests {
     }
 
     #[test]
+    fn grep_count_native_boundary_publishes_only_success_and_keeps_errors_terminal() {
+        assert_eq!(
+            native_grep_count(
+                successful_grep_count,
+                FreAotRegexExclusiveHandleV1::INVALID,
+                b"public fixture",
+            )
+            .expect("successful aggregate"),
+            17
+        );
+        let error = native_grep_count(
+            failing_grep_count,
+            FreAotRegexExclusiveHandleV1::INVALID,
+            b"public fixture",
+        )
+        .expect_err("nonzero native status is terminal");
+        assert!(error.contains("status 7"));
+    }
+
+    #[test]
     fn native_iterator_batches_indirect_refills() {
         SEARCH_CALLS.store(0, Ordering::Relaxed);
         FILL_CALLS.store(0, Ordering::Relaxed);
@@ -2334,6 +2578,10 @@ mod tests {
 
     #[test]
     fn generated_direct_exists_batches_match_their_scalar_entries() {
+        if generated::BUILD_VARIANT_POLICY == "optimizing-grep-count" {
+            assert!(generated::SPECS.is_empty());
+            return;
+        }
         const CASES: [&[u8]; 10] = [
             b"",
             b"a",
@@ -2398,6 +2646,10 @@ mod tests {
         reason = "one raw-ABI test keeps top-level, prefix, descriptor, and signed-domain failure ordering together"
     )]
     fn generated_direct_exists_batch_raw_abi_fails_closed() {
+        if generated::BUILD_VARIANT_POLICY == "optimizing-grep-count" {
+            assert!(generated::SPECS.is_empty());
+            return;
+        }
         let batch = generated::SPECS
             .iter()
             .find_map(|spec| match spec.backend {
@@ -2619,6 +2871,7 @@ mod tests {
         }];
         let error = missing_spec_error_from(
             &specs,
+            &[],
             "optimizing-exists",
             AotMode::Fast,
             AotOutput::Span,
@@ -2632,6 +2885,7 @@ mod tests {
 
         let absent = missing_spec_error_from(
             &specs,
+            &[],
             "optimizing-exists",
             AotMode::Optimizing,
             AotOutput::Exists,
@@ -2640,10 +2894,98 @@ mod tests {
         );
         assert!(absent.contains("pattern/profile is not in the ripgrep AOT registry"));
         assert!(!absent.contains("requested AOT variant was not emitted"));
+
+        let known_profile_keys = [manifest_profile_key("public-shape-only", false)];
+        let aggregate_only = missing_spec_error_from(
+            &[],
+            &known_profile_keys,
+            "optimizing-grep-count",
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            "public-shape-only",
+            false,
+        );
+        assert!(aggregate_only.contains("requested ordinary AOT variant was not emitted"));
+        assert!(aggregate_only.contains("aggregate-only build"));
+        assert!(aggregate_only.contains("build_variant_policy=optimizing-grep-count"));
+        assert!(aggregate_only.contains("ordinary_available_variants=none"));
+        assert!(aggregate_only.contains("FRE_RIPGREP_AOT_VARIANTS=all"));
+        assert!(!aggregate_only.contains("pattern/profile is not in the ripgrep AOT registry"));
+
+        let aggregate_absent = missing_spec_error_from(
+            &[],
+            &known_profile_keys,
+            "optimizing-grep-count",
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            "different-public-shape",
+            false,
+        );
+        assert!(aggregate_absent.contains("pattern/profile is not in the ripgrep AOT registry"));
+        assert!(!aggregate_absent.contains("requested ordinary AOT variant was not emitted"));
+
+        let aggregate_wrong_profile = missing_spec_error_from(
+            &[],
+            &known_profile_keys,
+            "optimizing-grep-count",
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            "public-shape-only",
+            true,
+        );
+        assert!(
+            aggregate_wrong_profile.contains("pattern/profile is not in the ripgrep AOT registry")
+        );
+        assert!(
+            !aggregate_wrong_profile.contains("requested ordinary AOT variant was not emitted")
+        );
+    }
+
+    #[test]
+    fn aggregate_only_registry_reports_ordinary_variants_omitted_by_policy() {
+        if generated::BUILD_VARIANT_POLICY != "optimizing-grep-count" {
+            return;
+        }
+        let Some(known) = generated::GREP_COUNT_SPECS.first() else {
+            return;
+        };
+        let error = AotMatcher::new(
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            known.pattern,
+            known.case_insensitive,
+        )
+        .expect_err("aggregate-only builds omit the known ordinary matcher variant");
+        assert!(error.contains("requested ordinary AOT variant was not emitted"));
+        assert!(error.contains("build_variant_policy=optimizing-grep-count"));
+        assert!(!error.contains("pattern/profile is not in the ripgrep AOT registry"));
+
+        let mut absent = "public-shape-not-in-manifest".to_owned();
+        while generated::ALL_MANIFEST_PROFILE_KEYS.contains(&manifest_profile_key(&absent, false)) {
+            absent.push('x');
+        }
+        let absent_error = AotMatcher::new(
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            &absent,
+            false,
+        )
+        .expect_err("unknown manifest profile must remain absent");
+        assert!(absent_error.contains("pattern/profile is not in the ripgrep AOT registry"));
+        assert!(!absent_error.contains("requested ordinary AOT variant was not emitted"));
     }
 
     #[test]
     fn generated_registry_routes_compiled_prepared_entries() {
+        assert_eq!(
+            generated::ALL_MANIFEST_PROFILE_KEYS.len(),
+            generated::BUILD_MANIFEST_PATTERN_COUNT,
+            "raw-free key table must cover every unfiltered manifest row"
+        );
+        assert!(
+            generated::BUILD_MANIFEST_PATTERN_COUNT >= generated::BUILD_PATTERN_COUNT,
+            "filtered build pattern count exceeds its complete manifest"
+        );
         let variants_per_pattern = match generated::BUILD_VARIANT_POLICY {
             "all" => 4,
             "optimizing-exists" => {
@@ -2653,6 +2995,10 @@ mod tests {
                 }));
                 1
             }
+            "optimizing-grep-count" => {
+                assert!(generated::SPECS.is_empty());
+                0
+            }
             other => panic!("unknown generated build variant policy: {other:?}"),
         };
         assert_eq!(
@@ -2660,7 +3006,7 @@ mod tests {
             generated::BUILD_PATTERN_COUNT * variants_per_pattern,
             "generated registry cardinality does not match its frozen pattern/variant policy"
         );
-        if generated::BUILD_VARIANT_POLICY == "optimizing-exists" {
+        if generated::BUILD_VARIANT_POLICY != "all" {
             return;
         }
         let mut prepared = 0;
@@ -2799,6 +3145,100 @@ mod tests {
     }
 
     #[test]
+    fn generated_grep_count_registry_is_opt_in_authenticated_and_aggregate_only() {
+        assert_eq!(
+            generated::BUILD_GREP_COUNT_ADMITTED_COUNT,
+            generated::GREP_COUNT_SPECS.len()
+        );
+        if generated::BUILD_VARIANT_POLICY != "optimizing-grep-count" {
+            assert!(generated::GREP_COUNT_SPECS.is_empty());
+            return;
+        }
+
+        assert!(generated::SPECS.is_empty());
+        assert!(generated::GREP_COUNT_SPECS.len() <= generated::BUILD_PATTERN_COUNT);
+        for spec in generated::GREP_COUNT_SPECS {
+            assert_eq!(spec.mode, AotMode::Optimizing);
+            assert!(
+                spec.description.contains(
+                    "route=compiled-prepared,api=grep-count-v1,aggregate=native-fused"
+                ),
+                "{}",
+                spec.description
+            );
+            assert!(spec.description.contains(
+                "proof=exact-finite-nonempty-nonnullable-assertion-free-crlf-free"
+            ));
+            assert!(
+                AotGrepCountFactory::select(
+                    AotMode::Optimizing,
+                    spec.pattern,
+                    spec.case_insensitive,
+                )
+                .is_some()
+            );
+            assert!(
+                AotGrepCountFactory::select(AotMode::Fast, spec.pattern, spec.case_insensitive)
+                    .is_none()
+            );
+
+            // SAFETY: the authenticated entry must reject the invalid handle
+            // before inspecting any deliberately invalid remaining argument.
+            let status = unsafe {
+                (spec.entry)(
+                    FreAotRegexExclusiveHandleV1::INVALID,
+                    std::ptr::null(),
+                    usize::MAX,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, fre_aot_regex_runtime::STATUS_INVALID_HANDLE);
+        }
+
+        if let Some(factory) =
+            AotGrepCountFactory::select(AotMode::Optimizing, "PM_RESUME", false)
+        {
+            assert_eq!(factory.description(), {
+                generated::GREP_COUNT_SPECS
+                    .iter()
+                    .find(|spec| spec.pattern == "PM_RESUME" && !spec.case_insensitive)
+                    .expect("selected public fixture")
+                    .description
+            });
+            let mut counter = factory.prepare().expect("prepare public GrepCount fixture");
+            assert_eq!(counter.description(), factory.description());
+            for (haystack, expected) in [
+                (b"".as_slice(), 0),
+                (b"unrelated".as_slice(), 0),
+                (b"PM_RESUME".as_slice(), 1),
+                (b"xPM_RESUMEx".as_slice(), 1),
+                (b"PM_RESUME\nmiss\nPM_RESUME\n".as_slice(), 2),
+                (b"PM_RESUME\r\nmiss\r\nPM_RESUME".as_slice(), 2),
+            ] {
+                assert_eq!(
+                    counter
+                        .count_matching_lines(haystack)
+                        .expect("native GrepCount call"),
+                    expected
+                );
+            }
+        }
+        if let Some(factory) =
+            AotGrepCountFactory::select(AotMode::Optimizing, "PM_RESUME", true)
+        {
+            let mut counter = factory
+                .prepare()
+                .expect("prepare public case-insensitive GrepCount fixture");
+            assert_eq!(
+                counter
+                    .count_matching_lines(b"pm_resume\nmiss\nPm_ReSuMe")
+                    .expect("case-insensitive native GrepCount call"),
+                2
+            );
+        }
+    }
+
+    #[test]
     fn generated_pruned_registry_rejects_absent_variant_clearly() {
         if generated::BUILD_VARIANT_POLICY != "optimizing-exists" {
             return;
@@ -2820,6 +3260,9 @@ mod tests {
 
     #[test]
     fn compiled_prepared_bulk_invalid_handle_precedes_other_validation() {
+        if generated::BUILD_VARIANT_POLICY == "optimizing-grep-count" {
+            return;
+        }
         let mut compiled_calls = 0;
         let mut saw_runtime_span = false;
         let mut saw_runtime_exists = false;

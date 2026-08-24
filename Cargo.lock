@@ -475,7 +475,9 @@ version = "0.1.0"
 dependencies = [
  "fre-aot-regex",
  "fre-aot-regex-runtime",
+ "fre-lower",
  "fre-syntax",
+ "sha2",
 ]
 
 [[package]]

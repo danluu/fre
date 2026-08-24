@@ -7,26 +7,34 @@ use std::process::Command;
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, EngineKind, EngineSelectionReason,
     IndependentExistsBatchCompileError, OperatingSystem, OutputContract, PreparedBulkStrategy,
-    StartAccelerator, Target, compile, compile_with_independent_exists_batch,
+    PreparedAggregateExports, PreparedAggregateStrategy, StartAccelerator, Target, compile,
+    compile_with_exact_finite_selected_end_grep_count,
+    compile_with_independent_exists_batch,
 };
 use fre_syntax::RustProfile;
 
+mod build_proof;
 mod build_support;
 mod build_target;
+mod registry_key;
 
+use build_proof::{exact_crlf_free_finite_language, ripgrep_grep_count_profile};
 use build_support::{
     BuildMode, BuildOutput, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy, patterns_path,
-    read_patterns,
+    purge_generated_artifacts, read_patterns,
 };
 use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
+use registry_key::manifest_profile_key;
 
 #[allow(
     clippy::too_many_lines,
     reason = "artifact compilation and generated registry construction form one build transaction"
 )]
 fn main() {
+    println!("cargo:rerun-if-changed=build_proof.rs");
     println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-changed=build_target.rs");
+    println!("cargo:rerun-if-changed=registry_key.rs");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
     println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_PATTERN_FILTER");
@@ -41,9 +49,18 @@ fn main() {
     let variant_policy = VariantPolicy::parse(env::var_os(VARIANTS_ENV).as_deref())
         .unwrap_or_else(|error| panic!("AOT variant policy: {error}"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    purge_generated_artifacts(&out_dir)
+        .unwrap_or_else(|error| panic!("purge stale AOT build artifacts: {error}"));
     let target = target().unwrap_or_else(|error| panic!("AOT target: {error}"));
     let mut patterns = read_patterns(&patterns_path)
         .unwrap_or_else(|error| panic!("AOT patterns manifest: {error}"));
+    let manifest_pattern_count = patterns.len();
+    let mut manifest_profile_key_rows = String::new();
+    for pattern in &patterns {
+        let key = manifest_profile_key(&pattern.source, pattern.case_insensitive);
+        writeln!(&mut manifest_profile_key_rows, "    {key:?},")
+            .expect("String writes cannot fail");
+    }
     if let Some(filter) = env::var_os("FRE_RIPGREP_AOT_PATTERN_FILTER") {
         let ids = filter.to_string_lossy();
         let ids = ids.split(',').collect::<Vec<_>>();
@@ -54,12 +71,14 @@ fn main() {
         );
     }
     let mut generated = format!(
-        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive fill ABI types are absent when every selected artifact takes a compatibility route\")]\nuse super::{{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans}};\n\npub(super) const BUILD_VARIANT_POLICY: &str = {:?};\npub(super) const BUILD_PATTERN_COUNT: usize = {};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {{\n",
+        "#[allow(unused_imports, reason = \"a fully declined aggregate-only registry declares no handle-taking symbol\")]\nuse fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive ABI types are absent unless their explicit build profile is selected\")]\nuse super::{{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, GrepCountSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans}};\n\npub(super) const BUILD_VARIANT_POLICY: &str = {:?};\n#[allow(dead_code, reason = \"generated-registry cardinality is checked by the package tests\")]\npub(super) const BUILD_PATTERN_COUNT: usize = {};\n#[allow(dead_code, reason = \"the raw-free manifest-key cardinality is checked by the package tests\")]\npub(super) const BUILD_MANIFEST_PATTERN_COUNT: usize = {manifest_pattern_count};\n\n/// Raw-free identities for every pattern/profile row in the selected manifest.\npub(super) const ALL_MANIFEST_PROFILE_KEYS: &[[u8; 32]] = &[\n{manifest_profile_key_rows}];\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {{\n",
         variant_policy.name(),
         patterns.len(),
     );
     let mut native_fills = String::new();
     let mut rows = String::new();
+    let mut grep_count_rows = String::new();
+    let mut grep_count_admitted = 0_usize;
     let mut objects = Vec::new();
 
     for pattern in &patterns {
@@ -299,12 +318,144 @@ fn main() {
             }
         }
     }
+
+    if variant_policy.includes(BuildMode::Optimizing, BuildOutput::GrepCount) {
+        for pattern in &patterns {
+            let profile = ripgrep_grep_count_profile(pattern.case_insensitive);
+            if !exact_crlf_free_finite_language(&pattern.source, &profile) {
+                continue;
+            }
+            let compiled = compile_with_exact_finite_selected_end_grep_count(
+                CompileRequest::new(pattern.source.clone(), target)
+                    .profile(profile)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "compile {} optimizing/grep-count after independent proof: {error}",
+                    pattern.id
+                )
+            });
+            let module = compiled.module();
+            let receipt = compiled.receipt();
+            let report = module
+                .exact_finite_selected_end_grep_count_aot_report()
+                .copied();
+            let entry_symbol = module.prepared_grep_count_symbol();
+            if report.is_none() && entry_symbol.is_none() {
+                assert!(
+                    module.prepared_aggregate_exports() == PreparedAggregateExports::NONE
+                        && module.prepared_aggregate_strategy().is_none()
+                        && receipt.prepared_aggregate_exports == PreparedAggregateExports::NONE
+                        && receipt.prepared_aggregate_strategy.is_none(),
+                    "structurally declined GrepCount artifact {} retained partial aggregate state",
+                    pattern.id
+                );
+                continue;
+            }
+            let (Some(report), Some(entry_symbol)) = (report, entry_symbol) else {
+                panic!(
+                    "GrepCount artifact {} disagrees between compiler report and exported entry",
+                    pattern.id
+                );
+            };
+            let Some((program_symbol, program_len)) = module.required_runtime_program() else {
+                panic!(
+                    "authenticated GrepCount artifact {} has no preparation program",
+                    pattern.id
+                );
+            };
+            let artifact_identity = compiled.program().artifact_identity();
+            assert!(
+                report.artifact_identity == artifact_identity
+                    && receipt.program_sha256 == artifact_identity
+                    && report.output == OutputContract::SelectedEnd
+                    && receipt.output == OutputContract::SelectedEnd
+                    && receipt.mode == CompileMode::Optimizing
+                    && receipt.target == target
+                    && receipt.line_terminator == b'\n'
+                    && report.source_count != 0
+                    && report.source_bytes != 0
+                    && report.maximum_width != 0
+                    && report.module_sha256 != [0; 32]
+                    && report.ordinary_entry_sha256 != [0; 32]
+                    && report.reducer_code_sha256 != [0; 32]
+                    && program_len != 0
+                    && module.prepared_aggregate_exports() == PreparedAggregateExports::GREP_COUNT
+                    && receipt.prepared_aggregate_exports == PreparedAggregateExports::GREP_COUNT
+                    && module.prepared_aggregate_strategy()
+                        == Some(PreparedAggregateStrategy::NativeFused)
+                    && receipt.prepared_aggregate_strategy
+                        == Some(PreparedAggregateStrategy::NativeFused)
+                    && module.prepared_count_symbol().is_none()
+                    && module.prepared_span_sum_symbol().is_none()
+                    && module.required_runtime_symbols().next().is_none()
+                    && !receipt.runtime_helper_required
+                    && receipt.required_prepare_capabilities == 0
+                    && receipt.object_bytes == compiled.object().len(),
+                "GrepCount artifact {} failed compiler report/identity/export authentication",
+                pattern.id
+            );
+
+            let stem = format!("{}_optimizing_grep_count", pattern.id);
+            let object = out_dir.join(format!("{stem}.o"));
+            fs::write(&object, compiled.object()).unwrap_or_else(|error| {
+                panic!("write generated object {}: {error}", object.display())
+            });
+            objects.push(object);
+            let entry_declaration = format!("grep_count_entry_{stem}");
+            let program_declaration = format!("grep_count_program_{stem}");
+            writeln!(
+                &mut generated,
+                "    #[link_name = {entry_symbol:?}] fn {entry_declaration}(handle: FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;",
+            )
+            .expect("String writes cannot fail");
+            writeln!(
+                &mut generated,
+                "    #[link_name = {program_symbol:?}] static {program_declaration}: [u8; {program_len}];",
+            )
+            .expect("String writes cannot fail");
+            let description = format!(
+                "mode=optimizing,route=compiled-prepared,api=grep-count-v1,aggregate=native-fused,proof=exact-finite-nonempty-nonnullable-assertion-free-crlf-free,engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
+                engine_name(receipt.engine),
+                reason_name(receipt.engine_selection_reason),
+                accelerator_name(receipt.start_accelerator),
+                architecture_name(target.architecture),
+                os_name(target.operating_system),
+                target.features.bits(),
+                receipt.thompson_states,
+                receipt
+                    .dfa
+                    .map_or_else(|| "-".to_owned(), |stats| stats.forward_states.to_string()),
+            );
+            writeln!(
+                &mut grep_count_rows,
+                "    GrepCountSpec {{ mode: AotMode::Optimizing, pattern: {:?}, case_insensitive: {}, description: {:?}, entry: {entry_declaration}, program: unsafe {{ &{program_declaration} }} }},",
+                pattern.source,
+                pattern.case_insensitive,
+                description,
+            )
+            .expect("String writes cannot fail");
+            grep_count_admitted += 1;
+        }
+    }
     generated.push_str("}\n\n");
     generated.push_str(&native_fills);
     generated.push_str(
         "\n#[allow(unsafe_code, reason = \"generated registry borrows exact immutable program symbols from linked compiler objects\")]\npub(super) const SPECS: &[CompiledSpec] = &[\n",
     );
     generated.push_str(&rows);
+    generated.push_str("];\n");
+    writeln!(
+        &mut generated,
+        "\n#[allow(dead_code, reason = \"generated GrepCount admission cardinality is checked by the package tests\")]\npub(super) const BUILD_GREP_COUNT_ADMITTED_COUNT: usize = {grep_count_admitted};"
+    )
+    .expect("String writes cannot fail");
+    generated.push_str(
+        "\n#[allow(unsafe_code, reason = \"generated registry borrows exact immutable GrepCount program symbols from linked compiler objects\")]\npub(super) const GREP_COUNT_SPECS: &[GrepCountSpec] = &[\n",
+    );
+    generated.push_str(&grep_count_rows);
     generated.push_str("];\n");
     fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");
     if !objects.is_empty() {
@@ -335,6 +486,11 @@ fn target() -> Result<Target, String> {
 
 fn make_archive(out_dir: &Path, objects: &[PathBuf]) {
     let archive = out_dir.join("libfre_ripgrep_aot_objects.a");
+    match fs::remove_file(&archive) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale AOT object archive {}: {error}", archive.display()),
+    }
     let archiver = env::var_os("AR").unwrap_or_else(|| "ar".into());
     let output = Command::new(&archiver)
         .arg("crs")
