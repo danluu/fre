@@ -27894,6 +27894,458 @@ pub(crate) fn lower_native_regex_redux_operation_v1(
     )
 }
 
+const WEIGHTED_CAPTURE_TEXT_SECTION: usize = 0;
+const WEIGHTED_CAPTURE_DATA_SECTION: usize = 1;
+const WEIGHTED_CAPTURE_ENTRY_SYMBOL: usize = 0;
+const WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE: usize = 2;
+
+fn native_weighted_capture_module(
+    target: Target,
+    domain: crate::UniformCaptureReducerDomain,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    component_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+) -> Result<CompiledModule, ObjectError> {
+    let prefix = match domain {
+        crate::UniformCaptureReducerDomain::WholeHaystack => {
+            "fre_aot_regex_weighted_count_captures_v1_"
+        }
+        crate::UniformCaptureReducerDomain::ByteSliceLinesLfCrLf => {
+            "fre_aot_regex_weighted_grep_captures_v1_"
+        }
+    };
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component_entries.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: identity_symbol(prefix, &identity)?,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(WEIGHTED_CAPTURE_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("weighted capture text extent"))?,
+    });
+    symbols.push(ModuleSymbol {
+        name: ".Lfre_aot_regex_weighted_capture_identity_v1".to_owned(),
+        binding: SymbolBinding::Local,
+        kind: SymbolKind::Object,
+        section: Some(WEIGHTED_CAPTURE_DATA_SECTION),
+        offset: 0,
+        size: 32,
+    });
+    for entry in component_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.weighted-capture",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: identity.into(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: WEIGHTED_CAPTURE_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+/// Lower one separately linkable weighted row reducer. Its only unresolved
+/// symbols are the ordinary Span component entries in first-source order.
+pub(crate) fn lower_native_weighted_capture_reducer_v1(
+    target: Target,
+    domain: crate::UniformCaptureReducerDomain,
+    identity: [u8; 32],
+    component_entries: &[String],
+    component_weights: &[u64],
+) -> Result<CompiledModule, ObjectError> {
+    if component_entries.is_empty()
+        || component_entries.len() != component_weights.len()
+        || component_entries.len() > crate::REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_MAX_COMPONENTS
+        || component_weights.contains(&0)
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "weighted capture target/component closure",
+        ));
+    }
+    let (code, relocations) = match target.architecture {
+        Architecture::X86_64 => {
+            lower_x86_64_native_weighted_capture_v1(domain, component_weights)?
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_native_weighted_capture_v1(domain, component_weights)?
+        }
+    };
+    native_weighted_capture_module(
+        target,
+        domain,
+        identity,
+        code,
+        component_entries,
+        relocations,
+    )
+}
+
+fn lower_x86_64_native_weighted_capture_domain_v1(
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<usize>), ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    const SELECTED_START_OFFSET: u8 = 16;
+    const SELECTED_END_OFFSET: u8 = 24;
+    const SELECTED_WEIGHT_OFFSET: u8 = 32;
+    let mut assembler = X86Assembler::new();
+    let search = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let mut call_displacements = Vec::new();
+    call_displacements
+        .try_reserve_exact(weights.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 calls"))?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xd6])?; // transactional output
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // next window start
+
+    assembler.bind(search)?;
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        SELECTED_START_OFFSET,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+    ])?;
+    for &weight in weights {
+        let next_component = assembler.label()?;
+        assembler.instruction(&[0x4c, 0x89, 0xe7])?; // rdi = haystack
+        assembler.instruction(&[0x4c, 0x89, 0xee])?; // rsi = length
+        assembler.instruction(&[0x48, 0x89, 0xda])?; // rdx = start
+        assembler.instruction(&[0x4c, 0x89, 0xe9])?; // rcx = end
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // r8 = result
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        call_displacements.push(call);
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], next_component)?;
+        assembler.instruction(&[0x83, 0xf8, 1])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?; // candidate start
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 8])?; // candidate end
+        assembler.instruction(&[0x49, 0x39, 0xd9])?; // start >= window start
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.instruction(&[0x4d, 0x39, 0xca])?; // end > start
+        assembler.branch(&[0x0f, 0x86], runtime_failure)?;
+        assembler.instruction(&[0x4d, 0x39, 0xea])?; // end <= length
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, SELECTED_START_OFFSET])?;
+        assembler.instruction(&[0x4d, 0x39, 0xd9])?; // earlier source wins equal start
+        assembler.branch(&[0x0f, 0x83], next_component)?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, SELECTED_START_OFFSET])?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, SELECTED_END_OFFSET])?;
+        let mut load_weight = vec![0x49, 0xbb];
+        load_weight.extend_from_slice(&weight.to_le_bytes());
+        assembler.instruction(&load_weight)?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, SELECTED_WEIGHT_OFFSET])?;
+        assembler.bind(next_component)?;
+    }
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SELECTED_START_OFFSET])?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x4c, 0x03, 0x7c, 0x24, SELECTED_WEIGHT_OFFSET])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x8b, 0x5c, 0x24, SELECTED_END_OFFSET])?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let mut calls = Vec::new();
+    calls
+        .try_reserve_exact(call_displacements.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 call offsets"))?;
+    for call in call_displacements {
+        calls.push(finished.label_offset(call)?);
+    }
+    Ok((finished.code, calls))
+}
+
+fn lower_x86_64_native_weighted_capture_v1(
+    domain: crate::UniformCaptureReducerDomain,
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let (private, mut calls) = lower_x86_64_native_weighted_capture_domain_v1(weights)?;
+    let code = if domain == crate::UniformCaptureReducerDomain::WholeHaystack {
+        private
+    } else {
+        let (mut wrapper, private_call) = lower_x86_64_native_capture_grep_wrapper_v1(0)?;
+        let private_offset = wrapper
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow("weighted capture x86 private alignment"))?
+            & !15;
+        wrapper
+            .try_reserve_exact(
+                private_offset
+                    .checked_sub(wrapper.len())
+                    .and_then(|padding| padding.checked_add(private.len()))
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "weighted capture x86 private extent",
+                    ))?,
+            )
+            .map_err(|_| ObjectError::Allocation("weighted capture x86 wrapper"))?;
+        wrapper.resize(private_offset, 0x90);
+        push_bytes(&mut wrapper, &private)?;
+        patch_x86_64_local_call(&mut wrapper, private_call, private_offset)?;
+        for call in &mut calls {
+            *call = private_offset
+                .checked_add(*call)
+                .ok_or(ObjectError::ArithmeticOverflow("weighted capture x86 child call"))?;
+        }
+        wrapper
+    };
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(calls.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 relocations"))?;
+    for (component, call) in calls.into_iter().enumerate() {
+        relocations.push(ModuleRelocation {
+            section: WEIGHTED_CAPTURE_TEXT_SECTION,
+            offset: offset_u64(call, "weighted capture x86 call")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component,
+            addend: -4,
+        });
+    }
+    Ok((code, relocations))
+}
+
+fn lower_aarch64_native_weighted_capture_domain_v1(
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<usize>), ObjectError> {
+    const FRAME_BYTES: u16 = 144;
+    const RESULT_OFFSET: u16 = 96;
+    const SELECTED_START_OFFSET: u16 = 112;
+    const SELECTED_WEIGHT_OFFSET: u16 = 128;
+    let mut assembler = Aarch64Assembler::new();
+    let search = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(weights.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture AArch64 calls"))?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+
+    assembler.bind(search)?;
+    aarch64_load_u64_constant(&mut assembler, 5, u64::MAX)?;
+    assembler.instruction(aarch64_store_x(5, 31, SELECTED_START_OFFSET)?)?;
+    for &weight in weights {
+        let next_component = assembler.label()?;
+        assembler.instruction(aarch64_mov_x(0, 19)?)?;
+        assembler.instruction(aarch64_mov_x(1, 20)?)?;
+        assembler.instruction(aarch64_mov_x(2, 23)?)?;
+        assembler.instruction(aarch64_mov_x(3, 20)?)?;
+        assembler.instruction(aarch64_add_x_imm(4, 31, RESULT_OFFSET)?)?;
+        call_offsets.push(assembler.instruction(0x9400_0000)?);
+        assembler.branch_zero_w(0, next_component)?;
+        assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(RESULT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("weighted capture AArch64 result"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 23)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 5)?)?;
+        assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, SELECTED_START_OFFSET)?)?;
+        assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+        assembler.branch_cond(AARCH64_HS, next_component)?;
+        assembler.instruction(aarch64_store_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(SELECTED_START_OFFSET).map_err(|_| {
+                ObjectError::ArithmeticOverflow("weighted capture AArch64 selected span")
+            })?,
+        )?)?;
+        aarch64_load_u64_constant(&mut assembler, 7, weight)?;
+        assembler.instruction(aarch64_store_x(7, 31, SELECTED_WEIGHT_OFFSET)?)?;
+        assembler.bind(next_component)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(5, 31, SELECTED_START_OFFSET)?)?;
+    aarch64_load_u64_constant(&mut assembler, 6, u64::MAX)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_x_imm(7, 31, SELECTED_WEIGHT_OFFSET)?)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 7)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(23, 31, SELECTED_START_OFFSET + 8)?)?;
+    assembler.branch(search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let code = assembler.finish_with_offsets(&mut call_offsets)?;
+    Ok((code, call_offsets))
+}
+
+fn lower_aarch64_native_weighted_capture_v1(
+    domain: crate::UniformCaptureReducerDomain,
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let (private, mut calls) = lower_aarch64_native_weighted_capture_domain_v1(weights)?;
+    let code = if domain == crate::UniformCaptureReducerDomain::WholeHaystack {
+        private
+    } else {
+        let (mut wrapper, private_call) = lower_aarch64_native_capture_grep_wrapper_v1(0)?;
+        if !wrapper.len().is_multiple_of(4) || !private.len().is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "weighted capture AArch64 instruction alignment",
+            ));
+        }
+        let private_offset = wrapper.len();
+        push_bytes(&mut wrapper, &private)?;
+        patch_aarch64_local_call(&mut wrapper, private_call, private_offset)?;
+        for call in &mut calls {
+            *call = private_offset
+                .checked_add(*call)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "weighted capture AArch64 child call",
+                ))?;
+        }
+        wrapper
+    };
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(calls.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture AArch64 relocations"))?;
+    for (component, call) in calls.into_iter().enumerate() {
+        relocations.push(ModuleRelocation {
+            section: WEIGHTED_CAPTURE_TEXT_SECTION,
+            offset: offset_u64(call, "weighted capture AArch64 call")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component,
+            addend: 0,
+        });
+    }
+    Ok((code, relocations))
+}
+
 type X86Label = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -139182,5 +139634,92 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "fre-aot-x86-macos-bundle",
             "native-x86-macos-differential-ok",
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links a maximum-weight reducer to a fake Span child on the host ISA"]
+    fn linked_weighted_capture_reducer_checked_add_is_transactional() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let child = "fre_aot_regex_weighted_overflow_fake_child".to_owned();
+        let module = lower_native_weighted_capture_reducer_v1(
+            target,
+            crate::UniformCaptureReducerDomain::WholeHaystack,
+            [0x5a; 32],
+            core::slice::from_ref(&child),
+            &[u64::MAX],
+        )
+        .expect("lower maximum-weight reducer");
+        let object = emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+            .expect("emit maximum-weight reducer");
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-weighted-capture-overflow-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create overflow linker directory");
+        let object_path = directory.join("reducer.o");
+        fs::write(&object_path, object).expect("write maximum-weight reducer");
+        let source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <limits.h>\n\
+             extern uint32_t {entry}(const unsigned char*,size_t,uint64_t*);\n\
+             uint32_t {child}(const unsigned char*h,size_t n,size_t s,size_t e,size_t*r){{\
+             (void)h;if(s>e||e>n)return 9;if(s==e)return 0;r[0]=s;r[1]=s+1;return 1;}}\n\
+             int main(void){{static const unsigned char h[2]={{0,0}};uint64_t v=7;\
+             uint32_t s={entry}(h,2,&v);if(s!=3||v!=7)return 10;\
+             v=8;s={entry}(h,1,&v);if(s!=0||v!=UINT64_MAX)return 11;return 0;}}\n",
+            entry = module.entry_symbol(),
+        );
+        let c_path = directory.join("overflow.c");
+        let executable = directory.join("overflow");
+        fs::write(&c_path, source).expect("write overflow C harness");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let output = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("link overflow reducer harness");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute overflow reducer harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).expect("remove overflow linker directory");
     }
 }

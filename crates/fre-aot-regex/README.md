@@ -95,3 +95,16 @@ stable program, final object, target, and line terminator; a semantic proof
 decline remains explicit. Proof/lowering/compiler failures are terminal, and
 the API rejects selectors with runtime or prepared-handle dependencies so a
 consumer cannot mistake a fallback for a helper-free native entry.
+
+`compile_rebar_weighted_capture_reducer_aot_v1` closes a proven ordered
+multi-source capture job whose retained ordinary Span components have unequal
+participation multipliers. It emits a separate three-argument native reducer
+object whose only external relocations are direct calls to those authenticated
+components. The reducer selects the earliest component match in first-source
+order, advances by its positive-width end, checked-adds its proved multiplier,
+and owns either the whole haystack or the exact LF/CRLF byte-line traversal.
+Its receipt binds the source/component map, first ordinals and weights, every
+component program/object identity, target, reducer identities, and exact call
+relocations. Only the explicit serialized-object byte cap is a typed decline;
+allocation, arithmetic, lowering, object-structure, and authentication errors
+remain terminal.

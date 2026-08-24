@@ -43,6 +43,7 @@ mod program;
 mod regex_set;
 mod regex_redux_aot;
 mod rebar_single_capture;
+mod rebar_weighted_capture;
 mod required_literals;
 mod seeded_reverse;
 mod shared_uniform_capture;
@@ -340,6 +341,18 @@ pub use rebar_single_capture::{
     RebarSingleCaptureReducerSourceRouteV1, compile_rebar_single_capture_aot_v1,
     compile_rebar_single_capture_participation_aot_v1,
     compile_rebar_single_capture_reducer_aot_v1,
+};
+pub use rebar_weighted_capture::{
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_MAX_COMPONENTS,
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_RECEIPT_VERSION,
+    RebarWeightedCaptureReducerAotArtifactV1,
+    RebarWeightedCaptureReducerAotAuthenticationErrorV1,
+    RebarWeightedCaptureReducerAotCompileDeclineV1,
+    RebarWeightedCaptureReducerAotCompileDispositionV1,
+    RebarWeightedCaptureReducerAotErrorV1, RebarWeightedCaptureReducerAotReceiptV1,
+    RebarWeightedCaptureReducerAotRequestV1, RebarWeightedCaptureReducerRelocationV1,
+    compile_rebar_weighted_capture_reducer_aot_v1,
 };
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureReducer,
