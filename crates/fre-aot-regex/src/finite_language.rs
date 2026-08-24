@@ -10,9 +10,10 @@ use fre_automata::{
 };
 use fre_lower::{
     FactError, FactLimits, FactOperation, FactOptionalProofs, FactOutput, FactProof, HirFacts,
-    LowerError, LowerLimits, analyze_facts,
+    LowerError, LowerLimits, analyze_facts, analyze_hir_facts,
 };
 use fre_syntax::RustParsed;
+use regex_syntax::hir::Hir;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -109,6 +110,76 @@ impl NativeFiniteLanguageCandidate {
         let operation = fact_operation(output);
         let facts = analyze_facts(parsed, operation, FactLimits::default()).ok()?;
         Self::from_facts(&facts, operation)
+    }
+
+    /// Analyze one already-composed canonical HIR while preserving hard
+    /// construction failures as terminal errors.
+    ///
+    /// Ordered multi-source compilation uses this after every source has
+    /// parsed independently and before the combined HIR is lowered. A bounded
+    /// fact or optional finite-language refusal remains an optimization
+    /// decline. Allocation, arithmetic, and invariant failures cannot be
+    /// converted into a later allocating fallback.
+    pub(crate) fn analyze_hir_checked(
+        hir: &Hir,
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        let operation = fact_operation(output);
+        let facts = match analyze_hir_facts(hir, operation, FactLimits::default()) {
+            Ok(facts) => facts,
+            Err(FactError::ResourceLimit { .. }) => return Ok(None),
+            Err(FactError::AllocationFailed {
+                structure,
+                additional,
+            }) => {
+                return Err(LowerError::AllocationFailed {
+                    structure,
+                    additional,
+                });
+            }
+            Err(FactError::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            Err(FactError::InternalInvariant { detail }) => {
+                return Err(LowerError::InternalInvariant { detail });
+            }
+            Err(FactError::CaptureErasureForCaptureOutput) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite ordered-many analysis requested capture erasure for capture output",
+                });
+            }
+            Err(_) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite ordered-many analysis observed an unknown fact failure",
+                });
+            }
+        };
+        if !facts.identity().authenticates_current() || facts.operation() != operation {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite ordered-many fact identity did not authenticate",
+            });
+        }
+        if !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(None);
+        }
+        let FactProof::Proven(language) = facts.into_finite_language() else {
+            return Ok(None);
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(None);
+        }
+        let total_bytes = language.total_bytes();
+        let strings = language.into_strings();
+        Ok(Some(Self {
+            operation,
+            strings,
+            total_bytes,
+        }))
     }
 
     /// Prove an exact finite language after ordinary lowering exceeded its
@@ -1117,6 +1188,7 @@ struct OrderedFiniteAutomaton {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrderedFiniteBuildPurpose {
     Optional,
+    OptionalFailClosed,
     LowerStateRescue,
 }
 
@@ -1146,6 +1218,19 @@ impl OrderedFiniteAutomaton {
             total_bytes,
             limits,
             OrderedFiniteBuildPurpose::LowerStateRescue,
+        )
+    }
+
+    fn build_optional_checked(
+        strings: &[Vec<u8>],
+        total_bytes: usize,
+        limits: OrderedFiniteBuildLimits,
+    ) -> Result<Option<Self>, LowerError> {
+        Self::build_checked(
+            strings,
+            total_bytes,
+            limits,
+            OrderedFiniteBuildPurpose::OptionalFailClosed,
         )
     }
 
@@ -1445,10 +1530,21 @@ impl OrderedFiniteAutomaton {
             },
         )?;
         let mut transitions = Vec::new();
-        if transition_cells <= limits.max_dense_transition_cells
-            && purpose == OrderedFiniteBuildPurpose::Optional
-            && transitions.try_reserve_exact(transition_cells).is_ok()
+        let build_dense = if transition_cells > limits.max_dense_transition_cells
+            || purpose == OrderedFiniteBuildPurpose::LowerStateRescue
         {
+            false
+        } else if purpose == OrderedFiniteBuildPurpose::Optional {
+            transitions.try_reserve_exact(transition_cells).is_ok()
+        } else {
+            reserve_exact(
+                &mut transitions,
+                transition_cells,
+                "ordered finite dense transitions",
+            )?;
+            true
+        };
+        if build_dense {
             transitions.resize(transition_cells, 0_u32);
             for &state_token in &breadth_first {
                 let state = usize::try_from(state_token).map_err(|_| {
@@ -1589,6 +1685,37 @@ impl NativeFiniteLanguageProgram {
             output,
             OrderedFiniteBuildLimits::default(),
         )
+    }
+
+    pub(crate) fn bind_checked(
+        candidate: NativeFiniteLanguageCandidate,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        if artifact_identity == [0; 32] || candidate.operation != fact_operation(output) {
+            return Err(LowerError::InternalInvariant {
+                detail: "checked finite-language sidecar authentication failed",
+            });
+        }
+        let source_count = u32::try_from(candidate.strings.len()).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "checked finite-language source count",
+            }
+        })?;
+        let Some(automaton) = OrderedFiniteAutomaton::build_optional_checked(
+            &candidate.strings,
+            candidate.total_bytes,
+            OrderedFiniteBuildLimits::default(),
+        )? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::finish_bind(
+            candidate,
+            artifact_identity,
+            output,
+            source_count,
+            automaton,
+        )))
     }
 
     fn bind_with_limits(

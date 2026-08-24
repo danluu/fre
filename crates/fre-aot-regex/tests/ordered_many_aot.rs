@@ -225,6 +225,78 @@ fn optimizing_count_and_span_sum_share_one_authenticated_source_identity() {
 }
 
 #[test]
+fn optimizing_exact_rows_can_select_one_ordered_finite_native_scan() {
+    let mut rows = Vec::new();
+    for byte in 0_u8..65 {
+        let mut pattern = String::from("(?-u:");
+        for _ in 0..8 {
+            pattern.push_str(&format!("\\x{byte:02x}"));
+        }
+        if byte == 64 {
+            pattern.push_str("\\x40");
+        }
+        pattern.push(')');
+        rows.push(OrderedManyRow::new(
+            OrderedManyPatternId::new(u32::from(byte)),
+            pattern,
+        ));
+    }
+    let artifact = compile_ordered_many_aot(
+        OrderedManyAotCompileRequest::new(rows, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    )
+    .expect("shared exact finite native reducer");
+
+    assert!(
+        artifact
+            .compiled()
+            .receipt()
+            .ordered_finite_language_aot
+            .is_some(),
+        "correlated variable-width exact rows should select one finite-language scan",
+    );
+    assert_eq!(
+        PreparedAggregateStrategy::NativeFused,
+        artifact.receipt().aggregate_strategy,
+    );
+    assert!(
+        artifact
+            .compiled()
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_none(),
+    );
+}
+
+#[test]
+fn finite_proof_refusals_retain_the_full_shared_incumbent() {
+    for patterns in [["", "a"], ["[a-z]{3}", "x"]] {
+        let artifact = compile_ordered_many_aot(
+            OrderedManyAotCompileRequest::new(rows(&patterns, &[0, 1]), Target::x86_64_linux())
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::COUNT,
+            SlowAotLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("finite proof refusal {patterns:?}: {error}"));
+        assert!(
+            artifact
+                .compiled()
+                .receipt()
+                .ordered_finite_language_aot
+                .is_none(),
+        );
+        assert!(matches!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeFused
+                | PreparedAggregateStrategy::NativeOrderedNfaFused
+        ));
+    }
+}
+
+#[test]
 fn full_ordinary_optimizer_keeps_helper_free_native_fused_ahead_of_v15() {
     let patterns = ["ab", "a", "b+"];
     let ids = [0, 1, 2];

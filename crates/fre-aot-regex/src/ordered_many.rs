@@ -29,7 +29,8 @@ use crate::{
     CompileError, CompileLimitsV1, CompileMode, CompileResource, CompiledRegex, DeterminizeLimits,
     MatchResult, ObjectError, OutputContract, PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, ProgramWorkspace, SearchWindow, SectionKind, SlowAotLimits,
-    SymbolBinding, SymbolKind, Target, program::CompiledProgram,
+    SymbolBinding, SymbolKind, Target, finite_language::NativeFiniteLanguageCandidate,
+    program::CompiledProgram,
     rust_profile_compiled_size_limit, set_rust_profile_compiled_size_limit,
 };
 
@@ -1548,6 +1549,13 @@ pub fn compile_ordered_many_aot_reported(
     }
 
     let ordered_hir = Hir::alternation(hirs);
+    let native_finite_language_candidate = if mode == CompileMode::Optimizing {
+        NativeFiniteLanguageCandidate::analyze_hir_checked(&ordered_hir, OutputContract::Span)
+            .map_err(CompileError::from)
+            .map_err(OrderedManyAotCompileError::Combined)?
+    } else {
+        None
+    };
     let raw = fre_lower::lower_hir_raw_general(
         &ordered_hir,
         OperationSemantics::CaptureFree,
@@ -1561,6 +1569,7 @@ pub fn compile_ordered_many_aot_reported(
         raw.clone(),
         profile.options.line_terminator,
         OutputContract::Span,
+        native_finite_language_candidate,
         target,
         mode,
         limits.compile,

@@ -1015,6 +1015,12 @@ fn validate_prepared_aggregate_exports(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteLanguageAttachPolicy {
+    Optional,
+    FailClosed,
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2025,6 +2031,7 @@ fn compile_with_slow_aot_limits_and_teddy_policy_v2(
         line_terminator,
         output,
         native_finite_language_candidate,
+        NativeFiniteLanguageAttachPolicy::Optional,
         finite_lower_state_rescue,
         target,
         mode,
@@ -2057,6 +2064,7 @@ pub fn compile_raw(
         b'\n',
         output,
         None,
+        NativeFiniteLanguageAttachPolicy::Optional,
         None,
         target,
         mode,
@@ -2092,6 +2100,7 @@ pub fn compile_raw_with_line_terminator(
         line_terminator,
         output,
         None,
+        NativeFiniteLanguageAttachPolicy::Optional,
         None,
         target,
         mode,
@@ -2116,6 +2125,7 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
     raw: RawPlan,
     line_terminator: u8,
     output: OutputContract,
+    native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
@@ -2128,7 +2138,8 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
             raw,
             line_terminator,
             output,
-            None,
+            native_finite_language_candidate,
+            NativeFiniteLanguageAttachPolicy::FailClosed,
             None,
             target,
             mode,
@@ -2144,7 +2155,8 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
         raw,
         line_terminator,
         output,
-        None,
+        native_finite_language_candidate,
+        NativeFiniteLanguageAttachPolicy::FailClosed,
         None,
         target,
         mode,
@@ -2671,6 +2683,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     line_terminator: u8,
     output: OutputContract,
     native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
+    native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
     mut finite_lower_state_rescue: Option<LowerError>,
     target: Target,
     mode: CompileMode,
@@ -2709,7 +2722,14 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     .into());
             }
         } else {
-            program.attach_native_finite_language(candidate);
+            match native_finite_language_attach_policy {
+                NativeFiniteLanguageAttachPolicy::Optional => {
+                    program.attach_native_finite_language(candidate);
+                }
+                NativeFiniteLanguageAttachPolicy::FailClosed => {
+                    program.attach_native_finite_language_checked(candidate)?;
+                }
+            }
         }
     }
     let program_bytes = program.serialized_len()?;

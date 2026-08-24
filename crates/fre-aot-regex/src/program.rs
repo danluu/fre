@@ -11169,6 +11169,25 @@ impl CompiledProgram {
         .map(Box::new);
     }
 
+    pub(crate) fn attach_native_finite_language_checked(
+        &mut self,
+        candidate: NativeFiniteLanguageCandidate,
+    ) -> Result<(), LowerError> {
+        self.native_finite_language = None;
+        if self.engine_selection_reason == Some(EngineSelectionReason::FastMode) {
+            return Err(LowerError::InternalInvariant {
+                detail: "checked finite-language sidecar reached a Fast-mode program",
+            });
+        }
+        self.native_finite_language = NativeFiniteLanguageProgram::bind_checked(
+            candidate,
+            self.identity.artifact,
+            self.output,
+        )?
+        .map(Box::new);
+        Ok(())
+    }
+
     pub(crate) fn attach_native_finite_language_for_lower_state_rescue(
         &mut self,
         candidate: NativeFiniteLanguageCandidate,
