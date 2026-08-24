@@ -11652,6 +11652,8 @@ fn try_k0_warm_exact_minimum_suffix_exists(
 /// while the barrier makes lazy priority select the same unique endpoint. A
 /// later suffix cannot move the selected start before the first suffix because
 /// its `L` corridor would have to cross the earlier tail's barrier byte.
+/// The zero-distance mandatory cut first completes root-byte absence and
+/// publishes the earliest possible suffix-search floor.
 /// Every metadata mismatch is a read-only decline to the incumbent K0 path.
 #[inline(never)]
 fn try_k0_bounded_literal_repeat_span(
@@ -11699,8 +11701,18 @@ fn try_k0_bounded_literal_repeat_span(
     let minimum_repeats = minimum_prefix_bytes / token_bytes;
     let maximum_repeats = maximum_prefix_bytes / token_bytes;
     let additional_repeats = maximum_repeats.checked_sub(minimum_repeats)?;
+    let first_member = cut.first_member(&haystack[window.start()..window.end()]);
+    let Some(first_member) = first_member else {
+        #[cfg(test)]
+        bounded_literal_repeat_span_probe::record_completion();
+        return Some(None);
+    };
+    let suffix_search_start = cut.candidate_floor(window.start(), first_member)?;
+    if suffix_search_start < window.start() || suffix_search_start > window.end() {
+        return None;
+    }
     let found = suffix
-        .find_window(haystack, window.start(), window.end())
+        .find_window(haystack, suffix_search_start, window.end())
         .ok()?;
     let Some((minimum_start, selected_end)) = found else {
         #[cfg(test)]
