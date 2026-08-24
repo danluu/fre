@@ -129852,35 +129852,41 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         }
 
         let target = Target::x86_64_linux();
-        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
-            let compiled = compile(
-                CompileRequest::new(pattern, target)
-                    .mode(CompileMode::Optimizing)
-                    .output(output),
-            )
-            .unwrap();
-            let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
-                compiled.program(),
-                target,
-                usize::MAX,
-                true,
-                true,
-            )
-            .unwrap();
-            let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
-                compiled.program(),
-                target,
-                usize::MAX,
-                true,
-                false,
-            )
-            .unwrap();
-            assert!(!enabled.has_exact_pair_suffix(), "{output:?}");
-            assert_eq!(
-                emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
-                emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
-                "non-Exists pair policy must be byte-inert: {output:?}"
-            );
+        for target in [
+            target,
+            Target::aarch64_linux().with_features(asimd).unwrap(),
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        ] {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                    true,
+                    true,
+                )
+                .unwrap();
+                let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                    true,
+                    false,
+                )
+                .unwrap();
+                assert!(!enabled.has_exact_pair_suffix(), "{target:?} {output:?}");
+                assert_eq!(
+                    emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                    emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                    "non-Exists pair policy must be byte-inert: {target:?} {output:?}"
+                );
+            }
         }
 
         let fast = compile(
