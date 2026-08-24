@@ -906,6 +906,24 @@ fn finite_literal_digest(literals: &[Vec<u8>]) -> Option<[u8; 32]> {
     Some(digest.finalize().into())
 }
 
+fn exact_singleton_identity(
+    artifact_identity: [u8; 32],
+    output: OutputContract,
+    literal: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/exact-singleton-count-witness/v1\0");
+    digest.update(artifact_identity);
+    digest.update([match output {
+        OutputContract::Exists => 1,
+        OutputContract::SelectedEnd => 2,
+        OutputContract::Span => 3,
+    }]);
+    digest.update(u64::try_from(literal.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(literal);
+    digest.finalize().into()
+}
+
 impl NativeFiniteSelectedEndTeddyChoice {
     fn derive(
         literals: &[Vec<u8>],
@@ -1686,6 +1704,10 @@ pub(crate) struct NativeFiniteLanguageProgram {
     /// `SelectedEnd` Teddy candidate.
     selected_end_literals: Vec<Vec<u8>>,
     selected_end_teddy_choice: Option<NativeFiniteSelectedEndTeddyChoice>,
+    /// Exact singleton retained only for the explicit Count-v3 portfolio when
+    /// another finite-language leaf does not already own the same bytes.
+    exact_singleton_literal: Vec<u8>,
+    exact_singleton_identity: [u8; 32],
 }
 
 impl NativeFiniteLanguageProgram {
@@ -1789,12 +1811,21 @@ impl NativeFiniteLanguageProgram {
     }
 
     fn finish_bind(
-        candidate: NativeFiniteLanguageCandidate,
+        mut candidate: NativeFiniteLanguageCandidate,
         artifact_identity: [u8; 32],
         output: OutputContract,
         source_count: u32,
         automaton: OrderedFiniteAutomaton,
     ) -> Self {
+        let retain_singleton = output == OutputContract::Span
+            && candidate.strings.len() == 1
+            && (1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES)
+                .contains(&candidate.strings[0].len());
+        let exact_singleton_identity = if retain_singleton {
+            exact_singleton_identity(artifact_identity, output, &candidate.strings[0])
+        } else {
+            [0; 32]
+        };
         let exists_choice = if output == OutputContract::Exists {
             NativeFiniteExistsChoice::derive(
                 &candidate.strings,
@@ -1813,13 +1844,20 @@ impl NativeFiniteLanguageProgram {
         } else {
             None
         };
-        let (exists_literals, selected_end_literals) = if exists_choice.is_some() {
-            (candidate.strings, Vec::new())
-        } else if selected_end_teddy_choice.is_some() {
-            (Vec::new(), candidate.strings)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (exists_literals, selected_end_literals, exact_singleton_literal) =
+            if exists_choice.is_some() {
+                (candidate.strings, Vec::new(), Vec::new())
+            } else if selected_end_teddy_choice.is_some() {
+                (Vec::new(), candidate.strings, Vec::new())
+            } else if retain_singleton {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    candidate.strings.pop().unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
         Self {
             artifact_identity,
             output,
@@ -1830,6 +1868,8 @@ impl NativeFiniteLanguageProgram {
             exists_choice,
             selected_end_literals,
             selected_end_teddy_choice,
+            exact_singleton_literal,
+            exact_singleton_identity,
         }
     }
 
@@ -2053,6 +2093,38 @@ impl NativeFiniteLanguageProgram {
             total_source_bytes: view.total_source_bytes,
             maximum_width: view.maximum_width,
         })
+    }
+
+    /// Return one exact non-empty finite literal only after its current
+    /// artifact/output binding and private witness identity are recomputed.
+    pub(crate) fn exact_singleton_literal(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<&[u8]> {
+        if output != OutputContract::Span
+            || !self.authenticates(artifact_identity, output)
+            || self.source_count != 1
+        {
+            return None;
+        }
+        let literal = if !self.exact_singleton_literal.is_empty() {
+            self.exact_singleton_literal.as_slice()
+        } else if self.exists_literals.len() == 1 {
+            self.exists_literals[0].as_slice()
+        } else if self.selected_end_literals.len() == 1 {
+            self.selected_end_literals[0].as_slice()
+        } else {
+            return None;
+        };
+        if self.total_source_bytes != literal.len()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+            || self.exact_singleton_identity
+                != exact_singleton_identity(artifact_identity, output, literal)
+        {
+            return None;
+        }
+        Some(literal)
     }
 
     /// Target-neutral correctness oracle for the future native lowering. The

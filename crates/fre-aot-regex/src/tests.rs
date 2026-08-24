@@ -202,6 +202,570 @@ fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
     ));
 }
 
+#[test]
+fn direct_exact_singleton_count_selects_for_every_supported_width_and_format() {
+    for target in [Target::aarch64_linux(), Target::aarch64_macos()].map(|target| {
+        target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target")
+    }) {
+        for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+            let pattern = "a".repeat(width);
+            let ordinary = compile(
+                CompileRequest::new(pattern.clone(), target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile exact-singleton ordinary control");
+            let none = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(pattern.clone(), target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::NONE,
+            )
+            .expect("compile exact-singleton NONE control");
+            assert_eq!(ordinary.object(), none.object());
+            assert_eq!(ordinary.program().serialize().unwrap(), none.program().serialize().unwrap());
+
+            let compiled = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+            .expect("compile direct exact-singleton Count");
+            let report = compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .expect("direct exact-singleton Count selection");
+            assert_eq!(usize::from(report.literal_bytes), width);
+            assert_eq!(
+                report.successor_mode,
+                crate::DirectExactSingletonCountSuccessorMode::NonOverlapping,
+            );
+            assert_eq!(
+                report.selection_basis,
+                crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance,
+            );
+            assert_eq!(report.incumbent_cost.scan_passes, 1);
+            assert_eq!(report.selected_cost.scan_passes, 1);
+            assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
+            assert_eq!(report.selected_cost.native_calls_per_match, 0);
+            assert_eq!(
+                report.incumbent_cost.internal_span_publications_per_match,
+                1,
+            );
+            assert_eq!(report.selected_cost.internal_span_publications_per_match, 0);
+            assert_eq!(report.incumbent_cost.unresolved_runtime_helpers, 0);
+            assert_eq!(report.selected_cost.unresolved_runtime_helpers, 0);
+            assert!(report.core_bytes != 0);
+            assert_eq!(compiled.receipt().prepared_aggregate_exports, PreparedAggregateExports::COUNT);
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            match target.operating_system {
+                OperatingSystem::Linux => assert_eq!(&compiled.object()[..4], b"\x7fELF"),
+                OperatingSystem::Macos => assert_eq!(&compiled.object()[..4], &0xfeed_facf_u32.to_le_bytes()),
+            }
+        }
+    }
+    let semantic_singleton = compile_with_prepared_aggregate_exports(
+        CompileRequest::new(
+            "a|a",
+            direct_count_asimd_target(OperatingSystem::Linux),
+        )
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile semantic exact-singleton Count");
+    assert_eq!(
+        semantic_singleton
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .map(|report| report.literal_bytes),
+        Some(1),
+    );
+}
+
+fn direct_count_asimd_target(operating_system: OperatingSystem) -> Target {
+    let target = match operating_system {
+        OperatingSystem::Linux => Target::aarch64_linux(),
+        OperatingSystem::Macos => Target::aarch64_macos(),
+    };
+    target
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .expect("valid AArch64 ASIMD target")
+}
+
+fn direct_count_request(
+    pattern: impl Into<String>,
+    target: Target,
+    mode: CompileMode,
+    max_object_bytes: usize,
+) -> CompileRequest {
+    let limits = CompileLimitsV1 {
+        max_object_bytes,
+        ..CompileLimitsV1::default()
+    };
+    CompileRequest::new(pattern, target)
+        .mode(mode)
+        .output(OutputContract::Span)
+        .limits(limits)
+}
+
+fn compile_count_with_direct_candidate_declined(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> crate::CompiledRegex {
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::Decline,
+    );
+    compile_with_prepared_aggregate_exports(request, exports)
+        .expect("compile forced direct Count-v3 incumbent")
+}
+
+#[test]
+fn direct_exact_singleton_count_declines_without_changing_every_ineligible_incumbent() {
+    let asimd = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let cases = [
+        ("a|b", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("a?", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("^a", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        (
+            "a{33}",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            "a",
+            Target::aarch64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            "a",
+            Target::x86_64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        ("a", asimd, CompileMode::Fast, PreparedAggregateExports::COUNT),
+        (
+            "a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        ),
+    ];
+    for (pattern, target, mode, exports) in cases {
+        let request = direct_count_request(pattern, target, mode, default_cap);
+        let incumbent = compile_count_with_direct_candidate_declined(request.clone(), exports);
+        let compiled = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("compile ineligible direct Count-v3 case");
+        assert_eq!(compiled.object(), incumbent.object(), "pattern {pattern:?}");
+        assert_eq!(compiled.module(), incumbent.module(), "pattern {pattern:?}");
+        assert!(
+            compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .is_none(),
+            "pattern {pattern:?}",
+        );
+    }
+}
+
+#[test]
+fn direct_exact_singleton_count_object_cap_decline_is_incumbent_exact_and_allocation_is_terminal() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let default_request =
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, default_cap);
+    let incumbent = compile_count_with_direct_candidate_declined(
+        default_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let selected = compile_with_prepared_aggregate_exports(
+        default_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile selected direct Count-v3 control");
+    assert!(selected.object().len() > incumbent.object().len());
+    assert!(
+        selected
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_some(),
+    );
+    let exact_selected = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            selected.object().len(),
+        ),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("exact selected direct Count-v3 object cap");
+    assert_eq!(exact_selected.object(), selected.object());
+
+    let candidate_cap = selected.object().len() - 1;
+    assert!(candidate_cap >= incumbent.object().len());
+    let capped_request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        candidate_cap,
+    );
+    let capped_incumbent = compile_count_with_direct_candidate_declined(
+        capped_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let capped_literal = capped_incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("capped incumbent exact-singleton witness");
+    assert!(matches!(
+        crate::direct_count_v3::prepare_direct_exact_singleton_count(
+            capped_literal,
+            capped_incumbent.program().artifact_identity(),
+            target,
+            candidate_cap,
+        )
+        .expect("prepare candidate below its completed module cap"),
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(_),
+    ));
+    let capped = compile_with_prepared_aggregate_exports(
+        capped_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("final direct Count-v3 object cap declines to incumbent");
+    assert_eq!(capped.object(), capped_incumbent.object());
+    assert_eq!(capped.module(), capped_incumbent.module());
+    assert!(
+        capped
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_none(),
+    );
+
+    let low_cap = incumbent.object().len() - 1;
+    let low_request =
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, low_cap);
+    let low_error = compile_with_prepared_aggregate_exports(
+        low_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("incumbent object cap remains terminal");
+    assert!(matches!(
+        low_error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit == low_cap && required == incumbent.object().len()
+    ));
+
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::AllocationFailure,
+    );
+    let allocation_error = compile_with_prepared_aggregate_exports(
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, default_cap),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("candidate allocation failure must remain terminal");
+    assert!(matches!(
+        allocation_error,
+        CompileError::Object(ObjectError::Allocation(
+            "injected direct Count-v3 candidate"
+        ))
+    ));
+}
+
+#[test]
+fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface() {
+    let target = direct_count_asimd_target(OperatingSystem::Macos);
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request,
+        PreparedAggregateExports::COUNT,
+    );
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare audited direct Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct Count-v3 core declined")
+        }
+    };
+    candidate
+        .authenticate_embedded(literal, &candidate.code)
+        .expect("authenticate untouched direct Count-v3 core");
+    let mut tampered_core = candidate.code.to_vec();
+    tampered_core[0] ^= 1;
+    assert!(
+        candidate
+            .authenticate_embedded(literal, &tampered_core)
+            .is_err(),
+    );
+
+    let mut wrong_identity = incumbent.module().clone();
+    assert!(wrong_identity
+        .install_direct_exact_singleton_count(literal, [7; 32], &candidate)
+        .is_err());
+
+    let wrong_candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        [7; 32],
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare differently bound direct Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported differently bound direct Count-v3 core declined")
+        }
+    };
+    let mut wrong_candidate_binding = incumbent.module().clone();
+    assert!(wrong_candidate_binding
+        .install_direct_exact_singleton_count(literal, artifact_identity, &wrong_candidate)
+        .is_err());
+
+    let mut tampered_incumbent = incumbent.module().clone();
+    let count = tampered_incumbent
+        .symbols()
+        .iter()
+        .find(|symbol| {
+            symbol.binding == crate::SymbolBinding::Global
+                && symbol.kind == crate::SymbolKind::Function
+                && symbol.name.starts_with("fre_aot_regex_count_exclusive_v1_")
+        })
+        .expect("incumbent Count symbol");
+    let tamper_offset = usize::try_from(count.offset + count.size - 1)
+        .expect("incumbent Count tamper offset");
+    assert!(tampered_incumbent.test_flip_text_byte(tamper_offset));
+    assert!(tampered_incumbent
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+
+    let mut selected = incumbent.module().clone();
+    assert!(selected
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .expect("install authenticated direct Count-v3 core")
+        .is_some());
+    let report = *selected
+        .direct_exact_singleton_count_aot_report()
+        .expect("selected direct Count-v3 report");
+    let text_index = selected
+        .sections()
+        .iter()
+        .position(|section| section.kind == SectionKind::Text)
+        .expect("selected text section index");
+    let text = &selected.sections()[text_index];
+    let core_end = report.core_offset + report.core_bytes;
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text.bytes()[report.core_offset..core_end])),
+        report.core_sha256,
+    );
+    assert!(selected.relocations().iter().all(|relocation| {
+        usize::try_from(relocation.offset)
+            .map_or(true, |offset| !(report.core_offset..core_end).contains(&offset))
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        symbol.section != Some(text_index)
+            || usize::try_from(symbol.offset + symbol.size)
+                .is_ok_and(|end| end <= report.core_offset)
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        !symbol.name.contains("fre_aot_count") && symbol.section.is_some()
+    }));
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes all 32 direct exact-singleton Count widths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked differential authenticates the public wrapper, Count-v3 core, and non-overlap semantics together"
+)]
+fn linked_host_direct_exact_singleton_count_matches_generated_nonoverlap_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-count-singleton-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct Count linker directory");
+    let mut source = format!(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n#define IDENTITY_OFFSET {}U\nstatic const uint8_t empty_hay[1]={{0}};\n",
+        crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    source.push_str(
+        "static uint64_t reference_nonoverlap_a(const uint8_t *hay,size_t len,size_t width){size_t offset=0U;uint64_t count=0U;while(offset+width<=len){size_t index=0U;while(index<width&&hay[offset+index]=='a')index++;if(index==width){count++;offset+=width;}else{offset++;}}return count;}\n",
+    );
+    let mut objects = Vec::new();
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        let pattern = format!("(?-u:{})", "\\x61".repeat(width));
+        let compiled = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                pattern,
+                target,
+                CompileMode::Optimizing,
+                CompileLimitsV1::default().max_object_bytes,
+            ),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("compile linked direct Count-v3 width");
+        let report = compiled
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .expect("linked width selected direct Count-v3");
+        assert_eq!(usize::from(report.literal_bytes), width);
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        let entry = compiled
+            .module()
+            .prepared_count_symbol()
+            .expect("linked direct Count-v3 symbol");
+        let object = directory.join(format!("count-{width}.o"));
+        fs::write(&object, compiled.object()).expect("write direct Count-v3 object");
+        objects.push(object);
+
+        let identity = initializer(&compiled.program().artifact_identity());
+        let negative = initializer(&vec![b'b'; width.saturating_mul(2).max(1)]);
+        let mut early = vec![b'a'; width];
+        early.push(b'b');
+        let mut late = vec![b'b'; 7];
+        late.extend(std::iter::repeat_n(b'a', width));
+        let dense = vec![b'a'; width * 4 - 1];
+        let overlap = vec![b'a'; width + 3];
+        let early_initializer = initializer(&early);
+        let late_initializer = initializer(&late);
+        let dense_initializer = initializer(&dense);
+        let overlap_initializer = initializer(&overlap);
+        let overlap_count = (width + 3) / width;
+        write!(
+            &mut source,
+            r#"
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity_{width}[32]={{{identity}}};
+static const uint8_t negative_{width}[]={{{negative}}};
+static const uint8_t early_{width}[]={{{early_initializer}}};
+static const uint8_t late_{width}[]={{{late_initializer}}};
+static const uint8_t dense_{width}[]={{{dense_initializer}}};
+static const uint8_t overlap_{width}[]={{{overlap_initializer}}};
+static int check_{width}(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity_{width},32U);
+  if({entry}(handle,empty_hay,0U,&out)!=0U||out!=0U)return 1;
+  out=99U;if({entry}(handle,negative_{width},sizeof(negative_{width}),&out)!=0U||out!=0U)return 2;
+  out=99U;if({entry}(handle,early_{width},sizeof(early_{width}),&out)!=0U||out!=1U)return 3;
+  out=99U;if({entry}(handle,late_{width},sizeof(late_{width}),&out)!=0U||out!=1U)return 4;
+  out=99U;if({entry}(handle,dense_{width},sizeof(dense_{width}),&out)!=0U||out!=3U)return 5;
+  out=99U;if({entry}(handle,overlap_{width},sizeof(overlap_{width}),&out)!=0U||out!={overlap_count}U)return 6;
+  if({width}U==1U){{
+    out=99U;if({entry}(0,early_{width},sizeof(early_{width}),&out)!=5U||out!=99U)return 7;
+    out=99U;if({entry}(wrong,early_{width},sizeof(early_{width}),&out)!=3U||out!=99U)return 8;
+    out=99U;if({entry}(handle,0,sizeof(early_{width}),&out)!=2U||out!=99U)return 9;
+    out=99U;if({entry}(handle,early_{width},(size_t)-1,&out)!=2U||out!=99U)return 10;
+    if({entry}(handle,early_{width},sizeof(early_{width}),0)!=2U)return 11;
+    if({entry}(handle,early_{width},sizeof(early_{width}),(uint64_t *)(void *)(misaligned+1))!=2U)return 12;
+  }}
+  uint8_t exhaustive[10];
+  for(size_t exhaustive_len=0U;exhaustive_len<=sizeof(exhaustive);exhaustive_len++){{
+    uint32_t combinations=1U<<(uint32_t)exhaustive_len;
+    for(uint32_t mask=0U;mask<combinations;mask++){{
+      for(size_t index=0U;index<exhaustive_len;index++)exhaustive[index]=((mask>>index)&1U)!=0U?'a':'b';
+      uint64_t expected=reference_nonoverlap_a(exhaustive,exhaustive_len,{width}U);
+      out=99U;
+      if({entry}(handle,exhaustive,exhaustive_len,&out)!=0U||out!=expected)return 13;
+    }}
+  }}
+  return 0;
+}}
+"#,
+        )
+        .expect("write direct Count-v3 C fixture");
+    }
+    source.push_str("int main(void){\n");
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        write!(
+            &mut source,
+            "int status_{width}=check_{width}();if(status_{width}!=0)return {width}*100+status_{width};\n",
+        )
+        .expect("write direct Count-v3 C main");
+    }
+    source.push_str("return 0;}\n");
+    let c_path = directory.join("direct-count.c");
+    let executable = directory.join("direct-count");
+    fs::write(&c_path, source).expect("write direct Count-v3 C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    linker.arg("-O2").arg(&c_path);
+    linker.args(&objects).arg("-o").arg(&executable);
+    let status = linker.status().expect("link direct Count-v3 differential");
+    assert!(status.success(), "direct Count-v3 differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct Count-v3 differential");
+    assert!(
+        result.status.success(),
+        "direct Count-v3 differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct Count-v3 linker directory");
+}
+
 fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String {
     let mut pattern = String::from("(?-u:");
     let mut first = true;

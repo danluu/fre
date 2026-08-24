@@ -11268,6 +11268,13 @@ impl CompiledProgram {
             .native_selected_end_grep_count_view(self.identity.artifact, self.output)
     }
 
+    /// Return the source-fact-authenticated exact singleton witness retained
+    /// only for the explicit whole-haystack Count portfolio.
+    pub(crate) fn native_exact_singleton_count_literal(&self) -> Option<&[u8]> {
+        self.native_finite_language_program()?
+            .exact_singleton_literal(self.identity.artifact, self.output)
+    }
+
     /// Return the bounded graph-derived fixed-prefix facts.
     ///
     /// The analysis uses only the validated Thompson graph. It does not inspect

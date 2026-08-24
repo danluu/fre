@@ -23,6 +23,7 @@ mod context_dfa;
 mod context_native;
 mod dfa;
 mod dfa_loop_skip;
+mod direct_count_v3;
 mod error;
 mod finite_language;
 mod grep_count;
@@ -98,6 +99,11 @@ pub use dfa::{
 pub use error::{
     CompileError, CompileResource, ExactFiniteGrepCountCompileError,
     IndependentExistsBatchCompileError, ObjectError,
+};
+pub use direct_count_v3::{
+    DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+    DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
+    DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
 };
 pub use grep_count::{
     DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
@@ -1217,6 +1223,16 @@ pub fn compile_with_independent_exists_batch(
 /// the same exclusive prepared handle. Requesting no exports is exactly
 /// equivalent to [`compile`].
 ///
+/// An optimizing `AArch64` target that explicitly enables
+/// [`CpuFeature::Aarch64Asimd`] may implement a sole `Count` export with the
+/// audited `Count-v3` core when source-independent finite-language facts prove
+/// one exact non-empty 1..=32-byte literal and that core beats the complete
+/// incumbent portfolio. The existing public wrapper still validates every
+/// argument and authenticates the prepared handle before entering that core;
+/// [`CompiledModule::direct_exact_singleton_count_aot_report`] records the
+/// selected strategy. Numeric candidate limits preserve the exact incumbent,
+/// while allocation or authentication failures remain terminal.
+///
 /// # Errors
 ///
 /// Returns [`CompileError::PreparedAggregateRequiresSpan`] when Count or
@@ -1325,7 +1341,7 @@ fn append_prepared_aggregate_exports_to_compiled(
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
     let format = ObjectFormat::for_target(target);
-    let (module, object) = match emit_with_ordered_nfa_accelerator_retries(
+    let (mut module, mut object) = match emit_with_ordered_nfa_accelerator_retries(
         module,
         format,
         max_object_bytes,
@@ -1504,6 +1520,40 @@ fn append_prepared_aggregate_exports_to_compiled(
             return Err(first_error.into());
         }
     };
+    if mode == CompileMode::Optimizing
+        && exports == PreparedAggregateExports::COUNT
+        && let Some(literal) = program.native_exact_singleton_count_literal()
+    {
+        match direct_count_v3::prepare_direct_exact_singleton_count(
+            literal,
+            artifact_identity,
+            target,
+            max_object_bytes,
+        )? {
+            direct_count_v3::DirectExactSingletonCountPreparation::Declined => {}
+            direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+                if let Some(rollback) = module.install_direct_exact_singleton_count(
+                    literal,
+                    artifact_identity,
+                    &candidate,
+                )? {
+                    match emit_object(&module, format, max_object_bytes) {
+                        Ok(candidate_object) => object = candidate_object,
+                        Err(ObjectError::Resource {
+                            resource: CompileResource::ObjectBytes,
+                            ..
+                        }) => {
+                            module.rollback_direct_exact_singleton_count(rollback)?;
+                        }
+                        Err(error) => {
+                            module.rollback_direct_exact_singleton_count(rollback)?;
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
     drop(serialized_program);
     let mut passes = selected_passes(&program, &module);
     passes

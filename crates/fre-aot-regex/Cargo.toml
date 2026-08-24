@@ -11,9 +11,13 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-count-compiler = { path = "../fre-aot-count-compiler" }
+fre-aot-optimizer = { path = "../fre-aot-optimizer" }
 fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-simd-kernels = { path = "../fre-simd-kernels" }

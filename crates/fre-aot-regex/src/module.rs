@@ -29,6 +29,12 @@ use crate::{
     },
     context_dfa::ContextDfaStats,
     context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
+    direct_count_v3::{
+        DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+        DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
+        DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
+        PreparedDirectExactSingletonCount,
+    },
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
@@ -1678,6 +1684,11 @@ pub(crate) enum PreparedOrderedNfaV15LoweringDisposition {
     DataLimit { required: usize },
 }
 
+pub(crate) struct DirectExactSingletonCountPatchRollback {
+    original_text: Box<[u8]>,
+    old_count_symbol_name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedOrderedNfaV15Surface {
     Compatibility,
@@ -1711,6 +1722,10 @@ pub struct CompiledModule {
     ordered_nfa_bulk_gate_target: Option<usize>,
     prepared_aggregate_exports: PreparedAggregateExports,
     prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
+    /// First instruction after the direct Count wrapper's complete public
+    /// argument and artifact-identity authentication prefix.
+    prepared_count_authenticated_body_offset: Option<usize>,
+    direct_exact_singleton_count_aot_report: Option<DirectExactSingletonCountAotReport>,
     runtime_symbol_index: Option<usize>,
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
@@ -6251,6 +6266,8 @@ impl CompiledModule {
             ordered_nfa_bulk_gate_target,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
+            prepared_count_authenticated_body_offset: None,
+            direct_exact_singleton_count_aot_report: None,
             runtime_symbol_index,
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
@@ -6713,6 +6730,24 @@ impl CompiledModule {
     #[must_use]
     pub const fn prepared_aggregate_strategy(&self) -> Option<PreparedAggregateStrategy> {
         self.prepared_aggregate_strategy
+    }
+
+    /// Return the authenticated direct Count-v3 selection, when the explicit
+    /// Count aggregate portfolio chose it over the complete incumbent.
+    #[must_use]
+    pub const fn direct_exact_singleton_count_aot_report(
+        &self,
+    ) -> Option<&DirectExactSingletonCountAotReport> {
+        self.direct_exact_singleton_count_aot_report.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_text_byte(&mut self, offset: usize) -> bool {
+        let Some(byte) = self.sections[TEXT_SECTION].data.get_mut(offset) else {
+            return false;
+        };
+        *byte ^= 1;
+        true
     }
 
     /// Return how the emitted prepared bulk-search symbol performs its loop.
@@ -7983,6 +8018,9 @@ impl CompiledModule {
         } else {
             None
         };
+        let direct_count_authenticated_body_relative = native_count_wrapper
+            .as_ref()
+            .and_then(|wrapper| wrapper.authenticated_body_offset);
         let native_span_sum_wrapper = if span_sum_native {
             Some(match native_call.ok_or(ObjectError::InvalidModule(
                 "native SpanSum reducer has no local call kind",
@@ -8816,8 +8854,42 @@ impl CompiledModule {
                         PREPARED_GREP_COUNT_SYMBOL_PREFIX,
                     )?
                 })
-            } else {
-                None
+        } else {
+            None
+        };
+        let prepared_count_authenticated_body_offset =
+            match (prepared_count_symbol_index, direct_count_authenticated_body_relative) {
+                (Some(index), Some(relative)) => {
+                    let symbol = symbols.get(index).ok_or(ObjectError::InvalidModule(
+                        "direct Count authentication symbol index is invalid",
+                    ))?;
+                    let start = usize::try_from(symbol.offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication entry offset",
+                        )
+                    })?;
+                    let size = usize::try_from(symbol.size).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication entry size",
+                        )
+                    })?;
+                    if relative.checked_add(16).is_none_or(|end| end > size) {
+                        return Err(ObjectError::InvalidModule(
+                            "direct Count authentication body is outside its entry",
+                        ));
+                    }
+                    Some(start.checked_add(relative).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication body offset",
+                        ),
+                    )?)
+                }
+                (None | Some(_), None) => None,
+                (None, Some(_)) => {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count authentication body has no Count entry",
+                    ));
+                }
             };
         let canonical_identity_symbols = [
             (
@@ -8897,6 +8969,9 @@ impl CompiledModule {
         self.prepared_grep_count_symbol_index = prepared_grep_count_symbol_index;
         self.prepared_aggregate_exports = exports;
         self.prepared_aggregate_strategy = Some(aggregate_strategy);
+        self.prepared_count_authenticated_body_offset =
+            prepared_count_authenticated_body_offset;
+        self.direct_exact_singleton_count_aot_report = None;
         self.runtime_program_symbol_index = runtime_program_symbol_index;
         if let Some(entry) = operation_entry_symbol_index {
             self.entry_symbol_index = entry;
@@ -8933,6 +9008,397 @@ impl CompiledModule {
             self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
         }
         Ok(self)
+    }
+
+    /// Replace only the already authenticated body of a fully materialized
+    /// direct Count incumbent with one audited exact-singleton Count-v3 core.
+    /// The public symbol, four-argument ABI, argument checks, and four-word
+    /// handle/artifact identity comparison remain unchanged.
+    pub(crate) fn install_direct_exact_singleton_count(
+        &mut self,
+        literal: &[u8],
+        artifact_identity: [u8; 32],
+        candidate: &PreparedDirectExactSingletonCount,
+    ) -> Result<Option<DirectExactSingletonCountPatchRollback>, ObjectError> {
+        if self.target.architecture != Architecture::Aarch64
+            || self.target.abi != CallAbi::Aapcs64
+            || !self
+                .target
+                .features
+                .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            || self.prepared_aggregate_exports != PreparedAggregateExports::COUNT
+            || self.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::NativeFused)
+            || self.required_runtime_symbols().next().is_some()
+            || self.direct_exact_singleton_count_aot_report.is_some()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+        {
+            return Ok(None);
+        }
+        if candidate.target != self.target
+            || candidate.artifact_identity != artifact_identity
+            || candidate.literal_sha256 != <[u8; 32]>::from(Sha256::digest(literal))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 candidate binding disagrees",
+            ));
+        }
+        let Some(authenticated_body_offset) = self.prepared_count_authenticated_body_offset else {
+            return Ok(None);
+        };
+        let count_index = self.prepared_count_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct Count-v3 candidate has no Count symbol"),
+        )?;
+        let count = self.symbols.get(count_index).ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 Count symbol index is invalid",
+        ))?;
+        let count_start = usize::try_from(count.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry offset")
+        })?;
+        let count_size = usize::try_from(count.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry size")
+        })?;
+        let count_end = count_start.checked_add(count_size).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry extent"),
+        )?;
+        let relative_body = authenticated_body_offset.checked_sub(count_start).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 authentication body precedes its entry"),
+        )?;
+        let mut expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let call_offset = count_start
+            .checked_add(expected.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 incumbent call offset",
+            ))?;
+        let ordinary = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 ordinary symbol index is invalid"),
+        )?;
+        let ordinary_offset = usize::try_from(ordinary.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 ordinary entry offset")
+        })?;
+        let call_instruction = aarch64_local_call_instruction(call_offset, ordinary_offset)?
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent call is out of range",
+            ))?;
+        let expected_call_end = expected.prepared_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 incumbent call extent"),
+        )?;
+        expected
+            .code
+            .get_mut(expected.prepared_call_offset..expected_call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent call escapes its entry",
+            ))?
+            .copy_from_slice(&call_instruction.to_le_bytes());
+        let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: identity_page,
+            page_offset: identity_page_offset,
+        } = expected.identity_relocation.ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 incumbent has no identity relocation",
+        ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent identity relocation has the wrong ISA",
+            ));
+        };
+        let identity_page = count_start.checked_add(identity_page).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity ADRP offset"),
+        )?;
+        let identity_page_offset = count_start.checked_add(identity_page_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity ADD offset"),
+        )?;
+        let mut incumbent_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (count_start..count_end).contains(&offset))
+        });
+        let identity_page_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent identity ADRP is absent"),
+        )?;
+        let identity_page_offset_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent identity ADD is absent"),
+        )?;
+        if incumbent_relocations.next().is_some()
+            || identity_page_relocation.offset
+                != u64::try_from(identity_page).unwrap_or(u64::MAX)
+            || identity_page_relocation.kind != RelocationKind::Aarch64Page21
+            || identity_page_relocation.addend != 0
+            || identity_page_offset_relocation.offset
+                != u64::try_from(identity_page_offset).unwrap_or(u64::MAX)
+            || identity_page_offset_relocation.kind != RelocationKind::Aarch64PageOff12
+            || identity_page_offset_relocation.addend != 0
+            || identity_page_relocation.symbol != identity_page_offset_relocation.symbol
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent relocation surface disagrees",
+            ));
+        }
+        let identity_data_symbol = self
+            .symbols
+            .get(identity_page_relocation.symbol)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent identity symbol is invalid",
+            ))?;
+        let identity_offset = usize::try_from(identity_data_symbol.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity data offset")
+        })?;
+        let identity_end = identity_offset.checked_add(artifact_identity.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity data extent"),
+        )?;
+        if count.binding != SymbolBinding::Global
+            || count.kind != SymbolKind::Function
+            || count.section != Some(TEXT_SECTION)
+            || !count.name.starts_with(PREPARED_COUNT_SYMBOL_PREFIX)
+            || ordinary.binding != SymbolBinding::Global
+            || ordinary.kind != SymbolKind::Function
+            || ordinary.section != Some(TEXT_SECTION)
+            || count_size != expected.code.len()
+            || expected.authenticated_body_offset != Some(relative_body)
+            || relative_body.checked_add(16).is_none_or(|end| end > count_size)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(count_start..count_end)
+                != Some(expected.code.as_slice())
+            || identity_data_symbol.name != ".Lfre_aot_regex_prepared_aggregate_identity"
+            || identity_data_symbol.binding != SymbolBinding::Local
+            || identity_data_symbol.kind != SymbolKind::Object
+            || identity_data_symbol.section != Some(PROGRAM_SECTION)
+            || identity_data_symbol.size != 32
+            || self.sections[PROGRAM_SECTION].data.get(identity_offset..identity_end)
+                != Some(artifact_identity.as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent authentication prefix disagrees",
+            ));
+        }
+        let canonical = [(count_index, PREPARED_COUNT_SYMBOL_PREFIX)];
+        let incumbent_module_identity = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateStrategy::NativeFused,
+            self.sections[TEXT_SECTION].bytes(),
+            self.sections[PROGRAM_SECTION].bytes(),
+            &self.symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+
+        let original_text_bytes = self.sections[TEXT_SECTION].data.len();
+        if count_end > original_text_bytes {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 Count entry escapes text",
+            ));
+        }
+        if !original_text_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent text is not instruction aligned",
+            ));
+        }
+        let core_offset = original_text_bytes
+            .checked_add(3)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 core alignment",
+            ))?
+            & !3;
+        let core_padding = core_offset.checked_sub(original_text_bytes).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 core padding"),
+        )?;
+        let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 core extent"),
+        )?;
+        let incumbent_code_bytes = u32::try_from(count_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 incumbent code bytes")
+        })?;
+        let selected_code_bytes = count_size
+            .checked_add(core_padding)
+            .and_then(|bytes| bytes.checked_add(candidate.code.len()))
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 selected code bytes",
+            ))?;
+        let incumbent_cost = DirectExactSingletonCountCostShape {
+            scan_passes: 1,
+            native_calls_per_match: 1,
+            internal_span_publications_per_match: 1,
+            unresolved_runtime_helpers: 0,
+            code_bytes: incumbent_code_bytes,
+        };
+        let selected_cost = DirectExactSingletonCountCostShape {
+            scan_passes: 1,
+            native_calls_per_match: 0,
+            internal_span_publications_per_match: 0,
+            unresolved_runtime_helpers: 0,
+            code_bytes: selected_code_bytes,
+        };
+        let incumbent_components = incumbent_cost.runtime_components();
+        let selected_components = selected_cost.runtime_components();
+        let no_worse = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .all(|(selected, incumbent)| *selected <= incumbent);
+        let strictly_better = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .any(|(selected, incumbent)| *selected < incumbent);
+        if !no_worse
+            || (!strictly_better && selected_cost.code_bytes >= incumbent_cost.code_bytes)
+        {
+            return Ok(None);
+        }
+
+        let branch_offset = authenticated_body_offset.checked_add(12).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 tail branch offset"),
+        )?;
+        let Some(branch) = aarch64_local_branch_instruction(branch_offset, core_offset)? else {
+            return Ok(None);
+        };
+        let patch = [
+            aarch64_mov_x(0, 1)?,
+            aarch64_mov_x(1, 2)?,
+            aarch64_mov_x(2, 3)?,
+            branch,
+        ];
+        let mut patch_bytes = [0_u8; 16];
+        for (slot, instruction) in patch_bytes.chunks_exact_mut(4).zip(patch) {
+            slot.copy_from_slice(&instruction.to_le_bytes());
+        }
+        let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 literal width")
+        })?;
+        let mut text = Vec::new();
+        text.try_reserve_exact(final_text_bytes)
+            .map_err(|_| ObjectError::Allocation("direct Count-v3 module text"))?;
+        text.extend_from_slice(&self.sections[TEXT_SECTION].data);
+        text[authenticated_body_offset..authenticated_body_offset + 16]
+            .copy_from_slice(&patch_bytes);
+        while text.len() < core_offset {
+            text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+        }
+        text.extend_from_slice(&candidate.code);
+        let embedded_sha256: [u8; 32] =
+            Sha256::digest(&text[core_offset..final_text_bytes]).into();
+        if text.get(core_offset..final_text_bytes) != Some(candidate.code.as_ref())
+            || embedded_sha256 != candidate.core_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 embedded core identity disagrees",
+            ));
+        }
+        candidate.authenticate_embedded(
+            literal,
+            &text[core_offset..final_text_bytes],
+        )?;
+        let mut selected_identity = Sha256::new();
+        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v1\0");
+        selected_identity.update(incumbent_module_identity);
+        selected_identity.update(artifact_identity);
+        selected_identity.update(candidate.recipe_identity);
+        selected_identity.update(candidate.core_sha256);
+        selected_identity.update([
+            literal_bytes,
+            1, // NonOverlapping successor.
+            1, // StructuralSingleScanDominance selection.
+        ]);
+        selected_identity.update(
+            u64::try_from(authenticated_body_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 authenticated body identity offset",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(
+            u64::try_from(core_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Count-v3 core identity offset")
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(
+            u64::try_from(candidate.code.len())
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Count-v3 core identity bytes")
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(incumbent_cost.runtime_components());
+        selected_identity.update(incumbent_cost.code_bytes.to_le_bytes());
+        selected_identity.update(selected_cost.runtime_components());
+        selected_identity.update(selected_cost.code_bytes.to_le_bytes());
+        let module_identity: [u8; 32] = selected_identity.finalize().into();
+        let count_name = identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &module_identity)?;
+        let selected_text = text.into_boxed_slice();
+        let original_text = std::mem::replace(
+            &mut self.sections[TEXT_SECTION].data,
+            selected_text,
+        );
+        let old_count_symbol_name = std::mem::replace(
+            &mut self.symbols[count_index].name,
+            count_name,
+        );
+        self.direct_exact_singleton_count_aot_report = Some(
+            DirectExactSingletonCountAotReport {
+                schema_version: DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+                literal_bytes,
+                successor_mode: DirectExactSingletonCountSuccessorMode::NonOverlapping,
+                selection_basis:
+                    DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance,
+                incumbent_strategy: PreparedAggregateStrategy::NativeFused,
+                incumbent_cost,
+                selected_cost,
+                authenticated_wrapper_body_offset: authenticated_body_offset,
+                core_offset,
+                core_bytes: candidate.code.len(),
+                core_sha256: candidate.core_sha256,
+                compile_identity: candidate.compile_identity,
+                object_identity: candidate.object_identity,
+                recipe_identity: candidate.recipe_identity,
+                module_identity,
+            },
+        );
+        Ok(Some(DirectExactSingletonCountPatchRollback {
+            original_text,
+            old_count_symbol_name,
+        }))
+    }
+
+    /// Restore the byte-identical fully materialized incumbent after the only
+    /// safe post-selection decline: the completed candidate object exceeds the
+    /// caller's explicit object-byte ceiling.
+    pub(crate) fn rollback_direct_exact_singleton_count(
+        &mut self,
+        rollback: DirectExactSingletonCountPatchRollback,
+    ) -> Result<(), ObjectError> {
+        let report = self
+            .direct_exact_singleton_count_aot_report
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 rollback has no selected report",
+            ))?;
+        if report.core_offset.checked_add(report.core_bytes)
+            != Some(self.sections[TEXT_SECTION].data.len())
+            || rollback.original_text.len() != report.core_offset
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback checkpoint disagrees",
+            ));
+        }
+        let count_index = self.prepared_count_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct Count-v3 rollback lost Count symbol"),
+        )?;
+        if self.symbols.get(count_index).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback Count symbol is invalid",
+            ));
+        }
+        self.sections[TEXT_SECTION].data = rollback.original_text;
+        self.symbols[count_index].name = rollback.old_count_symbol_name;
+        self.direct_exact_singleton_count_aot_report = None;
+        Ok(())
     }
 
     /// Append one compiler-generated uniform-capture whole-operation reducer.
@@ -10440,6 +10906,7 @@ struct NativePreparedBulkWrapper {
     bulk_runtime_fallback_offset: Option<usize>,
     compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
+    authenticated_body_offset: Option<usize>,
 }
 
 struct NativeDirectExistsBatchWrapper {
@@ -10889,6 +11356,7 @@ fn append_prepared_bulk_entry(
                 bulk_runtime_fallback_offset: None,
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
+                authenticated_body_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -10901,6 +11369,7 @@ fn append_prepared_bulk_entry(
                 bulk_runtime_fallback_offset: None,
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
+                authenticated_body_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -28671,6 +29140,8 @@ fn native_regex_redux_module(
         ordered_nfa_bulk_gate_target: None,
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -43052,6 +43523,7 @@ fn lower_x86_64_prepared_span_fill_impl(
             })
             .transpose()?,
         identity_relocation: None,
+        authenticated_body_offset: None,
         code: finished.code,
     })
 }
@@ -43461,6 +43933,7 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
         identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
             finished.label_offset(identity_displacement)?,
         )),
+        authenticated_body_offset: None,
         code: finished.code,
     })
 }
@@ -43714,6 +44187,7 @@ fn lower_x86_64_prepared_grep_count(
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
+        authenticated_body_offset: None,
     })
 }
 
@@ -45030,6 +45504,7 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: None,
+        authenticated_body_offset: None,
         code: finished.code,
     })
 }
@@ -45557,6 +46032,7 @@ fn lower_aarch64_prepared_span_fill_impl(
                 }
             }),
         identity_relocation: None,
+        authenticated_body_offset: None,
     })
 }
 
@@ -45638,6 +46114,7 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let authenticated_body = assembler.label()?;
     let terminal_scan = assembler.label()?;
     let terminal_word0 = assembler.label()?;
     let terminal_word1 = assembler.label()?;
@@ -45696,6 +46173,8 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
         assembler.instruction(aarch64_cmp_x(9, 8)?)?;
         assembler.branch_cond(AARCH64_NE, wrong_identity)?;
     }
+
+    assembler.bind(authenticated_body)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_pair_x(
@@ -45899,7 +46378,10 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
         offsets.push(call);
         index
     });
-    let code = assembler.finish_with_offsets(&mut offsets)?;
+    let (code, authenticated_body_offset) = assembler.finish_with_offsets_and_label(
+        &mut offsets,
+        (call_kind == NativeSpanReducerCallKind::DirectOrdinary).then_some(authenticated_body),
+    )?;
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
@@ -45922,6 +46404,7 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
                 page_offset: offsets[2],
             },
         ),
+        authenticated_body_offset,
     })
 }
 
@@ -46176,6 +46659,7 @@ fn lower_aarch64_prepared_grep_count(
                 page_offset: offsets[2],
             },
         ),
+        authenticated_body_offset: None,
     })
 }
 
@@ -47374,6 +47858,7 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: None,
+        authenticated_body_offset: None,
     })
 }
 
@@ -56384,10 +56869,31 @@ impl Aarch64Assembler {
     }
 
     fn finish_with_offsets(
-        mut self,
+        self,
         relocation_offsets: &mut [usize],
     ) -> Result<Vec<u8>, ObjectError> {
+        self.finish_with_offsets_and_label(relocation_offsets, None)
+            .map(|(code, _)| code)
+    }
+
+    fn finish_with_offsets_and_label(
+        mut self,
+        relocation_offsets: &mut [usize],
+        tracked_label: Option<Aarch64Label>,
+    ) -> Result<(Vec<u8>, Option<usize>), ObjectError> {
         let optimized = self.control_flow_optimized(relocation_offsets)?;
+        let tracked_offset = tracked_label
+            .map(|label| {
+                optimized
+                    .labels
+                    .get(label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule(
+                        "tracked AArch64 label is unbound",
+                    ))
+            })
+            .transpose()?;
         self.code = optimized.code;
         self.labels = optimized.labels;
         self.fixups = optimized.fixups;
@@ -56427,7 +56933,7 @@ impl Aarch64Assembler {
             self.code[fixup.instruction..end].copy_from_slice(&patched.to_le_bytes());
         }
         relocation_offsets.copy_from_slice(&optimized.relocation_offsets);
-        Ok(self.code)
+        Ok((self.code, tracked_offset))
     }
 }
 
@@ -65606,6 +66112,29 @@ fn patch_aarch64_local_branch(
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local branch immediate"))?;
     slot.copy_from_slice(&(0x1400_0000 | immediate).to_le_bytes());
     Ok(())
+}
+
+fn aarch64_local_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+) -> Result<Option<u32>, ObjectError> {
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 26)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << 26;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 direct Count-v3 tail branch immediate")
+    })?;
+    Ok(Some(0x1400_0000 | immediate))
+}
+
+fn aarch64_local_call_instruction(
+    instruction_offset: usize,
+    target: usize,
+) -> Result<Option<u32>, ObjectError> {
+    Ok(aarch64_local_branch_instruction(instruction_offset, target)?
+        .map(|instruction| instruction | 0x8000_0000))
 }
 
 #[allow(
@@ -116189,6 +116718,8 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 ordered_nfa_bulk_gate_target: None,
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
+                prepared_count_authenticated_body_offset: None,
+                direct_exact_singleton_count_aot_report: None,
                 runtime_symbol_index: None,
                 runtime_program_symbol_index: None,
                 start_accelerator: StartAccelerator::None,
@@ -116520,6 +117051,8 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             ordered_nfa_bulk_gate_target: None,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
+            prepared_count_authenticated_body_offset: None,
+            direct_exact_singleton_count_aot_report: None,
             runtime_symbol_index: None,
             runtime_program_symbol_index: None,
             start_accelerator: StartAccelerator::None,

@@ -245,9 +245,13 @@ name = "fre-aot-regex"
 version = "0.1.0"
 dependencies = [
  "fre",
+ "fre-aot-aarch64",
+ "fre-aot-count-compiler",
+ "fre-aot-optimizer",
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",
+ "fre-kernel-ir",
  "fre-kernels",
  "fre-lower",
  "fre-simd-kernels",
