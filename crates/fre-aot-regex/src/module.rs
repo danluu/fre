@@ -43183,7 +43183,10 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.bind(scan)?;
     assembler.instruction(&[0x4c, 0x39, 0xeb])?;
     assembler.branch(&[0x0f, 0x84], final_line)?;
-    assembler.instruction(&[0x43, 0x80, 0x3c, 0x1c, 0x0a])?;
+    // R12 is the haystack base and RBX is the current scan offset. The REX.B
+    // bit extends the SIB base; REX.X must remain clear so the index is RBX,
+    // not the unrelated caller-saved R11.
+    assembler.instruction(&[0x41, 0x80, 0x3c, 0x1c, 0x0a])?;
     assembler.branch(&[0x0f, 0x84], found_lf)?;
     assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
     assembler.branch(&[0x0f, 0x82], overflow)?;
@@ -71215,6 +71218,12 @@ mod tests {
             assert!(private_call > 0);
             assert_eq!(code.get(private_call - 1), Some(&0xe8));
             assert_eq!(frame_bytes % 16, 8);
+            assert!(code.windows(5).any(|window| {
+                window == [0x41, 0x80, 0x3c, 0x1c, 0x0a]
+            }));
+            assert!(!code.windows(5).any(|window| {
+                window == [0x43, 0x80, 0x3c, 0x1c, 0x0a]
+            }));
         }
     }
 
