@@ -11783,6 +11783,23 @@ impl<'a> K0SearchSession<'a> {
             .flatten()
     }
 
+    /// Return the same verifier certificate for an already authenticated
+    /// automaton-owned workspace without moving it into a session.
+    #[must_use]
+    #[inline]
+    pub(crate) fn positive_end_verifier_work_certificate_with_authenticated_workspace(
+        automaton: &Automaton,
+        workspace: &K0Workspace,
+        input_bytes: usize,
+    ) -> Option<u64> {
+        let capabilities = workspace.bound_capabilities;
+        (capabilities.reverse
+            && workspace.reverse.is_allocated()
+            && workspace.reverse.is_bound_to(automaton))
+        .then(|| automaton.conservative_reused_work_bound(input_bytes).ok())
+        .flatten()
+    }
+
     /// Authenticate whether any positive-width match ends at `endpoint`.
     ///
     /// Unlike selected-end recovery, this verifier does not assume that a
@@ -11805,13 +11822,57 @@ impl<'a> K0SearchSession<'a> {
     /// binding mismatch or an internal checked failure unrelated to the
     /// private verifier limits.
     #[doc(hidden)]
+    #[inline(never)]
+    pub fn try_positive_match_ending_at(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndVerification, SearchError> {
+        Self::try_positive_match_ending_at_with_capabilities(
+            self.automaton,
+            &mut self.workspace,
+            self.capabilities,
+            haystack,
+            window,
+            endpoint,
+            limits,
+        )
+    }
+
+    /// Execute the authoritative positive-end verifier against an already
+    /// authenticated automaton-owned workspace in place.
+    #[inline]
+    pub(crate) fn try_positive_match_ending_at_with_authenticated_workspace(
+        automaton: &Automaton,
+        workspace: &mut K0Workspace,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndVerification, SearchError> {
+        let capabilities = workspace.bound_capabilities;
+        Self::try_positive_match_ending_at_with_capabilities(
+            automaton,
+            workspace,
+            capabilities,
+            haystack,
+            window,
+            endpoint,
+            limits,
+        )
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "validation, private-cap decline, and exact receipts form one transaction"
     )]
-    #[inline(never)]
-    pub fn try_positive_match_ending_at(
-        &mut self,
+    #[inline(always)]
+    fn try_positive_match_ending_at_with_capabilities(
+        automaton: &Automaton,
+        workspace: &mut K0Workspace,
+        capabilities: LazyCapabilities,
         haystack: &[u8],
         window: SearchWindow,
         endpoint: usize,
@@ -11823,7 +11884,7 @@ impl<'a> K0SearchSession<'a> {
                 detail: "positive endpoint is outside the original search window",
             });
         }
-        if self.workspace.bound_automaton_identity != self.automaton.identity() {
+        if workspace.bound_automaton_identity != automaton.identity() {
             return Err(SearchError::InvalidResumeState {
                 detail: "positive-end verifier workspace belongs to another automaton",
             });
@@ -11836,7 +11897,7 @@ impl<'a> K0SearchSession<'a> {
                 false,
             ));
         }
-        if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
+        if !capabilities.reverse || !workspace.reverse.is_allocated() {
             return Ok(K0PositiveEndVerification::new(
                 K0PositiveEndOutcome::Declined,
                 0,
@@ -11844,22 +11905,22 @@ impl<'a> K0SearchSession<'a> {
                 false,
             ));
         }
-        if !self.workspace.reverse.is_bound_to(self.automaton) {
+        if !workspace.reverse.is_bound_to(automaton) {
             return Err(SearchError::InvalidResumeState {
                 detail: "positive-end verifier requires a bound bidirectional workspace",
             });
         }
 
         let reverse_window = SearchWindow::new(window.start(), endpoint);
-        let scratch_bytes = self.workspace.retained_bytes;
+        let scratch_bytes = workspace.retained_bytes;
         let mut setup = SetupAccounting::empty(scratch_bytes, true);
         let search_limits = SearchLimits {
             max_work: limits.max_work,
             max_scratch_bytes: scratch_bytes,
         };
         let mut meter = match prepare_resume_invocation(
-            self.automaton,
-            &mut self.workspace,
+            automaton,
+            workspace,
             reverse_window,
             search_limits,
             &mut setup,
@@ -11880,17 +11941,17 @@ impl<'a> K0SearchSession<'a> {
             Err(error) => return Err(error),
         };
 
-        if !self.capabilities.contextual {
+        if !capabilities.contextual {
             match prepare_reverse_lazy(
-                self.automaton,
-                &mut self.workspace,
+                automaton,
+                workspace,
                 &mut meter,
                 0,
                 endpoint,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let outcome = if self.workspace.reverse.declined {
+                    let outcome = if workspace.reverse.declined {
                         // An allocated direct reverse tier sets this sticky bit
                         // only after proving that no positive Accept-seeded
                         // frontier exists for the immutable plan.
@@ -11922,13 +11983,13 @@ impl<'a> K0SearchSession<'a> {
         let mut reverse_source_bytes = 0usize;
         let mut reverse_byte_limit_reached = false;
         let mut ignored_earliest_start = None;
-        let execution = if self.capabilities.contextual {
+        let execution = if capabilities.contextual {
             execute_positive_end_context_reverse_loop::<false>(
-                self.automaton,
+                automaton,
                 haystack,
                 window.start(),
                 endpoint,
-                &mut self.workspace,
+                workspace,
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
@@ -11937,11 +11998,11 @@ impl<'a> K0SearchSession<'a> {
             )
         } else {
             execute_positive_end_reverse_lazy_loop::<false>(
-                self.automaton,
+                automaton,
                 haystack,
                 window.start(),
                 endpoint,
-                &mut self.workspace,
+                workspace,
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
@@ -11990,13 +12051,57 @@ impl<'a> K0SearchSession<'a> {
     /// binding mismatch, or an internal checked failure unrelated to the
     /// private verifier limits.
     #[doc(hidden)]
+    #[inline(never)]
+    pub fn try_earliest_start_ending_at(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndStartVerification, SearchError> {
+        Self::try_earliest_start_ending_at_with_capabilities(
+            self.automaton,
+            &mut self.workspace,
+            self.capabilities,
+            haystack,
+            window,
+            endpoint,
+            limits,
+        )
+    }
+
+    /// Execute the authoritative earliest-start verifier against an already
+    /// authenticated automaton-owned workspace in place.
+    #[inline]
+    pub(crate) fn try_earliest_start_ending_at_with_authenticated_workspace(
+        automaton: &Automaton,
+        workspace: &mut K0Workspace,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndStartVerification, SearchError> {
+        let capabilities = workspace.bound_capabilities;
+        Self::try_earliest_start_ending_at_with_capabilities(
+            automaton,
+            workspace,
+            capabilities,
+            haystack,
+            window,
+            endpoint,
+            limits,
+        )
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "validation, private-cap decline, and exact receipts form one transaction"
     )]
-    #[inline(never)]
-    pub fn try_earliest_start_ending_at(
-        &mut self,
+    #[inline(always)]
+    fn try_earliest_start_ending_at_with_capabilities(
+        automaton: &Automaton,
+        workspace: &mut K0Workspace,
+        capabilities: LazyCapabilities,
         haystack: &[u8],
         window: SearchWindow,
         endpoint: usize,
@@ -12008,7 +12113,7 @@ impl<'a> K0SearchSession<'a> {
                 detail: "positive endpoint is outside the earliest-start verifier window",
             });
         }
-        if self.workspace.bound_automaton_identity != self.automaton.identity() {
+        if workspace.bound_automaton_identity != automaton.identity() {
             return Err(SearchError::InvalidResumeState {
                 detail: "positive-end verifier workspace belongs to another automaton",
             });
@@ -12021,7 +12126,7 @@ impl<'a> K0SearchSession<'a> {
                 false,
             ));
         }
-        if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
+        if !capabilities.reverse || !workspace.reverse.is_allocated() {
             return Ok(K0PositiveEndStartVerification::new(
                 K0PositiveEndStartOutcome::Declined,
                 0,
@@ -12029,22 +12134,22 @@ impl<'a> K0SearchSession<'a> {
                 false,
             ));
         }
-        if !self.workspace.reverse.is_bound_to(self.automaton) {
+        if !workspace.reverse.is_bound_to(automaton) {
             return Err(SearchError::InvalidResumeState {
                 detail: "positive-end verifier requires a bound bidirectional workspace",
             });
         }
 
         let reverse_window = SearchWindow::new(window.start(), endpoint);
-        let scratch_bytes = self.workspace.retained_bytes;
+        let scratch_bytes = workspace.retained_bytes;
         let mut setup = SetupAccounting::empty(scratch_bytes, true);
         let search_limits = SearchLimits {
             max_work: limits.max_work,
             max_scratch_bytes: scratch_bytes,
         };
         let mut meter = match prepare_resume_invocation(
-            self.automaton,
-            &mut self.workspace,
+            automaton,
+            workspace,
             reverse_window,
             search_limits,
             &mut setup,
@@ -12065,17 +12170,17 @@ impl<'a> K0SearchSession<'a> {
             Err(error) => return Err(error),
         };
 
-        if !self.capabilities.contextual {
+        if !capabilities.contextual {
             match prepare_reverse_lazy(
-                self.automaton,
-                &mut self.workspace,
+                automaton,
+                workspace,
                 &mut meter,
                 0,
                 endpoint,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let outcome = if self.workspace.reverse.declined {
+                    let outcome = if workspace.reverse.declined {
                         K0PositiveEndStartOutcome::Rejected
                     } else {
                         K0PositiveEndStartOutcome::Declined
@@ -12104,13 +12209,13 @@ impl<'a> K0SearchSession<'a> {
         let mut reverse_source_bytes = 0usize;
         let mut reverse_byte_limit_reached = false;
         let mut earliest_start = None;
-        let execution = if self.capabilities.contextual {
+        let execution = if capabilities.contextual {
             execute_positive_end_context_reverse_loop::<true>(
-                self.automaton,
+                automaton,
                 haystack,
                 window.start(),
                 endpoint,
-                &mut self.workspace,
+                workspace,
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
@@ -12119,11 +12224,11 @@ impl<'a> K0SearchSession<'a> {
             )
         } else {
             execute_positive_end_reverse_lazy_loop::<true>(
-                self.automaton,
+                automaton,
                 haystack,
                 window.start(),
                 endpoint,
-                &mut self.workspace,
+                workspace,
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,

@@ -133,6 +133,39 @@ fn ordinary_k0_calls_reuse_scratch_without_allocating_after_warmup() {
 }
 
 #[test]
+fn ordinary_absolute_end_k0_uses_its_warm_owner_without_allocating() {
+    let regex = PortableBuilder::new(r"(?-u:(?:ab){2,5}c\z)")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .unwrap();
+    let mut haystack = vec![b'x'; 1_024];
+    let end = haystack.len();
+    haystack[end - 7..].copy_from_slice(b"abababc");
+
+    let cold = Region::new(GLOBAL);
+    assert_eq!(
+        regex
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end())),
+        Some((end - 7, end)),
+    );
+    assert!(cold.change().allocations > 0);
+
+    let warm = Region::new(GLOBAL);
+    for _ in 0..32 {
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((end - 7, end)),
+        );
+        assert!(regex.is_match(&haystack));
+    }
+    assert_eq!(warm.change(), Stats::default());
+}
+
+#[test]
 fn ordinary_prepared_k0_exists_is_allocation_free_after_warmup() {
     let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
         .unicode(false)

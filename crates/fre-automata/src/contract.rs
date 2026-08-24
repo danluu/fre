@@ -1605,6 +1605,137 @@ impl Automaton {
         result.map(Some)
     }
 
+    /// Verify an exact positive endpoint through a populated automaton owner
+    /// without moving its workspace into a facade session. This warm-only
+    /// entry uses the same verifier and certificate as the pooled path below;
+    /// `Ok(None)` leaves cold publication and every decline to that path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] after authenticated warm-owner execution begins.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn search_window_with_warm_owner_positive_end_exists_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<bool>, SearchError> {
+        if window.start() >= window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let verifier_start = maximum_match_bytes.map_or(window.start(), |maximum| {
+            window.end().saturating_sub(maximum).max(window.start())
+        });
+        if verifier_start >= window.end() {
+            return Ok(Some(false));
+        }
+        let verifier_window = SearchWindow::new(verifier_start, window.end());
+        let verifier_bytes = verifier_window
+            .end()
+            .saturating_sub(verifier_window.start());
+        let warm = self.try_with_warm_owner_workspace(
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+            |workspace| {
+                let Some(max_work) =
+                    K0SearchSession::positive_end_verifier_work_certificate_with_authenticated_workspace(
+                        self,
+                        workspace,
+                        verifier_bytes,
+                    )
+                else {
+                    return Ok(None);
+                };
+                let verification =
+                    K0SearchSession::try_positive_match_ending_at_with_authenticated_workspace(
+                        self,
+                        workspace,
+                        haystack,
+                        verifier_window,
+                        window.end(),
+                        crate::K0PositiveEndLimits::new(max_work, verifier_bytes),
+                    )?;
+                Ok(match verification.outcome() {
+                    crate::K0PositiveEndOutcome::Matched => Some(true),
+                    crate::K0PositiveEndOutcome::Rejected => Some(false),
+                    crate::K0PositiveEndOutcome::Declined => None,
+                })
+            },
+        );
+        match warm {
+            Some(result) => result,
+            None => Ok(None),
+        }
+    }
+
+    /// Recover the earliest start for an exact positive endpoint through the
+    /// same populated owner without moving its workspace. The outer option is
+    /// route availability; the inner option is the exact no-match/match value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] after authenticated warm-owner execution begins.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn search_window_with_warm_owner_positive_end_span_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<Option<MatchSpan>>, SearchError> {
+        if window.start() >= window.end() || window.end() > haystack.len() {
+            return Ok(None);
+        }
+        let verifier_start = maximum_match_bytes.map_or(window.start(), |maximum| {
+            window.end().saturating_sub(maximum).max(window.start())
+        });
+        if verifier_start >= window.end() {
+            return Ok(Some(None));
+        }
+        let verifier_window = SearchWindow::new(verifier_start, window.end());
+        let verifier_bytes = verifier_window
+            .end()
+            .saturating_sub(verifier_window.start());
+        let warm = self.try_with_warm_owner_workspace(
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+            |workspace| {
+                let Some(max_work) =
+                    K0SearchSession::positive_end_verifier_work_certificate_with_authenticated_workspace(
+                        self,
+                        workspace,
+                        verifier_bytes,
+                    )
+                else {
+                    return Ok(None);
+                };
+                let verification =
+                    K0SearchSession::try_earliest_start_ending_at_with_authenticated_workspace(
+                        self,
+                        workspace,
+                        haystack,
+                        verifier_window,
+                        window.end(),
+                        crate::K0PositiveEndLimits::new(max_work, verifier_bytes),
+                    )?;
+                Ok(match verification.outcome() {
+                    crate::K0PositiveEndStartOutcome::Matched { start } => {
+                        Some(Some(MatchSpan::new(start, window.end())))
+                    }
+                    crate::K0PositiveEndStartOutcome::Rejected => Some(None),
+                    crate::K0PositiveEndStartOutcome::Declined => None,
+                })
+            },
+        );
+        match warm {
+            Some(result) => result,
+            None => Ok(None),
+        }
+    }
+
     /// Verify an exact positive endpoint through the automaton-owned
     /// bidirectional workspace. `maximum_match_bytes` narrows the reverse
     /// source window only when the caller has an immutable language proof for
