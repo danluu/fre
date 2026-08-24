@@ -70,6 +70,7 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 MAX_ITERATIONS = 10_000_000_000
+CALIBRATION_SEED_BYTES = 64 * 1024
 
 
 class BenchmarkFailure(RuntimeError):
@@ -434,7 +435,11 @@ def calibrate(
     byte_size: int,
 ) -> int:
     target_ns = math.ceil(args.min_sample_ms * 1_000_000)
-    iterations = 1
+    # A single short direct call can complete inside the host clock's
+    # observable tick. Seed calibration with a small fixed amount of scanned
+    # input so the first retained pair is measurable without biasing either
+    # implementation.
+    iterations = max(1, math.ceil(CALIBRATION_SEED_BYTES / byte_size))
     for attempt in range(12):
         pair = run_pair(
             args=args,
