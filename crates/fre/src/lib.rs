@@ -3175,6 +3175,30 @@ impl K0MandatorySuffixPlan {
         }
     }
 
+    #[cfg(target_has_atomic = "64")]
+    fn pooled_finite_consumption_span_early_prefix_offset(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
+                if scanner
+                    .finite_span_recovery_maximum_match_bytes()
+                    .is_some() =>
+            {
+                scanner
+                    .reverse_suffix_span_adaptive
+                    .finite_early_prefix_offset(
+                        window.end().saturating_sub(window.start()),
+                        &haystack[window.start()..window.end()],
+                        self.needle(),
+                    )
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(not(target_has_atomic = "64"))]
     fn pooled_finite_consumption_span_should_bypass_early(
         &self,
@@ -3183,6 +3207,16 @@ impl K0MandatorySuffixPlan {
     ) -> bool {
         let _ = (self, haystack, window);
         true
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn pooled_finite_consumption_span_early_prefix_offset(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<usize> {
+        let _ = (self, haystack, window);
+        None
     }
 
     #[cfg(not(target_has_atomic = "64"))]
@@ -11642,6 +11676,94 @@ fn try_k0_warm_exact_minimum_suffix_exists(
         .map(|found| found.is_some())
 }
 
+/// Complete one receipt-authenticated early bounded-literal-repeat Span
+/// without borrowing K0 workspace.
+///
+/// Construction proves the exact language `L{m,n}S`, binds the retained
+/// mandatory suffix to `L^m S`, proves a tail barrier, and admits only a
+/// zero-distance mandatory cut. The revalidated receipt supplies the suffix
+/// offset. If the first cut member begins a whole number of additional `L`
+/// tokens ending at that suffix, the cut proves no earlier match start and the
+/// barrier proves this accepted endpoint is the unique greedy endpoint.
+/// Every mismatch is a read-only decline to the complete immutable leaf.
+#[inline(never)]
+fn try_k0_bounded_literal_repeat_early_span(
+    suffix: &K0MandatorySuffixPlan,
+    cut: K0MandatoryCutPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+    suffix_offset: usize,
+) -> Option<fre_automata::MatchSpan> {
+    if window.start() != 0
+        || window.end() != haystack.len()
+        || cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+        || minimum_match_bytes == 0
+        || minimum_match_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let (token_bytes, tail_bytes) = suffix.bounded_literal_repeat_span_lengths()?;
+    let needle = suffix.needle();
+    if needle.len() != minimum_match_bytes
+        || token_bytes == 0
+        || tail_bytes == 0
+        || tail_bytes >= needle.len()
+        || tail_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let minimum_prefix_bytes = needle.len().checked_sub(tail_bytes)?;
+    let maximum_prefix_bytes = maximum_match_bytes.checked_sub(tail_bytes)?;
+    if minimum_prefix_bytes == 0
+        || !minimum_prefix_bytes.is_multiple_of(token_bytes)
+        || !maximum_prefix_bytes.is_multiple_of(token_bytes)
+    {
+        return None;
+    }
+    let token = needle.get(..token_bytes)?;
+    let tail_first = *needle.get(minimum_prefix_bytes)?;
+    if token.contains(&tail_first) {
+        return None;
+    }
+
+    let first_member = cut.first_member(&haystack[window.start()..window.end()])?;
+    let selected_start = window.start().checked_add(first_member)?;
+    let suffix_start = window.start().checked_add(suffix_offset)?;
+    let added_prefix_bytes = suffix_start.checked_sub(selected_start)?;
+    if !added_prefix_bytes.is_multiple_of(token_bytes) {
+        return None;
+    }
+    let minimum_repeats = minimum_prefix_bytes / token_bytes;
+    let maximum_repeats = maximum_prefix_bytes / token_bytes;
+    let added_repeats = added_prefix_bytes / token_bytes;
+    let selected_repeats = minimum_repeats.checked_add(added_repeats)?;
+    if selected_repeats > maximum_repeats {
+        return None;
+    }
+    let prefix = haystack.get(selected_start..suffix_start)?;
+    if prefix
+        .chunks_exact(token_bytes)
+        .any(|candidate| candidate != token)
+    {
+        return None;
+    }
+    let selected_end = suffix_start.checked_add(needle.len())?;
+    if selected_end > window.end()
+        || selected_end.checked_sub(selected_start)?
+            != selected_repeats
+                .checked_mul(token_bytes)?
+                .checked_add(tail_bytes)?
+    {
+        return None;
+    }
+    Some(fre_automata::MatchSpan::new(
+        selected_start,
+        selected_end,
+    ))
+}
+
 /// Complete one bounded-literal-repeat Span without borrowing K0 workspace.
 ///
 /// Construction proves the exact language `L{m,n}S`, binds the retained
@@ -11899,8 +12021,29 @@ impl PortableK0Plan {
         {
             return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
         }
-        if suffix.bounded_literal_repeat_span_lengths().is_some()
-            && let Some(output) = self.mandatory_cut.and_then(|cut| {
+        if suffix.bounded_literal_repeat_span_lengths().is_some() {
+            if let Some(suffix_offset) =
+                suffix.pooled_finite_consumption_span_early_prefix_offset(haystack, window)
+                && let Some(matched) = self.mandatory_cut.and_then(|cut| {
+                    try_k0_bounded_literal_repeat_early_span(
+                        suffix,
+                        cut,
+                        haystack,
+                        window,
+                        minimum_match_bytes,
+                        maximum_match_bytes,
+                        suffix_offset,
+                    )
+                })
+            {
+                #[cfg(test)]
+                {
+                    finite_consumption_span_facade_probe::record_attempt();
+                    finite_consumption_span_facade_probe::record_result(true);
+                }
+                return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(Some(matched)));
+            }
+            if let Some(output) = self.mandatory_cut.and_then(|cut| {
                 try_k0_bounded_literal_repeat_span(
                     suffix,
                     cut,
@@ -11909,14 +12052,23 @@ impl PortableK0Plan {
                     minimum_match_bytes,
                     maximum_match_bytes,
                 )
-            })
-        {
-            #[cfg(test)]
-            {
-                finite_consumption_span_facade_probe::record_attempt();
-                finite_consumption_span_facade_probe::record_result(true);
+            }) {
+                if let Some(matched) = output
+                    && let Some(suffix_start) = matched.end().checked_sub(suffix.needle().len())
+                    && let Some(suffix_offset) = suffix_start.checked_sub(window.start())
+                    && suffix_offset < K0_SUFFIX_FORWARD_FALLBACK_BYTES
+                    && let Some(admission) =
+                        suffix.try_admit_pooled_finite_consumption_span(window_bytes)
+                {
+                    admission.observe_finite_early_prefix(window_bytes, suffix_offset);
+                }
+                #[cfg(test)]
+                {
+                    finite_consumption_span_facade_probe::record_attempt();
+                    finite_consumption_span_facade_probe::record_result(true);
+                }
+                return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(output));
             }
-            return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(output));
         }
         let Some(admission) = suffix.try_admit_pooled_finite_consumption_span(window_bytes)
         else {
