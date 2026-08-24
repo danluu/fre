@@ -1522,6 +1522,14 @@ pub enum PreparedBulkStrategy {
     NativeOrderedNfaLoop,
 }
 
+/// Implementation selected behind a handle-free direct Exists-batch symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DirectExistsBatchStrategy {
+    /// Generated code validates one descriptor array and locally invokes the
+    /// complete public ordinary entry once per independent haystack.
+    NativeOrdinaryEntryLoop,
+}
+
 /// Prepared-handle capability bit required by an object whose aggregate/fill
 /// benchmark path is published through the native Ordered-TNFA iterator.
 /// This value is intentionally identical to runtime V3's capability bit but
@@ -1620,6 +1628,7 @@ pub struct CompiledModule {
     prepared_entry_symbol_index: Option<usize>,
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
+    direct_exists_batch_symbol_index: Option<usize>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
@@ -1791,6 +1800,9 @@ const PREPARED_SPAN_FILL_SYMBOL_PREFIX: &str =
     "fre_aot_regex_fill_spans_exclusive_v1_";
 const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
     "fre_aot_regex_is_match_batch_exclusive_v1_";
+const DIRECT_EXISTS_BATCH_SYMBOL_PREFIX: &str = "fre_aot_regex_is_match_batch_v1_";
+const DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/direct-exists-batch-v1\0";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
 const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
@@ -6150,6 +6162,7 @@ impl CompiledModule {
             prepared_entry_symbol_index,
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
+            direct_exists_batch_symbol_index: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -6544,6 +6557,32 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the handle-free independent-haystack Exists batch entry.
+    ///
+    /// The returned symbol accepts a pointer to an array of pointer/length
+    /// descriptors, a descriptor count, one writable byte per item, and a
+    /// writable processed-prefix count. It is present only when explicitly
+    /// requested for a self-contained direct [`OutputContract::Exists`]
+    /// module. Its canonical C/Rust function type is
+    /// `FreAotRegexIndependentExistsBatchV1` in `fre-aot-regex-runtime`; the
+    /// ordinary scalar entry remains unchanged.
+    #[must_use]
+    pub fn direct_exists_batch_symbol(&self) -> Option<&str> {
+        self.direct_exists_batch_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the handle-free direct Exists-batch symbol executes.
+    #[must_use]
+    pub const fn direct_exists_batch_strategy(&self) -> Option<DirectExistsBatchStrategy> {
+        if self.direct_exists_batch_symbol_index.is_some() {
+            Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
+        } else {
+            None
+        }
+    }
+
     /// Return the prepared full-haystack Count entry, when requested.
     ///
     /// The entry accepts a runtime-exclusive handle prepared from this
@@ -6759,6 +6798,180 @@ impl CompiledModule {
     #[cfg(test)]
     pub(crate) fn inject_test_only_runtime_program_dependency(&mut self) {
         self.runtime_program_symbol_index = Some(PROGRAM_SYMBOL);
+    }
+
+    /// Append a handle-free independent-haystack Exists loop only to a
+    /// complete self-contained direct module. Prepared and runtime-backed
+    /// modules return `None`; structural contradictions on a purported direct
+    /// module remain hard errors.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "route authentication, fallible construction, identity, and publication form one transactional append"
+    )]
+    pub(crate) fn append_direct_exists_batch(
+        mut self,
+        output: OutputContract,
+    ) -> Result<Option<Self>, ObjectError> {
+        if output != OutputContract::Exists
+            || self.prepared_entry_symbol_index.is_some()
+            || self.prepared_bulk_strategy.is_some()
+            || self.native_prepared_bulk_search_target.is_some()
+            || self.runtime_symbol_index.is_some()
+        {
+            return Ok(None);
+        }
+        if self.direct_exists_batch_symbol_index.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch was appended more than once",
+            ));
+        }
+        if self.prepared_span_fill_symbol_index.is_some()
+            || self.prepared_exists_batch_symbol_index.is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.prepared_aggregate_strategy.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch overlaps another additive surface",
+            ));
+        }
+        let has_unresolved_function_dependency = self
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(index, symbol)| {
+                symbol.section.is_none()
+                    && symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && self
+                        .relocations
+                        .iter()
+                        .any(|relocation| relocation.symbol == index)
+            });
+        if has_unresolved_function_dependency {
+            return Ok(None);
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct Exists batch entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch entry offset")
+        })?;
+        let entry_size = usize::try_from(entry.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch entry size")
+        })?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry extent",
+            ))?;
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch module has no text section",
+            ))?
+            .data
+            .len();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch target is not a complete text function",
+            ));
+        }
+        let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_direct_exists_batch()?,
+            Architecture::Aarch64 => lower_aarch64_direct_exists_batch()?,
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = code_offset
+            .checked_add(wrapper.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry extent",
+            ))?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("direct Exists batch text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        let call_offset = code_offset
+            .checked_add(wrapper.search_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch local call offset",
+            ))?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut text, call_offset, entry_start)?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut text, call_offset, entry_start)?;
+            }
+        }
+        let mut batch_identity = Sha256::new();
+        batch_identity.update(DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN);
+        batch_identity.update(entry_name_digest);
+        batch_identity.update(u64::try_from(entry_start).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch identity call target")
+        })?.to_le_bytes());
+        batch_identity.update(u64::try_from(code_offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch identity code offset")
+        })?.to_le_bytes());
+        batch_identity.update(text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("direct Exists batch wrapper is outside final text"),
+        )?);
+        let batch_identity: [u8; 32] = batch_identity.finalize().into();
+        let batch_name = identity_symbol(DIRECT_EXISTS_BATCH_SYMBOL_PREFIX, &batch_identity)?;
+        if let Some(ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report)) =
+            &mut self.exact_finite_exists_leaf_report
+        {
+            report.native_code_sha256 = Sha256::digest(&text).into();
+        }
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("direct Exists batch symbol"))?;
+        let batch_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: batch_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(code_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Exists batch code offset")
+            })?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Exists batch code size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.direct_exists_batch_symbol_index = Some(batch_symbol_index);
+        Ok(Some(self))
     }
 
     #[allow(
@@ -9625,6 +9838,11 @@ struct NativePreparedBulkWrapper {
     bulk_runtime_fallback_offset: Option<usize>,
     compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
+}
+
+struct NativeDirectExistsBatchWrapper {
+    code: Vec<u8>,
+    search_call_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27828,6 +28046,7 @@ fn native_regex_redux_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -43983,6 +44202,105 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     })
 }
 
+fn lower_x86_64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 32;
+    let mut assembler = X86Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // processed
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let descriptor_count_limit = u64::try_from(isize::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("direct Exists batch descriptor limit"))?
+        / 16;
+    let mut maximum_count = vec![0x49, 0xb8];
+    maximum_count.extend_from_slice(&descriptor_count_limit.to_le_bytes());
+    assembler.instruction(&maximum_count)?;
+    assembler.instruction(&[0x4c, 0x39, 0xc6])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], validated)?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // descriptors
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // matched bytes
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    assembler.instruction(&[0x49, 0x89, 0xcf])?;
+    assembler.instruction(&[0x31, 0xdb])?;
+    assembler.instruction(&[0x49, 0xc7, 0x07, 0, 0, 0, 0])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], complete)?;
+    assembler.instruction(&[0x49, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x49, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], late_invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x88], late_invalid)?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let search_call = assembler.label()?;
+    assembler.bind(search_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x86], completed_item)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(&[0x41, 0x88, 0x06])?;
+    assembler.instruction(&[0x49, 0x83, 0xc4, 0x10])?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x49, 0x83, 0xed, 0x01])?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 0x01])?;
+    assembler.instruction(&[0x49, 0x89, 0x1f])?;
+    assembler.branch(&[0xe9], loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeDirectExistsBatchWrapper {
+        search_call_offset: finished.label_offset(search_call)?,
+        code: finished.code,
+    })
+}
+
 /// Emit the AAPCS64 one-shot operation gate after complete read-only wrapper
 /// validation. X0..X7 and LR are restored before either successor; X18 is
 /// untouched and SP remains 16-byte aligned across the classifier BL.
@@ -46016,6 +46334,99 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: None,
+    })
+}
+
+fn lower_aarch64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    let mut assembler = Aarch64Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(4, 3, 3)?)?;
+    assembler.branch_nonzero_x(4, invalid)?;
+    let descriptor_count_limit = u64::try_from(isize::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("direct Exists batch descriptor limit"))?
+        / 16;
+    aarch64_load_u64_constant(&mut assembler, 4, descriptor_count_limit)?;
+    assembler.instruction(aarch64_cmp_x(1, 4)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, validated)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_and_low_x(4, 0, 3)?)?;
+    assembler.branch_nonzero_x(4, invalid)?;
+    assembler.branch_zero_x(2, invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 22, 0)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.branch_zero_x(20, complete)?;
+    assembler.instruction(aarch64_load_x_imm(24, 19, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(25, 19, 8)?)?;
+    assembler.branch_zero_x(24, late_invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(25, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, late_invalid)?;
+    assembler.instruction(aarch64_mov_x(0, 24)?)?;
+    assembler.instruction(aarch64_mov_x(1, 25)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 25)?)?;
+    // ADD (immediate) names SP for register 31; a MOV-register alias would
+    // name XZR and pass a null result pointer to the direct search.
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let search_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_LS, completed_item)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(aarch64_store_byte(0, 21, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(19, 19, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(21, 21, 1)?)?;
+    assembler.instruction(aarch64_sub_x_imm(20, 20, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.instruction(aarch64_store_x(23, 22, 0)?)?;
+    assembler.branch(loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [search_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeDirectExistsBatchWrapper {
+        code,
+        search_call_offset: offsets[0],
     })
 }
 
@@ -114320,6 +114731,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
+                direct_exists_batch_symbol_index: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
@@ -114648,6 +115060,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_entry_symbol_index: None,
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
+            direct_exists_batch_symbol_index: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,

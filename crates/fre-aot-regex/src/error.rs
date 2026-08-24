@@ -145,6 +145,43 @@ impl std::error::Error for CompileError {
     }
 }
 
+/// Failure from the opt-in independent Exists-batch compiler API.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum IndependentExistsBatchCompileError {
+    RequiresExists {
+        actual: crate::OutputContract,
+    },
+    Compile(CompileError),
+}
+
+impl fmt::Display for IndependentExistsBatchCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresExists { actual } => write!(
+                formatter,
+                "independent Exists-batch export requires Exists output, got {actual:?}"
+            ),
+            Self::Compile(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for IndependentExistsBatchCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequiresExists { .. } => None,
+            Self::Compile(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for IndependentExistsBatchCompileError {
+    fn from(value: CompileError) -> Self {
+        Self::Compile(value)
+    }
+}
+
 impl From<fre_syntax::ParseError> for CompileError {
     fn from(value: fre_syntax::ParseError) -> Self {
         Self::Syntax(value)

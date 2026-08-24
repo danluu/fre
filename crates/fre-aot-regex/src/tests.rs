@@ -12,13 +12,128 @@ use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
     DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi, FeatureSet,
-    PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    IndependentExistsBatchCompileError, PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
-    compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
+    compile_with_independent_exists_batch, compile_with_prepared_aggregate_exports,
+    compile_with_slow_aot_limits, emit_object,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
+
+#[test]
+fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("needle", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists);
+        let ordinary = compile(request.clone()).expect("ordinary direct Exists artifact");
+        assert!(ordinary.module().prepared_entry_symbol().is_none());
+        assert!(ordinary.module().direct_exists_batch_symbol().is_none());
+        let batched = compile_with_independent_exists_batch(request.clone())
+            .expect("direct Exists batch artifact");
+        let repeated = compile_with_independent_exists_batch(request.clone())
+            .expect("deterministic direct Exists batch artifact");
+        assert_eq!(batched.object(), repeated.object());
+        assert_eq!(batched.module(), repeated.module());
+        assert_eq!(
+            batched.module().direct_exists_batch_strategy(),
+            Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
+        );
+        let batch_symbol = batched
+            .module()
+            .direct_exists_batch_symbol()
+            .expect("handle-free direct batch symbol");
+        assert!(batch_symbol.starts_with("fre_aot_regex_is_match_batch_v1_"));
+        assert!(batched.module().prepared_exists_batch_symbol().is_none());
+        assert!(batched.module().required_runtime_symbols().next().is_none());
+        assert_eq!(batched.receipt().passes, ordinary.receipt().passes);
+        assert_eq!(
+            ordinary.program().serialize().expect("ordinary program bytes"),
+            batched.program().serialize().expect("batched program bytes")
+        );
+        assert_eq!(
+            ordinary.receipt().automaton_sha256,
+            batched.receipt().automaton_sha256
+        );
+        assert_eq!(
+            ordinary.receipt().program_sha256,
+            batched.receipt().program_sha256
+        );
+        assert_eq!(
+            ordinary.module().entry_symbol(),
+            batched.module().entry_symbol()
+        );
+
+        let ordinary_text = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("ordinary text");
+        let batched_text = batched
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("batched text");
+        let ordinary_entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("ordinary entry extent");
+        let entry_start = usize::try_from(ordinary_entry.offset).expect("entry start");
+        let entry_size = usize::try_from(ordinary_entry.size).expect("entry size");
+        let entry_end = entry_start.checked_add(entry_size).expect("entry end");
+        assert_eq!(
+            ordinary_text.bytes().get(entry_start..entry_end),
+            batched_text.bytes().get(entry_start..entry_end),
+            "additive batch changed the ordinary entry"
+        );
+        let ordinary_data = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("ordinary data");
+        let batched_data = batched
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("batched data");
+        assert_eq!(ordinary_data.bytes(), batched_data.bytes());
+        if let Some(mut expected) = ordinary.receipt().exact_single_literal_aot {
+            expected.native_code_sha256 = Sha256::digest(batched_text.bytes()).into();
+            assert_eq!(batched.receipt().exact_single_literal_aot, Some(expected));
+        }
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = ordinary.object().len();
+        let declined = compile_with_independent_exists_batch(request.limits(limits))
+            .expect("optional batch object-byte decline");
+        assert_eq!(declined.object(), ordinary.object());
+        assert_eq!(declined.module(), ordinary.module());
+        assert_eq!(declined.receipt().object_sha256, ordinary.receipt().object_sha256);
+        assert!(declined.module().direct_exists_batch_symbol().is_none());
+    }
+
+    assert!(matches!(
+        compile_with_independent_exists_batch(
+            CompileRequest::new("needle", Target::x86_64_linux())
+                .output(OutputContract::Span)
+        ),
+        Err(IndependentExistsBatchCompileError::RequiresExists {
+            actual: OutputContract::Span
+        })
+    ));
+}
 
 fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String {
     let mut pattern = String::from("(?-u:");

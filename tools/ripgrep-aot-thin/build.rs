@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fre_aot_regex::{
-    Architecture, CompileMode, CompileRequest, EngineKind, EngineSelectionReason, OperatingSystem,
-    OutputContract, PreparedBulkStrategy, StartAccelerator, Target, compile,
+    Architecture, CompileMode, CompileRequest, EngineKind, EngineSelectionReason,
+    IndependentExistsBatchCompileError, OperatingSystem, OutputContract, PreparedBulkStrategy,
+    StartAccelerator, Target, compile, compile_with_independent_exists_batch,
 };
 use fre_syntax::RustProfile;
 
@@ -90,12 +91,15 @@ fn main() {
                 }
                 let mut profile = RustProfile::default();
                 profile.options.case_insensitive = pattern.case_insensitive;
-                let compiled = compile(
-                    CompileRequest::new(pattern.source.clone(), target)
-                        .profile(profile)
-                        .mode(mode)
-                        .output(output),
-                )
+                let request = CompileRequest::new(pattern.source.clone(), target)
+                    .profile(profile)
+                    .mode(mode)
+                    .output(output);
+                let compiled = if output == OutputContract::Exists {
+                    compile_with_independent_exists_batch(request)
+                } else {
+                    compile(request).map_err(IndependentExistsBatchCompileError::from)
+                }
                 .unwrap_or_else(|error| {
                     panic!(
                         "compile {} {mode_name}/{output_name} {:?}: {error}",
@@ -112,6 +116,11 @@ fn main() {
                     "portable-runtime"
                 };
                 let batch_api = match output {
+                    OutputContract::Exists
+                        if compiled.module().direct_exists_batch_symbol().is_some() =>
+                    {
+                        "direct-exists-batch-v1"
+                    }
                     OutputContract::Exists
                         if compiled.module().prepared_exists_batch_symbol().is_some() =>
                     {
@@ -137,6 +146,9 @@ fn main() {
                     }
                     Some(PreparedBulkStrategy::NativeFrozenLoop) => "native-frozen-loop",
                     Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => "native-ordered-nfa-loop",
+                    None if compiled.module().direct_exists_batch_symbol().is_some() => {
+                        "native-direct-public-loop"
+                    }
                     None if has_prepared_entry => "compatibility",
                     None => "none",
                 };
@@ -245,7 +257,24 @@ fn main() {
                     } else {
                         "None".to_owned()
                     };
-                    format!("BackendFactory::Native {{ search: {declaration}, fill: {fill} }}")
+                    let exists_batch = if output == OutputContract::Exists {
+                        if let Some(symbol) = compiled.module().direct_exists_batch_symbol() {
+                            let batch = format!("exists_batch_{stem}");
+                            writeln!(
+                                &mut generated,
+                                "    #[link_name = {symbol:?}] fn {batch}(haystacks: *const AbiHaystack, count: usize, matched: *mut u8, processed: *mut usize) -> u32;",
+                            )
+                            .expect("String writes cannot fail");
+                            format!("Some({batch})")
+                        } else {
+                            "None".to_owned()
+                        }
+                    } else {
+                        "None".to_owned()
+                    };
+                    format!(
+                        "BackendFactory::Native {{ search: {declaration}, fill: {fill}, exists_batch: {exists_batch} }}"
+                    )
                 } else {
                     let program = out_dir.join(format!("{stem}.program"));
                     let bytes = compiled

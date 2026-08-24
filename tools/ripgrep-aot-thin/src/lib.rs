@@ -8,9 +8,10 @@ use fre_aot_regex::{MatchResult, SearchWindow};
 pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
     FreAotRegexExclusiveExistsBatchV1, FreAotRegexExclusiveHandleV1,
-    FreAotRegexExclusiveSpanFillV1, FreAotRegexHaystackV1, FreAotRegexIterStateV1,
-    FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
-    PreparedAotMatches, PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
+    FreAotRegexExclusiveSpanFillV1, FreAotRegexHaystackV1,
+    FreAotRegexIndependentExistsBatchV1, FreAotRegexIterStateV1, FreAotRegexResultV1,
+    ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PreparedAotMatches,
+    PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
     fre_aot_regex_runtime_prepare_exclusive_v1,
 };
 
@@ -37,6 +38,7 @@ type AbiHaystack = FreAotRegexHaystackV1;
 type NativeIterState = FreAotRegexIterStateV1;
 
 type NativeSearch = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut AbiResult) -> u32;
+type NativeExistsBatch = FreAotRegexIndependentExistsBatchV1;
 type NativeFill =
     fn(&[u8], &mut NativeIterState, &mut [MaybeUninit<AbiResult>]) -> NativeFillOutcome;
 type PreparedCompatSpanFill = fn(
@@ -75,6 +77,7 @@ enum BackendFactory {
     Native {
         search: NativeSearch,
         fill: Option<NativeFill>,
+        exists_batch: Option<NativeExistsBatch>,
     },
     Prepared {
         search: PreparedSearch,
@@ -128,6 +131,7 @@ enum Backend {
     Native {
         search: NativeSearch,
         fill: Option<NativeFill>,
+        exists_batch: Option<NativeExistsBatch>,
     },
     Prepared(PreparedNative),
     Runtime(Box<PreparedAotRegex>),
@@ -470,7 +474,15 @@ impl AotMatcher {
             })
             .ok_or_else(|| missing_spec_error(mode, output, pattern, case_insensitive))?;
         let backend = match spec.backend {
-            BackendFactory::Native { search, fill } => Backend::Native { search, fill },
+            BackendFactory::Native {
+                search,
+                fill,
+                exists_batch,
+            } => Backend::Native {
+                search,
+                fill,
+                exists_batch,
+            },
             BackendFactory::Prepared {
                 search,
                 program,
@@ -517,10 +529,10 @@ impl AotMatcher {
 
     /// Search up to [`EXISTS_BATCH_CAPACITY`] independent line haystacks.
     ///
-    /// Compiled-prepared artifacts execute the complete batch through one
-    /// native invocation while retaining their exclusive search workspace.
-    /// Other artifact routes preserve identical behavior with a checked
-    /// per-haystack compatibility loop.
+    /// Compiled prepared and self-contained direct artifacts execute the
+    /// complete batch through one native invocation. Other artifact routes
+    /// preserve identical behavior with a checked per-haystack compatibility
+    /// loop.
     ///
     /// # Errors
     ///
@@ -577,7 +589,14 @@ impl AotMatcher {
                     };
                 }
             }
-            Backend::Native { search, .. } => {
+            Backend::Native {
+                search,
+                exists_batch,
+                ..
+            } => {
+                if let Some(batch) = exists_batch {
+                    return direct_native_is_match_batch(*batch, haystacks, matched);
+                }
                 for (haystack, matched) in haystacks.iter().zip(matched) {
                     *matched = match native_search(*search, AotOutput::Exists, haystack, 0)? {
                         MatchResult::Exists(found) => found,
@@ -946,6 +965,47 @@ fn prepared_native_search(
 
 #[allow(
     unsafe_code,
+    reason = "single checked call boundary for a compiler-produced direct Exists-batch entry"
+)]
+fn direct_native_is_match_batch(
+    batch: NativeExistsBatch,
+    haystacks: &[&[u8]],
+    matched: &mut [bool],
+) -> Result<(), String> {
+    debug_assert_eq!(haystacks.len(), matched.len());
+    debug_assert!(!haystacks.is_empty());
+    debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
+
+    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const();
+    let mut descriptors = [AbiHaystack {
+        ptr: dangling,
+        len: 0,
+    }; EXISTS_BATCH_CAPACITY];
+    for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
+        *descriptor = AbiHaystack {
+            ptr: haystack.as_ptr(),
+            len: haystack.len(),
+        };
+    }
+    let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
+    let mut processed = 0;
+    // SAFETY: every descriptor names a live readable slice for this call;
+    // `encoded` has `count` writable bytes. The generated entry retains no
+    // pointer and initializes exactly the prefix published through
+    // `processed`.
+    let status = unsafe {
+        batch(
+            descriptors.as_ptr(),
+            haystacks.len(),
+            encoded.as_mut_ptr(),
+            &raw mut processed,
+        )
+    };
+    decode_exists_batch(status, processed, haystacks.len(), &encoded, matched)
+}
+
+#[allow(
+    unsafe_code,
     reason = "single checked call boundary for a compiler-produced prepared Exists-batch entry"
 )]
 fn prepared_native_is_match_batch(
@@ -969,7 +1029,7 @@ fn prepared_native_is_match_batch(
             len: haystack.len(),
         };
     }
-    let mut encoded = [0_u8; EXISTS_BATCH_CAPACITY];
+    let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
     let mut processed = 0;
     // SAFETY: `PreparedNative` exclusively owns `handle`; every descriptor
     // names a live readable slice for this call; `encoded` has `count`
@@ -984,10 +1044,19 @@ fn prepared_native_is_match_batch(
             &raw mut processed,
         )
     };
-    if processed > haystacks.len() {
+    decode_exists_batch(status, processed, haystacks.len(), &encoded, matched)
+}
+
+fn decode_exists_batch(
+    status: u32,
+    processed: usize,
+    count: usize,
+    encoded: &[u8; EXISTS_BATCH_CAPACITY],
+    matched: &mut [bool],
+) -> Result<(), String> {
+    if processed > count {
         return Err(format!(
-            "compiled Exists batch overreported its initialized prefix: {processed} > {}",
-            haystacks.len()
+            "compiled Exists batch overreported its initialized prefix: {processed} > {count}"
         ));
     }
     for (index, encoded) in encoded[..processed].iter().copied().enumerate() {
@@ -1003,14 +1072,12 @@ fn prepared_native_is_match_batch(
     }
     if status != 0 {
         return Err(format!(
-            "compiled Exists batch failed with status {status} after {processed}/{} haystacks",
-            haystacks.len()
+            "compiled Exists batch failed with status {status} after {processed}/{count} haystacks"
         ));
     }
-    if processed != haystacks.len() {
+    if processed != count {
         return Err(format!(
-            "compiled Exists batch returned success after {processed}/{} haystacks",
-            haystacks.len()
+            "compiled Exists batch returned success after {processed}/{count} haystacks"
         ));
     }
     Ok(())
@@ -1067,6 +1134,7 @@ mod tests {
     static PREPARED_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DIRECT_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn one_byte_search(
         _haystack: *const u8,
@@ -1315,6 +1383,23 @@ mod tests {
         0
     }
 
+    unsafe extern "C" fn contains_x_direct_exists_batch(
+        haystacks: *const AbiHaystack,
+        count: usize,
+        matched: *mut u8,
+        processed: *mut usize,
+    ) -> u32 {
+        DIRECT_EXISTS_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let haystacks = unsafe { std::slice::from_raw_parts(haystacks, count) };
+        let matched = unsafe { std::slice::from_raw_parts_mut(matched, count) };
+        for (index, haystack) in haystacks.iter().enumerate() {
+            let bytes = unsafe { std::slice::from_raw_parts(haystack.ptr, haystack.len) };
+            matched[index] = u8::from(bytes.contains(&b'x'));
+        }
+        unsafe { processed.write(count) };
+        0
+    }
+
     unsafe extern "C" fn nullable_search(
         _haystack: *const u8,
         haystack_len: usize,
@@ -1483,6 +1568,7 @@ mod tests {
             backend: Backend::Native {
                 search,
                 fill: Some(fill),
+                exists_batch: None,
             },
         }
     }
@@ -1501,6 +1587,18 @@ mod tests {
                 exists_batch,
                 handle: FreAotRegexExclusiveHandleV1::INVALID,
             }),
+        }
+    }
+
+    fn direct_exists_test_matcher(batch: NativeExistsBatch) -> AotMatcher {
+        AotMatcher {
+            output: AotOutput::Exists,
+            description: "test-direct-native",
+            backend: Backend::Native {
+                search: counted_one_byte_search,
+                fill: None,
+                exists_batch: Some(batch),
+            },
         }
     }
 
@@ -1675,6 +1773,253 @@ mod tests {
             assert_eq!(matched, index % 3 == 0);
         }
         assert_eq!(PREPARED_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn direct_exists_batch_crosses_native_abi_once_for_64_lines() {
+        DIRECT_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
+        let lines = (0..EXISTS_BATCH_CAPACITY)
+            .map(|index| {
+                if index % 3 == 0 {
+                    b"x".as_slice()
+                } else {
+                    b"no".as_slice()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = [false; EXISTS_BATCH_CAPACITY];
+        let mut direct = direct_exists_test_matcher(contains_x_direct_exists_batch);
+        direct
+            .is_match_batch(&lines, &mut outcomes)
+            .expect("direct Exists batch");
+        for (index, matched) in outcomes.into_iter().enumerate() {
+            assert_eq!(matched, index % 3 == 0);
+        }
+        assert_eq!(DIRECT_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn exists_batch_decoder_accepts_only_the_published_boolean_prefix() {
+        let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
+        let mut matched = [false; 3];
+
+        let error = decode_exists_batch(0, 4, 3, &encoded, &mut matched)
+            .expect_err("overreported prefix");
+        assert!(error.contains("overreported"));
+        assert_eq!(matched, [false; 3]);
+
+        encoded[0] = 1;
+        encoded[1] = 2;
+        let error = decode_exists_batch(0, 2, 3, &encoded, &mut matched)
+            .expect_err("invalid Boolean");
+        assert!(error.contains("invalid boolean 2 at index 1"));
+        assert_eq!(matched, [true, false, false]);
+
+        matched = [false; 3];
+        let error = decode_exists_batch(7, 1, 3, &encoded, &mut matched)
+            .expect_err("native failure after one result");
+        assert!(error.contains("status 7 after 1/3"));
+        assert_eq!(matched, [true, false, false]);
+
+        let error = decode_exists_batch(0, 1, 3, &encoded, &mut matched)
+            .expect_err("partial success is invalid");
+        assert!(error.contains("success after 1/3"));
+        assert_eq!(matched, [true, false, false]);
+
+        encoded[1] = 0;
+        encoded[2] = 1;
+        decode_exists_batch(0, 3, 3, &encoded, &mut matched).expect("complete Boolean prefix");
+        assert_eq!(matched, [true, false, true]);
+    }
+
+    #[test]
+    fn generated_direct_exists_batches_match_their_scalar_entries() {
+        const CASES: [&[u8]; 10] = [
+            b"",
+            b"a",
+            b"needle",
+            b"\n",
+            b"\n\n",
+            b"a\n",
+            b"a\r\nb",
+            b"late needle",
+            &[0xff, 0x00, b'a'],
+            &[b'x'; 65],
+        ];
+        let mut exercised = 0;
+        for spec in generated::SPECS {
+            if spec.output != AotOutput::Exists
+                || !matches!(
+                    spec.backend,
+                    BackendFactory::Native {
+                        exists_batch: Some(_),
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            exercised += 1;
+            for count in [1, 63, 64] {
+                let haystacks = (0..count)
+                    .map(|index| CASES[index % CASES.len()])
+                    .collect::<Vec<_>>();
+                let mut scalar = AotMatcher::new(
+                    spec.mode,
+                    spec.output,
+                    spec.pattern,
+                    spec.case_insensitive,
+                )
+                .expect("direct scalar matcher");
+                let expected = haystacks
+                    .iter()
+                    .map(|haystack| scalar.is_match(haystack).expect("direct scalar search"))
+                    .collect::<Vec<_>>();
+                let mut batch = AotMatcher::new(
+                    spec.mode,
+                    spec.output,
+                    spec.pattern,
+                    spec.case_insensitive,
+                )
+                .expect("direct batch matcher");
+                let mut actual = vec![false; count];
+                batch
+                    .is_match_batch(&haystacks, &mut actual)
+                    .expect("direct native batch search");
+                assert_eq!(actual, expected);
+            }
+        }
+        assert!(exercised > 0, "generated registry has no direct Exists batch");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one raw-ABI test keeps top-level, prefix, descriptor, and signed-domain failure ordering together"
+    )]
+    fn generated_direct_exists_batch_raw_abi_fails_closed() {
+        let batch = generated::SPECS
+            .iter()
+            .find_map(|spec| match spec.backend {
+                BackendFactory::Native {
+                    exists_batch: Some(batch),
+                    ..
+                } if spec.output == AotOutput::Exists => Some(batch),
+                _ => None,
+            })
+            .expect("generated direct Exists batch");
+        let mut processed = usize::MAX;
+        // SAFETY: zero count permits null descriptor and output arrays; the
+        // processed word is live, aligned, and writable.
+        let status = unsafe {
+            batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(processed, 0);
+
+        let mut output = [0xa5_u8; 2];
+        processed = usize::MAX;
+        // SAFETY: deliberately invalid top-level arguments are never
+        // dereferenced by the validated compiler boundary.
+        let status = unsafe {
+            batch(
+                std::ptr::null(),
+                1,
+                output.as_mut_ptr(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 2);
+        assert_eq!(processed, usize::MAX);
+        assert_eq!(output, [0xa5; 2]);
+
+        let valid = b"needle";
+        let descriptors = [
+            AbiHaystack {
+                ptr: valid.as_ptr(),
+                len: valid.len(),
+            },
+            AbiHaystack {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+        ];
+        processed = usize::MAX;
+        // SAFETY: the first descriptor is valid. The second is deliberately
+        // invalid and must stop before source access or tail publication.
+        let status = unsafe {
+            batch(
+                descriptors.as_ptr(),
+                descriptors.len(),
+                output.as_mut_ptr(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 2);
+        assert_eq!(processed, 1);
+        assert!(output[0] <= 1);
+        assert_eq!(output[1], 0xa5);
+
+        let oversized = [AbiHaystack {
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const(),
+            len: (isize::MAX as usize) + 1,
+        }];
+        output[0] = 0xa5;
+        processed = usize::MAX;
+        // SAFETY: the signed-domain length is rejected before the dangling
+        // source pointer can be dereferenced.
+        let status = unsafe {
+            batch(
+                oversized.as_ptr(),
+                1,
+                output.as_mut_ptr(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 2);
+        assert_eq!(processed, 0);
+        assert_eq!(output[0], 0xa5);
+
+        // SAFETY: both deliberately misaligned pointers are rejected before
+        // dereference. Count overflow is checked before descriptor access.
+        assert_eq!(
+            unsafe {
+                batch(
+                    std::ptr::without_provenance::<AbiHaystack>(1),
+                    1,
+                    output.as_mut_ptr(),
+                    &raw mut processed,
+                )
+            },
+            2
+        );
+        assert_eq!(
+            unsafe {
+                batch(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::without_provenance_mut::<usize>(1),
+                )
+            },
+            2
+        );
+        assert_eq!(
+            unsafe {
+                batch(
+                    std::ptr::null(),
+                    (isize::MAX as usize / 16) + 1,
+                    std::ptr::null_mut(),
+                    &raw mut processed,
+                )
+            },
+            2
+        );
     }
 
     #[test]
@@ -1891,9 +2236,25 @@ mod tests {
                         }
                     }
                 }
-                BackendFactory::Native { .. } => {
+                BackendFactory::Native {
+                    fill, exists_batch, ..
+                } => {
                     assert!(spec.description.contains("route=direct-native"));
-                    assert!(spec.description.contains("bulk=none"));
+                    match spec.output {
+                        AotOutput::Exists => {
+                            assert!(fill.is_none());
+                            assert!(exists_batch.is_some());
+                            assert!(spec.description.contains("api=direct-exists-batch-v1"));
+                            assert!(
+                                spec.description
+                                    .contains("bulk=native-direct-public-loop")
+                            );
+                        }
+                        AotOutput::Span => {
+                            assert!(exists_batch.is_none());
+                            assert!(spec.description.contains("bulk=none"));
+                        }
+                    }
                 }
                 BackendFactory::Runtime(_) => {
                     assert!(spec.description.contains("route=portable-runtime"));

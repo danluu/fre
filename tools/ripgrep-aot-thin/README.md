@@ -57,3 +57,21 @@ FRE_RIPGREP_AOT_VARIANTS=optimizing-exists \
 This emits only Optimizing/Exists for every selected row. Requests for Fast or
 Span then return a runtime error that names the build policy and available
 variant. Unset, empty, or `all` retains the default four-variant registry.
+
+## Exists batching
+
+Exists variants request an optional one-call native batch entry at build time.
+Prepared artifacts use their existing exclusive-handle batch API. A
+self-contained direct artifact may instead expose the additive, handle-free
+`direct-exists-batch-v1` API, which evaluates up to 64 independent haystacks
+through one Rust-to-native call while preserving the ordinary scalar entry.
+Runtime-backed and otherwise ineligible artifacts keep the checked scalar
+compatibility loop.
+
+The generated registry authenticates the advertised route before publishing
+it. The Rust adapter still constructs the bounded descriptor array and
+validates the returned status, initialized prefix, and Boolean results; the
+native entry owns the per-haystack search loop. This changes neither match
+semantics nor the default compiler API: callers must explicitly request the
+additive direct batch entry, and an object-byte-cap decline returns the exact
+ordinary artifact.

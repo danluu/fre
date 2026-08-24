@@ -95,7 +95,9 @@ pub use dfa::{
     DfaStats, NativeSlowPartialQuotientDisposition, NativeSlowPartialQuotientReceipt,
     MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
-pub use error::{CompileError, CompileResource, ObjectError};
+pub use error::{
+    CompileError, CompileResource, IndependentExistsBatchCompileError, ObjectError,
+};
 pub use grep_count::{
     DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
     GREP_COUNT_ACCOUNTING_VERSION, GREP_COUNT_ALGORITHM_VERSION, GrepCountConstructionReceipt,
@@ -104,6 +106,7 @@ pub use grep_count::{
 };
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
+    DirectExistsBatchStrategy,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
     ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport,
     ExactFiniteSelectedEndTeddyAotReportV2, ExactFiniteSelectedEndTeddyAotTargetTier,
@@ -962,6 +965,87 @@ pub fn compile_v2_with_slow_aot_limits(
             exact_finite_selected_end_teddy_aot,
         },
     })
+}
+
+/// Compile an Exists program and request one independent-haystack batch
+/// entry for a self-contained direct object.
+///
+/// Prepared artifacts already carry their exclusive-handle batch entry and
+/// are returned unchanged. Runtime-backed artifacts retain their checked
+/// compatibility route. A direct artifact receives an additive handle-free
+/// symbol whose loop locally calls the unchanged ordinary entry. If only the
+/// additive wrapper exceeds the requested final object-byte limit, the exact
+/// scalar artifact is returned without that optional symbol; consumers must
+/// inspect [`CompiledModule::direct_exists_batch_symbol`]. The canonical
+/// function type is `FreAotRegexIndependentExistsBatchV1` in
+/// `fre-aot-regex-runtime` and its C header.
+///
+/// # Errors
+///
+/// Returns [`IndependentExistsBatchCompileError::RequiresExists`] for another
+/// output contract. Allocation, malformed-module, object-backend, and base
+/// compilation failures remain terminal through
+/// [`IndependentExistsBatchCompileError::Compile`].
+pub fn compile_with_independent_exists_batch(
+    request: CompileRequest,
+) -> Result<CompiledRegex, IndependentExistsBatchCompileError> {
+    if request.output != OutputContract::Exists {
+        return Err(IndependentExistsBatchCompileError::RequiresExists {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let mut compiled = compile(request)?;
+    if compiled.module.prepared_exists_batch_symbol().is_some()
+        || compiled.module.direct_exists_batch_symbol().is_some()
+    {
+        return Ok(compiled);
+    }
+    let Some(module) = compiled
+        .module
+        .clone()
+        .append_direct_exists_batch(OutputContract::Exists)
+        .map_err(CompileError::from)?
+    else {
+        return Ok(compiled);
+    };
+    let object = match emit_object(&module, ObjectFormat::for_target(target), max_object_bytes) {
+        Ok(object) => object,
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => return Ok(compiled),
+        Err(error) => return Err(CompileError::from(error).into()),
+    };
+    compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot = module
+        .exact_finite_exists_byte_set_aot_report()
+        .copied();
+    compiled.receipt.exact_single_literal_aot =
+        module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot = module
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    compiled.receipt.ordered_finite_language_aot = module
+        .ordered_finite_language_aot_report()
+        .copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+    Ok(compiled)
 }
 
 /// Compile a program and append explicitly requested prepared reducer
