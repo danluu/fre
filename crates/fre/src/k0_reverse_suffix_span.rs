@@ -197,8 +197,8 @@ pub(crate) fn inspect(
 /// Prove the exact finite byte language `L{m,n}S` for the bounded ordinary
 /// selected-span leaf. Captures are transparent; every other HIR node and any
 /// assertion refuse. The retained mandatory suffix must equal `L^m S`, and
-/// the first byte of `S` must occur nowhere in `L`, making the greedy endpoint
-/// unique for a fixed start.
+/// the first byte of `S` must occur nowhere in `L`, making the endpoint unique
+/// for a fixed start under either repetition priority.
 pub(crate) fn inspect_bounded_literal_repeat(
     hir: &Hir,
     mandatory_suffix: &[u8],
@@ -250,7 +250,7 @@ fn inspect_bounded_literal_repeat_inner(
     let Some(maximum_repeats) = repetition.max else {
         return Ok(None);
     };
-    if !repetition.greedy || repetition.min == 0 || maximum_repeats < repetition.min {
+    if repetition.min == 0 || maximum_repeats < repetition.min {
         return Ok(None);
     }
     let token = peel_captures(&repetition.sub, meter)?;

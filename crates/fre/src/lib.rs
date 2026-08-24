@@ -3175,30 +3175,6 @@ impl K0MandatorySuffixPlan {
         }
     }
 
-    #[cfg(target_has_atomic = "64")]
-    fn pooled_finite_consumption_span_early_prefix_offset(
-        &self,
-        haystack: &[u8],
-        window: SearchWindow,
-    ) -> Option<usize> {
-        match &self.recovery {
-            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
-                if scanner
-                    .finite_span_recovery_maximum_match_bytes()
-                    .is_some() =>
-            {
-                scanner
-                    .reverse_suffix_span_adaptive
-                    .finite_early_prefix_offset(
-                        window.end().saturating_sub(window.start()),
-                        &haystack[window.start()..window.end()],
-                        self.needle(),
-                    )
-            }
-            _ => None,
-        }
-    }
-
     #[cfg(not(target_has_atomic = "64"))]
     fn pooled_finite_consumption_span_should_bypass_early(
         &self,
@@ -3207,16 +3183,6 @@ impl K0MandatorySuffixPlan {
     ) -> bool {
         let _ = (self, haystack, window);
         true
-    }
-
-    #[cfg(not(target_has_atomic = "64"))]
-    fn pooled_finite_consumption_span_early_prefix_offset(
-        &self,
-        haystack: &[u8],
-        window: SearchWindow,
-    ) -> Option<usize> {
-        let _ = (self, haystack, window);
-        None
     }
 
     #[cfg(not(target_has_atomic = "64"))]
@@ -11676,26 +11642,26 @@ fn try_k0_warm_exact_minimum_suffix_exists(
         .map(|found| found.is_some())
 }
 
-/// Complete one warmed early bounded-literal-repeat Span without borrowing K0
-/// workspace.
+/// Complete one bounded-literal-repeat Span without borrowing K0 workspace.
 ///
 /// Construction proves the exact language `L{m,n}S`, binds the retained
 /// mandatory suffix to `L^m S`, proves a tail barrier, and admits only a
-/// zero-distance mandatory cut. The revalidated receipt supplies the suffix
-/// offset. If the first cut member begins a whole number of additional `L`
-/// tokens ending at that suffix, the cut proves no earlier match start and the
-/// barrier proves this accepted endpoint is the unique greedy endpoint.
-/// Every mismatch is a read-only decline to the incumbent K0 path.
+/// zero-distance mandatory cut. The first occurrence of `L^m S` is therefore
+/// an accepted endpoint. Walking backward over at most `n - m` whole `L`
+/// tokens recovers the selected start: the walk implements greedy priority,
+/// while the barrier makes lazy priority select the same unique endpoint. A
+/// later suffix cannot move the selected start before the first suffix because
+/// its `L` corridor would have to cross the earlier tail's barrier byte.
+/// Every metadata mismatch is a read-only decline to the incumbent K0 path.
 #[inline(never)]
-fn try_k0_bounded_literal_repeat_early_span(
+fn try_k0_bounded_literal_repeat_span(
     suffix: &K0MandatorySuffixPlan,
     cut: K0MandatoryCutPlan,
     haystack: &[u8],
     window: SearchWindow,
     minimum_match_bytes: usize,
     maximum_match_bytes: usize,
-    suffix_offset: usize,
-) -> Option<fre_automata::MatchSpan> {
+) -> Option<Option<fre_automata::MatchSpan>> {
     #[cfg(test)]
     bounded_literal_repeat_span_probe::record_attempt();
     if window.start() != 0
@@ -11730,39 +11696,44 @@ fn try_k0_bounded_literal_repeat_early_span(
         return None;
     }
 
-    let first_member = cut.first_member(&haystack[window.start()..window.end()])?;
-    let selected_start = window.start().checked_add(first_member)?;
-    let suffix_start = window.start().checked_add(suffix_offset)?;
-    let added_prefix_bytes = suffix_start.checked_sub(selected_start)?;
-    if !added_prefix_bytes.is_multiple_of(token_bytes) {
-        return None;
-    }
     let minimum_repeats = minimum_prefix_bytes / token_bytes;
     let maximum_repeats = maximum_prefix_bytes / token_bytes;
-    let added_repeats = added_prefix_bytes / token_bytes;
-    let selected_repeats = minimum_repeats.checked_add(added_repeats)?;
-    if selected_repeats > maximum_repeats {
+    let additional_repeats = maximum_repeats.checked_sub(minimum_repeats)?;
+    let found = suffix
+        .find_window(haystack, window.start(), window.end())
+        .ok()?;
+    let Some((minimum_start, selected_end)) = found else {
+        #[cfg(test)]
+        bounded_literal_repeat_span_probe::record_completion();
+        return Some(None);
+    };
+    if selected_end != minimum_start.checked_add(needle.len())? {
         return None;
     }
-    let prefix = haystack.get(selected_start..suffix_start)?;
-    if prefix
-        .chunks_exact(token_bytes)
-        .any(|candidate| candidate != token)
-    {
-        return None;
+    let mut selected_start = minimum_start;
+    for _ in 0..additional_repeats {
+        let Some(previous_start) = selected_start
+            .checked_sub(token_bytes)
+            .filter(|start| *start >= window.start())
+        else {
+            break;
+        };
+        if haystack.get(previous_start..selected_start) != Some(token) {
+            break;
+        }
+        selected_start = previous_start;
     }
-    let selected_end = suffix_start.checked_add(needle.len())?;
     if selected_end > window.end()
-        || selected_end.checked_sub(selected_start)?
-            != selected_repeats
-                .checked_mul(token_bytes)?
-                .checked_add(tail_bytes)?
+        || selected_end.checked_sub(selected_start)? > maximum_match_bytes
     {
         return None;
     }
     #[cfg(test)]
     bounded_literal_repeat_span_probe::record_completion();
-    Some(fre_automata::MatchSpan::new(selected_start, selected_end))
+    Some(Some(fre_automata::MatchSpan::new(
+        selected_start,
+        selected_end,
+    )))
 }
 
 impl PortableK0Plan {
@@ -11916,28 +11887,24 @@ impl PortableK0Plan {
         {
             return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
         }
-        if let Some(suffix_offset) = suffix
-            .pooled_finite_consumption_span_early_prefix_offset(haystack, window)
+        if suffix.bounded_literal_repeat_span_lengths().is_some()
+            && let Some(output) = self.mandatory_cut.and_then(|cut| {
+                try_k0_bounded_literal_repeat_span(
+                    suffix,
+                    cut,
+                    haystack,
+                    window,
+                    minimum_match_bytes,
+                    maximum_match_bytes,
+                )
+            })
         {
-            let completed = self
-                .mandatory_cut
-                .and_then(|cut| {
-                    try_k0_bounded_literal_repeat_early_span(
-                        suffix,
-                        cut,
-                        haystack,
-                        window,
-                        minimum_match_bytes,
-                        maximum_match_bytes,
-                        suffix_offset,
-                    )
-                });
-            return Ok(completed.map_or(
-                K0PooledFiniteConsumptionSpanRoute::Unattempted,
-                |matched| {
-                    K0PooledFiniteConsumptionSpanRoute::Complete(Some(matched))
-                },
-            ));
+            #[cfg(test)]
+            {
+                finite_consumption_span_facade_probe::record_attempt();
+                finite_consumption_span_facade_probe::record_result(true);
+            }
+            return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(output));
         }
         let Some(admission) = suffix.try_admit_pooled_finite_consumption_span(window_bytes)
         else {
