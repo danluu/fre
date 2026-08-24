@@ -211,3 +211,38 @@ impl From<ObjectError> for CompileError {
         Self::Object(value)
     }
 }
+
+/// Failure from the opt-in exact-finite `SelectedEnd` GrepCount compiler.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ExactFiniteGrepCountCompileError {
+    RequiresSelectedEnd { actual: crate::OutputContract },
+    Compile(CompileError),
+}
+
+impl fmt::Display for ExactFiniteGrepCountCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresSelectedEnd { actual } => write!(
+                formatter,
+                "exact-finite GrepCount export requires SelectedEnd output, got {actual:?}"
+            ),
+            Self::Compile(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for ExactFiniteGrepCountCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequiresSelectedEnd { .. } => None,
+            Self::Compile(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for ExactFiniteGrepCountCompileError {
+    fn from(value: CompileError) -> Self {
+        Self::Compile(value)
+    }
+}

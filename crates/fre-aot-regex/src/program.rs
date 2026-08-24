@@ -11258,6 +11258,16 @@ impl CompiledProgram {
             .native_selected_end_teddy_view(self.identity.artifact, self.output)
     }
 
+    /// Return an independently re-authenticated proof that an exact finite
+    /// `SelectedEnd` language is non-empty, non-nullable, assertion-free, and
+    /// contains neither CR nor LF.
+    pub(crate) fn native_finite_selected_end_grep_count_view(
+        &self,
+    ) -> Option<crate::finite_language::NativeFiniteSelectedEndGrepCountView> {
+        self.native_finite_language_program()?
+            .native_selected_end_grep_count_view(self.identity.artifact, self.output)
+    }
+
     /// Return the bounded graph-derived fixed-prefix facts.
     ///
     /// The analysis uses only the validated Thompson graph. It does not inspect

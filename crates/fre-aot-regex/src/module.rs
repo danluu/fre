@@ -35,7 +35,7 @@ use crate::{
     dfa_loop_skip,
     finite_language::{
         NativeFiniteExistsChoiceView, NativeFiniteLanguageView,
-        NativeFiniteSelectedEndTeddyView,
+        NativeFiniteSelectedEndGrepCountView, NativeFiniteSelectedEndTeddyView,
     },
     mandatory_teddy::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
@@ -542,6 +542,33 @@ pub struct ExactFiniteSelectedEndTeddyAotReport {
     pub incumbent_code_bytes: usize,
     pub incumbent_data_bytes: usize,
     pub incumbent_relocation_count: usize,
+}
+
+/// Provenance for the opt-in exact-finite matching-line reducer.
+///
+/// The reducer invokes the unchanged direct `SelectedEnd` entry over the
+/// remaining haystack, counts the line containing that endpoint, and jumps to
+/// the next LF before searching again. Admission independently proves a
+/// non-empty assertion-free exact finite language containing neither CR nor
+/// LF, so one selected endpoint cannot cross a line boundary and one jump
+/// cannot hide a second matching line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteSelectedEndGrepCountAotReport {
+    pub artifact_identity: [u8; 32],
+    pub output: OutputContract,
+    pub source_count: u32,
+    pub source_bytes: usize,
+    pub maximum_width: u32,
+    /// Identity over the complete final additive module, including every
+    /// section, symbol, relocation, and the locally patched call.
+    pub module_sha256: [u8; 32],
+    /// Digest of the unchanged ordinary entry called by the reducer.
+    pub ordinary_entry_sha256: [u8; 32],
+    /// Digest of the final reducer bytes after the local call is patched.
+    pub reducer_code_sha256: [u8; 32],
+    pub ordinary_entry_offset: usize,
+    pub reducer_entry_offset: usize,
+    pub local_call_offset: usize,
 }
 
 /// Why a V2 exact-finite Teddy wrapper was selected.
@@ -1694,6 +1721,8 @@ pub struct CompiledModule {
     exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
     exact_finite_selected_end_teddy_aot_report: Option<ExactFiniteSelectedEndTeddyAotReport>,
     exact_finite_selected_end_teddy_aot_report_v2: Option<ExactFiniteSelectedEndTeddyAotReportV2>,
+    exact_finite_selected_end_grep_count_aot_report:
+        Option<ExactFiniteSelectedEndGrepCountAotReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -6232,6 +6261,7 @@ impl CompiledModule {
             exact_finite_exists_leaf_report,
             exact_finite_selected_end_teddy_aot_report: None,
             exact_finite_selected_end_teddy_aot_report_v2: None,
+            exact_finite_selected_end_grep_count_aot_report: None,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -6476,6 +6506,16 @@ impl CompiledModule {
         &self,
     ) -> Option<&ExactFiniteSelectedEndTeddyAotReportV2> {
         self.exact_finite_selected_end_teddy_aot_report_v2.as_ref()
+    }
+
+    /// Return provenance for the opt-in exact-finite `SelectedEnd` line-jump
+    /// GrepCount reducer.
+    #[must_use]
+    pub const fn exact_finite_selected_end_grep_count_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndGrepCountAotReport> {
+        self.exact_finite_selected_end_grep_count_aot_report
+            .as_ref()
     }
 
     /// Return exact geometry for a selected ordered finite-language native
@@ -6842,6 +6882,477 @@ impl CompiledModule {
     pub(crate) fn inject_test_only_runtime_program_dependency(&mut self) {
         self.runtime_program_symbol_index = Some(PROGRAM_SYMBOL);
     }
+    /// Authenticate the allocation-free module half of exact-finite
+    /// GrepCount admission. A caller uses this before serializing the program
+    /// so a structural decline performs no additive allocation at all.
+    pub(crate) fn can_append_exact_finite_selected_end_grep_count(
+        &self,
+    ) -> Result<bool, ObjectError> {
+        if self
+            .exact_finite_selected_end_grep_count_aot_report
+            .is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.prepared_count_symbol_index.is_some()
+            || self.prepared_span_sum_symbol_index.is_some()
+            || self.prepared_grep_count_symbol_index.is_some()
+            || self.prepared_aggregate_strategy.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount was appended more than once or overlaps another aggregate surface",
+            ));
+        }
+        if self.prepared_entry_symbol_index.is_some()
+            || self.prepared_span_fill_symbol_index.is_some()
+            || self.prepared_exists_batch_symbol_index.is_some()
+            || self.prepared_bulk_strategy.is_some()
+            || self.required_prepare_capabilities != 0
+            || self.native_prepared_bulk_search_target.is_some()
+            || self.ordered_nfa_bulk_gate_target.is_some()
+            || self.runtime_symbol_index.is_some()
+            || self.runtime_program_symbol_index.is_some()
+            || self.required_runtime_symbols().next().is_some()
+        {
+            return Ok(false);
+        }
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no text section",
+            ))?
+            .data
+            .len();
+        if self.sections.get(PROGRAM_SECTION).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no data section",
+            ));
+        }
+        let entry = self
+            .symbols
+            .get(self.entry_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount entry index is invalid",
+            ))?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry size"))?;
+        let entry_end =
+            entry_start
+                .checked_add(entry_size)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount target is not a complete text function",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Append the opt-in exact-finite `SelectedEnd` matching-line reducer to
+    /// a complete self-contained direct module. Unsupported module topology or
+    /// local-call reach returns `None`; malformed state, allocation failure,
+    /// arithmetic failure, and backend failure remain terminal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "route authentication, fallible construction, local relocation, identity, and publication form one transaction"
+    )]
+    pub(crate) fn append_exact_finite_selected_end_grep_count(
+        mut self,
+        proof: NativeFiniteSelectedEndGrepCountView,
+        serialized_program: &[u8],
+    ) -> Result<Option<Self>, ObjectError> {
+        if !self.can_append_exact_finite_selected_end_grep_count()? {
+            return Ok(None);
+        }
+        if proof.artifact_identity == [0; 32]
+            || proof.source_count == 0
+            || proof.total_source_bytes == 0
+            || proof.maximum_width == 0
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount proof is incomplete",
+            ));
+        }
+        let serialized_output =
+            serialized_program_output_contract(serialized_program, serialized_program.len())?;
+        if serialized_output != OutputContract::SelectedEnd {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount runtime program is not SelectedEnd",
+            ));
+        }
+        let serialized_identity: [u8; 32] = Sha256::digest(serialized_program).into();
+        if serialized_identity != proof.artifact_identity {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount runtime program identity disagrees",
+            ));
+        }
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no text section",
+            ))?
+            .data
+            .len();
+        if self.sections.get(PROGRAM_SECTION).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no data section",
+            ));
+        }
+        let entry = self
+            .symbols
+            .get(self.entry_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount entry index is invalid",
+            ))?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry size"))?;
+        let entry_end =
+            entry_start
+                .checked_add(entry_size)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount target is not a complete text function",
+            ));
+        }
+        let ordinary_entry_sha256: [u8; 32] = Sha256::digest(
+            self.sections[TEXT_SECTION]
+                .data
+                .get(entry_start..entry_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "exact-finite GrepCount ordinary entry is outside text",
+                ))?,
+        )
+        .into();
+
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_exact_finite_selected_end_grep_count()?,
+            Architecture::Aarch64 => lower_aarch64_exact_finite_selected_end_grep_count()?,
+        };
+        let wrapper = Some(wrapper);
+        if !native_aggregate_wrappers_fit(
+            self.target.architecture,
+            text_len,
+            entry_start,
+            &[&wrapper],
+        )? {
+            return Ok(None);
+        }
+        let wrapper = wrapper.ok_or(ObjectError::InvalidModule(
+            "exact-finite GrepCount wrapper disappeared after preflight",
+        ))?;
+        if wrapper.ordered_nfa_gate_call_offset.is_some()
+            || wrapper.bulk_runtime_fallback_offset.is_some()
+            || wrapper.compatibility_identity_relocation.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount wrapper retained another execution edge",
+            ));
+        }
+
+        let architecture = self.target.architecture;
+        let code_alignment_mask = match architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset =
+            text_len
+                .checked_add(code_alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry alignment",
+                ))?
+                & !code_alignment_mask;
+        let final_text_len =
+            code_offset
+                .checked_add(wrapper.code.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        let program_offset = self.sections[PROGRAM_SECTION]
+            .data
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount runtime program alignment",
+            ))?
+            & !15;
+        let identity_offset = program_offset
+            .checked_add(serialized_program.len())
+            .and_then(|end| end.checked_add(15))
+            .map(|end| end & !15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount identity alignment",
+            ))?;
+        let final_data_len = identity_offset
+            .checked_add(proof.artifact_identity.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount identity extent",
+            ))?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut data = std::mem::take(&mut sections[PROGRAM_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount text"))?;
+        data.try_reserve_exact(final_data_len.saturating_sub(data.len()))
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount data"))?;
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(3)
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount symbols"))?;
+        let relocation_count = match architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        };
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        relocations
+            .try_reserve_exact(relocation_count)
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount relocations"))?;
+
+        data.resize(program_offset, 0);
+        push_bytes(&mut data, serialized_program)?;
+        let runtime_program_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                RUNTIME_PROGRAM_SYMBOL_PREFIX,
+                "exact-finite GrepCount runtime program prefix",
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: offset_u64(
+                program_offset,
+                "exact-finite GrepCount runtime program offset",
+            )?,
+            size: u64::try_from(serialized_program.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact-finite GrepCount runtime program size")
+            })?,
+        });
+        data.resize(identity_offset, 0);
+        push_bytes(&mut data, &proof.artifact_identity)?;
+        let identity_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                ".Lfre_aot_regex_exact_finite_grep_count_identity",
+                "exact-finite GrepCount identity symbol",
+            )?,
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: offset_u64(identity_offset, "exact-finite GrepCount identity offset")?,
+            size: 32,
+        });
+
+        match architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        let local_call_offset = code_offset
+            .checked_add(wrapper.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount local call offset",
+            ))?;
+        let wrapper_size = wrapper.code.len();
+        let identity_relocation = wrapper
+            .identity_relocation
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount wrapper has no identity guard",
+            ))?;
+        push_bytes(&mut text, &wrapper.code)?;
+        match (architecture, identity_relocation) {
+            (Architecture::X86_64, NativePreparedIdentityRelocation::X86PcRelative32(offset)) => {
+                if offset.checked_add(4).is_none_or(|end| end > wrapper_size)
+                    || offset >= wrapper.prepared_call_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 exact-finite GrepCount identity guard is outside its entry",
+                    ));
+                }
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: offset_u64(
+                        code_offset
+                            .checked_add(offset)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "x86 exact-finite GrepCount identity relocation",
+                            ))?,
+                        "x86 exact-finite GrepCount identity relocation",
+                    )?,
+                    kind: RelocationKind::X86PcRelative32,
+                    symbol: identity_symbol_index,
+                    addend: -4,
+                });
+                patch_x86_64_local_call(&mut text, local_call_offset, entry_start)?;
+            }
+            (
+                Architecture::Aarch64,
+                NativePreparedIdentityRelocation::Aarch64Page21PageOff12 { page, page_offset },
+            ) => {
+                if page.checked_add(4).is_none_or(|end| end > wrapper_size)
+                    || page_offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > wrapper_size)
+                    || page >= wrapper.prepared_call_offset
+                    || page_offset >= wrapper.prepared_call_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 exact-finite GrepCount identity guard is outside its entry",
+                    ));
+                }
+                relocations.extend([
+                    ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: offset_u64(
+                            code_offset.checked_add(page).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "AArch64 exact-finite GrepCount identity ADRP",
+                                ),
+                            )?,
+                            "AArch64 exact-finite GrepCount identity ADRP",
+                        )?,
+                        kind: RelocationKind::Aarch64Page21,
+                        symbol: identity_symbol_index,
+                        addend: 0,
+                    },
+                    ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: offset_u64(
+                            code_offset.checked_add(page_offset).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "AArch64 exact-finite GrepCount identity ADD",
+                                ),
+                            )?,
+                            "AArch64 exact-finite GrepCount identity ADD",
+                        )?,
+                        kind: RelocationKind::Aarch64PageOff12,
+                        symbol: identity_symbol_index,
+                        addend: 0,
+                    },
+                ]);
+                patch_aarch64_local_call(&mut text, local_call_offset, entry_start)?;
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "exact-finite GrepCount identity relocation has the wrong ISA",
+                ));
+            }
+        }
+
+        let grep_count_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+                "exact-finite GrepCount entry prefix",
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: offset_u64(code_offset, "exact-finite GrepCount code offset")?,
+            size: u64::try_from(wrapper_size)
+                .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount code size"))?,
+        });
+        let canonical_identity_symbols = [
+            (runtime_program_symbol_index, RUNTIME_PROGRAM_SYMBOL_PREFIX),
+            (grep_count_symbol_index, PREPARED_GREP_COUNT_SYMBOL_PREFIX),
+        ];
+        let module_identity = prepared_aggregate_module_digest(
+            self.target,
+            proof.artifact_identity,
+            PreparedAggregateExports::GREP_COUNT,
+            PreparedAggregateStrategy::NativeFused,
+            &text,
+            &data,
+            &symbols,
+            &relocations,
+            &canonical_identity_symbols,
+        )?;
+        symbols[runtime_program_symbol_index].name =
+            identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &module_identity)?;
+        symbols[grep_count_symbol_index].name =
+            identity_symbol(PREPARED_GREP_COUNT_SYMBOL_PREFIX, &module_identity)?;
+        let reducer_code_sha256: [u8; 32] =
+            Sha256::digest(text.get(code_offset..final_text_len).ok_or(
+                ObjectError::InvalidModule("exact-finite GrepCount reducer is outside final text"),
+            )?)
+            .into();
+
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        sections[PROGRAM_SECTION].data = data.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        self.prepared_grep_count_symbol_index = Some(grep_count_symbol_index);
+        self.prepared_aggregate_exports = PreparedAggregateExports::GREP_COUNT;
+        self.prepared_aggregate_strategy = Some(PreparedAggregateStrategy::NativeFused);
+        self.runtime_program_symbol_index = Some(runtime_program_symbol_index);
+
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        }
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report_v2.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_v2_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
+        }
+        self.exact_finite_selected_end_grep_count_aot_report =
+            Some(ExactFiniteSelectedEndGrepCountAotReport {
+                artifact_identity: proof.artifact_identity,
+                output: OutputContract::SelectedEnd,
+                source_count: proof.source_count,
+                source_bytes: proof.total_source_bytes,
+                maximum_width: proof.maximum_width,
+                module_sha256: module_identity,
+                ordinary_entry_sha256,
+                reducer_code_sha256,
+                ordinary_entry_offset: entry_start,
+                reducer_entry_offset: code_offset,
+                local_call_offset,
+            });
+        Ok(Some(self))
+    }
+
 
     /// Append a handle-free independent-haystack Exists loop only to a
     /// complete self-contained direct module. Prepared and runtime-backed
@@ -28170,6 +28681,7 @@ fn native_regex_redux_module(
         exact_finite_exists_leaf_report: None,
         exact_finite_selected_end_teddy_aot_report: None,
         exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
@@ -28313,6 +28825,7 @@ fn native_weighted_capture_module(
         exact_finite_exists_leaf_report: None,
         exact_finite_selected_end_teddy_aot_report: None,
         exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
@@ -28750,6 +29263,7 @@ fn native_rebar_multi_grep_module_v1(
         exact_finite_exists_leaf_report: None,
         exact_finite_selected_end_teddy_aot_report: None,
         exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
@@ -43371,6 +43885,185 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
     Ok((finished.code, offsets.into_boxed_slice()))
 }
 
+/// Emit the exact-finite line-jump reducer. The local ordinary entry returns
+/// one selected endpoint in the still-unclassified suffix; the independently
+/// authenticated CR/LF-free finite-language proof makes that endpoint a
+/// witness for exactly one line. Scanning only from the endpoint to the next
+/// LF skips the rest of the already-counted line without rescanning prior
+/// bytes through either loop.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity validation, endpoint progress, LF skipping, and failure-atomic publication form one native leaf"
+)]
+fn lower_x86_64_exact_finite_selected_end_grep_count()
+-> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 16;
+
+    let mut assembler = X86Assembler::new();
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let scan_to_lf = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 exact-finite GrepCount identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 exact-finite GrepCount linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 exact-finite GrepCount header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 exact-finite GrepCount header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // base
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xcf])?; // output
+    assembler.instruction(&[0x4d, 0x31, 0xf6])?; // cursor
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // count
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x4c, 0x89, 0xf2])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe9])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x14, 0x24])?; // selected end
+    assembler.instruction(&[0x4d, 0x39, 0xf2])?;
+    assembler.branch(&[0x0f, 0x86], runtime_failure)?; // end <= cursor
+    assembler.instruction(&[0x4d, 0x39, 0xea])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?; // end > length
+    assembler.instruction(&[0x48, 0x83, 0xc3, 0x01])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x4d, 0x89, 0xd6])?;
+
+    assembler.bind(scan_to_lf)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x34, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.branch(&[0xe9], scan_to_lf)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x49, 0x89, 0x1f])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, PREPARED_INVALID_HANDLE_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, PREPARED_INVALID_ARGUMENT_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let prepared_call_offset = finished.label_offset(prepared_call)?;
+    let identity_relocation = NativePreparedIdentityRelocation::X86PcRelative32(
+        finished.label_offset(identity_displacement)?,
+    );
+    Ok(NativePreparedBulkWrapper {
+        code: finished.code,
+        prepared_call_offset,
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(identity_relocation),
+    })
+}
+
+
 fn x86_native_capture_reducer_boundary(
     assembler: &mut X86Assembler,
     caller_scratch_bytes: usize,
@@ -45613,6 +46306,179 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
     let code = assembler.finish_with_offsets(&mut offsets)?;
     Ok((code, offsets.into_boxed_slice()))
 }
+
+/// AAPCS64 lowering of the exact-finite `SelectedEnd` line-jump reducer.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity validation, endpoint progress, LF skipping, and failure-atomic publication form one native leaf"
+)]
+fn lower_aarch64_exact_finite_selected_end_grep_count()
+-> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 80;
+
+    let mut assembler = Aarch64Assembler::new();
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let scan_to_lf = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    let identity_page = assembler.instruction(0x9000_0007)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 exact-finite GrepCount identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            7,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-finite GrepCount linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 exact-finite GrepCount header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-finite GrepCount header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+    }
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 64)?)?;
+    assembler.instruction(aarch64_mov_x(19, 1)?)?;
+    assembler.instruction(aarch64_mov_x(20, 2)?)?;
+    assembler.instruction(aarch64_mov_x(21, 3)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_store_x(31, 31, 0)?)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 22)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_x_imm(24, 31, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(24, 22)?)?;
+    assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(24, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_mov_x(22, 24)?)?;
+
+    assembler.bind(scan_to_lf)?;
+    assembler.instruction(aarch64_cmp_x(22, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 19, 22)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(22, 22, 1)?)?;
+    assembler.branch(scan_to_lf)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(22, 22, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(22, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(23, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 64)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_INVALID_HANDLE_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_INVALID_ARGUMENT_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: offsets[1],
+            page_offset: offsets[2],
+        }),
+    })
+}
+
 
 fn aarch64_native_capture_reducer_boundary(
     assembler: &mut Aarch64Assembler,
@@ -115333,6 +116199,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 exact_finite_exists_leaf_report: None,
                 exact_finite_selected_end_teddy_aot_report: None,
                 exact_finite_selected_end_teddy_aot_report_v2: None,
+                exact_finite_selected_end_grep_count_aot_report: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -115663,6 +116530,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             exact_finite_exists_leaf_report: None,
             exact_finite_selected_end_teddy_aot_report: None,
             exact_finite_selected_end_teddy_aot_report_v2: None,
+            exact_finite_selected_end_grep_count_aot_report: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,

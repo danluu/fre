@@ -196,6 +196,27 @@ the final appended code, data, symbols, and relocations; the compile receipt
 also hashes the final object. Linkers can enumerate the exact undefined helper
 surface with `CompiledModule::required_runtime_symbols`.
 
+`compile_with_exact_finite_selected_end_grep_count` is a narrower opt-in
+GrepCount route for direct `SelectedEnd` objects. It is admitted only by the
+fresh source-authenticated finite-language sidecar after revalidating the
+complete trie and proving that every non-empty exact member contains neither
+CR nor LF. Generated code searches the entire unclassified suffix once,
+counts the line containing the selected endpoint, scans forward only to that
+line's LF, and repeats after it. This is matching-line Count, not match Count:
+multiple matches on one line still contribute one. Empty input has zero lines,
+a trailing LF creates no phantom line, and a non-empty unterminated tail is a
+line. CR-free admission makes whole-haystack searching observationally
+equivalent to the normal CR-before-LF stripping rule.
+
+The existing GrepCount ABI and exclusive-handle identity guard are unchanged.
+The module report authenticates the source artifact, unchanged local ordinary
+entry, patched local call, reducer bytes, and complete additive module. A
+missing report means the optimization was not selected. Structural refusal or
+an additive `ObjectBytes` ceiling returns the byte-identical ordinary artifact;
+allocation, arithmetic, malformed-module, and object-backend failures remain
+terminal. Ordinary `compile` and `compile_with_prepared_aggregate_exports`
+retain their existing bytes and route selection.
+
 ### Ordered multi-pattern programs
 
 `fre-aot-regex::compile_ordered_many` is an additive target-neutral operation

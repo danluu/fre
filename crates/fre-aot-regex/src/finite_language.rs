@@ -768,6 +768,21 @@ impl NativeFiniteLanguageView<'_> {
     }
 }
 
+/// Source-authenticated proof that a complete exact finite `SelectedEnd`
+/// language is safe to search across LF-delimited line domains.
+///
+/// The proof carries no source strings. It is constructed only after the
+/// bound finite-language graph has been revalidated and every exact trie edge
+/// has been shown to exclude both CR and LF. Non-empty language and
+/// non-nullability are inherited from [`NativeFiniteLanguageView`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeFiniteSelectedEndGrepCountView {
+    pub(crate) artifact_identity: [u8; 32],
+    pub(crate) source_count: u32,
+    pub(crate) total_source_bytes: usize,
+    pub(crate) maximum_width: u32,
+}
+
 /// Target-neutral exact-finite `Exists` strategy. This is a planning receipt,
 /// not a selection over the already compiled DFA: target finalization must
 /// still compare its concrete lowering against the incumbent native machine.
@@ -2011,6 +2026,33 @@ impl NativeFiniteLanguageProgram {
         self.selected_end_teddy_choice
             .as_ref()?
             .native_view(artifact_identity, &self.selected_end_literals)
+    }
+
+    /// Re-authenticate the complete exact finite language and prove that its
+    /// literals cannot consume a line delimiter. The compact sparse graph is
+    /// a trie: every source byte occurs on one of its explicit edges, so the
+    /// absence of CR/LF edges proves that a match cannot cross or consume an
+    /// LF/CRLF boundary.
+    pub(crate) fn native_selected_end_grep_count_view(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<NativeFiniteSelectedEndGrepCountView> {
+        let view = self.native_view(artifact_identity, output)?;
+        if output != OutputContract::SelectedEnd
+            || view
+                .sparse_edges
+                .iter()
+                .any(|edge| matches!(edge.byte, b'\r' | b'\n'))
+        {
+            return None;
+        }
+        Some(NativeFiniteSelectedEndGrepCountView {
+            artifact_identity,
+            source_count: view.source_count,
+            total_source_bytes: view.total_source_bytes,
+            maximum_width: view.maximum_width,
+        })
     }
 
     /// Target-neutral correctness oracle for the future native lowering. The

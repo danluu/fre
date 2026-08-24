@@ -96,7 +96,8 @@ pub use dfa::{
     MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
 pub use error::{
-    CompileError, CompileResource, IndependentExistsBatchCompileError, ObjectError,
+    CompileError, CompileResource, ExactFiniteGrepCountCompileError,
+    IndependentExistsBatchCompileError, ObjectError,
 };
 pub use grep_count::{
     DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
@@ -108,7 +109,8 @@ pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     DirectExistsBatchStrategy,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
-    ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport,
+    ExactFiniteSelectedEndGrepCountAotReport, ExactFiniteSelectedEndTeddyAotIsa,
+    ExactFiniteSelectedEndTeddyAotReport,
     ExactFiniteSelectedEndTeddyAotReportV2, ExactFiniteSelectedEndTeddyAotTargetTier,
     ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
     ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
@@ -965,6 +967,132 @@ pub fn compile_v2_with_slow_aot_limits(
             exact_finite_selected_end_teddy_aot,
         },
     })
+}
+
+/// Compile a `SelectedEnd` program and opt in to one native matching-line
+/// Count entry when an independently authenticated exact finite language can
+/// use endpoint-to-LF jumps safely.
+///
+/// Admission requires optimizing source compilation to prove the complete,
+/// non-empty, non-nullable, assertion-free finite byte language and to prove
+/// that no member contains CR or LF. The additive entry locally invokes the
+/// unchanged direct ordinary entry over the remaining haystack, counts the
+/// selected endpoint's line, and resumes after that line's LF. It uses the
+/// existing `FreAotRegexExclusiveGrepCountV1` ABI. Prepare the exact program
+/// returned by [`CompiledRegex::program`] through the module's
+/// [`CompiledModule::required_runtime_program`] symbol before invoking it.
+///
+/// Structural ineligibility and an additive final-object byte excess return
+/// the exact ordinary compilation unchanged; callers must inspect
+/// [`CompiledModule::exact_finite_selected_end_grep_count_aot_report`] and
+/// [`CompiledModule::prepared_grep_count_symbol`]. Allocation, arithmetic,
+/// malformed-module, and object-backend failures remain terminal.
+///
+/// # Errors
+///
+/// Returns [`ExactFiniteGrepCountCompileError::RequiresSelectedEnd`] for
+/// another output contract. All terminal compiler/object failures are wrapped
+/// in [`ExactFiniteGrepCountCompileError::Compile`].
+pub fn compile_with_exact_finite_selected_end_grep_count(
+    request: CompileRequest,
+) -> Result<CompiledRegex, ExactFiniteGrepCountCompileError> {
+    if request.output != OutputContract::SelectedEnd {
+        return Err(ExactFiniteGrepCountCompileError::RequiresSelectedEnd {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let mut compiled = compile(request)?;
+    let Some(proof) = compiled
+        .program
+        .native_finite_selected_end_grep_count_view()
+    else {
+        return Ok(compiled);
+    };
+    if !compiled
+        .module
+        .can_append_exact_finite_selected_end_grep_count()
+        .map_err(CompileError::from)?
+    {
+        return Ok(compiled);
+    }
+    let serialized_program = compiled.program.serialize()?;
+    let Some(module) = compiled
+        .module
+        .clone()
+        .append_exact_finite_selected_end_grep_count(proof, &serialized_program)
+        .map_err(CompileError::from)?
+    else {
+        return Ok(compiled);
+    };
+    let Some(object) = classify_exact_finite_grep_count_object_attempt(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
+    };
+
+    let mut passes = selected_passes(&compiled.program, &module);
+    passes.try_reserve_exact(1).map_err(|_| {
+        CompileError::from(ObjectError::Allocation(
+            "exact-finite GrepCount pass receipt",
+        ))
+    })?;
+    let aggregate_index = passes
+        .iter()
+        .position(|pass| *pass == OptimizationPass::PositionIndependentDataLayout)
+        .unwrap_or(passes.len());
+    passes.insert(aggregate_index, OptimizationPass::PreparedAggregateLowering);
+    compiled.receipt.passes = passes.into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot =
+        module.exact_finite_exists_byte_set_aot_report().copied();
+    compiled.receipt.exact_single_literal_aot =
+        module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot =
+        module.exact_finite_selected_end_teddy_aot_report().copied();
+    compiled.receipt.ordered_finite_language_aot =
+        module.ordered_finite_language_aot_report().copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required =
+        module.required_runtime_symbols().next().is_some();
+    compiled.receipt.prepared_aggregate_exports = module.prepared_aggregate_exports();
+    compiled.receipt.prepared_aggregate_strategy = module.prepared_aggregate_strategy();
+    compiled.receipt.required_prepare_capabilities = module.required_prepare_capabilities();
+    compiled.receipt.start_accelerator = module.start_accelerator();
+    compiled.receipt.anchored_prefix_filter_bytes = module.anchored_prefix_filter_bytes();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+    Ok(compiled)
+}
+
+/// Only the optional additive object's numeric byte ceiling authorizes an
+/// exact-base decline. In particular, allocator and backend failures must not
+/// be converted into absence after the compiler has begun the transaction.
+fn classify_exact_finite_grep_count_object_attempt(
+    result: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, CompileError> {
+    match result {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Preserve allocator and structural provenance at the additive module

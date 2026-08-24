@@ -11,14 +11,15 @@ use sha2::{Digest, Sha256};
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
-    DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi, FeatureSet,
-    IndependentExistsBatchCompileError, PreparedAggregateExports, PreparedAggregateStrategy,
+    DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi,
+    ExactFiniteGrepCountCompileError, FeatureSet, IndependentExistsBatchCompileError,
+    PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
-    compile_with_independent_exists_batch, compile_with_prepared_aggregate_exports,
-    compile_with_slow_aot_limits, emit_object, independent_exists_batch_append_outcome,
-    independent_exists_batch_object_outcome,
+    compile_with_exact_finite_selected_end_grep_count, compile_with_independent_exists_batch,
+    compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
+    independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
@@ -3059,6 +3060,502 @@ fn objects_and_receipts_are_deterministic() {
     assert_eq!(first.module(), second.module());
     assert_eq!(first.receipt().line_terminator, b'\n');
     assert_eq!(first.program().line_terminator(), b'\n');
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cross-target audit keeps proof admission, additive identity, local relocation, receipts, and exact-base decline together"
+)]
+fn exact_finite_selected_end_grep_count_is_authenticated_additive_and_resource_atomic() {
+    let request = |target| {
+        CompileRequest::new("alpha|alphabet|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+    };
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let ordinary = compile(request(target)).expect("ordinary SelectedEnd object");
+        assert!(
+            ordinary
+                .module()
+                .exact_finite_selected_end_grep_count_aot_report()
+                .is_none()
+        );
+        assert!(ordinary.module().prepared_grep_count_symbol().is_none());
+
+        let compiled = compile_with_exact_finite_selected_end_grep_count(request(target))
+            .expect("exact-finite line-jump GrepCount object");
+        let repeated = compile_with_exact_finite_selected_end_grep_count(request(target))
+            .expect("deterministic exact-finite line-jump GrepCount object");
+        assert_eq!(compiled.object(), repeated.object());
+        assert_eq!(compiled.module(), repeated.module());
+        assert_eq!(compiled.receipt(), repeated.receipt());
+        assert_eq!(
+            compiled.program().serialize().expect("additive program"),
+            ordinary.program().serialize().expect("ordinary program"),
+        );
+        assert_eq!(
+            compiled.module().entry_symbol(),
+            ordinary.module().entry_symbol()
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_strategy(),
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_exports,
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert_eq!(compiled.receipt().required_prepare_capabilities, 0);
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            compiled
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::PreparedAggregateLowering)
+        );
+
+        let report = compiled
+            .module()
+            .exact_finite_selected_end_grep_count_aot_report()
+            .copied()
+            .expect("authenticated line-jump report");
+        assert_eq!(
+            report.artifact_identity,
+            compiled.program().artifact_identity()
+        );
+        assert_eq!(report.output, OutputContract::SelectedEnd);
+        assert_eq!(report.source_count, 3);
+        assert_eq!(report.source_bytes, 17);
+        assert_eq!(report.maximum_width, 8);
+
+        let text = compiled
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("line-jump text");
+        let ordinary_text = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("ordinary text");
+        let ordinary_entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("ordinary entry record");
+        let ordinary_start = usize::try_from(ordinary_entry.offset).expect("ordinary offset");
+        let ordinary_size = usize::try_from(ordinary_entry.size).expect("ordinary size");
+        let ordinary_end = ordinary_start
+            .checked_add(ordinary_size)
+            .expect("ordinary extent");
+        assert_eq!(report.ordinary_entry_offset, ordinary_start);
+        assert_eq!(
+            text.bytes().get(ordinary_start..ordinary_end),
+            ordinary_text.bytes().get(ordinary_start..ordinary_end),
+            "additive reducer changed its local ordinary target",
+        );
+        assert_eq!(
+            report.ordinary_entry_sha256,
+            <[u8; 32]>::from(Sha256::digest(
+                ordinary_text
+                    .bytes()
+                    .get(ordinary_start..ordinary_end)
+                    .expect("ordinary entry bytes"),
+            )),
+        );
+
+        let reducer_name = compiled
+            .module()
+            .prepared_grep_count_symbol()
+            .expect("line-jump GrepCount symbol");
+        let reducer = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == reducer_name)
+            .expect("line-jump GrepCount record");
+        let reducer_start = usize::try_from(reducer.offset).expect("reducer offset");
+        let reducer_size = usize::try_from(reducer.size).expect("reducer size");
+        let reducer_end = reducer_start
+            .checked_add(reducer_size)
+            .expect("reducer extent");
+        assert_eq!(report.reducer_entry_offset, reducer_start);
+        assert_eq!(
+            report.reducer_code_sha256,
+            <[u8; 32]>::from(Sha256::digest(
+                text.bytes()
+                    .get(reducer_start..reducer_end)
+                    .expect("reducer bytes"),
+            )),
+        );
+        assert!((reducer_start..reducer_end).contains(&report.local_call_offset));
+        let local_target = match target.architecture {
+            Architecture::X86_64 => {
+                assert_eq!(text.bytes()[report.local_call_offset - 1], 0xe8);
+                let displacement = i32::from_le_bytes(
+                    text.bytes()[report.local_call_offset..report.local_call_offset + 4]
+                        .try_into()
+                        .expect("x86 local-call displacement"),
+                );
+                usize::try_from(
+                    i64::try_from(report.local_call_offset + 4)
+                        .expect("x86 call site")
+                        .checked_add(i64::from(displacement))
+                        .expect("x86 local-call target"),
+                )
+                .expect("non-negative x86 local-call target")
+            }
+            Architecture::Aarch64 => {
+                let instruction = u32::from_le_bytes(
+                    text.bytes()[report.local_call_offset..report.local_call_offset + 4]
+                        .try_into()
+                        .expect("AArch64 local-call instruction"),
+                );
+                assert_eq!(instruction & 0xfc00_0000, 0x9400_0000);
+                let words = ((instruction << 6) as i32) >> 6;
+                usize::try_from(
+                    i64::try_from(report.local_call_offset)
+                        .expect("AArch64 call site")
+                        .checked_add(i64::from(words) * 4)
+                        .expect("AArch64 local-call target"),
+                )
+                .expect("non-negative AArch64 local-call target")
+            }
+        };
+        assert_eq!(local_target, ordinary_start);
+
+        let identity_index = compiled
+            .module()
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.name == ".Lfre_aot_regex_exact_finite_grep_count_identity")
+            .expect("line-jump identity symbol");
+        let identity = &compiled.module().symbols()[identity_index];
+        let identity_section = identity.section.expect("identity data section");
+        let identity_start = usize::try_from(identity.offset).expect("identity offset");
+        assert_eq!(
+            &compiled.module().sections()[identity_section].data
+                [identity_start..identity_start + 32],
+            compiled.program().artifact_identity(),
+        );
+        let reducer_relocations = compiled
+            .module()
+            .relocations()
+            .iter()
+            .filter(|relocation| {
+                relocation.section == reducer.section.expect("reducer text section")
+                    && relocation.offset >= reducer.offset
+                    && relocation.offset < reducer.offset + reducer.size
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reducer_relocations.len(),
+            match target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 2,
+            },
+        );
+        assert!(
+            reducer_relocations
+                .iter()
+                .all(|relocation| relocation.symbol == identity_index)
+        );
+
+        let serialized = compiled.program().serialize().expect("preparation bytes");
+        let (program_name, program_len) = compiled
+            .module()
+            .required_runtime_program()
+            .expect("line-jump preparation program");
+        assert_eq!(program_len, serialized.len());
+        let program = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == program_name)
+            .expect("preparation program record");
+        let program_section = program.section.expect("preparation data section");
+        let program_start = usize::try_from(program.offset).expect("program offset");
+        assert_eq!(
+            &compiled.module().sections()[program_section].data
+                [program_start..program_start + program_len],
+            serialized,
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = ordinary.object().len();
+        let capped_request = request(target).limits(limits);
+        let capped_base = compile(capped_request.clone()).expect("capped exact base");
+        let declined = compile_with_exact_finite_selected_end_grep_count(capped_request)
+            .expect("optional line-jump object-byte decline");
+        assert_eq!(declined.object(), capped_base.object());
+        assert_eq!(declined.module(), capped_base.module());
+        assert_eq!(declined.receipt(), capped_base.receipt());
+        assert!(
+            declined
+                .module()
+                .exact_finite_selected_end_grep_count_aot_report()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn exact_finite_selected_end_grep_count_declines_closed_and_preserves_existing_apis() {
+    let target = Target::x86_64_linux();
+    for pattern in [
+        r"alpha\nbeta",
+        r"alpha\rbeta",
+        "alpha+",
+        "(?:alpha)?",
+        "^alpha",
+    ] {
+        let request = CompileRequest::new(pattern, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd);
+        let ordinary = compile(request.clone()).expect("ordinary decline fixture");
+        let declined = compile_with_exact_finite_selected_end_grep_count(request)
+            .expect("structural line-jump decline");
+        assert_eq!(declined.object(), ordinary.object(), "{pattern:?}");
+        assert_eq!(declined.module(), ordinary.module(), "{pattern:?}");
+        assert_eq!(declined.receipt(), ordinary.receipt(), "{pattern:?}");
+    }
+
+    let fast_request = CompileRequest::new("alpha|beta", target)
+        .mode(CompileMode::Fast)
+        .output(OutputContract::SelectedEnd);
+    let fast = compile(fast_request.clone()).expect("ordinary Fast fixture");
+    let fast_declined = compile_with_exact_finite_selected_end_grep_count(fast_request)
+        .expect("Fast mode has no source-authenticated finite sidecar");
+    assert_eq!(fast_declined.object(), fast.object());
+    assert_eq!(fast_declined.module(), fast.module());
+
+    let generic = compile_with_prepared_aggregate_exports(
+        CompileRequest::new("alpha|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+        PreparedAggregateExports::GREP_COUNT,
+    )
+    .expect("existing generic GrepCount API");
+    assert!(
+        generic
+            .module()
+            .exact_finite_selected_end_grep_count_aot_report()
+            .is_none()
+    );
+
+    assert!(matches!(
+        compile_with_exact_finite_selected_end_grep_count(
+            CompileRequest::new("alpha", target).output(OutputContract::Exists),
+        ),
+        Err(ExactFiniteGrepCountCompileError::RequiresSelectedEnd {
+            actual: OutputContract::Exists,
+        }),
+    ));
+}
+
+#[test]
+fn exact_finite_grep_count_object_decline_does_not_swallow_failures() {
+    assert_eq!(
+        crate::classify_exact_finite_grep_count_object_attempt(Ok(vec![1, 2, 3]))
+            .expect("successful optional object"),
+        Some(vec![1, 2, 3]),
+    );
+    assert_eq!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 10,
+            required: 11,
+        },))
+        .expect("numeric object-byte decline"),
+        None,
+    );
+    assert!(matches!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::Allocation(
+            "synthetic exact-finite GrepCount allocation"
+        ),)),
+        Err(CompileError::Object(ObjectError::Allocation(
+            "synthetic exact-finite GrepCount allocation",
+        ))),
+    ));
+    assert!(matches!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::InvalidModule(
+            "synthetic exact-finite GrepCount backend"
+        ),)),
+        Err(CompileError::Object(ObjectError::InvalidModule(
+            "synthetic exact-finite GrepCount backend",
+        ))),
+    ));
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes the generated line-jump reducer against the real runtime"]
+fn linked_host_exact_finite_selected_end_grep_count_matches_line_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+    } else {
+        Target::aarch64_macos()
+    };
+    let compiled = compile_with_exact_finite_selected_end_grep_count(
+        CompileRequest::new("alpha|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("host line-jump artifact");
+    let foreign = compile_with_exact_finite_selected_end_grep_count(
+        CompileRequest::new("gamma|delta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("foreign line-jump artifact");
+    let reducer = compiled
+        .module()
+        .prepared_grep_count_symbol()
+        .expect("host line-jump symbol");
+    let (program, program_len) = compiled
+        .module()
+        .required_runtime_program()
+        .expect("host preparation program");
+    let (foreign_program, foreign_program_len) = foreign
+        .module()
+        .required_runtime_program()
+        .expect("foreign preparation program");
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+extern const unsigned char {program}[];
+extern const unsigned char {foreign_program}[];
+extern uint32_t {reducer}(handle_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+static const unsigned char empty_source[1]={{0}};
+static const unsigned char negative[]={{'z','z','z'}};
+static const unsigned char one[]={{'a','l','p','h','a'}};
+static const unsigned char twice_one_line[]={{'a','l','p','h','a',' ','b','e','t','a'}};
+static const unsigned char two_lines[]={{'a','l','p','h','a','\n','b','e','t','a','\n','z'}};
+static const unsigned char crlf[]={{'z','\r','\n','a','l','p','h','a','\r','\n'}};
+static const unsigned char empty_lines[]={{'\n','a','l','p','h','a','\n','\n','b','e','t','a'}};
+static const unsigned char trailing_lf[]={{'b','e','t','a','\n'}};
+static const unsigned char binary[]={{0xff,'a','l','p','h','a',0x80,'\n',0x00,'b','e','t','a',0xfe}};
+#define CHECK(H,L,E,C) do{{uint64_t value=UINT64_C(0x1122334455667788);if({reducer}(right,(H),(L),&value)!=0U||value!=(uint64_t)(E))return (C);}}while(0)
+int main(void){{
+  handle_t right=0,wrong=0;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({program},{program_len}U,&right)!=0U)return 1;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({foreign_program},{foreign_program_len}U,&wrong)!=0U)return 2;
+  CHECK(empty_source,0U,0U,3);
+  CHECK(negative,sizeof(negative),0U,4);
+  CHECK(one,sizeof(one),1U,5);
+  CHECK(twice_one_line,sizeof(twice_one_line),1U,6);
+  CHECK(two_lines,sizeof(two_lines),2U,7);
+  CHECK(crlf,sizeof(crlf),1U,8);
+  CHECK(empty_lines,sizeof(empty_lines),2U,9);
+  CHECK(trailing_lf,sizeof(trailing_lf),1U,10);
+  CHECK(binary,sizeof(binary),2U,11);
+  uint64_t out=UINT64_C(0x8877665544332211);
+  if({reducer}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out)!=3U||out!=UINT64_C(0x8877665544332211))return 12;
+  if({reducer}((handle_t)0,(const unsigned char*)(uintptr_t)1,8U,&out)!=5U||out!=UINT64_C(0x8877665544332211))return 13;
+  if({reducer}(right,(const unsigned char*)0,0U,&out)!=2U||out!=UINT64_C(0x8877665544332211))return 14;
+  if({reducer}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x8877665544332211))return 15;
+  unsigned char bytes[17];memset(bytes,0xa5,sizeof(bytes));
+  if({reducer}(right,one,sizeof(one),(uint64_t*)(void*)(bytes+1))!=2U)return 16;
+  for(size_t i=0;i<sizeof(bytes);i++)if(bytes[i]!=0xa5U)return 17;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U)return 18;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 19;
+  return 0;
+}}
+"#,
+    );
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-exact-finite-grep-count-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create line-jump linker directory");
+    let object = directory.join("line-jump.o");
+    let foreign_object = directory.join("foreign.o");
+    let c_path = directory.join("line-jump.c");
+    let executable = directory.join("line-jump");
+    fs::write(&object, compiled.object()).expect("write line-jump object");
+    fs::write(&foreign_object, foreign.object()).expect("write foreign object");
+    fs::write(&c_path, source).expect("write line-jump C harness");
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let status = Command::new(compiler)
+        .arg("-O0")
+        .arg(&c_path)
+        .arg(&object)
+        .arg(&foreign_object)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link line-jump harness");
+    assert!(status.success(), "line-jump harness failed to link");
+    let output = Command::new(&executable)
+        .output()
+        .expect("execute line-jump harness");
+    assert!(
+        output.status.success(),
+        "line-jump status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove line-jump linker directory");
 }
 
 #[test]
