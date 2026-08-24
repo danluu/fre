@@ -3507,11 +3507,85 @@ mod tests {
                     ),
                     Err(SearchError::WorkLimit { .. })
                 ));
+
+                let zero_limits = SearchLimits {
+                    max_work_upper_bound: 0,
+                    max_candidate_visits: 0,
+                    max_scratch_bytes: 0,
+                };
+                assert!(matches!(
+                    plan.exists_window_value(haystack, Window::new(2, 1), zero_limits),
+                    Err(SearchError::InvalidWindow { .. })
+                ));
+                let nonterminal_end = haystack.len().checked_sub(1).unwrap();
+                assert_eq!(
+                    plan.exists_window_value(
+                        haystack,
+                        Window::new(0, nonterminal_end),
+                        zero_limits,
+                    ),
+                    Ok(false),
+                    "{} impossible absolute-end window precedes preflight",
+                    $owner,
+                );
+                assert!(matches!(
+                    plan.exists_window_value(b"!aaaaXX", window, zero_limits),
+                    Err(SearchError::CandidateLimit { .. })
+                ));
             }};
         }
 
         assert_plan!(scalar, "scalar");
         assert_plan!(dispatched, "dispatched");
+
+        let one_byte = RequiredLiteralPlan::build(
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            one_byte.exists_window_value(
+                b"!abZ",
+                Window::new(0, 4),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+        assert_eq!(
+            one_byte.exists_window_value(
+                b"!ab!",
+                Window::new(0, 4),
+                SearchLimits::unlimited(),
+            ),
+            Ok(false),
+        );
+
+        let high_byte = RequiredLiteralPlan::build(
+            ByteClass::from_bytes(&[0x80, 0x81]),
+            b"\xFF",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let high_haystack = [b'!', 0x80, 0x81, 0xFF];
+        assert_eq!(
+            high_byte.exists_window_value(
+                &high_haystack,
+                Window::full(&high_haystack),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+        assert_eq!(
+            high_byte.exists_window_value(
+                &high_haystack,
+                Window::new(3, high_haystack.len()),
+                SearchLimits::unlimited(),
+            ),
+            Ok(false),
+        );
     }
 
     #[test]

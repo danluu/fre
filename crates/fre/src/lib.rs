@@ -51113,6 +51113,129 @@ mod tests {
     }
 
     #[test]
+    fn required_literal_absolute_end_value_facades_preserve_windows_and_refusal_order() {
+        let ascii = PortableBuilder::new(r"(?-u:[a-z]+Z\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let scalar = PortableBuilder::new(r"(?-u:[\x80\x81]+\xFF\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &ascii.plan,
+            PortablePlan::RequiredLiteral(_) | PortablePlan::DispatchedRequiredLiteral(_)
+        ));
+        assert!(matches!(&scalar.plan, PortablePlan::RequiredLiteral(_)));
+
+        let ascii_haystack = b"!aaZ";
+        let scalar_haystack = [b'!', 0x80, 0x81, 0xFF];
+        for (regex, haystack) in [
+            (&ascii, ascii_haystack.as_slice()),
+            (&scalar, scalar_haystack.as_slice()),
+        ] {
+            for (start, expected) in [true, true, true, false, false].into_iter().enumerate() {
+                assert_eq!(
+                    regex.is_match_value_at(haystack, start, SearchLimits::unlimited()),
+                    Ok(expected),
+                    "start={start} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    regex.is_match_value_at(haystack, start, SearchLimits::unlimited()),
+                    regex
+                        .is_match_at(haystack, start, SearchLimits::unlimited())
+                        .map(|(matched, _)| matched),
+                    "value/accounted start={start} haystack={haystack:?}",
+                );
+            }
+
+            let terminal = SearchWindow::new(2, haystack.len());
+            assert_eq!(
+                regex.is_match_window_value(haystack, terminal, SearchLimits::unlimited()),
+                regex
+                    .is_match_window(haystack, terminal, SearchLimits::unlimited())
+                    .map(|(matched, _)| matched),
+            );
+            assert_eq!(
+                regex.is_match_window_value(haystack, terminal, SearchLimits::unlimited()),
+                Ok(true),
+            );
+
+            let mut extended = haystack.to_vec();
+            extended.push(b'!');
+            let nonterminal_match = SearchWindow::new(2, haystack.len());
+            assert_eq!(
+                regex.is_match_window_value(
+                    &extended,
+                    nonterminal_match,
+                    SearchLimits::unlimited(),
+                ),
+                regex
+                    .is_match_window(
+                        &extended,
+                        nonterminal_match,
+                        SearchLimits::unlimited(),
+                    )
+                    .map(|(matched, _)| matched),
+            );
+            assert_eq!(
+                regex.is_match_window_value(
+                    &extended,
+                    nonterminal_match,
+                    SearchLimits::unlimited(),
+                ),
+                Ok(false),
+            );
+
+            let zero_limits = SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            };
+            let out_of_range = haystack.len().checked_add(1).unwrap();
+            assert!(matches!(
+                regex.is_match_value_at(haystack, out_of_range, zero_limits),
+                Err(SearchError::RequiredLiteral(
+                    fre_kernels::RequiredLiteralSearchError::InvalidWindow { .. }
+                ))
+            ));
+            assert!(matches!(
+                regex.is_match_window_value(
+                    haystack,
+                    SearchWindow::new(2, 1),
+                    zero_limits,
+                ),
+                Err(SearchError::RequiredLiteral(
+                    fre_kernels::RequiredLiteralSearchError::InvalidWindow { .. }
+                ))
+            ));
+            let nonterminal_end = haystack.len().checked_sub(1).unwrap();
+            assert_eq!(
+                regex.is_match_window_value(
+                    haystack,
+                    SearchWindow::new(0, nonterminal_end),
+                    zero_limits,
+                ),
+                Ok(false),
+            );
+
+            let mut terminal_miss = haystack.to_vec();
+            *terminal_miss.last_mut().unwrap() = 0;
+            assert!(matches!(
+                regex.is_match_window_value(
+                    &terminal_miss,
+                    SearchWindow::full(&terminal_miss),
+                    zero_limits,
+                ),
+                Err(SearchError::RequiredLiteral(
+                    fre_kernels::RequiredLiteralSearchError::CandidateLimit { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn required_literal_ordinary_find_value_route_is_strictly_contained() {
         let ascii = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
             .unicode(false)
