@@ -108,12 +108,11 @@ fn exists_first_is_cheaper_then_promotes_once_without_losing_the_warm_path() {
     }
     assert_eq!(exists_after_span.change(), Stats::default());
 
-    // The ordinary finite-suffix Span sidecar shares the same automaton-owned
-    // bidirectional pool. Exercise it in this single allocation region owner
-    // so the process-global allocator meter cannot overlap another test.
+    // The exact bounded-literal-repeat Span owner needs no automaton workspace.
+    // Exercise it in this single allocation region owner so the process-global
+    // allocator meter cannot overlap another test.
     let regex = PortableBuilder::new(r"(?:ab){2,5}c")
         .unicode(false)
-        .plan_selection(PlanSelection::ForceK0)
         .build()
         .expect("bounded-repeat fixture builds through K0");
     let mut matched = Vec::with_capacity(4_093);
@@ -131,7 +130,7 @@ fn exists_first_is_cheaper_then_promotes_once_without_losing_the_warm_path() {
             .map(|span| (span.start(), span.end())),
         Some((4_086, 4_093)),
     );
-    assert!(cold.change().allocations > 0);
+    assert_eq!(cold.change(), Stats::default());
     assert_eq!(regex.find(&absent), None);
 
     let warm = Region::new(GLOBAL);
@@ -152,7 +151,6 @@ fn exists_first_is_cheaper_then_promotes_once_without_losing_the_warm_path() {
     // adaptive retry clock remeasures the source.
     let early_regex = PortableBuilder::new(r"(?:ab){2,5}c")
         .unicode(false)
-        .plan_selection(PlanSelection::ForceK0)
         .build()
         .expect("early bounded-repeat fixture builds through K0");
     let mut early = b"abababababc".to_vec();

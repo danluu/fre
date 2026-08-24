@@ -197,8 +197,8 @@ pub(crate) fn inspect(
 /// Prove the exact finite byte language `L{m,n}S` for the bounded ordinary
 /// selected-span leaf. Captures are transparent; every other HIR node and any
 /// assertion refuse. The retained mandatory suffix must equal `L^m S`, and
-/// the first byte of `S` must occur nowhere in `L`, making the greedy endpoint
-/// unique for a fixed start.
+/// the first byte of `S` must occur nowhere in `L`, making the endpoint unique
+/// for a fixed start under either repetition priority.
 pub(crate) fn inspect_bounded_literal_repeat(
     hir: &Hir,
     mandatory_suffix: &[u8],
@@ -250,7 +250,7 @@ fn inspect_bounded_literal_repeat_inner(
     let Some(maximum_repeats) = repetition.max else {
         return Ok(None);
     };
-    if !repetition.greedy || repetition.min == 0 || maximum_repeats < repetition.min {
+    if repetition.min == 0 || maximum_repeats < repetition.min {
         return Ok(None);
     }
     let token = peel_captures(&repetition.sub, meter)?;
@@ -763,12 +763,19 @@ mod tests {
             panic!("fixed-bound multi-byte-tail repeat was refused");
         };
         assert_eq!((fixed.token_bytes(), fixed.tail_bytes()), (2, 3));
+
+        let lazy = parse_bytes(r"(?-u:(?:ab){2,5}?c)");
+        let BoundedLiteralRepeatInspectionOutcome::Eligible(lazy) =
+            inspect_bounded_literal_repeat(&lazy, b"ababc", 5, 11, 0, u64::MAX).unwrap()
+        else {
+            panic!("barrier-authenticated lazy repeat was refused");
+        };
+        assert_eq!((lazy.token_bytes(), lazy.tail_bytes()), (2, 1));
     }
 
     #[test]
     fn bounded_literal_repeat_nearby_languages_fail_closed() {
         for (pattern, suffix, minimum, maximum) in [
-            (r"(?-u:(?:ab){2,5}?c)", b"ababc".as_slice(), 5, 11),
             (r"(?-u:(?:ab){0,5}c)", b"c".as_slice(), 1, 11),
             (r"(?-u:(?:ab){2,}c)", b"ababc".as_slice(), 5, 11),
             (r"(?-u:(?:ab){2,5}a)", b"ababa".as_slice(), 5, 11),

@@ -11422,6 +11422,52 @@ mod bounded_literal_repeat_span_probe {
     }
 }
 
+#[cfg(test)]
+mod bounded_literal_repeat_early_span_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) attempts: usize,
+        pub(super) completions: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            attempts: 0,
+            completions: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_attempt() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                attempts: counts.attempts.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_completion() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                completions: counts.completions.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+}
+
 // Re-authenticating the borrowed projection is not competitive with the
 // existing canonical warmed entry on tiny sources. Admit the ordinary lane
 // only where its omitted invocation ledger can amortize that fixed handoff.
@@ -11676,8 +11722,8 @@ fn try_k0_warm_exact_minimum_suffix_exists(
         .map(|found| found.is_some())
 }
 
-/// Complete one warmed early bounded-literal-repeat Span without borrowing K0
-/// workspace.
+/// Complete one receipt-authenticated early bounded-literal-repeat Span
+/// without borrowing K0 workspace.
 ///
 /// Construction proves the exact language `L{m,n}S`, binds the retained
 /// mandatory suffix to `L^m S`, proves a tail barrier, and admits only a
@@ -11685,7 +11731,7 @@ fn try_k0_warm_exact_minimum_suffix_exists(
 /// offset. If the first cut member begins a whole number of additional `L`
 /// tokens ending at that suffix, the cut proves no earlier match start and the
 /// barrier proves this accepted endpoint is the unique greedy endpoint.
-/// Every mismatch is a read-only decline to the incumbent K0 path.
+/// Every mismatch is a read-only decline to the complete immutable leaf.
 #[inline(never)]
 fn try_k0_bounded_literal_repeat_early_span(
     suffix: &K0MandatorySuffixPlan,
@@ -11697,7 +11743,7 @@ fn try_k0_bounded_literal_repeat_early_span(
     suffix_offset: usize,
 ) -> Option<fre_automata::MatchSpan> {
     #[cfg(test)]
-    bounded_literal_repeat_span_probe::record_attempt();
+    bounded_literal_repeat_early_span_probe::record_attempt();
     if window.start() != 0
         || window.end() != haystack.len()
         || cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
@@ -11761,8 +11807,117 @@ fn try_k0_bounded_literal_repeat_early_span(
         return None;
     }
     #[cfg(test)]
+    bounded_literal_repeat_early_span_probe::record_completion();
+    Some(fre_automata::MatchSpan::new(
+        selected_start,
+        selected_end,
+    ))
+}
+
+/// Complete one bounded-literal-repeat Span without borrowing K0 workspace.
+///
+/// Construction proves the exact language `L{m,n}S`, binds the retained
+/// mandatory suffix to `L^m S`, proves a tail barrier, and admits only a
+/// zero-distance mandatory cut. The first occurrence of `L^m S` is therefore
+/// an accepted endpoint. Walking backward over at most `n - m` whole `L`
+/// tokens recovers the selected start: the walk implements greedy priority,
+/// while the barrier makes lazy priority select the same unique endpoint. A
+/// later suffix cannot move the selected start before the first suffix because
+/// its `L` corridor would have to cross the earlier tail's barrier byte.
+/// The zero-distance mandatory cut first completes root-byte absence and
+/// publishes the earliest possible suffix-search floor.
+/// Every metadata mismatch is a read-only decline to the incumbent K0 path.
+#[inline(never)]
+fn try_k0_bounded_literal_repeat_span(
+    suffix: &K0MandatorySuffixPlan,
+    cut: K0MandatoryCutPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+) -> Option<Option<fre_automata::MatchSpan>> {
+    #[cfg(test)]
+    bounded_literal_repeat_span_probe::record_attempt();
+    if window.start() != 0
+        || window.end() != haystack.len()
+        || cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+        || minimum_match_bytes == 0
+        || minimum_match_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let (token_bytes, tail_bytes) = suffix.bounded_literal_repeat_span_lengths()?;
+    let needle = suffix.needle();
+    if needle.len() != minimum_match_bytes
+        || token_bytes == 0
+        || tail_bytes == 0
+        || tail_bytes >= needle.len()
+        || tail_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let minimum_prefix_bytes = needle.len().checked_sub(tail_bytes)?;
+    let maximum_prefix_bytes = maximum_match_bytes.checked_sub(tail_bytes)?;
+    if minimum_prefix_bytes == 0
+        || !minimum_prefix_bytes.is_multiple_of(token_bytes)
+        || !maximum_prefix_bytes.is_multiple_of(token_bytes)
+    {
+        return None;
+    }
+    let token = needle.get(..token_bytes)?;
+    let tail_first = *needle.get(minimum_prefix_bytes)?;
+    if token.contains(&tail_first) {
+        return None;
+    }
+
+    let minimum_repeats = minimum_prefix_bytes / token_bytes;
+    let maximum_repeats = maximum_prefix_bytes / token_bytes;
+    let additional_repeats = maximum_repeats.checked_sub(minimum_repeats)?;
+    let first_member = cut.first_member(&haystack[window.start()..window.end()]);
+    let Some(first_member) = first_member else {
+        #[cfg(test)]
+        bounded_literal_repeat_span_probe::record_completion();
+        return Some(None);
+    };
+    let suffix_search_start = cut.candidate_floor(window.start(), first_member)?;
+    if suffix_search_start < window.start() || suffix_search_start > window.end() {
+        return None;
+    }
+    let found = suffix
+        .find_window(haystack, suffix_search_start, window.end())
+        .ok()?;
+    let Some((minimum_start, selected_end)) = found else {
+        #[cfg(test)]
+        bounded_literal_repeat_span_probe::record_completion();
+        return Some(None);
+    };
+    if selected_end != minimum_start.checked_add(needle.len())? {
+        return None;
+    }
+    let mut selected_start = minimum_start;
+    for _ in 0..additional_repeats {
+        let Some(previous_start) = selected_start
+            .checked_sub(token_bytes)
+            .filter(|start| *start >= window.start())
+        else {
+            break;
+        };
+        if haystack.get(previous_start..selected_start) != Some(token) {
+            break;
+        }
+        selected_start = previous_start;
+    }
+    if selected_end > window.end()
+        || selected_end.checked_sub(selected_start)? > maximum_match_bytes
+    {
+        return None;
+    }
+    #[cfg(test)]
     bounded_literal_repeat_span_probe::record_completion();
-    Some(fre_automata::MatchSpan::new(selected_start, selected_end))
+    Some(Some(fre_automata::MatchSpan::new(
+        selected_start,
+        selected_end,
+    )))
 }
 
 impl PortableK0Plan {
@@ -11916,12 +12071,10 @@ impl PortableK0Plan {
         {
             return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
         }
-        if let Some(suffix_offset) = suffix
-            .pooled_finite_consumption_span_early_prefix_offset(haystack, window)
-        {
-            let completed = self
-                .mandatory_cut
-                .and_then(|cut| {
+        if suffix.bounded_literal_repeat_span_lengths().is_some() {
+            if let Some(suffix_offset) =
+                suffix.pooled_finite_consumption_span_early_prefix_offset(haystack, window)
+                && let Some(matched) = self.mandatory_cut.and_then(|cut| {
                     try_k0_bounded_literal_repeat_early_span(
                         suffix,
                         cut,
@@ -11931,13 +12084,41 @@ impl PortableK0Plan {
                         maximum_match_bytes,
                         suffix_offset,
                     )
-                });
-            return Ok(completed.map_or(
-                K0PooledFiniteConsumptionSpanRoute::Unattempted,
-                |matched| {
-                    K0PooledFiniteConsumptionSpanRoute::Complete(Some(matched))
-                },
-            ));
+                })
+            {
+                #[cfg(test)]
+                {
+                    finite_consumption_span_facade_probe::record_attempt();
+                    finite_consumption_span_facade_probe::record_result(true);
+                }
+                return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(Some(matched)));
+            }
+            if let Some(output) = self.mandatory_cut.and_then(|cut| {
+                try_k0_bounded_literal_repeat_span(
+                    suffix,
+                    cut,
+                    haystack,
+                    window,
+                    minimum_match_bytes,
+                    maximum_match_bytes,
+                )
+            }) {
+                if let Some(matched) = output
+                    && let Some(suffix_start) = matched.end().checked_sub(suffix.needle().len())
+                    && let Some(suffix_offset) = suffix_start.checked_sub(window.start())
+                    && suffix_offset < K0_SUFFIX_FORWARD_FALLBACK_BYTES
+                    && let Some(admission) =
+                        suffix.try_admit_pooled_finite_consumption_span(window_bytes)
+                {
+                    admission.observe_finite_early_prefix(window_bytes, suffix_offset);
+                }
+                #[cfg(test)]
+                {
+                    finite_consumption_span_facade_probe::record_attempt();
+                    finite_consumption_span_facade_probe::record_result(true);
+                }
+                return Ok(K0PooledFiniteConsumptionSpanRoute::Complete(output));
+            }
         }
         let Some(admission) = suffix.try_admit_pooled_finite_consumption_span(window_bytes)
         else {
@@ -13819,6 +14000,9 @@ impl PortableRegex {
                     LiteralWindow::new(window.start(), window.end()),
                     unicode_folded_literal_limits(SearchLimits::unlimited()),
                 )
+                .map_err(SearchError::from),
+            PortablePlan::LineDomainByteAtoms(plan) => plan
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
                 .map_err(SearchError::from),
             PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
                 .is_match_window_value(
@@ -28996,10 +29180,8 @@ mod tests {
             },
         );
 
-        // A suffix close to the incumbent floor is exact but not economical.
-        // The outlined route records its exact prefix position before touching
-        // reverse workspace; subsequent calls revalidate that receipt and
-        // complete this exact literal-repeat shape without pooled workspace.
+        // The complete leaf publishes a revalidated early-prefix receipt on
+        // the cold call; subsequent calls close through the hit-only leaf.
         let early_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -29011,6 +29193,7 @@ mod tests {
             .map(|matched| (matched.start(), matched.end()));
         super::finite_consumption_span_facade_probe::reset();
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             early_regex
                 .find(&early)
@@ -29021,8 +29204,8 @@ mod tests {
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
                 attempts: 1,
-                completions: 0,
-                declines: 1,
+                completions: 1,
+                declines: 0,
             },
         );
         let PortablePlan::K0(early_plan) = &early_regex.plan else {
@@ -29032,6 +29215,13 @@ mod tests {
             .mandatory_suffix
             .as_ref()
             .expect("early bounded repeat retains its mandatory suffix");
+        assert_eq!(
+            early_suffix.pooled_finite_consumption_span_early_prefix_offset(
+                &early,
+                SearchWindow::full(&early),
+            ),
+            Some(6),
+        );
         assert!(!early_suffix.pooled_finite_consumption_span_should_bypass_early(
             &early,
             SearchWindow::full(&early),
@@ -29047,29 +29237,39 @@ mod tests {
         assert_eq!(
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
-                attempts: 1,
-                completions: 0,
-                declines: 1,
+                attempts: 73,
+                completions: 73,
+                declines: 0,
             },
-            "the direct receipt path must not re-enter the pooled finite facade",
+            "every exact source must complete before pooled workspace",
         );
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+            "only the cold early call must enter the complete leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
                 attempts: 72,
                 completions: 72,
             },
-            "a revalidated exact receipt must complete through the direct leaf",
+            "every warm early call must close through the receipt leaf",
         );
 
-        // Changing the recorded suffix bytes invalidates the old receipt
-        // immediately. A successful late match clears the hint and keeps the
-        // exact route available without waiting through a cooldown.
+        // Changing source bytes cannot stale the immutable proof. The stable
+        // early source uses its receipt; a changed late source invalidates the
+        // hint and falls through to the complete leaf.
         let recover_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
             .expect("recovering bounded-repeat fixture builds");
         super::finite_consumption_span_facade_probe::reset();
+        super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             recover_regex
                 .find(&early)
@@ -29109,10 +29309,26 @@ mod tests {
         assert_eq!(
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
-                attempts: 3,
-                completions: 2,
-                declines: 1,
+                attempts: 11,
+                completions: 11,
+                declines: 0,
             },
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 3,
+                completions: 3,
+            },
+            "the cold early call and both changed late calls use the complete leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 8,
+                completions: 8,
+            },
+            "only stable warm early calls use the receipt leaf",
         );
 
         let ordinary_attempts_before_explicit =
@@ -29160,15 +29376,93 @@ mod tests {
             super::finite_consumption_span_facade_probe::snapshot(),
             super::finite_consumption_span_facade_probe::Counts {
                 attempts: 1,
-                completions: 0,
-                declines: 1,
+                completions: 1,
+                declines: 0,
             },
         );
     }
 
     #[cfg(target_has_atomic = "64")]
     #[test]
-    fn pooled_finite_consumption_suffix_span_foreign_owner_falls_back_exactly() {
+    fn bounded_literal_repeat_benchmark_boundary_1024_warms_early_span_receipt() {
+        const PATTERN: &str = r"(?:ab){2,5}c";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("benchmark-boundary bounded repeat builds");
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        // Keep this byte-for-byte identical to the benchmark case named
+        // `bounded_repeat_boundary_1024`. The boundary is the admitted window
+        // length; its retained `ababc` suffix begins at offset 6.
+        let mut haystack = b"abababababc".to_vec();
+        haystack.resize(1_024, b'x');
+        let expected = upstream
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((0, 11)));
+
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+            "the cold complete leaf must preserve the benchmark boundary",
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("benchmark-boundary bounded repeat must retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("benchmark-boundary bounded repeat retains its suffix");
+        assert_eq!(
+            suffix.pooled_finite_consumption_span_early_prefix_offset(
+                &haystack,
+                SearchWindow::full(&haystack),
+            ),
+            Some(6),
+            "the inclusive 1,024-byte window must retain its early receipt",
+        );
+
+        super::finite_consumption_span_facade_probe::reset();
+        super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
+        assert_eq!(
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            super::finite_consumption_span_facade_probe::snapshot(),
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 1,
+                declines: 0,
+            },
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+            "the hot benchmark-boundary find must close through the early leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts::default(),
+            "the hot benchmark-boundary find must not rescan the complete leaf",
+        );
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn bounded_literal_repeat_span_ignores_unneeded_foreign_feedback_owner() {
         const PATTERN: &str = r"(?:ab){2,5}c";
         let regex = PortableBuilder::new(PATTERN)
             .unicode(false)
@@ -29218,8 +29512,12 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(
             counts,
-            super::finite_consumption_span_facade_probe::Counts::default(),
-            "an in-flight foreign owner must leave this invocation on incumbent K0",
+            super::finite_consumption_span_facade_probe::Counts {
+                attempts: 1,
+                completions: 1,
+                declines: 0,
+            },
+            "the read-only exact owner must not wait for a feedback token",
         );
         drop(admission);
     }
@@ -29252,26 +29550,36 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(regex.find(haystack)), expected, "cold {label}");
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             super::finite_consumption_span_facade_probe::reset();
             assert_eq!(span(regex.find(haystack)), expected, "warm {label}");
             let expected_counts = if expected_direct {
-                super::bounded_literal_repeat_span_probe::Counts {
+                super::bounded_literal_repeat_early_span_probe::Counts {
                     attempts: 1,
                     completions: 1,
                 }
             } else {
-                super::bounded_literal_repeat_span_probe::Counts::default()
+                super::bounded_literal_repeat_early_span_probe::Counts::default()
             };
             assert_eq!(
-                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
                 expected_counts,
-                "warm exact receipt did not close directly: {label}",
+                "receipt-authenticated early owner did not close directly: {label}",
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts::default(),
+                "a warm early receipt re-entered the complete leaf: {label}",
             );
             if expected_direct {
                 assert_eq!(
                     super::finite_consumption_span_facade_probe::snapshot(),
-                    super::finite_consumption_span_facade_probe::Counts::default(),
-                    "warm exact receipt re-entered pooled workspace: {label}",
+                    super::finite_consumption_span_facade_probe::Counts {
+                        attempts: 1,
+                        completions: 1,
+                        declines: 0,
+                    },
+                    "complete exact owner did not terminate the finite facade: {label}",
                 );
             }
         }
@@ -29291,6 +29599,13 @@ mod tests {
                 b"q".as_slice(),
                 3,
                 6,
+            ),
+            (
+                r"(?:ab){2,5}?c",
+                b"ab".as_slice(),
+                b"c".as_slice(),
+                2,
+                5,
             ),
         ] {
             let descriptor_regex = PortableBuilder::new(pattern)
@@ -29323,7 +29638,7 @@ mod tests {
                             &regex,
                             &upstream,
                             &haystack,
-                            start == 0,
+                            true,
                             &format!(
                                 "pattern={pattern:?} length={length} start={start} repeats={repeats}"
                             ),
@@ -29354,13 +29669,22 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(regex.find(&haystack)), expected);
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             assert_eq!(span(regex.find(&haystack)), expected);
             assert_eq!(
                 super::bounded_literal_repeat_span_probe::snapshot(),
                 super::bounded_literal_repeat_span_probe::Counts {
                     attempts: 1,
+                    completions: 1,
+                },
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::Counts {
+                    attempts: 1,
                     completions: 0,
                 },
+                "a receipt with an invalid earlier token corridor must fall through",
             );
         }
 
@@ -29376,19 +29700,27 @@ mod tests {
         assert_eq!(overlong_expected, Some((2, 13)));
         assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
                 attempts: 1,
+                completions: 1,
+            },
+            "an overlong run must shift to the leftmost accepted bounded suffix",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 1,
                 completions: 0,
             },
-            "a receipt implying max+1 repeats must decline to shifted incumbent K0",
+            "a receipt spanning max+1 tokens must fall through",
         );
 
-        // Reuse one allocation after publishing a receipt. A changed prefix
-        // with the authenticated suffix still present must decline read-only;
-        // changing the suffix itself clears the hint before entering the leaf.
+        // Reuse one matcher across changed sources. Both a changed prefix and
+        // a changed former suffix must be evaluated from immutable metadata.
         let mut reused = vec![b'!'; 4_093];
         reused[..11].copy_from_slice(b"abababababc");
         reused[64..71].copy_from_slice(b"abababc");
@@ -29401,16 +29733,25 @@ mod tests {
             .find(&reused)
             .map(|matched| (matched.start(), matched.end()));
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(span(regex.find(&reused)), mutated_expected);
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
                 attempts: 1,
                 completions: 0,
             },
         );
         reused[6] = b'!';
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             span(regex.find(&reused)),
             upstream
@@ -29419,8 +29760,16 @@ mod tests {
         );
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
-            super::bounded_literal_repeat_span_probe::Counts::default(),
-            "changed receipt bytes must invalidate before the direct leaf",
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 1,
+            },
+            "changed source bytes must be searched directly without stale state",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
+            "changed receipt bytes must invalidate before the early helper",
         );
 
         // The existing structural window and width boundaries remain exact.
@@ -29436,18 +29785,23 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(boundary_regex.find(&haystack)), expected);
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             assert_eq!(span(boundary_regex.find(&haystack)), expected);
             let expected_counts = if length == 1_024 {
-                super::bounded_literal_repeat_span_probe::Counts {
+                super::bounded_literal_repeat_early_span_probe::Counts {
                     attempts: 1,
                     completions: 1,
                 }
             } else {
-                super::bounded_literal_repeat_span_probe::Counts::default()
+                super::bounded_literal_repeat_early_span_probe::Counts::default()
             };
             assert_eq!(
-                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
                 expected_counts,
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts::default(),
             );
         }
         let overwide_pattern = r"(?:ab){2,600}c";
@@ -29462,6 +29816,7 @@ mod tests {
         let mut overwide_source = vec![b'!'; 4_093];
         overwide_source[..7].copy_from_slice(b"abababc");
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         for _ in 0..2 {
             assert_eq!(
                 span(overwide.find(&overwide_source)),
@@ -29474,8 +29829,13 @@ mod tests {
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts::default(),
         );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
+        );
 
-        // Late and absent sources never manufacture an early-prefix receipt.
+        // Late and absent sources both complete through the same immutable
+        // owner without manufacturing a source receipt.
         for maybe_start in [None, Some(1_500)] {
             let late_regex = PortableBuilder::new(PATTERN)
                 .unicode(false)
@@ -29486,6 +29846,7 @@ mod tests {
                 haystack[start..start + 7].copy_from_slice(b"abababc");
             }
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             for _ in 0..2 {
                 assert_eq!(
                     span(late_regex.find(&haystack)),
@@ -29496,7 +29857,14 @@ mod tests {
             }
             assert_eq!(
                 super::bounded_literal_repeat_span_probe::snapshot(),
-                super::bounded_literal_repeat_span_probe::Counts::default(),
+                super::bounded_literal_repeat_span_probe::Counts {
+                    attempts: 2,
+                    completions: 2,
+                },
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::Counts::default(),
             );
         }
 
@@ -29506,6 +29874,7 @@ mod tests {
         early[..7].copy_from_slice(b"abababc");
         assert_eq!(span(regex.find(&early)), Some((0, 7)));
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         let full = SearchWindow::full(&early);
         assert_eq!(span(regex.find_value(&early, SearchLimits::unlimited()).unwrap()), Some((0, 7)));
         assert_eq!(span(regex.find_accounted(&early, SearchLimits::unlimited()).unwrap().0), Some((0, 7)));
@@ -29527,11 +29896,14 @@ mod tests {
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts::default(),
         );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
+        );
 
         for pattern in [
             r"(?:ab){0,5}c",
             r"(?:ab){2,}c",
-            r"(?:ab){2,5}?c",
             r"(?:ab){2,5}a",
             r"(?:[ab]){2,5}c",
             r"x(?:ab){2,5}c",
