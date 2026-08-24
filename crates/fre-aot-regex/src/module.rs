@@ -14334,6 +14334,7 @@ const VECTOR_FILTER_COST_BLOCK_BYTES: u64 = 64;
 /// replaying loads and can therefore tolerate more hits.
 const MAX_SPARSE_RESCAN_EXPECTED_HITS: u16 = 2;
 const MAX_ASIMD_BATCH_EXPECTED_HITS: u16 = 4;
+const AARCH64_ASIMD_VECTOR_BYTES: u16 = 16;
 const AARCH64_BATCH_BYTES: u16 = 64;
 /// A primary-only four-mask exact-product batch is profitable only while the
 /// scalar retry guard remains smaller than the target's bounded compare bank.
@@ -54363,6 +54364,36 @@ fn aarch64_emit_scalar_filter_membership(
     Ok(())
 }
 
+/// Branch to `candidate` when the current base satisfies one exact projected
+/// column. Unlike [`aarch64_emit_scalar_filter_membership`], a miss falls
+/// through so a one-way cold switch can advance past the independently
+/// checked base before replacing the projected constant bank.
+fn aarch64_emit_start_filter_scalar_candidate(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 scalar candidate filter is empty",
+        ));
+    }
+    aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+    for range in filter.ranges() {
+        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+        if range.start == range.end {
+            assembler.branch_cond(AARCH64_EQ, candidate)?;
+        } else {
+            let next_range = assembler.label()?;
+            assembler.branch_cond(AARCH64_LO, next_range)?;
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
+            assembler.branch_cond(AARCH64_LS, candidate)?;
+            assembler.bind(next_range)?;
+        }
+    }
+    Ok(())
+}
+
 fn aarch64_emit_exact_pair_scalar_test(
     assembler: &mut Aarch64Assembler,
     pair_filter: NativeExactPairFilter,
@@ -56730,6 +56761,10 @@ fn aarch64_ext_16b(
 const AARCH64_EXACT_FILTER_SCRATCH: u8 = 28;
 const AARCH64_VECTOR_FILTER_FIRST_CONSTANT: u8 = 1;
 const AARCH64_STANDALONE_FILTER_FIRST_CONSTANT: u8 = 16;
+// Optimizing+Exists exact-pair suffix retries do not retain the endpoint
+// minimum used by other output contracts. Keep their one-way relation phase
+// in caller-saved W13 across the bounded verifier.
+const AARCH64_SUFFIX_RELATION_PHASE: u8 = 13;
 
 const fn aarch64_caller_saved_simd(register: u8) -> bool {
     register <= 7 || register >= 16
@@ -59725,7 +59760,7 @@ fn aarch64_emit_suffix_prepass(
     } else {
         None
     };
-    let retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
+    let incumbent_retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
     let filter = suffix.filter;
     let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
     let scalar_filter = exact_pair_filter
@@ -59744,6 +59779,31 @@ fn aarch64_emit_suffix_prepass(
     let exact_pair_relation_activate = exact_pair_primary_cold_filter
         .map(|_| assembler.label())
         .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_retry_dispatch = exact_pair_primary_cold_filter
+        .filter(|_| suffix.retry.is_some())
+        .map(|_| assembler.label())
+        .transpose()?;
+    let retry_scan = exact_pair_retry_dispatch.unwrap_or(incumbent_retry_scan);
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair primary phase escaped Exists admission",
+        ));
+    }
     if suffix.minimum_width == 0 {
         return Err(ObjectError::InvalidModule(
             "AArch64 suffix filter has zero minimum width",
@@ -59787,6 +59847,9 @@ fn aarch64_emit_suffix_prepass(
     assembler.branch_cond(AARCH64_LO, done)?;
     if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS && !use_runtime_vl_dispatch {
         emit_constants(assembler)?;
+    }
+    if exact_pair_retry_dispatch.is_some() {
+        assembler.instruction(aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0)?)?;
     }
 
     if use_runtime_vl_dispatch {
@@ -59856,6 +59919,25 @@ fn aarch64_emit_suffix_prepass(
             let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
                 "AArch64 exact-pair primary vector label is absent",
             ))?;
+            let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 exact-pair primary single-vector label is absent",
+                ),
+            )?;
+            let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary scalar label is absent",
+            ))?;
+            let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+                ObjectError::InvalidModule("AArch64 exact-pair primary batch-hit label is absent"),
+            )?;
+            let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 exact-pair primary single-hit label is absent",
+                ),
+            )?;
+            let primary_candidate = exact_pair_primary_candidate.ok_or(
+                ObjectError::InvalidModule("AArch64 exact-pair primary candidate label is absent"),
+            )?;
             let relation_activate =
                 exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
                     "AArch64 exact-pair relation activation label is absent",
@@ -59871,18 +59953,80 @@ fn aarch64_emit_suffix_prepass(
                     "AArch64 exact-pair primary width",
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
-            assembler.branch_cond(AARCH64_LO, relation_activate)?;
+            assembler.branch_cond(AARCH64_LO, primary_single_vector)?;
             let primary_candidates = aarch64_emit_start_filter_batch_candidates(
                 assembler,
                 primary_filter,
                 AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
             )?;
             aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
-            assembler.branch_cond(AARCH64_NE, relation_activate)?;
+            assembler.branch_cond(AARCH64_NE, primary_batch_hit)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
             assembler.branch(primary_vector)?;
 
+            assembler.bind(primary_batch_hit)?;
+            aarch64_emit_first_candidate_in_batch(assembler, primary_candidates)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_single_vector)?;
+            let vector_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_ASIMD_VECTOR_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-pair primary tail width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, primary_scalar)?;
+            aarch64_emit_start_filter_address(assembler, primary_filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
+            aarch64_emit_start_filter_vector_candidates(
+                assembler,
+                primary_filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(assembler, 24)?;
+            assembler.branch_cond(AARCH64_NE, primary_single_hit)?;
+            assembler.instruction(aarch64_add_x_imm(
+                2,
+                2,
+                AARCH64_ASIMD_VECTOR_BYTES,
+            )?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(primary_single_hit)?;
+            aarch64_emit_first_candidate_lane(assembler, 24)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_scalar)?;
+            aarch64_emit_start_filter_scalar_bound(
+                assembler,
+                maximum_scan_offset,
+                no_match,
+            )?;
+            aarch64_emit_start_filter_scalar_candidate(
+                assembler,
+                primary_filter,
+                primary_candidate,
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(primary_scalar)?;
+
+            assembler.bind(primary_candidate)?;
+            // A projected byte is only a necessary condition. Authenticate
+            // the complete canonical pair before granting the graph-bound
+            // verifier its existing exact-factor candidate contract.
+            aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(relation_activate)?;
+
             assembler.bind(relation_activate)?;
+            if exact_pair_retry_dispatch.is_some() {
+                assembler.instruction(aarch64_movz_w(
+                    AARCH64_SUFFIX_RELATION_PHASE,
+                    1,
+                )?)?;
+            }
             aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
             assembler.branch(vector)?;
         }
@@ -60113,6 +60257,15 @@ fn aarch64_emit_suffix_prepass(
         )?;
     } else {
         aarch64_emit_suffix_restart(assembler, suffix.restart)?;
+    }
+    if let Some(retry_dispatch) = exact_pair_retry_dispatch {
+        let relation_activate =
+            exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair retry dispatch lost its activation label",
+            ))?;
+        assembler.bind(retry_dispatch)?;
+        assembler.branch_zero_w(AARCH64_SUFFIX_RELATION_PHASE, relation_activate)?;
+        assembler.branch(vector)?;
     }
     assembler.bind(done)?;
     Ok(())
@@ -129338,6 +129491,30 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "a non-batched exact relation must retain the direct relation emitter"
         );
 
+        let mut wrong_output = ordinary;
+        wrong_output.output = OutputContract::SelectedEnd;
+        let mut wrong_output_assembler = Aarch64Assembler::new();
+        let wrong_output_no_match = wrong_output_assembler.label().unwrap();
+        let wrong_output_matched = wrong_output_assembler.label().unwrap();
+        assert!(matches!(
+            aarch64_emit_suffix_prepass(
+                &mut wrong_output_assembler,
+                wrong_output.suffix_filter.unwrap(),
+                None,
+                true,
+                true,
+                true,
+                features,
+                OperatingSystem::Linux,
+                wrong_output,
+                wrong_output_no_match,
+                wrong_output_matched,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary phase escaped Exists admission"
+            ))
+        ));
+
         let emit = |layout: NativeDfaLayout| {
             let suffix = layout.suffix_filter.unwrap();
             let mut assembler = Aarch64Assembler::new();
@@ -129403,8 +129580,38 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .iter()
             .position(|word| *word == aarch64_ext_16b(16, 24, 25, 1).unwrap())
             .unwrap();
+        let primary_first_candidate_at = words
+            .iter()
+            .position(|word| *word == aarch64_bsl_16b(0, 28, 31).unwrap())
+            .unwrap();
+        let primary_pair_at = words
+            .iter()
+            .position(|word| *word == aarch64_load_halfword_imm(8, 12, 0).unwrap())
+            .unwrap();
+        let primary_tail_bound_at = words
+            .iter()
+            .position(|word| {
+                *word
+                    == aarch64_cmp_x_imm(
+                        12,
+                        u16::from(1_u8) + AARCH64_ASIMD_VECTOR_BYTES,
+                    )
+                    .unwrap()
+            })
+            .unwrap();
+        let primary_tail_advance_at = words
+            .iter()
+            .position(|word| {
+                *word
+                    == aarch64_add_x_imm(2, 2, AARCH64_ASIMD_VECTOR_BYTES).unwrap()
+            })
+            .unwrap();
         assert!(primary_constant_at < primary_candidates_at);
-        assert!(primary_candidates_at < relation_constant_at);
+        assert!(primary_candidates_at < primary_first_candidate_at);
+        assert!(primary_first_candidate_at < primary_tail_bound_at);
+        assert!(primary_tail_bound_at < primary_tail_advance_at);
+        assert!(primary_tail_advance_at < primary_pair_at);
+        assert!(primary_pair_at < relation_constant_at);
         assert!(relation_constant_at < relation_batch_at);
         let advance_batch = aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)
             .unwrap()
@@ -129427,6 +129634,21 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     .get(fixup.instruction - 4..fixup.instruction)
                     == Some(&advance_batch[..])
         }));
+        let advance_one = aarch64_add_x_imm(2, 2, 1).unwrap().to_le_bytes();
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            ordinary_emission.labels[fixup.label] == Some(relation_constant_at * 4)
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_one[..])
+        }));
+        assert!(!words.contains(
+            &aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0).unwrap()
+        ));
+        assert!(!words.contains(
+            &aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 1).unwrap()
+        ));
         let rewind = aarch64_sub_x_imm(2, 2, AARCH64_BATCH_BYTES)
             .unwrap()
             .to_le_bytes();
@@ -129435,7 +129657,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .code
                 .chunks_exact(4)
                 .any(|word| word == rewind),
-            "the primary hit edge keeps X2 at the unchanged batch base"
+            "candidate-first extraction must not rewind a completed primary batch"
         );
 
         let retry = layout_for(r"Z.{0,4}(?:q!|a@|b#)");
@@ -129443,29 +129665,124 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(retry.suffix_filter.unwrap().retry.is_some());
         let (retry_emission, retry_relation_vector) = emit(retry);
         let retry_base = aarch64_mov_x(2, 7).unwrap().to_le_bytes();
+        let retry_restore = retry_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction >= 4
+                    && retry_emission
+                        .code
+                        .get(fixup.instruction - 4..fixup.instruction)
+                        == Some(&retry_base[..])
+            })
+            .unwrap();
+        assert_ne!(retry_restore.label, retry_relation_vector);
+        let retry_dispatch_at = retry_emission.labels[retry_restore.label].unwrap();
+        let retry_phase_edge = retry_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction == retry_dispatch_at
+                    && fixup.kind == Aarch64FixupKind::CompareBranch19
+            })
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                retry_emission.code[retry_dispatch_at..retry_dispatch_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x3400_0000 | u32::from(AARCH64_SUFFIX_RELATION_PHASE)
+        );
+        let retry_activation_at = retry_emission.labels[retry_phase_edge.label].unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                retry_emission.code[retry_activation_at..retry_activation_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 1).unwrap()
+        );
         assert!(retry_emission.fixups.iter().any(|fixup| {
-            fixup.label == retry_relation_vector
-                && fixup.instruction >= 4
-                && retry_emission
-                    .code
-                    .get(fixup.instruction - 4..fixup.instruction)
-                    == Some(&retry_base[..])
+            fixup.instruction == retry_dispatch_at + 4
+                && fixup.kind == Aarch64FixupKind::Branch26
+                && fixup.label == retry_relation_vector
         }));
+        assert!(retry_emission
+            .code
+            .chunks_exact(4)
+            .any(|word| word
+                == aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0)
+                    .unwrap()
+                    .to_le_bytes()));
 
         let seeded = layout_for(r"(?s:.+)(?:q!|a@|b#)(?s:.*)");
         assert!(seeded.seeded_reverse.is_some());
         assert!(seeded.suffix_filter.unwrap().exact_pair_filter.is_some());
+        let mut wrong_seeded_output = seeded;
+        wrong_seeded_output.output = OutputContract::SelectedEnd;
+        let mut wrong_seeded_assembler = Aarch64Assembler::new();
+        let wrong_seeded_no_match = wrong_seeded_assembler.label().unwrap();
+        let wrong_seeded_matched = wrong_seeded_assembler.label().unwrap();
+        assert!(matches!(
+            aarch64_emit_suffix_prepass(
+                &mut wrong_seeded_assembler,
+                wrong_seeded_output.suffix_filter.unwrap(),
+                None,
+                true,
+                true,
+                true,
+                features,
+                OperatingSystem::Linux,
+                wrong_seeded_output,
+                wrong_seeded_no_match,
+                wrong_seeded_matched,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
         let (seeded_emission, seeded_relation_vector) = emit(seeded);
         // X15 is the child emitter's audited REVERSE_NEXT_BASE register.
         let seeded_next = aarch64_mov_x(2, 15).unwrap().to_le_bytes();
+        let seeded_phase_edge = seeded_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction >= 4
+                    && fixup.kind == Aarch64FixupKind::CompareBranch19
+                    && seeded_emission
+                        .code
+                        .get(fixup.instruction - 4..fixup.instruction)
+                        == Some(&seeded_next[..])
+            })
+            .unwrap();
+        let seeded_activation_at = seeded_emission.labels[seeded_phase_edge.label].unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                seeded_emission.code[seeded_activation_at..seeded_activation_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            aarch64_movz_w(
+                module_seeded_reverse_aarch64::REVERSE_RELATION_PHASE,
+                1
+            )
+            .unwrap()
+        );
         assert!(seeded_emission.fixups.iter().any(|fixup| {
-            fixup.label == seeded_relation_vector
-                && fixup.instruction >= 4
-                && seeded_emission
-                    .code
-                    .get(fixup.instruction - 4..fixup.instruction)
-                    == Some(&seeded_next[..])
+            fixup.instruction == seeded_phase_edge.instruction + 4
+                && fixup.kind == Aarch64FixupKind::Branch26
+                && fixup.label == seeded_relation_vector
         }));
+        assert!(seeded_emission
+            .code
+            .chunks_exact(4)
+            .any(|word| word
+                == aarch64_movz_w(
+                    module_seeded_reverse_aarch64::REVERSE_RELATION_PHASE,
+                    0
+                )
+                .unwrap()
+                .to_le_bytes()));
     }
 
     #[test]
@@ -129727,6 +130044,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             false_cartesian.extend_from_slice(b"q@a!b@");
         }
         false_cartesian.truncate(17);
+        let mut single_vector_tail = vec![b'x'; 128];
+        single_vector_tail[95..97].copy_from_slice(b"a@");
         let mut vector_end = vec![b'x'; 128];
         vector_end[126..].copy_from_slice(b"q!");
         let mut vector_boundary = vec![b'x'; 129];
@@ -129768,6 +130087,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             offset_1,
             late,
             false_cartesian,
+            single_vector_tail,
             vector_end,
             vector_boundary,
             vector_decoys,
@@ -129782,8 +130102,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(
             haystacks.iter().map(Vec::len).collect::<Vec<_>>(),
             [
-                1, 15, 16, 17, 17, 17, 17, 128, 129, 129, 257, 257, 257, 257, 257, 257,
-                129
+                1, 15, 16, 17, 17, 17, 17, 128, 128, 129, 129, 257, 257, 257, 257, 257,
+                257, 129
             ]
         );
 

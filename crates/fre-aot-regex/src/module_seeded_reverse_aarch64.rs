@@ -19,6 +19,10 @@ const REVERSE_FUEL: u8 = 13;
 const REVERSE_MINIMUM: u8 = 14;
 const REVERSE_NEXT_BASE: u8 = 15;
 const REVERSE_CURSOR: u8 = 16;
+// X7 is outside the reverse machine's persistent and scalar scratch sets. It
+// records the one-way replacement of projected ASIMD constants by the exact
+// relation bank across every reverse-candidate verification.
+pub(super) const REVERSE_RELATION_PHASE: u8 = 7;
 
 fn aarch64_movn_zero_x(destination: u8) -> Result<u32, ObjectError> {
     // MOVN Xd, #0 materializes the all-ones sentinel without consuming a
@@ -140,6 +144,26 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     let exact_pair_relation_activate = exact_pair_primary_cold_filter
         .map(|_| assembler.label())
         .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 seeded exact-pair primary phase escaped Exists admission",
+        ));
+    }
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
             if let Some(primary_filter) = exact_pair_primary_cold_filter {
@@ -188,6 +212,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS {
         emit_constants(assembler)?;
     }
+    if exact_pair_primary_cold_filter.is_some() {
+        assembler.instruction(aarch64_movz_w(REVERSE_RELATION_PHASE, 0)?)?;
+    }
     // Unlike the ordinary DFA's optional compact/direct layout, the sidecar
     // always owns an independent exact raw-byte class map.
     aarch64_set_table_address(assembler, REVERSE_CLASS_MAP, reverse.class_map_offset)?;
@@ -198,6 +225,29 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
                 "AArch64 seeded exact-pair primary vector label is absent",
             ))?;
+            let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 seeded exact-pair primary single-vector label is absent",
+                ),
+            )?;
+            let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+                "AArch64 seeded exact-pair primary scalar label is absent",
+            ))?;
+            let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 seeded exact-pair primary batch-hit label is absent",
+                ),
+            )?;
+            let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 seeded exact-pair primary single-hit label is absent",
+                ),
+            )?;
+            let primary_candidate = exact_pair_primary_candidate.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 seeded exact-pair primary candidate label is absent",
+                ),
+            )?;
             let relation_activate =
                 exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
                     "AArch64 seeded exact-pair relation activation label is absent",
@@ -213,18 +263,72 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                     "AArch64 seeded exact-pair primary width",
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
-            assembler.branch_cond(AARCH64_LO, relation_activate)?;
+            assembler.branch_cond(AARCH64_LO, primary_single_vector)?;
             let primary_candidates = aarch64_emit_start_filter_batch_candidates(
                 assembler,
                 primary_filter,
                 AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
             )?;
             aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
-            assembler.branch_cond(AARCH64_NE, relation_activate)?;
+            assembler.branch_cond(AARCH64_NE, primary_batch_hit)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
             assembler.branch(primary_vector)?;
 
+            assembler.bind(primary_batch_hit)?;
+            aarch64_emit_first_candidate_in_batch(assembler, primary_candidates)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_single_vector)?;
+            let vector_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_ASIMD_VECTOR_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 seeded exact-pair primary tail width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, primary_scalar)?;
+            aarch64_emit_start_filter_address(assembler, primary_filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
+            aarch64_emit_start_filter_vector_candidates(
+                assembler,
+                primary_filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(assembler, 24)?;
+            assembler.branch_cond(AARCH64_NE, primary_single_hit)?;
+            assembler.instruction(aarch64_add_x_imm(
+                2,
+                2,
+                AARCH64_ASIMD_VECTOR_BYTES,
+            )?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(primary_single_hit)?;
+            aarch64_emit_first_candidate_lane(assembler, 24)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_scalar)?;
+            aarch64_emit_start_filter_scalar_bound(
+                assembler,
+                maximum_scan_offset,
+                if proven_exists { no_match } else { finalize },
+            )?;
+            aarch64_emit_start_filter_scalar_candidate(
+                assembler,
+                primary_filter,
+                primary_candidate,
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(primary_scalar)?;
+
+            assembler.bind(primary_candidate)?;
+            aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(relation_activate)?;
+
             assembler.bind(relation_activate)?;
+            assembler.instruction(aarch64_movz_w(REVERSE_RELATION_PHASE, 1)?)?;
             aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
             assembler.branch(vector)?;
         }
@@ -509,6 +613,13 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         assembler.branch_cond(AARCH64_NE, global_minimum)?;
     }
     assembler.instruction(aarch64_mov_x(2, REVERSE_NEXT_BASE)?)?;
+    if exact_pair_primary_cold_filter.is_some() {
+        let relation_activate =
+            exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                "AArch64 seeded exact-pair reverse retry lost its activation label",
+            ))?;
+        assembler.branch_zero_w(REVERSE_RELATION_PHASE, relation_activate)?;
+    }
     assembler.branch(vector)?;
 
     assembler.bind(finalize)?;
