@@ -44006,8 +44006,8 @@ fn lower_aarch64_prepared_grep_count(
     call_kind: NativeSpanReducerCallKind,
     required_ordered_nfa: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u16 = 112;
-    const SESSION_OFFSET: u16 = 96;
+    const FRAME_BYTES: u16 = 128;
+    const SESSION_OFFSET: u16 = 112;
     if required_ordered_nfa && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "required Ordered-NFA GrepCount has no private prepared target",
@@ -44016,7 +44016,8 @@ fn lower_aarch64_prepared_grep_count(
 
     let mut assembler = Aarch64Assembler::new();
     let line_loop = assembler.label()?;
-    let scan = assembler.label()?;
+    let scan_words = assembler.label()?;
+    let scan_bytes = assembler.label()?;
     let found_lf = assembler.label()?;
     let final_line = assembler.label()?;
     let line_ready = assembler.label()?;
@@ -44081,7 +44082,8 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
     assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
-    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(27, 28, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 96)?)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
     assembler.instruction(aarch64_mov_x(21, 2)?)?;
@@ -44090,16 +44092,40 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
     assembler.branch_zero_x(21, finished)?;
 
+    // Preserve the two byte-lane constants across the local search calls. On
+    // long lines, the classic zero-byte test rejects eight bytes at a time;
+    // a candidate word falls back to the exact byte loop, which preserves the
+    // first-LF and CRLF semantics without an out-of-bounds vector tail.
+    assembler.instruction(aarch64_cmp_x_imm(21, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, line_loop)?;
+    aarch64_load_u64_constant(&mut assembler, 27, 0x0a0a_0a0a_0a0a_0a0a)?;
+    aarch64_load_u64_constant(&mut assembler, 28, 0x0101_0101_0101_0101)?;
+
     assembler.bind(line_loop)?;
     assembler.instruction(aarch64_mov_x(25, 23)?)?;
-    assembler.bind(scan)?;
+    assembler.bind(scan_words)?;
+    assembler.instruction(aarch64_add_x_imm(8, 23, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 21)?)?;
+    assembler.branch_cond(AARCH64_HI, scan_bytes)?;
+    assembler.instruction(aarch64_add_x_reg(9, 20, 23)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_eor_x(9, 10, 27)?)?;
+    assembler.instruction(aarch64_sub_x_reg(10, 9, 28)?)?;
+    assembler.instruction(aarch64_bic_x(10, 10, 9)?)?;
+    assembler.instruction(aarch64_add_x_lsl(9, 31, 28, 7)?)?;
+    assembler.instruction(aarch64_tst_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, scan_bytes)?;
+    assembler.instruction(aarch64_mov_x(23, 8)?)?;
+    assembler.branch(scan_words)?;
+
+    assembler.bind(scan_bytes)?;
     assembler.instruction(aarch64_cmp_x(23, 21)?)?;
     assembler.branch_cond(AARCH64_EQ, final_line)?;
     assembler.instruction(aarch64_load_byte_reg(8, 20, 23)?)?;
     assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
     assembler.branch_cond(AARCH64_EQ, found_lf)?;
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
-    assembler.branch(scan)?;
+    assembler.branch(scan_bytes)?;
 
     assembler.bind(found_lf)?;
     assembler.instruction(aarch64_mov_x(26, 23)?)?;
@@ -44120,7 +44146,7 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_add_x_reg(8, 20, 25)?)?;
     match call_kind {
         NativeSpanReducerCallKind::PreparedPrivate => {
-            assembler.instruction(aarch64_store_pair_x(31, 31, 31, 96)?)?;
+            assembler.instruction(aarch64_store_pair_x(31, 31, 31, 112)?)?;
             assembler.instruction(aarch64_mov_x(0, 19)?)?;
             assembler.instruction(aarch64_mov_x(1, 8)?)?;
             assembler.instruction(aarch64_mov_x(2, 26)?)?;
@@ -44163,7 +44189,8 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
     assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
-    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_load_pair_x(27, 28, 31, 80)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 96)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(invalid_handle)?;
@@ -54228,6 +54255,15 @@ fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
 fn aarch64_eor_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x4a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_eor_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xca00_0000
             | aarch64_reg(right, 16)?
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
@@ -70693,6 +70729,28 @@ mod tests {
                 .contains(&crate::OptimizationPass::ExactFiniteExistsByteSetLowering),
         );
         compiled
+    }
+
+    #[test]
+    fn aarch64_prepared_grep_count_rejects_lf_free_words_before_scalar_tail() {
+        let wrapper = lower_aarch64_prepared_grep_count(
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )
+        .expect("lower direct AArch64 GrepCount");
+        let words = wrapper
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_eor_x(9, 10, 27).unwrap()));
+        assert!(words.contains(&aarch64_sub_x_reg(10, 9, 28).unwrap()));
+        assert!(words.contains(&aarch64_bic_x(10, 10, 9).unwrap()));
+        assert!(words.contains(&aarch64_add_x_lsl(9, 31, 28, 7).unwrap()));
+        assert!(words.contains(&aarch64_tst_x(10, 9).unwrap()));
+        assert!(words.contains(&aarch64_load_pair_x(27, 28, 31, 80).unwrap()));
+        assert!(words.contains(&aarch64_load_pair_x(29, 30, 31, 96).unwrap()));
+        assert_eq!(aarch64_eor_x(9, 10, 27).unwrap(), 0xca1b_0149);
     }
 
     #[test]

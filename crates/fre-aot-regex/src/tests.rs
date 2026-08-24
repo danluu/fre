@@ -4023,6 +4023,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 b"\r\n".to_vec(),
                 b"a\r\nno\naa\n\n\ra\na\r".to_vec(),
                 b"a\n".to_vec(),
+                b"aaaaaaa\naaaaaaaa\naaaaaaaaa\r\naaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaa\r\n"
+                    .to_vec(),
             ],
         ),
         (
