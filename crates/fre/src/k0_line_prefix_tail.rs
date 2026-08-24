@@ -6,7 +6,7 @@
 //! authenticating that boundary avoids constructing generic K0 scratch for
 //! the common whole-line prefix predicate.
 
-use memchr::{memchr, memchr2, memmem};
+use memchr::{memchr, memchr2};
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 const MAX_PREFIX_BYTES: usize = 32;
@@ -32,11 +32,19 @@ impl Plan {
     #[inline]
     pub(crate) fn find_full(&self, haystack: &[u8]) -> Option<(usize, usize)> {
         let prefix = &self.prefix[..usize::from(self.prefix_len)];
+        let last_start = haystack.len().checked_sub(prefix.len())?;
         let mut search_start = 0_usize;
         loop {
-            let relative = memmem::find(&haystack[search_start..], prefix)?;
+            if search_start > last_start {
+                return None;
+            }
+            let relative = memchr(prefix[0], &haystack[search_start..=last_start])?;
             let start = search_start.checked_add(relative)?;
             let tail_start = start.checked_add(prefix.len())?;
+            if &haystack[start..tail_start] != prefix {
+                search_start = start.checked_add(1)?;
+                continue;
+            }
             if start != 0 && haystack[start - 1] != b'\n' {
                 search_start = start.checked_add(1)?;
                 continue;
