@@ -14561,6 +14561,14 @@ impl PortableRegex {
                         .map_err(SearchError::from);
                 }
             }
+            PortablePlan::K0(k0) => {
+                if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
+                    && let Some(plan) = k0.exclusive.line_token_loop()
+                    && let Some(matched) = plan.try_find_full(haystack)
+                {
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+            }
             // Every other family deliberately keeps its existing ordinary
             // fallback.
             _ => {}
@@ -51264,22 +51272,22 @@ mod tests {
         );
 
         contextual_span_v1_facade_probe::reset();
+        super::k0_line_token_loop_exists::span_route_probe::reset();
         assert_eq!(
             regex.find(&source).map(|matched| (matched.start(), matched.end())),
             expected,
-            "cold ordinary find",
+            "direct ordinary find",
         );
         assert_eq!(contextual_span_v1_facade_probe::snapshot(), (0, 0));
 
-        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
-            assert_eq!(
-                plan.contextual_ordinary_span_projection_eligible(
+        for bytes in [4_079, 4_080, 4_095, 4_096] {
+            assert!(
+                !plan.contextual_ordinary_span_projection_eligible(
                     K0PooledValueExecution::OrdinarySpan,
                     true,
                     bytes,
                 ),
-                admitted,
-                "window bytes={bytes}",
+                "the direct route must not seed a contextual owner: window bytes={bytes}",
             );
         }
         assert!(!plan.contextual_ordinary_span_projection_eligible(
@@ -51301,15 +51309,23 @@ mod tests {
         assert_eq!(
             regex.find(&source).map(|matched| (matched.start(), matched.end())),
             expected,
-            "warm-owner promotion replay",
+            "second direct call",
         );
-        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (1, 1));
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (0, 0));
         assert_eq!(
             regex.find(&source).map(|matched| (matched.start(), matched.end())),
             expected,
-            "immutable completion",
+            "third direct call",
         );
-        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (2, 2));
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (0, 0));
+        assert_eq!(
+            super::k0_line_token_loop_exists::span_route_probe::snapshot(),
+            super::k0_line_token_loop_exists::span_route_probe::Counts {
+                attempts: 3,
+                completed: 3,
+                declined: 0,
+            },
+        );
 
         let address = source.as_ptr();
         let capacity = source.capacity();
@@ -51318,9 +51334,29 @@ mod tests {
         assert_eq!(source.as_ptr(), address);
         assert_eq!(source.capacity(), capacity);
         assert_eq!(regex.find(&source), None);
-        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (3, 2));
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (0, 0));
+        for (bytes, admitted) in [(4_079, false), (4_080, true), (4_095, true), (4_096, false)] {
+            assert_eq!(
+                plan.contextual_ordinary_span_projection_eligible(
+                    K0PooledValueExecution::OrdinarySpan,
+                    true,
+                    bytes,
+                ),
+                admitted,
+                "fallback owner window bytes={bytes}",
+            );
+        }
         assert_eq!(regex.find(&source), None);
-        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (4, 3));
+        assert_eq!(contextual_span_v1_facade_probe::snapshot(), (1, 1));
+        assert_eq!(
+            super::k0_line_token_loop_exists::span_route_probe::snapshot(),
+            super::k0_line_token_loop_exists::span_route_probe::Counts {
+                attempts: 5,
+                completed: 3,
+                declined: 2,
+            },
+            "a rejected terminal candidate must replay the incumbent K0 path",
+        );
 
         source[4_090] = b'f';
         let contained = PortableBuilder::new(pattern)
@@ -51328,6 +51364,7 @@ mod tests {
             .build()
             .unwrap();
         contextual_span_v1_facade_probe::reset();
+        super::k0_line_token_loop_exists::span_route_probe::reset();
         assert!(contained.is_match(&source));
         for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
             assert_eq!(
@@ -51393,6 +51430,21 @@ mod tests {
             contextual_span_v1_facade_probe::snapshot(),
             (0, 0),
             "nonordinary Span APIs cannot enter the contextual lane",
+        );
+        assert_eq!(
+            super::k0_line_token_loop_exists::span_route_probe::snapshot(),
+            super::k0_line_token_loop_exists::span_route_probe::Counts::default(),
+            "explicit, accounted, session, iterator, and capture APIs stay out of ordinary Span",
+        );
+
+        assert_eq!(
+            regex.find(b"abbbcZ\n").map(|matched| (matched.start(), matched.end())),
+            Some((0, 6)),
+        );
+        assert_eq!(
+            super::k0_line_token_loop_exists::span_route_probe::snapshot(),
+            super::k0_line_token_loop_exists::span_route_probe::Counts::default(),
+            "a short ordinary find must bypass the direct route",
         );
     }
 

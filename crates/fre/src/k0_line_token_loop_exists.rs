@@ -1,4 +1,4 @@
-//! Exact ordinary existence for deterministic token-loop lines.
+//! Exact ordinary projections for deterministic token-loop lines.
 //!
 //! Construction admits byte-mode `StartLF (BRANCH | ...)+ TERMINAL EndLF`.
 //! Each branch is a positive sequence of singleton-byte atoms, including
@@ -7,9 +7,10 @@
 //! next required atom, and every branch ends in a fixed positive atom. The
 //! resulting token stream has one forward parse.
 //!
-//! Execution seeks only the first potential terminal. An absent candidate
-//! completes false, a valid body completes true, and every rejected candidate
-//! fails open immediately so the caller can replay canonical K0.
+//! Predicate execution seeks only the first potential terminal. Span
+//! execution may continue through a small bounded number of later terminal
+//! candidates, in source order. Exhausting that bound or otherwise declining
+//! fails open so the caller can replay canonical K0.
 
 use core::mem::size_of;
 
@@ -19,6 +20,7 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 const MAX_BRANCHES: usize = 4;
 const MAX_ATOMS: usize = 16;
 const MAX_TERMINAL_BYTES: usize = 8;
+const MAX_LATER_FIND_CANDIDATES: usize = 4;
 const UNBOUNDED: u8 = u8::MAX;
 pub(crate) const MIN_INPUT_BYTES: usize = 1_024;
 
@@ -111,6 +113,92 @@ impl Plan {
         output
     }
 
+    /// Attempt the complete ordinary full-input leftmost-first span.
+    ///
+    /// `None` is a source-shape refusal, never a negative answer. The caller
+    /// must replay canonical K0 in that case.
+    #[inline(never)]
+    pub(crate) fn try_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
+        let output = if haystack.len() < MIN_INPUT_BYTES {
+            None
+        } else {
+            let terminal_len = usize::from(self.terminal_len);
+            match haystack.len().checked_sub(terminal_len) {
+                None => None,
+                Some(last_start) => {
+                    let terminal = &self.terminal[..terminal_len];
+                    match memchr(terminal[0], &haystack[..=last_start]) {
+                        None => Some(None),
+                        Some(candidate) => match candidate.checked_add(terminal_len) {
+                            None => None,
+                            Some(candidate_end) => {
+                                if &haystack[candidate..candidate_end] != terminal
+                                    || (candidate_end != haystack.len()
+                                        && haystack[candidate_end] != b'\n')
+                                {
+                                    self.try_later_span_candidates(
+                                        haystack, terminal, last_start, candidate,
+                                    )
+                                    .map(Some)
+                                } else {
+                                    match self.try_authenticated_span_candidate(
+                                        haystack,
+                                        candidate,
+                                        candidate_end,
+                                    ) {
+                                        Some(span) => Some(Some(span)),
+                                        None => self
+                                            .try_later_span_candidates(
+                                                haystack, terminal, last_start, candidate,
+                                            )
+                                            .map(Some),
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        };
+        #[cfg(test)]
+        span_route_probe::record(output);
+        output
+    }
+
+    /// Continue strictly after a rejected first terminal candidate.
+    ///
+    /// Advancing one byte preserves overlapping multi-byte terminals. Every
+    /// potential start is considered in increasing order, so a returned span
+    /// is the exact leftmost valid later line. A missing candidate, arithmetic
+    /// refusal, or the explicit cap declines to canonical K0.
+    #[inline(never)]
+    fn try_later_span_candidates(
+        &self,
+        haystack: &[u8],
+        terminal: &[u8],
+        last_start: usize,
+        first_candidate: usize,
+    ) -> Option<(usize, usize)> {
+        let mut search_start = first_candidate.checked_add(1)?;
+        for _ in 0..MAX_LATER_FIND_CANDIDATES {
+            if search_start > last_start {
+                return None;
+            }
+            let relative = memchr(terminal[0], &haystack[search_start..=last_start])?;
+            let candidate = search_start.checked_add(relative)?;
+            let candidate_end = candidate.checked_add(terminal.len())?;
+            if &haystack[candidate..candidate_end] == terminal
+                && (candidate_end == haystack.len() || haystack[candidate_end] == b'\n')
+                && let Some(span) =
+                    self.try_authenticated_span_candidate(haystack, candidate, candidate_end)
+            {
+                return Some(span);
+            }
+            search_start = candidate.checked_add(1)?;
+        }
+        None
+    }
+
     #[inline(never)]
     fn try_authenticated_candidate(&self, haystack: &[u8], candidate: usize) -> Option<bool> {
         let line_start = memrchr(b'\n', &haystack[..candidate])
@@ -118,6 +206,40 @@ impl Plan {
             .unwrap_or(0);
         self.matches_body(&haystack[line_start..candidate])
             .then_some(true)
+    }
+
+    #[inline(never)]
+    fn try_authenticated_span_candidate(
+        &self,
+        haystack: &[u8],
+        candidate: usize,
+        candidate_end: usize,
+    ) -> Option<(usize, usize)> {
+        let line_start = memrchr(b'\n', &haystack[..candidate])
+            .and_then(|delimiter| delimiter.checked_add(1))
+            .unwrap_or(0);
+        self.matches_span_body(&haystack[line_start..candidate])
+            .then_some((line_start, candidate_end))
+    }
+
+    fn matches_span_body(&self, body: &[u8]) -> bool {
+        let mut position = 0_usize;
+        let mut tokens = 0_usize;
+        while position < body.len() {
+            let Some(branch) = self.branch_for(body[position]) else {
+                return false;
+            };
+            let before = position;
+            let Some(after) = self.match_branch(branch, body, position) else {
+                return false;
+            };
+            if after <= before {
+                return false;
+            }
+            position = after;
+            tokens = tokens.saturating_add(1);
+        }
+        tokens > 0
     }
 
     fn matches_body(&self, body: &[u8]) -> bool {
@@ -544,6 +666,45 @@ pub(crate) mod route_probe {
 }
 
 #[cfg(test)]
+pub(crate) mod span_route_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct Counts {
+        pub(crate) attempts: usize,
+        pub(crate) completed: usize,
+        pub(crate) declined: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+    }
+
+    pub(super) fn record(output: Option<Option<(usize, usize)>>) {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                attempts: counts.attempts.saturating_add(1),
+                completed: counts
+                    .completed
+                    .saturating_add(usize::from(output.is_some())),
+                declined: counts
+                    .declined
+                    .saturating_add(usize::from(output.is_none())),
+            });
+        });
+    }
+
+    pub(crate) fn reset() {
+        COUNTS.with(|slot| slot.set(Counts::default()));
+    }
+
+    pub(crate) fn snapshot() -> Counts {
+        COUNTS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use regex_syntax::ParserBuilder;
 
@@ -607,17 +768,141 @@ mod tests {
     }
 
     #[test]
-    fn first_rejected_candidate_declines_without_scanning_later_lines() {
-        let plan = plan(r"(?m)^(?:ab+c|de?f)+Z$");
+    fn rejected_candidate_continues_to_the_first_valid_later_line() {
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
         let mut source = vec![b'q'; 1_024];
-        source.extend_from_slice(b"\nabZ\nabbbcdefZ\n");
+        source.extend_from_slice(b"\nabZ\nabbbcdefZ\ndefabbbcZ\n");
+        let expected = oracle
+            .find(&source)
+            .map(|matched| (matched.start(), matched.end()));
         assert_eq!(plan.try_is_match_full(&source), None);
-        let position = source.len() - 3;
+        assert_eq!(plan.try_find_full(&source), Some(expected));
+
+        let first_valid = source
+            .windows(b"abbbcdefZ".len())
+            .position(|window| window == b"abbbcdefZ")
+            .unwrap();
+        let position = first_valid + b"abbbcde".len();
         assert_eq!(source[position], b'f');
         let address = source.as_ptr();
         source[position] = b'Q';
         assert_eq!(source.as_ptr(), address);
+        let expected = oracle
+            .find(&source)
+            .map(|matched| (matched.start(), matched.end()));
         assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_find_full(&source), Some(expected));
+    }
+
+    #[test]
+    fn later_candidate_search_advances_one_byte_for_overlapping_terminals() {
+        let pattern = r"(?m)^(?:xA|yz)+AAA$";
+        let plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut source = vec![b'q'; 1_024];
+        source.extend_from_slice(b"\nxAAAA\n");
+        let expected = oracle
+            .find(&source)
+            .map(|matched| (matched.start(), matched.end()));
+
+        assert!(expected.is_some());
+        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_find_full(&source), Some(expected));
+    }
+
+    #[test]
+    fn later_candidate_cap_returns_exact_spans_or_fails_open() {
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let source = |rejected_lines: usize| {
+            let mut source = vec![b'q'; 1_024];
+            for _ in 0..rejected_lines {
+                source.extend_from_slice(b"\nabZ");
+            }
+            source.extend_from_slice(b"\nabbbcdefZ\n");
+            source
+        };
+
+        let at_cap = source(super::MAX_LATER_FIND_CANDIDATES);
+        let expected = oracle
+            .find(&at_cap)
+            .map(|matched| (matched.start(), matched.end()));
+        assert!(expected.is_some());
+        assert_eq!(plan.try_find_full(&at_cap), Some(expected));
+
+        let beyond_cap = source(super::MAX_LATER_FIND_CANDIDATES + 1);
+        let expected = oracle
+            .find(&beyond_cap)
+            .map(|matched| (matched.start(), matched.end()));
+        assert!(expected.is_some());
+        assert_eq!(plan.try_find_full(&beyond_cap), None);
+        assert_eq!(
+            regex
+                .find(&beyond_cap)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+    }
+
+    #[test]
+    fn multiline_mutations_match_the_independent_oracle() {
+        let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
+        let plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut original = vec![b'q'; 1_024];
+        original.extend_from_slice(b"\nabZ\nabbbcdefZ\ndefabbbcZ\n");
+
+        for position in 1_024..original.len() {
+            for byte in [
+                0, b'\n', b'Z', b'a', b'b', b'c', b'd', b'e', b'f', b'q', 0xFF,
+            ] {
+                let mut source = original.clone();
+                source[position] = byte;
+                let expected = oracle
+                    .find(&source)
+                    .map(|matched| (matched.start(), matched.end()));
+                let planned = plan.try_find_full(&source);
+                if expected.is_some() {
+                    assert_eq!(
+                        planned,
+                        Some(expected),
+                        "position={position}, byte={byte:#04X}",
+                    );
+                } else if let Some(actual) = planned {
+                    assert_eq!(actual, expected, "position={position}, byte={byte:#04X}",);
+                }
+                assert_eq!(
+                    regex
+                        .find(&source)
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "position={position}, byte={byte:#04X}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -627,9 +912,11 @@ mod tests {
         source.extend_from_slice(b"abcZ");
         assert_eq!(source.len(), 1_024);
         assert_eq!(plan.try_is_match_full(&source), Some(true));
+        assert_eq!(plan.try_find_full(&source), Some(Some((0, 1_024))));
 
         source[0] = b'q';
         assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_find_full(&source), None);
     }
 
     #[test]
@@ -647,11 +934,13 @@ mod tests {
         assert_eq!(source.len(), 1_024);
         assert!(oracle.is_match(&source));
         assert_eq!(plan.try_is_match_full(&source), Some(true));
+        assert_eq!(plan.try_find_full(&source), Some(Some((1_015, 1_023))));
 
         assert_eq!(source[1_015], 0xFF);
         source[1_015] = 0x80;
         assert!(!oracle.is_match(&source));
         assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_find_full(&source), None);
     }
 
     #[test]
@@ -662,6 +951,36 @@ mod tests {
         assert_eq!(plan.try_is_match_full(&vec![b'q'; 1_023]), None);
         assert_eq!(plan.try_is_match_full(&vec![b'Z'; 1_024]), None);
         assert_eq!(plan.try_is_match_full(&vec![b'q'; 1_024]), Some(false));
+        assert_eq!(plan.try_find_full(&vec![b'Z'; 256]), None);
+        assert_eq!(plan.try_find_full(b"abbbcZ\n"), None);
+        assert_eq!(plan.try_find_full(&vec![b'q'; 1_023]), None);
+        assert_eq!(plan.try_find_full(&vec![b'Z'; 1_024]), None);
+        assert_eq!(plan.try_find_full(&vec![b'q'; 1_024]), Some(None));
+    }
+
+    #[test]
+    fn first_authenticated_candidate_returns_the_leftmost_line_span() {
+        let plan = plan(r"(?m)^(?:ab+c|de?f)+Z$");
+        let mut source = vec![b'q'; 1_024];
+        source.extend_from_slice(b"\nabbbcZ\ndefabbbcZ\n");
+        assert_eq!(plan.try_find_full(&source), Some(Some((1_025, 1_031))));
+    }
+
+    #[test]
+    fn multi_byte_terminal_returns_its_complete_span() {
+        let pattern = r"(?m)^(?:xy{2,4}q|rst)+END$";
+        let plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut source = vec![b'q'; 1_024];
+        source.extend_from_slice(b"\nxyyqrstEND\n");
+        let expected = oracle
+            .find(&source)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((1_025, 1_035)));
+        assert_eq!(plan.try_find_full(&source), Some(expected));
     }
 
     #[test]
@@ -684,6 +1003,15 @@ mod tests {
             source.push(b'\n');
             if let Some(matched) = plan.try_is_match_full(&source) {
                 assert_eq!(matched, oracle.is_match(&source), "line={line:?}");
+            }
+            if let Some(matched) = plan.try_find_full(&source) {
+                assert_eq!(
+                    matched,
+                    oracle
+                        .find(&source)
+                        .map(|matched| (matched.start(), matched.end())),
+                    "line={line:?}",
+                );
             }
             if depth == 6 {
                 return;
