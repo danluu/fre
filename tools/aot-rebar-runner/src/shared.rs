@@ -555,6 +555,19 @@ pub fn authenticate_native_whole_scalar_reducer(
     Ok(true)
 }
 
+fn admit_native_whole_scalar_reducer(
+    model: Model,
+    compiled: CompiledRegex,
+) -> Result<CompiledRegex, String> {
+    if !authenticate_native_whole_scalar_reducer(model, &compiled)? {
+        return Err(format!(
+            "general AOT {} compilation did not publish an authenticated native whole-operation reducer",
+            model.name(),
+        ));
+    }
+    Ok(compiled)
+}
+
 fn canonical_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
     let suffix = symbol.strip_prefix(prefix)?;
     (suffix.len() == 64
@@ -972,12 +985,10 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         })?;
         let selected =
             select_prepared_ordered_nfa_v15_or_incumbent(benchmark.model, compiled, disposition)?;
-        authenticate_native_whole_scalar_reducer(benchmark.model, &selected)?;
-        return Ok(selected);
+        return admit_native_whole_scalar_reducer(benchmark.model, selected);
     }
     if benchmark.model != Model::GrepCount {
-        authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)?;
-        return Ok(compiled);
+        return admit_native_whole_scalar_reducer(benchmark.model, compiled);
     }
     let grep_needs_operation_only_v15 = if compiled.module().required_prepare_capabilities()
         == PREPARED_CAPABILITY_ORDERED_NFA_V15
@@ -5823,6 +5834,69 @@ mod tests {
             Model::GrepCount,
             Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
         ));
+    }
+
+    #[test]
+    fn static_scalar_admission_rejects_a_runtime_helper_artifact() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let helper_backed = fre_aot_regex::compile_with_prepared_aggregate_exports(
+            CompileRequest::new(r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}", target)
+                .output(OutputContract::Span)
+                .mode(CompileMode::Fast),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("helper-backed Count artifact");
+        assert_eq!(
+            helper_backed.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+        );
+        let error = match admit_native_whole_scalar_reducer(Model::Count, helper_backed) {
+            Ok(_) => panic!("static scalar admission accepted RuntimeHelper"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "general AOT count compilation did not publish an authenticated native whole-operation reducer",
+        );
+    }
+
+    #[test]
+    fn static_scalar_admission_preserves_authenticated_native_artifacts() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model_name in ["count", "count-spans"] {
+            let benchmark = Benchmark::parse(&fixture(model_name, b"a+", b"baa"))
+                .expect("native scalar fixture");
+            let compiled = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(benchmark.pattern(), target)
+                    .profile(RustProfile::rebar_1_12_4())
+                    .output(benchmark.model.output())
+                    .mode(CompileMode::Optimizing)
+                    .limits(CompileLimitsV1::default()),
+                benchmark.model.exports(),
+                SlowAotLimits::default(),
+            )
+            .expect("native scalar artifact");
+            assert!(
+                authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)
+                    .expect("authenticate native scalar artifact"),
+            );
+            let expected_object = compiled.object().to_vec();
+            let expected_receipt = compiled.receipt().clone();
+            let admitted = admit_native_whole_scalar_reducer(benchmark.model, compiled)
+                .expect("admit authenticated native scalar artifact");
+            assert_eq!(admitted.object(), expected_object);
+            assert_eq!(admitted.receipt(), &expected_receipt);
+        }
     }
 
     #[test]
