@@ -11422,6 +11422,52 @@ mod bounded_literal_repeat_span_probe {
     }
 }
 
+#[cfg(test)]
+mod bounded_literal_repeat_early_span_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) attempts: usize,
+        pub(super) completions: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            attempts: 0,
+            completions: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_attempt() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                attempts: counts.attempts.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_completion() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                completions: counts.completions.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+}
+
 // Re-authenticating the borrowed projection is not competitive with the
 // existing canonical warmed entry on tiny sources. Admit the ordinary lane
 // only where its omitted invocation ledger can amortize that fixed handoff.
@@ -11696,6 +11742,8 @@ fn try_k0_bounded_literal_repeat_early_span(
     maximum_match_bytes: usize,
     suffix_offset: usize,
 ) -> Option<fre_automata::MatchSpan> {
+    #[cfg(test)]
+    bounded_literal_repeat_early_span_probe::record_attempt();
     if window.start() != 0
         || window.end() != haystack.len()
         || cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
@@ -11758,6 +11806,8 @@ fn try_k0_bounded_literal_repeat_early_span(
     {
         return None;
     }
+    #[cfg(test)]
+    bounded_literal_repeat_early_span_probe::record_completion();
     Some(fre_automata::MatchSpan::new(
         selected_start,
         selected_end,
@@ -29130,9 +29180,8 @@ mod tests {
             },
         );
 
-        // The exact literal-repeat owner completes a suffix close to the
-        // incumbent floor without touching reverse workspace or publishing a
-        // source receipt.
+        // The complete leaf publishes a revalidated early-prefix receipt on
+        // the cold call; subsequent calls close through the hit-only leaf.
         let early_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -29144,6 +29193,7 @@ mod tests {
             .map(|matched| (matched.start(), matched.end()));
         super::finite_consumption_span_facade_probe::reset();
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             early_regex
                 .find(&early)
@@ -29165,6 +29215,13 @@ mod tests {
             .mandatory_suffix
             .as_ref()
             .expect("early bounded repeat retains its mandatory suffix");
+        assert_eq!(
+            early_suffix.pooled_finite_consumption_span_early_prefix_offset(
+                &early,
+                SearchWindow::full(&early),
+            ),
+            Some(6),
+        );
         assert!(!early_suffix.pooled_finite_consumption_span_should_bypass_early(
             &early,
             SearchWindow::full(&early),
@@ -29189,19 +29246,30 @@ mod tests {
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts {
-                attempts: 73,
-                completions: 73,
+                attempts: 1,
+                completions: 1,
             },
-            "every ordinary call must complete through the direct leaf",
+            "only the cold early call must enter the complete leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 72,
+                completions: 72,
+            },
+            "every warm early call must close through the receipt leaf",
         );
 
-        // Changing source bytes cannot stale the immutable proof. Both the
-        // changed early source and a later match complete directly.
+        // Changing source bytes cannot stale the immutable proof. The stable
+        // early source uses its receipt; a changed late source invalidates the
+        // hint and falls through to the complete leaf.
         let recover_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
             .expect("recovering bounded-repeat fixture builds");
         super::finite_consumption_span_facade_probe::reset();
+        super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             recover_regex
                 .find(&early)
@@ -29245,6 +29313,22 @@ mod tests {
                 completions: 11,
                 declines: 0,
             },
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 3,
+                completions: 3,
+            },
+            "the cold early call and both changed late calls use the complete leaf",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 8,
+                completions: 8,
+            },
+            "only stable warm early calls use the receipt leaf",
         );
 
         let ordinary_attempts_before_explicit =
@@ -29388,20 +29472,26 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(regex.find(haystack)), expected, "cold {label}");
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             super::finite_consumption_span_facade_probe::reset();
             assert_eq!(span(regex.find(haystack)), expected, "warm {label}");
             let expected_counts = if expected_direct {
-                super::bounded_literal_repeat_span_probe::Counts {
+                super::bounded_literal_repeat_early_span_probe::Counts {
                     attempts: 1,
                     completions: 1,
                 }
             } else {
-                super::bounded_literal_repeat_span_probe::Counts::default()
+                super::bounded_literal_repeat_early_span_probe::Counts::default()
             };
             assert_eq!(
-                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
                 expected_counts,
-                "complete exact owner did not close directly: {label}",
+                "receipt-authenticated early owner did not close directly: {label}",
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts::default(),
+                "a warm early receipt re-entered the complete leaf: {label}",
             );
             if expected_direct {
                 assert_eq!(
@@ -29501,6 +29591,7 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(regex.find(&haystack)), expected);
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             assert_eq!(span(regex.find(&haystack)), expected);
             assert_eq!(
                 super::bounded_literal_repeat_span_probe::snapshot(),
@@ -29508,6 +29599,14 @@ mod tests {
                     attempts: 1,
                     completions: 1,
                 },
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::Counts {
+                    attempts: 1,
+                    completions: 0,
+                },
+                "a receipt with an invalid earlier token corridor must fall through",
             );
         }
 
@@ -29523,6 +29622,7 @@ mod tests {
         assert_eq!(overlong_expected, Some((2, 13)));
         assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
@@ -29531,6 +29631,14 @@ mod tests {
                 completions: 1,
             },
             "an overlong run must shift to the leftmost accepted bounded suffix",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 1,
+                completions: 0,
+            },
+            "a receipt spanning max+1 tokens must fall through",
         );
 
         // Reuse one matcher across changed sources. Both a changed prefix and
@@ -29547,6 +29655,7 @@ mod tests {
             .find(&reused)
             .map(|matched| (matched.start(), matched.end()));
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(span(regex.find(&reused)), mutated_expected);
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
@@ -29555,8 +29664,16 @@ mod tests {
                 completions: 1,
             },
         );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts {
+                attempts: 1,
+                completions: 0,
+            },
+        );
         reused[6] = b'!';
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         assert_eq!(
             span(regex.find(&reused)),
             upstream
@@ -29570,6 +29687,11 @@ mod tests {
                 completions: 1,
             },
             "changed source bytes must be searched directly without stale state",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
+            "changed receipt bytes must invalidate before the early helper",
         );
 
         // The existing structural window and width boundaries remain exact.
@@ -29585,18 +29707,23 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(span(boundary_regex.find(&haystack)), expected);
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             assert_eq!(span(boundary_regex.find(&haystack)), expected);
             let expected_counts = if length == 1_024 {
-                super::bounded_literal_repeat_span_probe::Counts {
+                super::bounded_literal_repeat_early_span_probe::Counts {
                     attempts: 1,
                     completions: 1,
                 }
             } else {
-                super::bounded_literal_repeat_span_probe::Counts::default()
+                super::bounded_literal_repeat_early_span_probe::Counts::default()
             };
             assert_eq!(
-                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
                 expected_counts,
+            );
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts::default(),
             );
         }
         let overwide_pattern = r"(?:ab){2,600}c";
@@ -29611,6 +29738,7 @@ mod tests {
         let mut overwide_source = vec![b'!'; 4_093];
         overwide_source[..7].copy_from_slice(b"abababc");
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         for _ in 0..2 {
             assert_eq!(
                 span(overwide.find(&overwide_source)),
@@ -29622,6 +29750,10 @@ mod tests {
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts::default(),
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
         );
 
         // Late and absent sources both complete through the same immutable
@@ -29636,6 +29768,7 @@ mod tests {
                 haystack[start..start + 7].copy_from_slice(b"abababc");
             }
             super::bounded_literal_repeat_span_probe::reset();
+            super::bounded_literal_repeat_early_span_probe::reset();
             for _ in 0..2 {
                 assert_eq!(
                     span(late_regex.find(&haystack)),
@@ -29651,6 +29784,10 @@ mod tests {
                     completions: 2,
                 },
             );
+            assert_eq!(
+                super::bounded_literal_repeat_early_span_probe::snapshot(),
+                super::bounded_literal_repeat_early_span_probe::Counts::default(),
+            );
         }
 
         // Explicit/accounted/limited/window and Exists calls never enter this
@@ -29659,6 +29796,7 @@ mod tests {
         early[..7].copy_from_slice(b"abababc");
         assert_eq!(span(regex.find(&early)), Some((0, 7)));
         super::bounded_literal_repeat_span_probe::reset();
+        super::bounded_literal_repeat_early_span_probe::reset();
         let full = SearchWindow::full(&early);
         assert_eq!(span(regex.find_value(&early, SearchLimits::unlimited()).unwrap()), Some((0, 7)));
         assert_eq!(span(regex.find_accounted(&early, SearchLimits::unlimited()).unwrap().0), Some((0, 7)));
@@ -29679,6 +29817,10 @@ mod tests {
         assert_eq!(
             super::bounded_literal_repeat_span_probe::snapshot(),
             super::bounded_literal_repeat_span_probe::Counts::default(),
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_early_span_probe::snapshot(),
+            super::bounded_literal_repeat_early_span_probe::Counts::default(),
         );
 
         for pattern in [
