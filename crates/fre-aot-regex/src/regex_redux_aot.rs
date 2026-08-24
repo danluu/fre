@@ -411,7 +411,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Architecture, RelocationKind, SectionKind, SymbolBinding};
+    use crate::{
+        module::NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        Architecture, RelocationKind, SectionKind, SymbolBinding,
+    };
 
     #[test]
     fn execution_abi_has_exact_word_layout() {
@@ -548,6 +551,15 @@ mod tests {
         }
 
         let module = artifact.reducer_module();
+        assert_eq!(
+            module
+                .sections()
+                .iter()
+                .find(|section| section.kind == SectionKind::Text)
+                .expect("reducer text section")
+                .alignment,
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        );
         assert_eq!(module.entry_symbol(), artifact.receipt().reducer_symbol);
         assert!(
             module.required_runtime_symbols().eq(artifact

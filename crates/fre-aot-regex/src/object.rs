@@ -2056,6 +2056,7 @@ fn write_i32_vec(bytes: &mut [u8], offset: usize, value: i32) -> Result<(), Obje
 )]
 mod tests {
     use super::*;
+    use crate::module::NATIVE_TEXT_LINK_ALIGNMENT_BYTES;
     use crate::{CompileMode, CompileRequest, Target, compile};
 
     const PATTERN: &str = r"(?:[A-Za-z_][A-Za-z0-9_]*::)+item";
@@ -2232,11 +2233,17 @@ mod tests {
         assert_eq!(headers + count * ELF_SECTION_HEADER_BYTES, bytes.len());
 
         let mut found = None;
+        let mut text_alignment = None;
         for index in 1..count {
             let header = headers + index * ELF_SECTION_HEADER_BYTES;
             let offset = usize::try_from(u64_at(bytes, header + 24)).unwrap();
             let size = usize::try_from(u64_at(bytes, header + 32)).unwrap();
             assert!(offset + size <= headers);
+            let flags = u64_at(bytes, header + 8);
+            if flags == (ELF_SHF_ALLOC | ELF_SHF_EXECINSTR) {
+                assert!(text_alignment.is_none(), "multiple executable sections");
+                text_alignment = Some((offset, u64_at(bytes, header + 48)));
+            }
             if u32_at(bytes, header + 4) == ELF_SHT_RELA {
                 assert_eq!(
                     u64_at(bytes, header + 56),
@@ -2254,6 +2261,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, relocation_types);
+        let (offset, alignment) = text_alignment.expect("ELF text section");
+        assert_eq!(alignment, NATIVE_TEXT_LINK_ALIGNMENT_BYTES);
+        assert!(offset.is_multiple_of(
+            usize::try_from(NATIVE_TEXT_LINK_ALIGNMENT_BYTES).unwrap()
+        ));
     }
 
     fn fixed_name(bytes: &[u8], offset: usize) -> &str {
@@ -2290,6 +2302,13 @@ mod tests {
         assert!(text_offset + text_size <= bytes.len());
         assert!(data_offset + data_size <= bytes.len());
         assert!(text_offset + text_size <= data_offset);
+        assert_eq!(
+            u32_at(bytes, text + 52),
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES.trailing_zeros()
+        );
+        assert!(text_offset.is_multiple_of(
+            usize::try_from(NATIVE_TEXT_LINK_ALIGNMENT_BYTES).unwrap()
+        ));
 
         let relocation_offset = usize::try_from(u32_at(bytes, text + 56)).unwrap();
         let relocation_count = usize::try_from(u32_at(bytes, text + 60)).unwrap();
@@ -2378,9 +2397,58 @@ mod tests {
     }
 
     #[test]
+    fn native_text_sections_publish_cache_line_link_alignment() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::aarch64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_macos(),
+        ] {
+            let (module, object) = module_and_object(target, CompileMode::Fast);
+            let text = module
+                .sections()
+                .iter()
+                .find(|section| section.kind == SectionKind::Text)
+                .expect("native text section");
+            assert_eq!(text.alignment, NATIVE_TEXT_LINK_ALIGNMENT_BYTES);
+            match ObjectFormat::for_target(target) {
+                ObjectFormat::Elf64 => {
+                    validate_elf(
+                        &object,
+                        if target.architecture == Architecture::X86_64 {
+                            ELF_EM_X86_64
+                        } else {
+                            ELF_EM_AARCH64
+                        },
+                        &expected_elf_relocation_types(&module),
+                    );
+                }
+                ObjectFormat::MachO64 => {
+                    validate_macho(
+                        &object,
+                        if target.architecture == Architecture::X86_64 {
+                            MACH_CPU_TYPE_X86_64
+                        } else {
+                            MACH_CPU_TYPE_ARM64
+                        },
+                        &expected_mach_relocation_types(&module),
+                        &expected_mach_symbol_types(&module),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exact_and_one_less_object_limits_are_enforced_before_emission() {
-        assert_exact_object_limit(Target::x86_64_linux(), ObjectFormat::Elf64);
-        assert_exact_object_limit(Target::x86_64_macos(), ObjectFormat::MachO64);
+        for target in [
+            Target::x86_64_linux(),
+            Target::aarch64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_macos(),
+        ] {
+            assert_exact_object_limit(target, ObjectFormat::for_target(target));
+        }
     }
 
     #[test]

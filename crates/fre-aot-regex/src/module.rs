@@ -1677,6 +1677,11 @@ pub struct CompiledModule {
 
 const TEXT_SECTION: usize = 0;
 const PROGRAM_SECTION: usize = 1;
+/// Keep independently linked native entries on a source-independent
+/// instruction-cache boundary. External registries concatenate one text
+/// section per artifact, so a weaker alignment lets growth in one artifact
+/// perturb every later entry even when their code and data are unchanged.
+pub(crate) const NATIVE_TEXT_LINK_ALIGNMENT_BYTES: u64 = 64;
 const ENTRY_SYMBOL: usize = 0;
 const PROGRAM_SYMBOL: usize = 1;
 const RUNTIME_SYMBOL: usize = 2;
@@ -5359,10 +5364,7 @@ impl CompiledModule {
             ModuleSection {
                 name: ".text",
                 kind: SectionKind::Text,
-                alignment: match target.architecture {
-                    Architecture::X86_64 => 16,
-                    Architecture::Aarch64 => 4,
-                },
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
                 data: lowering.code.into_boxed_slice(),
             },
             ModuleSection {
@@ -27809,11 +27811,7 @@ fn native_regex_redux_module(
             ModuleSection {
                 name: ".text",
                 kind: SectionKind::Text,
-                alignment: if target.architecture == Architecture::X86_64 {
-                    16
-                } else {
-                    4
-                },
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
                 data: code.into_boxed_slice(),
             },
             ModuleSection {
@@ -122884,9 +122882,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         }
     }
 
-    #[test]
-    fn synchronizing_accept_reverse_object_limit_restores_exact_incumbent() {
-        let target = Target::x86_64_linux();
+    fn assert_synchronizing_accept_reverse_object_limit_restores_exact_incumbent(target: Target) {
         let selected = compile(
             CompileRequest::new("(?:ee|f)+?R", target)
                 .mode(CompileMode::Optimizing)
@@ -122898,14 +122894,36 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "selected sync route: {:?}",
             selected.receipt(),
         );
+        assert_eq!(
+            selected.module().sections()[TEXT_SECTION].alignment,
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        );
         let incumbent = CompiledModule::lower_without_synchronizing_accept_reverse(
             selected.program(),
             target,
             usize::MAX,
         )
         .unwrap();
+        assert_eq!(
+            incumbent.sections()[TEXT_SECTION].alignment,
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        );
         let incumbent_object =
             emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        if target.operating_system == OperatingSystem::Macos {
+            let mut packed_incumbent = incumbent.clone();
+            packed_incumbent.sections[TEXT_SECTION].alignment = 1;
+            let packed_object = emit_object(
+                &packed_incumbent,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(
+                packed_object.len() < incumbent_object.len(),
+                "Mach-O fixture must exercise leading text padding: {target:?}",
+            );
+        }
         assert!(incumbent_object.len() < selected.object().len());
         assert!(
             selected.receipt().data_bytes <= incumbent_object.len(),
@@ -123021,6 +123039,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             constrained.module().required_runtime_symbols().count(),
             selected.module().required_runtime_symbols().count(),
         );
+    }
+
+    #[test]
+    fn synchronizing_accept_reverse_object_limit_restores_exact_incumbent() {
+        for target in [Target::x86_64_linux(), Target::x86_64_macos()] {
+            assert_synchronizing_accept_reverse_object_limit_restores_exact_incumbent(target);
+        }
     }
 
     #[test]
