@@ -147,7 +147,7 @@ fn main() {
                     Some(PreparedBulkStrategy::NativeFrozenLoop) => "native-frozen-loop",
                     Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => "native-ordered-nfa-loop",
                     None if compiled.module().direct_exists_batch_symbol().is_some() => {
-                        "native-direct-public-loop"
+                        "native-direct-trusted-full-window-loop"
                     }
                     None if has_prepared_entry => "compatibility",
                     None => "none",

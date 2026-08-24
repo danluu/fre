@@ -973,12 +973,15 @@ pub fn compile_v2_with_slow_aot_limits(
 /// Prepared artifacts already carry their exclusive-handle batch entry and
 /// are returned unchanged. Runtime-backed artifacts retain their checked
 /// compatibility route. A direct artifact receives an additive handle-free
-/// symbol whose loop locally calls the unchanged ordinary entry. If only the
-/// additive wrapper exceeds the requested final object-byte limit, the exact
-/// scalar artifact is returned without that optional symbol; consumers must
-/// inspect [`CompiledModule::direct_exists_batch_symbol`]. The canonical
-/// function type is `FreAotRegexIndependentExistsBatchV1` in
-/// `fre-aot-regex-runtime` and its C header.
+/// symbol whose loop enters an independently authenticated private
+/// full-window Exists core after validating each descriptor. The ordinary
+/// entry and its public ABI remain unchanged. Direct artifacts without that
+/// compiler receipt are returned unchanged. If only the additive wrapper
+/// exceeds the requested final object-byte limit, the exact scalar artifact
+/// is likewise returned without that optional symbol; consumers must inspect
+/// [`CompiledModule::direct_exists_batch_symbol`]. The canonical function type
+/// is `FreAotRegexIndependentExistsBatchV1` in `fre-aot-regex-runtime` and its
+/// C header.
 ///
 /// # Errors
 ///

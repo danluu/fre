@@ -529,10 +529,10 @@ impl AotMatcher {
 
     /// Search up to [`EXISTS_BATCH_CAPACITY`] independent line haystacks.
     ///
-    /// Compiled prepared and self-contained direct artifacts execute the
-    /// complete batch through one native invocation. Other artifact routes
-    /// preserve identical behavior with a checked per-haystack compatibility
-    /// loop.
+    /// A one-haystack request uses the scalar entry. Compiled prepared and
+    /// self-contained direct artifacts execute every larger complete batch
+    /// through one native invocation. Other artifact routes preserve
+    /// identical behavior with a checked per-haystack compatibility loop.
     ///
     /// # Errors
     ///
@@ -560,6 +560,10 @@ impl AotMatcher {
             ));
         }
         if haystacks.is_empty() {
+            return Ok(());
+        }
+        if let [haystack] = haystacks {
+            matched[0] = self.is_match(haystack)?;
             return Ok(());
         }
 
@@ -1135,6 +1139,8 @@ mod tests {
     static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DIRECT_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn one_byte_search(
         _haystack: *const u8,
@@ -1175,6 +1181,28 @@ mod tests {
         result: *mut AbiResult,
     ) -> u32 {
         unsafe { counted_one_byte_search(haystack, haystack_len, window_start, window_end, result) }
+    }
+
+    unsafe extern "C" fn singleton_one_byte_search(
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        result: *mut AbiResult,
+    ) -> u32 {
+        SINGLETON_EXISTS_SCALAR_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { one_byte_search(haystack, haystack_len, window_start, window_end, result) }
+    }
+
+    unsafe extern "C" fn singleton_one_byte_prepared_search(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        result: *mut AbiResult,
+    ) -> u32 {
+        unsafe { singleton_one_byte_search(haystack, haystack_len, window_start, window_end, result) }
     }
 
     fn dense_fill(
@@ -1397,6 +1425,35 @@ mod tests {
             matched[index] = u8::from(bytes.contains(&b'x'));
         }
         unsafe { processed.write(count) };
+        0
+    }
+
+    unsafe extern "C" fn singleton_prepared_exists_batch(
+        _handle: FreAotRegexExclusiveHandleV1,
+        _haystacks: *const AbiHaystack,
+        count: usize,
+        matched: *mut u8,
+        processed: *mut usize,
+    ) -> u32 {
+        SINGLETON_EXISTS_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            std::ptr::write_bytes(matched, 0, count);
+            processed.write(count);
+        }
+        0
+    }
+
+    unsafe extern "C" fn singleton_direct_exists_batch(
+        _haystacks: *const AbiHaystack,
+        count: usize,
+        matched: *mut u8,
+        processed: *mut usize,
+    ) -> u32 {
+        SINGLETON_EXISTS_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            std::ptr::write_bytes(matched, 0, count);
+            processed.write(count);
+        }
         0
     }
 
@@ -1796,6 +1853,46 @@ mod tests {
             assert_eq!(matched, index % 3 == 0);
         }
         assert_eq!(DIRECT_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn one_haystack_exists_batch_uses_the_scalar_entry() {
+        SINGLETON_EXISTS_SCALAR_CALLS.store(0, Ordering::Relaxed);
+        SINGLETON_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
+
+        let mut prepared = AotMatcher {
+            output: AotOutput::Exists,
+            description: "test-singleton-prepared",
+            backend: Backend::Prepared(PreparedNative {
+                search: singleton_one_byte_prepared_search,
+                span_fill: None,
+                exists_batch: Some(singleton_prepared_exists_batch),
+                handle: FreAotRegexExclusiveHandleV1::INVALID,
+            }),
+        };
+        let mut prepared_outcome = [false];
+        prepared
+            .is_match_batch(&[b"no"], &mut prepared_outcome)
+            .expect("one-haystack prepared Exists request");
+
+        let mut direct = AotMatcher {
+            output: AotOutput::Exists,
+            description: "test-singleton-direct",
+            backend: Backend::Native {
+                search: singleton_one_byte_search,
+                fill: None,
+                exists_batch: Some(singleton_direct_exists_batch),
+            },
+        };
+        let mut direct_outcome = [false];
+        direct
+            .is_match_batch(&[b"no"], &mut direct_outcome)
+            .expect("one-haystack direct Exists request");
+
+        assert_eq!(prepared_outcome, [true]);
+        assert_eq!(direct_outcome, [true]);
+        assert_eq!(SINGLETON_EXISTS_SCALAR_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(SINGLETON_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2247,7 +2344,7 @@ mod tests {
                             assert!(spec.description.contains("api=direct-exists-batch-v1"));
                             assert!(
                                 spec.description
-                                    .contains("bulk=native-direct-public-loop")
+                                    .contains("bulk=native-direct-trusted-full-window-loop")
                             );
                         }
                         AotOutput::Span => {

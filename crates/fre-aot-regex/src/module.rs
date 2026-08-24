@@ -1097,6 +1097,44 @@ struct NativeDfaEmission {
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
+    direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
+}
+
+/// Local entry into an ordinary direct-DFA Exists machine after its public
+/// raw-argument checks and result initialization. The additive batch wrapper
+/// proves those facts once per descriptor and reproduces this entry's exact
+/// callee-save prologue before entering the shared body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectExistsTrustedCore {
+    code_offset: usize,
+    prologue: NativeDirectExistsTrustedCorePrologue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectExistsTrustedCorePrologue {
+    X86_64 {
+        save_rbx: bool,
+        save_r12_r13: bool,
+        save_r14_r15: bool,
+    },
+    Aarch64,
+}
+
+impl NativeDirectExistsTrustedCorePrologue {
+    fn identity_tag(self) -> u8 {
+        match self {
+            Self::X86_64 {
+                save_rbx,
+                save_r12_r13,
+                save_r14_r15,
+            } => {
+                0x80 | u8::from(save_rbx)
+                    | (u8::from(save_r12_r13) << 1)
+                    | (u8::from(save_r14_r15) << 2)
+            }
+            Self::Aarch64 => 1,
+        }
+    }
 }
 
 struct NativeDynamicRowsEmission {
@@ -1526,7 +1564,9 @@ pub enum PreparedBulkStrategy {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DirectExistsBatchStrategy {
     /// Generated code validates one descriptor array and locally invokes the
-    /// complete public ordinary entry once per independent haystack.
+    /// ordinary matcher's implementation once per independent haystack. The
+    /// compiler may authenticate a private full-window entry into that same
+    /// implementation, without changing the public ordinary entry.
     NativeOrdinaryEntryLoop,
 }
 
@@ -1629,6 +1669,7 @@ pub struct CompiledModule {
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
+    native_direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
@@ -1802,7 +1843,7 @@ const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
     "fre_aot_regex_is_match_batch_exclusive_v1_";
 const DIRECT_EXISTS_BATCH_SYMBOL_PREFIX: &str = "fre_aot_regex_is_match_batch_v1_";
 const DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN: &[u8] =
-    b"fre-aot-regex/direct-exists-batch-v1\0";
+    b"fre-aot-regex/direct-exists-batch-trusted-full-window-v2\0";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
 const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
@@ -1945,6 +1986,7 @@ struct NativeLowering {
     /// This drives a final-object retry to the exact pre-feature complete-DFA
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
+    direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6163,6 +6205,7 @@ impl CompiledModule {
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
+            native_direct_exists_trusted_core: lowering.direct_exists_trusted_core,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -6850,6 +6893,9 @@ impl CompiledModule {
         if has_unresolved_function_dependency {
             return Ok(None);
         }
+        let Some(trusted_core) = self.native_direct_exists_trusted_core else {
+            return Ok(None);
+        };
 
         let entry = self.symbols.get(self.entry_symbol_index).ok_or(
             ObjectError::InvalidModule("direct Exists batch entry index is invalid"),
@@ -6883,10 +6929,34 @@ impl CompiledModule {
                 "direct Exists batch target is not a complete text function",
             ));
         }
+        if !(entry_start..entry_end).contains(&trusted_core.code_offset)
+            || !trusted_core.code_offset.is_multiple_of(match self.target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 4,
+            })
+            || !matches!(
+                (self.target.architecture, trusted_core.prologue),
+                (
+                    Architecture::X86_64,
+                    NativeDirectExistsTrustedCorePrologue::X86_64 { .. }
+                ) | (
+                    Architecture::Aarch64,
+                    NativeDirectExistsTrustedCorePrologue::Aarch64
+                )
+            )
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists trusted core is outside its ordinary entry",
+            ));
+        }
         let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
         let wrapper = match self.target.architecture {
-            Architecture::X86_64 => lower_x86_64_direct_exists_batch()?,
-            Architecture::Aarch64 => lower_aarch64_direct_exists_batch()?,
+            Architecture::X86_64 => {
+                lower_x86_64_direct_exists_batch(trusted_core.prologue)?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_direct_exists_batch(trusted_core.prologue)?
+            }
         };
         let alignment_mask = match self.target.architecture {
             Architecture::X86_64 => 15,
@@ -6922,20 +6992,41 @@ impl CompiledModule {
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct Exists batch local call offset",
             ))?;
+        let trampoline_offset = code_offset
+            .checked_add(wrapper.trampoline_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch trampoline offset",
+            ))?;
+        let core_jump_offset = code_offset
+            .checked_add(wrapper.core_jump_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch trusted-core jump offset",
+            ))?;
         match self.target.architecture {
             Architecture::X86_64 => {
-                patch_x86_64_local_call(&mut text, call_offset, entry_start)?;
+                patch_x86_64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_x86_64_local_jump(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
             }
             Architecture::Aarch64 => {
-                patch_aarch64_local_call(&mut text, call_offset, entry_start)?;
+                patch_aarch64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_aarch64_local_branch(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
             }
         }
         let mut batch_identity = Sha256::new();
         batch_identity.update(DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN);
         batch_identity.update(entry_name_digest);
-        batch_identity.update(u64::try_from(entry_start).map_err(|_| {
+        batch_identity.update(u64::try_from(trusted_core.code_offset).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Exists batch identity call target")
         })?.to_le_bytes());
+        batch_identity.update([trusted_core.prologue.identity_tag()]);
         batch_identity.update(u64::try_from(code_offset).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Exists batch identity code offset")
         })?.to_le_bytes());
@@ -9843,6 +9934,8 @@ struct NativePreparedBulkWrapper {
 struct NativeDirectExistsBatchWrapper {
     code: Vec<u8>,
     search_call_offset: usize,
+    trampoline_offset: usize,
+    core_jump_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10518,6 +10611,7 @@ fn lower_runtime_adapter(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10732,6 +10826,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -11161,6 +11256,7 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         composed_prepared,
         Some(mode),
@@ -11507,6 +11603,7 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -11728,6 +11825,7 @@ fn lower_native_slow_partial_with_data_limit(
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        direct_exists_trusted_core: None,
     }))
 }
 
@@ -13021,6 +13119,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -13775,6 +13874,7 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -21219,6 +21319,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         report,
     )))
@@ -21291,6 +21392,7 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         },
         report,
     )))
@@ -21846,6 +21948,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             .map_or(0, |filter| filter.guaranteed_bytes),
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
+        direct_exists_trusted_core: emission.direct_exists_trusted_core,
     }))
 }
 
@@ -28047,6 +28150,7 @@ fn native_regex_redux_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        native_direct_exists_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -40121,6 +40225,8 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x49, 0x89, 0x00])?;
         assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
     }
+    let has_direct_exists_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && layout.output == OutputContract::Exists;
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -40954,6 +41060,23 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     let mut finished = assembler.finish_with_label_offsets()?;
     let table_displacement = finished.label_offset(table_displacement_label)?;
+    let direct_exists_trusted_core_offset = if has_direct_exists_trusted_core {
+        let code_offset = table_displacement
+            .checked_sub(6)
+            .ok_or(ObjectError::InvalidModule(
+                "x86 direct Exists trusted core landmark",
+            ))?;
+        if finished.code.get(code_offset..table_displacement)
+            != Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 direct Exists trusted core landmark",
+            ));
+        }
+        Some(code_offset)
+    } else {
+        None
+    };
     if let Some(cold_start_label) = adaptive_cold_start {
         let cold_start = finished.label_offset(cold_start_label)?;
         let cold_bytes =
@@ -41031,6 +41154,18 @@ fn lower_x86_64_dfa_with_entry_contract(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        direct_exists_trusted_core: direct_exists_trusted_core_offset.map(|code_offset| {
+            NativeDirectExistsTrustedCore {
+                code_offset,
+                prologue: NativeDirectExistsTrustedCorePrologue::X86_64 {
+                    save_rbx: uses_exact_pair_phase_register,
+                    save_r12_r13: retain_vector_candidates
+                        || uses_seeded_reverse
+                        || retains_teddy_candidates,
+                    save_r14_r15: uses_seeded_reverse,
+                },
+            }
+        }),
     })
 }
 
@@ -44202,8 +44337,20 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     })
 }
 
-fn lower_x86_64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+fn lower_x86_64_direct_exists_batch(
+    prologue: NativeDirectExistsTrustedCorePrologue,
+) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 32;
+    let NativeDirectExistsTrustedCorePrologue::X86_64 {
+        save_rbx,
+        save_r12_r13,
+        save_r14_r15,
+    } = prologue
+    else {
+        return Err(ObjectError::InvalidModule(
+            "x86 direct Exists batch has a non-x86 trusted core",
+        ));
+    };
     let mut assembler = X86Assembler::new();
     let validated = assembler.label()?;
     let loop_head = assembler.label()?;
@@ -44212,6 +44359,7 @@ fn lower_x86_64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, 
     let late_invalid = assembler.label()?;
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
+    let trampoline = assembler.label()?;
 
     assembler.instruction(&[0x48, 0x85, 0xc9])?; // processed
     assembler.branch(&[0x0f, 0x84], invalid)?;
@@ -44294,9 +44442,28 @@ fn lower_x86_64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, 
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
+    assembler.bind(trampoline)?;
+    if save_rbx {
+        assembler.instruction(&[0x53])?;
+    }
+    if save_r12_r13 {
+        assembler.instruction(&[0x41, 0x54])?;
+        assembler.instruction(&[0x41, 0x55])?;
+    }
+    if save_r14_r15 {
+        assembler.instruction(&[0x41, 0x56])?;
+        assembler.instruction(&[0x41, 0x57])?;
+    }
+    assembler.instruction(&[0xe9])?;
+    let core_jump = assembler.label()?;
+    assembler.bind(core_jump)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativeDirectExistsBatchWrapper {
         search_call_offset: finished.label_offset(search_call)?,
+        trampoline_offset: finished.label_offset(trampoline)?,
+        core_jump_offset: finished.label_offset(core_jump)?,
         code: finished.code,
     })
 }
@@ -46337,8 +46504,15 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     })
 }
 
-fn lower_aarch64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+fn lower_aarch64_direct_exists_batch(
+    prologue: NativeDirectExistsTrustedCorePrologue,
+) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 96;
+    if prologue != NativeDirectExistsTrustedCorePrologue::Aarch64 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists batch has a non-AArch64 trusted core",
+        ));
+    }
     let mut assembler = Aarch64Assembler::new();
     let validated = assembler.label()?;
     let loop_head = assembler.label()?;
@@ -46422,11 +46596,32 @@ fn lower_aarch64_direct_exists_batch() -> Result<NativeDirectExistsBatchWrapper,
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let trampoline_offset = assembler.code.len();
+    let core_jump = assembler.instruction(0x1400_0000)?;
+    if core_jump != trampoline_offset {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline is not one branch",
+        ));
+    }
+
     let mut offsets = [search_call];
     let code = assembler.finish_with_offsets(&mut offsets)?;
+    let trampoline_offset = code
+        .len()
+        .checked_sub(4)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline is absent",
+        ))?;
+    if code.get(trampoline_offset..) != Some(0x1400_0000_u32.to_le_bytes().as_slice()) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline was rewritten",
+        ));
+    }
     Ok(NativeDirectExistsBatchWrapper {
         code,
         search_call_offset: offsets[0],
+        trampoline_offset,
+        core_jump_offset: trampoline_offset,
     })
 }
 
@@ -46467,6 +46662,44 @@ fn patch_x86_64_local_call(
     code.get_mut(displacement_offset..instruction_end_offset)
         .ok_or(ObjectError::InvalidModule(
             "x86 local call displacement is outside code",
+        ))?
+        .copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+fn patch_x86_64_local_jump(
+    code: &mut [u8],
+    displacement_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let instruction_end_offset = displacement_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local jump instruction end",
+        ))?;
+    if displacement_offset
+        .checked_sub(1)
+        .and_then(|opcode| code.get(opcode))
+        != Some(&0xe9)
+        || code.get(displacement_offset..instruction_end_offset) != Some(&[0, 0, 0, 0])
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 local jump placeholder is malformed",
+        ));
+    }
+    let target = i64::try_from(target)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local jump target"))?;
+    let instruction_end = i64::try_from(instruction_end_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local jump source"))?;
+    let displacement = target
+        .checked_sub(instruction_end)
+        .and_then(|displacement| i32::try_from(displacement).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local jump displacement",
+        ))?;
+    code.get_mut(displacement_offset..instruction_end_offset)
+        .ok_or(ObjectError::InvalidModule(
+            "x86 local jump displacement is outside code",
         ))?
         .copy_from_slice(&displacement.to_le_bytes());
     Ok(())
@@ -62172,6 +62405,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
         assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
     }
+    let has_direct_exists_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && layout.output == OutputContract::Exists;
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -63346,6 +63581,23 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    let direct_exists_trusted_core_offset = if has_direct_exists_trusted_core {
+        let code_offset = relocation_offsets[0]
+            .checked_sub(4)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 direct Exists trusted core landmark",
+            ))?;
+        if code.get(code_offset..relocation_offsets[0])
+            != Some(aarch64_mov_x(9, 2)?.to_le_bytes().as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 direct Exists trusted core landmark",
+            ));
+        }
+        Some(code_offset)
+    } else {
+        None
+    };
     let relocations = vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
@@ -63417,6 +63669,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        direct_exists_trusted_core: direct_exists_trusted_core_offset.map(|code_offset| {
+            NativeDirectExistsTrustedCore {
+                code_offset,
+                prologue: NativeDirectExistsTrustedCorePrologue::Aarch64,
+            }
+        }),
     })
 }
 
@@ -64438,6 +64696,40 @@ fn patch_aarch64_local_call(
     let immediate = u32::try_from(words.rem_euclid(modulus))
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local call immediate"))?;
     slot.copy_from_slice(&(0x9400_0000 | immediate).to_le_bytes());
+    Ok(())
+}
+
+fn patch_aarch64_local_branch(
+    code: &mut [u8],
+    instruction_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let end = instruction_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 local branch instruction end",
+        ))?;
+    let slot = code
+        .get_mut(instruction_offset..end)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 local branch is outside code",
+        ))?;
+    let instruction = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+    if instruction != 0x1400_0000 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local branch placeholder is malformed",
+        ));
+    }
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 26)? {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local branch is out of range",
+        ));
+    }
+    let modulus = 1_i64 << 26;
+    let immediate = u32::try_from(words.rem_euclid(modulus))
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local branch immediate"))?;
+    slot.copy_from_slice(&(0x1400_0000 | immediate).to_le_bytes());
     Ok(())
 }
 
@@ -72151,6 +72443,206 @@ mod tests {
         compiled
     }
 
+    fn aarch64_direct_branch_target(code: &[u8], instruction_offset: usize) -> usize {
+        let instruction = u32::from_le_bytes(
+            code[instruction_offset..instruction_offset + 4]
+                .try_into()
+                .expect("complete AArch64 direct branch"),
+        );
+        assert!(matches!(instruction >> 26, 0b000101 | 0b100101));
+        let immediate = i64::from(instruction & 0x03ff_ffff);
+        let signed_words = (immediate << 38) >> 38;
+        let source = i64::try_from(instruction_offset).expect("AArch64 source offset");
+        usize::try_from(source + signed_words * 4).expect("AArch64 branch target")
+    }
+
+    #[test]
+    fn direct_exists_batch_calls_only_an_authenticated_trusted_core() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("needle", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("ordinary direct Exists fixture");
+            let trusted_core = ordinary
+                .module()
+                .native_direct_exists_trusted_core
+                .expect("compiler-authenticated direct Exists core");
+            let entry = &ordinary.module().symbols[ordinary.module().entry_symbol_index];
+            let entry_start = usize::try_from(entry.offset).expect("ordinary entry start");
+            let entry_end = entry_start
+                .checked_add(usize::try_from(entry.size).expect("ordinary entry size"))
+                .expect("ordinary entry end");
+            assert!((entry_start..entry_end).contains(&trusted_core.code_offset));
+            assert!(trusted_core.code_offset > entry_start);
+            let ordinary_text = ordinary.module().sections[TEXT_SECTION].bytes();
+            match target.architecture {
+                Architecture::X86_64 => assert_eq!(
+                    ordinary_text
+                        .get(trusted_core.code_offset..trusted_core.code_offset + 3),
+                    Some([0x48, 0x89, 0xd6].as_slice()),
+                ),
+                Architecture::Aarch64 => assert_eq!(
+                    ordinary_text
+                        .get(trusted_core.code_offset..trusted_core.code_offset + 4),
+                    Some(aarch64_mov_x(9, 2).unwrap().to_le_bytes().as_slice()),
+                ),
+            }
+
+            let appended = ordinary
+                .module()
+                .clone()
+                .append_direct_exists_batch(OutputContract::Exists)
+                .expect("append authenticated direct Exists batch")
+                .expect("eligible authenticated direct Exists batch");
+            let batch_name = appended
+                .direct_exists_batch_symbol()
+                .expect("direct Exists batch symbol");
+            let batch = appended
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == batch_name)
+                .expect("direct Exists batch symbol record");
+            let batch_start = usize::try_from(batch.offset).expect("batch start");
+            let wrapper = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_direct_exists_batch(trusted_core.prologue)
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_direct_exists_batch(trusted_core.prologue)
+                }
+            }
+            .expect("lower authenticated wrapper shape");
+            assert_eq!(
+                usize::try_from(batch.size).expect("batch size"),
+                wrapper.code.len()
+            );
+            let text = appended.sections[TEXT_SECTION].bytes();
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let call_displacement = batch_start + wrapper.search_call_offset;
+                    assert_eq!(text[call_displacement - 1], 0xe8);
+                    let displacement = i64::from(i32::from_le_bytes(
+                        text[call_displacement..call_displacement + 4]
+                            .try_into()
+                            .expect("x86 call displacement"),
+                    ));
+                    let call_target = usize::try_from(
+                        i64::try_from(call_displacement + 4).expect("x86 call source")
+                            + displacement,
+                    )
+                    .expect("x86 call target");
+                    assert_eq!(call_target, batch_start + wrapper.trampoline_offset);
+                    assert_ne!(call_target, entry_start);
+
+                    let jump_displacement = batch_start + wrapper.core_jump_offset;
+                    assert_eq!(text[jump_displacement - 1], 0xe9);
+                    let displacement = i64::from(i32::from_le_bytes(
+                        text[jump_displacement..jump_displacement + 4]
+                            .try_into()
+                            .expect("x86 trusted-core jump displacement"),
+                    ));
+                    let jump_target = usize::try_from(
+                        i64::try_from(jump_displacement + 4).expect("x86 jump source")
+                            + displacement,
+                    )
+                    .expect("x86 jump target");
+                    assert_eq!(jump_target, trusted_core.code_offset);
+                }
+                Architecture::Aarch64 => {
+                    let call = batch_start + wrapper.search_call_offset;
+                    let trampoline = batch_start + wrapper.trampoline_offset;
+                    assert_eq!(aarch64_direct_branch_target(text, call), trampoline);
+                    assert_ne!(trampoline, entry_start);
+                    let jump = batch_start + wrapper.core_jump_offset;
+                    assert_eq!(jump, trampoline);
+                    assert_eq!(aarch64_direct_branch_target(text, jump), trusted_core.code_offset);
+                }
+            }
+
+            let mut forged = ordinary.module().clone();
+            forged.native_direct_exists_trusted_core = Some(NativeDirectExistsTrustedCore {
+                code_offset: entry_end,
+                prologue: trusted_core.prologue,
+            });
+            assert!(matches!(
+                forged.append_direct_exists_batch(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists trusted core is outside its ordinary entry"
+                ))
+            ));
+
+            let mut wrong_architecture = ordinary.module().clone();
+            wrong_architecture.native_direct_exists_trusted_core = Some(
+                NativeDirectExistsTrustedCore {
+                    code_offset: trusted_core.code_offset,
+                    prologue: match target.architecture {
+                        Architecture::X86_64 => NativeDirectExistsTrustedCorePrologue::Aarch64,
+                        Architecture::Aarch64 => {
+                            NativeDirectExistsTrustedCorePrologue::X86_64 {
+                                save_rbx: false,
+                                save_r12_r13: false,
+                                save_r14_r15: false,
+                            }
+                        }
+                    },
+                },
+            );
+            assert!(matches!(
+                wrong_architecture.append_direct_exists_batch(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists trusted core is outside its ordinary entry"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn x86_direct_exists_trampoline_reproduces_authenticated_callee_saves() {
+        for save_rbx in [false, true] {
+            for save_r12_r13 in [false, true] {
+                for save_r14_r15 in [false, true] {
+                    let wrapper = lower_x86_64_direct_exists_batch(
+                        NativeDirectExistsTrustedCorePrologue::X86_64 {
+                            save_rbx,
+                            save_r12_r13,
+                            save_r14_r15,
+                        },
+                    )
+                    .expect("x86 trusted-core wrapper");
+                    let mut expected = Vec::new();
+                    if save_rbx {
+                        expected.extend_from_slice(&[0x53]);
+                    }
+                    if save_r12_r13 {
+                        expected.extend_from_slice(&[0x41, 0x54, 0x41, 0x55]);
+                    }
+                    if save_r14_r15 {
+                        expected.extend_from_slice(&[0x41, 0x56, 0x41, 0x57]);
+                    }
+                    expected.push(0xe9);
+                    assert_eq!(
+                        &wrapper.code[wrapper.trampoline_offset..wrapper.core_jump_offset],
+                        expected,
+                    );
+                    assert_eq!(
+                        wrapper
+                            .code
+                            .get(wrapper.core_jump_offset..wrapper.core_jump_offset + 4),
+                        Some([0, 0, 0, 0].as_slice()),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn aarch64_prepared_grep_count_rejects_lf_free_words_before_scalar_tail() {
         let wrapper = lower_aarch64_prepared_grep_count(
@@ -76089,6 +76581,7 @@ mod tests {
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         })
     }
 
@@ -76483,6 +76976,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_exists_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -76734,6 +77228,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_exists_trusted_core: None,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -76904,6 +77399,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_exists_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -77058,6 +77554,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_exists_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -97812,6 +98309,7 @@ int main(void){{
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_exists_trusted_core: None,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -114732,6 +115230,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
                 direct_exists_batch_symbol_index: None,
+                native_direct_exists_trusted_core: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
@@ -115061,6 +115560,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
+            native_direct_exists_trusted_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -127018,6 +127518,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_exists_trusted_core: None,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();

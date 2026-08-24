@@ -124,6 +124,25 @@ fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
         assert!(declined.module().direct_exists_batch_symbol().is_none());
     }
 
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("(?-u:a|b)", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists);
+        let ordinary = compile(request.clone()).expect("exact byte-set Exists artifact");
+        assert!(ordinary.receipt().exact_finite_exists_byte_set_aot.is_some());
+        let declined = compile_with_independent_exists_batch(request)
+            .expect("trusted-core-ineligible exact byte-set decline");
+        assert_eq!(declined.object(), ordinary.object());
+        assert_eq!(declined.module(), ordinary.module());
+        assert_eq!(declined.receipt(), ordinary.receipt());
+        assert!(declined.module().direct_exists_batch_symbol().is_none());
+    }
+
     assert!(matches!(
         compile_with_independent_exists_batch(
             CompileRequest::new("needle", Target::x86_64_linux())
