@@ -14,7 +14,7 @@ use fre_aot_count_compiler::{
 };
 use fre_aot_optimizer::{
     COUNT_V3_RECIPE_CANONICAL_BYTES, CountV3OptimizeError, CountV3RequiredIsa,
-    CountV3TuningClass, encode_count_recipe_v3,
+    CountV3Strategy, CountV3TuningClass, encode_count_recipe_v3,
 };
 use fre_kernel_ir::{
     AggregateBuildError, BuildError, Count, ValidateError, ValidateLimits,
@@ -27,7 +27,26 @@ use crate::{
     PreparedAggregateStrategy, Target,
 };
 
-pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 1;
+pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 2;
+
+/// Largest source length routed to the authenticated incumbent body for the
+/// short-input periodic schedule. The focused core starts at one complete
+/// 8-KiB source span, so one shifted AArch64 immediate performs the admission
+/// without materializing a constant register.
+pub const DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES: u32 = 8191;
+
+/// Derive the complete source-only admission policy from an independently
+/// inspected optimizer strategy and the authenticated finite-literal width.
+pub(crate) const fn direct_exact_singleton_count_short_fallback_max_bytes(
+    strategy: CountV3Strategy,
+    literal_bytes: usize,
+) -> Option<u32> {
+    if matches!(strategy, CountV3Strategy::PeriodicRun) && matches!(literal_bytes, 2 | 4) {
+        Some(DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES)
+    } else {
+        None
+    }
+}
 
 /// Count successor rule authenticated by both exact finite-language facts and
 /// the focused Count-v3 recipe.
@@ -43,6 +62,9 @@ pub enum DirectExactSingletonCountSelectionBasis {
     /// Both scan once, while the focused core removes the incumbent's
     /// per-match search call and internal span publication.
     StructuralSingleScanDominance,
+    /// The direct arm has the same structural dominance, while a source-only
+    /// length gate retains the authenticated incumbent for its startup range.
+    StructuralSingleScanDominanceWithShortIncumbent,
 }
 
 /// Comparable operation shape. Smaller is better in every runtime field;
@@ -79,8 +101,16 @@ pub struct DirectExactSingletonCountAotReport {
     pub selection_basis: DirectExactSingletonCountSelectionBasis,
     pub incumbent_strategy: PreparedAggregateStrategy,
     pub incumbent_cost: DirectExactSingletonCountCostShape,
+    /// Cost of the selected direct arm. When `short_fallback_max_bytes` is
+    /// present, shorter sources use the exact `incumbent_cost` arm instead.
     pub selected_cost: DirectExactSingletonCountCostShape,
     pub authenticated_wrapper_body_offset: usize,
+    /// Inclusive source-length ceiling for the byte-identical incumbent arm.
+    /// `None` means the selected core owns every authenticated source length.
+    pub short_fallback_max_bytes: Option<u32>,
+    /// Text extent of the relocated incumbent body used by the short arm.
+    pub copied_incumbent_body_offset: Option<usize>,
+    pub copied_incumbent_body_bytes: Option<usize>,
     pub core_offset: usize,
     pub core_bytes: usize,
     pub core_sha256: [u8; 32],

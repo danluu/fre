@@ -102,6 +102,7 @@ pub use error::{
 };
 pub use direct_count_v3::{
     DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+    DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
     DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
     DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
 };

@@ -243,9 +243,27 @@ fn direct_exact_singleton_count_selects_for_every_supported_width_and_format() {
                 report.successor_mode,
                 crate::DirectExactSingletonCountSuccessorMode::NonOverlapping,
             );
+            let has_short_fallback = matches!(width, 2 | 4);
             assert_eq!(
                 report.selection_basis,
-                crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance,
+                if has_short_fallback {
+                    crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominanceWithShortIncumbent
+                } else {
+                    crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
+                },
+            );
+            assert_eq!(
+                report.short_fallback_max_bytes,
+                has_short_fallback
+                    .then_some(crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES),
+            );
+            assert_eq!(
+                report.copied_incumbent_body_offset.is_some(),
+                has_short_fallback,
+            );
+            assert_eq!(
+                report.copied_incumbent_body_bytes.is_some(),
+                has_short_fallback,
             );
             assert_eq!(report.incumbent_cost.scan_passes, 1);
             assert_eq!(report.selected_cost.scan_passes, 1);
@@ -452,6 +470,41 @@ fn direct_exact_singleton_count_object_cap_decline_is_incumbent_exact_and_alloca
             .is_none(),
     );
 
+    let gated_request =
+        direct_count_request("aa", target, CompileMode::Optimizing, default_cap);
+    let gated_incumbent = compile_count_with_direct_candidate_declined(
+        gated_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let gated_selected = compile_with_prepared_aggregate_exports(
+        gated_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile selected short-gated Count-v3 control");
+    assert!(gated_selected
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .is_some_and(|report| report.short_fallback_max_bytes.is_some()));
+    let gated_cap = gated_selected.object().len() - 1;
+    assert!(gated_cap >= gated_incumbent.object().len());
+    let capped_gated_request =
+        direct_count_request("aa", target, CompileMode::Optimizing, gated_cap);
+    let capped_gated_incumbent = compile_count_with_direct_candidate_declined(
+        capped_gated_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let capped_gated = compile_with_prepared_aggregate_exports(
+        capped_gated_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("short-gated Count-v3 object cap declines to incumbent");
+    assert_eq!(capped_gated.object(), capped_gated_incumbent.object());
+    assert_eq!(capped_gated.module(), capped_gated_incumbent.module());
+    assert!(capped_gated
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .is_none());
+
     let low_cap = incumbent.object().len() - 1;
     let low_request =
         direct_count_request("abcdefgh", target, CompileMode::Optimizing, low_cap);
@@ -540,7 +593,7 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
         .native_exact_singleton_count_literal()
         .expect("authenticated singleton witness");
     let artifact_identity = incumbent.program().artifact_identity();
-    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+    let mut candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
         literal,
         artifact_identity,
         target,
@@ -564,6 +617,21 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
             .authenticate_embedded(literal, &tampered_core)
             .is_err(),
     );
+
+    let canonical_strategy = candidate.canonical_recipe[13];
+    candidate.canonical_recipe[13] = if canonical_strategy == 1 { 2 } else { 1 };
+    let mut tampered_recipe_strategy = incumbent.module().clone();
+    assert!(tampered_recipe_strategy
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+    candidate.canonical_recipe[13] = canonical_strategy;
+
+    candidate.recipe_identity[0] ^= 1;
+    let mut tampered_recipe_identity = incumbent.module().clone();
+    assert!(tampered_recipe_identity
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+    candidate.recipe_identity[0] ^= 1;
 
     let mut wrong_identity = incumbent.module().clone();
     assert!(wrong_identity
@@ -637,6 +705,179 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
     assert!(selected.symbols().iter().all(|symbol| {
         !symbol.name.contains("fre_aot_count") && symbol.section.is_some()
     }));
+}
+
+#[test]
+fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() {
+    fn signed_target(instruction_offset: usize, immediate: u32, bits: u32) -> usize {
+        let shift = 64 - bits;
+        let words = ((u64::from(immediate) << shift) as i64) >> shift;
+        usize::try_from(
+            i64::try_from(instruction_offset).expect("instruction offset fits i64")
+                + words * 4,
+        )
+        .expect("local branch target is nonnegative")
+    }
+
+    fn direct_branch(instruction: u32) -> Option<(u32, u32, bool)> {
+        if instruction & 0xfc00_0000 == 0x9400_0000 {
+            Some((instruction & 0x03ff_ffff, 26, true))
+        } else if instruction & 0xfc00_0000 == 0x1400_0000 {
+            Some((instruction & 0x03ff_ffff, 26, false))
+        } else if instruction & 0xff00_0010 == 0x5400_0000 {
+            Some(((instruction >> 5) & 0x7ffff, 19, false))
+        } else if instruction & 0x7e00_0000 == 0x3400_0000 {
+            Some(((instruction >> 5) & 0x7ffff, 19, false))
+        } else if instruction & 0x7e00_0000 == 0x3600_0000 {
+            Some(((instruction >> 5) & 0x3fff, 14, false))
+        } else {
+            None
+        }
+    }
+
+    fn is_pc_relative_address_or_literal(instruction: u32) -> bool {
+        instruction & 0x1f00_0000 == 0x1000_0000
+            || instruction & 0x3b00_0000 == 0x1800_0000
+    }
+
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile short-gated direct Count-v3");
+    let report = selected
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .expect("short-gated direct Count-v3 report");
+    let short_max = report
+        .short_fallback_max_bytes
+        .expect("periodic width-two short fallback");
+    assert_eq!(
+        short_max,
+        crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+    );
+    let copied_offset = report
+        .copied_incumbent_body_offset
+        .expect("copied incumbent body offset");
+    let copied_bytes = report
+        .copied_incumbent_body_bytes
+        .expect("copied incumbent body bytes");
+
+    let selected_text = selected
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("selected text")
+        .bytes();
+    let incumbent_text = incumbent
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("incumbent text")
+        .bytes();
+    let authenticated = report.authenticated_wrapper_body_offset;
+    let gate = selected_text[authenticated..authenticated + 24]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("instruction")))
+        .collect::<Vec<_>>();
+    let direct_min = short_max.checked_add(1).expect("short threshold successor");
+    assert!(direct_min.is_multiple_of(1 << 12));
+    assert_eq!(
+        gate[0],
+        0xf140_001f | ((direct_min >> 12) << 10) | (2 << 5),
+    );
+    assert_eq!(gate[1] & 0xff00_001f, 0x5400_0003);
+    assert_eq!(
+        signed_target(authenticated + 4, (gate[1] >> 5) & 0x7ffff, 19),
+        copied_offset,
+    );
+    assert_eq!(gate[2], 0xaa01_03e0);
+    assert_eq!(gate[3], 0xaa02_03e1);
+    assert_eq!(gate[4], 0xaa03_03e2);
+    assert_eq!(gate[5] & 0xfc00_0000, 0x1400_0000);
+    assert_eq!(
+        signed_target(authenticated + 20, gate[5] & 0x03ff_ffff, 26),
+        report.core_offset,
+    );
+
+    let original_body = &incumbent_text[authenticated..authenticated + copied_bytes];
+    let copied_body = &selected_text[copied_offset..copied_offset + copied_bytes];
+    let differing_words = original_body
+        .chunks_exact(4)
+        .zip(copied_body.chunks_exact(4))
+        .filter(|(original, copied)| original != copied)
+        .collect::<Vec<_>>();
+    assert_eq!(differing_words.len(), 1, "only the local BL is relocated");
+    for word in [differing_words[0].0, differing_words[0].1] {
+        let word = u32::from_le_bytes(word.try_into().expect("BL instruction"));
+        assert_eq!(word & 0xfc00_0000, 0x9400_0000);
+    }
+
+    let ordinary_name = incumbent.module().entry_symbol();
+    let ordinary_offset = usize::try_from(
+        incumbent
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary_name)
+            .expect("ordinary entry symbol")
+            .offset,
+    )
+    .expect("ordinary entry offset");
+    let copied_delta = copied_offset - authenticated;
+    let mut escaping_calls = 0;
+    for (index, (original, copied)) in original_body
+        .chunks_exact(4)
+        .zip(copied_body.chunks_exact(4))
+        .enumerate()
+    {
+        let original = u32::from_le_bytes(original.try_into().expect("original instruction"));
+        let copied = u32::from_le_bytes(copied.try_into().expect("copied instruction"));
+        let Some((immediate, bits, call)) = direct_branch(original) else {
+            assert!(
+                !is_pc_relative_address_or_literal(original),
+                "incumbent body contains an unaudited PC-relative address or literal instruction",
+            );
+            continue;
+        };
+        let original_offset = authenticated + index * 4;
+        let original_target = signed_target(original_offset, immediate, bits);
+        let copied_instruction_offset = copied_offset + index * 4;
+        let (copied_immediate, copied_bits, copied_call) =
+            direct_branch(copied).expect("copied direct branch shape");
+        let copied_target = signed_target(
+            copied_instruction_offset,
+            copied_immediate,
+            copied_bits,
+        );
+        if call {
+            escaping_calls += 1;
+            assert!(copied_call);
+            assert_eq!(original_target, ordinary_offset);
+            assert_eq!(copied_target, ordinary_offset);
+        } else {
+            assert!(!copied_call);
+            assert!(
+                (authenticated..authenticated + copied_bytes).contains(&original_target),
+                "non-call branch at {original_offset:#x} escapes the incumbent body",
+            );
+            assert_eq!(copied_target, original_target + copied_delta);
+        }
+    }
+    assert_eq!(escaping_calls, 1, "the ordinary BL is the sole escaping branch");
 }
 
 #[cfg(all(
@@ -722,6 +963,8 @@ fn linked_host_direct_exact_singleton_count_matches_generated_nonoverlap_oracle(
         let dense_initializer = initializer(&dense);
         let overlap_initializer = initializer(&overlap);
         let overlap_count = (width + 3) / width;
+        let short_max = crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES;
+        let boundary_bytes = short_max + 2;
         write!(
             &mut source,
             r#"
@@ -762,6 +1005,15 @@ static int check_{width}(void){{
       out=99U;
       if({entry}(handle,exhaustive,exhaustive_len,&out)!=0U||out!=expected)return 13;
     }}
+  }}
+  uint8_t boundary[{boundary_bytes}U];
+  for(size_t index=0U;index<sizeof(boundary);index++)boundary[index]=(index%7U)==3U?'b':'a';
+  const size_t boundary_lengths[3]={{{short_max}U,{short_max}U+1U,{short_max}U+2U}};
+  for(size_t index=0U;index<3U;index++){{
+    size_t boundary_len=boundary_lengths[index];
+    uint64_t expected=reference_nonoverlap_a(boundary,boundary_len,{width}U);
+    out=99U;
+    if({entry}(handle,boundary,boundary_len,&out)!=0U||out!=expected)return 14;
   }}
   return 0;
 }}

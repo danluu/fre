@@ -34,6 +34,7 @@ use crate::{
         DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
         DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
         PreparedDirectExactSingletonCount,
+        direct_exact_singleton_count_short_fallback_max_bytes,
     },
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
@@ -9042,6 +9043,19 @@ impl CompiledModule {
                 "direct Count-v3 candidate binding disagrees",
             ));
         }
+        let candidate_recipe = fre_aot_optimizer::inspect_count_recipe_v3(
+            &candidate.canonical_recipe,
+        )
+        .map_err(|_| {
+            ObjectError::InvalidModule(
+                "direct Count-v3 canonical recipe authentication failed",
+            )
+        })?;
+        if candidate_recipe.identity().as_bytes() != &candidate.recipe_identity {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 canonical recipe identity disagrees",
+            ));
+        }
         let Some(authenticated_body_offset) = self.prepared_count_authenticated_body_offset else {
             return Ok(None);
         };
@@ -9131,6 +9145,8 @@ impl CompiledModule {
             || identity_page_offset_relocation.kind != RelocationKind::Aarch64PageOff12
             || identity_page_offset_relocation.addend != 0
             || identity_page_relocation.symbol != identity_page_offset_relocation.symbol
+            || identity_page >= authenticated_body_offset
+            || identity_page_offset >= authenticated_body_offset
         {
             return Err(ObjectError::InvalidModule(
                 "direct Count-v3 incumbent relocation surface disagrees",
@@ -9198,24 +9214,47 @@ impl CompiledModule {
                 "direct Count-v3 incumbent text is not instruction aligned",
             ));
         }
-        let core_offset = original_text_bytes
+        let short_fallback_max_bytes =
+            direct_exact_singleton_count_short_fallback_max_bytes(
+                candidate_recipe.strategy(),
+                literal.len(),
+            );
+        let incumbent_body_bytes = count_end.checked_sub(authenticated_body_offset).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent body extent is invalid"),
+        )?;
+        if !incumbent_body_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent body is not instruction aligned",
+            ));
+        }
+        let copied_incumbent_body_offset = short_fallback_max_bytes
+            .map(|_| original_text_bytes);
+        let copied_incumbent_body_bytes = short_fallback_max_bytes
+            .map(|_| incumbent_body_bytes);
+        let appended_incumbent_end = copied_incumbent_body_offset
+            .zip(copied_incumbent_body_bytes)
+            .map_or(Ok(original_text_bytes), |(offset, bytes)| {
+                offset.checked_add(bytes).ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 copied incumbent body extent",
+                ))
+            })?;
+        let core_offset = appended_incumbent_end
             .checked_add(3)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct Count-v3 core alignment",
             ))?
             & !3;
-        let core_padding = core_offset.checked_sub(original_text_bytes).ok_or(
-            ObjectError::ArithmeticOverflow("direct Count-v3 core padding"),
-        )?;
         let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
             ObjectError::ArithmeticOverflow("direct Count-v3 core extent"),
         )?;
         let incumbent_code_bytes = u32::try_from(count_size).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Count-v3 incumbent code bytes")
         })?;
+        let appended_code_bytes = final_text_bytes.checked_sub(original_text_bytes).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 appended code bytes"),
+        )?;
         let selected_code_bytes = count_size
-            .checked_add(core_padding)
-            .and_then(|bytes| bytes.checked_add(candidate.code.len()))
+            .checked_add(appended_code_bytes)
             .and_then(|bytes| u32::try_from(bytes).ok())
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct Count-v3 selected code bytes",
@@ -9250,20 +9289,79 @@ impl CompiledModule {
             return Ok(None);
         }
 
-        let branch_offset = authenticated_body_offset.checked_add(12).ok_or(
+        let direct_branch_relative = if short_fallback_max_bytes.is_some() {
+            20
+        } else {
+            12
+        };
+        let branch_offset = authenticated_body_offset.checked_add(direct_branch_relative).ok_or(
             ObjectError::ArithmeticOverflow("direct Count-v3 tail branch offset"),
         )?;
         let Some(branch) = aarch64_local_branch_instruction(branch_offset, core_offset)? else {
             return Ok(None);
         };
-        let patch = [
-            aarch64_mov_x(0, 1)?,
-            aarch64_mov_x(1, 2)?,
-            aarch64_mov_x(2, 3)?,
-            branch,
-        ];
-        let mut patch_bytes = [0_u8; 16];
-        for (slot, instruction) in patch_bytes.chunks_exact_mut(4).zip(patch) {
+        let mut patch = [0xd503_201f_u32; 6];
+        let patch_instructions: usize = if let (
+            Some(short_max),
+            Some(copied_offset),
+        ) = (short_fallback_max_bytes, copied_incumbent_body_offset)
+        {
+            let direct_min = short_max.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 short threshold"),
+            )?;
+            if !direct_min.is_multiple_of(1 << 12) {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 short threshold is not page aligned",
+                ));
+            }
+            let pages = u16::try_from(direct_min >> 12).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Count-v3 short threshold pages")
+            })?;
+            let gate_branch_offset = authenticated_body_offset.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 short branch offset"),
+            )?;
+            let Some(short_branch) = aarch64_local_cond_branch_instruction(
+                gate_branch_offset,
+                copied_offset,
+                AARCH64_LO,
+            )? else {
+                return Ok(None);
+            };
+            patch = [
+                aarch64_cmp_x_imm_lsl12(2, pages)?,
+                short_branch,
+                aarch64_mov_x(0, 1)?,
+                aarch64_mov_x(1, 2)?,
+                aarch64_mov_x(2, 3)?,
+                branch,
+            ];
+            6
+        } else {
+            patch[..4].copy_from_slice(&[
+                aarch64_mov_x(0, 1)?,
+                aarch64_mov_x(1, 2)?,
+                aarch64_mov_x(2, 3)?,
+                branch,
+            ]);
+            4
+        };
+        let patch_bytes_len = patch_instructions.checked_mul(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 wrapper patch bytes"),
+        )?;
+        if authenticated_body_offset
+            .checked_add(patch_bytes_len)
+            .is_none_or(|end| end > count_end)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 wrapper patch escapes its incumbent body",
+            ));
+        }
+        let mut patch_bytes = [0_u8; 24];
+        for (slot, instruction) in patch_bytes
+            .chunks_exact_mut(4)
+            .zip(patch.into_iter())
+            .take(patch_instructions)
+        {
             slot.copy_from_slice(&instruction.to_le_bytes());
         }
         let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
@@ -9273,12 +9371,70 @@ impl CompiledModule {
         text.try_reserve_exact(final_text_bytes)
             .map_err(|_| ObjectError::Allocation("direct Count-v3 module text"))?;
         text.extend_from_slice(&self.sections[TEXT_SECTION].data);
-        text[authenticated_body_offset..authenticated_body_offset + 16]
-            .copy_from_slice(&patch_bytes);
+        if let Some(copied_offset) = copied_incumbent_body_offset {
+            while text.len() < copied_offset {
+                text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+            }
+            text.extend_from_slice(
+                &self.sections[TEXT_SECTION].data[authenticated_body_offset..count_end],
+            );
+            let copied_call_offset = copied_offset
+                .checked_add(call_offset.checked_sub(authenticated_body_offset).ok_or(
+                    ObjectError::InvalidModule(
+                        "direct Count-v3 incumbent call precedes authenticated body",
+                    ),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 copied incumbent call offset",
+                ))?;
+            let copied_call_end = copied_call_offset.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 copied incumbent call extent"),
+            )?;
+            let Some(copied_call) = aarch64_local_call_instruction(
+                copied_call_offset,
+                ordinary_offset,
+            )? else {
+                return Ok(None);
+            };
+            text.get_mut(copied_call_offset..copied_call_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 copied incumbent call escapes text",
+                ))?
+                .copy_from_slice(&copied_call.to_le_bytes());
+            let copied_relative_call = copied_call_offset.checked_sub(copied_offset).ok_or(
+                ObjectError::InvalidModule("direct Count-v3 copied call precedes its body"),
+            )?;
+            let copied_relative_call_end = copied_relative_call.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 copied relative call extent"),
+            )?;
+            let original_body = &self.sections[TEXT_SECTION].data
+                [authenticated_body_offset..count_end];
+            let copied_body = text
+                .get(copied_offset..appended_incumbent_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 copied incumbent body escapes text",
+                ))?;
+            if copied_body.get(..copied_relative_call)
+                != original_body.get(..copied_relative_call)
+                || copied_body.get(copied_relative_call..copied_relative_call_end)
+                    != Some(copied_call.to_le_bytes().as_slice())
+                || copied_body.get(copied_relative_call_end..)
+                    != original_body.get(copied_relative_call_end..)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 copied incumbent body disagrees",
+                ));
+            }
+        }
         while text.len() < core_offset {
             text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
         }
         text.extend_from_slice(&candidate.code);
+        let patch_end = authenticated_body_offset.checked_add(patch_bytes_len).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 wrapper patch extent"),
+        )?;
+        text[authenticated_body_offset..patch_end]
+            .copy_from_slice(&patch_bytes[..patch_bytes_len]);
         let embedded_sha256: [u8; 32] =
             Sha256::digest(&text[core_offset..final_text_bytes]).into();
         if text.get(core_offset..final_text_bytes) != Some(candidate.code.as_ref())
@@ -9292,8 +9448,13 @@ impl CompiledModule {
             literal,
             &text[core_offset..final_text_bytes],
         )?;
+        let selection_basis = if short_fallback_max_bytes.is_some() {
+            DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominanceWithShortIncumbent
+        } else {
+            DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
+        };
         let mut selected_identity = Sha256::new();
-        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v1\0");
+        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v2\0");
         selected_identity.update(incumbent_module_identity);
         selected_identity.update(artifact_identity);
         selected_identity.update(candidate.recipe_identity);
@@ -9301,8 +9462,23 @@ impl CompiledModule {
         selected_identity.update([
             literal_bytes,
             1, // NonOverlapping successor.
-            1, // StructuralSingleScanDominance selection.
+            if short_fallback_max_bytes.is_some() { 2 } else { 1 },
         ]);
+        selected_identity.update(short_fallback_max_bytes.unwrap_or(0).to_le_bytes());
+        for extent in [
+            copied_incumbent_body_offset,
+            copied_incumbent_body_bytes,
+        ] {
+            selected_identity.update(
+                u64::try_from(extent.unwrap_or(0))
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 copied incumbent identity extent",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+        }
         selected_identity.update(
             u64::try_from(authenticated_body_offset)
                 .map_err(|_| {
@@ -9330,6 +9506,7 @@ impl CompiledModule {
         selected_identity.update(incumbent_cost.code_bytes.to_le_bytes());
         selected_identity.update(selected_cost.runtime_components());
         selected_identity.update(selected_cost.code_bytes.to_le_bytes());
+        selected_identity.update(Sha256::digest(&text));
         let module_identity: [u8; 32] = selected_identity.finalize().into();
         let count_name = identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &module_identity)?;
         let selected_text = text.into_boxed_slice();
@@ -9346,12 +9523,14 @@ impl CompiledModule {
                 schema_version: DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
                 literal_bytes,
                 successor_mode: DirectExactSingletonCountSuccessorMode::NonOverlapping,
-                selection_basis:
-                    DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance,
+                selection_basis,
                 incumbent_strategy: PreparedAggregateStrategy::NativeFused,
                 incumbent_cost,
                 selected_cost,
                 authenticated_wrapper_body_offset: authenticated_body_offset,
+                short_fallback_max_bytes,
+                copied_incumbent_body_offset,
+                copied_incumbent_body_bytes,
                 core_offset,
                 core_bytes: candidate.code.len(),
                 core_sha256: candidate.core_sha256,
@@ -9379,9 +9558,14 @@ impl CompiledModule {
             .ok_or(ObjectError::InvalidModule(
                 "direct Count-v3 rollback has no selected report",
             ))?;
+        let original_text_bytes = report
+            .copied_incumbent_body_offset
+            .unwrap_or(report.core_offset);
         if report.core_offset.checked_add(report.core_bytes)
             != Some(self.sections[TEXT_SECTION].data.len())
-            || rollback.original_text.len() != report.core_offset
+            || rollback.original_text.len() != original_text_bytes
+            || report.copied_incumbent_body_offset.is_some()
+                != report.copied_incumbent_body_bytes.is_some()
         {
             return Err(ObjectError::InvalidModule(
                 "direct Count-v3 rollback checkpoint disagrees",
@@ -56996,6 +57180,15 @@ fn aarch64_cmp_x_imm(register: u8, immediate: u16) -> Result<u32, ObjectError> {
     Ok(0xf100_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
 }
 
+fn aarch64_cmp_x_imm_lsl12(register: u8, immediate: u16) -> Result<u32, ObjectError> {
+    if immediate > 0x0fff {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 CMP X shifted immediate",
+        ));
+    }
+    Ok(0xf140_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
+}
+
 fn aarch64_csel_x(
     destination: u8,
     when_true: u8,
@@ -66127,6 +66320,31 @@ fn aarch64_local_branch_instruction(
         ObjectError::ArithmeticOverflow("AArch64 direct Count-v3 tail branch immediate")
     })?;
     Ok(Some(0x1400_0000 | immediate))
+}
+
+fn aarch64_local_cond_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+    condition: u8,
+) -> Result<Option<u32>, ObjectError> {
+    if condition > 15 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Count-v3 conditional branch condition",
+        ));
+    }
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 19)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << 19;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow(
+            "AArch64 direct Count-v3 conditional branch immediate",
+        )
+    })?;
+    Ok(Some(
+        0x5400_0000 | (immediate << 5) | u32::from(condition),
+    ))
 }
 
 fn aarch64_local_call_instruction(
