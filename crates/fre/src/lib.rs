@@ -890,7 +890,8 @@ use fre_kernels::{
     ExactLiteralOrdinaryExecutor, LiteralAccounting, LiteralBuildLimits,
     LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan, LiteralError, LiteralPlan,
     LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
-    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryExecutor, LiteralSetCompactPlan,
+    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
+    LiteralSetCompactOrdinaryExecutor, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
     LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
     LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
@@ -6042,6 +6043,84 @@ pub enum RipgrepStandardLiteralHirBuild {
     Refused(Hir),
 }
 
+/// Result of ripgrep's authenticated ordinary literal-set construction.
+///
+/// The ordinary variant deliberately has no checked or finite-search surface.
+/// Callers that receive the portable variant retain the complete established
+/// [`PortableRegex`] contract.
+#[doc(hidden)]
+pub enum RipgrepStandardLiteralsBuild {
+    /// Ripgrep may bind only an ordinary unmetered worker session.
+    Ordinary(RipgrepOrdinaryRegex),
+    /// Construction retained the checked canonical portable owner.
+    Portable(PortableRegex),
+}
+
+/// Ripgrep-only owner for one authenticated ordinary compact literal set.
+///
+/// Identity and construction reporting remain bound to the same immutable
+/// source as the retained engine, but finite, accounted and explicit-session
+/// methods are intentionally absent. Those APIs remain exclusive to
+/// [`PortableRegex`].
+#[doc(hidden)]
+pub struct RipgrepOrdinaryRegex {
+    source: Box<str>,
+    _capture_names: Box<[Option<Box<str>>]>,
+    literal_set: LiteralSetCompactOrdinaryPlan,
+    report: BuildReport,
+}
+
+impl fmt::Debug for RipgrepStandardLiteralsBuild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ordinary(_) => "RipgrepStandardLiteralsBuild::Ordinary(..)",
+            Self::Portable(_) => "RipgrepStandardLiteralsBuild::Portable(..)",
+        })
+    }
+}
+
+impl fmt::Debug for RipgrepOrdinaryRegex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RipgrepOrdinaryRegex")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RipgrepOrdinaryRegex {
+    /// Return the canonical source authenticated during construction.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    /// Return the complete construction and persistent-storage receipt.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn build_report(&self) -> &BuildReport {
+        &self.report
+    }
+
+    /// Return the construction-selected ordinary runtime identity.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.literal_set.runtime_implementation_id()
+    }
+
+    /// Bind one thread-confined ordinary worker session.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn ordinary_session(&self) -> PortableOrdinarySession<'_> {
+        PortableOrdinarySession {
+            plan: PortableOrdinarySessionPlan::LiteralSetCompact {
+                executor: self.literal_set.ordinary_executor(),
+            },
+        }
+    }
+}
+
 struct RipgrepStandardLiteralContext {
     source: Box<str>,
     admission: AdmissionStatus,
@@ -6101,6 +6180,36 @@ fn try_box_ripgrep_compact_literal_set(
         return Err(literal_set);
     }
     fre_exact_alloc::try_box_preserve(literal_set).map_err(|(_, literal_set)| literal_set)
+}
+
+fn ripgrep_flat_literal_build_report(
+    builder: &PortableBuilder,
+    planner_work: u64,
+    publication: &RipgrepFlatLiteralPublication,
+    plan_storage_bytes: usize,
+) -> Result<BuildReport, BuildError> {
+    BuildReport {
+        profile: publication.profile.clone(),
+        admission: publication.admission,
+        syntax: publication.syntax.clone(),
+        plan: PlanKind::LiteralSetDfa,
+        planner_work,
+        lowering: None,
+        states: 0,
+        edges: 0,
+        plan_storage_bytes,
+        source_storage_bytes: publication.source_storage_bytes,
+        capture_name_storage_bytes: publication.capture_name_storage_bytes,
+        charged_persistent_bytes: 0,
+        persistent_byte_limit: 0,
+        captures_len: publication.captures_len,
+        static_captures_len: publication.static_captures_len,
+        minimum_match_bytes: publication.minimum_match_bytes,
+        required_literal: None,
+        literal_class_run_literal: None,
+        forward_anchored: None,
+    }
+    .enforce_persistent_limit(builder.limits.max_persistent_bytes)
 }
 
 #[cold]
@@ -6164,37 +6273,106 @@ fn publish_ripgrep_borrowed_flat_literal_set(
             (PortablePlan::LiteralSetDfa(literal_set), storage)
         }
     };
+    let report = ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
     Ok(PortableRegex {
         source: publication.source,
         capture_names: publication.capture_names,
         line_total_grep_plan: publication.line_total_grep_plan,
         plan,
-        profile: publication.profile.clone(),
+        profile: publication.profile,
         limits: builder.limits,
         selection: builder.selection,
-        report: BuildReport {
-            profile: publication.profile,
-            admission: publication.admission,
-            syntax: publication.syntax,
-            plan: PlanKind::LiteralSetDfa,
-            planner_work,
-            lowering: None,
-            states: 0,
-            edges: 0,
-            plan_storage_bytes: storage,
-            source_storage_bytes: publication.source_storage_bytes,
-            capture_name_storage_bytes: publication.capture_name_storage_bytes,
-            charged_persistent_bytes: 0,
-            persistent_byte_limit: 0,
-            captures_len: publication.captures_len,
-            static_captures_len: publication.static_captures_len,
-            minimum_match_bytes: publication.minimum_match_bytes,
-            required_literal: None,
-            literal_class_run_literal: None,
-            forward_anchored: None,
-        }
-        .enforce_persistent_limit(builder.limits.max_persistent_bytes)?,
+        report,
     })
+}
+
+fn publish_ripgrep_canonical_flat_literal_set(
+    builder: &PortableBuilder,
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+    literal_set: LiteralSetPlan,
+) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
+    let storage = literal_set.build_accounting().persistent_bytes;
+    let report =
+        ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
+    Ok(RipgrepStandardLiteralsBuild::Portable(PortableRegex {
+        source: publication.source,
+        capture_names: publication.capture_names,
+        line_total_grep_plan: publication.line_total_grep_plan,
+        plan: PortablePlan::LiteralSetDfa(literal_set),
+        profile: publication.profile,
+        limits: builder.limits,
+        selection: builder.selection,
+        report,
+    }))
+}
+
+#[cold]
+#[inline(never)]
+fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
+    builder: &PortableBuilder,
+    patterns: &[&[u8]],
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
+    if builder.selection != PlanSelection::Auto
+        || patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        || publication.syntax.class_ranges != 0
+    {
+        return Err(BuildError::InternalInvariant(
+            "borrowed ripgrep ordinary literal set reached another planner terminal",
+        ));
+    }
+    match LiteralSetCompactOrdinaryPlan::try_new_ripgrep_standard_borrowed(
+        patterns,
+        builder.limits.literal_set,
+    )? {
+        LiteralSetCompactOrdinaryBuildOutcome::Candidate(candidate) => {
+            let storage = candidate.build_accounting().persistent_bytes;
+            let fits = publication
+                .source_storage_bytes
+                .checked_add(publication.capture_name_storage_bytes)
+                .and_then(|bytes| bytes.checked_add(storage))
+                .is_some_and(|charged| charged <= builder.limits.max_persistent_bytes);
+            if !fits {
+                return publish_ripgrep_canonical_flat_literal_set(
+                    builder,
+                    planner_work,
+                    publication,
+                    candidate.into_canonical()?,
+                );
+            }
+            let literal_set = candidate.into_ordinary();
+            let report =
+                ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
+            Ok(RipgrepStandardLiteralsBuild::Ordinary(
+                RipgrepOrdinaryRegex {
+                    source: publication.source,
+                    _capture_names: publication.capture_names,
+                    literal_set,
+                    report,
+                },
+            ))
+        }
+        LiteralSetCompactOrdinaryBuildOutcome::Canonical(literal_set) => {
+            publish_ripgrep_canonical_flat_literal_set(
+                builder,
+                planner_work,
+                publication,
+                literal_set,
+            )
+        }
+        LiteralSetCompactOrdinaryBuildOutcome::NotApplicable => {
+            let literal_set =
+                LiteralSetPlan::new_stable_borrowed(patterns, builder.limits.literal_set)?;
+            publish_ripgrep_canonical_flat_literal_set(
+                builder,
+                planner_work,
+                publication,
+                literal_set,
+            )
+        }
+    }
 }
 
 /// Publish the class-free large flat-literal plan from bytes still owned by the
@@ -7203,14 +7381,48 @@ impl PortableBuilder {
         {
             return Ok(None);
         }
-        self.build_ripgrep_standard_literal_bytes(patterns, canonical_source_limit)
+        self.build_ripgrep_standard_literal_bytes(
+            patterns,
+            canonical_source_limit,
+            publish_ripgrep_borrowed_flat_literal_set,
+        )
     }
 
-    fn build_ripgrep_standard_literal_bytes(
+    /// Build the same authenticated literal handoff for ripgrep's ordinary
+    /// worker surface, omitting the checked DFA only when the compact owner is
+    /// admitted. Every decline publishes the established portable owner.
+    #[doc(hidden)]
+    pub fn build_ripgrep_standard_literals_ordinary(
+        self,
+        patterns: &[&str],
+        canonical_source_limit: usize,
+    ) -> Result<Option<RipgrepStandardLiteralsBuild>, BuildError> {
+        if patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+            || patterns.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
+        {
+            return Ok(None);
+        }
+        self.build_ripgrep_standard_literal_bytes(
+            patterns,
+            canonical_source_limit,
+            publish_ripgrep_borrowed_flat_literal_set_ordinary,
+        )
+    }
+
+    fn build_ripgrep_standard_literal_bytes<T, F>(
         self,
         pattern_texts: &[&str],
         canonical_source_limit: usize,
-    ) -> Result<Option<PortableRegex>, BuildError> {
+        publish: F,
+    ) -> Result<Option<T>, BuildError>
+    where
+        F: FnOnce(
+            &PortableBuilder,
+            &[&[u8]],
+            u64,
+            RipgrepFlatLiteralPublication,
+        ) -> Result<T, BuildError>,
+    {
         if !self.accepts_ripgrep_standard_literal_hir() {
             return Ok(None);
         }
@@ -7272,13 +7484,7 @@ impl PortableBuilder {
             static_captures_len: Some(1),
             minimum_match_bytes,
         };
-        publish_ripgrep_borrowed_flat_literal_set(
-            &self,
-            patterns,
-            planner_work,
-            publication,
-        )
-        .map(Some)
+        publish(&self, patterns, planner_work, publication).map(Some)
     }
 
     fn accepts_ripgrep_standard_literal_hir(&self) -> bool {
@@ -28132,8 +28338,8 @@ mod tests {
         PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
         PortablePlan, PortableRegex, PortableRegexSetBuilder, PortableSearchSession,
         PortableSearchSessionPlan, PortableSpanVisitLimits, PortableTextBuilder,
-        PortableTextRegexSetBuilder, SearchAccounting, SearchError, SearchLimits,
-        SearchSessionLimits, SearchWindow, SimdDispatchContext,
+        PortableTextRegexSetBuilder, RipgrepStandardLiteralsBuild, SearchAccounting, SearchError,
+        SearchLimits, SearchSessionLimits, SearchWindow, SimdDispatchContext,
         UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         k0_finite_prefix_hedge_window, k0_finite_suffix_incumbent_single_pass_negative,
         k0_finite_suffix_prefix_hedge_bytes, k0_mandatory_suffix_completed_negative_is_useful,
@@ -29105,6 +29311,111 @@ mod tests {
             .build_ripgrep_standard_literals(&borrowed, usize::MAX)
             .expect("public uniform literal construction completes")
             .expect("public uniform literal shape is admitted")
+    }
+
+    fn build_public_uniform_ripgrep_ordinary(
+        patterns: &[String],
+    ) -> RipgrepStandardLiteralsBuild {
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+            .expect("public ordinary literal construction completes")
+            .expect("public ordinary literal shape is admitted")
+    }
+
+    #[test]
+    fn ripgrep_uniform_ordinary_owner_retains_only_the_compact_engine() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::RipgrepOrdinaryRegex>();
+
+        let mut patterns = public_uniform_ripgrep_literals(256, 128);
+        patterns[0] = "a".repeat(128);
+        let dual = build_public_uniform_ripgrep_literals(&patterns);
+        let RipgrepStandardLiteralsBuild::Ordinary(ordinary) =
+            build_public_uniform_ripgrep_ordinary(&patterns)
+        else {
+            panic!("eligible ripgrep literals retained a portable owner");
+        };
+        assert_eq!(ordinary.as_str(), dual.as_str());
+        assert_eq!(
+            ordinary.runtime_implementation_id(),
+            "literal-set-compact-nfa",
+        );
+        assert_eq!(
+            ordinary.build_report().plan_storage_bytes,
+            ordinary.literal_set.build_accounting().persistent_bytes,
+        );
+        assert!(
+            ordinary.build_report().plan_storage_bytes
+                < dual.build_report().plan_storage_bytes,
+        );
+
+        let mut haystack = vec![b'z'];
+        haystack.extend(core::iter::repeat_n(b'a', 256));
+        haystack.push(b'z');
+        let expected = Some(Match { start: 1, end: 129 });
+        let mut session = ordinary.ordinary_session();
+        assert_eq!(session.is_match_at(&haystack, 1), Ok(true));
+        assert_eq!(session.first_acceptance_at(&haystack, 1), Ok(Some(129)));
+        assert_eq!(session.find_at(&haystack, 1), Ok(expected));
+        let mut spans = Vec::new();
+        assert_eq!(
+            session
+                .try_visit_spans_at(&haystack, 1, |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(spans, [(1, 129), (129, 257)]);
+        assert_eq!(
+            session.count_positive_width_selected_ends_at(&haystack, 1),
+            Ok(Some(2)),
+        );
+    }
+
+    #[test]
+    fn ripgrep_ordinary_builder_preserves_portable_fallbacks_and_global_limits() {
+        let short = public_uniform_ripgrep_literals(256, 127);
+        assert!(matches!(
+            build_public_uniform_ripgrep_ordinary(&short),
+            RipgrepStandardLiteralsBuild::Portable(_),
+        ));
+
+        let wide = public_uniform_ripgrep_literals(256, 128);
+        let RipgrepStandardLiteralsBuild::Ordinary(admitted) =
+            build_public_uniform_ripgrep_ordinary(&wide)
+        else {
+            panic!("eligible ripgrep literals retained a portable owner");
+        };
+        let exact = admitted.build_report().charged_persistent_bytes;
+        let borrowed = wide.iter().map(String::as_str).collect::<Vec<_>>();
+        let exact_owner = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(BuildLimits {
+                max_persistent_bytes: exact,
+                ..BuildLimits::default()
+            })
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+            .expect("exact ordinary persistent cap closes")
+            .expect("the authenticated ordinary shape remains admitted");
+        assert!(matches!(
+            exact_owner,
+            RipgrepStandardLiteralsBuild::Ordinary(_),
+        ));
+        assert!(matches!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(BuildLimits {
+                    max_persistent_bytes: exact - 1,
+                    ..BuildLimits::default()
+                })
+                .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX),
+            Err(BuildError::PersistentBytesLimit { needed, limit })
+                if needed > limit && limit == exact - 1
+        ));
     }
 
     #[test]
