@@ -56719,8 +56719,18 @@ fn aarch64_sve_ld1b_predicated(
 }
 
 fn aarch64_sve_ld1rqb(destination: u8, base: u8) -> Result<u32, ObjectError> {
+    aarch64_sve_ld1rqb_imm(destination, base, 0)
+}
+
+fn aarch64_sve_ld1rqb_imm(destination: u8, base: u8, byte_offset: i16) -> Result<u32, ObjectError> {
+    // LD1RQB's signed imm4 is scaled by the fixed 16-byte replicated block.
+    if !(-128..=112).contains(&byte_offset) || byte_offset % 16 != 0 {
+        return Err(ObjectError::InvalidModule("SVE LD1RQB immediate"));
+    }
+    let immediate = u32::try_from(i32::from(byte_offset / 16).rem_euclid(16))
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE LD1RQB immediate"))?;
     // LD1RQB repeats one exact 16-byte set in every architectural segment.
-    Ok(0xa400_2000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+    Ok(0xa400_2000 | (immediate << 16) | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_dup_b_imm(destination: u8, immediate: u8) -> Result<u32, ObjectError> {
@@ -59262,23 +59272,27 @@ fn aarch64_emit_mandatory_teddy_sve_constants(
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_sve_ptrue_b())?;
     aarch64_set_table_address(assembler, 12, teddy.table_base)?;
-    let table_count = teddy
-        .plan
-        .columns()
-        .checked_mul(2)
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "AArch64 SVE Teddy table count",
-        ))?;
+    let table_count =
+        teddy
+            .plan
+            .columns()
+            .checked_mul(2)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 SVE Teddy table count",
+            ))?;
     for table in 0..table_count {
         let register = 16_u8
             .checked_add(table)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "AArch64 SVE Teddy constant register",
             ))?;
-        assembler.instruction(aarch64_sve_ld1rqb(register, 12)?)?;
-        if table.checked_add(1) != Some(table_count) {
-            assembler.instruction(aarch64_add_x_imm(12, 12, 16)?)?;
-        }
+        let byte_offset =
+            i16::from(table)
+                .checked_mul(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 SVE Teddy constant offset",
+                ))?;
+        assembler.instruction(aarch64_sve_ld1rqb_imm(register, 12, byte_offset)?)?;
     }
     Ok(())
 }
@@ -121287,6 +121301,28 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(aarch64_sve_ld1b_vl(7, 12, 3).unwrap(), 0xa403_a187);
         assert_eq!(aarch64_sve_ld1b_predicated(24, 1, 6).unwrap(), 0xa400_a4d8);
         assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
+        assert_eq!(
+            (0_u8..8)
+                .map(|table| {
+                    aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                })
+                .collect::<Vec<_>>(),
+            [
+                0xa400_2190,
+                0xa401_2191,
+                0xa402_2192,
+                0xa403_2193,
+                0xa404_2194,
+                0xa405_2195,
+                0xa406_2196,
+                0xa407_2197,
+            ],
+        );
+        assert_eq!(aarch64_sve_ld1rqb_imm(24, 12, -16).unwrap(), 0xa40f_2198);
+        assert_eq!(aarch64_sve_ld1rqb_imm(24, 12, -128).unwrap(), 0xa408_2198);
+        for invalid in [-144_i16, -127, -1, 1, 15, 113, 128] {
+            assert!(aarch64_sve_ld1rqb_imm(16, 12, invalid).is_err());
+        }
         assert_eq!(aarch64_sve_dup_b_imm(16, 0x00).unwrap(), 0x2538_c010);
         assert_eq!(aarch64_sve_dup_b_imm(17, 0x7f).unwrap(), 0x2538_cff1);
         assert_eq!(aarch64_sve_dup_b_imm(18, 0x80).unwrap(), 0x2538_d012);
@@ -127402,7 +127438,19 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     assert!(words.contains(&aarch64_cmtst_16b(24, 24, 24).unwrap()));
                 }
                 MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
-                    assert!(words.contains(&aarch64_sve_ld1rqb(16, 12).unwrap()));
+                    let table_count = teddy.plan.columns() * 2;
+                    let constant_loads = (0..table_count)
+                        .map(|table| {
+                            aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        words
+                            .windows(constant_loads.len())
+                            .filter(|window| *window == constant_loads)
+                            .count(),
+                        1,
+                    );
                     assert!(words.contains(&aarch64_sve_tbl_b(7, 16, 5).unwrap()));
                     assert!(words.contains(&aarch64_sve_cmpne_zero_b(1, 6).unwrap()));
                     let mut candidate_assembler = Aarch64Assembler::new();

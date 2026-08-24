@@ -3005,6 +3005,38 @@ mod tests {
         pattern
     }
 
+    fn fourth_column_disambiguation_pattern() -> String {
+        // The first three bytes deliberately have a common modeled
+        // fingerprint while the fourth separates the sources. Long exact
+        // verifiers make that fourth column win the unchanged forced V2 cost
+        // ordering, so this fixture truly emits all eight constant tables.
+        const LITERAL_BYTES: usize = 192;
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, fourth) in SCANNER_FREE_BYTES.into_iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in [
+                0xc0 + u8::try_from(ordinal % 2).unwrap(),
+                b'\n',
+                0x01,
+                fourth,
+                u8::try_from(ordinal).unwrap(),
+                0xee,
+            ] {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+            for _ in 6..LITERAL_BYTES {
+                pattern.push_str("\\xee");
+            }
+            if ordinal + 1 == SCANNER_FREE_BYTES.len() {
+                pattern.push_str("\\xc8");
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
     fn sve_batch_column_schedule(column: u8, initialize: bool) -> Vec<u32> {
         let mut schedule = Vec::new();
         schedule.push(aarch64_add_x_reg(12, 0, 2).unwrap());
@@ -4617,6 +4649,91 @@ mod tests {
             1,
             "the forced three-column SVE2 wrapper must retain one hoisted VL dispatch",
         );
+    }
+
+    #[test]
+    fn sve_teddy_tables_use_exact_fixed_ld1rqb_offsets_for_three_and_four_columns() {
+        let three_columns = sparse_single_prefix_three_column_pattern();
+        let four_columns = fourth_column_disambiguation_pattern();
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            for (pattern, expected_columns) in
+                [(three_columns.as_str(), 3_u8), (four_columns.as_str(), 4)]
+            {
+                let forced = force_v2(pattern, target);
+                let report = forced
+                    .receipt_v2()
+                    .exact_finite_selected_end_teddy_aot
+                    .expect("forced SVE exact Teddy report")
+                    .lowering;
+                let selection = select_exact_finite_selected_end_teddy_forced_v2(
+                    forced
+                        .program()
+                        .native_finite_selected_end_teddy_view()
+                        .unwrap(),
+                    target,
+                    report.incumbent_complete_dfa,
+                )
+                .expect("structurally eligible exact Teddy selection");
+                assert_eq!(selection.plan.columns(), expected_columns);
+
+                assert_eq!(report.columns, expected_columns);
+                let table_base = usize::try_from(report.table_base).unwrap();
+                let table_end = usize::try_from(report.table_end).unwrap();
+                assert!(table_base.is_multiple_of(16));
+                assert_eq!(
+                    table_end - table_base,
+                    usize::from(expected_columns) * AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN,
+                );
+                let data = forced.module().sections()[1].bytes();
+                let bank = selection.plan.bank(0).unwrap();
+                for column in 0..usize::from(expected_columns) {
+                    let low = table_base + column * AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN;
+                    let high = low + 16;
+                    assert_eq!(&data[low..high], bank.low(column).unwrap());
+                    assert_eq!(&data[high..high + 16], bank.high(column).unwrap());
+                }
+
+                let table_count = expected_columns * 2;
+                let loads = (0..table_count)
+                    .map(|table| {
+                        aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    table_base + usize::from(table_count - 1) * 16 + 16,
+                    table_end,
+                );
+                let words = forced.module().sections()[TEXT_SECTION].bytes()
+                    [..report.incumbent_code_offset]
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    words
+                        .windows(loads.len())
+                        .filter(|window| *window == loads)
+                        .count(),
+                    1,
+                    "one contiguous fixed-offset constant schedule: {target:?}/{expected_columns}",
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word & 0xfff0_fc00 == 0xa400_2000)
+                        .count(),
+                    usize::from(table_count),
+                    "only the authenticated table loads use LD1RQB: {target:?}/{expected_columns}",
+                );
+                assert!(
+                    !words.contains(&aarch64_add_x_imm(12, 12, 16).unwrap()),
+                    "fixed-offset loads must retire the serial table-base update: {target:?}/{expected_columns}",
+                );
+            }
+        }
     }
 
     #[test]
