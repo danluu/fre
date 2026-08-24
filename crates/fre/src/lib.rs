@@ -6275,7 +6275,15 @@ fn append_ripgrep_literal_source<const META_REJECTED: bool>(
     source: &mut String,
     text: &str,
 ) {
-    let grouped = text.chars().nth(1).is_some();
+    let grouped = if META_REJECTED {
+        // The typed handoff has already established non-emptiness. Decode
+        // only its first scalar: any remaining byte starts another scalar.
+        text.chars()
+            .next()
+            .is_some_and(|first| first.len_utf8() < text.len())
+    } else {
+        text.chars().nth(1).is_some()
+    };
     if grouped {
         source.push_str("(?:");
     }
@@ -6289,6 +6297,27 @@ fn append_ripgrep_literal_source<const META_REJECTED: bool>(
     if grouped {
         source.push(')');
     }
+}
+
+/// Validate the facts unique to ripgrep's typed literal handoff and report
+/// whether the literal needs the pinned HIR Printer's non-capturing group.
+///
+/// UTF-8 validity is carried by `str`. LF and every regex meta character are
+/// ASCII, so inspecting bytes proves the remaining facts without decoding
+/// every Unicode scalar. An empty string is refused independently here even
+/// though the caller has already checked its byte slice.
+#[inline]
+fn classify_ripgrep_standard_literal_text(text: &str) -> Option<bool> {
+    let first = text.chars().next()?;
+    for &byte in text.as_bytes() {
+        if byte == b'\n'
+            || (byte.is_ascii()
+                && regex_syntax::is_meta_character(char::from(byte)))
+        {
+            return None;
+        }
+    }
+    Some(first.len_utf8() < text.len())
 }
 
 /// Authenticate the literal shape used by ripgrep's ordinary, case-sensitive
@@ -6403,23 +6432,27 @@ where
             return None;
         }
         let text = literal.text()?;
-        let mut escapes = 0_u64;
-        let mut saw_character = false;
-        let mut grouped = false;
-        for character in text.chars() {
-            grouped |= saw_character;
-            saw_character = true;
-            if character == '\n' {
-                return None;
-            }
-            if regex_syntax::is_meta_character(character) {
-                if REJECT_META_CHARACTERS {
+        let (escapes, grouped) = if REJECT_META_CHARACTERS {
+            (0_u64, classify_ripgrep_standard_literal_text(text)?)
+        } else {
+            // Raw HIR bytes independently validate UTF-8 above and retain
+            // the incumbent scalar scan and exact escaping calculation.
+            let mut escapes = 0_u64;
+            let mut saw_character = false;
+            let mut grouped = false;
+            for character in text.chars() {
+                grouped |= saw_character;
+                saw_character = true;
+                if character == '\n' {
                     return None;
                 }
-                escapes = escapes.checked_add(1)?;
+                if regex_syntax::is_meta_character(character) {
+                    escapes = escapes.checked_add(1)?;
+                }
             }
-        }
-        debug_assert!(saw_character);
+            debug_assert!(saw_character);
+            (escapes, grouped)
+        };
         all_single_character &= !grouped;
         let group_bytes = if grouped { 4 } else { 0 };
         let escaped_source_bytes = unescaped_source_bytes
@@ -28415,6 +28448,140 @@ mod tests {
         for haystack in ["xxéyy".as_bytes(), "xx界value072yy".as_bytes(), b"absent"] {
             assert_eq!(text.find(haystack), hir.find(haystack));
         }
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_text_byte_classifier_is_exact() {
+        assert_eq!(super::classify_ripgrep_standard_literal_text(""), None);
+
+        for byte in 0_u8..=0x7f {
+            let character = char::from(byte);
+            let text = character.to_string();
+            let rejected = byte == b'\n' || regex_syntax::is_meta_character(character);
+            assert_eq!(
+                super::classify_ripgrep_standard_literal_text(&text),
+                (!rejected).then_some(false),
+                "typed classifier disagrees for ASCII byte {byte:#04x}"
+            );
+        }
+
+        for scalar in [
+            "\u{80}",
+            "\u{7ff}",
+            "\u{800}",
+            "\u{ffff}",
+            "\u{10000}",
+            "\u{10ffff}",
+            "\u{2028}",
+        ] {
+            assert_eq!(
+                super::classify_ripgrep_standard_literal_text(scalar),
+                Some(false),
+                "one Unicode scalar must not be grouped: {scalar:?}"
+            );
+        }
+        for grouped in ["éa", "aé", "é界", "e\u{301}", "🦀界"] {
+            assert_eq!(
+                super::classify_ripgrep_standard_literal_text(grouped),
+                Some(true),
+                "multiple Unicode scalars must be grouped: {grouped:?}"
+            );
+        }
+        assert_eq!(
+            super::classify_ripgrep_standard_literal_text("é\n界"),
+            None
+        );
+        assert_eq!(
+            super::classify_ripgrep_standard_literal_text("é[界"),
+            None
+        );
+    }
+
+    #[test]
+    fn ripgrep_standard_literal_text_closes_exact_resource_boundaries_before_scanning() {
+        #[derive(Clone, Copy)]
+        struct TextMustNotBeRequested;
+
+        impl super::RipgrepStandardLiteral<'static> for TextMustNotBeRequested {
+            fn bytes(self) -> &'static [u8] {
+                b"a"
+            }
+
+            fn text(self) -> Option<&'static str> {
+                panic!("resource refusal must precede the typed value scan")
+            }
+        }
+
+        assert!(
+            super::ripgrep_standard_literal_context_from::<_, _, true>(
+                1,
+                |index| (index == 0).then_some(TextMustNotBeRequested),
+                BuildLimits::default(),
+                0,
+            )
+            .is_none()
+        );
+
+        let patterns = (0..129)
+            .map(|index| format!("界value{index:04}"))
+            .collect::<Vec<_>>();
+        let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let context = |limits, canonical_source_limit| {
+            super::ripgrep_standard_literal_context_from::<_, _, true>(
+                pattern_refs.len(),
+                |index| pattern_refs.get(index).copied(),
+                limits,
+                canonical_source_limit,
+            )
+        };
+
+        let baseline = context(BuildLimits::default(), usize::MAX)
+            .expect("default typed literal resources admit the fixture");
+        let expected_source = Hir::alternation(
+            patterns
+                .iter()
+                .map(|pattern| Hir::literal(pattern.as_bytes()))
+                .collect(),
+        )
+        .to_string();
+        assert_eq!(&*baseline.source, expected_source);
+        let source_bytes = baseline.source.len();
+        let syntax = baseline.syntax.clone();
+
+        assert!(context(BuildLimits::default(), source_bytes).is_some());
+        assert!(
+            context(BuildLimits::default(), source_bytes.saturating_sub(1)).is_none()
+        );
+
+        macro_rules! assert_safety_boundary {
+            ($field:ident, $observed:expr) => {{
+                let observed = $observed;
+                assert!(observed > 0, "focused resource boundary must be positive");
+                let mut exact = BuildLimits::default();
+                exact.syntax_safety.$field = observed;
+                assert!(
+                    context(exact, usize::MAX).is_some(),
+                    "exact {} boundary must admit",
+                    stringify!($field)
+                );
+                let mut one_below = exact;
+                one_below.syntax_safety.$field = observed - 1;
+                assert!(
+                    context(one_below, usize::MAX).is_none(),
+                    "one-below {} boundary must refuse",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        assert_safety_boundary!(max_pattern_bytes, u64::try_from(source_bytes).unwrap());
+        assert_safety_boundary!(max_nesting, syntax.max_depth);
+        assert_safety_boundary!(max_hir_nodes, syntax.hir_nodes);
+        assert_safety_boundary!(max_parse_work, syntax.parse_work);
+        assert_safety_boundary!(
+            max_traversal_stack,
+            u64::try_from(pattern_refs.len()).unwrap()
+        );
     }
 
     #[test]
