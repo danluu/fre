@@ -32,6 +32,19 @@ continues to filter IDs after the selected manifest is loaded.
 The checked-in `testdata/patterns.tsv` is a generated, shape-only example; it
 does not contain production or private query contents.
 
+## Target features
+
+When `FRE_RIPGREP_AOT_FEATURES` is absent, the build inherits only the
+features understood by FRE from Cargo's target metadata. In particular,
+Cargo's AArch64 `neon` feature maps to FRE's `asimd`, and x86-64 `sse2` maps
+to FRE's `sse2`; unrelated Cargo feature names are ignored. This uses the
+compilation target's metadata and does not inspect the build host.
+
+`FRE_RIPGREP_AOT_FEATURES` remains an exact comma-separated override. An
+explicitly empty value selects the portable scalar target, while an unknown
+explicit name is an error. Cargo tracks both the explicit override and its
+target-feature metadata for build-script reruns.
+
 ## Optional variant pruning
 
 Trace-profile builds that only call optimizing Exists can opt into:

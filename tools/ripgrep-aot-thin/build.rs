@@ -5,18 +5,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fre_aot_regex::{
-    Architecture, CompileMode, CompileRequest, CpuFeature, EngineKind, EngineSelectionReason,
-    FeatureSet, OperatingSystem, OutputContract, PreparedBulkStrategy, StartAccelerator, Target,
-    compile,
+    Architecture, CompileMode, CompileRequest, EngineKind, EngineSelectionReason, OperatingSystem,
+    OutputContract, PreparedBulkStrategy, StartAccelerator, Target, compile,
 };
 use fre_syntax::RustProfile;
 
 mod build_support;
+mod build_target;
 
 use build_support::{
     BuildMode, BuildOutput, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy, patterns_path,
     read_patterns,
 };
+use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
 
 #[allow(
     clippy::too_many_lines,
@@ -24,7 +25,9 @@ use build_support::{
 )]
 fn main() {
     println!("cargo:rerun-if-changed=build_support.rs");
-    println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_FEATURES");
+    println!("cargo:rerun-if-changed=build_target.rs");
+    println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
+    println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
     println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_PATTERN_FILTER");
     println!("cargo:rerun-if-env-changed={PATTERNS_FILE_ENV}");
     println!("cargo:rerun-if-env-changed={VARIANTS_ENV}");
@@ -290,27 +293,13 @@ fn target() -> Result<Target, String> {
         ("aarch64", "macos") => Target::aarch64_macos(),
         _ => return Err(format!("unsupported Cargo target {architecture}-{os}")),
     };
-    let mut features = FeatureSet::EMPTY;
-    if let Some(value) = env::var_os("FRE_RIPGREP_AOT_FEATURES") {
-        for name in value
-            .to_string_lossy()
-            .split(',')
-            .filter(|name| !name.is_empty())
-        {
-            let feature = match name {
-                "sse2" => CpuFeature::X86Sse2,
-                "avx2" => CpuFeature::X86Avx2,
-                "avx512f" => CpuFeature::X86Avx512F,
-                "avx512bw" => CpuFeature::X86Avx512Bw,
-                "avx512vl" => CpuFeature::X86Avx512Vl,
-                "asimd" => CpuFeature::Aarch64Asimd,
-                "sve" => CpuFeature::Aarch64Sve,
-                "sve2" => CpuFeature::Aarch64Sve2,
-                _ => return Err(format!("unknown FRE_RIPGREP_AOT_FEATURES value {name:?}")),
-            };
-            features = features.with(feature);
-        }
-    }
+    let explicit_features = env::var_os(FEATURES_ENV);
+    let cargo_features = env::var_os(CARGO_TARGET_FEATURE_ENV);
+    let features = selected_features(
+        base.architecture,
+        explicit_features.as_deref(),
+        cargo_features.as_deref(),
+    )?;
     base.with_features(features)
         .map_err(|error| error.to_string())
 }

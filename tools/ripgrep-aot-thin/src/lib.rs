@@ -115,6 +115,14 @@ mod generated {
 #[path = "../build_support.rs"]
 mod build_support_tests;
 
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the library test target exercises only pure target-feature helpers"
+)]
+#[path = "../build_target.rs"]
+mod build_target_tests;
+
 #[derive(Debug)]
 enum Backend {
     Native {
