@@ -654,7 +654,23 @@ impl AotMatcher {
     /// lengths, an oversized batch, or any execution/ABI failure. If a native
     /// batch reports an error after publishing a valid prefix, that prefix is
     /// retained in `matched` and the remaining output elements are unchanged.
+    #[inline]
     pub fn is_match_descriptor_batch(
+        &mut self,
+        haystacks: &[AotHaystack<'_>],
+        matched: &mut [bool],
+    ) -> Result<(), String> {
+        // Keep the selector frameless in optimized builds. A singleton should
+        // enter the scalar adapter directly, while larger requests retain the
+        // zero-copy descriptor batch path and its independently sized frame.
+        if haystacks.len() == 1 && matched.len() == 1 {
+            return self.is_match_descriptor_single(&haystacks[0], &mut matched[0]);
+        }
+        self.is_match_descriptor_batch_non_single(haystacks, matched)
+    }
+
+    #[inline(never)]
+    fn is_match_descriptor_batch_non_single(
         &mut self,
         haystacks: &[AotHaystack<'_>],
         matched: &mut [bool],
@@ -689,6 +705,7 @@ impl AotMatcher {
         Ok(())
     }
 
+    #[inline(never)]
     fn is_match_descriptor_batch_validated(
         &mut self,
         haystacks: &[AotHaystack<'_>],
@@ -763,6 +780,56 @@ impl AotMatcher {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn is_match_descriptor_single(
+        &mut self,
+        haystack: &AotHaystack<'_>,
+        matched: &mut bool,
+    ) -> Result<(), String> {
+        if self.output != AotOutput::Exists {
+            return Err("AOT matcher was not compiled for Exists".to_owned());
+        }
+        let haystack = haystack.as_slice();
+        *matched = match &mut self.backend {
+            Backend::Prepared(prepared) => match prepared_native_search(
+                prepared.search,
+                prepared.handle,
+                AotOutput::Exists,
+                haystack,
+                0,
+            )? {
+                MatchResult::Exists(found) => found,
+                _ => {
+                    return Err(
+                        "AOT Exists artifact returned a different result contract".to_owned()
+                    );
+                }
+            },
+            Backend::Native { search, .. } => {
+                match native_search(*search, AotOutput::Exists, haystack, 0)? {
+                    MatchResult::Exists(found) => found,
+                    _ => {
+                        return Err(
+                            "AOT Exists artifact returned a different result contract".to_owned()
+                        );
+                    }
+                }
+            }
+            Backend::Runtime(prepared) => match prepared
+                .search(haystack, SearchWindow::new(0, haystack.len()))
+                .map_err(|error| format!("prepared AOT search: {error}"))?
+            {
+                MatchResult::Exists(found) => found,
+                _ => {
+                    return Err(
+                        "AOT Exists artifact returned a different result contract".to_owned()
+                    );
+                }
+            },
+        };
         Ok(())
     }
 
@@ -1225,6 +1292,9 @@ fn decode_exists_batch(
     unsafe_code,
     reason = "status 1 from either compiler-produced entry guarantees an initialized result"
 )]
+// Scalar Exists calls should fold the two valid statuses at their ABI call
+// site instead of paying a generic result-decoder call after the native entry.
+#[inline(always)]
 fn decode_search_result(
     output: AotOutput,
     status: u32,
@@ -1985,6 +2055,15 @@ mod tests {
             .is_match_descriptor_batch(&[], &mut [])
             .expect("empty descriptor batch");
 
+        let one = [AotHaystack::from(b"x")];
+        let mut span = native_matcher(one_byte_search, dense_fill);
+        let mut outcome = [true];
+        let error = span
+            .is_match_descriptor_batch(&one, &mut outcome)
+            .expect_err("descriptor singleton output-contract mismatch");
+        assert_eq!(error, "AOT matcher was not compiled for Exists");
+        assert_eq!(outcome, [true]);
+
         let two = [AotHaystack::from(b"x"), AotHaystack::from(b"no")];
         let error = direct
             .is_match_descriptor_batch(&two, &mut [false])
@@ -2126,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn one_haystack_exists_batch_uses_the_backend_scalar_loop() {
+    fn one_haystack_exists_batches_use_the_backend_scalar_entry() {
         SINGLETON_EXISTS_SCALAR_CALLS.store(0, Ordering::Relaxed);
         SINGLETON_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
 
@@ -2159,9 +2238,21 @@ mod tests {
             .is_match_batch(&[b"no"], &mut direct_outcome)
             .expect("one-haystack direct Exists request");
 
+        let descriptor = [AotHaystack::from(b"no")];
+        let mut prepared_descriptor_outcome = [false];
+        prepared
+            .is_match_descriptor_batch(&descriptor, &mut prepared_descriptor_outcome)
+            .expect("one-descriptor prepared Exists request");
+        let mut direct_descriptor_outcome = [false];
+        direct
+            .is_match_descriptor_batch(&descriptor, &mut direct_descriptor_outcome)
+            .expect("one-descriptor direct Exists request");
+
         assert_eq!(prepared_outcome, [true]);
         assert_eq!(direct_outcome, [true]);
-        assert_eq!(SINGLETON_EXISTS_SCALAR_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(prepared_descriptor_outcome, [true]);
+        assert_eq!(direct_descriptor_outcome, [true]);
+        assert_eq!(SINGLETON_EXISTS_SCALAR_CALLS.load(Ordering::Relaxed), 4);
         assert_eq!(SINGLETON_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 0);
     }
 
