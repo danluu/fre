@@ -729,12 +729,14 @@ impl RequiredLiteralPlan {
         self.exists_window_with_run_scanner(haystack, window, limits, None)
     }
 
-    /// Return only whether an unanchored `CLASS+ SUFFIX` match exists wholly
-    /// within `window`.
+    /// Return only whether a `CLASS+ SUFFIX` match exists wholly within
+    /// `window`.
     ///
     /// This preserves the complete incumbent preflight envelope but omits
     /// actual-event accounting and greedy-start recovery on the admitted
-    /// unanchored route. Anchored plans delegate to [`Self::find_window`].
+    /// unanchored route. An absolute-end-only plan checks the terminal suffix
+    /// and its predecessor after the same preflight; absolute-start plans
+    /// delegate to [`Self::find_window`].
     ///
     /// # Errors
     ///
@@ -853,6 +855,39 @@ impl RequiredLiteralPlan {
         limits: SearchLimits,
         backward_scanner: Option<&AsciiByteSetRunScanner>,
     ) -> Result<bool, SearchError> {
+        if self.anchors
+            == (Anchors {
+                start: false,
+                end: true,
+            })
+        {
+            if window.start() > window.end() || window.end() > haystack.len() {
+                return Err(SearchError::InvalidWindow {
+                    start: window.start(),
+                    end: window.end(),
+                    haystack_len: haystack.len(),
+                });
+            }
+            check_search_scratch(0, limits.max_scratch_bytes)?;
+            if window.end() != haystack.len() {
+                return Ok(false);
+            }
+
+            // Preserve the incumbent finite refusal boundary before looking
+            // at source bytes. Existence at an absolute end then needs no
+            // greedy-start recovery: one class byte immediately before the
+            // required suffix is already a complete `CLASS+ SUFFIX \z`
+            // witness.
+            self.preflight(window, limits, backward_scanner)?;
+            let suffix = self.suffix();
+            let Some(candidate) = window.end().checked_sub(suffix.len()) else {
+                return Ok(false);
+            };
+            if candidate <= window.start() || &haystack[candidate..window.end()] != suffix {
+                return Ok(false);
+            }
+            return Ok(self.class.contains(haystack[candidate - 1]));
+        }
         self.first_acceptance_window_value_with_run_scanner(
             haystack,
             window,
@@ -2080,9 +2115,10 @@ impl DispatchedRequiredLiteralPlan {
         )
     }
 
-    /// Return only whether an unanchored `CLASS+ SUFFIX` match exists wholly
-    /// within `window` while retaining the dispatched preflight envelope.
-    /// Anchored plans retain their established span search.
+    /// Return only whether a `CLASS+ SUFFIX` match exists wholly within
+    /// `window` while retaining the dispatched preflight envelope. An
+    /// absolute-end-only plan checks the terminal suffix and its predecessor;
+    /// absolute-start plans retain their established span search.
     ///
     /// # Errors
     ///
@@ -3102,9 +3138,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one matrix authenticates both owners, candidate streams, values, accounting, and anchor delegation"
+        reason = "one matrix authenticates both owners, candidate streams, values, accounting, and anchor semantics"
     )]
-    fn exists_candidate_stream_matches_spans_and_anchored_plans_delegate() {
+    fn exists_candidate_stream_matches_spans_and_preserves_anchor_semantics() {
         let class = ByteClass::from_bytes(b"a");
         let dispatch = SimdDispatchContext::capture();
         for suffix_len in [1_usize, 2, 3, 8, 17] {
@@ -3379,6 +3415,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn absolute_end_exists_value_matches_span_and_preserves_preflight() {
+        let class = ByteClass::from_bytes(b"ab");
+        let anchors = Anchors {
+            start: false,
+            end: true,
+        };
+        let scalar = RequiredLiteralPlan::build(
+            class,
+            b"ZQ",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = RequiredLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            class,
+            b"ZQ",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+
+        macro_rules! assert_plan {
+            ($plan:expr, $owner:literal) => {{
+                let plan = &$plan;
+                let alphabet = [b'a', b'b', b'Z', b'Q', b'!'];
+                for length in 0..=6_usize {
+                    let population = alphabet.len().pow(u32::try_from(length).unwrap());
+                    for ordinal in 0..population {
+                        let mut value = ordinal;
+                        let mut haystack = vec![0_u8; length];
+                        for byte in &mut haystack {
+                            *byte = alphabet[value % alphabet.len()];
+                            value /= alphabet.len();
+                        }
+                        for start in 0..=length {
+                            for end in start..=length {
+                                let window = Window::new(start, end);
+                                let expected = plan
+                                    .find_window(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .0
+                                    .is_some();
+                                assert_eq!(
+                                    plan.exists_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                    Ok(expected),
+                                    "{} haystack={haystack:?} window={start}..{end}",
+                                    $owner,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let haystack = b"!aaaaZQ";
+                let window = Window::full(haystack);
+                let accounted = plan
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap();
+                let exact = SearchLimits {
+                    max_work_upper_bound: accounted.1.work_upper_bound,
+                    max_candidate_visits: accounted.1.candidate_visits_upper_bound,
+                    max_scratch_bytes: accounted.1.scratch_bytes,
+                };
+                assert_eq!(
+                    plan.exists_window_value(haystack, window, exact),
+                    Ok(true),
+                    "{} exact preflight",
+                    $owner,
+                );
+                assert!(matches!(
+                    plan.exists_window_value(
+                        b"!aaaaXX",
+                        window,
+                        SearchLimits {
+                            max_work_upper_bound: exact.max_work_upper_bound - 1,
+                            ..exact
+                        },
+                    ),
+                    Err(SearchError::WorkLimit { .. })
+                ));
+            }};
+        }
+
+        assert_plan!(scalar, "scalar");
+        assert_plan!(dispatched, "dispatched");
     }
 
     #[test]

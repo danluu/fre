@@ -14352,9 +14352,7 @@ impl PortableRegex {
                     .exists_window_value(haystack, LiteralWindow::full(haystack))
                     .map_err(SearchError::from)
             }
-            PortablePlan::RequiredLiteral(required)
-                if !required.anchors().start && !required.anchors().end =>
-            {
+            PortablePlan::RequiredLiteral(required) => {
                 required
                     .exists_window_value(
                         haystack,
@@ -14363,9 +14361,7 @@ impl PortableRegex {
                     )
                     .map_err(SearchError::from)
             }
-            PortablePlan::DispatchedRequiredLiteral(required)
-                if !required.anchors().start && !required.anchors().end =>
-            {
+            PortablePlan::DispatchedRequiredLiteral(required) => {
                 required
                     .exists_window_value(
                         haystack,
@@ -14932,20 +14928,18 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::RequiredLiteral(required) => required
-                .find_window(
+                .exists_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     required_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::DispatchedRequiredLiteral(required) => required
-                .find_window(
+                .exists_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     required_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::BoundedRequiredLiteral(required) => required
                 .find_window(
