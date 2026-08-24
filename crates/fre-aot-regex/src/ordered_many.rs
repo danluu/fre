@@ -1990,6 +1990,60 @@ fn canonical_aggregate_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Opt
     .then_some(identity)
 }
 
+fn native_fused_ordered_many_symbol_identities_are_closed(
+    compiled: &CompiledRegex,
+    exports: PreparedAggregateExports,
+) -> bool {
+    let module = compiled.module();
+    let Some((program, program_len)) = module.required_runtime_program() else {
+        return false;
+    };
+    native_fused_ordered_many_symbol_names_are_closed(
+        program,
+        program_len,
+        &[
+            (
+                exports.contains(PreparedAggregateExports::COUNT),
+                module.prepared_count_symbol(),
+                "fre_aot_regex_count_exclusive_v1_",
+            ),
+            (
+                exports.contains(PreparedAggregateExports::SPAN_SUM),
+                module.prepared_span_sum_symbol(),
+                "fre_aot_regex_span_sum_exclusive_v1_",
+            ),
+            (
+                exports.contains(PreparedAggregateExports::GREP_COUNT),
+                module.prepared_grep_count_symbol(),
+                "fre_aot_regex_grep_count_exclusive_v1_",
+            ),
+        ],
+    )
+}
+
+fn native_fused_ordered_many_symbol_names_are_closed(
+    program: &str,
+    program_len: usize,
+    reducers: &[(bool, Option<&str>, &str)],
+) -> bool {
+    let Some(program_identity) =
+        canonical_aggregate_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    if program_len == 0 {
+        return false;
+    }
+    reducers.iter().all(|&(requested, symbol, prefix)| {
+        if requested {
+            symbol.and_then(|symbol| canonical_aggregate_symbol_identity(symbol, prefix))
+                == Some(program_identity)
+        } else {
+            symbol.is_none()
+        }
+    })
+}
+
 fn helper_free_ordered_many_aggregate_is_authenticated(
     compiled: &CompiledRegex,
     exports: PreparedAggregateExports,
@@ -2031,6 +2085,7 @@ fn helper_free_ordered_many_aggregate_is_authenticated(
         && module.required_runtime_symbols().next().is_none()
         && bulk_shape_is_exact
         && reducers_are_closed
+        && native_fused_ordered_many_symbol_identities_are_closed(compiled, exports)
 }
 
 fn defined_function_has_no_unresolved_relocations(compiled: &CompiledRegex, name: &str) -> bool {
@@ -2387,6 +2442,7 @@ mod tests {
         OrderedManyPatternId, OrderedManyProgram, OrderedManyRow, OrderedManySessionLimits,
         OrderedManyStrategy, OrdinaryOrderedManyAction, classify_ordinary_ordered_many_strategy,
         compile_ordered_many, compile_ordered_many_aot_reported,
+        native_fused_ordered_many_symbol_names_are_closed,
         ordinary_aggregate_representation_cap_may_try_v15, reserve_exact, tagged_build_may_decline,
     };
     use crate::{
@@ -2712,6 +2768,47 @@ mod tests {
             Err(OrderedManyAotCompileError::InternalInvariant(
                 "ordinary ordered-many aggregate omitted its strategy"
             ))
+        ));
+    }
+
+    #[test]
+    fn native_fused_reducer_identity_must_match_its_program() {
+        let identity = "b".repeat(64);
+        let program = format!("fre_aot_regex_runtime_program_v1_{identity}");
+        for prefix in [
+            "fre_aot_regex_count_exclusive_v1_",
+            "fre_aot_regex_span_sum_exclusive_v1_",
+            "fre_aot_regex_grep_count_exclusive_v1_",
+        ] {
+            let reducer = format!("{prefix}{identity}");
+            let reducers = [(true, Some(reducer.as_str()), prefix)];
+            assert!(native_fused_ordered_many_symbol_names_are_closed(
+                &program,
+                1,
+                &reducers,
+            ));
+
+            let mutated = format!("{prefix}{}", "c".repeat(64));
+            assert!(!native_fused_ordered_many_symbol_names_are_closed(
+                &program,
+                1,
+                &[(true, Some(mutated.as_str()), prefix)],
+            ));
+            assert!(!native_fused_ordered_many_symbol_names_are_closed(
+                &program,
+                1,
+                &[(false, Some(reducer.as_str()), prefix)],
+            ));
+            assert!(!native_fused_ordered_many_symbol_names_are_closed(
+                &program,
+                1,
+                &[(true, None, prefix)],
+            ));
+        }
+        assert!(!native_fused_ordered_many_symbol_names_are_closed(
+            &program,
+            0,
+            &[],
         ));
     }
 
