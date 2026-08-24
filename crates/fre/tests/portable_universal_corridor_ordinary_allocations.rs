@@ -25,6 +25,16 @@ fn universal_corridor_ordinary_facades_allocate_nothing() {
     let mut late = vec![b'a'; 4_095];
     late.push(b'X');
     let miss = vec![b'a'; 4_096];
+    let boundary_regex = PortableBuilder::new(r"(?s-u:.{0,64}X)")
+        .unicode(false)
+        .build()
+        .expect("universal finite corridor boundary fixture builds");
+    let boundary = [63_usize, 64, 65].map(|length| {
+        let mut haystack = vec![b'a'; length];
+        haystack[0] = b'X';
+        haystack[length - 1] = b'X';
+        haystack
+    });
 
     let first = Region::new(GLOBAL);
     assert_eq!(
@@ -49,6 +59,13 @@ fn universal_corridor_ordinary_facades_allocate_nothing() {
         assert!(black_box(regex.is_match(black_box(&late))));
         assert_eq!(black_box(regex.find(black_box(&miss))), None);
         assert!(!black_box(regex.is_match(black_box(&miss))));
+        for haystack in &boundary {
+            assert_eq!(
+                black_box(boundary_regex.find(black_box(haystack)))
+                    .map(|matched| (matched.start(), matched.end())),
+                Some((0, haystack.len())),
+            );
+        }
     }
     assert_eq!(measured.change(), Stats::default());
 }

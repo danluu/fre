@@ -11268,6 +11268,60 @@ mod contextual_span_v1_facade_probe {
 }
 
 #[cfg(test)]
+mod absolute_end_warm_owner_facade_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) exists_attempts: usize,
+        pub(super) exists_completions: usize,
+        pub(super) span_attempts: usize,
+        pub(super) span_completions: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            exists_attempts: 0,
+            exists_completions: 0,
+            span_attempts: 0,
+            span_completions: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists_attempt() {
+        let mut counts = COUNTS.get();
+        counts.exists_attempts = counts.exists_attempts.saturating_add(1);
+        COUNTS.set(counts);
+    }
+
+    pub(super) fn record_exists_completion() {
+        let mut counts = COUNTS.get();
+        counts.exists_completions = counts.exists_completions.saturating_add(1);
+        COUNTS.set(counts);
+    }
+
+    pub(super) fn record_span_attempt() {
+        let mut counts = COUNTS.get();
+        counts.span_attempts = counts.span_attempts.saturating_add(1);
+        COUNTS.set(counts);
+    }
+
+    pub(super) fn record_span_completion() {
+        let mut counts = COUNTS.get();
+        counts.span_completions = counts.span_completions.saturating_add(1);
+        COUNTS.set(counts);
+    }
+}
+
+#[cfg(test)]
 mod finite_consumption_span_facade_probe {
     use core::cell::Cell;
 
@@ -12154,6 +12208,57 @@ impl PortableK0Plan {
         Ok(route)
     }
 
+    /// Attempt an ordinary full-window absolute-end query through the
+    /// populated owner without moving its workspace. A cold or incompatible
+    /// owner returns `None` so the incumbent pooled path remains authoritative.
+    #[inline(never)]
+    fn warm_absolute_end_ordinary_exists(
+        &self,
+        haystack: &[u8],
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<bool>, K0SearchError> {
+        let window = SearchWindow::full(haystack);
+        #[cfg(test)]
+        absolute_end_warm_owner_facade_probe::record_exists_attempt();
+        let attempted = self
+            .automaton
+            .search_window_with_warm_owner_positive_end_exists_value(
+                haystack,
+                window,
+                maximum_match_bytes,
+            )?;
+        #[cfg(test)]
+        if attempted.is_some() {
+            absolute_end_warm_owner_facade_probe::record_exists_completion();
+        }
+        Ok(attempted)
+    }
+
+    /// Attempt the matching ordinary Span projection through the same
+    /// in-place warm owner. The exact verifier remains the sole start owner.
+    #[inline(never)]
+    fn warm_absolute_end_ordinary_span(
+        &self,
+        haystack: &[u8],
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<Option<fre_automata::MatchSpan>>, K0SearchError> {
+        let window = SearchWindow::full(haystack);
+        #[cfg(test)]
+        absolute_end_warm_owner_facade_probe::record_span_attempt();
+        let attempted = self
+            .automaton
+            .search_window_with_warm_owner_positive_end_span_value(
+                haystack,
+                window,
+                maximum_match_bytes,
+            )?;
+        #[cfg(test)]
+        if attempted.is_some() {
+            absolute_end_warm_owner_facade_probe::record_span_completion();
+        }
+        Ok(attempted)
+    }
+
     fn pooled_value(
         &self,
         operation: K0PooledValueOperation,
@@ -12210,6 +12315,32 @@ impl PortableK0Plan {
                     K0PooledValueOperation::Exists => K0PooledValue::Exists(false),
                     K0PooledValueOperation::Span => K0PooledValue::Span(None),
                 }));
+            }
+            if window.start() == 0 && window.end() == haystack.len() {
+                let attempted = match (operation, execution) {
+                    (
+                        K0PooledValueOperation::Exists,
+                        K0PooledValueExecution::OrdinaryExists,
+                    ) => self
+                        .warm_absolute_end_ordinary_exists(
+                            haystack,
+                            proof.maximum_match_bytes(),
+                        )?
+                        .map(K0PooledValue::Exists),
+                    (
+                        K0PooledValueOperation::Span,
+                        K0PooledValueExecution::OrdinarySpan,
+                    ) => self
+                        .warm_absolute_end_ordinary_span(
+                            haystack,
+                            proof.maximum_match_bytes(),
+                        )?
+                        .map(K0PooledValue::Span),
+                    _ => None,
+                };
+                if attempted.is_some() {
+                    return Ok(attempted);
+                }
             }
             let attempted = match operation {
                 K0PooledValueOperation::Exists => self
@@ -36401,6 +36532,273 @@ mod tests {
             regex.find_window_value(&haystack, full, finite).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn ordinary_k0_absolute_end_warm_owner_rescans_without_moving_the_workspace() {
+        let exists_first = PortableBuilder::new(r"(?-u:(?:ab){2,5}c\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("bounded absolute-end exists-first fixture lowers through K0");
+        let mut exists_first_haystack = vec![b'x'; 1_024];
+        let exists_first_end = exists_first_haystack.len();
+        exists_first_haystack[exists_first_end - 7..].copy_from_slice(b"abababc");
+
+        super::absolute_end_warm_owner_facade_probe::reset();
+        assert!(exists_first.is_match(&exists_first_haystack));
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                exists_attempts: 1,
+                ..super::absolute_end_warm_owner_facade_probe::Counts::default()
+            },
+            "the cold exists attempt must fall through to canonical pooled publication",
+        );
+        assert_eq!(
+            exists_first.find(&exists_first_haystack),
+            Some(Match {
+                start: exists_first_end - 7,
+                end: exists_first_end,
+            }),
+        );
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                exists_attempts: 1,
+                span_attempts: 1,
+                span_completions: 1,
+                ..super::absolute_end_warm_owner_facade_probe::Counts::default()
+            },
+        );
+
+        let regex = PortableBuilder::new(r"(?-u:(?:ab){2,5}c\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("bounded absolute-end fixture lowers through K0");
+        let mut haystack = vec![b'x'; 1_024];
+        let end = haystack.len();
+        haystack[end - 7..].copy_from_slice(b"abababc");
+
+        super::absolute_end_warm_owner_facade_probe::reset();
+        assert_eq!(
+            regex.find(&haystack),
+            Some(Match {
+                start: end - 7,
+                end,
+            })
+        );
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                span_attempts: 1,
+                ..super::absolute_end_warm_owner_facade_probe::Counts::default()
+            },
+            "the cold attempt must fall through to canonical pooled publication",
+        );
+
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                exists_attempts: 1,
+                exists_completions: 1,
+                span_attempts: 1,
+                span_completions: 0,
+            },
+        );
+
+        haystack[end - 11..].copy_from_slice(b"abababababc");
+        assert_eq!(
+            regex.find(&haystack),
+            Some(Match {
+                start: end - 11,
+                end,
+            }),
+            "earliest-start recovery preserves greedy bounded-repeat span",
+        );
+        haystack[end - 11..].fill(b'x');
+        assert!(!regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), None);
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                exists_attempts: 2,
+                exists_completions: 2,
+                span_attempts: 3,
+                span_completions: 2,
+            },
+            "warm negative outcomes are complete verifier results, not declines",
+        );
+    }
+
+    #[test]
+    fn ordinary_k0_without_absolute_end_never_enters_the_warm_owner() {
+        for pattern in [r"(?-u:(?:ab){2,5}c)", r"(?-u:\b(?:ab){2,5}c)"] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("proof-none bounded-repeat fixture lowers through K0");
+            let PortablePlan::K0(plan) = &regex.plan else {
+                unreachable!();
+            };
+            assert!(plan.absolute_end_proof.is_none());
+
+            let mut haystack = vec![b'!'; 64];
+            let end = haystack.len();
+            haystack[end - 7..].copy_from_slice(b"abababc");
+            super::absolute_end_warm_owner_facade_probe::reset();
+            assert!(regex.is_match(&haystack));
+            assert_eq!(
+                regex.find(&haystack),
+                Some(Match {
+                    start: end - 7,
+                    end,
+                })
+            );
+            assert_eq!(
+                super::absolute_end_warm_owner_facade_probe::snapshot(),
+                super::absolute_end_warm_owner_facade_probe::Counts::default(),
+                "proof-none ordinary K0 must not enter an absolute-end warm helper",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_k0_absolute_end_warm_owner_preserves_original_assertion_context() {
+        let regex = PortableBuilder::new(r"(?-u:\b[a-z]{1,8}\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("contextual absolute-end fixture lowers through K0");
+        let mut haystack = vec![b'x'; 16];
+        let end = haystack.len();
+        let start = end - 8;
+        haystack[start..].copy_from_slice(b"abcdefgh");
+        haystack[start - 1] = b'!';
+
+        assert_eq!(regex.find(&haystack), Some(Match { start, end }));
+        super::absolute_end_warm_owner_facade_probe::reset();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts {
+                exists_attempts: 1,
+                exists_completions: 1,
+                ..super::absolute_end_warm_owner_facade_probe::Counts::default()
+            },
+        );
+
+        // This byte is outside the maximum-width verifier window. The word
+        // boundary at `start` must nevertheless observe the current original
+        // source, not stale state retained by the warm owner.
+        haystack[start - 1] = b'z';
+        assert!(!regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), None);
+
+        super::absolute_end_warm_owner_facade_probe::reset();
+        let full = SearchWindow::full(&haystack);
+        assert_eq!(
+            regex
+                .find_window_value(&haystack, full, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            super::absolute_end_warm_owner_facade_probe::snapshot(),
+            super::absolute_end_warm_owner_facade_probe::Counts::default(),
+            "windowed value calls retain the incumbent route",
+        );
+    }
+
+    #[test]
+    fn ordinary_k0_absolute_end_warm_owner_matches_upstream_exhaustively() {
+        const PATTERNS: &[&str] = &[
+            r"(?-u:(?:a|ba){1,3}c\z)",
+            r"(?-u:(?:a|aa){1,3}c\z)",
+            r"(?-u:\b[a-c]{1,3}\z)",
+            r"(?m-u:(?:^a|b){1,3}c\z)",
+            r"(?-u:(?:[\x80-\x82]|a){1,3}c\z)",
+            r"(?-u:(?:a+|ba?)c\z)",
+        ];
+        const ALPHABET: &[u8] = &[b'a', b'b', b'c', b'!', b'\n', 0x80];
+
+        for &pattern in PATTERNS {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("absolute-end differential fixture lowers through K0");
+            let PortablePlan::K0(plan) = &regex.plan else {
+                panic!("forced absolute-end differential fixture did not retain K0");
+            };
+            assert!(
+                plan.absolute_end_proof.is_some(),
+                "fixture must carry the immutable absolute-end proof: {pattern:?}",
+            );
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("upstream accepts the differential fixture");
+
+            for length in 0_u32..=4 {
+                let population = ALPHABET.len().pow(length);
+                for mut encoded in 0..population {
+                    let mut haystack = vec![
+                        0_u8;
+                        usize::try_from(length).expect("small length fits usize")
+                    ];
+                    for byte in &mut haystack {
+                        *byte = ALPHABET[encoded % ALPHABET.len()];
+                        encoded /= ALPHABET.len();
+                    }
+                    let expected = upstream.find(&haystack).map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    });
+                    let full = SearchWindow::full(&haystack);
+                    assert_eq!(
+                        regex
+                            .find_window_value(&haystack, full, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected,
+                        "canonical span mismatch: pattern={pattern:?}, haystack={haystack:?}",
+                    );
+                    assert_eq!(
+                        regex
+                            .is_match_window_value(&haystack, full, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected.is_some(),
+                        "canonical exists mismatch: pattern={pattern:?}, haystack={haystack:?}",
+                    );
+
+                    super::absolute_end_warm_owner_facade_probe::reset();
+                    assert_eq!(
+                        regex.find(&haystack),
+                        expected,
+                        "warm span mismatch: pattern={pattern:?}, haystack={haystack:?}",
+                    );
+                    assert_eq!(
+                        regex.is_match(&haystack),
+                        expected.is_some(),
+                        "warm exists mismatch: pattern={pattern:?}, haystack={haystack:?}",
+                    );
+                    let expected_completions = usize::from(!haystack.is_empty());
+                    assert_eq!(
+                        super::absolute_end_warm_owner_facade_probe::snapshot(),
+                        super::absolute_end_warm_owner_facade_probe::Counts {
+                            exists_attempts: expected_completions,
+                            exists_completions: expected_completions,
+                            span_attempts: expected_completions,
+                            span_completions: expected_completions,
+                        },
+                        "ordinary warm route mismatch: pattern={pattern:?}, haystack={haystack:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
