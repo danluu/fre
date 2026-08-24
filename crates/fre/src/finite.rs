@@ -26,6 +26,7 @@ const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 1;
 const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
 const FIXED_PREDICATE_MAX_RANGES: usize = 4;
 pub(crate) const FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS: usize = 256;
+const OPTIONAL_LITERAL_TAIL_MAX_WORDS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FiniteExtractionTerminal {
@@ -2459,12 +2460,311 @@ enum GuardedRefusal {
 type GuardedSourceResult<'context> = Result<GuardedSource<'context>, GuardedRefusal>;
 type GuardedDictionaryResult = Result<(GuardedDictionary, GuardedFiniteAccounting), GuardedRefusal>;
 
+/// Exact dimensions for a class/capture/look/repetition-free literal HIR.
+///
+/// `regex-syntax` factors common prefixes, so a source alternation such as
+/// `ab|a` is represented as `a(?:b|)`. Empty HIR leaves are accepted here only
+/// as pieces of that factoring; the completed optional operand must still
+/// have a positive minimum width.
+#[derive(Clone, Copy)]
+struct LiteralTreeShape {
+    words: usize,
+    bytes: usize,
+    minimum_word_bytes: usize,
+    maximum_word_bytes: usize,
+    nodes: u64,
+    expansion_visits: u64,
+}
+
+fn literal_tree_shape(hir: &Hir) -> Option<LiteralTreeShape> {
+    match hir.kind() {
+        HirKind::Empty => Some(LiteralTreeShape {
+            words: 1,
+            bytes: 0,
+            minimum_word_bytes: 0,
+            maximum_word_bytes: 0,
+            nodes: 1,
+            expansion_visits: 1,
+        }),
+        HirKind::Literal(literal) if !literal.0.is_empty() => Some(LiteralTreeShape {
+            words: 1,
+            bytes: literal.0.len(),
+            minimum_word_bytes: literal.0.len(),
+            maximum_word_bytes: literal.0.len(),
+            nodes: 1,
+            expansion_visits: 1,
+        }),
+        HirKind::Alternation(children) if !children.is_empty() => {
+            let mut words = 0_usize;
+            let mut bytes = 0_usize;
+            let mut minimum_word_bytes = usize::MAX;
+            let mut maximum_word_bytes = 0_usize;
+            let mut nodes = 1_u64;
+            let mut expansion_visits = 1_u64;
+            for child in children {
+                let child = literal_tree_shape(child)?;
+                words = words.checked_add(child.words)?;
+                bytes = bytes.checked_add(child.bytes)?;
+                minimum_word_bytes = minimum_word_bytes.min(child.minimum_word_bytes);
+                maximum_word_bytes = maximum_word_bytes.max(child.maximum_word_bytes);
+                nodes = nodes.checked_add(child.nodes)?;
+                expansion_visits = expansion_visits.checked_add(child.expansion_visits)?;
+            }
+            Some(LiteralTreeShape {
+                words,
+                bytes,
+                minimum_word_bytes,
+                maximum_word_bytes,
+                nodes,
+                expansion_visits,
+            })
+        }
+        HirKind::Concat(children) if !children.is_empty() => {
+            let mut words = 1_usize;
+            let mut bytes = 0_usize;
+            let mut minimum_word_bytes = 0_usize;
+            let mut maximum_word_bytes = 0_usize;
+            let mut nodes = 1_u64;
+            let mut expansion_visits = 1_u64;
+            for child in children {
+                let child = literal_tree_shape(child)?;
+                let next_bytes = bytes
+                    .checked_mul(child.words)?
+                    .checked_add(child.bytes.checked_mul(words)?)?;
+                expansion_visits = expansion_visits
+                    .checked_add(u64::try_from(words).ok()?.checked_mul(child.expansion_visits)?)?;
+                words = words.checked_mul(child.words)?;
+                bytes = next_bytes;
+                minimum_word_bytes = minimum_word_bytes.checked_add(child.minimum_word_bytes)?;
+                maximum_word_bytes = maximum_word_bytes.checked_add(child.maximum_word_bytes)?;
+                nodes = nodes.checked_add(child.nodes)?;
+            }
+            Some(LiteralTreeShape {
+                words,
+                bytes,
+                minimum_word_bytes,
+                maximum_word_bytes,
+                nodes,
+                expansion_visits,
+            })
+        }
+        HirKind::Literal(_)
+        | HirKind::Class(_)
+        | HirKind::Look(_)
+        | HirKind::Repetition(_)
+        | HirKind::Capture(_)
+        | HirKind::Alternation(_)
+        | HirKind::Concat(_) => None,
+    }
+}
+
+/// Borrowed authority for the exact positive language
+/// `(?:L0|...|Lk)?T` (or its lazy form).
+///
+/// The unmetered preflight is used solely to decide whether the complete
+/// bounded materialization can run. Every successful structural inspection,
+/// expansion visit and publication unit is replayed below before any result
+/// is retained; an ineligible shape or a one-below work limit therefore enters
+/// the unchanged general extractor with no hidden planner spend.
+struct OptionalLiteralTail<'hir> {
+    operand: &'hir Hir,
+    operand_shape: LiteralTreeShape,
+    tail: &'hir [u8],
+    greedy: bool,
+    words: usize,
+    bytes: usize,
+    inspection_work: u64,
+    total_work: u64,
+}
+
+fn optional_literal_tail(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+) -> Option<OptionalLiteralTail<'_>> {
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let [optional, tail] = parts.as_slice() else {
+        return None;
+    };
+    let HirKind::Repetition(optional) = optional.kind() else {
+        return None;
+    };
+    if optional.min != 0 || optional.max != Some(1) {
+        return None;
+    }
+    let HirKind::Literal(tail) = tail.kind() else {
+        return None;
+    };
+    if tail.0.is_empty() {
+        return None;
+    }
+    let operand_shape = literal_tree_shape(&optional.sub)?;
+    if operand_shape.words < 2 || operand_shape.minimum_word_bytes == 0 {
+        return None;
+    }
+
+    let words = operand_shape.words.checked_add(1)?;
+    if words > OPTIONAL_LITERAL_TAIL_MAX_WORDS || words > max_words {
+        return None;
+    }
+    let bytes = tail
+        .0
+        .len()
+        .checked_mul(words)?
+        .checked_add(operand_shape.bytes)?;
+    if bytes > max_bytes {
+        return None;
+    }
+
+    // Root concat, optional repetition, the literal tree and the tail are all
+    // construction-owned HIR inspections. Materialization reserves one
+    // reusable operand-width scratch buffer, visits the literal tree once per
+    // actual expansion path, and publishes exactly the final word table.
+    let inspection_work = operand_shape.nodes.checked_add(3)?;
+    let total_work = inspection_work
+        .checked_add(u64::try_from(operand_shape.maximum_word_bytes).ok()?)?
+        .checked_add(operand_shape.expansion_visits)?
+        .checked_add(u64::try_from(words).ok()?)?
+        .checked_add(u64::try_from(bytes).ok()?)?;
+    Some(OptionalLiteralTail {
+        operand: &optional.sub,
+        operand_shape,
+        tail: tail.0.as_ref(),
+        greedy: optional.greedy,
+        words,
+        bytes,
+        inspection_work,
+        total_work,
+    })
+}
+
+fn push_optional_literal_tail_word<'context>(
+    language: &mut Language<'context>,
+    prefix: Option<&[u8]>,
+    tail: &[u8],
+    context: &'context FiniteExtractionContext,
+) -> Result<(), BuildError> {
+    let prefix_bytes = prefix.map_or(0, <[u8]>::len);
+    let length = prefix_bytes
+        .checked_add(tail.len())
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    let mut word = AccountedVec::new(context, FiniteStorage::Persistent);
+    word.reserve_planner(length, "optional literal-tail word bytes")?;
+    if let Some(prefix) = prefix {
+        word.extend_reserved(prefix.iter().copied(), prefix.len())?;
+    }
+    word.extend_reserved(tail.iter().copied(), tail.len())?;
+    language.push_word(word)
+}
+
+type LiteralWordEmitter<'emit, 'context> =
+    dyn FnMut(&mut AccountedVec<'context, u8>) -> Result<(), BuildError> + 'emit;
+
+fn enumerate_literal_tree<'hir, 'context>(
+    hir: &'hir Hir,
+    scratch: &mut AccountedVec<'context, u8>,
+    context: &'context FiniteExtractionContext,
+    emit: &mut LiteralWordEmitter<'_, 'context>,
+) -> Result<(), BuildError> {
+    context.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty => emit(scratch),
+        HirKind::Literal(literal) if !literal.0.is_empty() => {
+            let original_len = scratch.len();
+            scratch.extend_reserved(literal.0.iter().copied(), literal.0.len())?;
+            let result = emit(scratch);
+            scratch.values.truncate(original_len);
+            result
+        }
+        HirKind::Alternation(children) if !children.is_empty() => {
+            for child in children {
+                enumerate_literal_tree(child, scratch, context, emit)?;
+            }
+            Ok(())
+        }
+        HirKind::Concat(children) if !children.is_empty() => {
+            enumerate_literal_concat(children, 0, scratch, context, emit)
+        }
+        HirKind::Literal(_)
+        | HirKind::Class(_)
+        | HirKind::Look(_)
+        | HirKind::Repetition(_)
+        | HirKind::Capture(_)
+        | HirKind::Alternation(_)
+        | HirKind::Concat(_) => Err(BuildError::InternalInvariant(
+            "optional literal-tail preflight changed its operand shape",
+        )),
+    }
+}
+
+fn enumerate_literal_concat<'hir, 'context>(
+    children: &'hir [Hir],
+    index: usize,
+    scratch: &mut AccountedVec<'context, u8>,
+    context: &'context FiniteExtractionContext,
+    emit: &mut LiteralWordEmitter<'_, 'context>,
+) -> Result<(), BuildError> {
+    let Some(child) = children.get(index) else {
+        return emit(scratch);
+    };
+    let mut next = |scratch: &mut AccountedVec<'context, u8>| {
+        enumerate_literal_concat(children, index + 1, scratch, context, emit)
+    };
+    enumerate_literal_tree(child, scratch, context, &mut next)
+}
+
+fn extract_optional_literal_tail(
+    shape: OptionalLiteralTail<'_>,
+    context: &FiniteExtractionContext,
+) -> Result<Vec<Vec<u8>>, BuildError> {
+    context.charge(shape.inspection_work)?;
+    let mut scratch = AccountedVec::new(context, FiniteStorage::Scratch);
+    scratch.reserve_planner(
+        shape.operand_shape.maximum_word_bytes,
+        "optional literal-tail operand scratch",
+    )?;
+    let mut language = Language::empty(context, shape.bytes);
+    language.reserve_words(shape.words, "optional literal-tail words")?;
+    if !shape.greedy {
+        push_optional_literal_tail_word(&mut language, None, shape.tail, context)?;
+    }
+    let mut emit = |word: &mut AccountedVec<'_, u8>| {
+        push_optional_literal_tail_word(&mut language, Some(word), shape.tail, context)
+    };
+    enumerate_literal_tree(shape.operand, &mut scratch, context, &mut emit)?;
+    if shape.greedy {
+        push_optional_literal_tail_word(&mut language, None, shape.tail, context)?;
+    }
+    drop(scratch);
+    Ok(language.into_words())
+}
+
 fn extract_plain(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
     context: &FiniteExtractionContext,
 ) -> Result<Option<Vec<Vec<u8>>>, PlainFailure> {
+    if let Some(shape) = optional_literal_tail(hir, max_words, max_bytes)
+        && context
+            .work()
+            .checked_add(shape.total_work)
+            .is_some_and(|work| work <= context.work_limit)
+    {
+        let expected_work = context
+            .work()
+            .checked_add(shape.total_work)
+            .ok_or_else(|| plain_invariant("optional literal-tail work overflowed"))?;
+        let words = extract_optional_literal_tail(shape, context).map_err(PlainFailure::Resource)?;
+        if context.work() != expected_work {
+            return Err(plain_invariant(
+                "optional literal-tail materialization work did not close",
+            ));
+        }
+        return Ok(Some(words));
+    }
     match analyze(hir, max_words, max_bytes, context).map_err(PlainFailure::Resource)? {
         Analysis::Fits(_) => {}
         Analysis::TooLargeFixedSequence => return Err(PlainFailure::TooLargeFixedSequence),
@@ -5237,6 +5537,139 @@ mod tests {
                 && receipt.actual.work >= initial
                 && receipt.actual.work <= one_below
         ));
+    }
+
+    #[test]
+    fn optional_literal_tail_preserves_factored_priority_duplicates_and_greediness() {
+        let cases: &[(&str, &[&[u8]])] = &[
+            (
+                r"(?:ab|a)?b",
+                &[b"abb".as_slice(), b"ab".as_slice(), b"b".as_slice()],
+            ),
+            (
+                r"(?:a|ab)?b",
+                &[b"ab".as_slice(), b"abb".as_slice(), b"b".as_slice()],
+            ),
+            (
+                r"(?:ab|a)??b",
+                &[b"b".as_slice(), b"abb".as_slice(), b"ab".as_slice()],
+            ),
+            (
+                r"(?:a|ab)??b",
+                &[b"b".as_slice(), b"ab".as_slice(), b"abb".as_slice()],
+            ),
+            (
+                r"(?:ab|ab|a)?b",
+                &[
+                    b"abb".as_slice(),
+                    b"abb".as_slice(),
+                    b"ab".as_slice(),
+                    b"b".as_slice(),
+                ],
+            ),
+            (
+                r"(?:abc|abx|a)?z",
+                &[
+                    b"abcz".as_slice(),
+                    b"abxz".as_slice(),
+                    b"az".as_slice(),
+                    b"z".as_slice(),
+                ],
+            ),
+        ];
+        for &(pattern, expected) in cases {
+            let outcome = extract(&parse(pattern), 64, 4096, 11, u64::MAX, false);
+            assert!(outcome.has_closed_receipt(), "pattern={pattern:?}");
+            let FiniteOutcome::Fits { words, receipt } = outcome else {
+                panic!("optional literal-tail did not fit: {pattern:?}");
+            };
+            assert_eq!(words, expected, "pattern={pattern:?}");
+            let actual = receipt.actual.local;
+            assert_eq!(actual.allocations, expected.len() + 2, "pattern={pattern:?}");
+            assert_eq!(actual.reallocations, 0, "pattern={pattern:?}");
+            assert_eq!(actual.live_scratch_bytes, 0, "pattern={pattern:?}");
+            assert!(actual.released_scratch_bytes > 0, "pattern={pattern:?}");
+            assert_eq!(actual.released_persistent_bytes, 0, "pattern={pattern:?}");
+            assert_eq!(
+                actual.live_persistent_bytes,
+                super::finite_words_capacity_bytes(&words).unwrap(),
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn optional_literal_tail_limits_are_closed_and_fail_open() {
+        let hir = parse(r"(?:ab|a)?b");
+        let success = extract(&hir, 3, 6, 7, u64::MAX, false);
+        assert!(success.has_closed_receipt());
+        let exact_work = success.work();
+        let FiniteOutcome::Fits { words, receipt } = success else {
+            panic!("exact optional literal-tail boundary did not fit");
+        };
+        assert_eq!(words, [b"abb".as_slice(), b"ab".as_slice(), b"b".as_slice()]);
+        assert_eq!(receipt.actual.work, exact_work);
+        assert_eq!(receipt.actual.local.allocations, 5);
+        assert_eq!(receipt.actual.local.reallocations, 0);
+        assert_eq!(receipt.actual.local.live_scratch_bytes, 0);
+        assert!(receipt.actual.local.released_scratch_bytes > 0);
+
+        for (max_words, max_bytes) in [(2, 6), (3, 5)] {
+            let refused = extract(&hir, max_words, max_bytes, 7, u64::MAX, false);
+            assert!(refused.has_closed_receipt());
+            assert!(
+                matches!(refused, FiniteOutcome::Unsupported { .. }),
+                "max_words={max_words} max_bytes={max_bytes}",
+            );
+            let actual = refused.receipt().actual();
+            assert_eq!(actual.local.live_persistent_bytes, 0);
+            assert_eq!(actual.local.live_scratch_bytes, 0);
+        }
+
+        let one_below = exact_work.checked_sub(1).unwrap();
+        let refused = extract(&hir, 3, 6, 7, one_below, false);
+        assert!(refused.has_closed_receipt());
+        assert!(matches!(refused, FiniteOutcome::Unsupported { .. }));
+        assert!(refused.work() <= one_below);
+        assert_eq!(refused.receipt().actual().local.live_persistent_bytes, 0);
+        assert_eq!(refused.receipt().actual().local.live_scratch_bytes, 0);
+
+        let pattern = |branches: usize| {
+            let alternatives = (0..branches)
+                .map(|index| format!("x{index:02}"))
+                .collect::<Vec<_>>()
+                .join("|");
+            format!("(?:{alternatives})?x")
+        };
+        let at_limit = extract(&parse(&pattern(63)), 64, 8192, 0, u64::MAX, false);
+        assert!(at_limit.has_closed_receipt());
+        assert!(matches!(at_limit, FiniteOutcome::Fits { ref words, .. } if words.len() == 64));
+        let over_limit = extract(&parse(&pattern(64)), 65, 8192, 0, u64::MAX, false);
+        assert!(over_limit.has_closed_receipt());
+        assert!(matches!(over_limit, FiniteOutcome::Unsupported { .. }));
+    }
+
+    #[test]
+    fn optional_literal_tail_excludes_nonliteral_or_nonroot_shapes() {
+        for pattern in [
+            r"(?:(ab)|a)?b",
+            r"(?:[ac]|ab)?b",
+            r"(?:a\b|ab)?b",
+            r"(?:a+|ab)?b",
+            r"(?:|a)?b",
+            r"(?:ab|a)?[bc]",
+            r"x(?:ab|a)?b",
+        ] {
+            let outcome = extract(&parse(pattern), 64, 4096, 0, u64::MAX, false);
+            assert!(outcome.has_closed_receipt(), "pattern={pattern:?}");
+            assert!(
+                matches!(outcome, FiniteOutcome::Unsupported { .. }),
+                "unsafe shape admitted: {pattern:?}",
+            );
+            let actual = outcome.receipt().actual();
+            assert_eq!(actual.local.live_persistent_bytes, 0, "pattern={pattern:?}");
+            assert_eq!(actual.local.live_scratch_bytes, 0, "pattern={pattern:?}");
+        }
     }
 
     #[test]

@@ -29552,30 +29552,29 @@ mod tests {
     #[test]
     fn compact_prepared_ordinary_exists_public_lifecycle_is_boundary_exact() {
         const PATTERN: &str = r"(?:ab|a)??b";
-        for selection in [PlanSelection::Auto, PlanSelection::ForceK0] {
-            for length in [30, 31, 32, 63, 64] {
-                for hit in [false, true] {
-                    let regex = compact_prepared_k0(PATTERN, selection);
-                    let mut haystack = vec![b'x'; length];
-                    if hit {
-                        *haystack.last_mut().unwrap() = b'b';
-                    }
-                    super::k0_ordinary_exists_route_probe::reset();
-                    assert_eq!(regex.is_match(&haystack), hit);
-                    assert_eq!(regex.is_match(&haystack), hit);
-                    let prepared = if length >= 31 { 1_usize } else { 0 };
-                    let direct = usize::from((31..64).contains(&length));
-                    assert_eq!(
-                        super::k0_ordinary_exists_route_probe::snapshot(),
-                        super::k0_ordinary_exists_route_probe::Counts {
-                            canonical: 2 - prepared,
-                            prepared,
-                            direct,
-                            generic: 2 - direct,
-                        },
-                        "selection={selection:?} length={length} hit={hit}",
-                    );
+        let selection = PlanSelection::ForceK0;
+        for length in [30, 31, 32, 63, 64] {
+            for hit in [false, true] {
+                let regex = compact_prepared_k0(PATTERN, selection);
+                let mut haystack = vec![b'x'; length];
+                if hit {
+                    *haystack.last_mut().unwrap() = b'b';
                 }
+                super::k0_ordinary_exists_route_probe::reset();
+                assert_eq!(regex.is_match(&haystack), hit);
+                assert_eq!(regex.is_match(&haystack), hit);
+                let prepared = if length >= 31 { 1_usize } else { 0 };
+                let direct = usize::from((31..64).contains(&length));
+                assert_eq!(
+                    super::k0_ordinary_exists_route_probe::snapshot(),
+                    super::k0_ordinary_exists_route_probe::Counts {
+                        canonical: 2 - prepared,
+                        prepared,
+                        direct,
+                        generic: 2 - direct,
+                    },
+                    "selection={selection:?} length={length} hit={hit}",
+                );
             }
         }
     }
