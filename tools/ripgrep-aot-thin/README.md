@@ -79,3 +79,20 @@ one-haystack request uses the scalar entry directly. This changes neither match
 semantics nor the default compiler API: callers must explicitly request the
 additive direct batch entry, and an object-byte-cap decline returns the exact
 ordinary artifact.
+
+The `public_direct_exists_batch` example also has benchmark-only timed modes.
+Its four-argument form retains the ordinary automatic batch call. An exact
+fifth argument of `scalar-loop-v1` or `direct-call-v1` selects a scalar
+per-haystack loop or the descriptor-batch API after both haystack views and the
+bounded descriptor array have been prepared. The equal-length tokens avoid an
+allocator-layout difference between causal arms. Both call paths are
+preflighted in the same order, and route formatting happens after timing. The
+emitted route includes the selected `timed_mode`; unknown and lookalike values
+fail closed.
+
+For a causal wrapper comparison, build one direct-batch-capable example and
+pass that same resolved executable as both inputs to
+`scripts/benchmark-aot-direct-exists-batch.py --same-binary-causal`. The runner
+authenticates binary identity, the per-arm timed mode, output digests, and route
+evidence in its append-only log. This is a benchmark endpoint only and does not
+change or bypass the production matcher API.

@@ -23,6 +23,13 @@ EXPECTED_ROUTES = {
     "baseline": {"route": "direct-native", "api": "per-haystack", "bulk": "none"},
     "candidate": RUNNER["EXPECTED_ROUTE"]["candidate"],
 }
+CAUSAL_ROUTES = {
+    side: {
+        **RUNNER["DIRECT_BATCH_ROUTE"],
+        "timed_mode": RUNNER["SAME_BINARY_TIMED_ROUTE"][side],
+    }
+    for side in ("baseline", "candidate")
+}
 CELLS = [("negative", 1, 64)]
 PAIRS = 6
 WARMUPS = 2
@@ -87,6 +94,32 @@ def result(
         "result_digest": "22" * 8,
         "route": description,
     }
+
+
+def causal_result(
+    side: str,
+    *,
+    scenario: str = "negative",
+    batch: int = 8,
+    byte_size: int = 4096,
+    iterations: int = 7,
+    elapsed_ns: int = 100,
+) -> dict:
+    value = result(
+        side,
+        scenario=scenario,
+        batch=batch,
+        byte_size=byte_size,
+        iterations=iterations,
+        elapsed_ns=elapsed_ns,
+    )
+    route = CAUSAL_ROUTES[side]
+    value["route"] = (
+        "mode=optimizing,"
+        f"route={route['route']},api={route['api']},bulk={route['bulk']},"
+        f"engine=ordered-dfa,timed_mode={route['timed_mode']}"
+    )
+    return value
 
 
 def pair_events(
@@ -213,6 +246,138 @@ def validate(events: list[dict], *, cells=CELLS):
 
 
 class DirectExistsBatchResumeTests(unittest.TestCase):
+    def test_same_binary_causal_command_metadata_and_routes_are_authenticated(self):
+        scalar_command = RUNNER["invocation_command"](
+            pathlib.Path("one-binary"), "late", 8, 4096, 7, "scalar-loop-v1"
+        )
+        direct_command = RUNNER["invocation_command"](
+            pathlib.Path("one-binary"),
+            "late",
+            8,
+            4096,
+            7,
+            "direct-call-v1",
+        )
+        self.assertEqual(scalar_command[:-1], direct_command[:-1])
+        self.assertEqual(len(scalar_command[-1]), len(direct_command[-1]))
+        self.assertEqual(scalar_command[-1], "scalar-loop-v1")
+        self.assertEqual(direct_command[-1], "direct-call-v1")
+        with self.assertRaisesRegex(BenchmarkError, "unsupported benchmark timed mode"):
+            RUNNER["invocation_command"](
+                pathlib.Path("one-binary"), "late", 8, 4096, 7, "scalar"
+            )
+
+        baseline = causal_result("baseline")
+        candidate = causal_result("candidate")
+        for side, value in (("baseline", baseline), ("candidate", candidate)):
+            RUNNER["validate_result"](
+                value,
+                side=side,
+                scenario="negative",
+                batch=8,
+                byte_size=4096,
+                iterations=7,
+                expected_routes=CAUSAL_ROUTES,
+            )
+        RUNNER["validate_pair"](
+            baseline, candidate, expected_routes=CAUSAL_ROUTES
+        )
+
+        wrong_mode = dict(baseline)
+        wrong_mode["route"] = wrong_mode["route"].replace(
+            "scalar-per-haystack-loop-v1", "direct-descriptor-batch-api-v1"
+        )
+        with self.assertRaisesRegex(BenchmarkError, "timed_mode"):
+            RUNNER["validate_result"](
+                wrong_mode,
+                side="baseline",
+                scenario="negative",
+                batch=8,
+                byte_size=4096,
+                iterations=7,
+                expected_routes=CAUSAL_ROUTES,
+            )
+
+        unexpected_route_difference = dict(candidate)
+        baseline["route"] += ",causal_control=same"
+        unexpected_route_difference["route"] += ",causal_control=different"
+        with self.assertRaisesRegex(
+            BenchmarkError, "outside authenticated per-arm fields"
+        ):
+            RUNNER["validate_pair"](
+                baseline,
+                unexpected_route_difference,
+                expected_routes=CAUSAL_ROUTES,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "one-binary"
+            binary.write_bytes(b"same artifact")
+            run_metadata = RUNNER["metadata_event"](
+                binaries={"baseline": binary, "candidate": binary},
+                scenarios=["negative"],
+                batches=[8],
+                byte_sizes=[4096],
+                pairs=61,
+                warmup_pairs=4,
+                minimum_ns=200_000_000,
+                target_ns=250_000_000,
+                expected_routes=CAUSAL_ROUTES,
+                execution_modes=RUNNER["SAME_BINARY_EXECUTION_MODES"],
+            )
+        self.assertEqual(
+            run_metadata["comparison_policy"],
+            "same-binary-explicit-timed-mode-v1",
+        )
+        self.assertEqual(
+            run_metadata["binary_identity_policy"],
+            "same-resolved-executable-v1",
+        )
+        self.assertEqual(
+            run_metadata["execution_modes"], RUNNER["SAME_BINARY_EXECUTION_MODES"]
+        )
+        self.assertEqual(
+            run_metadata["baseline_sha256"], run_metadata["candidate_sha256"]
+        )
+        missing_mode_metadata = dict(run_metadata)
+        missing_mode_metadata.pop("execution_modes")
+        with self.assertRaisesRegex(BenchmarkError, "execution_modes"):
+            RUNNER["validate_resume_metadata"](
+                missing_mode_metadata, expected_metadata=run_metadata
+            )
+        missing_route_evidence = dict(run_metadata)
+        missing_route_evidence.pop("route_evidence")
+        with self.assertRaisesRegex(BenchmarkError, "route_evidence"):
+            RUNNER["validate_resume_metadata"](
+                missing_route_evidence, expected_metadata=run_metadata
+            )
+
+    def test_same_binary_causal_rejects_distinct_artifacts_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            baseline = root / "baseline"
+            candidate = root / "candidate"
+            output = root / "must-not-exist.jsonl"
+            for binary in (baseline, candidate):
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                os.chmod(binary, 0o700)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = RUNNER["main"](
+                    [
+                        "--baseline-bin",
+                        str(baseline),
+                        "--candidate-bin",
+                        str(candidate),
+                        "--output",
+                        str(output),
+                        "--same-binary-causal",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertIn("identical resolved binary paths", stderr.getvalue())
+            self.assertFalse(output.exists())
+
     def test_truncation_after_each_complete_phase_has_exact_resume_point(self):
         initial = [metadata()]
         progress = validate(initial)
@@ -686,7 +851,11 @@ class DirectExistsBatchResumeTests(unittest.TestCase):
                 for event in events[len(existing) :]:
                     kwargs["event_log"].write(event)
                 results.update(existing)
-                RUNNER["validate_pair"](results["baseline"], results["candidate"])
+                RUNNER["validate_pair"](
+                    results["baseline"],
+                    results["candidate"],
+                    expected_routes=EXPECTED_ROUTES,
+                )
                 return results
 
             globals_dict = RUNNER["main"].__globals__

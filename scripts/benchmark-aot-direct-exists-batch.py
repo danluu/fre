@@ -13,6 +13,13 @@ Then pass the two TARGET/release/examples/public_direct_exists_batch paths to
 this runner. Each recorded sample is a fresh process. The runner writes JSONL
 incrementally and never removes or filters a measurement.
 
+For a same-artifact causal comparison, build the direct-batch candidate once,
+pass that exact executable as both --baseline-bin and --candidate-bin, and add
+--same-binary-causal. The runner then sends the equal-length, versioned
+timed-mode tokens scalar-loop-v1 and direct-call-v1. Both modes prepare identical generated
+haystacks and descriptors before timing; only the selected timed call path
+differs. Each result must authenticate the expected timed_mode route field.
+
 After an interruption, rerun the identical command with --resume. Resume
 authenticates the binaries, options, routes, and every existing event before
 opening the file with O_APPEND. It reuses complete pairs and, if the final
@@ -54,6 +61,14 @@ DIRECT_BATCH_ROUTE = {
     "route": "direct-native",
     "api": "direct-exists-batch-v1",
     "bulk": "native-direct-trusted-full-window-loop",
+}
+SAME_BINARY_EXECUTION_MODES = {
+    "baseline": "scalar-loop-v1",
+    "candidate": "direct-call-v1",
+}
+SAME_BINARY_TIMED_ROUTE = {
+    "baseline": "scalar-per-haystack-loop-v1",
+    "candidate": "direct-descriptor-batch-api-v1",
 }
 DEFAULT_PAIRS = 61
 DEFAULT_WARMUP_PAIRS = 4
@@ -221,6 +236,14 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default="per-haystack",
         help="authenticated API route expected from the baseline binary",
     )
+    parser.add_argument(
+        "--same-binary-causal",
+        action="store_true",
+        help=(
+            "require both binary paths to resolve identically, then compare "
+            "the explicit scalar-loop and direct-descriptor-batch timed modes"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -317,6 +340,28 @@ def validate_result(
             )
 
 
+def invocation_command(
+    binary: Path,
+    scenario: str,
+    batch: int,
+    byte_size: int,
+    iterations: int,
+    timed_mode: str | None,
+) -> list[str]:
+    if timed_mode is not None and timed_mode not in SAME_BINARY_EXECUTION_MODES.values():
+        raise BenchmarkError(f"unsupported benchmark timed mode: {timed_mode!r}")
+    command = [
+        str(binary),
+        scenario,
+        str(batch),
+        str(byte_size),
+        str(iterations),
+    ]
+    if timed_mode is not None:
+        command.append(timed_mode)
+    return command
+
+
 def invoke(
     *,
     binary: Path,
@@ -331,14 +376,12 @@ def invoke(
     order: str,
     event_log: EventLog,
     expected_routes: dict[str, dict[str, str]],
+    execution_modes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    command = [
-        str(binary),
-        scenario,
-        str(batch),
-        str(byte_size),
-        str(iterations),
-    ]
+    timed_mode = None if execution_modes is None else execution_modes[side]
+    command = invocation_command(
+        binary, scenario, batch, byte_size, iterations, timed_mode
+    )
     wall_started = time.perf_counter_ns()
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     wall_ns = time.perf_counter_ns() - wall_started
@@ -414,7 +457,12 @@ def invoke(
     return result
 
 
-def validate_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
+def validate_pair(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    expected_routes: dict[str, dict[str, str]],
+) -> None:
     for field in ("input_digest", "result_digest", "matches_per_batch"):
         if baseline[field] != candidate[field]:
             raise BenchmarkError(
@@ -422,15 +470,25 @@ def validate_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
             )
     baseline_route = route_fields(baseline["route"])
     candidate_route = route_fields(candidate["route"])
+    allowed_differences = {"api", "bulk"}
+    for field in set(expected_routes["baseline"]) | set(expected_routes["candidate"]):
+        if expected_routes["baseline"].get(field) != expected_routes["candidate"].get(
+            field
+        ):
+            allowed_differences.add(field)
     baseline_normalized = {
-        key: value for key, value in baseline_route.items() if key not in ("api", "bulk")
+        key: value
+        for key, value in baseline_route.items()
+        if key not in allowed_differences
     }
     candidate_normalized = {
-        key: value for key, value in candidate_route.items() if key not in ("api", "bulk")
+        key: value
+        for key, value in candidate_route.items()
+        if key not in allowed_differences
     }
     if baseline_normalized != candidate_normalized:
         raise BenchmarkError(
-            "route descriptions differ outside api/bulk: "
+            "route descriptions differ outside authenticated per-arm fields: "
             f"{baseline_normalized!r} != {candidate_normalized!r}"
         )
 
@@ -448,6 +506,7 @@ def run_pair(
     order: str,
     event_log: EventLog,
     expected_routes: dict[str, dict[str, str]],
+    execution_modes: dict[str, str] | None = None,
     existing_results: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     results = {} if existing_results is None else dict(existing_results)
@@ -473,8 +532,11 @@ def run_pair(
             order=order,
             event_log=event_log,
             expected_routes=expected_routes,
+            execution_modes=execution_modes,
         )
-    validate_pair(results["baseline"], results["candidate"])
+    validate_pair(
+        results["baseline"], results["candidate"], expected_routes=expected_routes
+    )
     return results
 
 
@@ -489,6 +551,7 @@ def calibrate(
     cell_index: int,
     event_log: EventLog,
     expected_routes: dict[str, dict[str, str]],
+    execution_modes: dict[str, str] | None = None,
     start_iterations: int = 1,
     start_ordinal: int = 0,
     start_partial_results: dict[str, dict[str, Any]] | None = None,
@@ -508,6 +571,7 @@ def calibrate(
             order=order,
             event_log=event_log,
             expected_routes=expected_routes,
+            execution_modes=execution_modes,
             existing_results=(
                 start_partial_results if ordinal == start_ordinal else None
             ),
@@ -662,8 +726,9 @@ def metadata_event(
     minimum_ns: int,
     target_ns: int,
     expected_routes: dict[str, dict[str, str]],
+    execution_modes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    event = {
         "type": "metadata",
         "schema": "fre-public-direct-exists-batch-run-v1",
         "baseline_binary": str(binaries["baseline"]),
@@ -688,6 +753,36 @@ def metadata_event(
             "larger_dispatch": "batch=2..64-authenticated-direct-entry",
         },
     }
+    if execution_modes is not None:
+        causal_routes = {
+            side: {
+                **DIRECT_BATCH_ROUTE,
+                "timed_mode": SAME_BINARY_TIMED_ROUTE[side],
+            }
+            for side in ("baseline", "candidate")
+        }
+        if binaries["baseline"] != binaries["candidate"]:
+            raise BenchmarkError(
+                "same-binary metadata requires identical resolved binary paths"
+            )
+        if not structurally_equal(execution_modes, SAME_BINARY_EXECUTION_MODES):
+            raise BenchmarkError(
+                f"invalid same-binary execution modes: {execution_modes!r}"
+            )
+        if not structurally_equal(expected_routes, causal_routes):
+            raise BenchmarkError(
+                f"invalid same-binary expected routes: {expected_routes!r}"
+            )
+        if event["baseline_sha256"] != event["candidate_sha256"]:
+            raise BenchmarkError("same-binary hashes changed during metadata capture")
+        event.update(
+            {
+                "comparison_policy": "same-binary-explicit-timed-mode-v1",
+                "binary_identity_policy": "same-resolved-executable-v1",
+                "execution_modes": execution_modes,
+            }
+        )
+    return event
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -892,7 +987,9 @@ def consume_logged_pair(
             iterations=iterations,
             expected_routes=expected_routes,
         )
-    validate_pair(results["baseline"], results["candidate"])
+    validate_pair(
+        results["baseline"], results["candidate"], expected_routes=expected_routes
+    )
     return results, cursor + 2, True
 
 
@@ -1135,12 +1232,13 @@ def validate_resume_metadata(
 ) -> str:
     if structurally_equal(actual, expected_metadata):
         return "current-v1"
-    legacy_expected = dict(expected_metadata)
-    legacy_expected.pop("route_evidence")
-    if set(actual) == set(legacy_expected) and structurally_equal(
-        actual, legacy_expected
-    ):
-        return "legacy-v1-without-route-evidence"
+    if "comparison_policy" not in expected_metadata:
+        legacy_expected = dict(expected_metadata)
+        legacy_expected.pop("route_evidence")
+        if set(actual) == set(legacy_expected) and structurally_equal(
+            actual, legacy_expected
+        ):
+            return "legacy-v1-without-route-evidence"
     keys = sorted(set(actual) | set(expected_metadata))
     differences = [
         key
@@ -1179,14 +1277,36 @@ def main(argv: list[str] | None = None) -> int:
             "baseline": validate_binary(arguments.baseline_bin, "baseline binary"),
             "candidate": validate_binary(arguments.candidate_bin, "candidate binary"),
         }
-        expected_routes = {
-            "baseline": (
-                EXPECTED_ROUTE["baseline"]
-                if arguments.baseline_route == "per-haystack"
-                else DIRECT_BATCH_ROUTE
-            ),
-            "candidate": EXPECTED_ROUTE["candidate"],
-        }
+        if arguments.same_binary_causal:
+            if arguments.baseline_route != "per-haystack":
+                raise BenchmarkError(
+                    "--same-binary-causal cannot be combined with "
+                    "--baseline-route=direct-batch"
+                )
+            if binaries["baseline"] != binaries["candidate"]:
+                raise BenchmarkError(
+                    "--same-binary-causal requires identical resolved binary paths"
+                )
+            execution_modes: dict[str, str] | None = dict(
+                SAME_BINARY_EXECUTION_MODES
+            )
+            expected_routes = {
+                side: {
+                    **DIRECT_BATCH_ROUTE,
+                    "timed_mode": SAME_BINARY_TIMED_ROUTE[side],
+                }
+                for side in ("baseline", "candidate")
+            }
+        else:
+            execution_modes = None
+            expected_routes = {
+                "baseline": (
+                    EXPECTED_ROUTE["baseline"]
+                    if arguments.baseline_route == "per-haystack"
+                    else DIRECT_BATCH_ROUTE
+                ),
+                "candidate": EXPECTED_ROUTE["candidate"],
+            }
         cells = [
             (scenario, batch, byte_size)
             for scenario in arguments.scenarios
@@ -1205,6 +1325,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_ns=minimum_ns,
             target_ns=target_ns,
             expected_routes=expected_routes,
+            execution_modes=execution_modes,
         )
         if arguments.resume:
             events, log_identity = read_event_log(arguments.output)
@@ -1281,6 +1402,7 @@ def main(argv: list[str] | None = None) -> int:
                     cell_index=cell_index,
                     event_log=event_log,
                     expected_routes=expected_routes,
+                    execution_modes=execution_modes,
                     start_iterations=iterations,
                     start_ordinal=calibration_ordinal,
                     start_partial_results=partial_results or None,
@@ -1331,6 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
                     order=order,
                     event_log=event_log,
                     expected_routes=expected_routes,
+                    execution_modes=execution_modes,
                     existing_results=(
                         partial_results if warmup == warmup_completed else None
                     ),
@@ -1353,6 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
                             order=order,
                             event_log=event_log,
                             expected_routes=expected_routes,
+                            execution_modes=execution_modes,
                             existing_results=partial_results or None,
                         ),
                     )

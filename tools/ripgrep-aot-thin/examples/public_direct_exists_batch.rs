@@ -6,7 +6,7 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use fre_ripgrep_aot_thin::{AotMatcher, AotMode, AotOutput, EXISTS_BATCH_CAPACITY};
+use fre_ripgrep_aot_thin::{AotHaystack, AotMatcher, AotMode, AotOutput, EXISTS_BATCH_CAPACITY};
 
 const PATTERN: &str = "FRE_PUBLIC_BATCH_NEEDLE_7f4a9c2d";
 const DECOY: &[u8] = b"FRE_PUBLIC_BATCH_NEEDLE_7f4a9c2x";
@@ -19,6 +19,31 @@ enum Scenario {
     Early,
     Late,
     DenseDecoy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimedMode {
+    ScalarLoop,
+    DirectDescriptorBatch,
+}
+
+impl TimedMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "scalar-loop-v1" => Ok(Self::ScalarLoop),
+            "direct-call-v1" => Ok(Self::DirectDescriptorBatch),
+            _ => Err(format!(
+                "unknown timed mode {value:?}; expected scalar-loop-v1 or direct-call-v1"
+            )),
+        }
+    }
+
+    const fn route_field(self) -> &'static str {
+        match self {
+            Self::ScalarLoop => "scalar-per-haystack-loop-v1",
+            Self::DirectDescriptorBatch => "direct-descriptor-batch-api-v1",
+        }
+    }
 }
 
 impl Scenario {
@@ -54,6 +79,7 @@ struct Arguments {
     batch: usize,
     bytes: usize,
     iterations: usize,
+    timed_mode: Option<TimedMode>,
 }
 
 fn main() -> ExitCode {
@@ -80,7 +106,6 @@ fn run() -> Result<(), String> {
         .iter()
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
-
     let mut scalar = AotMatcher::new(AotMode::Optimizing, AotOutput::Exists, PATTERN, false)?;
     let expected = haystacks
         .iter()
@@ -94,23 +119,63 @@ fn run() -> Result<(), String> {
     }
 
     let mut matcher = AotMatcher::new(AotMode::Optimizing, AotOutput::Exists, PATTERN, false)?;
-    let route = matcher.description();
     let mut outcomes = expected.iter().map(|value| !value).collect::<Vec<_>>();
-    matcher.is_match_batch(&haystacks, &mut outcomes)?;
-    if outcomes != expected {
-        return Err("batch preflight disagrees with scalar is_match output".to_owned());
-    }
-
-    let started = Instant::now();
-    for _ in 0..arguments.iterations {
+    let elapsed = if let Some(timed_mode) = arguments.timed_mode {
+        let mut descriptor_storage = [AotHaystack::from(haystacks[0]); EXISTS_BATCH_CAPACITY];
+        for (descriptor, haystack) in descriptor_storage.iter_mut().zip(&haystacks) {
+            *descriptor = AotHaystack::from(*haystack);
+        }
+        let descriptors = &descriptor_storage[..haystacks.len()];
+        scalar_loop_once(&mut matcher, &haystacks, &mut outcomes)?;
+        if outcomes != expected {
+            return Err("scalar-loop preflight disagrees with scalar oracle".to_owned());
+        }
+        invert_outcomes(&expected, &mut outcomes);
+        matcher.is_match_descriptor_batch(descriptors, &mut outcomes)?;
+        if outcomes != expected {
+            return Err("descriptor-batch preflight disagrees with scalar oracle".to_owned());
+        }
+        invert_outcomes(&expected, &mut outcomes);
+        match timed_mode {
+            TimedMode::ScalarLoop => time_scalar_loop(
+                &mut matcher,
+                &haystacks,
+                &mut outcomes,
+                arguments.iterations,
+            )?,
+            TimedMode::DirectDescriptorBatch => time_direct_descriptor_batch(
+                &mut matcher,
+                descriptors,
+                &mut outcomes,
+                arguments.iterations,
+            )?,
+        }
+    } else {
         matcher.is_match_batch(&haystacks, &mut outcomes)?;
-    }
-    let elapsed = started.elapsed();
+        if outcomes != expected {
+            return Err("batch preflight disagrees with scalar is_match output".to_owned());
+        }
+        let started = Instant::now();
+        for _ in 0..arguments.iterations {
+            matcher.is_match_batch(&haystacks, &mut outcomes)?;
+        }
+        started.elapsed()
+    };
     black_box(&outcomes);
     if outcomes != expected {
         return Err("final timed batch disagrees with scalar preflight".to_owned());
     }
 
+    let route_storage = arguments.timed_mode.map(|mode| {
+        format!(
+            "{},timed_mode={}",
+            matcher.description(),
+            mode.route_field()
+        )
+    });
+    let route = route_storage
+        .as_deref()
+        .unwrap_or_else(|| matcher.description());
     let input_digest = digest_haystacks(&haystacks);
     let result_digest = digest_result(input_digest, arguments.iterations, &outcomes);
     let matches_per_batch = outcomes.iter().filter(|&&value| value).count();
@@ -134,15 +199,20 @@ fn run() -> Result<(), String> {
 
 fn parse_arguments() -> Result<Arguments, String> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 4 {
+    if !matches!(arguments.len(), 4 | 5) {
         return Err(
-            "usage: public_direct_exists_batch SCENARIO BATCH BYTES ITERATIONS".to_owned(),
+            "usage: public_direct_exists_batch SCENARIO BATCH BYTES ITERATIONS [TIMED_MODE]"
+                .to_owned(),
         );
     }
     let scenario = Scenario::parse(&arguments[0])?;
     let batch = parse_usize("batch", &arguments[1])?;
     let bytes = parse_usize("bytes", &arguments[2])?;
     let iterations = parse_usize("iterations", &arguments[3])?;
+    let timed_mode = arguments
+        .get(4)
+        .map(|value| TimedMode::parse(value))
+        .transpose()?;
     if !(1..=EXISTS_BATCH_CAPACITY).contains(&batch) {
         return Err(format!(
             "batch must be in 1..={EXISTS_BATCH_CAPACITY}, got {batch}"
@@ -161,7 +231,55 @@ fn parse_arguments() -> Result<Arguments, String> {
         batch,
         bytes,
         iterations,
+        timed_mode,
     })
+}
+
+fn invert_outcomes(expected: &[bool], outcomes: &mut [bool]) {
+    debug_assert_eq!(expected.len(), outcomes.len());
+    for (expected, outcome) in expected.iter().zip(outcomes) {
+        *outcome = !expected;
+    }
+}
+
+fn scalar_loop_once(
+    matcher: &mut AotMatcher,
+    haystacks: &[&[u8]],
+    outcomes: &mut [bool],
+) -> Result<(), String> {
+    debug_assert_eq!(haystacks.len(), outcomes.len());
+    for (haystack, outcome) in haystacks.iter().zip(outcomes) {
+        *outcome = matcher.is_match(haystack)?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn time_scalar_loop(
+    matcher: &mut AotMatcher,
+    haystacks: &[&[u8]],
+    outcomes: &mut [bool],
+    iterations: usize,
+) -> Result<std::time::Duration, String> {
+    let started = Instant::now();
+    for _ in 0..iterations {
+        scalar_loop_once(matcher, haystacks, outcomes)?;
+    }
+    Ok(started.elapsed())
+}
+
+#[inline(never)]
+fn time_direct_descriptor_batch(
+    matcher: &mut AotMatcher,
+    descriptors: &[AotHaystack<'_>],
+    outcomes: &mut [bool],
+    iterations: usize,
+) -> Result<std::time::Duration, String> {
+    let started = Instant::now();
+    for _ in 0..iterations {
+        matcher.is_match_descriptor_batch(descriptors, outcomes)?;
+    }
+    Ok(started.elapsed())
 }
 
 fn parse_usize(name: &str, value: &str) -> Result<usize, String> {
@@ -256,4 +374,47 @@ fn json_string(value: &str) -> String {
     }
     encoded.push('"');
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TimedMode;
+
+    #[test]
+    fn timed_modes_are_explicit_and_route_safe() {
+        let cases = [
+            (
+                "scalar-loop-v1",
+                TimedMode::ScalarLoop,
+                "scalar-per-haystack-loop-v1",
+            ),
+            (
+                "direct-call-v1",
+                TimedMode::DirectDescriptorBatch,
+                "direct-descriptor-batch-api-v1",
+            ),
+        ];
+        for (argument, expected, route) in cases {
+            let parsed = TimedMode::parse(argument).expect("documented timed mode");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.route_field(), route);
+            assert!(!route.contains(',') && !route.contains('='));
+        }
+    }
+
+    #[test]
+    fn timed_modes_reject_implicit_or_lookalike_values() {
+        for invalid in [
+            "",
+            "auto-batch",
+            "scalar",
+            "scalar-loop",
+            "direct-batch",
+            "direct-descriptor-batch",
+            "Scalar-loop-v1",
+            "direct-call-v1,mode=scalar-loop-v1",
+        ] {
+            assert!(TimedMode::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
 }
