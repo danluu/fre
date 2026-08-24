@@ -318,7 +318,10 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         usize::from(accounting.scratch_bytes),
         513 * core::mem::size_of::<u64>(),
     );
-    assert_eq!(accounting.actual_scratch_bytes, accounting.scratch_bytes);
+    assert_eq!(
+        usize::from(accounting.actual_scratch_bytes),
+        17 * core::mem::size_of::<u64>(),
+    );
     assert!(regex.find_accounted(haystack, exact).is_ok());
     assert!(regex.selected_end(haystack, exact).is_ok());
     let below = SearchLimits {
@@ -370,6 +373,80 @@ fn span_work_limit_accepts_the_bound_and_rejects_one_below() {
         )) if needed == usize::from(no_tail_accounting.scratch_bytes)
             && limit == no_tail_below.max_scratch_bytes
     ));
+}
+
+#[test]
+fn short_replay_only_changes_actual_scratch_at_the_exact_horizon_boundary() {
+    let cases = [
+        (16, 1, 17),
+        (17, 1, 513),
+        (64, 4, 513),
+        (64, 8, 513),
+    ];
+    for (token_bytes, repetitions, actual_scratch_cells) in cases {
+        let token = "a".repeat(token_bytes);
+        let pattern = format!(r"(?-u:(?:{token}){{0,{repetitions}}}z)");
+        let regex = build_auto(&pattern);
+        let upstream = regex::bytes::RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID,
+            "token_bytes={token_bytes} repetitions={repetitions}",
+        );
+
+        let mut haystack = b"xx".to_vec();
+        for _ in 0..repetitions {
+            haystack.extend_from_slice(token.as_bytes());
+        }
+        haystack.push(b'z');
+        let (matched, accounting) = regex
+            .find_accounted(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            span(matched),
+            upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+            "token_bytes={token_bytes} repetitions={repetitions}",
+        );
+        let SearchAccounting::NullableOptionalChain(accounting) = accounting else {
+            panic!("expected nullable finite-token accounting");
+        };
+        assert_eq!(
+            usize::from(accounting.scratch_bytes),
+            513 * core::mem::size_of::<u64>(),
+        );
+        assert_eq!(
+            usize::from(accounting.actual_scratch_bytes),
+            actual_scratch_cells * core::mem::size_of::<u64>(),
+        );
+        assert!(accounting.actual_work <= accounting.work_upper_bound);
+
+        let exact = SearchLimits {
+            max_work: accounting.work_upper_bound,
+            max_scratch_bytes: usize::from(accounting.scratch_bytes),
+        };
+        assert_eq!(
+            span(regex.find_accounted(&haystack, exact).unwrap().0),
+            upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        let below = SearchLimits {
+            max_work: accounting.work_upper_bound,
+            max_scratch_bytes: usize::from(accounting.scratch_bytes) - 1,
+        };
+        assert!(matches!(
+            regex.find_accounted(&haystack, below),
+            Err(SearchError::NullableOptionalChain(
+                NullableOptionalChainSearchError::ScratchLimit { needed, limit }
+            )) if needed == usize::from(accounting.scratch_bytes)
+                && limit == below.max_scratch_bytes
+        ));
+    }
 }
 
 #[test]

@@ -36,6 +36,10 @@ const MAX_TOTAL_TOKEN_BYTES: usize = 256;
 const MAX_REPETITIONS: usize = 63;
 const MAX_PREFIX_BYTES: usize = 512;
 const NO_TERMINAL: u8 = u8::MAX;
+const SHORT_PREFIX_BYTES: usize = 16;
+const SHORT_REACHABILITY_CELLS: usize = SHORT_PREFIX_BYTES + 1;
+const SHORT_REACHABILITY_SCRATCH_BYTES: usize =
+    core::mem::size_of::<[u64; SHORT_REACHABILITY_CELLS]>();
 const REACHABILITY_CELLS: usize = MAX_PREFIX_BYTES + 1;
 const REACHABILITY_SCRATCH_BYTES: usize =
     core::mem::size_of::<[u64; REACHABILITY_CELLS]>();
@@ -275,7 +279,7 @@ impl Plan {
             return Ok((None, actual, upper));
         };
         actual.candidate_visits = 1;
-        let start = self.earliest_start_for_tail(
+        let start = self.earliest_start_for_tail_dispatch(
             haystack,
             window.start(),
             tail_start,
@@ -310,6 +314,107 @@ impl Plan {
         Ok(matched)
     }
 
+    // Keep the short allocation out of both the caller and the incumbent
+    // maximum-sized replay frame. Dispatch only after a tail hit so misses and
+    // every source-independent admission check retain their existing path.
+    #[inline(never)]
+    fn earliest_start_for_tail_dispatch(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        tail_start: usize,
+        actual: &mut Actual,
+    ) -> Result<usize, Error> {
+        if usize::from(self.maximum_prefix_bytes) <= SHORT_PREFIX_BYTES {
+            return self.earliest_start_for_tail_short(
+                haystack,
+                window_start,
+                tail_start,
+                actual,
+            );
+        }
+        self.earliest_start_for_tail(haystack, window_start, tail_start, actual)
+    }
+
+    // This deliberately remains separate from `earliest_start_for_tail` so
+    // plans above the short horizon keep the incumbent replay code and frame.
+    #[inline(never)]
+    fn earliest_start_for_tail_short(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        tail_start: usize,
+        actual: &mut Actual,
+    ) -> Result<usize, Error> {
+        let horizon = tail_start
+            .saturating_sub(window_start)
+            .min(usize::from(self.maximum_prefix_bytes));
+        debug_assert!(horizon <= SHORT_PREFIX_BYTES);
+        let mut reachable_counts = [0_u64; SHORT_REACHABILITY_CELLS];
+        actual.replay_cells = actual
+            .replay_cells
+            .checked_add(SHORT_REACHABILITY_CELLS)
+            .ok_or(Error::ArithmeticOverflow {
+                computation: "finite-token reachability initialization work",
+            })?;
+        actual.scratch_bytes = SHORT_REACHABILITY_SCRATCH_BYTES;
+        reachable_counts[0] = 1;
+        let count_mask = low_count_mask(usize::from(self.maximum_repetitions));
+        let mut best_offset = 0usize;
+        let mut furthest_pending = 0usize;
+        let mut offset = 0usize;
+        while offset <= furthest_pending {
+            actual.replay_cells = actual.replay_cells.saturating_add(1);
+            let counts = reachable_counts[offset] & count_mask;
+            let next_counts = (counts << 1) & count_mask;
+            if next_counts != 0 {
+                let boundary = tail_start.checked_sub(offset).ok_or(
+                    Error::InternalInvariant {
+                        detail: "finite-token reverse boundary crossed the tail window",
+                    },
+                )?;
+                let available = boundary.saturating_sub(window_start);
+                let walk_limit = available
+                    .min(usize::from(self.maximum_token_bytes))
+                    .min(horizon.saturating_sub(offset));
+                let mut node = 0usize;
+                for depth in 1..=walk_limit {
+                    actual.backward_steps = actual.backward_steps.saturating_add(1);
+                    let byte = haystack[boundary - depth];
+                    let Some(target) = self.find_child(node, byte, actual)? else {
+                        break;
+                    };
+                    node = target;
+                    let terminal = self.nodes.get(node).ok_or(Error::InternalInvariant {
+                        detail: "finite-token reverse trie target escaped its nodes",
+                    })?;
+                    if terminal.first_source_token == NO_TERMINAL {
+                        continue;
+                    }
+                    let target_offset = offset.checked_add(depth).ok_or(
+                        Error::ArithmeticOverflow {
+                            computation: "finite-token reverse target offset",
+                        },
+                    )?;
+                    if target_offset > horizon {
+                        continue;
+                    }
+                    actual.replay_cells = actual.replay_cells.saturating_add(1);
+                    reachable_counts[target_offset] |= next_counts;
+                    best_offset = best_offset.max(target_offset);
+                    furthest_pending = furthest_pending.max(target_offset);
+                }
+            }
+            offset = offset.saturating_add(1);
+        }
+        tail_start
+            .checked_sub(best_offset)
+            .ok_or(Error::InternalInvariant {
+                detail: "finite-token recovered start crossed zero",
+            })
+    }
+
+    #[inline(never)]
     fn earliest_start_for_tail(
         &self,
         haystack: &[u8],
