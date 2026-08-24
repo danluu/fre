@@ -32,6 +32,9 @@ std::thread_local! {
     static FULL_PREPARED_FIND_CALL_COUNT: core::cell::Cell<usize> = const {
         core::cell::Cell::new(0)
     };
+    static ASCII_EXISTS_SPARSE_CONTINUATION_CALL_COUNT: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -57,6 +60,22 @@ pub(crate) fn full_prepared_find_call_count() -> usize {
 #[cfg(test)]
 fn record_full_prepared_find_call() {
     FULL_PREPARED_FIND_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn reset_ascii_exists_sparse_continuation_call_count() {
+    ASCII_EXISTS_SPARSE_CONTINUATION_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn ascii_exists_sparse_continuation_call_count() -> usize {
+    ASCII_EXISTS_SPARSE_CONTINUATION_CALL_COUNT.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_ascii_exists_sparse_continuation_call() {
+    ASCII_EXISTS_SPARSE_CONTINUATION_CALL_COUNT
+        .with(|count| count.set(count.get().saturating_add(1)));
 }
 
 const FIXED_BUILD_WORK: usize = 1;
@@ -2468,8 +2487,39 @@ fn ascii_word_run_exists(haystack: &[u8], minimum: usize) -> bool {
     if haystack.len() < minimum {
         return false;
     }
+    if minimum == 0 {
+        return haystack.iter().copied().any(is_ascii_word);
+    }
+    let mut prefix = 0_usize;
+    while prefix < minimum && is_ascii_word(haystack[prefix]) {
+        prefix += 1;
+    }
+    if prefix == minimum {
+        return true;
+    }
+    ascii_word_run_exists_after_first_reset(haystack, minimum)
+}
+
+#[inline(never)]
+fn ascii_word_run_exists_after_first_reset(haystack: &[u8], minimum: usize) -> bool {
+    #[cfg(test)]
+    record_ascii_exists_sparse_continuation_call();
+    // The caller found the first nonword before the construction-proved run
+    // minimum. Rediscover that reset outside the hot prefix probe, then
+    // range-skip only the following bytes proved nonword. Punctuation inside
+    // the conservative range deliberately stops the skip early.
+    let Some(first_reset) = haystack.iter().position(|&byte| !is_ascii_word(byte)) else {
+        return haystack.len() >= minimum;
+    };
+    let suffix = &haystack[first_reset + 1..];
+    if suffix.len() < minimum {
+        return false;
+    }
+    let Some(start) = find_byte_delta(b'0', b'z' - b'0', suffix) else {
+        return false;
+    };
     let mut run = 0_usize;
-    for &byte in haystack {
+    for &byte in &suffix[start..] {
         if is_ascii_word(byte) {
             run = run.saturating_add(1);
             if run >= minimum {
@@ -2775,7 +2825,8 @@ mod tests {
         AggregateInspectionError, AggregateInspectionOutcome, AggregateOperationIdentity,
         AggregateReduceError, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, Error,
         FIXED_BUILD_WORK, Plan, WordMode, WordRunTopology, aggregate_build_accounting_matches,
-        ascii_word_set, inspect_aggregate_attempt,
+        ascii_exists_sparse_continuation_call_count, ascii_word_set, inspect_aggregate_attempt,
+        reset_ascii_exists_sparse_continuation_call_count,
     };
     use crate::{Match, SearchLimits, SearchWindow};
 
@@ -3479,6 +3530,94 @@ mod tests {
             ),
             Ok(false),
         );
+    }
+
+    #[test]
+    fn prepaid_ascii_word_sparse_continuation_is_oracle_exact_and_source_local() {
+        for (pattern, plan) in [
+            (r"\b\w{1,}\b", Plan::new(1, WordMode::Ascii)),
+            (r"\w{1,}", Plan::bare_greedy(1, WordMode::Ascii)),
+            (r"\b\w{2,}\b", Plan::new(2, WordMode::Ascii)),
+            (r"\w{2,}", Plan::bare_greedy(2, WordMode::Ascii)),
+            (r"\b\w{25,}\b", Plan::new(25, WordMode::Ascii)),
+            (r"\w{25,}", Plan::bare_greedy(25, WordMode::Ascii)),
+        ] {
+            let auto = AsciiPlan::build_auto(plan).expect("exact ASCII owner");
+            for prefix_len in [31_usize, 32, 33, 63, 64, 65, 1_023, 1_024] {
+                let mut sources = Vec::new();
+                sources.push(vec![b'!'; prefix_len]);
+                sources.push(vec![0xff; prefix_len]);
+
+                let mut late = vec![b'!'; prefix_len];
+                late.extend(core::iter::repeat_n(b'A', plan.word_minimum_scalars()));
+                late.push(b'!');
+                sources.push(late);
+
+                let mut partial = vec![b'A'; plan.word_minimum_scalars() - 1];
+                partial.push(b'!');
+                partial.resize(prefix_len, b'!');
+                partial.extend(core::iter::repeat_n(b'Z', plan.word_minimum_scalars()));
+                partial.push(b'!');
+                sources.push(partial);
+
+                let mut conservative_stop = vec![b'!'; prefix_len];
+                conservative_stop[prefix_len / 2] = b'?';
+                conservative_stop.extend_from_slice(b"!AZ!");
+                sources.push(conservative_stop);
+
+                for source in sources {
+                    reset_ascii_exists_sparse_continuation_call_count();
+                    assert_eq!(
+                        auto.is_match_window_value(
+                            &source,
+                            SearchWindow::full(&source),
+                            SearchLimits::unlimited(),
+                        ),
+                        Ok(oracle_find(pattern, &source, false).is_some()),
+                        "pattern={pattern:?} source_len={}",
+                        source.len(),
+                    );
+                    assert_eq!(ascii_exists_sparse_continuation_call_count(), 1);
+                }
+            }
+        }
+
+        let auto = AsciiPlan::build_auto(Plan::new(2, WordMode::Ascii)).expect("exact ASCII owner");
+        let mut source = vec![b'!'; 4_093];
+        reset_ascii_exists_sparse_continuation_call_count();
+        assert_eq!(
+            auto.is_match_window_value(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits::unlimited(),
+            ),
+            Ok(false),
+        );
+        assert_eq!(ascii_exists_sparse_continuation_call_count(), 1);
+
+        source[4_090..4_092].copy_from_slice(b"AZ");
+        reset_ascii_exists_sparse_continuation_call_count();
+        assert_eq!(
+            auto.is_match_window_value(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+        assert_eq!(ascii_exists_sparse_continuation_call_count(), 1);
+
+        source[..2].copy_from_slice(b"AZ");
+        reset_ascii_exists_sparse_continuation_call_count();
+        assert_eq!(
+            auto.is_match_window_value(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits::unlimited(),
+            ),
+            Ok(true),
+        );
+        assert_eq!(ascii_exists_sparse_continuation_call_count(), 0);
     }
 
     #[test]
