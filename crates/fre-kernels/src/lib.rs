@@ -473,7 +473,9 @@ pub use literal_set::{
     LiteralSetUniformStandardOrdinaryExecutor,
 };
 pub use literal_set_compact::{
-    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryExecutor, LiteralSetCompactPlan,
+    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
+    LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryExecutor,
+    LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
 };
 pub use ordered_literal_aggregate::{
     ALGORITHM_ID as ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
