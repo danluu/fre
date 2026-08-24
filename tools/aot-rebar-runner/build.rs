@@ -350,6 +350,7 @@ fn main() {
                                 &bridge.rows,
                                 None,
                                 None,
+                                None,
                                 Some(&bridge),
                                 &architecture,
                                 &operating_system,
