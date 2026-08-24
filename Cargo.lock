@@ -186,6 +186,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-aot-direct-count-benchmark"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-regex",
+ "fre-aot-regex-runtime",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fre-aot-elf"
 version = "0.1.0"
 dependencies = [

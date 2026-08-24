@@ -39,6 +39,7 @@ members = [
     "tools/rebar-compare",
     "tools/rebar-manifest",
     "tools/aot-rebar-runner",
+    "tools/aot-direct-count-benchmark",
     "tools/ripgrep-aot-thin",
     "tools/rust-regex-conformance",
     "tools/fre-holdout",

@@ -1,0 +1,27 @@
+[package]
+name = "fre-aot-direct-count-benchmark"
+version.workspace = true
+description = "Public generated causal benchmark for the direct AOT Count route"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+fre = { path = "../../crates/fre" }
+fre-aot-regex-runtime = { path = "../../crates/fre-aot-regex-runtime" }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+
+[build-dependencies]
+fre-aot-regex = { path = "../../crates/fre-aot-regex" }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = "warn"
