@@ -5,7 +5,7 @@
 //! corpus name, or source-pattern identity outside the bound artifact hash.
 
 use fre_aot_aarch64::{
-    AotCountMappedMetadataV3, CountAotError, CountEmitLimitsV3,
+    AotCountMappedMetadataV3, CountAotError, CountAotUnsupported, CountEmitLimitsV3,
     audit_count_mapped_code_v3,
 };
 use fre_aot_count_compiler::{
@@ -155,6 +155,7 @@ pub(crate) enum DirectExactSingletonCountTestPreparation {
     Normal,
     Decline,
     AllocationFailure,
+    UnsupportedBackendFailure,
 }
 
 #[cfg(test)]
@@ -208,6 +209,13 @@ pub(crate) fn prepare_direct_exact_singleton_count(
         DirectExactSingletonCountTestPreparation::AllocationFailure => {
             return Err(ObjectError::Allocation(
                 "injected direct Count-v3 candidate",
+            ));
+        }
+        DirectExactSingletonCountTestPreparation::UnsupportedBackendFailure => {
+            return classify_compile_error(CountCompileErrorV3::Image(
+                CountAotError::Unsupported {
+                    reason: CountAotUnsupported::BackendTuple,
+                },
             ));
         }
     }
@@ -349,9 +357,9 @@ fn classify_compile_error(
             | CountV3OptimizeError::RetainedBytes { .. }
             | CountV3OptimizeError::IdentityBytesHashed { .. },
         )
-        | CountCompileErrorV3::Image(
-            CountAotError::ResourceLimit { .. } | CountAotError::Unsupported { .. },
-        ) => Ok(DirectExactSingletonCountPreparation::Declined),
+        | CountCompileErrorV3::Image(CountAotError::ResourceLimit { .. }) => {
+            Ok(DirectExactSingletonCountPreparation::Declined)
+        }
         CountCompileErrorV3::AllocationFailed
         | CountCompileErrorV3::Kernel(AggregateBuildError::Search(
             BuildError::AllocationFailed { .. }
@@ -371,10 +379,39 @@ fn classify_compile_error(
         | CountCompileErrorV3::Image(CountAotError::ArithmeticOverflow { .. }) => Err(
             ObjectError::ArithmeticOverflow("direct Count-v3 candidate"),
         ),
+        CountCompileErrorV3::Image(CountAotError::Unsupported { reason }) => {
+            Err(classify_unsupported_backend(reason))
+        }
         _ => Err(ObjectError::InvalidModule(
             "direct Count-v3 candidate authentication failed",
         )),
     }
+}
+
+fn classify_unsupported_backend(reason: CountAotUnsupported) -> ObjectError {
+    let at = match reason {
+        CountAotUnsupported::Output => "direct Count-v3 backend rejected Count output",
+        CountAotUnsupported::LiteralWidth => {
+            "direct Count-v3 backend rejected authenticated literal width"
+        }
+        CountAotUnsupported::KernelShape => {
+            "direct Count-v3 backend rejected authenticated kernel shape"
+        }
+        CountAotUnsupported::BackendTuple => {
+            "direct Count-v3 backend rejected authenticated target tuple"
+        }
+        CountAotUnsupported::OptimizerRecipe => {
+            "direct Count-v3 backend rejected authenticated optimizer recipe"
+        }
+        CountAotUnsupported::RecipeSchedule => {
+            "direct Count-v3 backend rejected authenticated recipe schedule"
+        }
+        CountAotUnsupported::TargetFeature => {
+            "direct Count-v3 backend rejected authenticated target features"
+        }
+        _ => "direct Count-v3 backend reported an unsupported authenticated contract",
+    };
+    ObjectError::InvalidModule(at)
 }
 
 #[allow(

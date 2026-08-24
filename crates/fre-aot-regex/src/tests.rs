@@ -486,6 +486,43 @@ fn direct_exact_singleton_count_object_cap_decline_is_incumbent_exact_and_alloca
 }
 
 #[test]
+fn direct_exact_singleton_count_backend_unsupported_is_terminal() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    assert!(!incumbent.object().is_empty());
+    assert!(
+        incumbent
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_none(),
+    );
+
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::UnsupportedBackendFailure,
+    );
+    let error = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("backend contract failure must not return the incumbent");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::InvalidModule(
+            "direct Count-v3 backend rejected authenticated target tuple"
+        ))
+    ));
+}
+
+#[test]
 fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface() {
     let target = direct_count_asimd_target(OperatingSystem::Macos);
     let request = direct_count_request(
