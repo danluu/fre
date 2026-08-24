@@ -436,6 +436,11 @@ fn configured_shared_ordered_many_reducers_match_build_many()
 
 fn configured_native_rows_klv(model: Model) -> Vec<u8> {
     let mut output = Vec::new();
+    let haystack = if model == Model::GrepCount {
+        b"ab\nz\r\nnone\rtrail\n".as_slice()
+    } else {
+        b"abx".as_slice()
+    };
     let model = model.name().as_bytes();
     for (key, value) in [
         ("name", b"synthetic/aot-runner/native-row-bridge".as_slice()),
@@ -451,7 +456,7 @@ fn configured_native_rows_klv(model: Model) -> Vec<u8> {
         ("pattern", b"a".as_slice()),
         ("pattern", b"ab".as_slice()),
         ("pattern", b"".as_slice()),
-        ("haystack", b"abx".as_slice()),
+        ("haystack", haystack),
     ] {
         output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
         output.extend_from_slice(value);

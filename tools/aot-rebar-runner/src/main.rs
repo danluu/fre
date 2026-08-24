@@ -3845,6 +3845,18 @@ fn authenticate_linked_shared_uniform_capture(benchmark: &shared::Benchmark) -> 
     Ok(())
 }
 
+fn shared_ordered_many_linked_digests_are_closed(
+    patterns: &[String],
+    claimed_sources_sha256: [u8; 32],
+    object: &[u8],
+    claimed_object_sha256: [u8; 32],
+) -> Result<bool, String> {
+    let expected_sources_sha256 = shared::ordered_many_source_sha256(patterns)?;
+    Ok(claimed_sources_sha256 == expected_sources_sha256
+        && !object.is_empty()
+        && sha256(object) == claimed_object_sha256)
+}
+
 fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Result<(), String> {
     let (adapter, reducer_prefix, span_iteration, grep_iteration) = match benchmark.model {
         shared::Model::Count => (
@@ -3873,6 +3885,12 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
         }
     };
     let sources = benchmark.patterns.len();
+    let digests_are_closed = shared_ordered_many_linked_digests_are_closed(
+        &benchmark.patterns,
+        linked::ORDERED_MANY_SOURCES_SHA256,
+        linked::OBJECT_BYTES,
+        linked::OBJECT_SHA256,
+    )?;
     let valid_source_map = linked::SOURCE_TO_ARTIFACT.len() == sources
         && linked::SOURCE_TO_ARTIFACT
             .iter()
@@ -3918,6 +3936,7 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
     if sources < 2
         || sources > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         || linked::NATIVE_ROW_BRIDGE
+        || !digests_are_closed
         || linked::EXPECTED_PATTERN != ""
         || linked::SOURCE_PATTERN_COUNT != sources
         || !valid_source_map
@@ -5651,6 +5670,47 @@ mod tests {
                 shared::Model::GrepCount
                     .adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             ),
+        );
+    }
+
+    #[test]
+    fn shared_ordered_many_digest_closure_rejects_source_and_object_mutations() {
+        let patterns = vec!["foo".to_owned(), "bar+".to_owned()];
+        let sources_sha256 =
+            shared::ordered_many_source_sha256(&patterns).expect("synthetic source identity");
+        let object = b"synthetic linked object";
+        let object_sha256 = sha256(object);
+        assert!(
+            shared_ordered_many_linked_digests_are_closed(
+                &patterns,
+                sources_sha256,
+                object,
+                object_sha256,
+            )
+            .expect("authenticate synthetic shared digests"),
+        );
+
+        let mut wrong_sources = sources_sha256;
+        wrong_sources[0] ^= 1;
+        assert!(
+            !shared_ordered_many_linked_digests_are_closed(
+                &patterns,
+                wrong_sources,
+                object,
+                object_sha256,
+            )
+            .expect("reject mutated source identity"),
+        );
+        let mut wrong_object = object_sha256;
+        wrong_object[0] ^= 1;
+        assert!(
+            !shared_ordered_many_linked_digests_are_closed(
+                &patterns,
+                sources_sha256,
+                object,
+                wrong_object,
+            )
+            .expect("reject mutated object identity"),
         );
     }
 

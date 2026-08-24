@@ -780,11 +780,21 @@ fn configured_source(
         uniform_capture && shared_ordered_many
     );
     if let Some(ordered) = ordered_many_receipt {
-        assert_eq!(ordered.rows, benchmark.patterns.len());
+        let expected_pattern_bytes = benchmark
+            .patterns
+            .iter()
+            .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+            .expect("shared ordered-many source byte sum overflowed");
+        let expected_sources_sha256 =
+            shared::ordered_many_source_sha256(&benchmark.patterns)
+                .expect("shared ordered-many source identity failed");
         assert_eq!(
-            ordered.pattern_bytes,
-            benchmark.patterns.iter().map(String::len).sum::<usize>()
+            ordered.schema_version,
+            fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
         );
+        assert_eq!(ordered.rows, benchmark.patterns.len());
+        assert_eq!(ordered.pattern_bytes, expected_pattern_bytes);
+        assert_eq!(ordered.ordered_sources_sha256, expected_sources_sha256);
         assert_eq!(ordered.program_sha256, receipt.program_sha256);
         assert_eq!(ordered.object_sha256, receipt.object_sha256);
         assert_eq!(ordered.exports, benchmark.model.exports());

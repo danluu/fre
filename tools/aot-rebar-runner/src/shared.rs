@@ -461,6 +461,9 @@ fn authenticate_native_whole_scalar_reducer_with_policy(
     let program_identity =
         canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_")
         .ok_or_else(|| "native scalar preparation program symbol is not canonical".to_owned())?;
+    let shared_native_fused_identity_is_exact = !shared_ordered_many
+        || strategy != Some(PreparedAggregateStrategy::NativeFused)
+        || reducer_identity == program_identity;
 
     let ordered_nfa = strategy == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
     let bulk_shape_is_exact = if ordered_nfa {
@@ -488,6 +491,7 @@ fn authenticate_native_whole_scalar_reducer_with_policy(
         || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
         || receipt.runtime_helper_required
         || !bulk_shape_is_exact
+        || !shared_native_fused_identity_is_exact
         || !has_exact_runtime_symbol_closure(compiled, &[])
         || reducer_name == program_name
         || program_len == 0
@@ -2208,6 +2212,12 @@ fn authenticate_shared_ordered_many_aggregate(
     let module = compiled.module();
     let receipt = compiled.receipt();
     let shared_receipt = artifact.receipt();
+    let expected_pattern_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "shared ordered-many authentication byte sum overflowed".to_owned())?;
+    let expected_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
     let strategy = module.prepared_aggregate_strategy();
     let whole_scalar_is_authenticated =
         authenticate_shared_ordered_many_whole_scalar_reducer(benchmark.model, compiled)?;
@@ -2318,9 +2328,10 @@ fn authenticate_shared_ordered_many_aggregate(
         || reducer.is_none()
         || !whole_scalar_is_authenticated
         || !symbol_surface_closed
+        || shared_receipt.schema_version != fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
         || shared_receipt.rows != benchmark.patterns.len()
-        || shared_receipt.pattern_bytes
-            != benchmark.patterns.iter().map(String::len).sum::<usize>()
+        || shared_receipt.pattern_bytes != expected_pattern_bytes
+        || shared_receipt.ordered_sources_sha256 != expected_sources_sha256
         || shared_receipt.program_sha256 != receipt.program_sha256
         || shared_receipt.object_sha256 != receipt.object_sha256
         || shared_receipt.exports != benchmark.model.exports()
