@@ -967,6 +967,32 @@ pub fn compile_v2_with_slow_aot_limits(
     })
 }
 
+/// Preserve allocator and structural provenance at the additive module
+/// transaction. An ineligible `Ok(None)` may retain the ordinary artifact;
+/// every error, including `ObjectBytes` reported before final emission,
+/// remains terminal.
+fn independent_exists_batch_append_outcome(
+    outcome: Result<Option<CompiledModule>, ObjectError>,
+) -> Result<Option<CompiledModule>, IndependentExistsBatchCompileError> {
+    outcome.map_err(|error| CompileError::from(error).into())
+}
+
+/// Classify the one resource decline authorized after the additive module is
+/// complete. Only the final object's byte cap may retain the ordinary
+/// artifact; allocator and all other object failures remain terminal.
+fn independent_exists_batch_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, IndependentExistsBatchCompileError> {
+    match outcome {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(CompileError::from(error).into()),
+    }
+}
+
 /// Compile an Exists program and request one independent-haystack batch
 /// entry for a self-contained direct object.
 ///
@@ -1005,21 +1031,22 @@ pub fn compile_with_independent_exists_batch(
     {
         return Ok(compiled);
     }
-    let Some(module) = compiled
-        .module
-        .clone()
-        .append_direct_exists_batch(OutputContract::Exists)
-        .map_err(CompileError::from)?
+    let Some(module) = independent_exists_batch_append_outcome(
+        compiled
+            .module
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists),
+    )?
     else {
         return Ok(compiled);
     };
-    let object = match emit_object(&module, ObjectFormat::for_target(target), max_object_bytes) {
-        Ok(object) => object,
-        Err(ObjectError::Resource {
-            resource: CompileResource::ObjectBytes,
-            ..
-        }) => return Ok(compiled),
-        Err(error) => return Err(CompileError::from(error).into()),
+    let Some(object) = independent_exists_batch_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
     };
     compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
     compiled.receipt.object_sha256 = Sha256::digest(&object).into();

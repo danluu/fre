@@ -17,9 +17,56 @@ use crate::{
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_independent_exists_batch, compile_with_prepared_aggregate_exports,
-    compile_with_slow_aot_limits, emit_object,
+    compile_with_slow_aot_limits, emit_object, independent_exists_batch_append_outcome,
+    independent_exists_batch_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
+
+#[test]
+fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams() {
+    const APPEND_SITE: &str = "injected direct Exists batch append allocation";
+    const OBJECT_SITE: &str = "injected direct Exists batch object allocation";
+
+    assert!(matches!(
+        independent_exists_batch_append_outcome(Err(ObjectError::Allocation(APPEND_SITE))),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(APPEND_SITE))
+        ))
+    ));
+    assert!(matches!(
+        independent_exists_batch_object_outcome(Err(ObjectError::Allocation(OBJECT_SITE))),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(OBJECT_SITE))
+        ))
+    ));
+
+    // An object-byte resource report is not a generic optional-candidate
+    // decline. It remains terminal at append and is authorized only after the
+    // completed additive module reaches final object emission.
+    assert!(matches!(
+        independent_exists_batch_append_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        })),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 31,
+                required: 32,
+            })
+        ))
+    ));
+    assert!(
+        independent_exists_batch_object_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        }))
+        .expect("final ObjectBytes cap is the sole optional resource decline")
+        .is_none()
+    );
+}
 
 #[test]
 fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
