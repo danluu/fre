@@ -1094,6 +1094,13 @@ fn emit_macho(module: &CompiledModule, max_bytes: usize) -> Result<Vec<u8>, Obje
     let segment_file_bytes = file_cursor
         .checked_sub(content_start)
         .ok_or_else(|| overflow("Mach segment file size"))?;
+    // Section file offsets are aligned from the end of the load commands,
+    // while section virtual addresses are aligned from zero. A first-section
+    // alignment stricter than `content_start` can therefore add leading file
+    // padding that has no corresponding virtual-cursor advance. Mach-O still
+    // requires LC_SEGMENT_64 filesize <= vmsize; cover that file-only prefix
+    // without changing section addresses, offsets, or object-cap accounting.
+    let segment_virtual_bytes = virtual_cursor.max(segment_file_bytes);
 
     let symbols = build_mach_symbols(module, &sections)?;
     build_mach_relocations(module, &mut sections, &symbols.map)?;
@@ -1128,7 +1135,7 @@ fn emit_macho(module: &CompiledModule, max_bytes: usize) -> Result<Vec<u8>, Obje
         segment_command_bytes,
         content_start,
         segment_file_bytes,
-        virtual_cursor,
+        segment_virtual_bytes,
         &sections,
     )?;
     command_offset = checked_add(command_offset, segment_command_bytes, "Mach command offset")?;
@@ -2286,8 +2293,10 @@ mod tests {
         assert_eq!(u32_at(bytes, 16), 4);
         assert_eq!(u32_at(bytes, 32), MACH_LC_SEGMENT_64);
         assert_eq!(u32_at(bytes, 36), 232);
+        let virtual_size = usize::try_from(u64_at(bytes, 64)).unwrap();
         let file_offset = usize::try_from(u64_at(bytes, 72)).unwrap();
         let file_size = usize::try_from(u64_at(bytes, 80)).unwrap();
+        assert!(file_size <= virtual_size);
         assert!(file_offset + file_size <= bytes.len());
         assert_eq!(u32_at(bytes, 96), 2);
 
@@ -2437,6 +2446,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn aligned_macho_static_archive_is_accepted_by_rustc_llvm() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            Target::x86_64_macos()
+        } else {
+            Target::aarch64_macos()
+        };
+        let (_, object) = module_and_object(target, CompileMode::Fast);
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aligned-macho-archive-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir(&directory).expect("create aligned Mach-O archive directory");
+        let object_path = directory.join("aligned.o");
+        let archive_path = directory.join("libfre_alignment_fixture.a");
+        let source_path = directory.join("probe.rs");
+        let rlib_path = directory.join("libfre_alignment_probe.rlib");
+        fs::write(&object_path, object).expect("write aligned Mach-O object");
+        fs::write(&source_path, b"").expect("write empty Rust archive probe");
+
+        let archive = Command::new("ar")
+            .arg("crs")
+            .arg(&archive_path)
+            .arg(&object_path)
+            .output()
+            .expect("invoke archive writer for aligned Mach-O object");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let bundled = Command::new(&rustc)
+            .arg("--crate-name")
+            .arg("fre_alignment_probe")
+            .arg("--crate-type")
+            .arg("rlib")
+            .arg(&source_path)
+            .arg("-L")
+            .arg(format!("native={}", directory.display()))
+            .arg("-l")
+            .arg("static=fre_alignment_fixture")
+            .arg("-o")
+            .arg(&rlib_path)
+            .output()
+            .expect("invoke rustc LLVM archive writer");
+        fs::remove_dir_all(&directory).expect("remove aligned Mach-O archive directory");
+
+        assert!(
+            archive.status.success(),
+            "archive writer rejected aligned Mach-O object: {}{}",
+            String::from_utf8_lossy(&archive.stdout),
+            String::from_utf8_lossy(&archive.stderr),
+        );
+        assert!(
+            bundled.status.success(),
+            "rustc LLVM archive writer rejected aligned Mach-O object: {}{}",
+            String::from_utf8_lossy(&bundled.stdout),
+            String::from_utf8_lossy(&bundled.stderr),
+        );
     }
 
     #[test]
