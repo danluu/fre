@@ -42,6 +42,7 @@ mod prefix_relation;
 mod program;
 mod regex_set;
 mod regex_redux_aot;
+mod rebar_multi_grep;
 mod rebar_single_capture;
 mod rebar_weighted_capture;
 mod required_literals;
@@ -326,6 +327,17 @@ pub use regex_redux_aot::{
     NativeRegexReduxAotArtifactV1, NativeRegexReduxAotErrorV1, NativeRegexReduxAotLimitsV1,
     NativeRegexReduxAotReceiptV1, NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
     compile_native_regex_redux_aot_v1,
+};
+pub use rebar_multi_grep::{
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS,
+    RebarMultiGrepReducerAotArtifactV1, RebarMultiGrepReducerAotCompileDeclineV1,
+    RebarMultiGrepReducerAotCompileDispositionV1, RebarMultiGrepReducerAotErrorV1,
+    RebarMultiGrepReducerAotReceiptV1, RebarMultiGrepReducerRowV1,
+    compile_rebar_multi_grep_reducer_aot_v1,
 };
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,

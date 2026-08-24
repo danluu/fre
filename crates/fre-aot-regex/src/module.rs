@@ -28346,6 +28346,154 @@ fn lower_aarch64_native_weighted_capture_v1(
     Ok((code, relocations))
 }
 
+const REBAR_MULTI_GREP_TEXT_SECTION: usize = 0;
+const REBAR_MULTI_GREP_ENTRY_SYMBOL: usize = 0;
+const REBAR_MULTI_GREP_ROW_SYMBOL_BASE: usize = 1;
+
+fn native_rebar_multi_grep_module_v1(
+    target: Target,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    row_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+) -> Result<CompiledModule, ObjectError> {
+    let entry_name = identity_symbol("fre_aot_regex_rebar_multi_grep_v1_", &identity)?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(REBAR_MULTI_GREP_ROW_SYMBOL_BASE + row_entries.len())
+        .map_err(|_| ObjectError::Allocation("Rebar multi-grep reducer symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: entry_name,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(REBAR_MULTI_GREP_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("Rebar multi-grep text extent"))?,
+    });
+    for entry in row_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.rebar-multi-grep",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 1,
+                data: Box::default(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REBAR_MULTI_GREP_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+pub(crate) fn lower_native_rebar_multi_grep_reducer_v1(
+    target: Target,
+    identity: [u8; 32],
+    row_entries: &[String],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || row_entries.iter().any(String::is_empty)
+        || row_entries.iter().enumerate().any(|(row, entry)| {
+            row_entries[..row].iter().any(|prior| prior == entry)
+        })
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar multi-grep target or row closure",
+        ));
+    }
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_multi_grep_v1(row_entries.len())?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_multi_grep_v1(row_entries.len())?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar multi-grep row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_MULTI_GREP_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar multi-grep call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_MULTI_GREP_ROW_SYMBOL_BASE
+                    .checked_add(row)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "Rebar multi-grep row symbol",
+                    ))?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_multi_grep_module_v1(target, identity, code, row_entries, relocations)
+}
+
 type X86Label = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -42697,6 +42845,174 @@ fn lower_x86_64_prepared_grep_count(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "LF/CRLF traversal, every-row validation, and transactional publication form one auditable native operation"
+)]
+fn lower_x86_64_native_rebar_multi_grep_v1(
+    row_count: usize,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    const RESULT_END_OFFSET: u8 = 8;
+    const LINE_LENGTH_OFFSET: u8 = 24;
+    const MATCHED_OFFSET: u8 = 32;
+    if row_count == 0 {
+        return Err(ObjectError::InvalidModule(
+            "x86 Rebar multi-grep row cardinality",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    assembler.instruction(&[0x55])?; // rbp
+    assembler.instruction(&[0x53])?; // rbx
+    assembler.instruction(&[0x41, 0x54])?; // r12
+    assembler.instruction(&[0x41, 0x55])?; // r13
+    assembler.instruction(&[0x41, 0x56])?; // r14
+    assembler.instruction(&[0x41, 0x57])?; // r15
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
+    assembler.instruction(&[0x49, 0x89, 0xf5])?; // complete length
+    assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // cursor
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x48, 0x89, 0xdd])?; // line start
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x41, 0x80, 0x3c, 0x1c, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x48, 0x89, 0xd8])?; // line end before LF
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x39, 0xe8])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x41, 0x80, 0x7c, 0x04, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x48, 0x83, 0xe8, 1])?;
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x48, 0x89, 0xd8])?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x48, 0x29, 0xe8])?; // line length
+    assembler.instruction(&[
+        0x48,
+        0x89,
+        0x44,
+        0x24,
+        LINE_LENGTH_OFFSET,
+    ])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, MATCHED_OFFSET, 0, 0, 0, 0])?;
+
+    let mut call_labels = Vec::new();
+    call_labels
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("x86 Rebar multi-grep calls"))?;
+    for _ in 0..row_count {
+        let next_row = assembler.label()?;
+        assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0xff, 0xff, 0xff, 0xff])?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            RESULT_END_OFFSET,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+        ])?;
+        assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?; // base + line start
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x74,
+            0x24,
+            LINE_LENGTH_OFFSET,
+        ])?;
+        assembler.instruction(&[0x31, 0xd2])?;
+        assembler.instruction(&[0x48, 0x89, 0xf1])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        call_labels.push(call);
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], next_row)?;
+        assembler.instruction(&[0x83, 0xf8, 1])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, RESULT_END_OFFSET])?;
+        assembler.instruction(&[0x48, 0x39, 0xd0])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[
+            0x48,
+            0x3b,
+            0x54,
+            0x24,
+            LINE_LENGTH_OFFSET,
+        ])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0xc7, 0x44, 0x24, MATCHED_OFFSET, 1, 0, 0, 0])?;
+        assembler.bind(next_row)?;
+    }
+    assembler.instruction(&[0x83, 0x7c, 0x24, MATCHED_OFFSET, 0])?;
+    assembler.branch(&[0x0f, 0x84], completed_line)?;
+    assembler.instruction(&[0x49, 0x83, 0xc7, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let offsets = call_labels
+        .into_iter()
+        .map(|label| finished.label_offset(label))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((finished.code, offsets.into_boxed_slice()))
+}
+
 fn x86_native_capture_reducer_boundary(
     assembler: &mut X86Assembler,
     caller_scratch_bytes: usize,
@@ -44676,6 +44992,134 @@ fn lower_aarch64_prepared_grep_count(
             },
         ),
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "LF/CRLF traversal, every-row validation, and transactional publication form one auditable AAPCS64 operation"
+)]
+fn lower_aarch64_native_rebar_multi_grep_v1(
+    row_count: usize,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const FRAME_BYTES: u16 = 112;
+    const RESULT_OFFSET: u16 = 96;
+    if row_count == 0 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Rebar multi-grep row cardinality",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(24, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(5, 19, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(5, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(25, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 25, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 19, 5)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(6, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(25, 25, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_sub_x_reg(26, 25, 24)?)?;
+    assembler.instruction(aarch64_movz_x(27, 0, 0)?)?;
+
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("AArch64 Rebar multi-grep calls"))?;
+    for _ in 0..row_count {
+        let next_row = assembler.label()?;
+        assembler.instruction(0x9280_0005)?; // movn x5, #0
+        assembler.instruction(aarch64_store_pair_x(
+            5,
+            5,
+            31,
+            i16::try_from(RESULT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
+        assembler.instruction(aarch64_mov_x(1, 26)?)?;
+        assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+        assembler.instruction(aarch64_mov_x(3, 26)?)?;
+        assembler.instruction(aarch64_add_x_imm(4, 31, RESULT_OFFSET)?)?;
+        call_offsets.push(assembler.instruction(0x9400_0000)?);
+        assembler.branch_zero_w(0, next_row)?;
+        assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(RESULT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 26)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_movz_x(27, 1, 0)?)?;
+        assembler.bind(next_row)?;
+    }
+    assembler.branch_zero_x(27, completed_line)?;
+    assembler.instruction(aarch64_adds_x_imm(22, 22, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = call_offsets;
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok((code, offsets.into_boxed_slice()))
 }
 
 fn aarch64_native_capture_reducer_boundary(
