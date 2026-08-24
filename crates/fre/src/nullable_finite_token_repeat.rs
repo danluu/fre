@@ -269,6 +269,8 @@ impl Plan {
         actual.candidate_visits = 1;
         let start = if self.maximum_repetitions == 1 && self.token_count == 1 {
             self.ordinary_single_token_start(haystack, tail_start)?
+        } else if self.token_count == 1 {
+            self.ordinary_repeated_single_token_start(haystack, tail_start)?
         } else {
             self.earliest_start_for_tail_dispatch(
                 haystack,
@@ -309,6 +311,36 @@ impl Plan {
         } else {
             tail_start
         })
+    }
+
+    #[inline(never)]
+    fn ordinary_repeated_single_token_start(
+        &self,
+        haystack: &[u8],
+        tail_start: usize,
+    ) -> Result<usize, Error> {
+        let token_bytes = usize::from(self.maximum_token_bytes);
+        let edges = match self.edges.get(..token_bytes) {
+            Some(edges) => edges,
+            None => {
+                return Err(Error::InternalInvariant {
+                    detail: "finite-token linear trie escaped its edge pool",
+                });
+            }
+        };
+        let mut start = tail_start;
+        for _ in 0..self.maximum_repetitions {
+            if start < token_bytes {
+                break;
+            }
+            for (offset, edge) in edges.iter().enumerate() {
+                if edge.byte != haystack[start - offset - 1] {
+                    return Ok(start);
+                }
+            }
+            start -= token_bytes;
+        }
+        Ok(start)
     }
 
     fn first_tail(
