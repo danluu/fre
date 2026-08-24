@@ -2,11 +2,26 @@
 
 use std::{alloc::System, hint::black_box};
 
-use fre::{PlanKind, PortableBuilder};
+use fre::{PlanKind, PortableBuilder, PortableRegex};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+fn multibyte_fixture() -> (PortableRegex, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let regex = PortableBuilder::new(r"(?-u:(?:ab|cd)+XYZ)")
+        .build()
+        .unwrap();
+    assert_eq!(regex.build_report().plan, PlanKind::K0);
+    let mut late = vec![b'!'; 4_089];
+    late.extend_from_slice(b"cdabXYZ");
+    let absent = vec![b'!'; 4_096];
+    let dense = b"XYZ!".repeat(1_024);
+    assert!(regex.is_match(&late));
+    assert!(!regex.is_match(&absent));
+    assert!(!regex.is_match(&dense));
+    (regex, late, absent, dense)
+}
 
 #[test]
 fn line_token_loop_ordinary_values_allocate_nothing() {
@@ -42,6 +57,23 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
     dense_inline.push(b'Z');
     assert!(dense_regex.is_match(&dense_inline));
 
+    let unanchored = PortableBuilder::new(r"(?-u:(?:ab+c|de?f)+Z)")
+        .build()
+        .unwrap();
+    assert_eq!(unanchored.build_report().plan, PlanKind::K0);
+    let mut unanchored_late = vec![b'!'; 4_087];
+    unanchored_late.extend_from_slice(b"abbbcdefZ");
+    let unanchored_absent = vec![b'!'; 4_096];
+    let unanchored_dense = vec![b'Z'; 4_096];
+    let mut unanchored_rejected_then_late = vec![b'!'; 4_080];
+    unanchored_rejected_then_late.extend_from_slice(b"qbcZ!abcZ");
+    assert!(unanchored.is_match(&unanchored_late));
+    assert!(!unanchored.is_match(&unanchored_absent));
+    assert!(!unanchored.is_match(&unanchored_dense));
+    assert!(unanchored.is_match(&unanchored_rejected_then_late));
+
+    let (multibyte, multibyte_late, multibyte_absent, multibyte_dense) = multibyte_fixture();
+
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
         assert!(black_box(regex.is_match(black_box(&late))));
@@ -61,6 +93,37 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
                 .map(|matched| (matched.start(), matched.end())),
             Some((4_083, 4_092)),
         );
+        assert!(black_box(unanchored.is_match(black_box(&unanchored_late))));
+        assert!(!black_box(
+            unanchored.is_match(black_box(&unanchored_absent))
+        ));
+        assert!(!black_box(
+            unanchored.is_match(black_box(&unanchored_dense))
+        ));
+        assert!(black_box(
+            unanchored.is_match(black_box(&unanchored_rejected_then_late))
+        ));
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_late)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((4_087, 4_096)),
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_absent))),
+            None,
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_dense))),
+            None,
+        );
+        assert_eq!(
+            black_box(unanchored.find(black_box(&unanchored_rejected_then_late)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((4_085, 4_089)),
+        );
+        assert!(black_box(multibyte.is_match(black_box(&multibyte_late))));
+        assert!(!black_box(multibyte.is_match(black_box(&multibyte_absent))));
+        assert!(!black_box(multibyte.is_match(black_box(&multibyte_dense))));
     }
     assert_eq!(measured.change(), Stats::default());
 }

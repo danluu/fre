@@ -98,7 +98,66 @@ enum CompactPreflight {
         canonical_build: LiteralSetBuildAccounting,
         compact_build: LiteralSetBuildAccounting,
         width: usize,
+        dense_depth: usize,
     },
+}
+
+/// Choose the forced-dense prefix depth from the deepest possible trie branch.
+///
+/// Every branching state is witnessed by a pair of patterns whose LCP ends at
+/// that state. Nonterminal states strictly deeper than the maximum pairwise
+/// LCP have one literal transition and can use Aho's `KIND_ONE`
+/// representation; terminal match states have zero literal transitions.
+/// Equal patterns, pairs equal through the bounded probe, and source orders
+/// with an inversion conservatively retain the legacy maximum. For an
+/// already-sorted source, the deepest pairwise LCP is witnessed by adjacent
+/// patterns, so one bounded pass finds the exact depth without copying or
+/// sorting construction input.
+fn deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> Option<usize> {
+    debug_assert!(patterns.iter().all(|pattern| pattern.len() == width));
+    let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
+    if probe_depth == 0 || patterns.len() < 2 {
+        return Some(0);
+    }
+    if patterns.len() > MAX_PATTERNS {
+        return None;
+    }
+
+    let mut deepest = 0_usize;
+    for adjacent in patterns.windows(2) {
+        let left = adjacent[0].get(..probe_depth)?;
+        let right = adjacent[1].get(..probe_depth)?;
+        let mut lcp = 0_usize;
+        while lcp < probe_depth {
+            let left_byte = *left.get(lcp)?;
+            let right_byte = *right.get(lcp)?;
+            if left_byte < right_byte {
+                break;
+            }
+            if left_byte > right_byte {
+                return Some(probe_depth);
+            }
+            lcp = lcp.checked_add(1)?;
+        }
+        deepest = deepest.max(lcp);
+        if deepest == probe_depth {
+            return Some(probe_depth);
+        }
+    }
+    Some(deepest)
+}
+
+fn deepest_branch_build_work_upper_bound(patterns: usize, width: usize) -> Option<usize> {
+    if patterns > MAX_PATTERNS {
+        return None;
+    }
+    let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
+    // Every adjacent bounded prefix can require `probe_depth` byte comparisons
+    // plus one unit for pair formation, order selection and maximum
+    // bookkeeping.
+    patterns
+        .saturating_sub(1)
+        .checked_mul(probe_depth.checked_add(1)?)
 }
 
 fn compact_preflight(
@@ -115,16 +174,23 @@ fn compact_preflight(
     if !uniform_positive || canonical_build.build_work_upper_bound < MIN_DENSE_BUILD_WORK {
         return Ok(CompactPreflight::Canonical(canonical_build));
     }
+    let Some(deepest_branch_build_work) =
+        deepest_branch_build_work_upper_bound(canonical_build.patterns, width)
+    else {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    };
     // Contiguous conversion writes every encoded transition and then remaps
-    // every encoded state ID in a second pass. Charge two complete cell
-    // traversals plus state-map and pattern-vector setup. Together with the
-    // canonical receipt this also covers a complete compact attempt followed
-    // by same-shared-NFA canonical fallback.
+    // every encoded state ID in a second pass. Charge those two complete cell
+    // traversals, state-map and pattern-vector setup, and the complete bounded
+    // topology-selector charge. Together with the canonical receipt this also
+    // covers a complete compact attempt followed by same-shared-NFA canonical
+    // fallback.
     let Some(compact_build_work) = canonical_build
         .dfa_cells_upper_bound
         .checked_mul(2)
         .and_then(|work| work.checked_add(canonical_build.trie_states_upper_bound))
         .and_then(|work| work.checked_add(canonical_build.patterns))
+        .and_then(|work| work.checked_add(deepest_branch_build_work))
         .and_then(|work| work.checked_add(canonical_build.build_work_upper_bound))
     else {
         return Ok(CompactPreflight::Canonical(canonical_build));
@@ -132,8 +198,11 @@ fn compact_preflight(
     if compact_build_work > limits.max_build_work {
         return Ok(CompactPreflight::Canonical(canonical_build));
     }
+    let Some(dense_depth) = deepest_branch_dense_depth(patterns, width) else {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    };
     // Retain the established three-owner envelope. It conservatively covers
-    // both the dual owner and the ordinary policy's pairwise construction:
+    // both the dual owner and the ordinary policy's topology selection:
     // shared+compact followed, on refusal, by shared+canonical.
     let Some(dense_states_upper_bound) = canonical_build
         .patterns
@@ -170,6 +239,7 @@ fn compact_preflight(
         canonical_build,
         compact_build,
         width,
+        dense_depth,
     })
 }
 
@@ -225,9 +295,19 @@ fn canonical_from_shared(
     LiteralSetPlan::from_preflight_dfa(build, automaton, limits)
 }
 
-fn compact_engine(shared: &noncontiguous::NFA, width: usize) -> Option<CompactEngine> {
+fn compact_engine(
+    shared: &noncontiguous::NFA,
+    width: usize,
+    dense_depth: usize,
+) -> Option<CompactEngine> {
+    debug_assert!(dense_depth <= MAX_DENSE_DEPTH);
+    debug_assert!(dense_depth < width);
     let mut builder = NFA::builder();
-    builder.dense_depth(width.min(MAX_DENSE_DEPTH));
+    // aho-corasick 1.1.4 interprets this as an exclusive state-depth
+    // threshold: states with `state.depth() < dense_depth` are forced dense.
+    // The unchanged worst-case byte envelope above also covers Aho's automatic
+    // dense-state choices outside this forced prefix.
+    builder.dense_depth(dense_depth);
     let automaton = builder.build_from_noncontiguous(shared).ok()?;
     debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
     debug_assert_eq!(automaton.min_pattern_len(), width);
@@ -256,25 +336,26 @@ impl LiteralSetCompactPlan {
         patterns: &[&[u8]],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
-        let (canonical_build, mut compact_build, width) = match compact_preflight(patterns, limits)?
-        {
-            CompactPreflight::NotApplicable => {
-                return Ok(LiteralSetCompactBuildOutcome::NotApplicable);
-            }
-            CompactPreflight::Canonical(build) => {
-                return canonical_outcome(patterns, build, limits);
-            }
-            CompactPreflight::Eligible {
-                canonical_build,
-                compact_build,
-                width,
-            } => (canonical_build, compact_build, width),
-        };
+        let (canonical_build, mut compact_build, width, dense_depth) =
+            match compact_preflight(patterns, limits)? {
+                CompactPreflight::NotApplicable => {
+                    return Ok(LiteralSetCompactBuildOutcome::NotApplicable);
+                }
+                CompactPreflight::Canonical(build) => {
+                    return canonical_outcome(patterns, build, limits);
+                }
+                CompactPreflight::Eligible {
+                    canonical_build,
+                    compact_build,
+                    width,
+                    dense_depth,
+                } => (canonical_build, compact_build, width, dense_depth),
+            };
         let shared = build_shared(patterns)?;
         // Checked and explicit-session calls retain the exact established DFA
         // contract. The compact NFA is an additional ordinary-only engine.
         let canonical = canonical_from_shared(&shared, canonical_build, limits)?;
-        let engine = match compact_engine(&shared, width) {
+        let engine = match compact_engine(&shared, width, dense_depth) {
             Some(engine) => engine,
             None => return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical)),
         };
@@ -359,23 +440,24 @@ impl LiteralSetCompactOrdinaryPlan {
         patterns: &[&[u8]],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
-        let (canonical_build, mut compact_build, width) = match compact_preflight(patterns, limits)?
-        {
-            CompactPreflight::NotApplicable => {
-                return Ok(LiteralSetCompactOrdinaryBuildOutcome::NotApplicable);
-            }
-            CompactPreflight::Canonical(build) => {
-                return canonical_plan(patterns, build, limits)
-                    .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
-            }
-            CompactPreflight::Eligible {
-                canonical_build,
-                compact_build,
-                width,
-            } => (canonical_build, compact_build, width),
-        };
+        let (canonical_build, mut compact_build, width, dense_depth) =
+            match compact_preflight(patterns, limits)? {
+                CompactPreflight::NotApplicable => {
+                    return Ok(LiteralSetCompactOrdinaryBuildOutcome::NotApplicable);
+                }
+                CompactPreflight::Canonical(build) => {
+                    return canonical_plan(patterns, build, limits)
+                        .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
+                }
+                CompactPreflight::Eligible {
+                    canonical_build,
+                    compact_build,
+                    width,
+                    dense_depth,
+                } => (canonical_build, compact_build, width, dense_depth),
+            };
         let shared = build_shared(patterns)?;
-        let Some(engine) = compact_engine(&shared, width) else {
+        let Some(engine) = compact_engine(&shared, width, dense_depth) else {
             return canonical_from_shared(&shared, canonical_build, limits)
                 .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
         };
@@ -522,26 +604,20 @@ impl CompactEngine {
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
         debug_assert!(!self.window_is_too_short(window));
-        let mut input = Input::new(haystack).span(window.start()..window.end());
-        loop {
-            let Some(matched) = self
-                .automaton
-                .try_find(&input)
-                .expect("the compact literal NFA supports unanchored search")
-            else {
-                return Ok(Ok(()));
-            };
+        let input = Input::new(haystack).span(window.start()..window.end());
+        let matches = self
+            .automaton
+            .try_find_iter(input)
+            .expect("the compact literal NFA supports unanchored iteration");
+        for matched in matches {
             let span = self.absolute_span(matched)?;
             match visitor(span) {
                 Ok(true) => {}
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
             }
-            if window.end() - matched.end() < self.width {
-                return Ok(Ok(()));
-            }
-            input.set_start(matched.end());
         }
+        Ok(Ok(()))
     }
 
     #[inline]
@@ -564,24 +640,14 @@ impl CompactEngine {
         window: Window,
     ) -> Result<u64, LiteralSetError> {
         debug_assert!(!self.window_is_too_short(window));
-        let mut input = Input::new(haystack).span(window.start()..window.end());
-        let mut count = 0_usize;
-        loop {
-            let Some(matched) = self
-                .automaton
-                .try_find(&input)
-                .expect("the compact literal NFA supports unanchored search")
-            else {
-                break;
-            };
-            // Matches do not overlap and have positive width, so their count
-            // is bounded by the validated window length.
-            count += 1;
-            if window.end() - matched.end() < self.width {
-                break;
-            }
-            input.set_start(matched.end());
-        }
+        let input = Input::new(haystack).span(window.start()..window.end());
+        let count = self
+            .automaton
+            .try_find_iter(input)
+            .expect("the compact literal NFA supports unanchored iteration")
+            .count();
+        // Matches do not overlap and have positive width, so their count is
+        // bounded by the validated window length.
         u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
             computation: "compact literal-set ordinary match count",
         })
@@ -705,9 +771,11 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE, CompactPreflight,
         LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
         LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
-        MAX_PATTERNS, MIN_PATTERN_BYTES,
+        MAX_DENSE_DEPTH, MAX_PATTERNS, MIN_PATTERN_BYTES, compact_preflight,
+        deepest_branch_build_work_upper_bound, deepest_branch_dense_depth,
     };
     use crate::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, Window,
@@ -723,6 +791,261 @@ mod tests {
                 pattern
             })
             .collect()
+    }
+
+    fn brute_deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> usize {
+        let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
+        let mut deepest = 0_usize;
+        for (left_index, left) in patterns.iter().enumerate() {
+            for right in &patterns[left_index + 1..] {
+                let lcp = left
+                    .iter()
+                    .zip(*right)
+                    .take(probe_depth)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                deepest = deepest.max(lcp);
+            }
+        }
+        deepest
+    }
+
+    #[test]
+    fn sorted_gate_matches_pairwise_oracle_and_unsorted_input_retains_legacy_depth() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        fn below(seed: &mut u64, upper: usize) -> usize {
+            usize::try_from(next(seed) % u64::try_from(upper).unwrap()).unwrap()
+        }
+
+        let mut seed = 0xd1ff_e12a_5eed_0042_u64;
+        for case in 0..48 {
+            let pattern_count = if case == 0 {
+                MAX_PATTERNS
+            } else {
+                2 + below(&mut seed, MAX_PATTERNS - 1)
+            };
+            let width = 1 + below(&mut seed, 48);
+            let shared = below(&mut seed, width.min(MAX_DENSE_DEPTH + 1));
+            let mut common = vec![0_u8; shared];
+            for byte in &mut common {
+                *byte = u8::try_from(next(&mut seed) & 0xff).unwrap();
+            }
+            let mut patterns = (0..pattern_count)
+                .map(|index| {
+                    let mut pattern = (0..width)
+                        .map(|_| u8::try_from(next(&mut seed) & 0xff).unwrap())
+                        .collect::<Vec<_>>();
+                    pattern[..shared].copy_from_slice(&common);
+                    if shared < width && index % 5 == 0 {
+                        pattern[shared] = 0;
+                    }
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            if case % 3 == 0 {
+                patterns[pattern_count - 1] = patterns[0].clone();
+            }
+
+            let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
+            patterns.sort_by(|left, right| left[..probe_depth].cmp(&right[..probe_depth]));
+            let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            assert_eq!(
+                deepest_branch_dense_depth(&borrowed, width),
+                Some(brute_deepest_branch_dense_depth(&borrowed, width)),
+                "sorted source order, case={case}",
+            );
+            for end in (1..pattern_count).rev() {
+                let other = below(&mut seed, end + 1);
+                patterns.swap(end, other);
+            }
+            let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let nondecreasing = borrowed
+                .windows(2)
+                .all(|pair| pair[0][..probe_depth] <= pair[1][..probe_depth]);
+            let expected = if nondecreasing {
+                brute_deepest_branch_dense_depth(&borrowed, width)
+            } else {
+                probe_depth
+            };
+            assert_eq!(
+                deepest_branch_dense_depth(&borrowed, width),
+                Some(expected),
+                "permuted order, case={case}",
+            );
+        }
+    }
+
+    #[test]
+    fn source_order_gate_covers_sorted_inverted_and_equal_prefixes() {
+        fn patterns(values: &[u16]) -> Vec<Vec<u8>> {
+            values
+                .iter()
+                .map(|&value| {
+                    let mut pattern = vec![b'q'; MIN_PATTERN_BYTES];
+                    pattern[MAX_DENSE_DEPTH - 1] = u8::try_from(value).unwrap();
+                    pattern
+                })
+                .collect()
+        }
+
+        let sorted = patterns(&(0_u16..256).collect::<Vec<_>>());
+        let borrowed = sorted.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(23),
+        );
+
+        let reverse = patterns(&(0_u16..256).rev().collect::<Vec<_>>());
+        let borrowed = reverse.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
+
+        let mut late_values = (0_u16..254).collect::<Vec<_>>();
+        late_values.extend([255, 254]);
+        let late = patterns(&late_values);
+        let borrowed = late.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
+
+        let equal = vec![vec![b'a'; MIN_PATTERN_BYTES]; MAX_PATTERNS];
+        let borrowed = equal.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(MAX_DENSE_DEPTH),
+        );
+    }
+
+    #[test]
+    fn deepest_branch_depth_covers_zero_shallow_and_terminal_cases() {
+        assert_eq!(
+            deepest_branch_dense_depth(&[b"aaaa", b"baaa", b"caaa", b"daaa"], 4),
+            Some(0),
+        );
+        assert_eq!(
+            deepest_branch_dense_depth(&[b"aa00", b"aa10", b"ba00"], 4),
+            Some(2),
+            "one deep pair controls the selected depth",
+        );
+        assert_eq!(
+            deepest_branch_dense_depth(&[b"aaa", b"aab"], 3),
+            Some(2),
+            "the terminal match-state level is excluded",
+        );
+    }
+
+    #[test]
+    fn deepest_branch_depth_selects_public_depth_22_and_legacy_cap() {
+        let patterns = (0_u16..256)
+            .map(|index| {
+                let group = usize::from(index) / 10;
+                let mut pattern = vec![b'q'; MIN_PATTERN_BYTES];
+                pattern[20] = u8::try_from(group / 9).unwrap();
+                pattern[21] = u8::try_from(group).unwrap();
+                pattern[22] = u8::try_from(index).unwrap();
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            deepest_branch_dense_depth(&borrowed, MIN_PATTERN_BYTES),
+            Some(22),
+        );
+
+        let duplicate = vec![b'a'; 32];
+        assert_eq!(
+            deepest_branch_dense_depth(&[&duplicate, &duplicate], duplicate.len()),
+            Some(MAX_DENSE_DEPTH),
+            "equal-through-cap pairs conservatively retain the rollout maximum",
+        );
+    }
+
+    #[test]
+    fn source_order_probe_work_bound_covers_every_adjacent_prefix() {
+        assert_eq!(
+            deepest_branch_build_work_upper_bound(MAX_PATTERNS, MIN_PATTERN_BYTES),
+            Some(6_375),
+        );
+        assert_eq!(deepest_branch_build_work_upper_bound(129, 254), Some(3_200),);
+        assert_eq!(
+            deepest_branch_build_work_upper_bound(MAX_PATTERNS + 1, MIN_PATTERN_BYTES),
+            None,
+        );
+    }
+
+    #[test]
+    fn compact_preflight_preserves_the_legacy_worst_case_dense_state_envelope() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let CompactPreflight::Eligible {
+            canonical_build,
+            compact_build,
+            width,
+            dense_depth,
+        } = compact_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap()
+        else {
+            panic!("public compact fixture should pass preflight");
+        };
+        assert_eq!(dense_depth, 9);
+        assert_eq!(
+            deepest_branch_build_work_upper_bound(MAX_PATTERNS, width),
+            Some(6_375),
+        );
+        let dense_states = canonical_build.patterns * width.min(MAX_DENSE_DEPTH) + 1;
+        let expected = canonical_build.build_bytes_upper_bound
+            + dense_states * ALPHABET_LEN * BYTES_PER_DFA_CELL_ENVELOPE
+            + canonical_build.trie_states_upper_bound * BYTES_PER_TRIE_STATE_ENVELOPE;
+        assert_eq!(compact_build.build_bytes_upper_bound, expected);
+        assert!(matches!(
+            compact_preflight(
+                &borrowed,
+                LiteralSetBuildLimits {
+                    max_build_work: compact_build.build_work_upper_bound - 1,
+                    ..LiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap(),
+            CompactPreflight::Canonical(_),
+        ));
+    }
+
+    #[test]
+    fn zero_deepest_branch_still_builds_the_compact_owner() {
+        let patterns = (0_u16..256)
+            .map(|first| {
+                let mut pattern = vec![b'q'; MIN_PATTERN_BYTES];
+                pattern[0] = u8::try_from(first).unwrap();
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let CompactPreflight::Eligible { dense_depth, .. } =
+            compact_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap()
+        else {
+            panic!("unique-first-byte fixture should pass compact preflight");
+        };
+        assert_eq!(dense_depth, 0);
+
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("aho-corasick accepts a zero forced-dense depth")
+            .into_ordinary();
+        let mut haystack = vec![b'z'; MIN_PATTERN_BYTES + 2];
+        haystack[1..=MIN_PATTERN_BYTES].copy_from_slice(&patterns[17]);
+        assert_eq!(
+            plan.ordinary_executor()
+                .find_window_value(&haystack, Window::new(1, MIN_PATTERN_BYTES + 1),),
+            Ok(Some((1, MIN_PATTERN_BYTES + 1))),
+        );
     }
 
     fn compact_outcome(
@@ -794,7 +1117,7 @@ mod tests {
             .expect("129x254 crosses the compact work floor");
         assert_eq!(
             selected.build_accounting().build_work_upper_bound,
-            25_230_847
+            25_234_047
         );
 
         let below_width = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES - 1);
@@ -812,7 +1135,7 @@ mod tests {
             .expect("256x128 crosses both compact floors");
         assert_eq!(
             selected.build_accounting().build_work_upper_bound,
-            25_232_641
+            25_239_016
         );
 
         let mut nonuniform = at_width;
