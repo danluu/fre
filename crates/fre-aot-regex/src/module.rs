@@ -60999,6 +60999,18 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_exact_product_residual_batch =
         use_asimd_exact_product_multicolumn_batch
             || use_asimd_exact_product_scalar_residual_batch;
+    // A residual prefix guard prevents publishing a candidate from the
+    // general 64-byte batch: the graph-selected columns are necessary but
+    // not sufficient. They can still reject the whole batch transactionally.
+    // A nonempty conjunction leaves X2 untouched and replays the established
+    // 16-byte retained-candidate loop, which remains solely responsible for
+    // selecting and authenticating candidates.
+    let use_asimd_residual_reject_batch = use_asimd_filter
+        && retain_vector_candidates
+        && !use_asimd_exact_product_residual_batch
+        && prefix_relation_vector.is_none()
+        && vector_filter.is_some()
+        && layout.start_filter.is_some_and(use_aarch64_filter_batch);
     let use_asimd_relation_batch = use_asimd_filter
         && !retain_vector_candidates
         && prefix_relation_vector.is_some()
@@ -61008,8 +61020,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         && (!retain_vector_candidates || use_asimd_exact_product_residual_batch)
         && (prefix_relation_vector.is_none() || use_asimd_relation_batch)
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
-    let use_asimd_multicolumn_batch = use_asimd_batch && vector_filter.is_some();
+    let use_asimd_filter_batch = use_asimd_batch || use_asimd_residual_reject_batch;
+    let use_asimd_multicolumn_batch = use_asimd_filter_batch && vector_filter.is_some();
     let filter_single_vector_loop = use_asimd_exact_product_residual_batch
+        .then(|| assembler.label())
+        .transpose()?;
+    let filter_residual_reject_batch_hit = use_asimd_residual_reject_batch
         .then(|| assembler.label())
         .transpose()?;
     if use_asimd_sparse_lookup
@@ -61263,7 +61279,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             if use_asimd_filter {
                 assembler.bind(filter_vector)?;
                 assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-                if use_asimd_batch {
+                if use_asimd_filter_batch {
                     let batch_bytes = u16::from(maximum_scan_offset)
                         .checked_add(AARCH64_BATCH_BYTES)
                         .ok_or(ObjectError::ArithmeticOverflow(
@@ -61290,7 +61306,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                             first_register,
                         )?
                     };
-                    filter_batch_first_candidates = Some(first_candidates);
+                    if use_asimd_batch {
+                        filter_batch_first_candidates = Some(first_candidates);
+                    }
                     aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
                     assembler.branch_cond(
                         AARCH64_NE,
@@ -61358,13 +61376,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 assembler.branch(filter_single_vector_loop.unwrap_or(filter_vector))?;
 
                 if let Some(vector_filter) = vector_filter {
-                    if use_asimd_batch {
+                    if use_asimd_filter_batch {
                         assembler.bind(filter_batch_primary_hit)?;
                         aarch64_emit_vector_filter_secondary_batch(&mut assembler, vector_filter)?;
                         aarch64_emit_candidate_batch_any(&mut assembler, 24)?;
                         assembler.branch_cond(
                             AARCH64_NE,
-                            if use_exact_asimd_lane {
+                            if let Some(hit) = filter_residual_reject_batch_hit {
+                                hit
+                            } else if use_exact_asimd_lane {
                                 filter_batch_hit
                             } else {
                                 filter_scalar
@@ -61372,6 +61392,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                         )?;
                         assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
                         assembler.branch(filter_vector)?;
+                    }
+                    if let Some(hit) = filter_residual_reject_batch_hit {
+                        assembler.bind(hit)?;
+                        // Batch helpers borrow X12 for source addresses and
+                        // reductions. Restore the incumbent loop's remaining
+                        // byte count without moving X2, then replay exactly
+                        // the same 16-byte candidate-selection path.
+                        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                        assembler.branch(filter_single_vector)?;
                     }
 
                     assembler.bind(filter_single_primary_hit)?;
@@ -78539,6 +78568,261 @@ mod tests {
                 >= 2,
             "the ASIMD batch must load both primary and secondary columns"
         );
+    }
+
+    #[test]
+    fn residual_prefix_asimd_batch_rejects_only_and_replays_the_incumbent() {
+        fn direct_branch_target(words: &[u32], instruction: usize) -> Option<usize> {
+            let word = *words.get(instruction)?;
+            if word & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = i64::from(word & 0x03ff_ffff);
+            let signed = if immediate & (1_i64 << 25) != 0 {
+                immediate - (1_i64 << 26)
+            } else {
+                immediate
+            };
+            usize::try_from(i64::try_from(instruction).ok()?.checked_add(signed)?).ok()
+        }
+
+        // A generated, identity-independent finite shape: a long exact
+        // prefix plus variable-width exact leaves. The graph can select
+        // several necessary byte columns, but no fixed-width exact-product
+        // proof permits the batch to publish a candidate.
+        let pattern = "source_derived_shared_prefix_(?:alpha|bravo|charlie|delta)";
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile residual-prefix ASIMD probe");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedDfa);
+        let (_, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().expect("native DFA view"),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        assert!(layout.has_prefix_guard());
+        assert_eq!(layout.exact_prefix_match_width, None);
+        assert!(layout.prefix_relation.is_none());
+        let primary = layout.start_filter.expect("rare primary column");
+        assert!(use_aarch64_filter_batch(primary));
+        let vector = layout.vector_filter.expect("graph-selected conjunction");
+        assert!(vector.columns().len() >= 2);
+        let coverage = derive_native_vector_guard_coverage(layout, false, Some(vector))
+            .expect("vector guard coverage");
+        assert!(coverage.has_rejectable_residual(layout).unwrap());
+
+        let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            emission.conjunction,
+            Some(NativeVectorConjunctionEmission {
+                filter: vector,
+                coverage,
+                batch_vectors: 4,
+            })
+        );
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+            "a fully rejected conjunction must advance one 64-byte batch"
+        );
+        assert!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_ld1_four_16b(16, 12).unwrap())
+                .count()
+                >= 2,
+            "the rejection proof must intersect primary and secondary 64-byte masks"
+        );
+
+        let maximum_scan_offset = vector.max_scan_offset();
+        let incumbent_bound = aarch64_cmp_x_imm(
+            12,
+            u16::from(maximum_scan_offset).checked_add(16).unwrap(),
+        )
+        .unwrap();
+        let restore_remaining = aarch64_sub_x_reg(12, 3, 2).unwrap();
+        assert!(
+            words.windows(2).enumerate().any(|(index, pair)| {
+                pair[0] == restore_remaining
+                    && direct_branch_target(&words, index + 1)
+                        .and_then(|target| words.get(target))
+                        .is_some_and(|&word| word == incumbent_bound)
+            }),
+            "a possible batch hit must keep X2, restore X12, and replay the unchanged 16-byte loop"
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes the rejection-only ASIMD batch natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused native differential keeps fixture generation and execution together"
+    )]
+    fn linked_residual_prefix_asimd_batch_agrees_with_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const PATTERN: &str = "source_derived_shared_prefix_(?:alpha|bravo|charlie|delta)";
+        const LITERALS: [&[u8]; 4] = [
+            b"source_derived_shared_prefix_alpha",
+            b"source_derived_shared_prefix_bravo",
+            b"source_derived_shared_prefix_charlie",
+            b"source_derived_shared_prefix_delta",
+        ];
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile linked residual-prefix probe");
+        let (_, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().expect("native DFA view"),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        assert_eq!(layout.exact_prefix_match_width, None);
+        let vector = layout.vector_filter.expect("graph-selected conjunction");
+        let coverage = derive_native_vector_guard_coverage(layout, false, Some(vector))
+            .expect("vector guard coverage");
+        assert!(coverage.has_rejectable_residual(layout).unwrap());
+        let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(emission.conjunction.unwrap().batch_vectors, 4);
+
+        let mut fixtures = vec![vec![b'x'; 384], {
+            let mut decoys = Vec::new();
+            for _ in 0..12 {
+                decoys.extend_from_slice(b"source_derived_shared_prefix_omega");
+            }
+            decoys
+        }];
+        for (index, offset) in [
+            0_usize, 15, 16, 47, 63, 64, 65, 127, 128, 191, 192, 255, 256, 320,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let literal = LITERALS[index % LITERALS.len()];
+            let mut haystack = vec![b'x'; 384];
+            haystack[offset..offset + literal.len()].copy_from_slice(literal);
+            fixtures.push(haystack);
+        }
+        let mut false_then_match = vec![b'x'; 384];
+        false_then_match[0..34].copy_from_slice(b"source_derived_shared_prefix_omega");
+        false_then_match[63..97].copy_from_slice(b"source_derived_shared_prefix_omega");
+        false_then_match[128..LITERALS[2].len() + 128].copy_from_slice(LITERALS[2]);
+        fixtures.push(false_then_match);
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-asimd-residual-reject-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let object = directory.join("residual.o");
+        fs::write(&object, compiled.object()).unwrap();
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n",
+        );
+        let symbol = compiled.module().entry_symbol();
+        writeln!(
+            source,
+            "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+        )
+        .unwrap();
+        for (fixture, haystack) in fixtures.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{fixture}[]={{{bytes}}};").unwrap();
+            let mut windows = Vec::new();
+            for start in 0..=haystack.len() {
+                windows.push((start, haystack.len()));
+            }
+            for end in 0..=haystack.len() {
+                windows.push((0, end));
+            }
+            let boundaries = [
+                0_usize, 1, 14, 15, 16, 17, 46, 47, 48, 62, 63, 64, 65, 66, 126, 127,
+                128, 129, 190, 191, 192, 193, 254, 255, 256, 257, 319, 320, 321, 383, 384,
+            ];
+            for &start in &boundaries {
+                for &end in &boundaries {
+                    if start <= end && end <= haystack.len() {
+                        windows.push((start, end));
+                    }
+                }
+            }
+            windows.sort_unstable();
+            windows.dedup();
+            writeln!(source, "static const size_t w{fixture}[][3]={{").unwrap();
+            for (start, end) in windows {
+                let MatchResult::Exists(found) = compiled
+                    .search(haystack, SearchWindow::new(start, end))
+                    .unwrap()
+                else {
+                    panic!("Exists contract returned another result shape");
+                };
+                writeln!(source, "{{{start},{end},{}}},", u8::from(found)).unwrap();
+            }
+            source.push_str("};\n");
+        }
+        source.push_str("int main(void){size_t r[2];uint32_t s;size_t i;\n");
+        for (fixture, haystack) in fixtures.iter().enumerate() {
+            writeln!(
+                source,
+                "for(i=0;i<sizeof(w{fixture})/sizeof(w{fixture}[0]);i++){{r[0]=99;r[1]=99;s={symbol}(h{fixture},{},w{fixture}[i][0],w{fixture}[i][1],r);if(s!=w{fixture}[i][2]||r[0]!=0||r[1]!=0){{fprintf(stderr,\"fixture {fixture} window %zu status %u result %zu %zu\\n\",i,s,r[0],r[1]);return 1;}}}}",
+                haystack.len()
+            )
+            .unwrap();
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("residual.c");
+        let executable = directory.join("residual");
+        fs::write(&c_path, source).unwrap();
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
