@@ -879,6 +879,91 @@ mod tests {
     }
 
     #[test]
+    fn seeded_ordinary_engine_matches_the_canonical_dfa_across_windows() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        fn below(seed: &mut u64, upper: usize) -> usize {
+            let upper = u64::try_from(upper).unwrap();
+            usize::try_from(next(seed) % upper).unwrap()
+        }
+
+        let mut seed = 0x5cee_987d_a7a5_eed5_u64;
+        let mut patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        for pattern in &mut patterns {
+            for byte in &mut pattern[12..] {
+                *byte = b'a' + u8::try_from(next(&mut seed) & 3).unwrap();
+            }
+        }
+        let dual = compact(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the seeded uniform set admits the dual owner");
+        let canonical = dual
+            .canonical
+            .ordinary_executor()
+            .expect("the canonical uniform DFA binds ordinary search");
+        let ordinary_plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the seeded uniform set admits the ordinary owner")
+            .into_ordinary();
+        let ordinary = ordinary_plan.ordinary_executor();
+
+        for case in 0..64 {
+            let len = usize::try_from(next(&mut seed) % 769).unwrap();
+            let mut haystack = (0..len)
+                .map(|_| b'a' + u8::try_from(next(&mut seed) & 7).unwrap())
+                .collect::<Vec<_>>();
+            if case % 3 != 0 && len >= MIN_PATTERN_BYTES {
+                let pattern = below(&mut seed, patterns.len());
+                let at = below(&mut seed, len - MIN_PATTERN_BYTES + 1);
+                haystack[at..at + MIN_PATTERN_BYTES].copy_from_slice(&patterns[pattern]);
+            }
+            let start = below(&mut seed, len + 1);
+            let end = start + below(&mut seed, len - start + 1);
+            let window = Window::new(start, end);
+
+            let expected = canonical.find_window_value(&haystack, window);
+            assert_eq!(ordinary.find_window_value(&haystack, window), expected);
+            assert_eq!(
+                ordinary.exists_window_value(&haystack, window),
+                canonical.exists_window_value(&haystack, window),
+            );
+            assert_eq!(
+                ordinary.selected_end_window_value(&haystack, window),
+                canonical.selected_end_window_value(&haystack, window),
+            );
+            assert_eq!(
+                ordinary.count_spans_window_value(&haystack, window),
+                canonical.count_spans_window_value(&haystack, window),
+            );
+            let mut expected_spans = Vec::new();
+            canonical
+                .try_visit_spans_window_value(&haystack, window, |span| {
+                    expected_spans.push(span);
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap()
+                .unwrap();
+            let mut actual_spans = Vec::new();
+            ordinary
+                .try_visit_spans_window_value(&haystack, window, |span| {
+                    actual_spans.push(span);
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                actual_spans, expected_spans,
+                "case={case} window={window:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_candidate_resolves_one_exact_owner_or_same_shared_fallback() {
         let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
         let dual = compact(&patterns, LiteralSetBuildLimits::default())
