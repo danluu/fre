@@ -50,6 +50,7 @@ mod literal_anchor;
 mod literal_assertions;
 mod literal_class_run_literal;
 mod literal_set;
+mod literal_set_compact;
 mod line_domain_byte_atoms;
 mod ordered_literal_aggregate;
 mod packed_literal_set;
@@ -470,6 +471,9 @@ pub use literal_set::{
     LiteralSetFoldAttachment, LiteralSetIterationAccounting, LiteralSetMatchSemantics,
     LiteralSetMatches, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
     LiteralSetUniformStandardOrdinaryExecutor,
+};
+pub use literal_set_compact::{
+    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryExecutor, LiteralSetCompactPlan,
 };
 pub use ordered_literal_aggregate::{
     ALGORITHM_ID as ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,

@@ -889,6 +889,7 @@ use fre_kernels::{
     ExactLiteralOrdinaryExecutor, LiteralAccounting, LiteralBuildLimits,
     LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan, LiteralError, LiteralPlan,
     LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
+    LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryExecutor, LiteralSetCompactPlan,
     LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
     LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
@@ -6063,6 +6064,44 @@ struct RipgrepFlatLiteralPublication {
     minimum_match_bytes: Option<usize>,
 }
 
+#[cfg(test)]
+mod literal_set_compact_owner_allocation_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Guard;
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|failure| {
+            assert!(!failure.replace(true), "compact owner failure already armed");
+        });
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|failure| failure.replace(false))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|failure| failure.set(false));
+        }
+    }
+}
+
+fn try_box_ripgrep_compact_literal_set(
+    literal_set: LiteralSetCompactPlan,
+) -> Result<Box<LiteralSetCompactPlan>, LiteralSetCompactPlan> {
+    #[cfg(test)]
+    if literal_set_compact_owner_allocation_probe::take_failure() {
+        return Err(literal_set);
+    }
+    fre_exact_alloc::try_box_preserve(literal_set).map_err(|(_, literal_set)| literal_set)
+}
+
 #[cold]
 #[inline(never)]
 fn publish_ripgrep_borrowed_flat_literal_set(
@@ -6079,16 +6118,56 @@ fn publish_ripgrep_borrowed_flat_literal_set(
             "borrowed ripgrep literal set reached another planner terminal",
         ));
     }
-    let literal_set = LiteralSetPlan::new_stable_borrowed(
+    let outcome = LiteralSetCompactPlan::try_new_ripgrep_standard_borrowed(
         patterns,
         builder.limits.literal_set,
     )?;
-    let storage = literal_set.build_accounting().persistent_bytes;
+    let (plan, storage) = match outcome {
+        LiteralSetCompactBuildOutcome::Compact(literal_set) => {
+            let compact_storage = literal_set
+                .build_accounting()
+                .persistent_bytes
+                .checked_add(core::mem::size_of::<LiteralSetCompactPlan>());
+            let compact_fits = compact_storage
+                .and_then(|storage| {
+                    publication
+                        .source_storage_bytes
+                        .checked_add(publication.capture_name_storage_bytes)
+                        .and_then(|bytes| bytes.checked_add(storage))
+                })
+                .is_some_and(|charged| charged <= builder.limits.max_persistent_bytes);
+            if compact_fits {
+                let storage = compact_storage.expect("the admitted compact storage was checked");
+                match try_box_ripgrep_compact_literal_set(literal_set) {
+                    Ok(literal_set) => (PortablePlan::LiteralSetCompact(literal_set), storage),
+                    Err(literal_set) => {
+                        let literal_set = literal_set.into_canonical();
+                        let storage = literal_set.build_accounting().persistent_bytes;
+                        (PortablePlan::LiteralSetDfa(literal_set), storage)
+                    }
+                }
+            } else {
+                let literal_set = literal_set.into_canonical();
+                let storage = literal_set.build_accounting().persistent_bytes;
+                (PortablePlan::LiteralSetDfa(literal_set), storage)
+            }
+        }
+        LiteralSetCompactBuildOutcome::Canonical(literal_set) => {
+            let storage = literal_set.build_accounting().persistent_bytes;
+            (PortablePlan::LiteralSetDfa(literal_set), storage)
+        }
+        LiteralSetCompactBuildOutcome::NotApplicable => {
+            let literal_set =
+                LiteralSetPlan::new_stable_borrowed(patterns, builder.limits.literal_set)?;
+            let storage = literal_set.build_accounting().persistent_bytes;
+            (PortablePlan::LiteralSetDfa(literal_set), storage)
+        }
+    };
     Ok(PortableRegex {
         source: publication.source,
         capture_names: publication.capture_names,
         line_total_grep_plan: publication.line_total_grep_plan,
-        plan: PortablePlan::LiteralSetDfa(literal_set),
+        plan,
         profile: publication.profile.clone(),
         limits: builder.limits,
         selection: builder.selection,
@@ -10881,6 +10960,18 @@ impl Clone for PortableRegex {
     /// facade replays its already-admitted deterministic construction instead
     /// of weakening those plan-level ownership contracts.
     fn clone(&self) -> Self {
+        if let PortablePlan::LiteralSetCompact(plan) = &self.plan {
+            return Self {
+                source: self.source.clone(),
+                capture_names: self.capture_names.clone(),
+                line_total_grep_plan: self.line_total_grep_plan,
+                plan: PortablePlan::LiteralSetCompact(plan.clone()),
+                profile: self.profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: self.report.clone(),
+            };
+        }
         let profile = match &self.profile {
             CompatibilityProfile::RustBytes(profile) => profile.clone(),
             CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
@@ -11563,6 +11654,33 @@ mod packed_literal_set_ordinary_facade_probe {
 
 #[cfg(test)]
 mod literal_set_dfa_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
+#[cfg(test)]
+mod literal_set_compact_ordinary_facade_probe {
     use core::cell::Cell;
 
     std::thread_local! {
@@ -13011,6 +13129,9 @@ enum PortablePlan {
     ),
     UnicodeScalarRun(Box<UnicodeScalarSearchPlan>),
     LineDomainByteAtoms(Box<line_domain_byte_atoms::OwnedPlan>),
+    /// Append the authenticated compact owner so every established runtime
+    /// plan discriminant and dense literal-set layout remains unchanged.
+    LiteralSetCompact(Box<LiteralSetCompactPlan>),
 }
 
 impl PortablePlan {
@@ -13048,6 +13169,7 @@ impl PortablePlan {
             Self::BoundedDelimitedSegmentRepeat(plan) => plan.plan_id(),
             Self::UnicodeScalarRun(_) => UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
             Self::LineDomainByteAtoms(_) => fre_kernels::LINE_DOMAIN_BYTE_ATOMS_PLAN_ID,
+            Self::LiteralSetCompact(plan) => plan.runtime_implementation_id(),
         }
     }
 }
@@ -13489,6 +13611,11 @@ impl PortableRegex {
                     ))
                 }
             }
+            PortablePlan::LiteralSetCompact(literal_set) => {
+                PortableOrdinarySessionPlan::LiteralSetCompact {
+                    executor: literal_set.ordinary_executor(),
+                }
+            }
             _ => PortableOrdinarySessionPlan::Canonical(Box::new(
                 self.search_session(SearchSessionLimits::unlimited())?,
             )),
@@ -13899,6 +14026,14 @@ impl PortableRegex {
                         .map_err(SearchError::from)
                 }
             }
+            PortablePlan::LiteralSetCompact(literal_set) => {
+                #[cfg(test)]
+                literal_set_compact_ordinary_facade_probe::record_exists();
+                literal_set
+                    .ordinary_executor()
+                    .exists_window_value(haystack, LiteralWindow::full(haystack))
+                    .map_err(SearchError::from)
+            }
             PortablePlan::RequiredLiteral(required)
                 if !required.anchors().start && !required.anchors().end =>
             {
@@ -14145,6 +14280,18 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    literal_set_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::LiteralSetDfa(accounting),
+                ))
+            }
+            PortablePlan::LiteralSetCompact(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = literal_set.find_window(
                     haystack,
@@ -14451,6 +14598,14 @@ impl PortableRegex {
                 .map(|matched| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::LiteralSetDfa(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::LiteralSetCompact(literal_set) => literal_set
                 .find_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -14853,6 +15008,18 @@ impl PortableRegex {
                 };
                 Ok((end, SearchAccounting::LiteralSetDfa(accounting)))
             }
+            PortablePlan::LiteralSetCompact(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    literal_set_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::LiteralSetDfa(accounting),
+                ))
+            }
             PortablePlan::RequiredLiteral(required) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = required.find_window(
@@ -15134,6 +15301,14 @@ impl PortableRegex {
                 Ok((end, SearchAccounting::GuardedLiteralSet(accounting)))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
+                let (matched, accounting) =
+                    literal_set.find(haystack, literal_set_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::LiteralSetDfa(accounting),
+                ))
+            }
+            PortablePlan::LiteralSetCompact(literal_set) => {
                 let (matched, accounting) =
                     literal_set.find(haystack, literal_set_limits(limits))?;
                 Ok((
@@ -15564,6 +15739,15 @@ impl PortableRegex {
                     )
                 }?;
                 Ok(matched.map(|(start, end)| Match { start, end }))
+            }
+            PortablePlan::LiteralSetCompact(literal_set) => {
+                #[cfg(test)]
+                literal_set_compact_ordinary_facade_probe::record_span();
+                literal_set
+                    .ordinary_executor()
+                    .find_window_value(haystack, LiteralWindow::full(haystack))
+                    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                    .map_err(SearchError::from)
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
@@ -16243,6 +16427,18 @@ impl PortableRegex {
                     SearchAccounting::LiteralSetDfa(accounting),
                 ))
             }
+            PortablePlan::LiteralSetCompact(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    literal_set_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::LiteralSetDfa(accounting),
+                ))
+            }
             PortablePlan::RequiredLiteral(required) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = required.find_window(
@@ -16550,6 +16746,14 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::LiteralSetCompact(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PackedLiteralSet(literal_set) => literal_set
                 .find_window_value(
                     haystack,
@@ -16837,6 +17041,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
+                let (matched, accounting) =
+                    literal_set.find_window(haystack, window, literal_set_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.transitions_upper_bound).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::LiteralSetCompact(literal_set) => {
                 let (matched, accounting) =
                     literal_set.find_window(haystack, window, literal_set_limits(limits))?;
                 Ok((
@@ -17334,6 +17546,10 @@ enum PortableOrdinarySessionPlan<'a> {
     /// discriminants and their common dispatch order remain stable.
     ExactLiteral {
         executor: ExactLiteralOrdinaryExecutor<'a>,
+    },
+    /// Appended to preserve every established ordinary-session discriminant.
+    LiteralSetCompact {
+        executor: LiteralSetCompactOrdinaryExecutor<'a>,
     },
 }
 
@@ -23002,6 +23218,9 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
+                .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
                 direct_next,
@@ -23057,6 +23276,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .first_acceptance_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
+                .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
@@ -23135,6 +23357,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
@@ -23280,6 +23506,17 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from)
                 .map_err(PortableFindIterError::Search)
             }
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => {
+                let mut visitor = visitor;
+                executor
+                    .try_visit_spans_window_value(
+                        haystack,
+                        LiteralWindow::new(start, haystack.len()),
+                        |(start, end)| visitor(Match { start, end }),
+                    )
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)
+            }
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
                 direct_next,
@@ -23401,6 +23638,10 @@ impl<'r> PortableOrdinarySession<'r> {
                         .map_err(SearchError::from)
                 }
             }
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
+                .count_spans_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(Some)
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 executor,
                 direct_next,
@@ -27771,8 +28012,9 @@ mod tests {
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
         K0PackedFrontierPlan, K0PooledValue, K0PooledValueExecution, K0PooledValueOperation,
         K0ReverseSuffixSpanAttempt, K0SpanSourceCursor,
-        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetError, LiteralWindow, Match,
-        OperationSemantics, PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
+        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetBuildLimits, LiteralSetError,
+        LiteralWindow, Match, OperationSemantics,
+        PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
         PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
@@ -28730,6 +28972,291 @@ mod tests {
             Some(Match { start: 2, end: 10 }),
         );
         assert_eq!(regex.find(b"xxxxxxxx"), None);
+    }
+
+    fn public_uniform_ripgrep_literals(count: usize, width: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let prefix = format!("literal{index:04}");
+                assert!(prefix.len() <= width);
+                let mut pattern = prefix;
+                pattern.extend(core::iter::repeat_n('q', width - pattern.len()));
+                pattern
+            })
+            .collect()
+    }
+
+    fn build_public_uniform_ripgrep_literals(patterns: &[String]) -> PortableRegex {
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals(&borrowed, usize::MAX)
+            .expect("public uniform literal construction completes")
+            .expect("public uniform literal shape is admitted")
+    }
+
+    #[test]
+    fn ripgrep_uniform_compact_policy_closes_public_geometry_boundaries() {
+        for (count, width, compact) in [
+            (129, 253, false),
+            (129, 254, true),
+            (256, 127, false),
+            (256, 128, true),
+        ] {
+            let patterns = public_uniform_ripgrep_literals(count, width);
+            let regex = build_public_uniform_ripgrep_literals(&patterns);
+            assert_eq!(
+                matches!(&regex.plan, PortablePlan::LiteralSetCompact(_)),
+                compact,
+                "count={count}, width={width}",
+            );
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                if compact {
+                    "literal-set-compact-nfa"
+                } else {
+                    "literal-set-dfa"
+                },
+            );
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        }
+    }
+
+    #[test]
+    fn ripgrep_uniform_compact_preserves_checked_ordinary_and_clone_contracts() {
+        let mut patterns = public_uniform_ripgrep_literals(256, 128);
+        patterns[0] = "a".repeat(128);
+        let regex = build_public_uniform_ripgrep_literals(&patterns);
+        let PortablePlan::LiteralSetCompact(compact) = &regex.plan else {
+            panic!("public uniform literals did not retain the compact owner");
+        };
+        assert_eq!(regex.runtime_implementation_id(), "literal-set-compact-nfa");
+        assert_eq!(
+            regex.build_report().plan_storage_bytes,
+            compact.build_accounting().persistent_bytes
+                + core::mem::size_of::<fre_kernels::LiteralSetCompactPlan>(),
+        );
+
+        let cloned = regex.clone();
+        assert!(matches!(&cloned.plan, PortablePlan::LiteralSetCompact(_)));
+        assert_eq!(
+            cloned.runtime_implementation_id(),
+            regex.runtime_implementation_id()
+        );
+        assert_eq!(cloned.build_report(), regex.build_report());
+
+        let hir = Hir::alternation(
+            patterns
+                .iter()
+                .map(|pattern| Hir::literal(pattern.as_bytes()))
+                .collect::<Vec<_>>(),
+        );
+        let via_hir = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir(&hir, usize::MAX)
+            .expect("public uniform HIR construction completes")
+            .expect("public uniform HIR is admitted");
+        assert!(matches!(&via_hir.plan, PortablePlan::LiteralSetCompact(_)));
+        assert_eq!(via_hir.as_str(), regex.as_str());
+        assert_eq!(via_hir.build_report(), regex.build_report());
+
+        let mut haystack = vec![b'z'];
+        haystack.extend(core::iter::repeat_n(b'a', 256));
+        haystack.push(b'z');
+        let expected = Some(Match { start: 1, end: 129 });
+        super::literal_set_compact_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), expected);
+        assert_eq!(cloned.find(&haystack), expected);
+        assert_eq!(via_hir.find(&haystack), expected);
+        assert_eq!(
+            super::literal_set_compact_ordinary_facade_probe::snapshot(),
+            (1, 3),
+        );
+
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+        ));
+        assert_eq!(ordinary.is_match_at(&haystack, 1), Ok(true));
+        assert_eq!(ordinary.first_acceptance_at(&haystack, 1), Ok(Some(129)));
+        assert_eq!(ordinary.find_at(&haystack, 1), Ok(expected));
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans_at(&haystack, 1, |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(spans, [(1, 129), (129, 257)]);
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(&haystack, 1),
+            Ok(Some(2)),
+        );
+
+        let window = SearchWindow::new(1, 257);
+        let needed = window.end() - window.start() + 1;
+        let checked = regex
+            .find_window(
+                &haystack,
+                window,
+                SearchLimits {
+                    max_work: u64::try_from(needed).unwrap(),
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        let mut checked_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            checked_session
+                .find_window(
+                    &haystack,
+                    window,
+                    SearchLimits {
+                        max_work: u64::try_from(needed).unwrap(),
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap(),
+            checked,
+        );
+        let (matched, accounting) = checked;
+        assert_eq!(matched, expected);
+        let SearchAccounting::LiteralSetDfa(accounting) = accounting else {
+            panic!("compact literal search changed accounting family");
+        };
+        assert_eq!(accounting.transitions_upper_bound, needed);
+        assert_eq!(
+            regex.find_window(
+                &haystack,
+                window,
+                SearchLimits {
+                    max_work: u64::try_from(needed - 1).unwrap(),
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::LiteralSetDfa(
+                LiteralSetError::TransitionLimit {
+                    needed,
+                    limit: needed - 1,
+                }
+            )),
+        );
+
+        let invalid = SearchWindow::new(2, haystack.len() + 1);
+        assert!(matches!(
+            regex.find_window_value(&haystack, invalid, SearchLimits::unlimited()),
+            Err(SearchError::LiteralSetDfa(LiteralSetError::InvalidWindow {
+                start: 2,
+                end,
+                haystack_len,
+            })) if end == haystack.len() + 1 && haystack_len == haystack.len()
+        ));
+    }
+
+    #[test]
+    fn ripgrep_uniform_compact_global_cap_falls_back_to_retained_canonical() {
+        let patterns = public_uniform_ripgrep_literals(256, 128);
+        let compact = build_public_uniform_ripgrep_literals(&patterns);
+        let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let pattern_bytes = patterns
+            .iter()
+            .map(|pattern| pattern.as_bytes())
+            .collect::<Vec<_>>();
+        let defaults = BuildLimits::default();
+        let dense = fre_kernels::LiteralSetPlan::new_stable_borrowed(
+            &pattern_bytes,
+            defaults.literal_set,
+        )
+            .expect("the incumbent dense owner builds under default limits");
+        let dense_limit = compact
+            .build_report()
+            .source_storage_bytes
+            .checked_add(compact.build_report().capture_name_storage_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(dense.build_accounting().persistent_bytes)
+            })
+            .unwrap();
+        assert!(dense_limit < compact.build_report().charged_persistent_bytes);
+
+        let constrained = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(BuildLimits {
+                max_persistent_bytes: dense_limit,
+                ..defaults
+            })
+            .build_ripgrep_standard_literals(&pattern_refs, usize::MAX)
+            .expect("the exact incumbent global cap remains a successful build")
+            .expect("the authenticated flat literal handoff remains admitted");
+        assert_eq!(constrained.runtime_implementation_id(), "literal-set-dfa");
+        assert_eq!(
+            constrained.build_report().charged_persistent_bytes,
+            dense_limit,
+        );
+    }
+
+    #[test]
+    fn ripgrep_uniform_compact_constituent_cap_keeps_retained_canonical() {
+        let patterns = public_uniform_ripgrep_literals(256, 128);
+        let selected = build_public_uniform_ripgrep_literals(&patterns);
+        let compact_persistent = selected
+            .build_report()
+            .plan_storage_bytes
+            .checked_sub(core::mem::size_of::<fre_kernels::LiteralSetCompactPlan>())
+            .unwrap();
+        let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let pattern_bytes = patterns
+            .iter()
+            .map(|pattern| pattern.as_bytes())
+            .collect::<Vec<_>>();
+        let defaults = BuildLimits::default();
+        let dense = fre_kernels::LiteralSetPlan::new_stable_borrowed(
+            &pattern_bytes,
+            defaults.literal_set,
+        )
+            .expect("the incumbent dense owner builds under default limits");
+        assert!(dense.build_accounting().persistent_bytes < compact_persistent);
+
+        let constrained = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(BuildLimits {
+                literal_set: LiteralSetBuildLimits {
+                    max_persistent_bytes: compact_persistent - 1,
+                    ..defaults.literal_set
+                },
+                ..defaults
+            })
+            .build_ripgrep_standard_literals(&pattern_refs, usize::MAX)
+            .expect("a compact-only constituent cap retains the incumbent")
+            .expect("the authenticated flat literal handoff remains admitted");
+        assert_eq!(constrained.runtime_implementation_id(), "literal-set-dfa");
+        assert_eq!(
+            constrained.build_report().plan_storage_bytes,
+            dense.build_accounting().persistent_bytes,
+        );
+    }
+
+    #[test]
+    fn ripgrep_uniform_compact_owner_allocation_failure_keeps_retained_canonical() {
+        let patterns = public_uniform_ripgrep_literals(256, 128);
+        let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let _failure = super::literal_set_compact_owner_allocation_probe::fail_next();
+        let fallback = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals(&pattern_refs, usize::MAX)
+            .expect("compact owner allocation failure keeps the incumbent")
+            .expect("the authenticated flat literal handoff remains admitted");
+        assert_eq!(fallback.runtime_implementation_id(), "literal-set-dfa");
+        assert_eq!(
+            fallback.find(patterns[17].as_bytes()),
+            Some(Match { start: 0, end: 128 }),
+        );
     }
 
     #[test]
