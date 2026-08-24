@@ -3605,6 +3605,135 @@ pub fn compile_native_row_bridge(
     })
 }
 
+/// Build-time selection for the helper-free whole-operation multi-pattern
+/// `grep` reducer. The two explicit declines alone retain the pre-existing
+/// exact Rust line/row adapter.
+#[derive(Clone, Debug)]
+pub enum NativeMultiGrepReducerDisposition {
+    Selected(fre_aot_regex::RebarMultiGrepReducerAotArtifactV1),
+    DeclinedPreparedRow { artifact: usize },
+    DeclinedObjectBytes {
+        limit: usize,
+        required: usize,
+    },
+}
+
+/// Attempt to replace the Rust line/row adapter with one native operation.
+///
+/// Existing independently authenticated ordinary rows remain the semantic
+/// leaves. Prepared V15 rows retain the old route because their exclusive
+/// handle lifecycle is intentionally outside this reducer ABI. The wrapper
+/// is charged against the same total linked-object ceiling as its rows. Only
+/// that final numeric object cap may decline; every construction or
+/// authentication failure is terminal.
+pub fn try_compile_native_multi_grep_reducer(
+    benchmark: &Benchmark,
+    bridge: &NativeRowBridge,
+) -> Result<NativeMultiGrepReducerDisposition, String> {
+    if benchmark.model != Model::GrepCount
+        || benchmark.patterns.len() < 2
+        || !benchmark.uses_native_row_bridge()
+        || bridge.artifacts.is_empty()
+        || bridge.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.total_object_bytes == 0
+        || bridge.total_object_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err("native multi-grep reducer requires an authenticated multi-pattern Grep row bridge"
+            .to_owned());
+    }
+    let exact_row_bytes = bridge
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |total, artifact| {
+            total.checked_add(artifact.compiled.object().len())
+        })
+        .ok_or_else(|| "native multi-grep row object-byte sum overflowed".to_owned())?;
+    if exact_row_bytes != bridge.total_object_bytes {
+        return Err("native multi-grep row object-byte receipt mismatch".to_owned());
+    }
+    if let Some((artifact, _)) = bridge
+        .artifacts
+        .iter()
+        .enumerate()
+        .find(|(_, artifact)| artifact.route.is_prepared())
+    {
+        return Ok(NativeMultiGrepReducerDisposition::DeclinedPreparedRow {
+            artifact,
+        });
+    }
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "native multi-grep source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(bridge.artifacts.len())
+        .map_err(|_| "native multi-grep row descriptor allocation failed".to_owned())?;
+    rows.extend(bridge.artifacts.iter().map(|artifact| {
+        fre_aot_regex::RebarMultiGrepReducerRowV1::new(
+            &artifact.compiled,
+            artifact.first_source_ordinal,
+        )
+    }));
+    let reducer_limit = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(bridge.total_object_bytes)
+        .ok_or_else(|| "native multi-grep reducer object-byte remainder underflowed".to_owned())?;
+    let disposition = fre_aot_regex::compile_rebar_multi_grep_reducer_aot_v1(
+        ordered_sources_sha256,
+        benchmark.patterns.len(),
+        source_bytes,
+        &bridge.source_to_artifact,
+        &rows,
+        reducer_limit,
+    )
+    .map_err(|error| format!("native multi-grep reducer compilation failed: {error}"))?;
+    let selected = match disposition {
+        fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Selected(selected) => selected,
+        fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Declined(
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDeclineV1::ObjectBytes {
+                limit,
+                required,
+            },
+        ) => {
+            return Ok(NativeMultiGrepReducerDisposition::DeclinedObjectBytes {
+                limit,
+                required,
+            });
+        }
+    };
+    let receipt = selected.receipt();
+    let total_link_bytes = bridge
+        .total_object_bytes
+        .checked_add(selected.object().len())
+        .ok_or_else(|| "native multi-grep total linked object bytes overflowed".to_owned())?;
+    if !selected.authenticates_rows(
+        ordered_sources_sha256,
+        benchmark.patterns.len(),
+        source_bytes,
+        &bridge.source_to_artifact,
+        &rows,
+    ) || receipt.max_object_bytes() != reducer_limit
+        || receipt.object_bytes() != selected.object().len()
+        || receipt.reducer_relocation_count() != bridge.artifacts.len()
+        || receipt.semantic_runtime_calls() != 0
+        || !receipt
+            .row_entry_symbols()
+            .iter()
+            .map(String::as_str)
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || !selected
+            .module()
+            .required_runtime_symbols()
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || selected.object().is_empty()
+        || total_link_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err("native multi-grep reducer adapter authentication failed".to_owned());
+    }
+    Ok(NativeMultiGrepReducerDisposition::Selected(selected))
+}
+
 fn authenticate_native_row(compiled: &CompiledRegex, source_ordinal: usize) -> Result<(), String> {
     let module = compiled.module();
     let receipt = compiled.receipt();
@@ -5012,6 +5141,81 @@ mod tests {
                 .is_none());
             assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
         }
+    }
+
+    #[test]
+    fn native_multi_grep_reducer_seals_the_deduplicated_row_closure() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for insertion in [
+            b"pattern:5:^foo$\npattern:5:^bar$\n".as_slice(),
+            b"pattern:5:^foo$\n".as_slice(),
+        ] {
+            let mut multi = fixture("grep", b"^foo$", b"foo\nbar\r\nno");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(offset..offset, insertion.iter().copied());
+            let benchmark = Benchmark::parse(&multi).expect("multi-grep fixture");
+            let bridge = compile_native_row_bridge(&benchmark, target)
+                .expect("independent multi-grep rows");
+            let disposition = try_compile_native_multi_grep_reducer(&benchmark, &bridge)
+                .expect("native multi-grep adapter");
+            let NativeMultiGrepReducerDisposition::Selected(artifact) = disposition else {
+                panic!("ordinary public rows unexpectedly declined their reducer");
+            };
+            let receipt = artifact.receipt();
+            assert_eq!(receipt.source_cardinality(), benchmark.patterns.len());
+            assert_eq!(receipt.source_to_row(), bridge.source_to_artifact);
+            assert_eq!(receipt.reducer_relocation_count(), bridge.artifacts.len());
+            assert_eq!(receipt.semantic_runtime_calls(), 0);
+            assert_eq!(
+                receipt.object_bytes() + bridge.total_object_bytes,
+                artifact.object().len() + bridge.total_object_bytes,
+            );
+            assert!(
+                receipt.object_bytes() + bridge.total_object_bytes
+                    <= MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn native_multi_grep_reducer_declines_the_prepared_row_shape() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut multi = fixture("grep", b"a+", b"foo\nbar");
+        let insertion = b"pattern:7:\\bfoo\\b\n";
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, insertion.iter().copied());
+        let mut benchmark = Benchmark::parse(&multi).expect("prepared multi-grep fixture");
+        benchmark.unicode = true;
+        let bridge = compile_native_row_bridge(&benchmark, target)
+            .expect("runtime-dependent row selects explicit prepared V15");
+        assert_eq!(bridge.artifacts.len(), 2);
+        assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
+        assert_eq!(
+            bridge.artifacts[1].route,
+            NativeRowRoute::PreparedOrderedNfaV15,
+        );
+        let disposition = try_compile_native_multi_grep_reducer(&benchmark, &bridge)
+            .expect("prepared row is a typed reducer decline");
+        assert!(matches!(
+            disposition,
+            NativeMultiGrepReducerDisposition::DeclinedPreparedRow { artifact: 1 },
+        ));
     }
 
     #[test]

@@ -721,6 +721,35 @@ fn strict_native_row_reduce(
     })
 }
 
+#[allow(
+    unsafe_code,
+    reason = "route authentication binds the statically linked whole-operation reducer ABI"
+)]
+fn strict_linked_native_multi_grep_reduce(haystack: &[u8]) -> Result<u64, String> {
+    let mut value = u64::MAX;
+    // SAFETY: route authentication binds the symbol and complete ordinary-row
+    // closure to this ABI. The haystack and aligned output remain live and
+    // disjoint for the complete call.
+    let status = unsafe {
+        linked::reduce_multi_grep(haystack.as_ptr(), haystack.len(), &mut value)
+    };
+    match status {
+        fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS if value != u64::MAX => {
+            Ok(value)
+        }
+        fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS => Err(
+            "native multi-grep reducer returned success without publishing its output".to_owned(),
+        ),
+        other if value != u64::MAX => Err(format!(
+            "native multi-grep reducer returned status {other} after modifying its transactional output"
+        )),
+        other => Err(format!(
+            "native multi-grep reducer {:?} returned status {other}",
+            linked::MULTI_GREP_REDUCER_SYMBOL,
+        )),
+    }
+}
+
 fn search_native_rows_with(
     row_count: usize,
     haystack_len: usize,
@@ -1968,6 +1997,26 @@ fn print_provenance() {
             )
             .expect("format native-row component provenance");
         }
+        if linked::NATIVE_MULTI_GREP_REDUCER {
+            write!(
+                &mut provenance,
+                " native_multi_grep_reducer=true multi_grep_reducer_abi_version={} multi_grep_reducer_source_cardinality={} multi_grep_reducer_source_bytes={} multi_grep_reducer_ordered_sources_sha256={} multi_grep_reducer_symbol={} multi_grep_reducer_operation_identity_sha256={} multi_grep_reducer_code_sha256={} multi_grep_reducer_object_sha256={} multi_grep_reducer_relocation_count={} multi_grep_reducer_semantic_runtime_calls={} multi_grep_reducer_object_bytes={} multi_grep_reducer_max_object_bytes={} multi_grep_reducer_artifact_identity_sha256={}",
+                linked::MULTI_GREP_REDUCER_ABI_VERSION,
+                linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY,
+                linked::MULTI_GREP_REDUCER_SOURCE_BYTES,
+                hex(&linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256),
+                linked::MULTI_GREP_REDUCER_SYMBOL,
+                hex(&linked::MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256),
+                hex(&linked::MULTI_GREP_REDUCER_CODE_SHA256),
+                hex(&linked::MULTI_GREP_REDUCER_OBJECT_SHA256),
+                linked::MULTI_GREP_REDUCER_RELOCATION_COUNT,
+                linked::MULTI_GREP_REDUCER_SEMANTIC_RUNTIME_CALLS,
+                linked::MULTI_GREP_REDUCER_OBJECT_BYTES,
+                linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES,
+                hex(&linked::MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256),
+            )
+            .expect("format native multi-grep reducer provenance");
+        }
         if linked::UNIFORM_CAPTURE_BRIDGE {
             let groups = linked::SOURCE_PARTICIPATING_GROUPS
                 .iter()
@@ -2025,7 +2074,9 @@ fn print_provenance() {
             )
             .expect("format uniform-capture proof provenance");
         }
-        let boundary = if linked::UNIFORM_CAPTURE_BRIDGE {
+        let boundary = if linked::NATIVE_MULTI_GREP_REDUCER {
+            "single-call-helper-free-native-multi-grep-reducer"
+        } else if linked::UNIFORM_CAPTURE_BRIDGE {
             "native-search-core-static-uniform-capture-resolution"
         } else {
             "complete-native-row-bridge"
@@ -2185,6 +2236,111 @@ fn authenticate_benchmark(
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn update_multi_grep_identity_usize(
+    digest: &mut Sha256,
+    value: usize,
+) -> Result<(), String> {
+    digest.update(
+        u64::try_from(value)
+            .map_err(|_| "multi-grep identity integer overflowed u64".to_owned())?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+fn update_multi_grep_identity_field(
+    digest: &mut Sha256,
+    bytes: &[u8],
+) -> Result<(), String> {
+    update_multi_grep_identity_usize(digest, bytes.len())?;
+    digest.update(bytes);
+    Ok(())
+}
+
+fn expected_multi_grep_operation_identity(
+    benchmark: &shared::Benchmark,
+) -> Result<[u8; 32], String> {
+    let target = shared::target_from_parts(
+        linked::TARGET_ARCH,
+        linked::TARGET_OS,
+        linked::FEATURE_BITS,
+    )?;
+    let ordered_sources_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)?;
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "multi-grep runtime source byte sum overflowed".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+    digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes());
+    digest.update([
+        target.architecture as u8,
+        target.operating_system as u8,
+        target.abi as u8,
+    ]);
+    digest.update(target.features.bits().to_le_bytes());
+    update_multi_grep_identity_usize(&mut digest, benchmark.patterns.len())?;
+    update_multi_grep_identity_usize(&mut digest, source_bytes)?;
+    digest.update(ordered_sources_sha256);
+    update_multi_grep_identity_usize(&mut digest, linked::SOURCE_TO_ARTIFACT.len())?;
+    for &row in linked::SOURCE_TO_ARTIFACT {
+        update_multi_grep_identity_usize(&mut digest, row)?;
+    }
+    update_multi_grep_identity_usize(&mut digest, linked::ROW_ARTIFACT_COUNT)?;
+    for row in 0..linked::ROW_ARTIFACT_COUNT {
+        update_multi_grep_identity_usize(
+            &mut digest,
+            linked::ROW_FIRST_SOURCE_ORDINALS[row],
+        )?;
+        update_multi_grep_identity_field(
+            &mut digest,
+            linked::ROW_ENTRY_SYMBOLS[row].as_bytes(),
+        )?;
+        digest.update(linked::ROW_AUTOMATON_SHA256[row]);
+        digest.update(linked::ROW_PROGRAM_SHA256[row]);
+        digest.update(linked::ROW_OBJECT_SHA256[row]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn expected_multi_grep_artifact_identity(
+    operation_identity: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0");
+    digest.update(operation_identity);
+    update_multi_grep_identity_field(&mut digest, linked::MULTI_GREP_REDUCER_SYMBOL.as_bytes())?;
+    digest.update(linked::MULTI_GREP_REDUCER_CODE_SHA256);
+    digest.update(linked::MULTI_GREP_REDUCER_OBJECT_SHA256);
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::MULTI_GREP_REDUCER_RELOCATION_COUNT,
+    )?;
+    update_multi_grep_identity_usize(&mut digest, linked::MULTI_GREP_REDUCER_OBJECT_BYTES)?;
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES,
+    )?;
+    Ok(digest.finalize().into())
+}
+
+fn multi_grep_reducer_receipt_is_empty() -> bool {
+    linked::MULTI_GREP_REDUCER_ABI_VERSION == 0
+        && linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY == 0
+        && linked::MULTI_GREP_REDUCER_SOURCE_BYTES == 0
+        && linked::MULTI_GREP_REDUCER_RELOCATION_COUNT == 0
+        && linked::MULTI_GREP_REDUCER_SEMANTIC_RUNTIME_CALLS == 0
+        && linked::MULTI_GREP_REDUCER_OBJECT_BYTES == 0
+        && linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES == 0
+        && linked::MULTI_GREP_REDUCER_SYMBOL.is_empty()
+        && linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256 == [0; 32]
+        && linked::MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256 == [0; 32]
+        && linked::MULTI_GREP_REDUCER_CODE_SHA256 == [0; 32]
+        && linked::MULTI_GREP_REDUCER_OBJECT_SHA256 == [0; 32]
+        && linked::MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256 == [0; 32]
 }
 
 fn strict_capture_source_provenance_is_empty() -> bool {
@@ -2788,6 +2944,12 @@ fn authenticate_linked_capture_next_reducer_source() -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
+    if linked::NATIVE_MULTI_GREP_REDUCER && !linked::NATIVE_ROW_BRIDGE {
+        return Err("multi-grep reducer is detached from its native-row closure".to_owned());
+    }
+    if !linked::NATIVE_ROW_BRIDGE && !multi_grep_reducer_receipt_is_empty() {
+        return Err("non-row route contains a multi-grep reducer receipt".to_owned());
+    }
     let single_capture_reducer = authenticate_linked_single_capture_reducer_route(benchmark)?;
     let weighted_capture_reducer =
         authenticate_linked_weighted_capture_reducer_route(benchmark)?;
@@ -3777,6 +3939,72 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
     Ok(())
 }
 
+fn authenticate_native_multi_grep_reducer(
+    benchmark: &shared::Benchmark,
+    has_prepared_v15: bool,
+) -> Result<(), String> {
+    if !linked::NATIVE_MULTI_GREP_REDUCER {
+        return multi_grep_reducer_receipt_is_empty()
+            .then_some(())
+            .ok_or_else(|| {
+                "native-row adapter fallback contains a multi-grep reducer receipt".to_owned()
+            });
+    }
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "multi-grep runtime source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)?;
+    let operation_identity = expected_multi_grep_operation_identity(benchmark)?;
+    let artifact_identity = expected_multi_grep_artifact_identity(operation_identity)?;
+    let operation_identity_hex = hex(&operation_identity);
+    let symbol_identity = native_symbol_identity(
+        linked::MULTI_GREP_REDUCER_SYMBOL,
+        "fre_aot_regex_rebar_multi_grep_v1_",
+    );
+    let reducer_limit = shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(linked::ROW_TOTAL_OBJECT_BYTES)
+        .ok_or_else(|| "multi-grep linked object-byte remainder underflowed".to_owned())?;
+    let total_object_bytes = linked::ROW_TOTAL_OBJECT_BYTES
+        .checked_add(linked::MULTI_GREP_REDUCER_OBJECT_BYTES)
+        .ok_or_else(|| "multi-grep linked object-byte total overflowed".to_owned())?;
+    let final_digests = [
+        linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256,
+        linked::MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256,
+        linked::MULTI_GREP_REDUCER_CODE_SHA256,
+        linked::MULTI_GREP_REDUCER_OBJECT_SHA256,
+        linked::MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256,
+    ];
+    if benchmark.model != shared::Model::GrepCount
+        || benchmark.patterns.len() < 2
+        || has_prepared_v15
+        || linked::UNIFORM_CAPTURE_BRIDGE
+        || linked::STRICT_CAPTURE_BRIDGE
+        || linked::PARTICIPATION_CAPTURE_BRIDGE
+        || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+        || linked::MULTI_GREP_REDUCER_ABI_VERSION
+            != fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION
+        || linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY != benchmark.patterns.len()
+        || linked::MULTI_GREP_REDUCER_SOURCE_BYTES != source_bytes
+        || linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256 != ordered_sources_sha256
+        || linked::MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256 != operation_identity
+        || linked::MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256 != artifact_identity
+        || symbol_identity != Some(operation_identity_hex.as_str())
+        || linked::MULTI_GREP_REDUCER_RELOCATION_COUNT != linked::ROW_ARTIFACT_COUNT
+        || linked::MULTI_GREP_REDUCER_SEMANTIC_RUNTIME_CALLS != 0
+        || linked::MULTI_GREP_REDUCER_OBJECT_BYTES == 0
+        || linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES != reducer_limit
+        || linked::MULTI_GREP_REDUCER_OBJECT_BYTES
+            > linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES
+        || total_object_bytes > shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || final_digests.contains(&[0; 32])
+    {
+        return Err("linked native multi-grep reducer receipt is inconsistent".to_owned());
+    }
+    Ok(())
+}
+
 fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     const ROW_STRATEGY: &str = "native-independent-span-row-selector-v1";
     const MIXED_ROW_STRATEGY: &str = "native-independent-span-row-selector-mixed-prepared-v15-v1";
@@ -3789,6 +4017,10 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
     const MIXED_GREP_ROW_STRATEGY: &str =
         "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1";
+    const NATIVE_MULTI_GREP_STRATEGY: &str =
+        "native-independent-span-row-whole-grep-reducer-v1";
+    const LINKED_NATIVE_MULTI_GREP_STRATEGY: &str =
+        "linked-native-multi-grep-whole-operation-reducer-v1";
     const SELECTOR_FALLBACK_STRATEGY: &str =
         "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1";
     const GREP_SELECTOR_FALLBACK_STRATEGY: &str =
@@ -3860,6 +4092,7 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     let has_prepared_v15 = linked::ROW_REQUIRED_PREPARE_CAPABILITIES
         .iter()
         .any(|&capabilities| capabilities != 0);
+    authenticate_native_multi_grep_reducer(benchmark, has_prepared_v15)?;
     let expected_caps = PrepareV3Caps::for_required_capabilities(if has_prepared_v15 {
         PREPARE_CAPABILITY_ORDERED_NFA_V15
     } else {
@@ -3893,7 +4126,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden global prepared route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+    let expected_aggregate_strategy = if linked::NATIVE_MULTI_GREP_REDUCER {
+        NATIVE_MULTI_GREP_STRATEGY
+    } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
         WEIGHTED_CAPTURE_STRATEGY
     } else if linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE {
         SELECTOR_FALLBACK_STRATEGY
@@ -3923,7 +4158,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else {
         "not-applicable"
     };
-    let expected_grep_strategy = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE
+    let expected_grep_strategy = if linked::NATIVE_MULTI_GREP_REDUCER {
+        LINKED_NATIVE_MULTI_GREP_STRATEGY
+    } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE
         && benchmark.model == shared::Model::GrepCaptures
     {
         GREP_WEIGHTED_CAPTURE_STRATEGY
@@ -3951,7 +4188,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
     }
-    let expected_adapter = if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
+    let expected_adapter = if linked::NATIVE_MULTI_GREP_REDUCER {
+        "general-aot-native-multi-grep-whole-operation-reducer-v1"
+    } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
         match benchmark.model {
             shared::Model::CountCaptures => {
                 "general-aot-native-weighted-capture-count-reducer-v1"
@@ -4810,6 +5049,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::UNIFORM_CAPTURE_BRIDGE
+        || linked::NATIVE_MULTI_GREP_REDUCER
     {
         None
     } else {
@@ -4829,6 +5069,8 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
             strict_capture_reduce(benchmark.model, haystack, &mut capture_slots)
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
+        } else if linked::NATIVE_MULTI_GREP_REDUCER {
+            strict_linked_native_multi_grep_reduce(haystack)
         } else {
             strict_native_row_reduce(
                 benchmark.model,

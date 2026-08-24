@@ -278,7 +278,7 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                 .args([
                     "build",
                     "--offline",
-                    "--jobs=2",
+                    "--jobs=1",
                     "-p",
                     "fre-aot-rebar-runner",
                     "--bin",
@@ -336,13 +336,28 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                 .into());
             }
             let provenance = std::str::from_utf8(&provenance.stdout)?;
+            if model != Model::GrepCount {
+                for expected_field in [
+                    "schema=fre.aot.rebar-runner.v2",
+                    "shared_ordered_many=true",
+                    "source_pattern_count=5",
+                    "boundary=single-call-shared-ordered-many-helper-free-native-reducer",
+                ] {
+                    if !provenance.contains(expected_field) {
+                        return Err(format!(
+                            "shared ordered-many provenance omitted {expected_field:?}: {provenance}"
+                        )
+                        .into());
+                    }
+                }
+                continue;
+            }
             for expected_field in [
                 "schema=fre.aot.rebar-runner.v3",
                 "native_row_bridge=true",
                 "source_pattern_count=5",
                 "source_to_artifact=0,1,2,1,3",
                 "component_count=4",
-                "boundary=complete-native-row-bridge",
             ] {
                 if !provenance.contains(expected_field) {
                     return Err(format!(
@@ -351,14 +366,24 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                     .into());
                 }
             }
-            let expected_strategy = if model == Model::GrepCount {
-                "aggregate_strategy=per-line-native-independent-span-row-exists-v1"
-            } else {
-                "aggregate_strategy=native-independent-span-row-selector-v1"
-            };
-            if !provenance.contains(expected_strategy) {
+            let (expected_boundary, expected_strategy) = (
+                "boundary=single-call-helper-free-native-multi-grep-reducer",
+                "aggregate_strategy=native-independent-span-row-whole-grep-reducer-v1",
+            );
+            for expected_field in [expected_boundary, expected_strategy] {
+                if !provenance.contains(expected_field) {
+                    return Err(format!(
+                        "native-row provenance omitted {expected_field:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+            if !provenance.contains("native_multi_grep_reducer=true")
+                || !provenance.contains("multi_grep_reducer_relocation_count=4")
+                || !provenance.contains("multi_grep_reducer_semantic_runtime_calls=0")
+            {
                 return Err(format!(
-                    "native-row provenance omitted {expected_strategy:?}: {provenance}"
+                    "native multi-Grep provenance omitted its typed reducer receipt: {provenance}"
                 )
                 .into());
             }
