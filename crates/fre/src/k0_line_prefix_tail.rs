@@ -19,10 +19,6 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) const fn storage_bytes() -> usize {
-        core::mem::size_of::<Self>()
-    }
-
     #[inline]
     pub(crate) fn is_match_full(&self, haystack: &[u8]) -> bool {
         self.find_full(haystack).is_some()

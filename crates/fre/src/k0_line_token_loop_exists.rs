@@ -13,8 +13,6 @@
 //! order. Exhausting that span bound or otherwise declining fails open so the
 //! caller can replay canonical K0.
 
-use core::mem::size_of;
-
 use memchr::{memchr, memrchr};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
@@ -72,10 +70,6 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) const fn storage_bytes() -> usize {
-        size_of::<Self>()
-    }
-
     /// Attempt the complete ordinary full-input predicate.
     ///
     /// `None` is a source-shape refusal, never a negative answer. The caller
