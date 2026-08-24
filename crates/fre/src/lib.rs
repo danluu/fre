@@ -6710,8 +6710,6 @@ impl PortableBuilder {
     /// `Ok(None)` preserves the caller's configured-HIR fallback for every
     /// option, value or resource boundary outside this exact successful lane.
     #[doc(hidden)]
-    #[cold]
-    #[inline(never)]
     pub fn build_ripgrep_standard_literals(
         self,
         patterns: &[&str],
@@ -6733,8 +6731,6 @@ impl PortableBuilder {
         )
     }
 
-    #[cold]
-    #[inline(never)]
     fn build_ripgrep_standard_literal_bytes(
         self,
         patterns: &[&[u8]],
