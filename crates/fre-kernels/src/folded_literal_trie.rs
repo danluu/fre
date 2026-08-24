@@ -4242,6 +4242,20 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
                 })?;
         }
     }
+    base_build_requirements_from_dimensions(
+        patterns.len(),
+        scalar_positions,
+        equivalent_scalars,
+        max_pattern_scalars,
+    )
+}
+
+fn base_build_requirements_from_dimensions(
+    patterns: usize,
+    scalar_positions: usize,
+    equivalent_scalars: usize,
+    max_pattern_scalars: usize,
+) -> Result<BuildAccounting, BuildError> {
     let states_upper_bound =
         scalar_positions
             .checked_add(1)
@@ -4250,7 +4264,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             })?;
     let transitions_upper_bound = equivalent_scalars;
     let persistent_bytes_upper_bound =
-        exact_retained_bytes(states_upper_bound, transitions_upper_bound, patterns.len())?;
+        exact_retained_bytes(states_upper_bound, transitions_upper_bound, patterns)?;
     let pairwise_comparisons = checked_build_mul(
         equivalent_scalars,
         equivalent_scalars,
@@ -4273,8 +4287,8 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             )?)
             .and_then(|work| work.checked_add(scalar_positions))
             .and_then(|work| work.checked_add(states_upper_bound))
-            .and_then(|work| work.checked_add(patterns.len()))
-            .and_then(|work| work.checked_add(patterns.len()))
+            .and_then(|work| work.checked_add(patterns))
+            .and_then(|work| work.checked_add(patterns))
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "folded insertion work",
             })?;
@@ -4286,7 +4300,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             computation: "folded construction work",
         })?;
     Ok(BuildAccounting {
-        patterns: patterns.len(),
+        patterns,
         scalar_positions,
         equivalent_scalars,
         states_upper_bound,
@@ -4317,6 +4331,56 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         outputs: 0,
         allocations: 0,
     })
+}
+
+/// Return the complete conservative construction envelope from an already
+/// authenticated folded-literal census.
+///
+/// This performs checked arithmetic only and reads no class or pattern
+/// source. An integrating planner can therefore reserve the trie build before
+/// materializing borrowed [`FoldedScalarClass`] views or attempting a
+/// persistent allocation.
+///
+/// # Errors
+///
+/// Returns [`BuildError::ArithmeticOverflow`] if the supplied dimensions do
+/// not fit the construction envelope.
+pub fn build_requirements_from_dimensions(
+    patterns: usize,
+    scalar_positions: usize,
+    equivalent_scalars: usize,
+    max_pattern_scalars: usize,
+) -> Result<BuildAccounting, BuildError> {
+    let mut accounting = base_build_requirements_from_dimensions(
+        patterns,
+        scalar_positions,
+        equivalent_scalars,
+        max_pattern_scalars,
+    )?;
+    // A source-derived root selection admits at most one of these phases.
+    // Reserve their maximum so callers that cannot inspect the source can
+    // still pre-admit every strategy the constructor may select.
+    let successor_work = root_prefilter_successor_work_upper_bound(equivalent_scalars)?;
+    let fingerprint_work = root_prefilter_fingerprint_work_upper_bound(equivalent_scalars)?;
+    let fingerprint_work = if fingerprint_work <= ROOT_PREFILTER_FINGERPRINT_MAX_WORK {
+        fingerprint_work
+    } else {
+        0
+    };
+    let optional_work = successor_work.max(fingerprint_work);
+    accounting.root_prefilter_work_upper_bound = accounting
+        .root_prefilter_work_upper_bound
+        .checked_add(optional_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded optional root prefilter upper work",
+        })?;
+    accounting.work_upper_bound = accounting
+        .work_upper_bound
+        .checked_add(optional_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded optional root construction work",
+        })?;
+    Ok(accounting)
 }
 
 // This is the v5 base-column/classifier envelope. Successor work is admitted
@@ -6334,6 +6398,58 @@ mod tests {
         assert_ne!(build_probe::scalar_reads(), 0);
         assert_eq!(build_probe::successor_attempts(), 0);
         assert_eq!(build_probe::allocation_attempts(), 0);
+    }
+
+    #[test]
+    fn dimension_only_requirements_cover_every_optional_root_strategy() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let wide_classes = one_class(&FOUR);
+        let wide_patterns = [FoldedLiteral::new(&wide_classes)];
+        let wide_base = super::preflight_from_lengths(&wide_patterns).unwrap();
+        let wide_complete = super::build_requirements_from_dimensions(
+            wide_base.patterns,
+            wide_base.scalar_positions,
+            wide_base.equivalent_scalars,
+            wide_base.max_pattern_scalars,
+        )
+        .unwrap();
+        let wide_actual = admitted(&wide_patterns).build_accounting();
+        assert!(wide_complete.work_upper_bound >= wide_actual.work_upper_bound);
+        assert!(
+            wide_complete.root_prefilter_work_upper_bound
+                >= wide_actual.root_prefilter_work_upper_bound
+        );
+        assert_eq!(
+            wide_complete.persistent_bytes_upper_bound,
+            wide_base.persistent_bytes_upper_bound
+        );
+
+        const A: [char; 1] = ['a'];
+        const B: [char; 1] = ['b'];
+        let narrow_classes = [
+            FoldedScalarClass::new(&KELVIN),
+            FoldedScalarClass::new(&A),
+            FoldedScalarClass::new(&B),
+        ];
+        let narrow_patterns = [FoldedLiteral::new(&narrow_classes)];
+        let narrow_base = super::preflight_from_lengths(&narrow_patterns).unwrap();
+        let narrow_complete = super::build_requirements_from_dimensions(
+            narrow_base.patterns,
+            narrow_base.scalar_positions,
+            narrow_base.equivalent_scalars,
+            narrow_base.max_pattern_scalars,
+        )
+        .unwrap();
+        let narrow_actual = admitted(&narrow_patterns).build_accounting();
+        assert!(narrow_complete.work_upper_bound >= narrow_actual.work_upper_bound);
+        assert!(
+            narrow_complete.root_prefilter_work_upper_bound
+                >= narrow_actual.root_prefilter_work_upper_bound
+        );
+        assert_eq!(
+            narrow_complete.persistent_bytes_upper_bound,
+            narrow_base.persistent_bytes_upper_bound
+        );
     }
 
     #[test]

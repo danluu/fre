@@ -352,6 +352,7 @@ pub use folded_literal_trie::{
     ScanLimits as FoldedLiteralTrieScanLimits, ScanReceipt as FoldedLiteralTrieScanReceipt,
     ScanResource as FoldedLiteralTrieScanResource,
     ScanUpperBounds as FoldedLiteralTrieScanUpperBounds,
+    build_requirements_from_dimensions as folded_literal_trie_build_requirements_from_dimensions,
 };
 pub use forward_anchored::{
     ABSOLUTE_END_FIXED_PLAN_ID,
