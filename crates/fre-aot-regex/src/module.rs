@@ -71218,12 +71218,41 @@ mod tests {
             assert!(private_call > 0);
             assert_eq!(code.get(private_call - 1), Some(&0xe8));
             assert_eq!(frame_bytes % 16, 8);
-            assert!(code.windows(5).any(|window| {
-                window == [0x41, 0x80, 0x3c, 0x1c, 0x0a]
-            }));
+            let common_addressing_forms: &[&[u8]] = &[
+                &[0x48, 0x89, 0x5c, 0x24, 0x08], // [RSP+8] <- RBX line start
+                &[0x48, 0x8b, 0x6c, 0x24, 0x08], // RBP <- [RSP+8]
+                &[0x41, 0x80, 0x3c, 0x1c, 0x0a], // cmp byte [R12+RBX], LF
+                &[0x43, 0x80, 0x7c, 0x1c, 0xff, 0x0d], // cmp byte [R12+R11-1], CR
+                &[0x49, 0x8d, 0x3c, 0x2c],       // RDI <- R12+RBP
+                &[0x4c, 0x03, 0x3c, 0x24],       // R15 += [RSP]
+                &[0x4d, 0x89, 0x3e],             // [R14] <- R15
+            ];
+            for &form in common_addressing_forms {
+                assert!(
+                    code.windows(form.len()).any(|window| window == form),
+                    "missing x86 capture Grep addressing form {form:02x?}",
+                );
+            }
             assert!(!code.windows(5).any(|window| {
                 window == [0x43, 0x80, 0x3c, 0x1c, 0x0a]
             }));
+            let scratch_addressing_forms: &[&[u8]] = if caller_scratch_bytes == 0 {
+                &[&[0x48, 0x8d, 0x14, 0x24]] // RDX <- &count at [RSP]
+            } else {
+                &[
+                    &[0x48, 0x89, 0x54, 0x24, 0x10], // [RSP+16] <- RDX
+                    &[0x48, 0x89, 0x4c, 0x24, 0x18], // [RSP+24] <- RCX
+                    &[0x48, 0x8b, 0x54, 0x24, 0x10], // RDX <- [RSP+16]
+                    &[0x48, 0x8b, 0x4c, 0x24, 0x18], // RCX <- [RSP+24]
+                    &[0x4c, 0x8d, 0x04, 0x24],       // R8 <- &count at [RSP]
+                ]
+            };
+            for &form in scratch_addressing_forms {
+                assert!(
+                    code.windows(form.len()).any(|window| window == form),
+                    "missing x86 capture Grep scratch addressing form {form:02x?}",
+                );
+            }
         }
     }
 
