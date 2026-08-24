@@ -62,3 +62,42 @@ fn ordinary_line_prefix_tail_is_differential_and_cold_allocation_free() {
     assert!(exists_regex.is_match(&rejected_then_late));
     assert_eq!(cold.change(), Stats::default());
 }
+
+#[test]
+fn ordinary_class_plus_corridor_is_differential_and_cold_allocation_free() {
+    let pattern = r"(?-u:[a-z]+MID[0-9]+)";
+    let find_regex = PortableBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    let exists_regex = PortableBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    assert_eq!(find_regex.build_report().plan, PlanKind::K0);
+    assert_eq!(exists_regex.build_report().plan, PlanKind::K0);
+
+    let mut late = vec![b'!'; 4_093];
+    late.extend_from_slice(b"alphabeticMID12345");
+    let absent = vec![b'!'; 4_127];
+    let upstream = RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    let expected_late = upstream
+        .find(&late)
+        .map(|matched| (matched.start(), matched.end()));
+    assert_eq!(expected_late, Some((4_093, 4_111)));
+
+    let cold = Region::new(GLOBAL);
+    assert_eq!(
+        find_regex
+            .find(&late)
+            .map(|matched| (matched.start(), matched.end())),
+        expected_late,
+    );
+    assert_eq!(find_regex.find(&absent), None);
+    assert!(exists_regex.is_match(&late));
+    assert!(!exists_regex.is_match(&absent));
+    assert_eq!(cold.change(), Stats::default());
+}
