@@ -562,14 +562,12 @@ impl AotMatcher {
         if haystacks.is_empty() {
             return Ok(());
         }
-        if let [haystack] = haystacks {
-            matched[0] = self.is_match(haystack)?;
-            return Ok(());
-        }
 
         match &mut self.backend {
             Backend::Prepared(prepared) => {
-                if let Some(batch) = prepared.exists_batch {
+                if haystacks.len() > 1
+                    && let Some(batch) = prepared.exists_batch
+                {
                     return prepared_native_is_match_batch(
                         batch,
                         prepared.handle,
@@ -598,7 +596,9 @@ impl AotMatcher {
                 exists_batch,
                 ..
             } => {
-                if let Some(batch) = exists_batch {
+                if haystacks.len() > 1
+                    && let Some(batch) = exists_batch
+                {
                     return direct_native_is_match_batch(*batch, haystacks, matched);
                 }
                 for (haystack, matched) in haystacks.iter().zip(matched) {
@@ -1856,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn one_haystack_exists_batch_uses_the_scalar_entry() {
+    fn one_haystack_exists_batch_uses_the_backend_scalar_loop() {
         SINGLETON_EXISTS_SCALAR_CALLS.store(0, Ordering::Relaxed);
         SINGLETON_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
 
