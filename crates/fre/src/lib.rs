@@ -14882,6 +14882,9 @@ impl PortableRegex {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::NullableFiniteTokenRepeat(plan) => plan
+                .find_full_ordinary_value(haystack)
+                .map_err(SearchError::NullableOptionalChain),
             _ => self.find_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }

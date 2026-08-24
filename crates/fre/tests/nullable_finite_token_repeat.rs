@@ -47,6 +47,8 @@ fn enumerate_haystacks(alphabet: &[u8], maximum: usize, mut visit: impl FnMut(&[
 #[test]
 fn variable_tokens_prefix_sharing_and_ambiguity_match_upstream_and_k0() {
     let patterns = [
+        r"(?-u:(?:a|aa|ba){0,1}z)",
+        r"(?-u:(?:aa|a|ba){0,1}z)",
         r"(?-u:(?:a|aa|ba){0,3}z)",
         r"(?-u:(?:aa|a|ba){0,3}z)",
         r"(?-u:(?:a|aa|ba){0,3}?z)",
@@ -380,6 +382,7 @@ fn short_replay_only_changes_actual_scratch_at_the_exact_horizon_boundary() {
     let cases = [
         (16, 1, 17),
         (17, 1, 513),
+        (64, 1, 513),
         (64, 4, 513),
         (64, 8, 513),
     ];
@@ -446,6 +449,80 @@ fn short_replay_only_changes_actual_scratch_at_the_exact_horizon_boundary() {
             )) if needed == usize::from(accounting.scratch_bytes)
                 && limit == below.max_scratch_bytes
         ));
+    }
+}
+
+#[test]
+fn single_repetition_linear_token_matches_upstream_across_every_byte_mutation() {
+    let token = (0..64)
+        .map(|offset| char::from(b'a' + u8::try_from(offset % 25).unwrap()))
+        .collect::<String>();
+    let mut exact = b"!!".to_vec();
+    exact.extend_from_slice(token.as_bytes());
+    exact.extend_from_slice(b"zQ");
+    let mut haystacks = vec![b"zQ".to_vec(), b"!zQ".to_vec(), exact.clone()];
+    for offset in 0..token.len() {
+        for replacement in [b'!', b'z'] {
+            let mut mutated = exact.clone();
+            mutated[2 + offset] = replacement;
+            haystacks.push(mutated);
+        }
+    }
+
+    for pattern in [
+        format!(r"(?-u:(?:{token}){{0,1}}zQ)"),
+        format!(r"(?-u:(?:{token}){{0,1}}?zQ)"),
+    ] {
+        let regex = build_auto(&pattern);
+        let upstream = regex::bytes::RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID,
+        );
+
+        for haystack in &haystacks {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                span(regex.find(haystack)),
+                expected,
+                "pattern={pattern:?} haystack={haystack:?}",
+            );
+            let (accounted, accounting) = regex
+                .find_accounted(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                span(accounted),
+                expected,
+                "accounted pattern={pattern:?} haystack={haystack:?}",
+            );
+            let SearchAccounting::NullableOptionalChain(accounting) = accounting else {
+                panic!("expected nullable finite-token accounting");
+            };
+            assert_eq!(
+                usize::from(accounting.actual_scratch_bytes),
+                513 * core::mem::size_of::<u64>(),
+            );
+
+            for start in [0, 1, 2, haystack.len().saturating_sub(1), haystack.len()] {
+                let expected_at = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    span(
+                        regex
+                            .find_at_value(haystack, start, SearchLimits::unlimited())
+                            .unwrap(),
+                    ),
+                    expected_at,
+                    "pattern={pattern:?} haystack={haystack:?} start={start}",
+                );
+            }
+        }
     }
 }
 

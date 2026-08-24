@@ -248,6 +248,69 @@ impl Plan {
             .map(|(matched, _, _)| matched)
     }
 
+    /// Execute the ordinary full-input span projection. Shape dispatch is
+    /// deliberately deferred until after a tail hit so the common miss path
+    /// retains the incumbent work and branch structure.
+    pub(crate) fn find_full_ordinary_value(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<Match>, Error> {
+        let window = SearchWindow::full(haystack);
+        validate_window(haystack, window)?;
+        let upper = self.work_upper_bound(window)?;
+        enforce_work(upper, SearchLimits::unlimited())?;
+        enforce_scratch(REACHABILITY_SCRATCH_BYTES, SearchLimits::unlimited())?;
+        let mut actual = Actual::default();
+        let Some((tail_start, tail_end)) =
+            self.find_tail(haystack, window.start(), window.end(), &mut actual)?
+        else {
+            return Ok(None);
+        };
+        actual.candidate_visits = 1;
+        let start = if self.maximum_repetitions == 1 && self.token_count == 1 {
+            self.ordinary_single_token_start(haystack, tail_start)?
+        } else {
+            self.earliest_start_for_tail_dispatch(
+                haystack,
+                window.start(),
+                tail_start,
+                &mut actual,
+            )?
+        };
+        Ok(Some(Match {
+            start,
+            end: tail_end,
+        }))
+    }
+
+    #[inline(never)]
+    fn ordinary_single_token_start(
+        &self,
+        haystack: &[u8],
+        tail_start: usize,
+    ) -> Result<usize, Error> {
+        let token_bytes = usize::from(self.maximum_token_bytes);
+        let walk_limit = tail_start.min(token_bytes);
+        let edges = match self.edges.get(..walk_limit) {
+            Some(edges) => edges,
+            None => {
+                return Err(Error::InternalInvariant {
+                    detail: "finite-token linear trie escaped its edge pool",
+                });
+            }
+        };
+        for (offset, edge) in edges.iter().enumerate() {
+            if edge.byte != haystack[tail_start - offset - 1] {
+                return Ok(tail_start);
+            }
+        }
+        Ok(if walk_limit == token_bytes {
+            tail_start - token_bytes
+        } else {
+            tail_start
+        })
+    }
+
     fn first_tail(
         &self,
         haystack: &[u8],

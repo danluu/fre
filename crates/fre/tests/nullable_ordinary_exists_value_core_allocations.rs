@@ -22,6 +22,11 @@ fn ordinary_nullable_exists_and_finite_span_value_cores_allocate_nothing() {
         .build()
         .unwrap();
     let maximum_token = "a".repeat(64);
+    let single_pattern = format!(r"(?-u:(?:{maximum_token}){{0,1}}z)");
+    let single = PortableBuilder::new(&single_pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
     let maximum_pattern = format!(r"(?-u:(?:{maximum_token}){{0,8}}z)");
     let maximum = PortableBuilder::new(&maximum_pattern)
         .unicode(false)
@@ -39,6 +44,10 @@ fn ordinary_nullable_exists_and_finite_span_value_cores_allocate_nothing() {
         maximum.runtime_implementation_id(),
         NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID,
     );
+    assert_eq!(
+        single.runtime_implementation_id(),
+        NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID,
+    );
 
     let optional_hit = b"xxaacz--z";
     let finite_hit = b"xxaabaz--z";
@@ -47,6 +56,9 @@ fn ordinary_nullable_exists_and_finite_span_value_cores_allocate_nothing() {
         maximum_hit.extend_from_slice(maximum_token.as_bytes());
     }
     maximum_hit.push(b'z');
+    let mut single_hit = b"xx".to_vec();
+    single_hit.extend_from_slice(maximum_token.as_bytes());
+    single_hit.push(b'z');
     let miss = b"xxxxxxxx";
     assert!(optional.is_match(optional_hit));
     assert!(finite.is_match(finite_hit));
@@ -58,6 +70,7 @@ fn ordinary_nullable_exists_and_finite_span_value_cores_allocate_nothing() {
             .is_some()
     );
     assert!(maximum.find(&maximum_hit).is_some());
+    assert!(single.find(&single_hit).is_some());
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
@@ -81,6 +94,8 @@ fn ordinary_nullable_exists_and_finite_span_value_cores_allocate_nothing() {
         );
         assert!(maximum.find(&maximum_hit).is_some());
         assert!(maximum.find(miss).is_none());
+        assert!(single.find(&single_hit).is_some());
+        assert!(single.find(miss).is_none());
     }
     assert_eq!(measured.change(), Stats::default());
 }
