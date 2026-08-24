@@ -175,17 +175,19 @@ timing belongs to a separately named compiler-stage benchmark.
   pre-wrapper object into one composite proof identity. It then appends one
   Count/GrepCaptures wrapper to the full shared ordered-many Count portfolio.
   Only helper-free `NativeFused` or scalar-operation-only V15 closure is
-  published: no SpanFill, runtime helper, or Rust row loop remains. A typed
-  unequal-multiplier decline next retains the independently authenticated
-  ordinary Span rows and emits a separate helper-free weighted reducer. That
-  reducer resolves leftmost/first-source priority, checked-adds each winning
-  component's proved multiplier, and owns the whole CountCaptures or exact
-  LF/CRLF GrepCaptures traversal in one call. Its receipt closes the source
-  map, first ordinals, weights, component program/object hashes, reducer
-  identities, and exact PLT32/Branch26 component relocations. Only its fixed
-  numeric object-cap decline preserves the pre-existing Rust row adapter;
-  allocation, arithmetic, lowering, object, and authentication failures are
-  terminal.
+  published: no SpanFill, runtime helper, or Rust row loop remains. When all
+  sources still prove uniform participation, a typed shared-reducer decline
+  next retains the independently authenticated ordinary Span rows and emits a
+  separate helper-free weighted reducer. This covers unequal multipliers as
+  well as an equal-multiplier shared representation, native-data, or object
+  envelope decline. The reducer resolves leftmost/first-source priority,
+  checked-adds each winning component's proved multiplier, and owns the whole
+  CountCaptures or exact LF/CRLF GrepCaptures traversal in one call. Its
+  receipt closes the source map, first ordinals, equal or unequal weights,
+  component program/object hashes, reducer identities, and exact
+  PLT32/Branch26 component relocations. Only its fixed numeric object-cap
+  decline preserves the pre-existing Rust row adapter; allocation, arithmetic,
+  lowering, object, and authentication failures are terminal.
 - The final fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
@@ -453,10 +455,10 @@ the retained row. They are reported separately from capture-materializing
 engines and remain outside the strict wholly-native-operation numerator.
 The v6 weighted-capture record carries those same per-source proofs but closes
 them into one helper-free operation entry. It additionally seals source and
-component priority, unequal weights, the LF terminator, final reducer and
-artifact identities, fixed object cap, and every architecture-specific child
-call relocation; the census therefore admits that exact route to the strict
-whole-operation numerator.
+component priority, equal or unequal component weights, the LF terminator,
+final reducer and artifact identities, fixed object cap, and every
+architecture-specific child call relocation; the census therefore admits that
+exact route to the strict whole-operation numerator.
 The additive v4 strict-capture record instead binds the native `capture_next`,
 materializer, and selector symbols plus the source, selector, capture program,
 plan, bundle, object, and complete artifact identities. It reports

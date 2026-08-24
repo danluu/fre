@@ -3095,12 +3095,15 @@ pub fn compile_uniform_capture_bridge(
     }
 }
 
-/// Close the remaining unequal-multiplier bridge with one helper-free native
-/// reducer over its independently authenticated ordinary Span components.
+/// Close a retained multi-source uniform row bridge with one helper-free
+/// native reducer over its independently authenticated ordinary Span
+/// components.
 ///
-/// Allocation, arithmetic, lowering, object formation and authentication
-/// failures are terminal. Only the reducer object's exact numeric cap may
-/// preserve the existing Rust row bridge.
+/// This includes both unequal multipliers and equal-multiplier jobs whose
+/// preferred shared reducer declined its explicit representation or numeric
+/// envelope. Allocation, arithmetic, lowering, object formation and
+/// authentication failures are terminal. Only the reducer object's exact
+/// numeric cap may preserve the existing Rust row bridge.
 pub fn try_compile_weighted_capture_reducer_bridge(
     benchmark: &Benchmark,
     target: Target,
@@ -3121,21 +3124,6 @@ pub fn try_compile_weighted_capture_reducer_bridge(
         return Err("weighted capture reducer requires a multi-source ordinary uniform-capture bridge"
             .to_owned());
     }
-    let first_multiplier = bridge.source_receipts[0]
-        .participation()
-        .participating_groups_per_match();
-    if bridge.source_receipts.iter().all(|receipt| {
-        receipt
-            .participation()
-            .participating_groups_per_match()
-            == first_multiplier
-    }) {
-        return Err(
-            "weighted capture reducer requires the shared reducer's unequal-multiplier decline"
-                .to_owned(),
-        );
-    }
-
     let mut components = Vec::new();
     components
         .try_reserve_exact(bridge.rows.artifacts.len())
@@ -5795,6 +5783,60 @@ mod tests {
         assert_eq!(receipt.max_object_bytes(), MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES);
         assert_eq!(receipt.relocations().len(), 2);
         assert!(receipt.reducer_object_bytes() > 0);
+    }
+
+    #[test]
+    fn weighted_capture_reducer_accepts_equal_uniform_row_bridge() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, operation) in [
+            (
+                "count-captures",
+                UniformCaptureReducerOperation::CountCaptures,
+            ),
+            (
+                "grep-captures",
+                UniformCaptureReducerOperation::GrepCaptures,
+            ),
+        ] {
+            let mut klv = fixture(model, b"(a+)", b"aa\nbbb\nab");
+            let insertion = b"pattern:4:(a+)\npattern:4:(b+)\n";
+            let offset = klv
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            klv.splice(offset..offset, insertion.iter().copied());
+            let benchmark = Benchmark::parse(&klv).expect("equal capture fixture");
+            let bridge = compile_uniform_capture_bridge(&benchmark, target)
+                .expect("equal uniform capture bridge");
+            assert_eq!(bridge.rows.source_to_artifact, [0, 0, 1]);
+            assert_eq!(bridge.rows.artifacts.len(), 2);
+            assert!(bridge.source_receipts.iter().all(|receipt| {
+                receipt
+                    .participation()
+                    .participating_groups_per_match()
+                    .get()
+                    == 2
+            }));
+
+            let WeightedCaptureReducerBridgeDisposition::Compiled(weighted) =
+                try_compile_weighted_capture_reducer_bridge(&benchmark, target, &bridge)
+                    .expect("compile equal-weight capture reducer")
+            else {
+                panic!("small equal-weight wrapper must fit its explicit cap")
+            };
+            let receipt = weighted.artifact.receipt();
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.source_to_component(), [0, 0, 1]);
+            assert_eq!(receipt.component_first_source_ordinals(), [0, 2]);
+            assert_eq!(receipt.component_weights(), [2, 2]);
+            assert_eq!(receipt.relocations().len(), 2);
+            assert!(receipt.reducer_object_bytes() > 0);
+        }
     }
 
     #[test]

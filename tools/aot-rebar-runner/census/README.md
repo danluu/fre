@@ -81,7 +81,9 @@ symbols remain required defined-symbol inventory bound to the retained source
 receipt; they are not counted as additional operation entries.
 
 The v6 weighted-capture reducer likewise closes the complete operation after
-an unequal-multiplier shared-reducer decline. It calls each independently
+any typed shared-reducer decline that leaves a complete multi-source ordinary
+uniform bridge. This includes unequal multipliers and equal-multiplier shared
+representation or numeric-envelope declines. It calls each independently
 authenticated positive-width ordinary Span component inside one native
 leftmost/first-source reducer, applies the winning component's sealed capture
 weight with checked arithmetic, and owns either the whole haystack or the

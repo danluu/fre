@@ -215,15 +215,7 @@ fn main() {
             .expect("compile helper-free public Rebar uniform-capture bridge")
         {
             shared::UniformCaptureBridgeDisposition::Proven(bridge) => {
-                let unequal_multipliers = bridge.source_receipts.windows(2).any(|pair| {
-                    pair[0]
-                        .participation()
-                        .participating_groups_per_match()
-                        != pair[1]
-                            .participation()
-                            .participating_groups_per_match()
-                });
-                let weighted = if unequal_multipliers {
+                let weighted = if benchmark.patterns.len() > 1 {
                     match shared::try_compile_weighted_capture_reducer_bridge(
                         &benchmark,
                         target,
