@@ -58,7 +58,7 @@ type NativeIterState = FreAotRegexIterStateV1;
 ///     AotHaystack::from(bytes.as_slice())
 /// }
 /// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct AotHaystack<'a> {
     abi: AbiHaystack,
