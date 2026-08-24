@@ -1774,6 +1774,7 @@ fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
     };
     let count = exports.contains(PreparedAggregateExports::COUNT);
     let span_sum = exports.contains(PreparedAggregateExports::SPAN_SUM);
+    let grep_count = exports.contains(PreparedAggregateExports::GREP_COUNT);
     let symbols = [
         Some(module.entry_symbol()),
         Some(prepared_entry),
@@ -1782,6 +1783,9 @@ fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
         span_sum
             .then(|| module.prepared_span_sum_symbol())
             .flatten(),
+        grep_count
+            .then(|| module.prepared_grep_count_symbol())
+            .flatten(),
         Some(program),
     ];
     let symbols_are_distinct = symbols.iter().enumerate().all(|(index, symbol)| match symbol {
@@ -1789,7 +1793,11 @@ fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
             .iter()
             .flatten()
             .all(|other| other != symbol),
-        None => (!count && index == 3) || (!span_sum && index == 4),
+        None => {
+            (!count && index == 3)
+                || (!span_sum && index == 4)
+                || (!grep_count && index == 5)
+        }
     });
     receipt.output == OutputContract::Span
         && receipt.entry_abi == EntryAbi::SpanSearchV1
@@ -1804,7 +1812,6 @@ fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
             == Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
         && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
         && module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
-        && module.prepared_grep_count_symbol().is_none()
         && program_len != 0
         && exact_ordered_nfa_v15_runtime_symbol_closure(compiled, exports)
         && defined_global_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
@@ -1814,6 +1821,9 @@ fn ordinary_native_ordered_nfa_v15_compatibility_is_authenticated(
             defined_global_symbol(compiled, symbol, SymbolKind::Function, None)
         })
         && module.prepared_span_sum_symbol().is_none_or(|symbol| {
+            defined_global_symbol(compiled, symbol, SymbolKind::Function, None)
+        })
+        && module.prepared_grep_count_symbol().is_none_or(|symbol| {
             defined_global_symbol(compiled, symbol, SymbolKind::Function, None)
         })
         && defined_global_symbol(compiled, program, SymbolKind::Object, Some(program_len))
