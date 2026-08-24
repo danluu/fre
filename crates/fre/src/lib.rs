@@ -11193,6 +11193,7 @@ impl K0ExclusivePlan {
         }
     }
 
+    #[cfg(test)]
     fn line_token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::LineTokenLoop(plan) => Some(plan),
