@@ -7,10 +7,11 @@
 //! next required atom, and every branch ends in a fixed positive atom. The
 //! resulting token stream has one forward parse.
 //!
-//! Predicate execution seeks only the first potential terminal. Span
-//! execution may continue through a small bounded number of later terminal
-//! candidates, in source order. Exhausting that bound or otherwise declining
-//! fails open so the caller can replay canonical K0.
+//! Predicate execution seeks the first potential terminal directly, then can
+//! continue exactly by remaining line ends. Span execution may continue
+//! through a small bounded number of later terminal candidates, in source
+//! order. Exhausting that span bound or otherwise declining fails open so the
+//! caller can replay canonical K0.
 
 use core::mem::size_of;
 
@@ -98,7 +99,7 @@ impl Plan {
                                     || (candidate_end != haystack.len()
                                         && haystack[candidate_end] != b'\n')
                                 {
-                                    None
+                                    self.try_later_exists_by_line_end(haystack)
                                 } else {
                                     self.try_authenticated_candidate(haystack, candidate)
                                 }
@@ -111,6 +112,47 @@ impl Plan {
         #[cfg(test)]
         route_probe::record(output);
         output
+    }
+
+    /// Continue by candidate-bearing lines after the predicate's first
+    /// terminal candidate is rejected. A line can match only when its terminal
+    /// is its suffix, so each such line is authenticated at most once. Lines
+    /// without the terminal lead byte are skipped in one forward scan. This
+    /// never needs a candidate cap or partial work followed by canonical replay.
+    #[inline(never)]
+    fn try_later_exists_by_line_end(&self, haystack: &[u8]) -> Option<bool> {
+        let terminal = &self.terminal[..usize::from(self.terminal_len)];
+        let last_start = haystack.len().checked_sub(terminal.len())?;
+        let first_candidate = memchr(terminal[0], &haystack[..=last_start])?;
+        let mut line_search_start = 0_usize;
+        let mut candidate = first_candidate;
+        loop {
+            let line_start = match memrchr(b'\n', &haystack[line_search_start..candidate]) {
+                Some(relative) => line_search_start.checked_add(relative)?.checked_add(1)?,
+                None => line_search_start,
+            };
+            let after_candidate = candidate.checked_add(1)?;
+            let line_end = match memchr(b'\n', &haystack[after_candidate..]) {
+                Some(relative) => after_candidate.checked_add(relative)?,
+                None => haystack.len(),
+            };
+            if let Some(suffix_start) = line_end.checked_sub(terminal.len())
+                && suffix_start > first_candidate
+                && suffix_start >= line_start
+                && &haystack[suffix_start..line_end] == terminal
+                && self.matches_body(&haystack[line_start..suffix_start])
+            {
+                return Some(true);
+            }
+            if line_end == haystack.len() {
+                return Some(false);
+            }
+            line_search_start = line_end.checked_add(1)?;
+            let Some(relative) = memchr(terminal[0], &haystack[line_search_start..]) else {
+                return Some(false);
+            };
+            candidate = line_search_start.checked_add(relative)?;
+        }
     }
 
     /// Attempt the complete ordinary full-input leftmost-first span.
@@ -204,8 +246,11 @@ impl Plan {
         let line_start = memrchr(b'\n', &haystack[..candidate])
             .and_then(|delimiter| delimiter.checked_add(1))
             .unwrap_or(0);
-        self.matches_body(&haystack[line_start..candidate])
-            .then_some(true)
+        if self.matches_body(&haystack[line_start..candidate]) {
+            Some(true)
+        } else {
+            self.try_later_exists_by_line_end(haystack)
+        }
     }
 
     #[inline(never)]
@@ -242,6 +287,7 @@ impl Plan {
         tokens > 0
     }
 
+    #[inline(always)]
     fn matches_body(&self, body: &[u8]) -> bool {
         let mut position = 0_usize;
         let mut tokens = 0_usize;
@@ -780,7 +826,7 @@ mod tests {
         let expected = oracle
             .find(&source)
             .map(|matched| (matched.start(), matched.end()));
-        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_is_match_full(&source), Some(expected.is_some()));
         assert_eq!(plan.try_find_full(&source), Some(expected));
 
         let first_valid = source
@@ -795,7 +841,7 @@ mod tests {
         let expected = oracle
             .find(&source)
             .map(|matched| (matched.start(), matched.end()));
-        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_is_match_full(&source), Some(expected.is_some()));
         assert_eq!(plan.try_find_full(&source), Some(expected));
     }
 
@@ -814,12 +860,12 @@ mod tests {
             .map(|matched| (matched.start(), matched.end()));
 
         assert!(expected.is_some());
-        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_is_match_full(&source), Some(true));
         assert_eq!(plan.try_find_full(&source), Some(expected));
     }
 
     #[test]
-    fn later_candidate_cap_returns_exact_spans_or_fails_open() {
+    fn predicate_remains_exact_across_the_span_candidate_cap() {
         let pattern = r"(?m)^(?:ab+c|de?f)+Z$";
         let plan = plan(pattern);
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -839,25 +885,69 @@ mod tests {
             source
         };
 
-        let at_cap = source(super::MAX_LATER_FIND_CANDIDATES);
-        let expected = oracle
-            .find(&at_cap)
-            .map(|matched| (matched.start(), matched.end()));
-        assert!(expected.is_some());
-        assert_eq!(plan.try_find_full(&at_cap), Some(expected));
+        for rejected_lines in 1..=super::MAX_LATER_FIND_CANDIDATES {
+            let admitted = source(rejected_lines);
+            let expected = oracle
+                .find(&admitted)
+                .map(|matched| (matched.start(), matched.end()));
+            assert!(expected.is_some());
+            assert_eq!(plan.try_is_match_full(&admitted), Some(true));
+            assert_eq!(plan.try_find_full(&admitted), Some(expected));
+            super::route_probe::reset();
+            assert!(regex.is_match(&admitted));
+            assert_eq!(
+                super::route_probe::snapshot(),
+                super::route_probe::Counts {
+                    attempts: 1,
+                    completed: 1,
+                    declined: 0,
+                },
+            );
+        }
 
-        let beyond_cap = source(super::MAX_LATER_FIND_CANDIDATES + 1);
-        let expected = oracle
-            .find(&beyond_cap)
-            .map(|matched| (matched.start(), matched.end()));
-        assert!(expected.is_some());
-        assert_eq!(plan.try_find_full(&beyond_cap), None);
-        assert_eq!(
-            regex
+        for rejected_lines in [
+            super::MAX_LATER_FIND_CANDIDATES + 1,
+            super::MAX_LATER_FIND_CANDIDATES * 8 + 1,
+        ] {
+            let beyond_cap = source(rejected_lines);
+            let expected = oracle
                 .find(&beyond_cap)
-                .map(|matched| (matched.start(), matched.end())),
-            expected,
-        );
+                .map(|matched| (matched.start(), matched.end()));
+            assert!(expected.is_some());
+            assert_eq!(plan.try_is_match_full(&beyond_cap), Some(true));
+            assert_eq!(plan.try_find_full(&beyond_cap), None);
+            super::route_probe::reset();
+            assert!(regex.is_match(&beyond_cap));
+            assert_eq!(
+                super::route_probe::snapshot(),
+                super::route_probe::Counts {
+                    attempts: 1,
+                    completed: 1,
+                    declined: 0,
+                },
+            );
+            assert_eq!(
+                regex
+                    .find(&beyond_cap)
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+        }
+
+        for rejected_lines in [
+            super::MAX_LATER_FIND_CANDIDATES,
+            super::MAX_LATER_FIND_CANDIDATES + 1,
+            super::MAX_LATER_FIND_CANDIDATES * 8 + 1,
+        ] {
+            let mut rejected_only = vec![b'q'; 1_024];
+            for _ in 0..rejected_lines {
+                rejected_only.extend_from_slice(b"\nabZ");
+            }
+            rejected_only.push(b'\n');
+            assert!(!oracle.is_match(&rejected_only));
+            assert_eq!(plan.try_is_match_full(&rejected_only), Some(false));
+            assert_eq!(plan.try_find_full(&rejected_only), None);
+        }
     }
 
     #[test]
@@ -884,6 +974,13 @@ mod tests {
                 let expected = oracle
                     .find(&source)
                     .map(|matched| (matched.start(), matched.end()));
+                if let Some(actual) = plan.try_is_match_full(&source) {
+                    assert_eq!(
+                        actual,
+                        expected.is_some(),
+                        "predicate position={position}, byte={byte:#04X}",
+                    );
+                }
                 let planned = plan.try_find_full(&source);
                 if expected.is_some() {
                     assert_eq!(
@@ -894,6 +991,11 @@ mod tests {
                 } else if let Some(actual) = planned {
                     assert_eq!(actual, expected, "position={position}, byte={byte:#04X}",);
                 }
+                assert_eq!(
+                    regex.is_match(&source),
+                    expected.is_some(),
+                    "predicate position={position}, byte={byte:#04X}",
+                );
                 assert_eq!(
                     regex
                         .find(&source)
@@ -915,7 +1017,7 @@ mod tests {
         assert_eq!(plan.try_find_full(&source), Some(Some((0, 1_024))));
 
         source[0] = b'q';
-        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_is_match_full(&source), Some(false));
         assert_eq!(plan.try_find_full(&source), None);
     }
 
@@ -939,23 +1041,72 @@ mod tests {
         assert_eq!(source[1_015], 0xFF);
         source[1_015] = 0x80;
         assert!(!oracle.is_match(&source));
-        assert_eq!(plan.try_is_match_full(&source), None);
+        assert_eq!(plan.try_is_match_full(&source), Some(false));
         assert_eq!(plan.try_find_full(&source), None);
+
+        let mut rejected_then_late = vec![0x80; 1_024];
+        rejected_then_late.extend_from_slice(&[
+            b'\n', 0xFF, b'q', 0xFD, b'\n', 0xFF, b'a', b'q', 0xFD, b'\n',
+        ]);
+        assert!(oracle.is_match(&rejected_then_late));
+        assert_eq!(plan.try_is_match_full(&rejected_then_late), Some(true));
+        let address = rejected_then_late.as_ptr();
+        rejected_then_late[1_029] = 0x80;
+        assert_eq!(rejected_then_late.as_ptr(), address);
+        assert!(!oracle.is_match(&rejected_then_late));
+        assert_eq!(plan.try_is_match_full(&rejected_then_late), Some(false));
+        rejected_then_late[1_029] = 0xFF;
+        assert_eq!(rejected_then_late.as_ptr(), address);
+        assert!(oracle.is_match(&rejected_then_late));
+        assert_eq!(plan.try_is_match_full(&rejected_then_late), Some(true));
     }
 
     #[test]
-    fn dense_terminal_candidates_and_short_inputs_decline_fail_open() {
+    fn dense_terminal_candidates_are_exact_and_short_inputs_decline() {
         let plan = plan(r"(?m)^(?:ab+c|de?f)+Z$");
         assert_eq!(plan.try_is_match_full(&vec![b'Z'; 256]), None);
         assert_eq!(plan.try_is_match_full(b"abbbcZ\n"), None);
         assert_eq!(plan.try_is_match_full(&vec![b'q'; 1_023]), None);
-        assert_eq!(plan.try_is_match_full(&vec![b'Z'; 1_024]), None);
+        assert_eq!(plan.try_is_match_full(&vec![b'Z'; 1_024]), Some(false));
         assert_eq!(plan.try_is_match_full(&vec![b'q'; 1_024]), Some(false));
         assert_eq!(plan.try_find_full(&vec![b'Z'; 256]), None);
         assert_eq!(plan.try_find_full(b"abbbcZ\n"), None);
         assert_eq!(plan.try_find_full(&vec![b'q'; 1_023]), None);
         assert_eq!(plan.try_find_full(&vec![b'Z'; 1_024]), None);
         assert_eq!(plan.try_find_full(&vec![b'q'; 1_024]), Some(None));
+    }
+
+    #[test]
+    fn dense_inline_terminals_scan_each_line_once() {
+        let pattern = r"(?m)^(?:Za|bc)+Z$";
+        let dense_plan = plan(pattern);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        let mut same_line = b"Za".repeat(512);
+        same_line.push(b'Z');
+        assert_eq!(same_line.len(), 1_025);
+        assert!(oracle.is_match(&same_line));
+        assert_eq!(dense_plan.try_is_match_full(&same_line), Some(true));
+
+        let address = same_line.as_ptr();
+        *same_line.last_mut().unwrap() = b'Q';
+        assert_eq!(same_line.as_ptr(), address);
+        assert!(!oracle.is_match(&same_line));
+        assert_eq!(dense_plan.try_is_match_full(&same_line), Some(false));
+
+        let mut many_rejected_lines = vec![b'q'; 1_024];
+        for _ in 0..64 {
+            many_rejected_lines.extend_from_slice(b"\nabZ");
+        }
+        many_rejected_lines.push(b'\n');
+        let ordinary = plan(r"(?m)^(?:ab+c|de?f)+Z$");
+        assert_eq!(
+            ordinary.try_is_match_full(&many_rejected_lines),
+            Some(false)
+        );
     }
 
     #[test]
@@ -980,6 +1131,7 @@ mod tests {
             .find(&source)
             .map(|matched| (matched.start(), matched.end()));
         assert_eq!(expected, Some((1_025, 1_035)));
+        assert_eq!(plan.try_is_match_full(&source), Some(true));
         assert_eq!(plan.try_find_full(&source), Some(expected));
     }
 
@@ -1108,7 +1260,10 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(complete.is_match(&dense), oracle.is_match(&dense));
-        assert_eq!(super::route_probe::snapshot(), super::route_probe::Counts::default());
+        assert_eq!(
+            super::route_probe::snapshot(),
+            super::route_probe::Counts::default()
+        );
 
         let admitted_dense = vec![b'Z'; 1_024];
         assert_eq!(
@@ -1119,10 +1274,10 @@ mod tests {
             super::route_probe::snapshot(),
             super::route_probe::Counts {
                 attempts: 1,
-                completed: 0,
-                declined: 1,
+                completed: 1,
+                declined: 0,
             },
-            "an admitted dense ordinary source must replay canonical K0",
+            "an admitted dense ordinary predicate is completed by line ends",
         );
     }
 }
