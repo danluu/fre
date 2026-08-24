@@ -2,6 +2,7 @@
 
 #![warn(unsafe_code)]
 
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 use fre_aot_regex::{MatchResult, SearchWindow};
@@ -36,6 +37,64 @@ pub enum AotOutput {
 type AbiResult = FreAotRegexResultV1;
 type AbiHaystack = FreAotRegexHaystackV1;
 type NativeIterState = FreAotRegexIterStateV1;
+
+/// A reusable, lifetime-bound view of one haystack for batched AOT searches.
+///
+/// Constructing this view records the native batch ABI's pointer and length
+/// once. Passing a slice of views to [`AotMatcher::is_match_descriptor_batch`]
+/// lets a compiled batch entry consume those descriptors directly, without
+/// the adapter copying a slice of Rust fat pointers into an intermediate
+/// descriptor array on every call. The referenced bytes remain borrowed for
+/// the complete lifetime of the view.
+///
+/// The fields are private so safe code cannot forge an invalid pointer/length
+/// pair. Use [`AotHaystack::from`] (or `slice.into()`) to construct a view.
+///
+/// ```compile_fail
+/// use fre_ripgrep_aot_thin::AotHaystack;
+///
+/// fn dangling<'a>() -> AotHaystack<'a> {
+///     let bytes = vec![b'x'];
+///     AotHaystack::from(bytes.as_slice())
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct AotHaystack<'a> {
+    abi: AbiHaystack,
+    lifetime: PhantomData<&'a [u8]>,
+}
+
+impl<'a> From<&'a [u8]> for AotHaystack<'a> {
+    fn from(haystack: &'a [u8]) -> Self {
+        Self {
+            abi: AbiHaystack {
+                ptr: haystack.as_ptr(),
+                len: haystack.len(),
+            },
+            lifetime: PhantomData,
+        }
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for AotHaystack<'a> {
+    fn from(haystack: &'a [u8; N]) -> Self {
+        Self::from(haystack.as_slice())
+    }
+}
+
+impl AotHaystack<'_> {
+    #[allow(
+        unsafe_code,
+        reason = "the private descriptor can only be constructed from a live shared byte slice"
+    )]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the private fields were obtained from a shared slice, and
+        // the phantom lifetime prevents this view from outliving that slice.
+        // Copying the view cannot mutate or extend the referenced storage.
+        unsafe { std::slice::from_raw_parts(self.abi.ptr, self.abi.len) }
+    }
+}
 
 type NativeSearch = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut AbiResult) -> u32;
 type NativeExistsBatch = FreAotRegexIndependentExistsBatchV1;
@@ -546,37 +605,104 @@ impl AotMatcher {
     ///
     /// Returns an error for an output-contract mismatch, unequal input/output
     /// lengths, an oversized batch, or any execution/ABI failure.
+    #[allow(
+        unsafe_code,
+        reason = "the initialized prefix of the bounded stack descriptor array is tracked exactly"
+    )]
     pub fn is_match_batch(
         &mut self,
         haystacks: &[&[u8]],
         matched: &mut [bool],
     ) -> Result<(), String> {
-        if self.output != AotOutput::Exists {
-            return Err("AOT matcher was not compiled for Exists".to_owned());
-        }
-        if haystacks.len() != matched.len() {
-            return Err(format!(
-                "AOT Exists batch input/output length mismatch: {} != {}",
-                haystacks.len(),
-                matched.len()
-            ));
-        }
-        if haystacks.len() > EXISTS_BATCH_CAPACITY {
-            return Err(format!(
-                "AOT Exists batch length {} exceeds capacity {EXISTS_BATCH_CAPACITY}",
-                haystacks.len()
-            ));
-        }
+        self.validate_exists_batch_request(haystacks.len(), matched.len())?;
         if haystacks.is_empty() {
             return Ok(());
         }
 
+        let mut descriptors =
+            [const { MaybeUninit::<AotHaystack<'_>>::uninit() }; EXISTS_BATCH_CAPACITY];
+        for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
+            descriptor.write(AotHaystack::from(*haystack));
+        }
+        // SAFETY: the loop initialized exactly the prefix selected here. Each
+        // view borrows its corresponding input slice, and the private dispatch
+        // retains neither descriptors nor byte pointers after it returns.
+        let descriptors = unsafe {
+            std::slice::from_raw_parts(
+                descriptors.as_ptr().cast::<AotHaystack<'_>>(),
+                haystacks.len(),
+            )
+        };
+        self.is_match_descriptor_batch_validated(descriptors, matched)
+    }
+
+    /// Search reusable haystack descriptors without an adapter-side copy.
+    ///
+    /// A caller that batches the same line buffers across matchers or repeated
+    /// searches can construct [`AotHaystack`] values once and reuse them.
+    /// Compiled prepared and self-contained direct batch entries read this
+    /// descriptor slice in place. Scalar and portable compatibility routes
+    /// retain identical matching behavior by reading the lifetime-bound byte
+    /// slices represented by each descriptor.
+    ///
+    /// A one-haystack request continues to use the scalar entry. Empty batches
+    /// are accepted and leave the output unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an output-contract mismatch, unequal input/output
+    /// lengths, an oversized batch, or any execution/ABI failure. If a native
+    /// batch reports an error after publishing a valid prefix, that prefix is
+    /// retained in `matched` and the remaining output elements are unchanged.
+    pub fn is_match_descriptor_batch(
+        &mut self,
+        haystacks: &[AotHaystack<'_>],
+        matched: &mut [bool],
+    ) -> Result<(), String> {
+        self.validate_exists_batch_request(haystacks.len(), matched.len())?;
+        if haystacks.is_empty() {
+            return Ok(());
+        }
+        self.is_match_descriptor_batch_validated(haystacks, matched)
+    }
+
+    fn validate_exists_batch_request(
+        &self,
+        haystack_len: usize,
+        matched_len: usize,
+    ) -> Result<(), String> {
+        if self.output != AotOutput::Exists {
+            return Err("AOT matcher was not compiled for Exists".to_owned());
+        }
+        if haystack_len != matched_len {
+            return Err(format!(
+                "AOT Exists batch input/output length mismatch: {} != {}",
+                haystack_len, matched_len
+            ));
+        }
+        if haystack_len > EXISTS_BATCH_CAPACITY {
+            return Err(format!(
+                "AOT Exists batch length {} exceeds capacity {EXISTS_BATCH_CAPACITY}",
+                haystack_len
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_match_descriptor_batch_validated(
+        &mut self,
+        haystacks: &[AotHaystack<'_>],
+        matched: &mut [bool],
+    ) -> Result<(), String> {
+        debug_assert_eq!(haystacks.len(), matched.len());
+        debug_assert!(!haystacks.is_empty());
+        debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
         match &mut self.backend {
             Backend::Prepared(prepared) => {
                 if haystacks.len() > 1
                     && let Some(batch) = prepared.exists_batch
                 {
-                    return prepared_native_is_match_batch(
+                    return prepared_native_is_match_descriptor_batch(
                         batch,
                         prepared.handle,
                         haystacks,
@@ -584,6 +710,7 @@ impl AotMatcher {
                     );
                 }
                 for (haystack, matched) in haystacks.iter().zip(matched) {
+                    let haystack = haystack.as_slice();
                     *matched = match prepared_native_search(
                         prepared.search,
                         prepared.handle,
@@ -607,9 +734,10 @@ impl AotMatcher {
                 if haystacks.len() > 1
                     && let Some(batch) = exists_batch
                 {
-                    return direct_native_is_match_batch(*batch, haystacks, matched);
+                    return direct_native_is_match_descriptor_batch(*batch, haystacks, matched);
                 }
                 for (haystack, matched) in haystacks.iter().zip(matched) {
+                    let haystack = haystack.as_slice();
                     *matched = match native_search(*search, AotOutput::Exists, haystack, 0)? {
                         MatchResult::Exists(found) => found,
                         _ => {
@@ -621,6 +749,7 @@ impl AotMatcher {
             }
             Backend::Runtime(prepared) => {
                 for (haystack, matched) in haystacks.iter().zip(matched) {
+                    let haystack = haystack.as_slice();
                     *matched = match prepared
                         .search(haystack, SearchWindow::new(0, haystack.len()))
                         .map_err(|error| format!("prepared AOT search: {error}"))?
@@ -979,33 +1108,24 @@ fn prepared_native_search(
     unsafe_code,
     reason = "single checked call boundary for a compiler-produced direct Exists-batch entry"
 )]
-fn direct_native_is_match_batch(
+fn direct_native_is_match_descriptor_batch(
     batch: NativeExistsBatch,
-    haystacks: &[&[u8]],
+    haystacks: &[AotHaystack<'_>],
     matched: &mut [bool],
 ) -> Result<(), String> {
     debug_assert_eq!(haystacks.len(), matched.len());
     debug_assert!(!haystacks.is_empty());
     debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
 
-    let mut descriptors =
-        [const { MaybeUninit::<AbiHaystack>::uninit() }; EXISTS_BATCH_CAPACITY];
-    for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
-        descriptor.write(AbiHaystack {
-            ptr: haystack.as_ptr(),
-            len: haystack.len(),
-        });
-    }
     let mut processed = 0;
-    // SAFETY: `zip` initialized exactly the first `count` descriptors and
-    // every one names a live readable slice. The batch ABI reads only that
-    // prefix and retains no pointer, so the uninitialized capacity tail is
-    // unobservable. This compiler-produced entry writes only the valid Boolean
-    // representations 0 and 1 to the live output prefix; the untouched tail
-    // remains initialized by the safe caller.
+    // SAFETY: `AotHaystack` is transparent over `AbiHaystack`; its private
+    // constructor and lifetime guarantee every descriptor names a live
+    // readable slice. The batch ABI retains no pointer. This compiler-produced
+    // entry writes only the valid Boolean representations 0 and 1 to the live
+    // output prefix; the untouched tail remains initialized by the safe caller.
     let status = unsafe {
         batch(
-            descriptors.as_ptr().cast::<AbiHaystack>(),
+            haystacks.as_ptr().cast::<AbiHaystack>(),
             haystacks.len(),
             matched.as_mut_ptr().cast::<u8>(),
             &raw mut processed,
@@ -1036,36 +1156,27 @@ fn direct_native_is_match_batch(
     unsafe_code,
     reason = "single checked call boundary for a compiler-produced prepared Exists-batch entry"
 )]
-fn prepared_native_is_match_batch(
+fn prepared_native_is_match_descriptor_batch(
     batch: PreparedExistsBatch,
     handle: FreAotRegexExclusiveHandleV1,
-    haystacks: &[&[u8]],
+    haystacks: &[AotHaystack<'_>],
     matched: &mut [bool],
 ) -> Result<(), String> {
     debug_assert_eq!(haystacks.len(), matched.len());
     debug_assert!(!haystacks.is_empty());
     debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
 
-    let mut descriptors =
-        [const { MaybeUninit::<AbiHaystack>::uninit() }; EXISTS_BATCH_CAPACITY];
-    for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
-        descriptor.write(AbiHaystack {
-            ptr: haystack.as_ptr(),
-            len: haystack.len(),
-        });
-    }
     let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
     let mut processed = 0;
-    // SAFETY: `PreparedNative` exclusively owns `handle`; `zip` initialized
-    // exactly the first `count` descriptors and every one names a live
-    // readable slice. The batch ABI reads only that prefix and retains no
-    // pointer, so the uninitialized capacity tail is unobservable. `encoded`
-    // has `count` writable bytes, and the generated entry initializes exactly
-    // the prefix it publishes through `processed`.
+    // SAFETY: `PreparedNative` exclusively owns `handle`. `AotHaystack` is
+    // transparent over `AbiHaystack`; its private constructor and lifetime
+    // guarantee every descriptor names a live readable slice. The batch ABI
+    // retains no pointer. `encoded` has `count` writable bytes, and the
+    // generated entry initializes exactly the prefix published in `processed`.
     let status = unsafe {
         batch(
             handle,
-            descriptors.as_ptr().cast::<AbiHaystack>(),
+            haystacks.as_ptr().cast::<AbiHaystack>(),
             haystacks.len(),
             encoded.as_mut_ptr(),
             &raw mut processed,
@@ -1843,6 +1954,113 @@ mod tests {
                 .contains("inconsistent final span/state")
         );
         assert!(iteration.next().is_none());
+    }
+
+    #[test]
+    fn aot_haystack_is_an_exact_lifetime_bound_abi_view() {
+        assert_eq!(
+            std::mem::size_of::<AotHaystack<'_>>(),
+            std::mem::size_of::<AbiHaystack>()
+        );
+        assert_eq!(
+            std::mem::align_of::<AotHaystack<'_>>(),
+            std::mem::align_of::<AbiHaystack>()
+        );
+
+        let bytes = [0x00, 0x7f, 0xff];
+        let descriptor = AotHaystack::from(bytes.as_slice());
+        assert_eq!(descriptor.abi.ptr, bytes.as_ptr());
+        assert_eq!(descriptor.abi.len, bytes.len());
+        assert_eq!(descriptor.as_slice(), bytes);
+
+        let empty = AotHaystack::from([].as_slice());
+        assert_eq!(empty.abi.len, 0);
+        assert!(empty.as_slice().is_empty());
+    }
+
+    #[test]
+    fn descriptor_batch_accepts_empty_and_rejects_invalid_lengths() {
+        let mut direct = direct_exists_test_matcher(contains_x_direct_exists_batch);
+        direct
+            .is_match_descriptor_batch(&[], &mut [])
+            .expect("empty descriptor batch");
+
+        let two = [AotHaystack::from(b"x"), AotHaystack::from(b"no")];
+        let error = direct
+            .is_match_descriptor_batch(&two, &mut [false])
+            .expect_err("descriptor/output length mismatch");
+        assert!(error.contains("length mismatch: 2 != 1"));
+
+        let oversized = vec![AotHaystack::from(b""); EXISTS_BATCH_CAPACITY + 1];
+        let mut outcomes = vec![true; oversized.len()];
+        let error = direct
+            .is_match_descriptor_batch(&oversized, &mut outcomes)
+            .expect_err("oversized descriptor batch");
+        assert!(error.contains("exceeds capacity"));
+        assert!(outcomes.iter().all(|&matched| matched));
+    }
+
+    #[test]
+    fn descriptor_batch_publishes_mixed_prepared_and_direct_results() {
+        let lines = [b"x".as_slice(), b"no".as_slice(), b"suffix-x".as_slice()];
+        let descriptors = lines.map(AotHaystack::from);
+
+        PREPARED_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
+        let mut prepared = prepared_test_matcher(
+            AotOutput::Exists,
+            None,
+            Some(contains_x_prepared_exists_batch),
+        );
+        let mut prepared_outcomes = [false; 3];
+        prepared
+            .is_match_descriptor_batch(&descriptors, &mut prepared_outcomes)
+            .expect("prepared descriptor batch");
+        assert_eq!(prepared_outcomes, [true, false, true]);
+        assert_eq!(PREPARED_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+
+        DIRECT_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
+        let mut direct = direct_exists_test_matcher(contains_x_direct_exists_batch);
+        let mut direct_outcomes = [false; 3];
+        direct
+            .is_match_descriptor_batch(&descriptors, &mut direct_outcomes)
+            .expect("direct descriptor batch");
+        assert_eq!(direct_outcomes, prepared_outcomes);
+        assert_eq!(DIRECT_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn descriptor_batch_failure_preserves_valid_boolean_prefix_and_tail() {
+        let descriptors = [
+            AotHaystack::from(b"first"),
+            AotHaystack::from(b"second"),
+            AotHaystack::from(b"third"),
+        ];
+        let mut outcomes = [false, true, false];
+        let mut direct = direct_exists_test_matcher(one_then_error_direct_exists_batch);
+        let error = direct
+            .is_match_descriptor_batch(&descriptors, &mut outcomes)
+            .expect_err("native failure after one Boolean result");
+        assert!(error.contains("status 7 after 1/3"));
+        assert_eq!(outcomes, [true, true, false]);
+    }
+
+    #[test]
+    fn descriptor_batch_scalar_fallback_reads_the_borrowed_slices() {
+        let descriptors = [AotHaystack::from(b""), AotHaystack::from(b"nonempty")];
+        let mut outcomes = [true, false];
+        let mut direct = AotMatcher {
+            output: AotOutput::Exists,
+            description: "test-direct-scalar-fallback",
+            backend: Backend::Native {
+                search: one_byte_search,
+                fill: None,
+                exists_batch: None,
+            },
+        };
+        direct
+            .is_match_descriptor_batch(&descriptors, &mut outcomes)
+            .expect("descriptor scalar fallback");
+        assert_eq!(outcomes, [false, true]);
     }
 
     #[test]
