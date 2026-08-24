@@ -43,6 +43,14 @@ pub const ORDERED_MANY_TAGGED_MAX_ROWS: usize = 128;
 /// quotient ceiling.
 pub const ORDERED_MANY_AOT_MAX_ROWS: usize = 4_096;
 
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static EXPLICIT_V15_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Caller-defined pattern identifier returned with each selected row.
 ///
 /// Identifier values are payload only. They never participate in matching or
@@ -1433,14 +1441,15 @@ pub fn compile_ordered_many_aot(
 /// Count, SpanSum, and GrepCount are fused native whole-operation reducers.
 /// The complete ordinary optimizer transaction runs first and is selected
 /// only when its model-specific reducer is an authenticated helper-free
-/// `NativeFused` function. Every other ordinary aggregate—including a
-/// `NativeFused` object that still imports semantic helpers—defers to the
-/// explicit reported V15 transaction against the same raw plan.
+/// function. A known helper-backed ordinary strategy defers to the explicit
+/// reported V15 transaction against the same raw plan. A module that claims
+/// `NativeFused` but fails that exact authentication is malformed and remains
+/// terminal.
 ///
 /// # Errors
 ///
-/// A well-formed ordinary candidate that is not helper-free merely selects
-/// the explicit V15 transaction. An ordinary `ProgramBytes` or final
+/// A well-formed ordinary candidate with a known helper-backed strategy merely
+/// selects the explicit V15 transaction. An ordinary `ProgramBytes` or final
 /// `ObjectBytes` representation cap also permits that exact prior backend to
 /// report its own success, typed decline, or terminal error. Every parse,
 /// lower, allocation, overflow, invariant, other numeric resource, codegen,
@@ -1589,12 +1598,18 @@ pub fn compile_ordered_many_aot_reported(
     let compiled = match ordinary {
         Some(ordinary)
             if ordinary.module().prepared_aggregate_strategy()
-                == Some(PreparedAggregateStrategy::NativeFused)
-                && helper_free_ordered_many_aggregate_is_authenticated(&ordinary, exports) =>
+                == Some(PreparedAggregateStrategy::NativeFused) =>
         {
+            if !helper_free_ordered_many_aggregate_is_authenticated(&ordinary, exports) {
+                return Err(OrderedManyAotCompileError::InternalInvariant(
+                    "ordinary NativeFused ordered-many aggregate failed authentication",
+                ));
+            }
             ordinary
         }
         ordinary => {
+            #[cfg(test)]
+            EXPLICIT_V15_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let scalar_operation_only = exports == PreparedAggregateExports::COUNT
                 || exports == PreparedAggregateExports::SPAN_SUM
                 || exports == PreparedAggregateExports::GREP_COUNT;
@@ -1737,6 +1752,10 @@ fn helper_free_ordered_many_aggregate_is_authenticated(
     compiled: &CompiledRegex,
     exports: PreparedAggregateExports,
 ) -> bool {
+    #[cfg(test)]
+    if INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE.with(std::cell::Cell::get) {
+        return false;
+    }
     let module = compiled.module();
     let bulk_shape_is_exact = match module.prepared_bulk_strategy() {
         None => {
@@ -2122,14 +2141,17 @@ fn reserve_exact<T, E>(
 #[cfg(test)]
 mod tests {
     use super::{
+        EXPLICIT_V15_ATTEMPTS, INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE,
         OrderedManyCompileLimits, OrderedManyCompileRequest, OrderedManyMatch,
+        OrderedManyAotCompileError, OrderedManyAotCompileLimits, OrderedManyAotCompileRequest,
         OrderedManyPatternId, OrderedManyProgram, OrderedManyRow, OrderedManySessionLimits,
-        OrderedManyStrategy, compile_ordered_many,
+        OrderedManyStrategy, compile_ordered_many, compile_ordered_many_aot_reported,
         ordinary_aggregate_representation_cap_may_try_v15, reserve_exact,
         tagged_build_may_decline,
     };
     use crate::{
-        CompileError as AotCompileError, CompileMode, CompileResource, ObjectError,
+        CompileError as AotCompileError, CompileMode, CompileResource, DeterminizeLimits,
+        ObjectError, PreparedAggregateExports, SlowAotLimits, Target,
     };
     use fre_automata::{CompileError, TaggedManyBuildError};
 
@@ -2359,6 +2381,48 @@ mod tests {
             terminal
                 .iter()
                 .all(|error| !ordinary_aggregate_representation_cap_may_try_v15(error)),
+        );
+    }
+
+    #[test]
+    fn native_fused_authentication_failure_is_terminal_before_v15() {
+        let rows = ["ab", "a", "b+"]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, pattern)| {
+                OrderedManyRow::new(
+                    OrderedManyPatternId::new(u32::try_from(ordinal).unwrap()),
+                    pattern,
+                )
+            })
+            .collect();
+        let mut limits = OrderedManyAotCompileLimits::default();
+        limits.compile.determinize = DeterminizeLimits {
+            max_states: 0,
+            max_transitions: 0,
+            max_work: 0,
+        };
+        EXPLICIT_V15_ATTEMPTS.with(|attempts| attempts.set(0));
+        INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE.with(|inject| inject.set(true));
+        let result = compile_ordered_many_aot_reported(
+            OrderedManyAotCompileRequest::new(rows, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits),
+            PreparedAggregateExports::COUNT,
+            SlowAotLimits::default(),
+        );
+        INJECT_ORDINARY_NATIVE_FUSED_AUTH_FAILURE.with(|inject| inject.set(false));
+
+        assert!(matches!(
+            result,
+            Err(OrderedManyAotCompileError::InternalInvariant(
+                "ordinary NativeFused ordered-many aggregate failed authentication"
+            ))
+        ));
+        assert_eq!(
+            0,
+            EXPLICIT_V15_ATTEMPTS.with(std::cell::Cell::get),
+            "terminal NativeFused authentication failure reached the V15 transaction",
         );
     }
 
