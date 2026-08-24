@@ -3705,6 +3705,8 @@ fn emit_periodic_neon_v3(
         });
     }
     let wide = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let wide_primary_first_hit = assembler.new_label(LabelKindV3::Internal)?;
+    let wide_second_columns = assembler.new_label(LabelKindV3::Internal)?;
     let wide_empty = assembler.new_label(LabelKindV3::Internal)?;
     let wide_hit = assembler.new_label(LabelKindV3::Internal)?;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
@@ -3791,29 +3793,71 @@ fn emit_periodic_neon_v3(
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
     assembler.add_imm(X9, X15, u16::from(filter.offsets[1]))?;
-    for (group, first_base) in [X8, X16].into_iter().enumerate() {
-        if group != 0 {
-            assembler.add_imm(first_base, X8, 64)?;
-        }
-        let mask_base =
-            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
-        assembler.load_vectors4x128(0, first_base)?;
-        for lane in 0_u8..4 {
-            assembler.compare_equal_bytes16(mask_base + lane, lane, vector_registers[0])?;
-        }
+    assembler.load_vectors4x128(0, X8)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + lane,
+            lane,
+            vector_registers[0],
+        )?;
+    }
+    // A nonempty first 16-start mask is a cheap density witness. Preserve
+    // the incumbent two-column work shape for that common dense case instead
+    // of paying the complete eight-mask absence reduction on every batch.
+    assembler.unsigned_max_across_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3)?;
+    assembler.move_vector_byte_to32(X6, 0)?;
+    assembler.cmp_imm64(X6, 0)?;
+    assembler.branch_cond(ConditionV3::NotEqual, wide_primary_first_hit)?;
+
+    assembler.add_imm(X16, X8, 64)?;
+    assembler.load_vectors4x128(0, X16)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+            lane,
+            vector_registers[0],
+        )?;
     }
     assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
-    assembler.or_bytes16(1, SPARSE_BLOCK_MASK_BASE_V3 + 2, SPARSE_BLOCK_MASK_BASE_V3 + 3)?;
+    assembler.or_bytes16(
+        1,
+        SPARSE_BLOCK_MASK_BASE_V3 + 2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 3,
+    )?;
     assembler.or_bytes16(0, 0, 1)?;
-    assembler.or_bytes16(1, SPARSE_BLOCK_MASK_BASE_V3 + 4, SPARSE_BLOCK_MASK_BASE_V3 + 5)?;
-    assembler.or_bytes16(2, SPARSE_BLOCK_MASK_BASE_V3 + 6, SPARSE_BLOCK_MASK_BASE_V3 + 7)?;
+    assembler.or_bytes16(
+        1,
+        SPARSE_BLOCK_MASK_BASE_V3 + 4,
+        SPARSE_BLOCK_MASK_BASE_V3 + 5,
+    )?;
+    assembler.or_bytes16(
+        2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 6,
+        SPARSE_BLOCK_MASK_BASE_V3 + 7,
+    )?;
     assembler.or_bytes16(1, 1, 2)?;
     assembler.or_bytes16(0, 0, 1)?;
     assembler.unsigned_max_across_bytes16(0, 0)?;
     assembler.move_vector_byte_to32(X6, 0)?;
     assembler.cmp_imm64(X6, 0)?;
     assembler.branch_cond(ConditionV3::Equal, wide_empty)?;
+    assembler.branch(wide_second_columns)?;
 
+    // The first primary mask was already proved nonempty. Materialize the
+    // remaining retained primary masks, then fall through to the unchanged
+    // exact second-column intersection without the full-batch reduction.
+    assembler.bind(wide_primary_first_hit)?;
+    assembler.add_imm(X16, X8, 64)?;
+    assembler.load_vectors4x128(0, X16)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+            lane,
+            vector_registers[0],
+        )?;
+    }
+
+    assembler.bind(wide_second_columns)?;
     for (group, second_base) in [X9, X5].into_iter().enumerate() {
         if group != 0 {
             assembler.add_imm(second_base, X9, 64)?;

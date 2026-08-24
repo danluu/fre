@@ -5930,6 +5930,8 @@ fn policy_periodic_neon_v3(
         return Err(invalid_v3("invalid periodic NEON policy stride"));
     }
     let wide = policy.new_label(LabelKindV3::VectorLoop)?;
+    let wide_primary_first_hit = policy.new_label(LabelKindV3::Internal)?;
+    let wide_second_columns = policy.new_label(LabelKindV3::Internal)?;
     let wide_empty = policy.new_label(LabelKindV3::Internal)?;
     let wide_hit = policy.new_label(LabelKindV3::Internal)?;
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
@@ -6036,36 +6038,76 @@ fn policy_periodic_neon_v3(
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
     add_immediate64_v3(policy, X9, X15, u16::from(filter.offsets[1]))?;
-    for (group, first_base) in [X8, X16].into_iter().enumerate() {
-        if group != 0 {
-            add_immediate64_v3(policy, first_base, X8, 64)?;
-        }
-        let mask_base =
-            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
+    exact_v3(
+        policy,
+        DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: 0,
+            base: X8,
+        },
+    )?;
+    for lane in 0_u8..4 {
         exact_v3(
             policy,
-            DecodedInstructionV3::LoadVectors4x128 {
-                first_destination: 0,
-                base: first_base,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: SPARSE_BLOCK_MASK_BASE_V3 + lane,
+                left: lane,
+                right: vector_registers[0],
             },
         )?;
-        for lane in 0_u8..4 {
-            exact_v3(
-                policy,
-                DecodedInstructionV3::CompareEqualBytes16 {
-                    destination: mask_base + lane,
-                    left: lane,
-                    right: vector_registers[0],
-                },
-            )?;
-        }
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+            destination: 0,
+            source: SPARSE_BLOCK_MASK_BASE_V3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::MoveVectorByteTo32 {
+            destination: X6,
+            source: 0,
+        },
+    )?;
+    compare_immediate64_v3(policy, X6, 0)?;
+    condition_v3(policy, ConditionV3::NotEqual, wide_primary_first_hit)?;
+
+    add_immediate64_v3(policy, X16, X8, 64)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: 0,
+            base: X16,
+        },
+    )?;
+    for lane in 0_u8..4 {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+                left: lane,
+                right: vector_registers[0],
+            },
+        )?;
     }
     for (destination, left, right) in [
         (0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1),
-        (1, SPARSE_BLOCK_MASK_BASE_V3 + 2, SPARSE_BLOCK_MASK_BASE_V3 + 3),
+        (
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        ),
         (0, 0, 1),
-        (1, SPARSE_BLOCK_MASK_BASE_V3 + 4, SPARSE_BLOCK_MASK_BASE_V3 + 5),
-        (2, SPARSE_BLOCK_MASK_BASE_V3 + 6, SPARSE_BLOCK_MASK_BASE_V3 + 7),
+        (
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        ),
+        (
+            2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        ),
         (1, 1, 2),
         (0, 0, 1),
     ] {
@@ -6094,7 +6136,29 @@ fn policy_periodic_neon_v3(
     )?;
     compare_immediate64_v3(policy, X6, 0)?;
     condition_v3(policy, ConditionV3::Equal, wide_empty)?;
+    branch_v3(policy, wide_second_columns)?;
 
+    policy.bind(wide_primary_first_hit)?;
+    add_immediate64_v3(policy, X16, X8, 64)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: 0,
+            base: X16,
+        },
+    )?;
+    for lane in 0_u8..4 {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+                left: lane,
+                right: vector_registers[0],
+            },
+        )?;
+    }
+
+    policy.bind(wide_second_columns)?;
     for (group, second_base) in [X9, X5].into_iter().enumerate() {
         if group != 0 {
             add_immediate64_v3(policy, second_base, X9, 64)?;
