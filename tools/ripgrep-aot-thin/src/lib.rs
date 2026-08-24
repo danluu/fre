@@ -1360,6 +1360,7 @@ fn decode_search_result(
     reason = "tests provide small audited stand-ins for compiler-produced native entries"
 )]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1374,6 +1375,7 @@ mod tests {
     static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DIRECT_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXISTS_BATCH_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -2112,6 +2114,9 @@ mod tests {
 
     #[test]
     fn descriptor_batch_publishes_mixed_prepared_and_direct_results() {
+        let _counter_guard = EXISTS_BATCH_COUNTER_TEST_LOCK
+            .lock()
+            .expect("Exists batch counter test lock");
         let lines = [b"x".as_slice(), b"no".as_slice(), b"suffix-x".as_slice()];
         let descriptors = lines.map(AotHaystack::from);
 
@@ -2175,6 +2180,9 @@ mod tests {
 
     #[test]
     fn prepared_exists_batch_crosses_native_abi_once_for_64_lines() {
+        let _counter_guard = EXISTS_BATCH_COUNTER_TEST_LOCK
+            .lock()
+            .expect("Exists batch counter test lock");
         PREPARED_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
         let lines = (0..EXISTS_BATCH_CAPACITY)
             .map(|index| {
@@ -2202,6 +2210,9 @@ mod tests {
 
     #[test]
     fn direct_exists_batch_crosses_native_abi_once_for_64_lines() {
+        let _counter_guard = EXISTS_BATCH_COUNTER_TEST_LOCK
+            .lock()
+            .expect("Exists batch counter test lock");
         DIRECT_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
         let lines = (0..EXISTS_BATCH_CAPACITY)
             .map(|index| {
