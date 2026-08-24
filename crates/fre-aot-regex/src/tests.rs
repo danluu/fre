@@ -803,6 +803,178 @@ static int check_{width}(void){{
     fs::remove_dir_all(directory).expect("remove direct Count-v3 linker directory");
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes focused PeriodicRun staged wide paths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked fixture keeps all staged wide outcomes beside its independent non-overlap oracle"
+)]
+fn linked_host_direct_exact_singleton_count_periodic_wide_stage_matches_independent_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let literal = b"aeaeaeaeae";
+    let kernel = fre_kernel_ir::build_exact_aggregate::<fre_kernel_ir::Count>(
+        literal,
+        fre_kernel_ir::ValidateLimits::default(),
+    )
+    .expect("build focused periodic Count program");
+    let optimized = fre_aot_optimizer::optimize_count_v3(
+        &kernel,
+        fre_aot_optimizer::CountV3TuningClass::GenericAarch64,
+        fre_aot_optimizer::CountV3OptimizerLimits::default(),
+    )
+    .expect("optimize focused periodic Count program");
+    assert_eq!(
+        optimized.recipe().strategy(),
+        fre_aot_optimizer::CountV3Strategy::PeriodicRun,
+    );
+    let filters = optimized.recipe().filter_offsets();
+    assert_eq!(filters.len(), 2);
+    let primary = literal[usize::from(filters[0])];
+    let secondary = literal[usize::from(filters[1])];
+    assert_ne!(primary, secondary);
+    let absent = (0..=u8::MAX)
+        .find(|byte| !literal.contains(byte))
+        .expect("focused periodic literal omits a byte");
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let pattern = format!(
+        "(?-u:{})",
+        literal
+            .iter()
+            .map(|byte| format!(r"\x{byte:02x}"))
+            .collect::<String>(),
+    );
+    let compiled = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            pattern,
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        ),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile focused periodic direct Count-v3");
+    let report = compiled
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .expect("focused periodic direct Count-v3 selected");
+    assert_eq!(usize::from(report.literal_bytes), literal.len());
+    assert!(compiled.module().required_runtime_symbols().next().is_none());
+    let entry = compiled
+        .module()
+        .prepared_count_symbol()
+        .expect("focused periodic direct Count-v3 symbol");
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-count-periodic-wide-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create focused periodic linker directory");
+    let object = directory.join("count.o");
+    fs::write(&object, compiled.object()).expect("write focused periodic Count-v3 object");
+
+    let identity = initializer(&compiled.program().artifact_identity());
+    let literal_initializer = initializer(literal);
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#define IDENTITY_OFFSET {identity_offset}U
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity[32]={{{identity}}};
+static const uint8_t literal[]={{{literal_initializer}}};
+static uint64_t reference_nonoverlap(const uint8_t *hay,size_t len){{
+  size_t offset=0U;uint64_t count=0U;
+  while(offset+sizeof(literal)<=len){{
+    size_t index=0U;
+    while(index<sizeof(literal)&&hay[offset+index]==literal[index])index++;
+    if(index==sizeof(literal)){{count++;offset+=sizeof(literal);}}else{{offset++;}}
+  }}
+  return count;
+}}
+int main(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t primary_absent[384];
+  uint8_t primary_only[384];
+  uint8_t late_complete[384];
+  uint64_t expected=0U;
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));
+  memcpy(handle+IDENTITY_OFFSET,identity,32U);
+  memset(primary_absent,{absent}U,sizeof(primary_absent));
+  memset(primary_only,{primary}U,sizeof(primary_only));
+  memset(late_complete,{absent}U,sizeof(late_complete));
+  memcpy(late_complete+150U,literal,sizeof(literal));
+  memcpy(late_complete+150U+sizeof(literal),literal,sizeof(literal));
+  expected=reference_nonoverlap(primary_absent,sizeof(primary_absent));
+  if(expected!=0U)return 1;
+  if({entry}(handle,primary_absent,sizeof(primary_absent),&out)!=0U||out!=expected)return 2;
+  expected=reference_nonoverlap(primary_only,sizeof(primary_only));out=99U;
+  if(expected!=0U)return 3;
+  if({entry}(handle,primary_only,sizeof(primary_only),&out)!=0U||out!=expected)return 4;
+  expected=reference_nonoverlap(late_complete,sizeof(late_complete));out=99U;
+  if(expected!=2U)return 5;
+  if({entry}(handle,late_complete,sizeof(late_complete),&out)!=0U||out!=expected)return 6;
+  return 0;
+}}
+"#,
+        identity_offset = crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    let c_path = directory.join("periodic-wide.c");
+    let executable = directory.join("periodic-wide");
+    fs::write(&c_path, source).expect("write focused periodic Count-v3 C fixture");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    let status = linker
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link focused periodic Count-v3 differential");
+    assert!(
+        status.success(),
+        "focused periodic Count-v3 differential failed to link"
+    );
+    let result = Command::new(&executable)
+        .output()
+        .expect("run focused periodic Count-v3 differential");
+    assert!(
+        result.status.success(),
+        "focused periodic Count-v3 differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove focused periodic linker directory");
+}
+
 fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String {
     let mut pattern = String::from("(?-u:");
     let mut first = true;
