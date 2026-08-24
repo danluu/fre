@@ -44422,7 +44422,6 @@ fn lower_x86_64_direct_exists_batch(
     assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
     assembler.instruction(&[0x49, 0x83, 0xed, 0x01])?;
     assembler.instruction(&[0x48, 0x83, 0xc3, 0x01])?;
-    assembler.instruction(&[0x49, 0x89, 0x1f])?;
     assembler.branch(&[0xe9], loop_head)?;
     assembler.bind(complete)?;
     assembler.instruction(&[0x31, 0xc0])?;
@@ -44431,6 +44430,10 @@ fn lower_x86_64_direct_exists_batch(
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
 
     assembler.bind(returned)?;
+    // `processed` is observable only after this function returns. Publishing
+    // the completed prefix once here avoids a loop-carried store dependency
+    // while preserving the exact prefix on success and every late failure.
+    assembler.instruction(&[0x49, 0x89, 0x1f])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0x41, 0x5f])?;
     assembler.instruction(&[0x41, 0x5e])?;
@@ -46576,7 +46579,6 @@ fn lower_aarch64_direct_exists_batch(
     assembler.instruction(aarch64_add_x_imm(21, 21, 1)?)?;
     assembler.instruction(aarch64_sub_x_imm(20, 20, 1)?)?;
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
-    assembler.instruction(aarch64_store_x(23, 22, 0)?)?;
     assembler.branch(loop_head)?;
     assembler.bind(complete)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
@@ -46585,6 +46587,9 @@ fn lower_aarch64_direct_exists_batch(
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
 
     assembler.bind(returned)?;
+    // Publish the completed prefix exactly once at the ABI return boundary;
+    // X23 remains the authoritative count on success and late failures.
+    assembler.instruction(aarch64_store_x(23, 22, 0)?)?;
     assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
     assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
@@ -72640,6 +72645,80 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn direct_exists_batch_publishes_only_statuses_proved_boolean() {
+        let x86 = lower_x86_64_direct_exists_batch(
+            NativeDirectExistsTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: false,
+            },
+        )
+        .expect("x86 direct Exists batch");
+        let x86_stores = x86
+            .code
+            .windows(3)
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == [0x41, 0x88, 0x06]).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(x86_stores.len(), 1);
+        let x86_compare = x86.code[..x86_stores[0]]
+            .windows(3)
+            .rposition(|bytes| bytes == [0x83, 0xf8, 0x01])
+            .expect("x86 Boolean proof precedes matched-byte store");
+        let conditional = x86_compare + 3;
+        if x86.code[conditional] == 0x77 {
+            // The assembler may invert JBE + JMP into one relaxed JA over
+            // the Boolean publication block.
+            assert_eq!(x86_stores[0], conditional + 2);
+        } else {
+            let conditional_bytes = if x86.code[conditional] == 0x76 {
+                2
+            } else {
+                assert_eq!(&x86.code[conditional..conditional + 2], &[0x0f, 0x86]);
+                6
+            };
+            let rejected = conditional + conditional_bytes;
+            let rejected_bytes = match x86.code[rejected] {
+                0xeb => 2,
+                0xe9 => 5,
+                opcode => panic!("unexpected x86 rejected-status branch {opcode:#x}"),
+            };
+            assert_eq!(x86_stores[0], rejected + rejected_bytes);
+        }
+
+        let aarch64 = lower_aarch64_direct_exists_batch(
+            NativeDirectExistsTrustedCorePrologue::Aarch64,
+        )
+        .expect("AArch64 direct Exists batch");
+        let words = aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let store = aarch64_store_byte(0, 21, 0).expect("AArch64 matched-byte store");
+        let stores = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == store).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1);
+        let compare = words
+            .iter()
+            .position(|&word| word == aarch64_cmp_w_imm(0, 1).unwrap())
+            .expect("AArch64 status <= 1 comparison");
+        let condition = words[compare + 1] & 0xff00_001f;
+        if condition == 0x5400_0000 | u32::from(AARCH64_HI) {
+            // As on x86, branch relaxation can invert the condition so the
+            // proved Boolean publication becomes the fallthrough block.
+            assert_eq!(stores[0], compare + 2);
+        } else {
+            assert_eq!(condition, 0x5400_0000 | u32::from(AARCH64_LS));
+            assert_eq!(words[compare + 2] >> 26, 0b000101);
+            assert_eq!(stores[0], compare + 3);
         }
     }
 

@@ -62,6 +62,14 @@ const NATIVE_SPAN_BUFFER_CAPACITY: usize = 64;
 /// compiled Exists-batch invocation.
 pub const EXISTS_BATCH_CAPACITY: usize = 64;
 
+// The direct batch ABI publishes compiler-authenticated 0/1 bytes directly
+// into caller-owned Boolean storage. Keep that representation dependency a
+// compile-time condition instead of silently assuming it in pointer math.
+const _: () = {
+    assert!(std::mem::size_of::<bool>() == std::mem::size_of::<u8>());
+    assert!(std::mem::align_of::<bool>() == std::mem::align_of::<u8>());
+};
+
 #[derive(Clone, Copy, Debug)]
 #[allow(
     dead_code,
@@ -988,22 +996,40 @@ fn direct_native_is_match_batch(
             len: haystack.len(),
         });
     }
-    let mut encoded = [0xff_u8; EXISTS_BATCH_CAPACITY];
     let mut processed = 0;
     // SAFETY: `zip` initialized exactly the first `count` descriptors and
     // every one names a live readable slice. The batch ABI reads only that
     // prefix and retains no pointer, so the uninitialized capacity tail is
-    // unobservable. `encoded` has `count` writable bytes, and the generated
-    // entry initializes exactly the prefix published through `processed`.
+    // unobservable. This compiler-produced entry writes only the valid Boolean
+    // representations 0 and 1 to the live output prefix; the untouched tail
+    // remains initialized by the safe caller.
     let status = unsafe {
         batch(
             descriptors.as_ptr().cast::<AbiHaystack>(),
             haystacks.len(),
-            encoded.as_mut_ptr(),
+            matched.as_mut_ptr().cast::<u8>(),
             &raw mut processed,
         )
     };
-    decode_exists_batch(status, processed, haystacks.len(), &encoded, matched)
+    if processed > haystacks.len() {
+        return Err(format!(
+            "compiled Exists batch overreported its initialized prefix: {processed} > {}",
+            haystacks.len()
+        ));
+    }
+    if status != 0 {
+        return Err(format!(
+            "compiled Exists batch failed with status {status} after {processed}/{} haystacks",
+            haystacks.len()
+        ));
+    }
+    if processed != haystacks.len() {
+        return Err(format!(
+            "compiled Exists batch returned success after {processed}/{} haystacks",
+            haystacks.len()
+        ));
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1423,6 +1449,23 @@ mod tests {
         }
         unsafe { processed.write(count) };
         0
+    }
+
+    unsafe extern "C" fn one_then_error_direct_exists_batch(
+        _haystacks: *const AbiHaystack,
+        count: usize,
+        matched: *mut u8,
+        processed: *mut usize,
+    ) -> u32 {
+        if count == 0 {
+            unsafe { processed.write(0) };
+        } else {
+            unsafe {
+                matched.write(1);
+                processed.write(1);
+            }
+        }
+        7
     }
 
     unsafe extern "C" fn singleton_prepared_exists_batch(
@@ -1850,6 +1893,18 @@ mod tests {
             assert_eq!(matched, index % 3 == 0);
         }
         assert_eq!(DIRECT_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn direct_exists_batch_failure_preserves_valid_boolean_prefix_and_tail() {
+        let lines = [b"first".as_slice(), b"second".as_slice(), b"third".as_slice()];
+        let mut outcomes = [false, true, false];
+        let mut direct = direct_exists_test_matcher(one_then_error_direct_exists_batch);
+        let error = direct
+            .is_match_batch(&lines, &mut outcomes)
+            .expect_err("native failure after one Boolean result");
+        assert!(error.contains("status 7 after 1/3"));
+        assert_eq!(outcomes, [true, true, false]);
     }
 
     #[test]

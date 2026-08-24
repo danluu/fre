@@ -761,10 +761,10 @@ pub type FreAotRegexExclusiveExistsBatchV1 = unsafe extern "C" fn(
 /// direct program.
 ///
 /// Status zero means all independent haystacks were processed. After top-level
-/// argument validation, `processed_out` is initialized to zero and thereafter
-/// counts the completely initialized `matched_out` prefix; every initialized
-/// byte is exactly zero or one. A later invalid descriptor or ordinary-entry
-/// failure preserves that prefix and returns the failing status. A zero input
+/// argument validation, `processed_out` is initialized to zero. When the call
+/// returns, it counts the completely initialized `matched_out` prefix; every
+/// initialized byte is exactly zero or one. A later invalid descriptor or
+/// ordinary-entry failure returns the exact completed prefix. A zero input
 /// count is valid, permits null input/output arrays, and publishes a processed
 /// count of zero.
 ///

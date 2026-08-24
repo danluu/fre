@@ -124,11 +124,11 @@ typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
 /*
  * Handle-free counterpart for a self-contained direct Exists program. Status
  * 0 means every input was processed. After top-level argument validation,
- * processed_out starts at zero and thereafter counts the completely
- * initialized matched_out prefix; each initialized byte is exactly 0 or 1.
- * A later invalid descriptor or ordinary-entry failure preserves that prefix
- * and returns the failing status. A zero count permits null haystacks and
- * matched_out pointers and publishes a processed count of zero.
+ * processed_out starts at zero. When the call returns, it counts the
+ * completely initialized matched_out prefix; each initialized byte is exactly
+ * 0 or 1. A later invalid descriptor or ordinary-entry failure returns the
+ * exact completed prefix. A zero count permits null haystacks and matched_out
+ * pointers and publishes a processed count of zero.
  *
  * For a nonzero count, both arrays are live for the complete call, the
  * descriptor array is naturally aligned, every descriptor has a nonnull ptr
