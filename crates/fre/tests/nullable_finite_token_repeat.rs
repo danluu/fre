@@ -527,6 +527,61 @@ fn single_repetition_linear_token_matches_upstream_across_every_byte_mutation() 
 }
 
 #[test]
+fn repeated_single_token_ordinary_spans_match_accounted_and_upstream() {
+    let token = "abcdefg";
+    for maximum in [2, 3, 8, 63] {
+        let mut exact = b"!!".to_vec();
+        exact.extend_from_slice(token.repeat(maximum).as_bytes());
+        exact.extend_from_slice(b"zQ");
+        let mut over_maximum = b"!!".to_vec();
+        over_maximum.extend_from_slice(token.repeat(maximum + 1).as_bytes());
+        over_maximum.extend_from_slice(b"zQ");
+        let mut partial = b"!!".to_vec();
+        partial.extend_from_slice(&token.as_bytes()[..token.len() - 1]);
+        partial.extend_from_slice(b"zQ");
+        let mut haystacks = vec![b"zQ".to_vec(), partial, exact.clone(), over_maximum];
+        for offset in 0..token.len() * maximum {
+            let mut mutated = exact.clone();
+            mutated[2 + offset] = b'!';
+            haystacks.push(mutated);
+        }
+
+        for lazy in ["", "?"] {
+            let pattern = format!(r"(?-u:(?:{token}){{0,{maximum}}}{lazy}zQ)");
+            let regex = build_auto(&pattern);
+            let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID,
+            );
+
+            for haystack in &haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let accounted = regex
+                    .find_accounted(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    span(regex.find(haystack)),
+                    expected,
+                    "ordinary pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    span(accounted),
+                    expected,
+                    "accounted pattern={pattern:?} haystack={haystack:?}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn persistent_limit_is_checked_at_the_exact_projected_total() {
     let pattern = r"(?-u:(?:ab|cd|efg|hijk){0,7}z)";
     let baseline = build_auto(pattern);
