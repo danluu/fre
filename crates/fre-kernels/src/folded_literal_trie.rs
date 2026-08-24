@@ -12,8 +12,8 @@ use core::{fmt, marker::PhantomData, mem};
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_simd_kernels::{
     BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, BYTE_SET_WIDE_BLOCK_BYTES,
-    ByteBucketClassifier, ByteBucketTables, DispatchPolicy, SelectionReceipt, SimdDispatchContext,
-    classify_byte_set1_32, classify_byte_set2_32, classify_byte_set3_32,
+    ByteBucketClassifier, ByteBucketMasks16, ByteBucketTables, DispatchPolicy, SelectionReceipt,
+    SimdDispatchContext, classify_byte_set1_32, classify_byte_set2_32, classify_byte_set3_32,
 };
 use memchr::{memchr, memchr_iter, memchr2, memchr2_iter, memchr3, memchr3_iter};
 
@@ -861,6 +861,10 @@ impl RootPrefilter {
 
     #[inline(never)]
     fn scan_value(&self, source: &[u8], hit: &mut ValueHitState<'_, '_>) {
+        if matches!(self.needle_count, 4..=256) {
+            self.scan_wide_value(source, hit);
+            return;
+        }
         let first = match self.needle_count {
             1 => memchr(self.needles[0], source),
             2 => memchr2(self.needles[0], self.needles[1], source),
@@ -927,6 +931,115 @@ impl RootPrefilter {
                 return;
             };
             if !hit.on_hit(position) {
+                return;
+            }
+        }
+    }
+
+    #[allow(
+        clippy::inline_always,
+        reason = "wide value scans keep their column-specialized loops free of a call per nonempty block"
+    )]
+    #[inline(always)]
+    fn scan_wide_value_masks(
+        masks: ByteBucketMasks16,
+        block_start: usize,
+        hit: &mut ValueHitState<'_, '_>,
+    ) -> bool {
+        for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
+            while chunk != 0 {
+                let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
+                    .expect("a classified narrow lane fits in usize");
+                let Some(position) = chunk_index
+                    .checked_mul(8)
+                    .and_then(|offset| offset.checked_add(lane))
+                    .and_then(|offset| block_start.checked_add(offset))
+                else {
+                    hit.declined = true;
+                    return false;
+                };
+                if !hit.on_wide_hit(position) {
+                    return false;
+                }
+                let Some(shift) = lane.checked_mul(8) else {
+                    hit.declined = true;
+                    return false;
+                };
+                let Some(lane_mask) = u32::try_from(shift)
+                    .ok()
+                    .and_then(|shift| u64::from(u8::MAX).checked_shl(shift))
+                else {
+                    hit.declined = true;
+                    return false;
+                };
+                chunk &= !lane_mask;
+            }
+        }
+        true
+    }
+
+    #[inline(never)]
+    fn scan_wide_value(&self, source: &[u8], hit: &mut ValueHitState<'_, '_>) {
+        let Some(classifier) = self.classifier else {
+            hit.declined = true;
+            return;
+        };
+        value_scan_probe::record_wide();
+        let columns = classifier.tables().columns();
+        let mut block_start = 0_usize;
+        if columns == 1 {
+            while let Some(masks) = classifier.classify_first_16(&source[block_start..]) {
+                let Some(next) = block_start.checked_add(BYTE_BUCKET_BLOCK_BYTES) else {
+                    hit.declined = true;
+                    return;
+                };
+                if masks.chunks() == [0, 0] {
+                    block_start = next;
+                    continue;
+                }
+                if !Self::scan_wide_value_masks(masks, block_start, hit) {
+                    return;
+                }
+                block_start = next;
+            }
+        } else {
+            let required_input_bytes = classifier.tables().required_input_bytes();
+            while source
+                .len()
+                .checked_sub(block_start)
+                .is_some_and(|remaining| remaining >= required_input_bytes)
+            {
+                let Some(next) = block_start.checked_add(BYTE_BUCKET_BLOCK_BYTES) else {
+                    hit.declined = true;
+                    return;
+                };
+                let Some(screening) = classifier.classify_first_16(&source[block_start..]) else {
+                    hit.declined = true;
+                    return;
+                };
+                if screening.chunks() == [0, 0] {
+                    block_start = next;
+                    continue;
+                }
+                let Some(masks) = classifier.classify_16(&source[block_start..]) else {
+                    hit.declined = true;
+                    return;
+                };
+                if !Self::scan_wide_value_masks(masks, block_start, hit) {
+                    return;
+                }
+                block_start = next;
+            }
+        }
+        for (tail_offset, &byte) in source[block_start..].iter().enumerate() {
+            if !self.primary_matches(byte) {
+                continue;
+            }
+            let Some(position) = block_start.checked_add(tail_offset) else {
+                hit.declined = true;
+                return;
+            };
+            if !hit.on_wide_hit(position) {
                 return;
             }
         }
@@ -1415,11 +1528,12 @@ impl FoldedLiteralTriePlan {
     /// Return the leftmost candidate without retaining successful execution
     /// accounting.
     ///
-    /// Admitted memchr-width plans preserve the reporting path's complete
-    /// pre-source envelope and refusal order, then verify candidate starts
-    /// without updating diagnostic counters. Structurally unsupported plans
-    /// and impossible value arithmetic decline to the reporting implementation
-    /// so its exact partial-error receipt remains authoritative.
+    /// Admitted narrow and classified wide prefilter plans preserve the
+    /// reporting path's complete pre-source envelope and refusal order, then
+    /// verify candidate starts without updating diagnostic counters.
+    /// Structurally unsupported plans and impossible value arithmetic decline
+    /// to the reporting implementation so its exact partial-error receipt
+    /// remains authoritative.
     ///
     /// # Errors
     ///
@@ -1660,7 +1774,9 @@ impl FoldedLiteralTriePlan {
             source,
             actual: ScanActual::default(),
         })?;
-        if !matches!(prefilter.needle_count, 1..=3)
+        let supported_prefilter = matches!(prefilter.needle_count, 1..=3)
+            || (matches!(prefilter.needle_count, 4..=256) && prefilter.classifier.is_some());
+        if !supported_prefilter
             || usize::from(prefilter.guard_needle_count) > ROOT_PREFILTER_BYTE_VALUES
         {
             return Ok(ValueScanAttempt::Declined);
@@ -2418,8 +2534,26 @@ struct ValueHitState<'plan, 'source> {
 }
 
 impl ValueHitState<'_, '_> {
+    #[allow(
+        clippy::inline_always,
+        reason = "narrow folded scans keep the incumbent inlined hit continuation"
+    )]
     #[inline(always)]
     fn on_hit(&mut self, hit: usize) -> bool {
+        self.on_hit_impl(hit)
+    }
+
+    #[inline(never)]
+    fn on_wide_hit(&mut self, hit: usize) -> bool {
+        self.on_hit_impl(hit)
+    }
+
+    #[allow(
+        clippy::inline_always,
+        reason = "the wide wrapper outlines this body while narrow callers retain it inline"
+    )]
+    #[inline(always)]
+    fn on_hit_impl(&mut self, hit: usize) -> bool {
         let Some(relative_start) = hit.checked_sub(self.offset) else {
             return true;
         };
@@ -4803,6 +4937,11 @@ mod scan_source_probe {
     pub(super) const fn record() {}
 }
 
+#[cfg(not(test))]
+mod value_scan_probe {
+    pub(super) const fn record_wide() {}
+}
+
 #[cfg(test)]
 pub(crate) mod root_candidate_dispatch_probe {
     use std::cell::Cell;
@@ -4852,6 +4991,32 @@ mod scan_source_probe {
 
     pub(super) fn accesses() -> usize {
         ACCESSES.get()
+    }
+}
+
+#[cfg(test)]
+mod value_scan_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static WIDE_SCANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_wide() {
+        WIDE_SCANS.set(
+            WIDE_SCANS
+                .get()
+                .checked_add(1)
+                .expect("folded wide-value scan probe overflow"),
+        );
+    }
+
+    pub(super) fn reset() {
+        WIDE_SCANS.set(0);
+    }
+
+    pub(super) fn wide_scans() -> usize {
+        WIDE_SCANS.get()
     }
 }
 
@@ -5064,8 +5229,8 @@ mod tests {
         correlated_root_prefilter_tables, derive_union_successor_guard,
         execute_folded_scan_impl, root_classifier_independent_volume, root_classifier_volume,
         root_prefilter_fingerprint_work_upper_bound, scan_source_probe, successor_guard_is_better,
-        union_successor_guard_candidate, volume_density_is_strictly_lower, volume_gain_at_least,
-        RootClassifierVolume,
+        union_successor_guard_candidate, value_scan_probe, volume_density_is_strictly_lower,
+        volume_gain_at_least, RootClassifierVolume,
     };
     use crate::{LiteralCandidate, Window};
     use fre_simd_kernels::{
@@ -6315,6 +6480,7 @@ mod tests {
         let narrow_prefilter = narrow.root_prefilter.as_ref().unwrap();
         assert_eq!(narrow_prefilter.needle_count, 3);
         assert!(narrow_prefilter.classifier.is_none());
+        value_scan_probe::reset();
         let (found, matched) = assert_value_projection_parity(
             &narrow,
             b"xKKKK",
@@ -6325,6 +6491,7 @@ mod tests {
         );
         assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 1, 3)));
         assert!(matched.unwrap());
+        assert_eq!(value_scan_probe::wide_scans(), 0);
 
         let mut malformed = vec![0xFF, 0xC0, 0xAF, 0xED, 0xA0, 0x80];
         let valid_start = malformed.len();
@@ -6389,6 +6556,7 @@ mod tests {
         let wide = admitted(&wide_patterns);
         assert_eq!(wide.build.root_prefilter_needles, 4);
         assert_eq!(wide.root_prefilter_classifier_columns(), 1);
+        value_scan_probe::reset();
         let (found, matched) = assert_value_projection_parity(
             &wide,
             b"xxqD!",
@@ -6399,9 +6567,11 @@ mod tests {
         );
         assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 3, 4)));
         assert!(matched.unwrap());
+        assert_eq!(value_scan_probe::wide_scans(), 2);
 
         let correlated = correlated_ascii_plan();
         assert_eq!(correlated.root_prefilter_classifier_columns(), 2);
+        value_scan_probe::reset();
         let (found, matched) = assert_value_projection_parity(
             &correlated,
             b"xxq\x01az",
@@ -6412,6 +6582,122 @@ mod tests {
         );
         assert_eq!(found.unwrap(), Some(LiteralCandidate::new(0, 3, 5)));
         assert!(matched.unwrap());
+        assert_eq!(value_scan_probe::wide_scans(), 2);
+    }
+
+    #[test]
+    fn wide_value_projections_continue_across_blocks_guards_and_scalar_tails() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let class = FoldedScalarClass::new(&FOUR);
+        let guarded_classes = [class, class];
+        let guarded = admitted(&[FoldedLiteral::new(&guarded_classes)]);
+        let guarded_prefilter = guarded.root_prefilter.as_ref().unwrap();
+        assert_eq!(guarded_prefilter.needle_count, 4);
+        assert_eq!(guarded_prefilter.offset, 1);
+        assert_eq!(guarded_prefilter.guard_needle_count, 4);
+        assert_eq!(guarded_prefilter.guard_offset, 0);
+        assert_eq!(guarded.root_prefilter_classifier_columns(), 1);
+
+        let mut source = vec![b'!'; 2 * BYTE_BUCKET_BLOCK_BYTES + 11];
+        for position in [1, 8, 15, 24, 31, 40] {
+            source[position] = b'A';
+        }
+        let expected_start = source.len();
+        source.extend_from_slice(b"AA");
+        value_scan_probe::reset();
+        let (found, matched) = assert_value_projection_parity(
+            &guarded,
+            &source,
+            Window::full(&source),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(
+            found.unwrap(),
+            Some(LiteralCandidate::new(
+                0,
+                expected_start,
+                expected_start + 2
+            ))
+        );
+        assert!(matched.unwrap());
+        assert_eq!(value_scan_probe::wide_scans(), 2);
+
+        let correlated = correlated_ascii_plan();
+        assert_eq!(correlated.root_prefilter_classifier_columns(), 2);
+        let mut source = vec![b'q'; 2 * BYTE_BUCKET_BLOCK_BYTES + 2];
+        source[0..2].copy_from_slice(b"\x01z");
+        source[15..17].copy_from_slice(b"\x02q");
+        source[32..34].copy_from_slice(b"\x04m");
+        value_scan_probe::reset();
+        let (found, matched) = assert_value_projection_parity(
+            &correlated,
+            &source,
+            Window::full(&source),
+            ScanLimits::unlimited(),
+            1,
+            1,
+        );
+        assert_eq!(found.unwrap(), Some(LiteralCandidate::new(3, 32, 34)));
+        assert!(matched.unwrap());
+        assert_eq!(value_scan_probe::wide_scans(), 2);
+
+        for columns in 3..=BYTE_BUCKET_MAX_COLUMNS {
+            let (plan, exact) = correlated_variable_width_plan(columns);
+            assert_eq!(plan.root_prefilter_classifier_columns(), columns);
+            let pattern_index = columns - 1;
+            let literal = &exact[pattern_index];
+            let prefilter = plan.root_prefilter.as_ref().unwrap();
+            for (start, extra) in [(16_usize, 32_usize), (32, 0)] {
+                let mut source = vec![b'!'; start + literal.len() + extra];
+                source[usize::from(prefilter.offset)] =
+                    exact[0][usize::from(prefilter.offset)];
+                source[start..start + literal.len()].copy_from_slice(literal);
+                value_scan_probe::reset();
+                let (found, matched) = assert_value_projection_parity(
+                    &plan,
+                    &source,
+                    Window::full(&source),
+                    ScanLimits::unlimited(),
+                    1,
+                    1,
+                );
+                assert_eq!(
+                    found.unwrap(),
+                    Some(LiteralCandidate::new(
+                        pattern_index,
+                        start,
+                        start + literal.len()
+                    )),
+                    "{columns} columns at {start}"
+                );
+                assert!(matched.unwrap());
+                assert_eq!(value_scan_probe::wide_scans(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_value_projection_declines_missing_classifier_before_source_access() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let classes = one_class(&FOUR);
+        let mut plan = admitted(&[FoldedLiteral::new(&classes)]);
+        plan.root_prefilter.as_mut().unwrap().classifier = None;
+
+        scan_source_probe::reset();
+        value_scan_probe::reset();
+        let error = plan
+            .find_window_value(b"A", Window::full(b"A"), ScanLimits::unlimited())
+            .unwrap_err();
+        assert!(matches!(
+            error.source,
+            ScanError::Invariant {
+                detail: "wide folded root prefilter is missing its classifier"
+            }
+        ));
+        assert_eq!(scan_source_probe::accesses(), 1);
+        assert_eq!(value_scan_probe::wide_scans(), 0);
     }
 
     #[test]
