@@ -9244,7 +9244,19 @@ impl CompiledModule {
                         "direct Count-v3 incumbent text symbol offset",
                     )
                 })?;
-                if symbol_offset >= authenticated_body_offset {
+                let symbol_bytes = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol size",
+                    )
+                })?;
+                let symbol_end = symbol_offset.checked_add(symbol_bytes).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol extent",
+                    ),
+                )?;
+                if symbol_offset >= authenticated_body_offset
+                    || symbol_end > authenticated_body_offset
+                {
                     return Err(ObjectError::InvalidModule(
                         "direct Count-v3 incumbent body has an unaudited symbol",
                     ));
