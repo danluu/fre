@@ -2360,6 +2360,23 @@ impl K0ReverseSuffixSpanAdaptiveState {
     const TRANSIENT_IN_FLIGHT: u64 = Self::TRANSIENT_EPOCH_MASK;
     const TRANSIENT_INITIAL_SKIP_CALLS: u64 = 8;
     const TRANSIENT_MAX_STAGE: u64 = 5;
+    // A finite bounded-literal-repeat plan uses the otherwise spare high
+    // payload of this same word for immutable construction metadata. Rust
+    // slices cannot reach the reserved class-63 marker. Eleven bits per
+    // nonzero literal length cover the established 1,024-byte mandatory-
+    // suffix construction limit; a compact class exponent and valid bit
+    // replace the ordinary finite receipt's one-hot class while preserving
+    // the same ten-bit source offset.
+    const BOUNDED_DESCRIPTOR: u64 = 1_u64 << 63;
+    const BOUNDED_TOKEN_SHIFT: u32 = 10;
+    const BOUNDED_TAIL_SHIFT: u32 = 21;
+    const BOUNDED_LENGTH_MASK: u64 = 0x7ff;
+    const BOUNDED_RECEIPT_CLASS_SHIFT: u32 = 32;
+    const BOUNDED_RECEIPT_CLASS_MASK: u64 = 0x3f << Self::BOUNDED_RECEIPT_CLASS_SHIFT;
+    const BOUNDED_RECEIPT_VALID: u64 = 1_u64 << 38;
+    const BOUNDED_IMMUTABLE_MASK: u64 = Self::BOUNDED_DESCRIPTOR
+        | (Self::BOUNDED_LENGTH_MASK << Self::BOUNDED_TOKEN_SHIFT)
+        | (Self::BOUNDED_LENGTH_MASK << Self::BOUNDED_TAIL_SHIFT);
 
     const fn new() -> Self {
         Self {
@@ -2368,6 +2385,75 @@ impl K0ReverseSuffixSpanAdaptiveState {
             #[cfg(not(target_has_atomic = "64"))]
             disabled_window_classes: 0,
         }
+    }
+
+    fn try_install_bounded_literal_repeat_descriptor(
+        &mut self,
+        token_bytes: usize,
+        tail_bytes: usize,
+    ) -> bool {
+        if token_bytes > K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES
+            || tail_bytes > K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES
+        {
+            return false;
+        }
+        let Some(token) = token_bytes.checked_sub(1).and_then(|length| {
+            (length <= Self::BOUNDED_LENGTH_MASK as usize).then_some(length as u64)
+        }) else {
+            return false;
+        };
+        let Some(tail) = tail_bytes.checked_sub(1).and_then(|length| {
+            (length <= Self::BOUNDED_LENGTH_MASK as usize).then_some(length as u64)
+        }) else {
+            return false;
+        };
+        let descriptor = Self::BOUNDED_DESCRIPTOR
+            | token << Self::BOUNDED_TOKEN_SHIFT
+            | tail << Self::BOUNDED_TAIL_SHIFT;
+        #[cfg(target_has_atomic = "64")]
+        {
+            let state = self.disabled_window_classes.get_mut();
+            if *state != 0 {
+                return false;
+            }
+            *state = descriptor;
+            true
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let _ = (descriptor, &self.disabled_window_classes);
+            false
+        }
+    }
+
+    fn bounded_literal_repeat_lengths(&self) -> Option<(usize, usize)> {
+        let observed = self.load();
+        if observed & Self::BOUNDED_DESCRIPTOR == 0 {
+            return None;
+        }
+        let token = (observed >> Self::BOUNDED_TOKEN_SHIFT) & Self::BOUNDED_LENGTH_MASK;
+        let tail = (observed >> Self::BOUNDED_TAIL_SHIFT) & Self::BOUNDED_LENGTH_MASK;
+        Some((token as usize + 1, tail as usize + 1))
+    }
+
+    const fn bounded_descriptor_metadata(observed: u64) -> Option<u64> {
+        if observed & Self::BOUNDED_DESCRIPTOR == 0 {
+            None
+        } else {
+            Some(observed & Self::BOUNDED_IMMUTABLE_MASK)
+        }
+    }
+
+    const fn bounded_receipt_class(observed: u64) -> Option<u32> {
+        if observed & (Self::BOUNDED_DESCRIPTOR | Self::BOUNDED_RECEIPT_VALID)
+            != (Self::BOUNDED_DESCRIPTOR | Self::BOUNDED_RECEIPT_VALID)
+        {
+            return None;
+        }
+        Some(
+            ((observed & Self::BOUNDED_RECEIPT_CLASS_MASK)
+                >> Self::BOUNDED_RECEIPT_CLASS_SHIFT) as u32,
+        )
     }
 
     fn window_class(window_bytes: usize) -> Option<u32> {
@@ -2502,19 +2588,31 @@ impl K0ReverseSuffixSpanAdaptiveState {
         let mut observed = self.load();
         loop {
             if finite_early_receipts {
-                let receipt_class = observed & !Self::TRANSIENT_MASK;
-                if receipt_class == permanent {
+                let descriptor = Self::bounded_descriptor_metadata(observed);
+                let matching_receipt = descriptor.map_or_else(
+                    || observed & !Self::TRANSIENT_MASK == permanent,
+                    |_| {
+                        Self::bounded_receipt_class(observed)
+                            == Self::window_class(window_bytes)
+                    },
+                );
+                if matching_receipt {
                     return None;
                 }
-                if receipt_class != 0 {
+                let stale_receipt = descriptor.map_or_else(
+                    || observed & !Self::TRANSIENT_MASK != 0,
+                    |_| Self::bounded_receipt_class(observed).is_some(),
+                );
+                if stale_receipt {
+                    let replacement = descriptor.unwrap_or(0);
                     match self.disabled_window_classes.compare_exchange_weak(
                         observed,
-                        0,
+                        replacement,
                         core::sync::atomic::Ordering::Relaxed,
                         core::sync::atomic::Ordering::Relaxed,
                     ) {
                         Ok(_) => {
-                            observed = 0;
+                            observed = replacement;
                             continue;
                         }
                         Err(actual) => {
@@ -2524,7 +2622,9 @@ impl K0ReverseSuffixSpanAdaptiveState {
                     }
                 }
             }
-            if observed & permanent != 0 {
+            if Self::bounded_descriptor_metadata(observed).is_none()
+                && observed & permanent != 0
+            {
                 return None;
             }
             let transient = observed & Self::TRANSIENT_MASK;
@@ -2650,22 +2750,32 @@ impl K0ReverseSuffixSpanAdaptiveState {
     }
 
     #[cfg(target_has_atomic = "64")]
-    fn finite_early_prefix_matches(
+    fn finite_early_prefix_offset(
         &self,
         window_bytes: usize,
         window: &[u8],
         needle: &[u8],
-    ) -> bool {
+    ) -> Option<usize> {
         let Some(class) = Self::permanent_class_mask(window_bytes) else {
-            return false;
+            return None;
         };
+        let window_class = Self::window_class(window_bytes)
+            .expect("a permanent finite receipt class has an exponent");
         let mut observed = self.load();
         loop {
-            let receipt_class = observed & !Self::TRANSIENT_MASK;
-            if receipt_class == 0 {
-                return false;
+            let descriptor = Self::bounded_descriptor_metadata(observed);
+            let receipt_present = descriptor.map_or_else(
+                || observed & !Self::TRANSIENT_MASK != 0,
+                |_| Self::bounded_receipt_class(observed).is_some(),
+            );
+            if !receipt_present {
+                return None;
             }
-            if receipt_class == class {
+            let matching_class = descriptor.map_or_else(
+                || observed & !Self::TRANSIENT_MASK == class,
+                |_| Self::bounded_receipt_class(observed) == Some(window_class),
+            );
+            if matching_class {
                 let offset = usize::try_from(observed & Self::TRANSIENT_MASK)
                     .expect("the finite early-prefix offset fits usize");
                 if offset
@@ -2673,7 +2783,7 @@ impl K0ReverseSuffixSpanAdaptiveState {
                     .and_then(|end| window.get(offset..end))
                     == Some(needle)
                 {
-                    return true;
+                    return Some(offset);
                 }
             }
             // A finite ConsumptionRun owns this adaptive word exclusively.
@@ -2682,16 +2792,28 @@ impl K0ReverseSuffixSpanAdaptiveState {
             // the whole performance hint and may immediately remeasure. Other
             // source changes deliberately retain the conservative incumbent
             // choice while the same proven early suffix remains in place.
+            let replacement = descriptor.unwrap_or(0);
             match self.disabled_window_classes.compare_exchange_weak(
                 observed,
-                0,
+                replacement,
                 core::sync::atomic::Ordering::Relaxed,
                 core::sync::atomic::Ordering::Relaxed,
             ) {
-                Ok(_) => return false,
+                Ok(_) => return None,
                 Err(actual) => observed = actual,
             }
         }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn finite_early_prefix_matches(
+        &self,
+        window_bytes: usize,
+        window: &[u8],
+        needle: &[u8],
+    ) -> bool {
+        self.finite_early_prefix_offset(window_bytes, window, needle)
+            .is_some()
     }
 
     #[cfg(target_has_atomic = "64")]
@@ -2709,12 +2831,23 @@ impl K0ReverseSuffixSpanAdaptiveState {
             self.settle_transient(expected_transient, 0);
             return;
         };
-        let receipt = class | (suffix_offset as u64 & Self::TRANSIENT_MASK);
         let mut observed = self.load();
         loop {
-            if observed != expected_transient {
+            if observed & Self::TRANSIENT_MASK != expected_transient {
                 return;
             }
+            let receipt = if let Some(descriptor) = Self::bounded_descriptor_metadata(observed) {
+                let Some(window_class) = Self::window_class(window_bytes) else {
+                    self.settle_transient(expected_transient, 0);
+                    return;
+                };
+                descriptor
+                    | Self::BOUNDED_RECEIPT_VALID
+                    | u64::from(window_class) << Self::BOUNDED_RECEIPT_CLASS_SHIFT
+                    | (suffix_offset as u64 & Self::TRANSIENT_MASK)
+            } else {
+                class | (suffix_offset as u64 & Self::TRANSIENT_MASK)
+            };
             match self.disabled_window_classes.compare_exchange_weak(
                 observed,
                 receipt,
@@ -2786,7 +2919,8 @@ struct K0ConsumptionRunPlan {
     // the incumbent consumption run alone, `usize::MAX` is its established
     // unbounded reverse-suffix route, and every other positive value is the
     // HIR-authenticated finite maximum for ordinary pooled Span recovery.
-    // Thus the new finite facade retains no additional plan bytes.
+    // The adaptive word below carries any bounded-literal-repeat descriptor,
+    // so incumbent values and high-byte membership remain byte-for-byte raw.
     span_recovery: usize,
     // Runtime-dispatch scanners are naturally wide enough without this word;
     // use the recovered word for a source-independent performance hint while
@@ -2796,6 +2930,33 @@ struct K0ConsumptionRunPlan {
 }
 
 impl K0ConsumptionRunPlan {
+    fn finite_span_recovery_maximum_match_bytes(&self) -> Option<usize> {
+        (self.span_recovery != 0 && self.span_recovery != usize::MAX)
+            .then_some(self.span_recovery)
+    }
+
+    fn bounded_literal_repeat_span_lengths(&self) -> Option<(usize, usize)> {
+        self.reverse_suffix_span_adaptive
+            .bounded_literal_repeat_lengths()
+    }
+
+    fn try_install_bounded_literal_repeat_span(
+        &mut self,
+        token_bytes: usize,
+        tail_bytes: usize,
+        maximum_match_bytes: usize,
+    ) -> bool {
+        if self.high_members != [0, 0]
+            || self.finite_span_recovery_maximum_match_bytes() != Some(maximum_match_bytes)
+            || token_bytes == 0
+            || tail_bytes == 0
+        {
+            return false;
+        }
+        self.reverse_suffix_span_adaptive
+            .try_install_bounded_literal_repeat_descriptor(token_bytes, tail_bytes)
+    }
+
     fn contains(&self, byte: u8) -> bool {
         if byte < 0x80 {
             return self.ascii_members.set().contains(byte);
@@ -2954,10 +3115,17 @@ impl K0MandatorySuffixPlan {
 
     fn pooled_finite_consumption_span_maximum_match_bytes(&self) -> Option<usize> {
         match &self.recovery {
-            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
-                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
-            {
-                Some(scanner.span_recovery)
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner) => {
+                scanner.finite_span_recovery_maximum_match_bytes()
+            }
+            _ => None,
+        }
+    }
+
+    fn bounded_literal_repeat_span_lengths(&self) -> Option<(usize, usize)> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner) => {
+                scanner.bounded_literal_repeat_span_lengths()
             }
             _ => None,
         }
@@ -2970,7 +3138,9 @@ impl K0MandatorySuffixPlan {
     ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
-                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
+                if scanner
+                    .finite_span_recovery_maximum_match_bytes()
+                    .is_some() =>
             {
                 scanner
                     .reverse_suffix_span_adaptive
@@ -2988,17 +3158,44 @@ impl K0MandatorySuffixPlan {
     ) -> bool {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
-                if scanner.span_recovery != 0 && scanner.span_recovery != usize::MAX =>
+                if scanner
+                    .finite_span_recovery_maximum_match_bytes()
+                    .is_some() =>
+            {
+                scanner.bounded_literal_repeat_span_lengths().is_none()
+                    && scanner
+                        .reverse_suffix_span_adaptive
+                        .finite_early_prefix_matches(
+                            window.end().saturating_sub(window.start()),
+                            &haystack[window.start()..window.end()],
+                            self.needle(),
+                        )
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn pooled_finite_consumption_span_early_prefix_offset(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
+                if scanner
+                    .finite_span_recovery_maximum_match_bytes()
+                    .is_some() =>
             {
                 scanner
                     .reverse_suffix_span_adaptive
-                    .finite_early_prefix_matches(
+                    .finite_early_prefix_offset(
                         window.end().saturating_sub(window.start()),
                         &haystack[window.start()..window.end()],
                         self.needle(),
                     )
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -3010,6 +3207,16 @@ impl K0MandatorySuffixPlan {
     ) -> bool {
         let _ = (self, haystack, window);
         true
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn pooled_finite_consumption_span_early_prefix_offset(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<usize> {
+        let _ = (self, haystack, window);
+        None
     }
 
     #[cfg(not(target_has_atomic = "64"))]
@@ -3895,6 +4102,95 @@ fn try_build_k0_consumption_run(
             .unwrap_or(0),
         reverse_suffix_span_adaptive: K0ReverseSuffixSpanAdaptiveState::new(),
     }))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the late optional proof closes source, suffix, cut, width, and planner receipts before mutating its compact recovery payload"
+)]
+fn try_admit_k0_bounded_literal_repeat_span(
+    suffix: Option<&mut K0MandatorySuffixPlan>,
+    mandatory_cut: Option<K0MandatoryCutPlan>,
+    structural_hir: &Hir,
+    minimum_match_bytes: Option<usize>,
+    maximum_match_bytes: Option<usize>,
+    initial_work: u64,
+    max_planner_work: u64,
+) -> Result<u64, BuildError> {
+    if !cfg!(target_has_atomic = "64")
+        || mandatory_cut.map(K0MandatoryCutPlan::maximum_before_root)
+            != Some(MaximumConsumedDistance::Finite(0))
+    {
+        return Ok(initial_work);
+    }
+    let (Some(minimum_match_bytes), Some(maximum_match_bytes), Some(suffix)) =
+        (minimum_match_bytes, maximum_match_bytes, suffix)
+    else {
+        return Ok(initial_work);
+    };
+    let K0MandatorySuffixPlan { literal, recovery } = suffix;
+    let K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner) = recovery else {
+        return Ok(initial_work);
+    };
+    if scanner
+        .finite_span_recovery_maximum_match_bytes()
+        != Some(maximum_match_bytes)
+        || scanner.bounded_literal_repeat_span_lengths().is_some()
+    {
+        return Ok(initial_work);
+    }
+    let inspection = match k0_reverse_suffix_span::inspect_bounded_literal_repeat(
+        structural_hir,
+        literal.needle(),
+        minimum_match_bytes,
+        maximum_match_bytes,
+        initial_work,
+        max_planner_work,
+    ) {
+        Ok(inspection) => inspection,
+        Err(k0_reverse_suffix_span::InspectionError::WorkLimit {
+            actual,
+            needed,
+            limit,
+        }) => {
+            if actual < initial_work
+                || actual > limit
+                || needed <= limit
+                || limit != max_planner_work
+            {
+                return Err(BuildError::InternalInvariant(
+                    "bounded literal-repeat Span work refusal did not close",
+                ));
+            }
+            return Ok(actual);
+        }
+        Err(k0_reverse_suffix_span::InspectionError::ArithmeticOverflow) => {
+            return Err(BuildError::InternalInvariant(
+                "bounded literal-repeat Span inspection overflowed",
+            ));
+        }
+    };
+    let planner_work = inspection.planner_work();
+    if planner_work < initial_work || planner_work > max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "bounded literal-repeat Span successful work receipt did not close",
+        ));
+    }
+    let k0_reverse_suffix_span::BoundedLiteralRepeatInspectionOutcome::Eligible(inspection) =
+        inspection
+    else {
+        return Ok(planner_work);
+    };
+    if !scanner.try_install_bounded_literal_repeat_span(
+        inspection.token_bytes(),
+        inspection.tail_bytes(),
+        maximum_match_bytes,
+    ) {
+        return Err(BuildError::InternalInvariant(
+            "bounded literal-repeat descriptor installation disagreed with its preflight",
+        ));
+    }
+    Ok(planner_work)
 }
 
 fn insert_k0_consumption_range(
@@ -10308,6 +10604,20 @@ impl PortableBuilder {
         let line_token_loop_storage_bytes = line_token_loop_exists
             .as_deref()
             .map_or(0, |_| k0_line_token_loop_exists::Plan::storage_bytes());
+        // Spend only residual planner authority on the compact ordinary Span
+        // proof after every incumbent K0 owner has been retained. Success
+        // mutates no layout or storage accounting: an all-ASCII consumption
+        // run carries the descriptor in words that still denote an empty
+        // high-byte set. Refusal leaves its established recovery untouched.
+        fallback_planner_work = try_admit_k0_bounded_literal_repeat_span(
+            mandatory_suffix_plan.as_mut(),
+            mandatory_cut_plan,
+            &rust.hir,
+            minimum_match_bytes,
+            rust.hir.properties().maximum_len(),
+            fallback_planner_work,
+            self.limits.max_planner_work,
+        )?;
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(lazy_delimited_repeat_storage_bytes)
@@ -10979,6 +11289,52 @@ mod finite_consumption_span_facade_probe {
     }
 }
 
+#[cfg(test)]
+mod bounded_literal_repeat_span_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) attempts: usize,
+        pub(super) completions: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            attempts: 0,
+            completions: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_attempt() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                attempts: counts.attempts.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_completion() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                completions: counts.completions.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+}
+
 // Re-authenticating the borrowed projection is not competitive with the
 // existing canonical warmed entry on tiny sources. Admit the ordinary lane
 // only where its omitted invocation ledger can amortize that fixed handoff.
@@ -11233,6 +11589,95 @@ fn try_k0_warm_exact_minimum_suffix_exists(
         .map(|found| found.is_some())
 }
 
+/// Complete one warmed early bounded-literal-repeat Span without borrowing K0
+/// workspace.
+///
+/// Construction proves the exact language `L{m,n}S`, binds the retained
+/// mandatory suffix to `L^m S`, proves a tail barrier, and admits only a
+/// zero-distance mandatory cut. The revalidated receipt supplies the suffix
+/// offset. If the first cut member begins a whole number of additional `L`
+/// tokens ending at that suffix, the cut proves no earlier match start and the
+/// barrier proves this accepted endpoint is the unique greedy endpoint.
+/// Every mismatch is a read-only decline to the incumbent K0 path.
+#[inline(never)]
+fn try_k0_bounded_literal_repeat_early_span(
+    suffix: &K0MandatorySuffixPlan,
+    cut: K0MandatoryCutPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+    suffix_offset: usize,
+) -> Option<fre_automata::MatchSpan> {
+    #[cfg(test)]
+    bounded_literal_repeat_span_probe::record_attempt();
+    if window.start() != 0
+        || window.end() != haystack.len()
+        || cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+        || minimum_match_bytes == 0
+        || minimum_match_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let (token_bytes, tail_bytes) = suffix.bounded_literal_repeat_span_lengths()?;
+    let needle = suffix.needle();
+    if needle.len() != minimum_match_bytes
+        || token_bytes == 0
+        || tail_bytes == 0
+        || tail_bytes >= needle.len()
+        || tail_bytes > maximum_match_bytes
+    {
+        return None;
+    }
+    let minimum_prefix_bytes = needle.len().checked_sub(tail_bytes)?;
+    let maximum_prefix_bytes = maximum_match_bytes.checked_sub(tail_bytes)?;
+    if minimum_prefix_bytes == 0
+        || !minimum_prefix_bytes.is_multiple_of(token_bytes)
+        || !maximum_prefix_bytes.is_multiple_of(token_bytes)
+    {
+        return None;
+    }
+    let token = needle.get(..token_bytes)?;
+    let tail_first = *needle.get(minimum_prefix_bytes)?;
+    if token.contains(&tail_first) {
+        return None;
+    }
+
+    let first_member = cut.first_member(&haystack[window.start()..window.end()])?;
+    let selected_start = window.start().checked_add(first_member)?;
+    let suffix_start = window.start().checked_add(suffix_offset)?;
+    let added_prefix_bytes = suffix_start.checked_sub(selected_start)?;
+    if !added_prefix_bytes.is_multiple_of(token_bytes) {
+        return None;
+    }
+    let minimum_repeats = minimum_prefix_bytes / token_bytes;
+    let maximum_repeats = maximum_prefix_bytes / token_bytes;
+    let added_repeats = added_prefix_bytes / token_bytes;
+    let selected_repeats = minimum_repeats.checked_add(added_repeats)?;
+    if selected_repeats > maximum_repeats {
+        return None;
+    }
+    let prefix = haystack.get(selected_start..suffix_start)?;
+    if prefix
+        .chunks_exact(token_bytes)
+        .any(|candidate| candidate != token)
+    {
+        return None;
+    }
+    let selected_end = suffix_start.checked_add(needle.len())?;
+    if selected_end > window.end()
+        || selected_end.checked_sub(selected_start)?
+            != selected_repeats
+                .checked_mul(token_bytes)?
+                .checked_add(tail_bytes)?
+    {
+        return None;
+    }
+    #[cfg(test)]
+    bounded_literal_repeat_span_probe::record_completion();
+    Some(fre_automata::MatchSpan::new(selected_start, selected_end))
+}
+
 impl PortableK0Plan {
     fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
         self.exclusive.correlated_terminal()
@@ -11383,6 +11828,29 @@ impl PortableK0Plan {
                 > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
         {
             return Ok(K0PooledFiniteConsumptionSpanRoute::Unattempted);
+        }
+        if let Some(suffix_offset) = suffix
+            .pooled_finite_consumption_span_early_prefix_offset(haystack, window)
+        {
+            let completed = self
+                .mandatory_cut
+                .and_then(|cut| {
+                    try_k0_bounded_literal_repeat_early_span(
+                        suffix,
+                        cut,
+                        haystack,
+                        window,
+                        minimum_match_bytes,
+                        maximum_match_bytes,
+                        suffix_offset,
+                    )
+                });
+            return Ok(completed.map_or(
+                K0PooledFiniteConsumptionSpanRoute::Unattempted,
+                |matched| {
+                    K0PooledFiniteConsumptionSpanRoute::Complete(Some(matched))
+                },
+            ));
         }
         let Some(admission) = suffix.try_admit_pooled_finite_consumption_span(window_bytes)
         else {
@@ -28182,6 +28650,7 @@ mod tests {
             suffix.pooled_finite_consumption_span_maximum_match_bytes(),
             Some(11),
         );
+        assert_eq!(suffix.bounded_literal_repeat_span_lengths(), Some((2, 1)));
         assert!(!suffix.has_reverse_suffix_span());
 
         let upstream = regex::bytes::RegexBuilder::new(PATTERN)
@@ -28231,8 +28700,8 @@ mod tests {
 
         // A suffix close to the incumbent floor is exact but not economical.
         // The outlined route records its exact prefix position before touching
-        // reverse workspace; subsequent calls revalidate those few literal
-        // bytes and remain on authoritative forward K0.
+        // reverse workspace; subsequent calls revalidate that receipt and
+        // complete this exact literal-repeat shape without pooled workspace.
         let early_regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -28243,6 +28712,7 @@ mod tests {
             .find(&early)
             .map(|matched| (matched.start(), matched.end()));
         super::finite_consumption_span_facade_probe::reset();
+        super::bounded_literal_repeat_span_probe::reset();
         assert_eq!(
             early_regex
                 .find(&early)
@@ -28264,7 +28734,7 @@ mod tests {
             .mandatory_suffix
             .as_ref()
             .expect("early bounded repeat retains its mandatory suffix");
-        assert!(early_suffix.pooled_finite_consumption_span_should_bypass_early(
+        assert!(!early_suffix.pooled_finite_consumption_span_should_bypass_early(
             &early,
             SearchWindow::full(&early),
         ));
@@ -28283,7 +28753,15 @@ mod tests {
                 completions: 0,
                 declines: 1,
             },
-            "a revalidated near-prefix receipt leaves later calls on incumbent K0",
+            "the direct receipt path must not re-enter the pooled finite facade",
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 72,
+                completions: 72,
+            },
+            "a revalidated exact receipt must complete through the direct leaf",
         );
 
         // Changing the recorded suffix bytes invalidates the old receipt
@@ -28446,6 +28924,331 @@ mod tests {
             "an in-flight foreign owner must leave this invocation on incumbent K0",
         );
         drop(admission);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn bounded_literal_repeat_direct_span_is_oracle_exact_and_fail_closed() {
+        fn span(matched: Option<Match>) -> Option<(usize, usize)> {
+            matched.map(|matched| (matched.start, matched.end))
+        }
+
+        fn descriptor(regex: &PortableRegex) -> Option<(usize, usize)> {
+            let PortablePlan::K0(plan) = &regex.plan else {
+                panic!("focused bounded literal repeat must retain K0");
+            };
+            plan.mandatory_suffix
+                .as_ref()
+                .and_then(K0MandatorySuffixPlan::bounded_literal_repeat_span_lengths)
+        }
+
+        fn assert_warm_direct(
+            regex: &PortableRegex,
+            upstream: &regex::bytes::Regex,
+            haystack: &[u8],
+            expected_direct: bool,
+            label: &str,
+        ) {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(span(regex.find(haystack)), expected, "cold {label}");
+            super::bounded_literal_repeat_span_probe::reset();
+            super::finite_consumption_span_facade_probe::reset();
+            assert_eq!(span(regex.find(haystack)), expected, "warm {label}");
+            let expected_counts = if expected_direct {
+                super::bounded_literal_repeat_span_probe::Counts {
+                    attempts: 1,
+                    completions: 1,
+                }
+            } else {
+                super::bounded_literal_repeat_span_probe::Counts::default()
+            };
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                expected_counts,
+                "warm exact receipt did not close directly: {label}",
+            );
+            if expected_direct {
+                assert_eq!(
+                    super::finite_consumption_span_facade_probe::snapshot(),
+                    super::finite_consumption_span_facade_probe::Counts::default(),
+                    "warm exact receipt re-entered pooled workspace: {label}",
+                );
+            }
+        }
+
+        for (pattern, token, tail, minimum, maximum) in [
+            (r"(?:ab){2,5}c", b"ab".as_slice(), b"c".as_slice(), 2, 5),
+            (
+                r"(?:ab){2,5}XYZ",
+                b"ab".as_slice(),
+                b"XYZ".as_slice(),
+                2,
+                5,
+            ),
+            (
+                r"(?:xyz){3,6}q",
+                b"xyz".as_slice(),
+                b"q".as_slice(),
+                3,
+                6,
+            ),
+        ] {
+            let descriptor_regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("focused bounded literal repeat builds");
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                descriptor(&descriptor_regex),
+                Some((token.len(), tail.len())),
+            );
+            for length in [1_024, 4_093] {
+                for start in [0, 1, 2, 31, 32] {
+                    for repeats in minimum..=maximum {
+                        let regex = PortableBuilder::new(pattern)
+                            .unicode(false)
+                            .build()
+                            .expect("isolated bounded literal repeat builds");
+                        let mut matched = Vec::new();
+                        for _ in 0..repeats {
+                            matched.extend_from_slice(token);
+                        }
+                        matched.extend_from_slice(tail);
+                        let mut haystack = vec![b'!'; length];
+                        haystack[start..start + matched.len()].copy_from_slice(&matched);
+                        assert_warm_direct(
+                            &regex,
+                            &upstream,
+                            &haystack,
+                            start == 0,
+                            &format!(
+                                "pattern={pattern:?} length={length} start={start} repeats={repeats}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        const PATTERN: &str = r"(?:ab){2,5}c";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        // A first cut member that is not the beginning of a whole token chain
+        // makes the leaf decline without disturbing the authoritative route.
+        for (decoy, start) in [(b"a!".as_slice(), 31), (b"ab!".as_slice(), 32)] {
+            let mut haystack = vec![b'!'; 4_093];
+            haystack[..decoy.len()].copy_from_slice(decoy);
+            haystack[start..start + 7].copy_from_slice(b"abababc");
+            let expected = upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(span(regex.find(&haystack)), expected);
+            super::bounded_literal_repeat_span_probe::reset();
+            assert_eq!(span(regex.find(&haystack)), expected);
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts {
+                    attempts: 1,
+                    completions: 0,
+                },
+            );
+        }
+
+        let mut overlong = vec![b'!'; 4_093];
+        overlong[..13].copy_from_slice(b"ababababababc");
+        let overlong_regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let overlong_expected = upstream
+            .find(&overlong)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(overlong_expected, Some((2, 13)));
+        assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
+        super::bounded_literal_repeat_span_probe::reset();
+        assert_eq!(span(overlong_regex.find(&overlong)), overlong_expected);
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 0,
+            },
+            "a receipt implying max+1 repeats must decline to shifted incumbent K0",
+        );
+
+        // Reuse one allocation after publishing a receipt. A changed prefix
+        // with the authenticated suffix still present must decline read-only;
+        // changing the suffix itself clears the hint before entering the leaf.
+        let mut reused = vec![b'!'; 4_093];
+        reused[..11].copy_from_slice(b"abababababc");
+        reused[64..71].copy_from_slice(b"abababc");
+        let expected = upstream
+            .find(&reused)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(span(regex.find(&reused)), expected);
+        reused[1] = b'!';
+        let mutated_expected = upstream
+            .find(&reused)
+            .map(|matched| (matched.start(), matched.end()));
+        super::bounded_literal_repeat_span_probe::reset();
+        assert_eq!(span(regex.find(&reused)), mutated_expected);
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts {
+                attempts: 1,
+                completions: 0,
+            },
+        );
+        reused[6] = b'!';
+        super::bounded_literal_repeat_span_probe::reset();
+        assert_eq!(
+            span(regex.find(&reused)),
+            upstream
+                .find(&reused)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts::default(),
+            "changed receipt bytes must invalidate before the direct leaf",
+        );
+
+        // The existing structural window and width boundaries remain exact.
+        for length in [1_023, 1_024] {
+            let mut haystack = vec![b'!'; length];
+            haystack[..7].copy_from_slice(b"abababc");
+            let boundary_regex = PortableBuilder::new(PATTERN)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected = upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(span(boundary_regex.find(&haystack)), expected);
+            super::bounded_literal_repeat_span_probe::reset();
+            assert_eq!(span(boundary_regex.find(&haystack)), expected);
+            let expected_counts = if length == 1_024 {
+                super::bounded_literal_repeat_span_probe::Counts {
+                    attempts: 1,
+                    completions: 1,
+                }
+            } else {
+                super::bounded_literal_repeat_span_probe::Counts::default()
+            };
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                expected_counts,
+            );
+        }
+        let overwide_pattern = r"(?:ab){2,600}c";
+        let overwide = PortableBuilder::new(overwide_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let overwide_upstream = regex::bytes::RegexBuilder::new(overwide_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut overwide_source = vec![b'!'; 4_093];
+        overwide_source[..7].copy_from_slice(b"abababc");
+        super::bounded_literal_repeat_span_probe::reset();
+        for _ in 0..2 {
+            assert_eq!(
+                span(overwide.find(&overwide_source)),
+                overwide_upstream
+                    .find(&overwide_source)
+                    .map(|matched| (matched.start(), matched.end())),
+            );
+        }
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts::default(),
+        );
+
+        // Late and absent sources never manufacture an early-prefix receipt.
+        for maybe_start in [None, Some(1_500)] {
+            let late_regex = PortableBuilder::new(PATTERN)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut haystack = vec![b'!'; 4_093];
+            if let Some(start) = maybe_start {
+                haystack[start..start + 7].copy_from_slice(b"abababc");
+            }
+            super::bounded_literal_repeat_span_probe::reset();
+            for _ in 0..2 {
+                assert_eq!(
+                    span(late_regex.find(&haystack)),
+                    upstream
+                        .find(&haystack)
+                        .map(|matched| (matched.start(), matched.end())),
+                );
+            }
+            assert_eq!(
+                super::bounded_literal_repeat_span_probe::snapshot(),
+                super::bounded_literal_repeat_span_probe::Counts::default(),
+            );
+        }
+
+        // Explicit/accounted/limited/window and Exists calls never enter this
+        // ordinary full-window unlimited Span leaf, including on error.
+        let mut early = vec![b'!'; 4_093];
+        early[..7].copy_from_slice(b"abababc");
+        assert_eq!(span(regex.find(&early)), Some((0, 7)));
+        super::bounded_literal_repeat_span_probe::reset();
+        let full = SearchWindow::full(&early);
+        assert_eq!(span(regex.find_value(&early, SearchLimits::unlimited()).unwrap()), Some((0, 7)));
+        assert_eq!(span(regex.find_accounted(&early, SearchLimits::unlimited()).unwrap().0), Some((0, 7)));
+        assert_eq!(span(regex.find_window_value(&early, full, SearchLimits::unlimited()).unwrap()), Some((0, 7)));
+        assert!(regex.is_match(&early));
+        let refusing = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(regex.find_value(&early, refusing).is_err());
+        assert!(regex
+            .find_window_value(
+                &early,
+                SearchWindow::new(early.len() + 1, early.len()),
+                refusing,
+            )
+            .is_err());
+        assert_eq!(
+            super::bounded_literal_repeat_span_probe::snapshot(),
+            super::bounded_literal_repeat_span_probe::Counts::default(),
+        );
+
+        for pattern in [
+            r"(?:ab){0,5}c",
+            r"(?:ab){2,}c",
+            r"(?:ab){2,5}?c",
+            r"(?:ab){2,5}a",
+            r"(?:[ab]){2,5}c",
+            r"x(?:ab){2,5}c",
+            r"\A(?:ab){2,5}c",
+            r"(?:ab){2,5}c$",
+            r"(?:ab|a){2,5}c",
+            r"(?:\xFF){2,5}c",
+        ] {
+            let refused = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("nearby refusal fixture builds");
+            assert_eq!(descriptor(&refused), None, "unsafe shape admitted: {pattern:?}");
+        }
     }
 
     #[test]
@@ -30601,6 +31404,162 @@ mod tests {
         );
         assert!(!malformed.finite_early_prefix_matches(1_024, &early, NEEDLE));
         assert_eq!(malformed.load(), 0);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn bounded_literal_repeat_descriptor_survives_every_receipt_transition() {
+        const WINDOW_BYTES: usize = 4_096;
+        const OTHER_CLASS_BYTES: usize = 16_384;
+        const OFFSET: usize = 6;
+        const NEEDLE: &[u8] = b"ababc";
+
+        for (token_bytes, tail_bytes) in [(1, 1), (1_024, 1_024)] {
+            let mut boundary = super::K0ReverseSuffixSpanAdaptiveState::new();
+            assert!(boundary
+                .try_install_bounded_literal_repeat_descriptor(token_bytes, tail_bytes));
+            assert_eq!(
+                boundary.bounded_literal_repeat_lengths(),
+                Some((token_bytes, tail_bytes)),
+            );
+        }
+        for (token_bytes, tail_bytes) in [(0, 1), (1, 0), (1_025, 1), (1, 1_025)] {
+            let mut boundary = super::K0ReverseSuffixSpanAdaptiveState::new();
+            assert!(!boundary
+                .try_install_bounded_literal_repeat_descriptor(token_bytes, tail_bytes));
+            assert_eq!(boundary.load(), 0);
+        }
+        for offset in [511, 512, 1_023] {
+            let mut boundary = super::K0ReverseSuffixSpanAdaptiveState::new();
+            assert!(boundary.try_install_bounded_literal_repeat_descriptor(2, 1));
+            boundary
+                .try_admit_finite(WINDOW_BYTES)
+                .unwrap()
+                .observe_finite_early_prefix(WINDOW_BYTES, offset);
+            let mut window = vec![b'x'; WINDOW_BYTES];
+            window[offset..offset + NEEDLE.len()].copy_from_slice(NEEDLE);
+            assert_eq!(
+                boundary.finite_early_prefix_offset(WINDOW_BYTES, &window, NEEDLE),
+                Some(offset),
+            );
+            assert_eq!(boundary.bounded_literal_repeat_lengths(), Some((2, 1)));
+        }
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::bounded_receipt_class(
+                super::K0ReverseSuffixSpanAdaptiveState::BOUNDED_RECEIPT_VALID
+                    | (38_u64
+                        << super::K0ReverseSuffixSpanAdaptiveState::BOUNDED_RECEIPT_CLASS_SHIFT),
+            ),
+            None,
+            "a normal one-hot class bit cannot impersonate a descriptor receipt",
+        );
+
+        let mut adaptive = super::K0ReverseSuffixSpanAdaptiveState::new();
+        assert!(adaptive.try_install_bounded_literal_repeat_descriptor(2, 1));
+        assert_eq!(adaptive.bounded_literal_repeat_lengths(), Some((2, 1)));
+        let descriptor = adaptive.load();
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::bounded_descriptor_metadata(descriptor),
+            Some(descriptor),
+        );
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::bounded_receipt_class(descriptor),
+            None,
+        );
+        assert!(!adaptive.try_install_bounded_literal_repeat_descriptor(2, 1));
+
+        adaptive
+            .try_admit_finite(WINDOW_BYTES)
+            .expect("an immutable descriptor remains independently admissible")
+            .observe_finite_early_prefix(WINDOW_BYTES, OFFSET);
+        assert_eq!(adaptive.bounded_literal_repeat_lengths(), Some((2, 1)));
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::bounded_receipt_class(adaptive.load()),
+            super::K0ReverseSuffixSpanAdaptiveState::window_class(WINDOW_BYTES),
+        );
+        assert_eq!(
+            adaptive.load() & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+            OFFSET as u64,
+        );
+
+        let mut early = vec![b'x'; WINDOW_BYTES];
+        early[OFFSET..OFFSET + NEEDLE.len()].copy_from_slice(NEEDLE);
+        assert_eq!(
+            adaptive.finite_early_prefix_offset(WINDOW_BYTES, &early, NEEDLE),
+            Some(OFFSET),
+        );
+        assert!(
+            adaptive.try_admit_finite(WINDOW_BYTES).is_none(),
+            "an exact same-class receipt stays authoritative",
+        );
+
+        early[OFFSET] = b'y';
+        assert_eq!(
+            adaptive.finite_early_prefix_offset(WINDOW_BYTES, &early, NEEDLE),
+            None,
+        );
+        assert_eq!(adaptive.load(), descriptor);
+        assert_eq!(adaptive.bounded_literal_repeat_lengths(), Some((2, 1)));
+        drop(
+            adaptive
+                .try_admit_finite(WINDOW_BYTES)
+                .expect("changed source clears only the receipt"),
+        );
+        assert_eq!(adaptive.load(), descriptor);
+
+        early[OFFSET] = NEEDLE[0];
+        adaptive
+            .try_admit_finite(WINDOW_BYTES)
+            .expect("the cleared descriptor can publish a replacement receipt")
+            .observe_finite_early_prefix(WINDOW_BYTES, OFFSET);
+        let other_class = adaptive
+            .try_admit_finite(OTHER_CLASS_BYTES)
+            .expect("another class clears only the receipt and admits immediately");
+        assert_eq!(adaptive.bounded_literal_repeat_lengths(), Some((2, 1)));
+        drop(other_class);
+        assert_eq!(adaptive.load(), descriptor);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn bounded_literal_repeat_descriptor_has_one_concurrent_receipt_owner() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        const CONTENDERS: usize = 8;
+        let mut adaptive = super::K0ReverseSuffixSpanAdaptiveState::new();
+        assert!(adaptive.try_install_bounded_literal_repeat_descriptor(2, 1));
+        let adaptive = Arc::new(adaptive);
+        let start = Arc::new(Barrier::new(CONTENDERS + 1));
+        let hold = Arc::new(Barrier::new(CONTENDERS + 1));
+        let owners = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..CONTENDERS {
+                let adaptive = Arc::clone(&adaptive);
+                let start = Arc::clone(&start);
+                let hold = Arc::clone(&hold);
+                let owners = Arc::clone(&owners);
+                scope.spawn(move || {
+                    start.wait();
+                    let admission = adaptive.try_admit_finite(4_096);
+                    if admission.is_some() {
+                        owners.fetch_add(1, Ordering::Relaxed);
+                    }
+                    hold.wait();
+                    drop(admission);
+                });
+            }
+            start.wait();
+            hold.wait();
+        });
+        assert_eq!(owners.load(Ordering::Relaxed), 1);
+        assert_eq!(adaptive.bounded_literal_repeat_lengths(), Some((2, 1)));
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::bounded_receipt_class(adaptive.load()),
+            None,
+        );
     }
 
     #[test]

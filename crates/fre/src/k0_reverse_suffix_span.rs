@@ -1,4 +1,5 @@
-//! Allocation-free source-order proofs for unbounded K0 reverse-suffix Span.
+//! Allocation-free source-order and selected-span proofs for K0 mandatory
+//! suffix routes.
 //!
 //! A retained mandatory suffix is useful for recovering a match start only
 //! when visiting suffix occurrences in source order cannot skip a globally
@@ -51,6 +52,38 @@ pub(crate) enum Proof {
     /// Each repeated prefix unit ends in a byte-class separator that cannot
     /// occur in another unit component or in the terminal suffix.
     CyclicTrailingClassSeparator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedLiteralRepeatInspection {
+    token_bytes: usize,
+    tail_bytes: usize,
+    planner_work: u64,
+}
+
+impl BoundedLiteralRepeatInspection {
+    pub(crate) const fn token_bytes(self) -> usize {
+        self.token_bytes
+    }
+
+    pub(crate) const fn tail_bytes(self) -> usize {
+        self.tail_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundedLiteralRepeatInspectionOutcome {
+    Eligible(BoundedLiteralRepeatInspection),
+    Ineligible { planner_work: u64 },
+}
+
+impl BoundedLiteralRepeatInspectionOutcome {
+    pub(crate) const fn planner_work(self) -> u64 {
+        match self {
+            Self::Eligible(inspection) => inspection.planner_work,
+            Self::Ineligible { planner_work } => planner_work,
+        }
+    }
 }
 
 /// Completed optional proof and its exact cumulative planner work.
@@ -159,6 +192,133 @@ pub(crate) fn inspect(
             planner_work: meter.work,
         },
     })
+}
+
+/// Prove the exact finite byte language `L{m,n}S` for the bounded ordinary
+/// selected-span leaf. Captures are transparent; every other HIR node and any
+/// assertion refuse. The retained mandatory suffix must equal `L^m S`, and
+/// the first byte of `S` must occur nowhere in `L`, making the greedy endpoint
+/// unique for a fixed start.
+pub(crate) fn inspect_bounded_literal_repeat(
+    hir: &Hir,
+    mandatory_suffix: &[u8],
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+    initial_work: u64,
+    max_planner_work: u64,
+) -> Result<BoundedLiteralRepeatInspectionOutcome, InspectionError> {
+    let mut meter = Meter::new(initial_work, max_planner_work)?;
+    let proof = inspect_bounded_literal_repeat_inner(
+        hir,
+        mandatory_suffix,
+        minimum_match_bytes,
+        maximum_match_bytes,
+        &mut meter,
+    )?;
+    Ok(match proof {
+        Some((token_bytes, tail_bytes)) => {
+            BoundedLiteralRepeatInspectionOutcome::Eligible(BoundedLiteralRepeatInspection {
+                token_bytes,
+                tail_bytes,
+                planner_work: meter.work,
+            })
+        }
+        None => BoundedLiteralRepeatInspectionOutcome::Ineligible {
+            planner_work: meter.work,
+        },
+    })
+}
+
+fn inspect_bounded_literal_repeat_inner(
+    hir: &Hir,
+    mandatory_suffix: &[u8],
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+    meter: &mut Meter,
+) -> Result<Option<(usize, usize)>, InspectionError> {
+    let root = peel_captures(hir, meter)?;
+    let HirKind::Concat(parts) = root.kind() else {
+        return Ok(None);
+    };
+    let [repeated, tail] = parts.as_slice() else {
+        return Ok(None);
+    };
+    let repeated = peel_captures(repeated, meter)?;
+    let HirKind::Repetition(repetition) = repeated.kind() else {
+        return Ok(None);
+    };
+    let Some(maximum_repeats) = repetition.max else {
+        return Ok(None);
+    };
+    if !repetition.greedy || repetition.min == 0 || maximum_repeats < repetition.min {
+        return Ok(None);
+    }
+    let token = peel_captures(&repetition.sub, meter)?;
+    let HirKind::Literal(token) = token.kind() else {
+        return Ok(None);
+    };
+    let tail = peel_captures(tail, meter)?;
+    let HirKind::Literal(tail) = tail.kind() else {
+        return Ok(None);
+    };
+    if token.0.is_empty() || tail.0.is_empty() {
+        return Ok(None);
+    }
+    let tail_head = tail.0[0];
+    for &byte in token.0.iter() {
+        meter.charge(LITERAL_BYTE_WORK)?;
+        if !byte.is_ascii() || byte == tail_head {
+            return Ok(None);
+        }
+    }
+    for &byte in tail.0.iter() {
+        meter.charge(LITERAL_BYTE_WORK)?;
+        if !byte.is_ascii() {
+            return Ok(None);
+        }
+    }
+    let minimum_repeats =
+        usize::try_from(repetition.min).map_err(|_| InspectionError::ArithmeticOverflow)?;
+    let maximum_repeats =
+        usize::try_from(maximum_repeats).map_err(|_| InspectionError::ArithmeticOverflow)?;
+    meter.charge(WIDTH_ARITHMETIC_WORK)?;
+    let minimum_prefix_bytes = token
+        .0
+        .len()
+        .checked_mul(minimum_repeats)
+        .ok_or(InspectionError::ArithmeticOverflow)?;
+    meter.charge(WIDTH_ARITHMETIC_WORK)?;
+    let maximum_prefix_bytes = token
+        .0
+        .len()
+        .checked_mul(maximum_repeats)
+        .ok_or(InspectionError::ArithmeticOverflow)?;
+    meter.charge(WIDTH_ARITHMETIC_WORK)?;
+    let computed_minimum = minimum_prefix_bytes
+        .checked_add(tail.0.len())
+        .ok_or(InspectionError::ArithmeticOverflow)?;
+    meter.charge(WIDTH_ARITHMETIC_WORK)?;
+    let computed_maximum = maximum_prefix_bytes
+        .checked_add(tail.0.len())
+        .ok_or(InspectionError::ArithmeticOverflow)?;
+    if computed_minimum != minimum_match_bytes
+        || computed_maximum != maximum_match_bytes
+        || mandatory_suffix.len() != minimum_match_bytes
+    {
+        return Ok(None);
+    }
+    for (index, &actual) in mandatory_suffix.iter().enumerate() {
+        meter.charge(SUFFIX_BYTE_WORK)?;
+        let expected = if index < minimum_prefix_bytes {
+            token.0[index % token.0.len()]
+        } else {
+            tail.0[index - minimum_prefix_bytes]
+        };
+        if actual != expected {
+            return Ok(None);
+        }
+    }
+    Ok(Some((token.0.len(), tail.0.len())))
 }
 
 fn inspect_inner(
@@ -544,7 +704,10 @@ fn peel_captures<'hir>(
 mod tests {
     use regex_syntax::ParserBuilder;
 
-    use super::{InspectionError, InspectionOutcome, Proof, inspect};
+    use super::{
+        BoundedLiteralRepeatInspectionOutcome, InspectionError, InspectionOutcome, Proof, inspect,
+        inspect_bounded_literal_repeat,
+    };
 
     fn parse_bytes(pattern: &str) -> regex_syntax::hir::Hir {
         ParserBuilder::new()
@@ -566,6 +729,74 @@ mod tests {
             panic!("reverse-suffix Span order proof was refused: {pattern:?}");
         };
         inspection.proof()
+    }
+
+    #[test]
+    fn bounded_literal_repeat_receipt_is_exact_and_replayable() {
+        let hir = parse_bytes(r"(?-u:(?:(ab)){2,5}(c))");
+        let initial_work = 31;
+        let BoundedLiteralRepeatInspectionOutcome::Eligible(inspection) =
+            inspect_bounded_literal_repeat(&hir, b"ababc", 5, 11, initial_work, u64::MAX)
+                .unwrap()
+        else {
+            panic!("exact bounded literal repeat was refused");
+        };
+        assert_eq!(inspection.token_bytes(), 2);
+        assert_eq!(inspection.tail_bytes(), 1);
+        let exact_work = BoundedLiteralRepeatInspectionOutcome::Eligible(inspection).planner_work();
+        assert_eq!(
+            inspect_bounded_literal_repeat(&hir, b"ababc", 5, 11, initial_work, exact_work)
+                .unwrap(),
+            BoundedLiteralRepeatInspectionOutcome::Eligible(inspection),
+        );
+        let one_below = exact_work.checked_sub(1).unwrap();
+        assert!(matches!(
+            inspect_bounded_literal_repeat(&hir, b"ababc", 5, 11, initial_work, one_below),
+            Err(InspectionError::WorkLimit { actual, needed, limit })
+                if actual < needed && needed == exact_work && limit == one_below,
+        ));
+
+        let fixed = parse_bytes(r"(?-u:(?:ab){2,2}XYZ)");
+        let BoundedLiteralRepeatInspectionOutcome::Eligible(fixed) =
+            inspect_bounded_literal_repeat(&fixed, b"ababXYZ", 7, 7, 0, u64::MAX).unwrap()
+        else {
+            panic!("fixed-bound multi-byte-tail repeat was refused");
+        };
+        assert_eq!((fixed.token_bytes(), fixed.tail_bytes()), (2, 3));
+    }
+
+    #[test]
+    fn bounded_literal_repeat_nearby_languages_fail_closed() {
+        for (pattern, suffix, minimum, maximum) in [
+            (r"(?-u:(?:ab){2,5}?c)", b"ababc".as_slice(), 5, 11),
+            (r"(?-u:(?:ab){0,5}c)", b"c".as_slice(), 1, 11),
+            (r"(?-u:(?:ab){2,}c)", b"ababc".as_slice(), 5, 11),
+            (r"(?-u:(?:ab){2,5}a)", b"ababa".as_slice(), 5, 11),
+            (r"(?-u:(?:[ab]){2,5}c)", b"aac".as_slice(), 3, 6),
+            (r"(?-u:(?:ab){2,5}c$)", b"ababc".as_slice(), 5, 11),
+            (r"(?-u:\A(?:ab){2,5}c)", b"ababc".as_slice(), 5, 11),
+            (r"(?-u:(?:ab|a){2,5}c)", b"aac".as_slice(), 3, 11),
+            (r"(?-u:(?:\xFF){2,5}c)", b"\xff\xffc".as_slice(), 3, 6),
+            (r"(?-u:(?:ab){2,5}c)", b"ababc".as_slice(), 4, 11),
+            (r"(?-u:(?:ab){2,5}c)", b"ababc".as_slice(), 5, 10),
+            (r"(?-u:(?:ab){2,5}c)", b"abxbc".as_slice(), 5, 11),
+        ] {
+            assert!(
+                matches!(
+                    inspect_bounded_literal_repeat(
+                        &parse_bytes(pattern),
+                        suffix,
+                        minimum,
+                        maximum,
+                        0,
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                    BoundedLiteralRepeatInspectionOutcome::Ineligible { .. },
+                ),
+                "unsafe nearby language was admitted: {pattern:?}",
+            );
+        }
     }
 
     #[test]
