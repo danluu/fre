@@ -11217,17 +11217,9 @@ impl K0ExclusivePlan {
     }
 
     #[inline]
-    fn try_ordinary_is_match_full(&self, haystack: &[u8]) -> Option<bool> {
+    fn line(&self) -> Option<&K0LinePlan> {
         match self {
-            Self::Line(plan) => plan.try_ordinary_is_match_full(haystack),
-            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
-        }
-    }
-
-    #[inline]
-    fn try_ordinary_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
-        match self {
-            Self::Line(plan) => plan.try_ordinary_find_full(haystack),
+            Self::Line(plan) => Some(plan),
             Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
@@ -14037,7 +14029,8 @@ impl PortableRegex {
             }
             PortablePlan::K0(k0) => {
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(matched) = k0.exclusive.try_ordinary_is_match_full(haystack)
+                    && let Some(plan) = k0.exclusive.line()
+                    && let Some(matched) = plan.try_ordinary_is_match_full(haystack)
                 {
                     return Ok(matched);
                 }
@@ -15761,7 +15754,8 @@ impl PortableRegex {
             }
             PortablePlan::K0(k0) => {
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
-                    && let Some(matched) = k0.exclusive.try_ordinary_find_full(haystack)
+                    && let Some(plan) = k0.exclusive.line()
+                    && let Some(matched) = plan.try_ordinary_find_full(haystack)
                 {
                     return Ok(matched.map(|(start, end)| Match { start, end }));
                 }
