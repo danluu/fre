@@ -1,8 +1,9 @@
 use fre_aot_regex::{
-    CompileMode, DeterminizeLimits, MatchResult, OrderedManyAotCompileDecline,
+    CompileMode, DeterminizeLimits, EntryAbi, MatchResult, OrderedManyAotCompileDecline,
     OrderedManyAotCompileDisposition, OrderedManyAotCompileError, OrderedManyAotCompileLimits,
     OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow, PreparedAggregateExports,
-    PreparedAggregateStrategy, SearchWindow, SlowAotLimits, Target, compile_ordered_many_aot,
+    PreparedAggregateStrategy, PreparedBulkStrategy, SearchWindow, SlowAotLimits, Target,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, compile_ordered_many_aot,
     compile_ordered_many_aot_reported,
 };
 use regex_automata::meta::Regex as MetaRegex;
@@ -261,6 +262,49 @@ fn full_ordinary_optimizer_keeps_helper_free_native_fused_ahead_of_v15() {
 }
 
 #[test]
+fn shared_v15_scalar_operation_is_closed_for_count_and_span_sum_cross_isa() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        for export in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+        ] {
+            let artifact = compile_ordered_many_aot(
+                OrderedManyAotCompileRequest::new(
+                    rows(&[r"(?-u:[\x00-\xFF])\bfoo\b"], &[0]),
+                    target,
+                )
+                .mode(CompileMode::Fast),
+                export,
+                SlowAotLimits::default(),
+            )
+            .expect("shared Ordered-NFA scalar operation");
+            let compiled = artifact.compiled();
+            let module = compiled.module();
+            assert_eq!(
+                artifact.receipt().aggregate_strategy,
+                PreparedAggregateStrategy::NativeOrderedNfaFused,
+            );
+            assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(
+                compiled.receipt().required_prepare_capabilities,
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            );
+            assert!(!compiled.receipt().runtime_helper_required);
+            assert_eq!(module.prepared_bulk_strategy(), None);
+            assert_eq!(module.prepared_entry_symbol(), None);
+            assert_eq!(module.prepared_span_fill_symbol(), None);
+            assert!(module.required_runtime_symbols().next().is_none());
+            let reducer = if export == PreparedAggregateExports::COUNT {
+                module.prepared_count_symbol()
+            } else {
+                module.prepared_span_sum_symbol()
+            };
+            assert_eq!(reducer, Some(module.entry_symbol()));
+        }
+    }
+}
+
+#[test]
 fn shared_aot_limits_and_export_surface_fail_closed() {
     let request = || {
         OrderedManyAotCompileRequest::new(rows(&["a", "b"], &[0, 1]), Target::x86_64_linux())
@@ -292,6 +336,17 @@ fn shared_aot_limits_and_export_surface_fail_closed() {
         v15.receipt().aggregate_strategy,
         PreparedAggregateStrategy::NativeOrderedNfaFused,
     );
+    assert_eq!(
+        v15.compiled().receipt().entry_abi,
+        EntryAbi::PreparedScalarReduceV1,
+    );
+    assert_eq!(v15.compiled().module().prepared_bulk_strategy(), None);
+    assert!(v15
+        .compiled()
+        .module()
+        .required_runtime_symbols()
+        .next()
+        .is_none());
 
     let mut slow = SlowAotLimits::default();
     slow.max_native_data_bytes = 0;

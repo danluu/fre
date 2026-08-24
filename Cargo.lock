@@ -226,12 +226,14 @@ dependencies = [
  "fre-lower",
  "fre-syntax",
  "regex-automata 0.4.15",
+ "sha2",
 ]
 
 [[package]]
 name = "fre-aot-regex"
 version = "0.1.0"
 dependencies = [
+ "fre",
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",

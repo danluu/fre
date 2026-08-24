@@ -1861,6 +1861,13 @@ fn byte_set_overlaps_range(set: AnchoredByteSet, start: u8, end: u8) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NfaTerminalSuffixBarrierOutcome {
+    Proven,
+    Declined,
+    Allocation,
+}
+
 /// Prove that every member of the final suffix column is a source barrier.
 ///
 /// The reverse epsilon closure of every accept identifies the exact consuming
@@ -1871,16 +1878,34 @@ fn byte_set_overlaps_range(set: AnchoredByteSet, start: u8, end: u8) -> bool {
 /// first suffix endpoint is reverse-verified, its earliest start is therefore
 /// globally leftmost and ordered replay may be anchored there.
 ///
-/// This is deliberately conservative. Malformed relations, allocations, the
-/// fixed work ceiling, assertions, overlapping body ranges, and terminal
-/// continuations all decline the proof without changing the executable plan.
+/// This is deliberately conservative. Malformed relations, the fixed work
+/// ceiling, assertions, overlapping body ranges, and terminal continuations
+/// decline the proof. Allocation is reported separately so a newly admitted
+/// caller can preserve fail-closed allocator semantics; the legacy boolean
+/// wrapper below continues to treat it as an ordinary absent proof.
 #[allow(
     clippy::too_many_lines,
     reason = "keeping the two graph closures and their shared invariants contiguous makes the barrier proof auditable"
 )]
-pub(crate) fn nfa_terminal_suffix_is_barrier(
+pub(crate) fn nfa_terminal_suffix_barrier_outcome(
     raw: &RawPlan,
     terminal: AnchoredByteSet,
+) -> NfaTerminalSuffixBarrierOutcome {
+    let mut work = AnchoredWork::new(MAX_NFA_SUFFIX_TERMINAL_BARRIER_WORK);
+    let proven = nfa_terminal_suffix_barrier_with_work(raw, terminal, &mut work);
+    if proven {
+        NfaTerminalSuffixBarrierOutcome::Proven
+    } else if work.allocation_failed {
+        NfaTerminalSuffixBarrierOutcome::Allocation
+    } else {
+        NfaTerminalSuffixBarrierOutcome::Declined
+    }
+}
+
+fn nfa_terminal_suffix_barrier_with_work(
+    raw: &RawPlan,
+    terminal: AnchoredByteSet,
+    work: &mut AnchoredWork,
 ) -> bool {
     if terminal.cardinality() == 0
         || raw.roles.is_empty()
@@ -1892,8 +1917,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
         return false;
     }
 
-    let mut work = AnchoredWork::new(MAX_NFA_SUFFIX_TERMINAL_BARRIER_WORK);
-    let Some(incoming) = AnalysisIncoming::build(raw, &mut work) else {
+    let Some(incoming) = AnalysisIncoming::build(raw, work) else {
         return false;
     };
     let states = raw.roles.len();
@@ -1901,16 +1925,19 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
 
     let mut reverse_seen = Vec::new();
     if reverse_seen.try_reserve_exact(states).is_err() {
+        work.mark_allocation_failure();
         return false;
     }
     reverse_seen.resize(states, false);
     let mut terminal_edges = Vec::new();
     if terminal_edges.try_reserve_exact(edges).is_err() {
+        work.mark_allocation_failure();
         return false;
     }
     terminal_edges.resize(edges, false);
     let mut stack = Vec::new();
     if stack.try_reserve(states).is_err() {
+        work.mark_allocation_failure();
         return false;
     }
     for (state, &role) in raw.roles.iter().enumerate() {
@@ -1921,7 +1948,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
             let Ok(state) = u32::try_from(state) else {
                 return false;
             };
-            if !anchored_push(&mut stack, state, &mut work) {
+            if !anchored_push(&mut stack, state, work) {
                 return false;
             }
         }
@@ -1959,7 +1986,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
             };
             match (raw.roles.get(source), raw.edge_kinds.get(edge)) {
                 (Some(StateRole::Split), Some(EdgeKind::Epsilon)) => {
-                    if !anchored_push(&mut stack, incoming_edge.source, &mut work) {
+                    if !anchored_push(&mut stack, incoming_edge.source, work) {
                         return false;
                     }
                 }
@@ -1977,6 +2004,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
     let mut terminal_union = AnchoredByteSet::EMPTY;
     let mut forward_stack = Vec::new();
     if forward_stack.try_reserve(states).is_err() {
+        work.mark_allocation_failure();
         return false;
     }
     for (edge, &is_terminal) in terminal_edges.iter().enumerate() {
@@ -1998,10 +2026,10 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
             continue;
         }
         if is_terminal {
-            if !terminal_union.insert_range(start, end, &mut work) {
+            if !terminal_union.insert_range(start, end, work) {
                 return false;
             }
-            if !anchored_push(&mut forward_stack, target, &mut work) {
+            if !anchored_push(&mut forward_stack, target, work) {
                 return false;
             }
         } else if byte_set_overlaps_range(terminal, start, end) {
@@ -2017,6 +2045,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
     // `a+`, where the final byte class legitimately occurs in the body.
     let mut forward_seen = Vec::new();
     if forward_seen.try_reserve_exact(states).is_err() {
+        work.mark_allocation_failure();
         return false;
     }
     forward_seen.resize(states, false);
@@ -2051,7 +2080,7 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
                     let Some(&target) = raw.edge_targets.get(edge) else {
                         return false;
                     };
-                    if !anchored_push(&mut forward_stack, target, &mut work) {
+                    if !anchored_push(&mut forward_stack, target, work) {
                         return false;
                     }
                 }
@@ -2060,6 +2089,16 @@ pub(crate) fn nfa_terminal_suffix_is_barrier(
         }
     }
     true
+}
+
+pub(crate) fn nfa_terminal_suffix_is_barrier(
+    raw: &RawPlan,
+    terminal: AnchoredByteSet,
+) -> bool {
+    matches!(
+        nfa_terminal_suffix_barrier_outcome(raw, terminal),
+        NfaTerminalSuffixBarrierOutcome::Proven
+    )
 }
 
 impl NfaMandatorySuffix {
@@ -22125,6 +22164,7 @@ struct AnchoredWork {
     limit: u64,
     used: u64,
     declined: bool,
+    allocation_failed: bool,
     context_assertions: bool,
 }
 
@@ -22134,8 +22174,14 @@ impl AnchoredWork {
             limit,
             used: 0,
             declined: false,
+            allocation_failed: false,
             context_assertions: false,
         }
+    }
+
+    fn mark_allocation_failure(&mut self) {
+        self.declined = true;
+        self.allocation_failed = true;
     }
 
     fn charge(&mut self, amount: u64) -> bool {
@@ -22413,7 +22459,7 @@ impl AnalysisIncoming {
         let states = raw.roles.len();
         let mut by_target = Vec::new();
         if by_target.try_reserve_exact(states).is_err() {
-            work.declined = true;
+            work.mark_allocation_failure();
             return None;
         }
         by_target.resize_with(states, Vec::new);
@@ -22430,7 +22476,7 @@ impl AnalysisIncoming {
                 let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
                 let row = by_target.get_mut(target)?;
                 if row.try_reserve(1).is_err() {
-                    work.declined = true;
+                    work.mark_allocation_failure();
                     return None;
                 }
                 row.push(AnalysisIncomingEdge {
@@ -22451,7 +22497,7 @@ fn analysis_state_edges(raw: &RawPlan, state: usize) -> Option<core::ops::Range<
 
 fn anchored_push<T>(values: &mut Vec<T>, value: T, work: &mut AnchoredWork) -> bool {
     if values.try_reserve(1).is_err() {
-        work.declined = true;
+        work.mark_allocation_failure();
         return false;
     }
     values.push(value);

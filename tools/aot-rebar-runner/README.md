@@ -8,13 +8,31 @@ portable FRE facade.
 The checked-in build script consumes one public Rebar KLV file. Scalar models
 compile and link one single-pattern general-AOT artifact. The fixed
 `regex-redux` model has no external patterns; it compiles and links the exact
-15 public Rebar stage patterns as independent ordinary Span artifacts. The
+15 public Rebar stage patterns as independent ordinary Span artifacts plus
+one helper-free whole-operation reducer object. The reducer owns flattening,
+all exhaustive count/substitution traversals, replacement copies, receipt and
+report publication, and calls only those 15 direct entries. The
 additive multi-pattern `count`/`count-spans`/`grep` route compiles an
 Optimizing+Span object for each distinct source row and links the deduplicated
 native objects. Each row is either an ordinary helper-free native entry or,
 only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
 independently authenticated V15 prepared native search entry. A build with
 no KLV remains a harmless unconfigured workspace binary.
+
+A configured build has two validation modes. With both
+`FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` absent,
+the existing pinned Rust oracle remains authoritative; provenance marks this
+mode `stock-rust-unsealed-v1`, and the formal census rejects it. With both set,
+the build requires canonical unsigned decimal plus one safe versioned
+comparator identifier, then seals them together with the SHA-256 of the exact
+standard Rebar KLV. Runtime requires that byte-for-byte KLV and authenticates
+the combined binding before preparing or invoking the artifact. In this
+`frozen-public-schedule-v1` mode the sealed expected value is authoritative;
+the pinned Rust run is retained as a structured, report-only diagnostic.
+Setting only one variable, malformed metadata, a changed KLV, or a tampered or
+missing digest fails closed. This is one general input contract with no
+benchmark-name or pattern exception. Later references to a stock-authoritative
+oracle describe the backwards-compatible unsealed mode.
 
 `count-captures` and `grep-captures` have an additional all-or-nothing route.
 The compiler proves from the same canonical HIR that every nonempty match has
@@ -31,14 +49,19 @@ capture offsets.
 If that theorem specifically declines for an exact one-pattern job, the build
 next tries an independently authenticated native exact-span participation
 artifact. The ordinary Span selector remains authoritative for match choice;
-one helper-free DFA export replays that selected span and publishes only its
-participating group count into caller-owned storage. An authenticated semantic
-negative retains the pre-existing strict `capture_next` fallback. Parse,
-lowering, allocation, unrelated resource, emission, and authentication failures
-are terminal and are never converted into fallback. The adapter permits one
-fixed numeric retry only after the exact default participation DFA-state cap;
-that retry changes the state and dependent construction-work ceilings and
-nothing else.
+one helper-free DFA export replays that selected span and proves its exact
+participating group count. A selected participation artifact is then sealed
+into a new helper-free reducer that owns the complete match traversal and, for
+`grep-captures`, the exact `bstr::ByteSlice::lines` LF/CRLF domain. An
+authenticated participation semantic negative may independently select the
+strict `capture_next` source; that source is sealed into the same typed
+whole-operation ABI with private receipt-sized iterator state and result slots.
+The retained source route remains explicit in the final receipt. Parse,
+lowering, allocation, unrelated resource, emission, arithmetic, finalization,
+and authentication failures are terminal and are never converted into another
+source route. The adapter permits one fixed numeric retry only after the exact
+default participation DFA-state cap; that retry changes the state and
+dependent construction-work ceilings and nothing else.
 If that fixed retry itself exhausts exactly its `DfaStates` or `BuildWork`
 ceiling for a one-source `grep-captures` operation, one final mixed adapter may
 retain the helper-free ordinary Span selector already emitted by the uniform
@@ -57,6 +80,8 @@ rebar klv --max-iters 9 --max-warmup-iters 1 \
   curated/01-literal/sherlock-en > /tmp/fre-aot-public.klv
 
 FRE_AOT_REBAR_KLV=/tmp/fre-aot-public.klv \
+  FRE_AOT_REBAR_EXPECTED_VALUE=123 \
+  FRE_AOT_REBAR_EXPECTED_COMPARATOR=re2-2025-11-05 \
   FRE_AOT_REBAR_SOURCE_COMMIT="$(git rev-parse HEAD)" \
   FRE_AOT_REBAR_SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
   CARGO_TARGET_DIR=/tmp/fre-aot-rebar-target \
@@ -100,8 +125,14 @@ timing belongs to a separately named compiler-stage benchmark.
 - Single-pattern `grep` calls its identity-suffixed native `GrepCount` reducer
   exactly once per sample. That generated reducer owns Rebar's LF/CRLF line
   domain, including empty input, lone CR, trailing LF, and checked
-  transactional `u64` publication, and calls only its authenticated local
-  ordinary search or prepared V15 search. For multiple patterns the runner
+  transactional `u64` publication, and calls only its authenticated
+  object-local search. When an ordinary GrepCount incumbent needs the prepared
+  Ordered-NFA V15 route, the runner first requests the closed scalar-operation
+  surface: its sole global function is GrepCount, its search and capability
+  gate are object-local, and it has no unresolved runtime functions. Only a
+  typed unsupported, native-data-byte, or object-byte decline preserves the
+  exact incumbent; allocation, lowering, emission, and authentication errors
+  remain terminal. For multiple patterns the runner
   still invokes every retained row's corresponding direct or prepared search
   entry per line and counts lines for which any row reports a match. Prepared
   handles are constructed before warmup and timed loops.
@@ -113,12 +144,28 @@ timing belongs to a separately named compiler-stage benchmark.
   program/object identities, preparation caps, and dependency surface before
   the call. A helper-free `NativeFused` reducer has no Rust adapter loop and is
   admitted to the strict whole-operation-native census numerator. An ordered
-  V15 reducer also removes the Rust loop, but its declared semantic helpers
-  keep it out of that strict numerator. Typed semantic or exact lower-work
+  V15 operation-only reducer likewise enters that numerator only with
+  `PreparedScalarReduceV1`, one COUNT child equal to the module entry, no bulk,
+  SpanFill, prepared-search, or runtime-symbol surface, the exact V15 caps,
+  and a distinct multiplier wrapper. The compatibility prepared-SpanFill
+  reducer remains available only after a typed V15 unsupported, native-data,
+  or object-byte decline and keeps its declared semantic helpers. Typed
+  semantic or exact lower-work
   decline alone may continue into the pre-existing capture portfolio; parse,
   allocation, emission, authentication, and unrelated resource failures are
   terminal. The independent stock Rust captures oracle remains authoritative
   for the published benchmark value.
+- A multi-pattern capture job also first attempts one shared reducer when every
+  independently parsed source proves the same positive participation
+  multiplier. The compiler binds source order, caller IDs, exact source bytes,
+  Rust profile, every proof fact, the selected shared program and its
+  pre-wrapper object into one composite proof identity. It then appends one
+  Count/GrepCaptures wrapper to the full shared ordered-many Count portfolio.
+  Only helper-free `NativeFused` or scalar-operation-only V15 closure is
+  published: no SpanFill, runtime helper, or Rust row loop remains. Typed
+  semantic, unequal-multiplier, unsupported, native-data, and object-cap
+  declines retain the pre-existing row adapter; all other failures are
+  terminal.
 - The fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
@@ -129,22 +176,22 @@ timing belongs to a separately named compiler-stage benchmark.
   hashes. An independently constructed Rust captures oracle remains
   authoritative for the final value.
   After a uniform-proof decline, an exact one-pattern job may instead select a
-  helper-free exact-span participation DFA. Rust iterates spans through the
-  authenticated ordinary selector, passes each exact selected span to the
-  paired replay entry, and adds the returned nonzero count only after a
-  transactional `MATCH` status. The exact 16-byte aligned caller-owned scratch
-  area is reserved and must remain byte-for-byte untouched; non-`MATCH` status
-  must leave the count untouched and fails the operation. `grep-captures`
-  restarts the same checked loop for every Rebar byte-line domain. The stock
-  Rust captures oracle remains authoritative for the final value.
+  helper-free exact-span participation DFA. The final native reducer owns the
+  selector iteration, exact-span replay, empty-match byte progress, checked
+  accumulation, and transactional output. Its private participation scratch is
+  exactly the receipt's 16 bytes and is never caller-owned. `grep-captures`
+  performs LF splitting, strips one preceding CR, emits no line for empty input,
+  and emits no extra line after a final LF inside that same native call.
   An authenticated participation semantic decline may select the stricter
-  native `capture_next` route instead. That iterator publishes every
-  group-zero-inclusive slot into one caller-owned allocation, and the adapter
-  validates continuation state, fused exhaustion, slot completeness,
-  containment, progress, and checked participation totals on every result.
-  The route admits at most 4,096 capture groups, exposes no runtime helper, and
-  remains a native search/capture core with a checked Rust adapter loop rather
-  than a wholly fused operation.
+  native `capture_next` source instead. Its final reducer owns private iterator
+  state and the exact checked `group_count * slot_width` allocation, validates
+  every participating slot internally, and publishes only the complete scalar.
+  Both source routes expose zero runtime helpers and use the non-handle
+  `fre_aot_regex_{count,grep}_captures_v1_<identity>` ABI exactly once per
+  benchmark operation. The runner authenticates the final symbol hash, source
+  and final object identities, operation/domain, route-private schema, and
+  fixed object cap before dispatch. The independent stock Rust captures oracle
+  remains authoritative for the final value.
   If the fixed direct-participation construction envelope is exhausted, the
   one-source grep-only selector-first adapter instead calls that exact native
   selector once per line. Negative lines are complete native certificates;
@@ -157,16 +204,14 @@ timing belongs to a separately named compiler-stage benchmark.
   conditional mixed route, not a claim that positive capture materialization
   became native.
 - `regex-redux` runs the pinned flatten expression, all nine variant counts,
-  and all five ordered substitutions through their separately linked ordinary
-  Span entries. Rust owns only checked stage sequencing, replacement copies,
-  scalar accounting, and the canonical nine-line plus terminal report
-  formatting. Every stage must return an in-window nonempty Span; invalid,
-  backward, empty, or non-success results fail the complete sample. An untimed
-  independent Rust translation must reproduce the input/clean/final lengths,
-  all nine counts, all five substitution lengths, and the complete report
-  bytes exactly.
-  This is a complete runtime composite with precompiled entries, not a claim
-  that omitted per-call regex construction is timing-equivalent to Rebar.
+  and all five ordered substitutions in exactly one call to the linked native
+  reducer. Two `floor(3 * input_len / 2)` scratch buffers, the 1,024-byte report
+  buffer, and the 144-byte receipt are allocated once outside warmup and timed
+  loops. The reducer leaves final bytes in scratch B and transactionally
+  publishes the canonical report and 18-word receipt only after every stage
+  succeeds. Rust validates the sealed ABI and ranges around the call; after
+  timing, the independent stock translation must reproduce every receipt
+  field, every report byte, and every final byte exactly.
 
 For a multi-pattern scalar job, exact duplicate source rows are compiled once;
 distinct source spellings that produce the same complete route and object are
@@ -193,11 +238,15 @@ the strict whole-operation-native numerator only after the ordinary oracle,
 semantic-helper traps, and selected-entry trap all agree.
 
 If the ordinary optimizer does not publish that exact helper-free reducer, the
-same semantic plan may retain the prepared V15 route. Its one-call reducer
-deliberately retains compatibility semantic helpers, so provenance continues
-to name it `linked-shared-ordered-many-helper-backed-reducer` and the census
-keeps its boundary `semantic-helper-backed`. Typed V15 unsupported and byte-
-limit declines retain the independent-row incumbent; allocation, invariant,
+same semantic plan may select the additive scalar-operation-only V15 route.
+That object has `entry_abi=PreparedScalarReduceV1`: the sole global function is
+the Count, SpanSum, or single-pattern GrepCount reducer, its search and
+required-capability gate are local,
+and its runtime-function surface is empty. A legacy or wrongly prepared handle
+fails closed instead of entering a compatibility reducer. The older prepared
+V15 search API and its entry/SpanFill/helper topology remain unchanged for row
+and capture consumers. Typed V15 unsupported and byte-limit declines
+retain the independent-row incumbent byte-for-byte; allocation, invariant,
 emission, semantic-identity, and authentication failures remain terminal. An
 ordinary program/object representation cap may consult that same reported V15
 transaction, whose success, typed decline, or terminal error remains
@@ -234,37 +283,51 @@ helper path.
 
 The `fre.aot.rebar-runner.v2` provenance record separates the compiler's real
 aggregate strategy from the physical `count-spans` iteration route and binds
-`prepare_config_version`, `required_prepare_capabilities`, and every V3 cap.
+`entry_abi`, `prepare_config_version`, `required_prepare_capabilities`, and
+every V3 cap.
 For a V2 object the Ordered-NFA handle, scratch, and setup-work cap fields are
 zero (not applicable). For a required V3 object they are the actual generic
 defaults used to construct the config: 8 MiB whole handle, 8 MiB scratch, and
 2,000,000 setup-work units. `required_runtime_symbols` remains an honest link
-surface: compatibility helpers may be unresolved even though a successfully
-prepared required-V15 benchmark operation cannot invoke them.
+surface. Legacy V15 search objects report their compatibility helpers; a
+scalar-operation-only V15 object must report an empty surface.
 
-Without an externally authenticated expectation, the independent Rust oracle
-is deliberately constructed only after all AOT samples so it cannot warm the
-candidate's first-call path. A sealed schedule runner instead passes its
-selected comparator's scalar as `--expected-value=<u64>` after independently
-executing that comparator. This prevents a defect in a non-selected comparator
-from vetoing a correct candidate; it is not permission to derive an expectation
-from the candidate itself. Regex-redux retains its complete independent
-stage-receipt comparison in both modes. The normal output remains Rebar's
-`nanoseconds,value` format. `--provenance` emits the adapter, compiler and
-optimizer versions, target/features, engine/aggregate strategy, exact symbols,
-required runtime surface, and program/object SHA-256 identities.
+The independent Rust oracle is deliberately constructed only after all AOT
+samples so it cannot warm the candidate's first-call path. It is fatal and
+authoritative in the unsealed compatibility mode. A schedule runner may pass
+its independently obtained selected-comparator scalar as
+`--expected-value=<u64>`; a frozen build requires that argument to equal its
+sealed value. In either schedule-authoritative mode, stock scalar,
+availability, and regex-redux receipt differences are emitted on stderr as
+`fre.aot.rebar-runner.stock-comparator.v1` records without replacing the sealed
+or supplied answer. The expectation must never be derived from the candidate
+itself. The normal output remains Rebar's `nanoseconds,value` format.
+`--provenance` emits validation authority, sealed value/comparator, exact KLV
+and combined-binding SHA-256 identities, stock divergence policy, adapter,
+compiler and optimizer versions, target/features, engine/aggregate strategy,
+exact symbols, required runtime surface, and program/object identities.
 The mixed selector-first route uses schema `fre.aot.rebar-runner.v4` and also
 publishes `selector_capture_fallback_bridge`, `capture_resolution`, the stock
 positive-fallback profile/symbol, and the exact direct-participation resource,
 required value, and limit that selected the route.
+The helper-free nonuniform one-source reducer uses schema
+`fre.aot.rebar-runner.v5`. It publishes one reducer operation entry plus the
+retained participation or `capture_next` child closure as identity inventory,
+keeps source-object and final-object hashes distinct, and seals the operation,
+LF/CRLF domain, empty progress, private schema, reducer-symbol hash, fixed
+object cap, and final artifact identity. Child entries are never counted as
+benchmark operation entries.
 
 ## Qualification before using results
 
-1. Run every statically eligible public exact-adapter job against each point's
-   sealed selected comparator and require its sealed scalar for both first-call
-   (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules. Pass that
-   scalar to the AOT arm with `--expected-value=<u64>`; standalone development
-   runs continue to use the pinned Rust 1.12.4 fallback oracle.
+1. Freeze a scalar and versioned independent comparator for every public
+   first-call (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) KLV
+   before building. Set both expected env vars and require exact candidate
+   agreement. The schedule runner may also pass that same scalar with
+   `--expected-value=<u64>`; a mismatch with the frozen value fails closed.
+   Also run pinned Rust 1.12.4 and retain every structured divergence; it
+   cannot override the sealed schedule. Unsealed builds are
+   development/compatibility runs and are ineligible for the formal census.
 2. Retain explicit nullable/empty-match, empty-haystack, invalid-byte, CRLF,
    lone-CR, trailing-LF and no-final-LF fixtures.
 3. Run the linked ABI tests in `fre-aot-regex`, including wrong-artifact
@@ -335,16 +398,19 @@ V15 loop. It never scans across a line boundary and never substitutes one
 whole-haystack match stream for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
-prepared program/entry and no semantic runtime-helper relocation. Native
-coverage additionally requires an independent final-binary audit, complete
-operation success after all semantic helpers are trap-patched, and a trap when
-each claimed component entry is patched on a fixture that reaches it.
+prepared program/entry and no semantic runtime-helper relocation, and unless
+the reducer's unresolved link closure is exactly the 15 component entries.
+Native coverage additionally requires an independent final-binary audit,
+complete operation success after all semantic helpers are trap-patched, and a
+trap when the claimed whole-operation reducer entry is patched.
 The v3 provenance record publishes a separate native flag, entry symbol,
 runtime-symbol surface, and program/object hash for every numbered regex-redux
-component or retained native row. Merely linking a component does not count a
-helper-backed entry as native.
-The census reports these componentized routes as native search cores with a
-Rust adapter loop, not as wholly fused native operations.
+component or retained native row. For regex-redux it additionally seals the
+operation identity, reducer symbol/code/data/object digests, exact relocation
+and component-link surfaces, empty semantic-helper surface, request/receipt/
+report extents, scratch formula, and report/receipt schemas. The census counts
+this route as whole-operation native only when the one reducer entry and all
+of those closures authenticate.
 Uniform-capture routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to

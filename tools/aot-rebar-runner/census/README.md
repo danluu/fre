@@ -18,6 +18,15 @@ and first/steady replication produces a larger raw schedule-point population;
 the plan seals those exact point IDs and their hash separately and never uses
 that raw count in place of 311.
 
+Every runtime job also has one frozen scalar authority. The controller rejects
+conflicting values across its replicated points and chooses
+`re2-2025-11-05` when that comparator is present, otherwise the pinned
+`rust-regex-1.12.4`; no benchmark-specific exception is allowed. Formal
+provenance must be `frozen-public-schedule-v1`, carry that exact scalar and
+comparator, and seal the byte-for-byte candidate KLV SHA-256 in a nonzero
+combined binding. Ordinary `stock-rust-unsealed-v1` builds remain supported by
+the runner for compatibility, but are categorically census-ineligible.
+
 Every runtime job remains in the headline denominator. Unsupported models,
 build/link failures, timeouts, missing receipts, wrong answers, helper-backed
 execution, and failed controls are nonnative outcomes. The summary reports:
@@ -36,8 +45,8 @@ expected value.
 
 Fallback `count-spans` direct-entry or Span-fill iteration, multi-pattern
 per-line `grep`, the static uniform capture multiplier route, the helper-free
-exact-span participation route, the selector-negative/stock-positive capture
-route, and the strict native `capture_next` route can
+legacy v4 exact-span participation route, the selector-negative/stock-positive
+capture route, and the legacy v4 strict native `capture_next` route can
 authenticate a native search or search/capture core while retaining a checked
 Rust adapter outer loop. They are excluded from the strict whole-operation
 numerator. Single-pattern `grep` instead enters the authenticated generated
@@ -57,6 +66,16 @@ unreached. A positive input remains correct through stock captures but is
 classified nonnative rather than receiving credit for a partially native
 operation.
 
+The v5 single-capture reducer route is different from those legacy v4 source
+bridges. After exactly one participation or `capture_next` source has been
+selected and authenticated, the compiler seals that source into one
+helper-free `CountCaptures` or `GrepCaptures` reducer. That reducer owns the
+complete whole-haystack traversal or exact byte-slice LF/CRLF line domain.
+Only its final reducer symbol is an operation entry and trap target. The three
+route-specific selector/replay/bundle or `capture_next`/materializer/selector
+symbols remain required defined-symbol inventory bound to the retained source
+receipt; they are not counted as additional operation entries.
+
 `grep`, `count-captures`, and `grep-captures` with 1..4096 source expressions
 are exact adapter *shapes*. This admits them to the sealed qualification
 population; it does not turn either build-time proof into an assumption. A
@@ -67,15 +86,57 @@ allocation, resource, emission,
 authentication, multi-source, or remaining semantic decline fails the
 all-or-nothing build and must receive a `record-failure` receipt. It remains in
 the 311-job denominator as nonnative rather than disappearing as unsupported.
+Once either source route is selected, reducer construction and authentication
+are terminal: a reducer error never authorizes switching source routes.
 
 The strict whole-operation boundary is a closed route classification, not a
-route-name suffix convention. A scalar `count-spans` artifact receives that
-classification only when its exact `Some(NativeFused)` or
-`Some(NativeOrderedNfaFused)` receipt is selected through
-`linked-native-span-sum-reducer`. A Span-fill entry still leaves refill,
-validation, and reduction in Rust and therefore remains an adapter-loop route.
-An unknown route, or a helper-backed or unknown aggregate strategy claiming
-the native SpanSum reducer iteration, is rejected rather than inferred native.
+route-name suffix convention. Scalar `count` and `count-spans` artifacts receive
+that classification only when an exact `Some(NativeFused)` receipt also proves
+an empty runtime-symbol set, zero prepare capability, and no prepared bulk
+route, or when the exact operation-only V15 topology is authenticated. The
+latter must carry `entry_abi=PreparedScalarReduceV1`,
+`Some(NativeOrderedNfaFused)`, the V15 capability and resource caps, no bulk or
+SpanFill entry, no runtime symbols, the reducer as the public entry, and one
+shared reducer/runtime-program identity. It maps to the same strict Count or
+SpanSum whole-operation policy as the direct reducer.
+
+The legacy `entry_abi=SpanSearchV1` V15 envelope is deliberately separate: its
+ordinary search/SpanFill entries and model-specific compatibility helper remain
+trap-visible, and the distinct
+`linked-native-count-helper-backed-reducer` or
+`linked-native-span-sum-helper-backed-reducer` route is classified
+semantic-helper-backed.
+A Span-fill entry used by the Rust adapter still leaves refill, validation, and
+reduction in Rust. Unknown, mixed, or mismatched scalar reducer envelopes are
+rejected rather than inferred native.
+
+Single-source uniform CountCaptures and GrepCaptures use the same distinction.
+Their `PreparedScalarReduceV1` form is strict only when COUNT is the entry, the
+multiplier wrapper is a distinct operation symbol, bulk/SpanFill/prepared entry
+and runtime symbols are absent, and the exact V15 capability and caps are
+sealed. A typed unsupported, native-data, or object-byte decline may retain the
+legacy prepared-SpanFill compatibility form; no compiler or authentication
+error authorizes that fallback.
+
+Shared ordered-many Count and SpanSum use the same ABI distinction. A
+`PreparedScalarReduceV1` receipt is strict only when `bulk=None`, the entry is
+exactly the reducer, the runtime-symbol and SpanFill surfaces are empty, and
+the reducer/program identities agree. A legacy `SpanSearchV1` V15 receipt
+retains its semantic-helper-backed classification; the ordinary NativeFused
+`SpanSearchV1` receipt retains its independently authenticated helper-free
+classification. The normalized receipt preserves the entry ABI and route
+variant so neither topology can be reclassified after raw provenance parsing.
+
+Shared `count-captures` and `grep-captures` reuse that closed shared receipt,
+but the final selected entry is a distinct native capture reducer whose only
+semantic child is the authenticated local Count function. Direct
+`NativeFused` and `PreparedScalarReduceV1` V15 forms must both have no bulk
+entry, SpanFill symbol, or semantic runtime symbol. The latter binds the Count
+entry (not the outer capture reducer) to the serialized-program identity.
+Both map to `linked-shared-ordered-many-helper-free-reducer`; the selected-entry
+negative trap targets the outer capture reducer, while runner startup
+independently reconstructs the ordered source digest and every uniform-proof
+binding before provenance can be emitted.
 
 ## Privacy boundary and static dry run
 
@@ -91,14 +152,70 @@ Each schedule and its expected file digest must be named explicitly. Repeated
 jobs; conflicting IDs fail closed. `--dry-run` validates the source freeze,
 schedule identities, public path containment, KLV hashes, and the 344/33/311
 denominators without writing output, invoking Cargo, building, running a test,
-or executing a benchmark:
+or executing a benchmark.
+
+The preferred sealed mode additionally accepts a closed public KLV inventory.
+The production inventory carries authenticated job metadata:
+
+```json
+{
+  "schema": "fre.public-rebar-klv-inventory.v1",
+  "job_count": 344,
+  "compile_job_count": 33,
+  "runtime_job_count": 311,
+  "model_counts": {
+    "compile": 33, "count": 133, "count-captures": 15,
+    "count-spans": 129, "grep": 11, "grep-captures": 22,
+    "regex-redux": 1
+  },
+  "rebar_revision": "...",
+  "rebar_binary_sha256": "...",
+  "entries": [
+    {
+      "benchmark": "public/name",
+      "engine": "rust/regex",
+      "job_id": "runtime-job-000",
+      "klv_file": "klv/runtime-job-000.klv",
+      "klv_sha256": "...",
+      "klv_bytes": 123,
+      "model": "count"
+    }
+  ]
+}
+```
+
+The earlier minimal `path`/`sha256`/`bytes` entry form remains accepted. The
+inventory must contain exactly 344 entries. All production counts, job IDs,
+Rust-engine declarations, benchmark/model declarations, and the Rebar
+revision shared with the schedule are checked. Each KLV is parsed in either
+the current production Rebar field order or the exact legacy order, both with
+a closed key set; pattern and haystack bytes are immediately
+reduced to hashes and lengths. The semantic join uses benchmark, model,
+ordered pattern hashes, haystack hash/length, and the two regex flags. Timing
+fields are validated but deliberately do not change semantic identity, so the
+canonical manifest KLV can be joined to sealed schedule metadata from a
+retired host path with different public measurement controls. In the rich
+production form only, the old path is syntax-checked but never resolved; the
+minimal compatibility form retains its byte-backed path check. The schedule
+file digest and complete point topology remain sealed. Every manifest identity must map to exactly one public
+job and all its frozen schedule points. The plan retains both input file
+digests, all 344 normalized mappings, and separate entries/mapping digests.
+Schedule-only invocation remains accepted for existing version-2 plans.
+
+Expected-result authority is comparator-first: the fixed preference is RE2
+2025-11-05, then Rust regex 1.12.4. All points for the selected comparator must
+agree. Different scalars, including internal conflicts, from a lower-priority
+comparator are retained with their point IDs as sealed divergence diagnostics
+instead of preventing qualification or silently changing the selected scalar.
 
 ```sh
 python3 tools/aot-rebar-runner/census/true_native_census.py plan \
   --schedule /public/control/schedule-timing.json \
   --schedule-sha256 EXPECTED_SHA256 \
-  --public-klv-root /public/corpus/klv \
-  --recorded-public-klv-root public-corpus/klv \
+  --public-manifest /public/control/public-klv-manifest.json \
+  --public-manifest-sha256 EXPECTED_MANIFEST_SHA256 \
+  --public-klv-root /public/corpus \
+  --recorded-public-klv-root public-corpus \
   --public-corpus-label public-rebar-CORPUS_ID \
   --source-dir /clean/fre-source \
   --source-commit EXPECTED_COMMIT \
@@ -121,9 +238,53 @@ Do not perform these steps while a timing holdout needs an idle machine. They
 are documented so the committed controller is runnable later without another
 design step.
 
+The formal driver performs the complete resumable run on a native host matching
+the plan target. The work and two Cargo target directories must be distinct,
+outside the sealed source checkout, and empty on the first invocation. A sealed
+state file binds the plan, manifest, schedules, source/work paths, canonical
+timeouts, the complete controlled build-environment projection, and byte
+identities of Cargo, `rustc`, Git, `nm`, and the trap library for subsequent
+resumes:
+
+```sh
+python3 tools/aot-rebar-runner/census/formal_qualification.py \
+  --plan census-plan.json \
+  --source-dir /clean/fre-source \
+  --public-klv-root /public/corpus \
+  --work-dir /qualification/formal-census \
+  --primary-target-dir /qualification/target-a \
+  --replica-target-dir /qualification/target-b \
+  --trap-library /control/runtime_symbol_trap.so
+```
+
+For each exact-adapter runtime job it rechecks clean HEAD/tree/Cargo.lock,
+selects the sealed comparator result, and builds release binaries in the two
+independent targets with a closed inherited environment, debuginfo disabled,
+dynamic-symbol export enabled, incremental compilation disabled, and
+`--locked --offline --jobs 1 --target RUSTC_HOST`. Rustup proxies are resolved
+to the actual Cargo and `rustc` binaries, and the exact `rustc` host must map to
+the sealed native plan target. Timed-out Cargo builds run in a driver-created
+session whose exact process group is terminated before work continues. The
+runner and every nonempty provenance-ordered object are copied byte-for-byte
+into a new sealed attempt directory before another job can replace Cargo
+output. Each retained side is recorded in an ordered, receipt-bound artifact
+manifest; every file and every path component is content/type-checked again on
+resume and immediately before and after summary. Existing receipts are
+discovered by their validated contents rather than their filenames. Build,
+provenance, and qualification failures/timeouts use the existing
+privacy-preserving `record-failure` receipt; successful artifacts use the
+existing `qualify-job` logic. Before summary the driver revalidates the complete
+exact-adapter receipt population, accounts for every unsupported row, rechecks
+source state and all bound tool bytes, and requires the summary denominator to
+be exactly 311. It never retains build or process output, only optional byte
+counts and SHA-256 evidence digests.
+
 Build every exact-adapter job twice in independent, empty target directories,
 with the plan's commit/tree, target, feature set, public build KLV, locked
-dependencies, and `CARGO_INCREMENTAL=0`. The final runner must export its
+dependencies, `CARGO_INCREMENTAL=0`, and both
+`FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` selected
+from the sealed plan. Setting only one value or omitting the frozen authority
+must fail qualification. The final runner must export its
 symbols to the dynamic symbol table (`-Wl,--export-dynamic` on ELF;
 `-Wl,-export_dynamic` on Mach-O), because inability to arm a symbol is a failed
 qualification, not permission to omit it. Preserve each runner and
@@ -137,7 +298,7 @@ one receipt per exact-adapter job:
 python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
   --plan census-plan.json \
   --job-id PUBLIC_FRE_JOB_ID \
-  --public-klv-root /public/corpus/klv \
+  --public-klv-root /public/corpus \
   --primary-runner /build-a/fre-aot-rebar-runner \
   --replica-runner /build-b/fre-aot-rebar-runner \
   --primary-object /build-a/aot-rebar-artifact.o \
@@ -149,6 +310,14 @@ python3 tools/aot-rebar-runner/census/true_native_census.py qualify-job \
 Repeat `--primary-object` and `--replica-object` in component ordinal order for
 a composite v3 runner or the single-component strict-capture v4 runner. Its
 normalized provenance must match every supplied object digest in both builds.
+For regex-redux, supply the 15 component objects in ordinal order followed by
+`aot-rebar-artifact.o`, the whole-operation reducer. Its reducer is the sole
+claimed operation entry; the 15 component entries are authenticated linked
+identities rather than Rust adapter-loop entries. A v5 single-capture reducer
+supplies its one final reducer object, not its retained source object. That
+reducer is likewise the sole operation entry; its retained source symbols are
+independently inventoried identities inside the object, not adapter-loop
+entries.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
@@ -174,18 +343,33 @@ missing raw v3 fields are rejected rather than silently discarded.
 Native-capture v4 publishes exactly one source, artifact, and component. The
 exact-span variant closes its selector, capture program, DFA geometry, bundle,
 object, architecture-specific strategy, and three distinct selector/bundle/
-replay symbols; its semantic-runtime-call count and final-binary helper
-inventory must both be empty. Strict-capture v4's
+replay symbols; its semantic-runtime-call count must be zero. Any independently
+inventoried linker-retained helper must be armed and remain untriggered.
+Strict-capture v4's
 sole component entry is an identity-suffixed native `capture_next`, its declared
 runtime-symbol list is empty, and its object/program identities agree with the
 component receipt. The closed record also seals group count and nullability,
 source/selector/capture/plan/bundle/artifact digests, and the distinct native
 materializer and ordinary selector symbols. Prepared V15 adds only the closed
 typed proof objects described above; `strict_capture` exists only on normalized
-v4. The
-independent final-binary inventory must also contain zero semantic runtime
-symbols for this strict route; an unused-but-linked helper is a failed strict
-qualification rather than a trap-only allowance.
+v4. Its provenance-declared helper list must remain empty. Linker-retained
+final-binary helpers are accepted only through the same complete arm-and-
+untriggered dynamic proof; reaching one fails strict qualification.
+
+Single-capture reducer v5 instead publishes no component list, runtime program,
+prepared handle, or native-row bridge. Its closed proof binds the operation and
+domain, exact retained source route, cardinality, both source identities, group
+and empty-match obligations, zero semantic-runtime calls, route-specific
+private state layout, source artifact/object identities, full reducer-symbol
+digest, and distinct final object/identity under the fixed 256 MiB cap.
+`source_pattern_sha256` is the ordinary SHA-256 of the raw schedule pattern and
+is the only field bound to `input.pattern_sha256[0]`. The separate
+`source_sha256` is the compiler receipt's domain-separated, length-bearing
+source identity; neither field may substitute for the other. The normalized
+receipt keeps the final object hash separate from the retained source-object
+hash; the supplied `aot-rebar-artifact.o` must match the final reducer object.
+The route-specific nested source proof is reauthenticated on receipt read-back,
+and all three child identity symbols must exist in both final binaries.
 
 The closed selector-capture-fallback v4 variant is deliberately narrower. It
 binds one helper-free native Span selector, the exact fixed-cap
@@ -251,6 +435,13 @@ Three fresh processes authenticate each job:
    `linked-uniform-capture-row-adapter-loop`; strict capture uses
    `strict-capture-next-v1` and `linked-strict-capture-next-adapter-loop`.
    Neither inflates the stricter wholly fused-operation numerator.
+   Single-capture reducer v5 traps exactly its final Count/Grep reducer. Its
+   child source symbols are inventoried but never substituted for that negative
+   control. With reproducible final-object identity, an oracle pass, a helper
+   surface that is either empty or fully armed and untriggered, and that
+   reducer trap, the exact
+   `linked-native-single-capture-reducer` policy enters the strict
+   whole-operation numerator.
 
 Thus a `RuntimeHelper` route fails phase 2. A mixed
 `*WithRuntimeHelper` artifact is judged at the requested operation boundary:

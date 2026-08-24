@@ -17,10 +17,10 @@ use crate::{
     CaptureOnePassDisposition, CompileMode, CompiledModule, NativeCaptureAotDeclineV1,
     NativeCaptureAotError, NativeCaptureAotLimitsV1, NativeCaptureAotReceiptV1,
     NativeCaptureAotStrategyV1, NativeCaptureBundleV1View, NativeCaptureDescriptorV1,
-    NativeParticipationAotArtifactV1, NativeParticipationAotErrorV1,
-    NativeParticipationAotLimitsV1, NativeParticipationAotReceiptV1,
-    NativeParticipationAotStrategyV1, OnePassCaptureBuildError, OnePassCaptureBuildFailure,
-    OutputContract, Target,
+    NativeParticipationAotArtifactV1, NativeParticipationAotDeclineV1,
+    NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1, NativeParticipationAotReceiptV1,
+    NativeParticipationAotStrategyV1, ObjectError, ObjectFormat, OnePassCaptureBuildError,
+    OnePassCaptureBuildFailure, OutputContract, Target, emit_object,
 };
 
 pub const REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY: usize = 1;
@@ -28,6 +28,8 @@ pub const REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/rebar-single-capture-aot-v1\0";
 pub const REBAR_SINGLE_CAPTURE_PARTICIPATION_AOT_V1_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/rebar-single-capture-participation-aot-v1\0";
+pub const REBAR_SINGLE_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/rebar-single-capture-reducer-aot-v1\0";
 
 const DIGEST_BYTES: usize = 32;
 const REBAR_PROFILE_IDENTITY: &[u8] =
@@ -494,6 +496,494 @@ impl RebarSingleCaptureParticipationAotArtifactV1 {
     }
 }
 
+/// Whole-operation scalar projection owned by one exact Rebar capture source.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RebarSingleCaptureReducerOperationV1 {
+    CountCaptures = 1,
+    GrepCaptures = 2,
+}
+
+impl RebarSingleCaptureReducerOperationV1 {
+    #[must_use]
+    pub const fn domain(self) -> RebarSingleCaptureReducerDomainV1 {
+        match self {
+            Self::CountCaptures => RebarSingleCaptureReducerDomainV1::WholeHaystack,
+            Self::GrepCaptures => RebarSingleCaptureReducerDomainV1::ByteSliceLinesLfCrLf,
+        }
+    }
+
+    const fn native_domain(self) -> crate::module::NativeCaptureReducerDomainV1 {
+        match self {
+            Self::CountCaptures => crate::module::NativeCaptureReducerDomainV1::WholeHaystack,
+            Self::GrepCaptures => crate::module::NativeCaptureReducerDomainV1::ByteSliceLines,
+        }
+    }
+}
+
+/// Exact byte domain owned by the one-call reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RebarSingleCaptureReducerDomainV1 {
+    WholeHaystack = 1,
+    /// Rust `bstr::ByteSlice::lines`: LF-delimited, one immediately preceding
+    /// CR stripped, no line for empty input, and no extra line after final LF.
+    ByteSliceLinesLfCrLf = 2,
+}
+
+/// Distinct authenticated child closure used inside the generated reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RebarSingleCaptureReducerSourceRouteV1 {
+    /// Ordinary Span selection followed by exact-span participation replay.
+    ExactSpanParticipationV1 = 1,
+    /// Strict object-local capture iterator with private state and slots.
+    CaptureNextV1 = 2,
+}
+
+/// Fully authenticated source artifact consumed by one reducer transaction.
+///
+/// The enum is intentionally route-bearing rather than a generic module. A
+/// participation negative remains an explicit terminal route-unavailable
+/// result and can never be reinterpreted as `capture_next` or a helper edge.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would allocate between source authentication and final module construction"
+)]
+pub enum RebarSingleCaptureReducerSourceArtifactV1 {
+    ExactSpanParticipation(RebarSingleCaptureParticipationAotArtifactV1),
+    CaptureNext(RebarSingleCaptureAotArtifactV1),
+}
+
+impl From<RebarSingleCaptureParticipationAotArtifactV1>
+    for RebarSingleCaptureReducerSourceArtifactV1
+{
+    fn from(value: RebarSingleCaptureParticipationAotArtifactV1) -> Self {
+        Self::ExactSpanParticipation(value)
+    }
+}
+
+impl From<RebarSingleCaptureAotArtifactV1> for RebarSingleCaptureReducerSourceArtifactV1 {
+    fn from(value: RebarSingleCaptureAotArtifactV1) -> Self {
+        Self::CaptureNext(value)
+    }
+}
+
+impl RebarSingleCaptureReducerSourceArtifactV1 {
+    #[must_use]
+    pub const fn route(&self) -> RebarSingleCaptureReducerSourceRouteV1 {
+        match self {
+            Self::ExactSpanParticipation(_) => {
+                RebarSingleCaptureReducerSourceRouteV1::ExactSpanParticipationV1
+            }
+            Self::CaptureNext(_) => RebarSingleCaptureReducerSourceRouteV1::CaptureNextV1,
+        }
+    }
+
+    #[must_use]
+    pub const fn module(&self) -> &CompiledModule {
+        match self {
+            Self::ExactSpanParticipation(source) => source.module(),
+            Self::CaptureNext(source) => source.module(),
+        }
+    }
+
+    #[must_use]
+    pub fn object(&self) -> &[u8] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.object(),
+            Self::CaptureNext(source) => source.object(),
+        }
+    }
+
+    #[must_use]
+    pub fn authenticates_receipt(&self) -> bool {
+        match self {
+            Self::ExactSpanParticipation(source) => source.authenticates_receipt(),
+            Self::CaptureNext(source) => source.authenticates_receipt(),
+        }
+    }
+
+    fn source_cardinality(&self) -> usize {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().source_cardinality(),
+            Self::CaptureNext(source) => source.receipt().source_cardinality(),
+        }
+    }
+
+    fn source_bytes(&self) -> usize {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().source_bytes(),
+            Self::CaptureNext(source) => source.receipt().source_bytes(),
+        }
+    }
+
+    fn source_sha256(&self) -> [u8; DIGEST_BYTES] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().source_sha256(),
+            Self::CaptureNext(source) => source.receipt().source_sha256(),
+        }
+    }
+
+    fn profile(&self) -> &RustProfile {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().profile(),
+            Self::CaptureNext(source) => source.receipt().profile(),
+        }
+    }
+
+    fn target(&self) -> Target {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().target(),
+            Self::CaptureNext(source) => source.receipt().target(),
+        }
+    }
+
+    fn capture_level(&self) -> CaptureLevel {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().capture_level(),
+            Self::CaptureNext(source) => source.receipt().capture_level(),
+        }
+    }
+
+    fn group_count(&self) -> usize {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().group_count(),
+            Self::CaptureNext(source) => source.receipt().group_count(),
+        }
+    }
+
+    fn can_match_empty(&self) -> bool {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().can_match_empty(),
+            Self::CaptureNext(source) => source.receipt().can_match_empty(),
+        }
+    }
+
+    fn selector_sha256(&self) -> [u8; DIGEST_BYTES] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.native_receipt().selector_sha256,
+            Self::CaptureNext(source) => source.receipt().selector_sha256(),
+        }
+    }
+
+    fn capture_sha256(&self) -> [u8; DIGEST_BYTES] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.native_receipt().capture_sha256,
+            Self::CaptureNext(source) => source.receipt().capture_sha256(),
+        }
+    }
+
+    fn artifact_identity_sha256(&self) -> [u8; DIGEST_BYTES] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.receipt().artifact_identity_sha256(),
+            Self::CaptureNext(source) => source.receipt().artifact_identity_sha256(),
+        }
+    }
+
+    fn object_sha256(&self) -> [u8; DIGEST_BYTES] {
+        match self {
+            Self::ExactSpanParticipation(source) => source.native_receipt().object_sha256,
+            Self::CaptureNext(source) => source.receipt().object_sha256(),
+        }
+    }
+
+    fn native_source(&self) -> crate::module::NativeCaptureReducerSourceV1<'_> {
+        match self {
+            Self::ExactSpanParticipation(source) => {
+                let participation_scratch_bytes = source.native_receipt().scratch_bytes;
+                let caller_scratch_bytes = if matches!(
+                    source.native_receipt().strategy,
+                    NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                        | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                ) {
+                    participation_scratch_bytes
+                } else {
+                    0
+                };
+                crate::module::NativeCaptureReducerSourceV1::ExactSpanParticipation {
+                    selector_symbol: source.selector_entry_symbol(),
+                    bundle_symbol: source.bundle_symbol(),
+                    participation_symbol: source.participation_entry_symbol(),
+                    group_count: source.receipt().group_count(),
+                    participation_scratch_bytes,
+                    caller_scratch_bytes,
+                }
+            }
+            Self::CaptureNext(source) => crate::module::NativeCaptureReducerSourceV1::CaptureNext {
+                capture_next_symbol: source.capture_next_symbol(),
+                group_count: source.receipt().group_count(),
+            },
+        }
+    }
+
+    fn symbols(&self) -> [&str; 3] {
+        match self {
+            Self::ExactSpanParticipation(source) => [
+                source.selector_entry_symbol(),
+                source.bundle_symbol(),
+                source.participation_entry_symbol(),
+            ],
+            Self::CaptureNext(source) => [source.capture_next_symbol(), "", ""],
+        }
+    }
+}
+
+/// Immutable source/schema/operation receipt for one whole-operation reducer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebarSingleCaptureReducerAotReceiptV1 {
+    operation: RebarSingleCaptureReducerOperationV1,
+    domain: RebarSingleCaptureReducerDomainV1,
+    source_route: RebarSingleCaptureReducerSourceRouteV1,
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_sha256: [u8; DIGEST_BYTES],
+    profile: RustProfile,
+    target: Target,
+    capture_level: CaptureLevel,
+    group_count: usize,
+    can_match_empty: bool,
+    empty_progress: RebarSingleCaptureEmptyProgressV1,
+    semantic_runtime_calls: usize,
+    caller_scratch_bytes: usize,
+    private_participation_scratch_bytes: usize,
+    private_iterator_state_bytes: usize,
+    private_result_slot_count: usize,
+    private_result_slot_bytes: usize,
+    selector_sha256: [u8; DIGEST_BYTES],
+    capture_sha256: [u8; DIGEST_BYTES],
+    source_artifact_identity_sha256: [u8; DIGEST_BYTES],
+    source_object_sha256: [u8; DIGEST_BYTES],
+    reducer_symbol_sha256: [u8; DIGEST_BYTES],
+    object_sha256: [u8; DIGEST_BYTES],
+    object_bytes: usize,
+    max_object_bytes: usize,
+    artifact_identity_sha256: [u8; DIGEST_BYTES],
+}
+
+impl RebarSingleCaptureReducerAotReceiptV1 {
+    #[must_use]
+    pub const fn operation(&self) -> RebarSingleCaptureReducerOperationV1 {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn domain(&self) -> RebarSingleCaptureReducerDomainV1 {
+        self.domain
+    }
+
+    #[must_use]
+    pub const fn source_route(&self) -> RebarSingleCaptureReducerSourceRouteV1 {
+        self.source_route
+    }
+
+    #[must_use]
+    pub const fn source_cardinality(&self) -> usize {
+        self.source_cardinality
+    }
+
+    #[must_use]
+    pub const fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    #[must_use]
+    pub const fn source_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.source_sha256
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &RustProfile {
+        &self.profile
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> Target {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn capture_level(&self) -> CaptureLevel {
+        self.capture_level
+    }
+
+    #[must_use]
+    pub const fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    #[must_use]
+    pub const fn can_match_empty(&self) -> bool {
+        self.can_match_empty
+    }
+
+    #[must_use]
+    pub const fn empty_progress(&self) -> RebarSingleCaptureEmptyProgressV1 {
+        self.empty_progress
+    }
+
+    #[must_use]
+    pub const fn semantic_runtime_calls(&self) -> usize {
+        self.semantic_runtime_calls
+    }
+
+    /// Exact aligned scratch extent supplied by the operation owner on every
+    /// reducer call. The reducer authenticates this extent before reading the
+    /// haystack and never retains the pointer after return.
+    #[must_use]
+    pub const fn caller_scratch_bytes(&self) -> usize {
+        self.caller_scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn private_participation_scratch_bytes(&self) -> usize {
+        self.private_participation_scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn private_iterator_state_bytes(&self) -> usize {
+        self.private_iterator_state_bytes
+    }
+
+    #[must_use]
+    pub const fn private_result_slot_count(&self) -> usize {
+        self.private_result_slot_count
+    }
+
+    #[must_use]
+    pub const fn private_result_slot_bytes(&self) -> usize {
+        self.private_result_slot_bytes
+    }
+
+    #[must_use]
+    pub const fn selector_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.selector_sha256
+    }
+
+    #[must_use]
+    pub const fn capture_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.capture_sha256
+    }
+
+    #[must_use]
+    pub const fn source_artifact_identity_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.source_artifact_identity_sha256
+    }
+
+    #[must_use]
+    pub const fn source_object_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.source_object_sha256
+    }
+
+    #[must_use]
+    pub const fn reducer_symbol_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.reducer_symbol_sha256
+    }
+
+    #[must_use]
+    pub const fn object_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.object_sha256
+    }
+
+    #[must_use]
+    pub const fn object_bytes(&self) -> usize {
+        self.object_bytes
+    }
+
+    #[must_use]
+    pub const fn max_object_bytes(&self) -> usize {
+        self.max_object_bytes
+    }
+
+    #[must_use]
+    pub const fn artifact_identity_sha256(&self) -> [u8; DIGEST_BYTES] {
+        self.artifact_identity_sha256
+    }
+}
+
+/// One exact retained Rebar source closure plus its one-call native reducer.
+#[derive(Debug)]
+pub struct RebarSingleCaptureReducerAotArtifactV1 {
+    source: RebarSingleCaptureReducerSourceArtifactV1,
+    module: CompiledModule,
+    object: Box<[u8]>,
+    reducer_symbol: String,
+    receipt: RebarSingleCaptureReducerAotReceiptV1,
+}
+
+impl RebarSingleCaptureReducerAotArtifactV1 {
+    #[must_use]
+    pub const fn source(&self) -> &RebarSingleCaptureReducerSourceArtifactV1 {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn module(&self) -> &CompiledModule {
+        &self.module
+    }
+
+    #[must_use]
+    pub fn object(&self) -> &[u8] {
+        &self.object
+    }
+
+    #[must_use]
+    pub fn reducer_symbol(&self) -> &str {
+        &self.reducer_symbol
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &RebarSingleCaptureReducerAotReceiptV1 {
+        &self.receipt
+    }
+
+    /// Re-authenticate the retained source artifact, deterministically append
+    /// the exact route again, and compare the complete module/object receipt.
+    #[must_use]
+    pub fn authenticates_receipt(&self) -> bool {
+        rebar_single_capture_reducer_artifact_authenticates(self)
+    }
+}
+
+/// Terminal reducer construction failure. No variant authorizes another
+/// source route, a runtime helper, or a Rust-loop fallback.
+#[derive(Debug)]
+pub enum RebarSingleCaptureReducerAotErrorV1 {
+    ParticipationUnavailable(NativeParticipationAotDeclineV1),
+    SourceAuthentication(&'static str),
+    Object(ObjectError),
+    ArithmeticOverflow(&'static str),
+    Authentication(&'static str),
+}
+
+impl fmt::Display for RebarSingleCaptureReducerAotErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Rebar single-pattern capture reducer AOT failed: {self:?}",
+        )
+    }
+}
+
+impl std::error::Error for RebarSingleCaptureReducerAotErrorV1 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Object(source) => Some(source),
+            Self::ParticipationUnavailable(_)
+            | Self::SourceAuthentication(_)
+            | Self::ArithmeticOverflow(_)
+            | Self::Authentication(_) => None,
+        }
+    }
+}
+
+impl From<ObjectError> for RebarSingleCaptureReducerAotErrorV1 {
+    fn from(value: ObjectError) -> Self {
+        Self::Object(value)
+    }
+}
+
 /// Failure before publishing a Rebar exact-span participation artifact.
 /// Semantic native declines are successful authenticated negative artifacts,
 /// not members of this error type.
@@ -789,6 +1279,417 @@ pub fn compile_rebar_single_capture_aot_v1(
     Ok(artifact)
 }
 
+/// Append one one-call whole-operation reducer to an exact retained Rebar
+/// capture source artifact.
+///
+/// The source variant fixes the only permitted child graph. A selected
+/// participation artifact uses ordinary Span plus exact-span replay; a strict
+/// capture artifact uses only `capture_next` with private state and exact
+/// receipt-sized slots. No decline or construction failure selects the other
+/// route, and the final object is published only after deterministic module
+/// reconstruction and receipt authentication.
+pub fn compile_rebar_single_capture_reducer_aot_v1(
+    source: RebarSingleCaptureReducerSourceArtifactV1,
+    operation: RebarSingleCaptureReducerOperationV1,
+    max_object_bytes: usize,
+) -> Result<RebarSingleCaptureReducerAotArtifactV1, RebarSingleCaptureReducerAotErrorV1> {
+    authenticate_reducer_source(&source)?;
+    let source_route = source.route();
+    let source_cardinality = source.source_cardinality();
+    let source_bytes = source.source_bytes();
+    let source_sha256 = source.source_sha256();
+    let profile = source.profile().clone();
+    let target = source.target();
+    let capture_level = source.capture_level();
+    let group_count = source.group_count();
+    let can_match_empty = source.can_match_empty();
+    let selector_sha256 = source.selector_sha256();
+    let capture_sha256 = source.capture_sha256();
+    let source_artifact_identity_sha256 = source.artifact_identity_sha256();
+    let source_object_sha256 = source.object_sha256();
+    let (
+        caller_scratch_bytes,
+        private_participation_scratch_bytes,
+        private_iterator_state_bytes,
+        private_result_slot_count,
+        private_result_slot_bytes,
+    ) = reducer_private_schema(&source)?;
+    let native_domain = operation.native_domain();
+    let (module, reducer_symbol) = {
+        let native_source = source.native_source();
+        let (module, reducer_symbol) = source.module().clone().append_native_capture_reducer_v1(
+            native_domain,
+            native_source,
+            source_artifact_identity_sha256,
+        )?;
+        module
+            .authenticate_native_capture_reducer_v1(
+                source.module(),
+                native_domain,
+                native_source,
+                source_artifact_identity_sha256,
+                &reducer_symbol,
+            )
+            .map_err(|_| {
+                RebarSingleCaptureReducerAotErrorV1::Authentication(
+                    "fresh deterministic native closure",
+                )
+            })?;
+        (module, reducer_symbol)
+    };
+    let object = emit_object(&module, ObjectFormat::for_target(target), max_object_bytes)?;
+    let object_sha256 = reducer_sha256(&object);
+    let mut receipt = RebarSingleCaptureReducerAotReceiptV1 {
+        operation,
+        domain: operation.domain(),
+        source_route,
+        source_cardinality,
+        source_bytes,
+        source_sha256,
+        profile,
+        target,
+        capture_level,
+        group_count,
+        can_match_empty,
+        empty_progress: RebarSingleCaptureEmptyProgressV1::Byte,
+        semantic_runtime_calls: 0,
+        caller_scratch_bytes,
+        private_participation_scratch_bytes,
+        private_iterator_state_bytes,
+        private_result_slot_count,
+        private_result_slot_bytes,
+        selector_sha256,
+        capture_sha256,
+        source_artifact_identity_sha256,
+        source_object_sha256,
+        reducer_symbol_sha256: reducer_sha256(reducer_symbol.as_bytes()),
+        object_sha256,
+        object_bytes: object.len(),
+        max_object_bytes,
+        artifact_identity_sha256: [0; DIGEST_BYTES],
+    };
+    receipt.artifact_identity_sha256 =
+        rebar_single_capture_reducer_artifact_identity(&receipt, &source, &reducer_symbol)?;
+    let artifact = RebarSingleCaptureReducerAotArtifactV1 {
+        source,
+        module,
+        object: object.into_boxed_slice(),
+        reducer_symbol,
+        receipt,
+    };
+    if !artifact.authenticates_receipt() {
+        return Err(RebarSingleCaptureReducerAotErrorV1::Authentication(
+            "fresh Rebar whole-operation reducer artifact",
+        ));
+    }
+    Ok(artifact)
+}
+
+fn authenticate_reducer_source(
+    source: &RebarSingleCaptureReducerSourceArtifactV1,
+) -> Result<(), RebarSingleCaptureReducerAotErrorV1> {
+    if !source.authenticates_receipt() {
+        return Err(RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
+            "retained source receipt",
+        ));
+    }
+    let mut expected_profile = RustProfile::rebar_1_12_4();
+    expected_profile.options = source.profile().options.clone();
+    if source.source_cardinality() != REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY
+        || source.source_sha256() == [0; DIGEST_BYTES]
+        || source.profile() != &expected_profile
+        || source.capture_level() != CaptureLevel::All
+        || source.group_count() == 0
+        || source.selector_sha256() == [0; DIGEST_BYTES]
+        || source.capture_sha256() == [0; DIGEST_BYTES]
+        || source.artifact_identity_sha256() == [0; DIGEST_BYTES]
+        || source.object_sha256() == [0; DIGEST_BYTES]
+        || source.object().is_empty()
+        || reducer_sha256(source.object()) != source.object_sha256()
+        || source.module().target() != source.target()
+        || source.module().required_runtime_symbols().next().is_some()
+        || source.module().required_runtime_program().is_some()
+        || source.module().prepared_entry_symbol().is_some()
+        || source.module().prepared_aggregate_exports() != crate::PreparedAggregateExports::NONE
+        || source.module().required_prepare_capabilities() != 0
+    {
+        return Err(RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
+            "source profile/schema/helper closure",
+        ));
+    }
+    match source {
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(source) => {
+            let native = source.native_receipt();
+            if native.strategy == NativeParticipationAotStrategyV1::NegativeEntry {
+                return Err(
+                    RebarSingleCaptureReducerAotErrorV1::ParticipationUnavailable(
+                        native.decline.ok_or(
+                            RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
+                                "negative participation decline",
+                            ),
+                        )?,
+                    ),
+                );
+            }
+            let architecture_closes = match native.target.architecture {
+                Architecture::X86_64 => matches!(
+                    native.strategy,
+                    NativeParticipationAotStrategyV1::DfaX86_64
+                        | NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                ),
+                Architecture::Aarch64 => matches!(
+                    native.strategy,
+                    NativeParticipationAotStrategyV1::DfaAarch64
+                        | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+                ),
+            };
+            let scratch_closes = match native.strategy {
+                NativeParticipationAotStrategyV1::DfaX86_64
+                | NativeParticipationAotStrategyV1::DfaAarch64 => {
+                    native.scratch_bytes == crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+                }
+                NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                | NativeParticipationAotStrategyV1::OrderedNfaAarch64 => {
+                    native.scratch_bytes != 0
+                        && native.scratch_bytes.is_multiple_of(
+                            crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
+                        )
+                }
+                NativeParticipationAotStrategyV1::NegativeEntry => false,
+            };
+            if !architecture_closes
+                || native.decline.is_some()
+                || native.semantic_runtime_calls != 0
+                || native.groups != source.receipt().group_count()
+                || !scratch_closes
+                || !(1..=64).contains(&native.groups)
+            {
+                return Err(RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
+                    "selected exact-span participation route",
+                ));
+            }
+        }
+        RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(source) => {
+            let native = source.native_receipt();
+            let expected = match native.target.architecture {
+                Architecture::X86_64 => NativeCaptureAotStrategyV1::NativeOnePassX86_64,
+                Architecture::Aarch64 => NativeCaptureAotStrategyV1::NativeOnePassAarch64,
+            };
+            if native.strategy != expected
+                || native.decline.is_some()
+                || native.semantic_runtime_calls != 0
+                || source.receipt().result_slot_count() != source.receipt().group_count()
+                || source.receipt().group_count().checked_mul(2)
+                    != Some(source.receipt().raw_tag_slot_count())
+                || !(1..=16).contains(&source.receipt().group_count())
+            {
+                return Err(RebarSingleCaptureReducerAotErrorV1::SourceAuthentication(
+                    "selected strict capture-next route",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reducer_private_schema(
+    source: &RebarSingleCaptureReducerSourceArtifactV1,
+) -> Result<(usize, usize, usize, usize, usize), RebarSingleCaptureReducerAotErrorV1> {
+    match source {
+        RebarSingleCaptureReducerSourceArtifactV1::ExactSpanParticipation(source) => {
+            let native = source.native_receipt();
+            if matches!(
+                native.strategy,
+                NativeParticipationAotStrategyV1::OrderedNfaX86_64
+                    | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+            ) {
+                Ok((native.scratch_bytes, 0, 0, 0, 0))
+            } else {
+                Ok((
+                    0,
+                    crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES,
+                    0,
+                    0,
+                    0,
+                ))
+            }
+        }
+        RebarSingleCaptureReducerSourceArtifactV1::CaptureNext(source) => {
+            let slots = source.receipt().group_count();
+            let state_bytes = usize::try_from(crate::NATIVE_CAPTURE_AOT_V1_ITER_STATE_BYTES)
+                .map_err(|_| {
+                    RebarSingleCaptureReducerAotErrorV1::ArithmeticOverflow(
+                        "private capture iterator state",
+                    )
+                })?;
+            let slot_width = usize::try_from(crate::NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES)
+                .map_err(|_| {
+                    RebarSingleCaptureReducerAotErrorV1::ArithmeticOverflow(
+                        "private capture result slot width",
+                    )
+                })?;
+            let bytes = slots.checked_mul(slot_width).ok_or(
+                RebarSingleCaptureReducerAotErrorV1::ArithmeticOverflow(
+                    "private capture result slots",
+                ),
+            )?;
+            Ok((0, 0, state_bytes, slots, bytes))
+        }
+    }
+}
+
+fn rebar_single_capture_reducer_artifact_authenticates(
+    artifact: &RebarSingleCaptureReducerAotArtifactV1,
+) -> bool {
+    let receipt = &artifact.receipt;
+    let source = &artifact.source;
+    let Ok((caller_scratch_bytes, scratch_bytes, state_bytes, slot_count, slot_bytes)) =
+        reducer_private_schema(source)
+    else {
+        return false;
+    };
+    if authenticate_reducer_source(source).is_err()
+        || receipt.operation.domain() != receipt.domain
+        || receipt.source_route != source.route()
+        || receipt.source_cardinality != source.source_cardinality()
+        || receipt.source_bytes != source.source_bytes()
+        || receipt.source_sha256 != source.source_sha256()
+        || &receipt.profile != source.profile()
+        || receipt.target != source.target()
+        || receipt.target != artifact.module.target()
+        || receipt.capture_level != source.capture_level()
+        || receipt.group_count != source.group_count()
+        || receipt.can_match_empty != source.can_match_empty()
+        || receipt.empty_progress != RebarSingleCaptureEmptyProgressV1::Byte
+        || receipt.semantic_runtime_calls != 0
+        || receipt.caller_scratch_bytes != caller_scratch_bytes
+        || receipt.private_participation_scratch_bytes != scratch_bytes
+        || receipt.private_iterator_state_bytes != state_bytes
+        || receipt.private_result_slot_count != slot_count
+        || receipt.private_result_slot_bytes != slot_bytes
+        || receipt.selector_sha256 != source.selector_sha256()
+        || receipt.capture_sha256 != source.capture_sha256()
+        || receipt.source_artifact_identity_sha256 != source.artifact_identity_sha256()
+        || receipt.source_object_sha256 != source.object_sha256()
+        || receipt.reducer_symbol_sha256 != reducer_sha256(artifact.reducer_symbol.as_bytes())
+        || receipt.object_bytes != artifact.object.len()
+        || receipt.object_bytes == 0
+        || receipt.object_bytes > receipt.max_object_bytes
+        || receipt.object_sha256 != reducer_sha256(&artifact.object)
+        || artifact.module.required_runtime_symbols().next().is_some()
+        || artifact.module.required_runtime_program().is_some()
+        || artifact.module.prepared_entry_symbol().is_some()
+        || artifact.module.prepared_aggregate_exports() != crate::PreparedAggregateExports::NONE
+        || artifact.module.required_prepare_capabilities() != 0
+    {
+        return false;
+    }
+    let native_source = source.native_source();
+    if artifact
+        .module
+        .authenticate_native_capture_reducer_v1(
+            source.module(),
+            receipt.operation.native_domain(),
+            native_source,
+            receipt.source_artifact_identity_sha256,
+            &artifact.reducer_symbol,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if !emit_object(
+        &artifact.module,
+        ObjectFormat::for_target(receipt.target),
+        receipt.max_object_bytes,
+    )
+    .is_ok_and(|expected| expected.as_slice() == artifact.object.as_ref())
+    {
+        return false;
+    }
+    rebar_single_capture_reducer_artifact_identity(receipt, source, &artifact.reducer_symbol)
+        .is_ok_and(|identity| identity == receipt.artifact_identity_sha256)
+}
+
+fn rebar_single_capture_reducer_artifact_identity(
+    receipt: &RebarSingleCaptureReducerAotReceiptV1,
+    source: &RebarSingleCaptureReducerSourceArtifactV1,
+    reducer_symbol: &str,
+) -> Result<[u8; DIGEST_BYTES], RebarSingleCaptureReducerAotErrorV1> {
+    let mut digest = Sha256::new();
+    digest.update(REBAR_SINGLE_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+    digest.update(REBAR_PROFILE_IDENTITY);
+    digest.update([
+        receipt.operation as u8,
+        receipt.domain as u8,
+        receipt.source_route as u8,
+        match receipt.capture_level {
+            CaptureLevel::All => 1,
+        },
+        u8::from(receipt.can_match_empty),
+        receipt.empty_progress as u8,
+    ]);
+    hash_options(&mut digest, &receipt.profile.options);
+    hash_target(&mut digest, receipt.target);
+    for value in [
+        receipt.source_cardinality,
+        receipt.source_bytes,
+        receipt.group_count,
+        receipt.semantic_runtime_calls,
+        receipt.private_participation_scratch_bytes,
+        receipt.private_iterator_state_bytes,
+        receipt.private_result_slot_count,
+        receipt.private_result_slot_bytes,
+        receipt.object_bytes,
+        receipt.max_object_bytes,
+    ] {
+        digest.update(reducer_usize_u64(value, "capture reducer receipt")?.to_le_bytes());
+    }
+    if receipt.caller_scratch_bytes != 0 {
+        digest.update(b"caller-scratch-v1\0");
+        digest.update(
+            reducer_usize_u64(
+                receipt.caller_scratch_bytes,
+                "capture reducer caller scratch",
+            )?
+            .to_le_bytes(),
+        );
+    }
+    for identity in [
+        receipt.source_sha256,
+        receipt.selector_sha256,
+        receipt.capture_sha256,
+        receipt.source_artifact_identity_sha256,
+        receipt.source_object_sha256,
+        receipt.reducer_symbol_sha256,
+        receipt.object_sha256,
+    ] {
+        digest.update(identity);
+    }
+    for symbol in source
+        .symbols()
+        .into_iter()
+        .chain(core::iter::once(reducer_symbol))
+    {
+        digest.update(
+            reducer_usize_u64(symbol.len(), "capture reducer symbol identity")?.to_le_bytes(),
+        );
+        digest.update(symbol.as_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn reducer_usize_u64(
+    value: usize,
+    site: &'static str,
+) -> Result<u64, RebarSingleCaptureReducerAotErrorV1> {
+    u64::try_from(value).map_err(|_| RebarSingleCaptureReducerAotErrorV1::ArithmeticOverflow(site))
+}
+
+fn reducer_sha256(bytes: &[u8]) -> [u8; DIGEST_BYTES] {
+    Sha256::digest(bytes).into()
+}
+
 fn rebar_single_artifact_authenticates(artifact: &RebarSingleCaptureAotArtifactV1) -> bool {
     let receipt = &artifact.receipt;
     let native = &artifact.native;
@@ -843,10 +1744,18 @@ fn rebar_single_participation_artifact_authenticates(
     let mut expected_profile = RustProfile::rebar_1_12_4();
     expected_profile.options = receipt.profile.options.clone();
     let selected_strategy = match receipt.target.architecture {
-        Architecture::X86_64 => NativeParticipationAotStrategyV1::DfaX86_64,
-        Architecture::Aarch64 => NativeParticipationAotStrategyV1::DfaAarch64,
+        Architecture::X86_64 => matches!(
+            native_receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaX86_64
+                | NativeParticipationAotStrategyV1::OrderedNfaX86_64
+        ),
+        Architecture::Aarch64 => matches!(
+            native_receipt.strategy,
+            NativeParticipationAotStrategyV1::DfaAarch64
+                | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+        ),
     };
-    let route_closes = if native_receipt.strategy == selected_strategy {
+    let route_closes = if selected_strategy {
         native_receipt.decline.is_none()
             && native.module().required_runtime_symbols().next().is_none()
             && native.module().required_runtime_program().is_none()
@@ -915,6 +1824,8 @@ fn rebar_single_participation_artifact_identity(
             NativeParticipationAotStrategyV1::DfaX86_64 => 1_u16,
             NativeParticipationAotStrategyV1::DfaAarch64 => 2_u16,
             NativeParticipationAotStrategyV1::NegativeEntry => 3_u16,
+            NativeParticipationAotStrategyV1::OrderedNfaX86_64 => 4_u16,
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64 => 5_u16,
         }
         .to_le_bytes(),
     );
@@ -941,6 +1852,32 @@ fn rebar_single_participation_artifact_identity(
     ] {
         digest
             .update(participation_usize_u64(value, "native participation identity")?.to_le_bytes());
+    }
+    if matches!(
+        native_receipt.strategy,
+        NativeParticipationAotStrategyV1::OrderedNfaX86_64
+            | NativeParticipationAotStrategyV1::OrderedNfaAarch64
+    ) {
+        digest.update(b"ordered-nfa-fallback-v1\0");
+        for value in [
+            native_receipt.ordered_nfa_states,
+            native_receipt.ordered_nfa_byte_ranges,
+            native_receipt.dfa_fallback_required,
+            native_receipt.dfa_fallback_limit,
+        ] {
+            digest.update(
+                participation_usize_u64(value, "ordered-NFA participation identity")?
+                    .to_le_bytes(),
+            );
+        }
+        digest.update(
+            match native_receipt.dfa_fallback_resource {
+                Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u16,
+                Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u16,
+                _ => 0_u16,
+            }
+            .to_le_bytes(),
+        );
     }
     for identity in [
         native_receipt.capture_sha256,

@@ -3323,7 +3323,7 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
                 Some(if grep_count {
                     PreparedAggregateStrategy::RuntimeHelper
                 } else {
-                    PreparedAggregateStrategy::NativeFused
+                    PreparedAggregateStrategy::NativeFusedWithRuntimeHelper
                 }),
             );
             assert_eq!(
@@ -3449,6 +3449,110 @@ fn prepared_v15_grep_count_is_native_fail_closed_and_cross_target() {
 }
 
 #[test]
+fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        for export in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::GREP_COUNT,
+        ] {
+            let request = || {
+                CompileRequest::new(r"\b\w{12,}\b", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let legacy = crate::compile_with_prepared_ordered_nfa_v15(
+                request(),
+                export,
+            )
+            .expect("legacy V15 compatibility topology");
+            assert_eq!(legacy.receipt().entry_abi, EntryAbi::SpanSearchV1);
+            assert_eq!(
+                legacy.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+            );
+            assert!(legacy.module().prepared_entry_symbol().is_some());
+            assert!(legacy.module().prepared_span_fill_symbol().is_some());
+            assert!(legacy.module().required_runtime_symbols().next().is_some());
+
+            let disposition =
+                crate::compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+                    request(),
+                    export,
+                )
+                .expect("closed V15 scalar operation compile");
+            let compiled = disposition
+                .into_compiled()
+                .expect("eligible V15 scalar operation");
+            let module = compiled.module();
+            assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+            );
+            assert_eq!(module.prepared_bulk_strategy(), None);
+            assert_eq!(module.prepared_entry_symbol(), None);
+            assert_eq!(module.prepared_span_fill_symbol(), None);
+            assert_eq!(
+                compiled.receipt().required_prepare_capabilities,
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            );
+            assert!(!compiled.receipt().runtime_helper_required);
+            assert!(module.required_runtime_symbols().next().is_none());
+            assert!(module.required_runtime_program().is_some());
+            let reducer = if export == PreparedAggregateExports::COUNT {
+                module.prepared_count_symbol()
+            } else if export == PreparedAggregateExports::SPAN_SUM {
+                module.prepared_span_sum_symbol()
+            } else {
+                module.prepared_grep_count_symbol()
+            };
+            assert_eq!(reducer, Some(module.entry_symbol()));
+            let global_functions = module
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.binding == crate::SymbolBinding::Global
+                        && symbol.kind == crate::SymbolKind::Function
+                        && symbol.section.is_some()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(global_functions.len(), 1);
+            assert_eq!(global_functions[0].name, module.entry_symbol());
+            assert!(module.relocations().iter().all(|relocation| {
+                module
+                    .symbols()
+                    .get(relocation.symbol)
+                    .is_some_and(|symbol| symbol.section.is_some())
+            }));
+        }
+    }
+}
+
+#[test]
+fn prepared_v15_scalar_operation_rejects_every_non_scalar_export_shape() {
+    for exports in [
+        PreparedAggregateExports::NONE,
+        PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        PreparedAggregateExports::ALL,
+    ] {
+        let error = crate::compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+            CompileRequest::new(r"\b\w{12,}\b", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            exports,
+        )
+        .expect_err("non-scalar V15 operation export shape");
+        assert!(matches!(
+            error,
+            CompileError::PreparedScalarOperationRequiresSingleExport { actual }
+                if actual == exports
+        ));
+    }
+}
+
+#[test]
 fn prepared_aggregate_exports_enforce_the_final_object_limit() {
     let request = || {
         CompileRequest::new("a+|bc", Target::x86_64_linux())
@@ -3492,7 +3596,7 @@ fn native_prepared_aggregate_object_limit_has_exact_boundary() {
     .expect("native aggregate exact resource baseline");
     assert_eq!(
         baseline.receipt().prepared_aggregate_strategy,
-        Some(PreparedAggregateStrategy::NativeFused),
+        Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
     );
     let exact_limits = CompileLimitsV1 {
         max_object_bytes: baseline.object().len(),

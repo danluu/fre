@@ -15,12 +15,14 @@
  * window. The haystack is bytes; invalid UTF-8 is ordinary input.
  *
  * A selected entry requires non-null, naturally aligned, nonwrapping request,
- * scratch, and count pointers. scratch_len must be exactly 16. Scratch is
- * caller-owned reserved ABI storage: the native scratch channel validates but
- * never reads or writes it. (An aliased count_out can still publish there on
- * MATCH.) MATCH alone publishes count_out. Every other status leaves count_out
- * and scratch untouched. A well-formed but nonmatching span is a
- * RUNTIME_FAILURE. A negative entry returns
+ * scratch, and count pointers. scratch_len must equal the exact extent in the
+ * paired receipt. DFA entries require 16 caller-owned reserved bytes and do
+ * not read or write them. Ordered-NFA entries use their larger receipt-sized
+ * extent as transient replay state and may overwrite it, including on a
+ * non-success status. No entry retains scratch after return. Scratch must not
+ * overlap count_out, the request, the plan, or a nonempty haystack. MATCH
+ * alone publishes count_out; every other status leaves count_out untouched. A
+ * well-formed but nonmatching span is a RUNTIME_FAILURE. A negative entry returns
  * FRE_AOT_REGEX_STATUS_NATIVE_PARTICIPATION_UNAVAILABLE without reading the
  * request.
  */

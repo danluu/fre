@@ -9,6 +9,10 @@
   ],
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonzeroSha256": {
+      "type": "string",
+      "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+    },
     "gitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "idSet": {
       "type": "object",
@@ -78,6 +82,117 @@
         "point_count": { "type": "integer", "minimum": 1 }
       }
     },
+    "expectedPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["point_id", "expected"],
+      "properties": {
+        "point_id": { "type": "string", "minLength": 1 },
+        "expected": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        }
+      }
+    },
+    "expectedObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparator", "expected_values", "points"],
+      "properties": {
+        "comparator": {
+          "enum": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "expected_values": {
+          "type": "array",
+          "items": {
+            "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+          },
+          "minItems": 1, "uniqueItems": true
+        },
+        "points": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedPoint" },
+          "minItems": 1
+        }
+      }
+    },
+    "expectedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id", "selected_expected", "selected_comparator", "divergent",
+        "observations"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "selected_expected": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "selected_comparator": {
+          "enum": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "divergent": { "type": "boolean" },
+        "observations": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedObservation" },
+          "minItems": 1, "maxItems": 2
+        }
+      }
+    },
+    "expectedResults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority", "preference", "runtime_jobs", "runtime_jobs_sha256",
+        "divergent_jobs"
+      ],
+      "properties": {
+        "authority": { "const": "frozen-comparator-first-v1" },
+        "preference": {
+          "const": ["re2-2025-11-05", "rust-regex-1.12.4"]
+        },
+        "runtime_jobs": {
+          "type": "array", "items": { "$ref": "#/$defs/expectedResult" },
+          "minItems": 311, "maxItems": 311
+        },
+        "runtime_jobs_sha256": { "$ref": "#/$defs/sha256" },
+        "divergent_jobs": { "$ref": "#/$defs/idSet" }
+      }
+    },
+    "publicManifestMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_ordinal", "manifest_klv", "semantic_identity_sha256",
+        "job_id", "point_ids"
+      ],
+      "properties": {
+        "manifest_ordinal": { "type": "integer", "minimum": 0, "maximum": 343 },
+        "manifest_klv": { "$ref": "#/$defs/klv" },
+        "semantic_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "job_id": { "type": "string", "minLength": 1 },
+        "point_ids": {
+          "type": "array", "items": { "type": "string", "minLength": 1 },
+          "minItems": 1, "uniqueItems": true
+        }
+      }
+    },
+    "publicManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "file_sha256", "entry_count", "entries_sha256",
+        "mappings", "mapping_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "fre.public-rebar-klv-inventory.v1" },
+        "file_sha256": { "$ref": "#/$defs/sha256" },
+        "entry_count": { "const": 344 },
+        "entries_sha256": { "$ref": "#/$defs/sha256" },
+        "mappings": {
+          "type": "array", "items": { "$ref": "#/$defs/publicManifestMapping" },
+          "minItems": 344, "maxItems": 344
+        },
+        "mapping_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "planJob": {
       "type": "object",
       "additionalProperties": false,
@@ -138,6 +253,7 @@
         "public_corpus": {
           "type": "object",
           "additionalProperties": false,
+          "dependentRequired": { "manifest": ["expected_results"] },
           "required": [
             "label", "klv_root_recorded", "privacy_policy", "rebar_revisions", "schedules"
           ],
@@ -146,7 +262,9 @@
             "klv_root_recorded": { "type": "string", "minLength": 1 },
             "privacy_policy": { "const": "public-rebar-only; hashed-input-identities; no-pattern-or-haystack-bytes" },
             "rebar_revisions": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-            "schedules": { "type": "array", "items": { "$ref": "#/$defs/schedule" }, "minItems": 1 }
+            "schedules": { "type": "array", "items": { "$ref": "#/$defs/schedule" }, "minItems": 1 },
+            "expected_results": { "$ref": "#/$defs/expectedResults" },
+            "manifest": { "$ref": "#/$defs/publicManifest" }
           }
         },
         "target": {
@@ -375,11 +493,85 @@
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "scalarNativeReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256"
+      ],
+      "properties": {
+        "route_variant": {
+          "enum": ["direct-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
+        "prepare_operation_flags": { "enum": [2, 4] },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "entry_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "program_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "span_fill_identity_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "direct-v2" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "ordered-v15" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "span_fill_identity_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          },
+          "else": {
+            "properties": {
+              "span_fill_identity_sha256": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
     "sharedOrderedManyProvenance": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "receipt_schema_version", "source_pattern_count",
+        "route_variant", "receipt_schema_version", "source_pattern_count",
         "ordered_sources_sha256", "required_prepare_capabilities",
         "prepare_config_version", "prepare_operation_flags",
         "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
@@ -387,23 +579,52 @@
         "reducer_identity_sha256"
       ],
       "properties": {
+        "route_variant": {
+          "enum": ["native-fused-v2", "ordered-v15", "ordered-v15-operation-only"]
+        },
         "receipt_schema_version": { "const": 1 },
         "source_pattern_count": {
           "type": "integer", "minimum": 2, "maximum": 4096
         },
         "ordered_sources_sha256": { "$ref": "#/$defs/sha256" },
-        "required_prepare_capabilities": { "const": 1 },
-        "prepare_config_version": { "const": 3 },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
         "prepare_operation_flags": { "enum": [2, 4] },
-        "max_handle_bytes": { "const": 8388608 },
-        "max_scratch_bytes": { "const": 8388608 },
-        "max_setup_work": { "const": 2000000 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
         "runtime_program_len": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
         "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "native-fused-v2" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
     },
     "uniformCaptureProvenance": {
       "type": "object",
@@ -455,6 +676,64 @@
         }
       }
     },
+    "uniformCaptureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256"
+      ],
+      "properties": {
+        "route_variant": {
+          "enum": ["direct-v1", "ordered-v15", "ordered-v15-operation-only"]
+        },
+        "required_prepare_capabilities": { "enum": [0, 1] },
+        "prepare_config_version": { "enum": [2, 3] },
+        "prepare_operation_flags": { "const": 2 },
+        "max_handle_bytes": { "enum": [0, 8388608] },
+        "max_scratch_bytes": { "enum": [0, 8388608] },
+        "max_setup_work": { "enum": [0, 2000000] },
+        "runtime_program_len": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "entry_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "program_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "span_fill_identity_sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "route_variant": { "const": "direct-v1" } },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 0 },
+              "prepare_config_version": { "const": 2 },
+              "max_handle_bytes": { "const": 0 },
+              "max_scratch_bytes": { "const": 0 },
+              "max_setup_work": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_prepare_capabilities": { "const": 1 },
+              "prepare_config_version": { "const": 3 },
+              "max_handle_bytes": { "const": 8388608 },
+              "max_scratch_bytes": { "const": 8388608 },
+              "max_setup_work": { "const": 2000000 }
+            }
+          }
+        }
+      ]
+    },
     "strictCaptureProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -497,7 +776,11 @@
         "participation_strategy", "participation_semantic_runtime_calls",
         "participation_assertions", "participation_assertion_signatures",
         "participation_byte_classes", "participation_dfa_states",
-        "participation_transition_cells", "participation_build_work",
+        "participation_transition_cells", "participation_ordered_nfa_states",
+        "participation_ordered_nfa_byte_ranges",
+        "participation_dfa_fallback_resource",
+        "participation_dfa_fallback_required",
+        "participation_dfa_fallback_limit", "participation_build_work",
         "participation_scratch_bytes", "participation_plan_bytes",
         "capture_source_sha256", "capture_selector_sha256", "capture_program_sha256",
         "selector_object_sha256", "participation_bundle_sha256",
@@ -528,6 +811,21 @@
         "participation_transition_cells": {
           "type": "integer", "minimum": 1, "maximum": 16777216
         },
+        "participation_ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "participation_dfa_fallback_resource": {
+          "type": "integer", "minimum": 0, "maximum": 2
+        },
+        "participation_dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "participation_dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
         "participation_build_work": {
           "type": "integer", "minimum": 1, "maximum": 268435456
         },
@@ -557,6 +855,214 @@
         }
       }
     },
+    "captureReducerParticipationSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm_id", "strategy", "assertions", "assertion_signatures",
+        "byte_classes", "dfa_states", "transition_cells",
+        "ordered_nfa_states", "ordered_nfa_byte_ranges",
+        "dfa_fallback_resource", "dfa_fallback_required",
+        "dfa_fallback_limit", "build_work",
+        "scratch_bytes", "plan_bytes", "selector_object_sha256",
+        "bundle_sha256", "export_identity_sha256", "bundle_symbol",
+        "selector_symbol", "entry_symbol"
+      ],
+      "properties": {
+        "algorithm_id": {
+          "enum": [
+            "fre-aot-regex.exact-span-participation-dfa.v1",
+            "fre-aot-regex.exact-span-participation-ordered-nfa.v1"
+          ]
+        },
+        "strategy": { "enum": [1, 2, 4, 5] },
+        "assertions": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "assertion_signatures": {
+          "type": "integer", "minimum": 0, "maximum": 256
+        },
+        "byte_classes": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "dfa_states": { "type": "integer", "minimum": 0, "maximum": 131072 },
+        "transition_cells": {
+          "type": "integer", "minimum": 0, "maximum": 16777216
+        },
+        "ordered_nfa_states": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "ordered_nfa_byte_ranges": {
+          "type": "integer", "minimum": 0, "maximum": 268435456
+        },
+        "dfa_fallback_resource": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "dfa_fallback_required": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "dfa_fallback_limit": {
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "build_work": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "scratch_bytes": {
+          "type": "integer", "minimum": 16, "maximum": 8388608
+        },
+        "plan_bytes": {
+          "type": "integer", "minimum": 256, "maximum": 268435456
+        },
+        "selector_object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "export_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_bundle_v1_[0-9a-f]{64}$"
+        },
+        "selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        },
+        "entry_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_participation_exact_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "captureReducerCaptureNextSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_sha256", "bundle_sha256", "next_symbol",
+        "materialize_symbol", "selector_symbol"
+      ],
+      "properties": {
+        "plan_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "bundle_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "next_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_next_v1_[0-9a-f]{64}$"
+        },
+        "materialize_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_capture_materialize_v1_[0-9a-f]{64}$"
+        },
+        "selector_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "captureReducerProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "domain", "source_route", "source_cardinality",
+        "source_bytes", "source_pattern_sha256", "source_sha256", "group_count",
+        "can_match_empty",
+        "empty_progress", "semantic_runtime_calls",
+        "caller_scratch_bytes",
+        "private_participation_scratch_bytes", "private_iterator_state_bytes",
+        "private_result_slot_count", "private_result_slot_bytes",
+        "selector_sha256", "capture_sha256",
+        "source_artifact_identity_sha256", "source_object_sha256",
+        "reducer_symbol", "reducer_symbol_sha256", "object_sha256",
+        "object_bytes", "max_object_bytes", "artifact_identity_sha256",
+        "participation_source", "capture_next_source"
+      ],
+      "properties": {
+        "operation": { "enum": ["count-captures", "grep-captures"] },
+        "domain": { "enum": ["whole-haystack", "byte-slice-lines-lf-crlf"] },
+        "source_route": {
+          "enum": ["exact-span-participation-v1", "capture-next-v1"]
+        },
+        "source_cardinality": { "const": 1 },
+        "source_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "source_pattern_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "group_count": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "can_match_empty": { "type": "boolean" },
+        "empty_progress": { "const": "byte" },
+        "semantic_runtime_calls": { "const": 0 },
+        "caller_scratch_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 8388608
+        },
+        "private_participation_scratch_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 16
+        },
+        "private_iterator_state_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 24
+        },
+        "private_result_slot_count": {
+          "type": "integer", "minimum": 0, "maximum": 16
+        },
+        "private_result_slot_bytes": {
+          "type": "integer", "minimum": 0, "maximum": 256
+        },
+        "selector_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "capture_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "source_object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "oneOf": [
+            { "pattern": "^fre_aot_regex_count_captures_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_grep_captures_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_count_captures_scratch_v1_[0-9a-f]{64}$" },
+            { "pattern": "^fre_aot_regex_grep_captures_scratch_v1_[0-9a-f]{64}$" }
+          ]
+        },
+        "reducer_symbol_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "max_object_bytes": { "const": 268435456 },
+        "artifact_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "participation_source": {
+          "anyOf": [
+            { "$ref": "#/$defs/captureReducerParticipationSource" },
+            { "type": "null" }
+          ]
+        },
+        "capture_next_source": {
+          "anyOf": [
+            { "$ref": "#/$defs/captureReducerCaptureNextSource" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source_route": { "const": "exact-span-participation-v1" }
+            },
+            "required": ["source_route"]
+          },
+          "then": {
+            "properties": {
+              "participation_source": {
+                "$ref": "#/$defs/captureReducerParticipationSource"
+              },
+              "capture_next_source": { "type": "null" },
+              "private_iterator_state_bytes": { "const": 0 },
+              "private_result_slot_count": { "const": 0 },
+              "private_result_slot_bytes": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "participation_source": { "type": "null" },
+              "capture_next_source": {
+                "$ref": "#/$defs/captureReducerCaptureNextSource"
+              },
+              "group_count": { "maximum": 16 },
+              "caller_scratch_bytes": { "const": 0 },
+              "private_participation_scratch_bytes": { "const": 0 },
+              "private_iterator_state_bytes": { "const": 24 }
+            }
+          }
+        }
+      ]
+    },
     "selectorCaptureFallbackProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -583,6 +1089,74 @@
         }
       }
     },
+    "regexReduxProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_version", "operation_identity_sha256", "reducer_symbol",
+        "reducer_code_sha256", "reducer_data_sha256", "reducer_object_sha256",
+        "reducer_relocation_count", "reducer_link_symbols",
+        "semantic_runtime_symbols", "request_bytes", "receipt_bytes",
+        "report_bytes", "scratch_buffer_count", "scratch_capacity_numerator",
+        "scratch_capacity_denominator", "receipt_schema", "report_schema"
+      ],
+      "properties": {
+        "abi_version": { "const": 1 },
+        "operation_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_rebar_regex_redux_v1_[0-9a-f]{64}$"
+        },
+        "reducer_code_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_data_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_object_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_relocation_count": { "enum": [16, 17] },
+        "reducer_link_symbols": {
+          "type": "array", "minItems": 15, "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^fre_aot_regex_search_v1_[0-9a-f]{64}$"
+          }
+        },
+        "semantic_runtime_symbols": { "const": [] },
+        "request_bytes": { "const": 72 },
+        "receipt_bytes": { "const": 144 },
+        "report_bytes": { "const": 1024 },
+        "scratch_buffer_count": { "const": 2 },
+        "scratch_capacity_numerator": { "const": 3 },
+        "scratch_capacity_denominator": { "const": 2 },
+        "receipt_schema": {
+          "const": "u64-input-clean-variant9-substitution5-final-report-v1"
+        },
+        "report_schema": {
+          "const": "variant9-blank-input-clean-final-lines-v1"
+        }
+      }
+    },
+    "frozenValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority", "expected_value", "expected_comparator",
+        "schedule_klv_sha256", "schedule_binding_sha256", "stock_comparator",
+        "stock_divergence_policy"
+      ],
+      "properties": {
+        "authority": { "const": "frozen-public-schedule-v1" },
+        "expected_value": {
+          "type": "integer", "minimum": 0, "maximum": 18446744073709551615
+        },
+        "expected_comparator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/+:\\-]{0,127}$"
+        },
+        "schedule_klv_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "schedule_binding_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "stock_comparator": { "const": "rust-regex-1.12.4" },
+        "stock_divergence_policy": { "const": "report-only" }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -593,13 +1167,14 @@
         "aggregate_strategy", "uniform_capture", "shared_ordered_many",
         "prepared_bulk_strategy", "span_iteration_strategy", "grep_iteration_strategy",
         "program_sha256", "object_sha256", "program_symbol", "entry_symbol",
-        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components"
+        "reducer_symbol", "span_fill_symbol", "required_runtime_symbols", "components",
+        "entry_abi", "validation"
       ],
       "properties": {
         "schema": {
           "enum": [
             "fre.aot.rebar-runner.v2", "fre.aot.rebar-runner.v3",
-            "fre.aot.rebar-runner.v4"
+            "fre.aot.rebar-runner.v4", "fre.aot.rebar-runner.v5"
           ]
         },
         "adapter": { "type": "string" },
@@ -609,11 +1184,18 @@
         "source_tree": { "type": "string" },
         "target": { "type": "string" },
         "feature_bits": { "type": "string" },
+        "entry_abi": {
+          "enum": [
+            null, "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+          ]
+        },
+        "validation": { "$ref": "#/$defs/frozenValidation" },
         "kind": {
           "enum": [
             "scalar-v2", "composite-v3", "strict-capture-v4",
             "participation-capture-v4", "selector-capture-fallback-v4",
-            "prepared-grep-v15-v2", "shared-ordered-many-v2"
+            "prepared-grep-v15-v2", "shared-ordered-many-v2",
+            "single-capture-reducer-v5"
           ]
         },
         "composite_kind": {
@@ -622,7 +1204,8 @@
             "regex-redux-fixed-v1", "strict-capture-next-v1",
             "exact-span-participation-v1", "selector-negative-certificate-v1",
             "mixed-prepared-native-row-bridge-v15",
-            "shared-ordered-many-native-reducer-v1"
+            "shared-ordered-many-native-reducer-v1",
+            "single-capture-whole-operation-reducer-v1"
           ]
         },
         "source_pattern_count": { "type": ["integer", "null"], "minimum": 0 },
@@ -636,6 +1219,7 @@
         "uniform_capture": {
           "anyOf": [
             { "$ref": "#/$defs/uniformCaptureProvenance" },
+            { "$ref": "#/$defs/uniformCaptureReducerProvenance" },
             { "type": "null" }
           ]
         },
@@ -649,10 +1233,15 @@
         "participation_capture": {
           "$ref": "#/$defs/participationCaptureProvenance"
         },
+        "capture_reducer": { "$ref": "#/$defs/captureReducerProvenance" },
         "selector_capture_fallback": {
           "$ref": "#/$defs/selectorCaptureFallbackProvenance"
         },
+        "regex_redux": { "$ref": "#/$defs/regexReduxProvenance" },
         "prepared_grep_v15": { "$ref": "#/$defs/preparedGrepV15Provenance" },
+        "scalar_native_reducer": {
+          "$ref": "#/$defs/scalarNativeReducerProvenance"
+        },
         "prepared_v15_limits": { "$ref": "#/$defs/preparedV15LimitsProvenance" },
         "prepared_bulk_strategy": { "type": ["string", "null"] },
         "span_iteration_strategy": { "type": ["string", "null"] },
@@ -671,6 +1260,50 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": { "schema": { "const": "fre.aot.rebar-runner.v2" } },
+            "required": ["schema"]
+          },
+          "then": {
+            "properties": {
+              "entry_abi": {
+                "enum": [
+                  "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+                ]
+              }
+            }
+          },
+          "else": { "properties": { "entry_abi": { "type": "null" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "composite_kind": { "const": "regex-redux-fixed-v1" }
+            },
+            "required": ["composite_kind"]
+          },
+          "then": { "required": ["regex_redux"] },
+          "else": { "not": { "required": ["regex_redux"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "single-capture-reducer-v5" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["capture_reducer"],
+            "properties": {
+              "schema": { "const": "fre.aot.rebar-runner.v5" },
+              "composite_kind": {
+                "const": "single-capture-whole-operation-reducer-v1"
+              },
+              "components": { "maxItems": 0 },
+              "required_runtime_symbols": { "maxItems": 0 }
+            }
+          },
+          "else": { "not": { "required": ["capture_reducer"] } }
+        },
         {
           "if": {
             "properties": { "kind": { "const": "strict-capture-v4" } },
@@ -721,6 +1354,31 @@
           },
           "then": { "required": ["prepared_grep_v15"] },
           "else": { "not": { "required": ["prepared_grep_v15"] } }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "kind": { "const": "scalar-v2" },
+                  "model": { "const": "count" }
+                },
+                "required": ["kind", "model"]
+              },
+              {
+                "properties": {
+                  "kind": { "const": "scalar-v2" },
+                  "model": { "const": "count-spans" },
+                  "span_iteration_strategy": {
+                    "const": "linked-native-span-sum-reducer"
+                  }
+                },
+                "required": ["kind", "model", "span_iteration_strategy"]
+              }
+            ]
+          },
+          "then": { "required": ["scalar_native_reducer"] },
+          "else": { "not": { "required": ["scalar_native_reducer"] } }
         },
         {
           "if": {

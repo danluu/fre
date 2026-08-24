@@ -421,8 +421,182 @@ fn configured_native_rows_klv(model: Model) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "recursive Cargo smoke for all fixed regex-redux AOT objects and entries"]
-fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(), DynError> {
+#[ignore = "recursive Cargo smoke for both single-capture whole-operation models"]
+fn configured_nonuniform_capture_reducers_match_public_oracle_and_v5_receipts(
+) -> Result<(), DynError> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "fre-aot-rebar-capture-reducers-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+
+    let result = (|| {
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        // Production precedence currently consumes the assertion-free,
+        // <=16-group strict subset through participation. CaptureNext itself
+        // is finalized independently in the shared source/receipt test.
+        for (index, (model, pattern, source_route)) in [
+            (
+                Model::CountCaptures,
+                r"(a)?b",
+                "source_route=exact-span-participation-v1",
+            ),
+            (
+                Model::GrepCaptures,
+                r"(a)?b",
+                "source_route=exact-span-participation-v1",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let klv_bytes = configured_capture_reducer_klv(model, pattern);
+            let benchmark = Benchmark::parse(&klv_bytes)?;
+            let expected = capture_oracle(&benchmark)?;
+            let klv = root.join(format!("capture-reducer-{index}.klv"));
+            let target = root.join(format!("target-{index}"));
+            fs::write(&klv, &klv_bytes)?;
+            let built = Command::new(&cargo)
+                .current_dir(workspace_root())
+                .args([
+                    "build",
+                    "--offline",
+                    "--jobs=1",
+                    "-p",
+                    "fre-aot-rebar-runner",
+                    "--bin",
+                    "fre-aot-rebar-runner",
+                ])
+                .env("CARGO_TARGET_DIR", &target)
+                .env("FRE_AOT_REBAR_KLV", &klv)
+                .env("FRE_AOT_REBAR_FEATURES", "none")
+                .env("FRE_AOT_REBAR_SOURCE_COMMIT", "capture-reducer-smoke")
+                .env("FRE_AOT_REBAR_SOURCE_TREE", "capture-reducer-smoke")
+                .output()?;
+            if !built.status.success() {
+                return Err(format!(
+                    "configured capture reducer build failed for {model:?}/{source_route}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&built.stdout),
+                    String::from_utf8_lossy(&built.stderr),
+                )
+                .into());
+            }
+            let runner = target.join("debug").join(format!(
+                "fre-aot-rebar-runner{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let executed = Command::new(&runner)
+                .stdin(Stdio::from(fs::File::open(&klv)?))
+                .output()?;
+            if !executed.status.success() {
+                return Err(format!(
+                    "capture reducer failed for {model:?}/{source_route}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&executed.stdout),
+                    String::from_utf8_lossy(&executed.stderr),
+                )
+                .into());
+            }
+            let (_, actual) = std::str::from_utf8(&executed.stdout)?
+                .trim()
+                .split_once(',')
+                .ok_or("capture reducer output is not nanoseconds,value")?;
+            let actual = actual.parse::<u64>()?;
+            if actual != expected {
+                return Err(format!(
+                    "capture reducer {model:?}/{source_route} returned {actual}, oracle returned {expected}"
+                )
+                .into());
+            }
+            let provenance = Command::new(&runner).arg("--provenance").output()?;
+            let provenance = std::str::from_utf8(&provenance.stdout)?;
+            for field in [
+                "schema=fre.aot.rebar-runner.v5",
+                "capture_reducer_bridge=true",
+                "native_row_bridge=false",
+                source_route,
+                "semantic_runtime_calls=0",
+                "required_runtime_symbols=",
+                "boundary=single-call-helper-free-single-capture-whole-operation-reducer",
+            ] {
+                if !provenance.contains(field) {
+                    return Err(format!(
+                        "capture reducer provenance omitted {field:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("preserving failed capture reducer smoke at {}", root.display());
+            Err(error)
+        }
+    }
+}
+
+fn configured_capture_reducer_klv(model: Model, pattern: &str) -> Vec<u8> {
+    let mut output = Vec::new();
+    for (key, value) in [
+        (
+            "name",
+            b"synthetic/aot-runner/nonuniform-capture-reducer".as_slice(),
+        ),
+        ("model", model.name().as_bytes()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"false".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("pattern", pattern.as_bytes()),
+        ("haystack", b"b\r\nab\nno\nb\r".as_slice()),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+fn capture_oracle(benchmark: &Benchmark) -> Result<u64, String> {
+    fn domain(regex: &Regex, haystack: &[u8]) -> Result<u64, String> {
+        regex
+            .captures_iter(regex_automata::Input::new(haystack))
+            .try_fold(0_u64, |mut total, captures| {
+                for group in 0..captures.group_len() {
+                    if captures.get_group(group).is_some() {
+                        total = total
+                            .checked_add(1)
+                            .ok_or_else(|| "capture reducer oracle overflow".to_owned())?;
+                    }
+                }
+                Ok(total)
+            })
+    }
+    let regex = oracle_regex(benchmark)?;
+    match benchmark.model {
+        Model::CountCaptures => domain(&regex, &benchmark.haystack),
+        Model::GrepCaptures => benchmark.haystack.lines().try_fold(0_u64, |total, line| {
+            total
+                .checked_add(domain(&regex, line)?)
+                .ok_or_else(|| "grep-captures reducer oracle overflow".to_owned())
+        }),
+        _ => Err("capture reducer oracle received a non-capture model".to_owned()),
+    }
+}
+
+#[test]
+#[ignore = "recursive Cargo smoke for the fixed one-call native regex-redux operation"]
+fn configured_regex_redux_links_and_executes_one_native_operation() -> Result<(), DynError> {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -447,7 +621,7 @@ fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(
             .args([
                 "build",
                 "--offline",
-                "--jobs=2",
+                "--jobs=1",
                 "-p",
                 "fre-aot-rebar-runner",
                 "--bin",
@@ -501,7 +675,22 @@ fn configured_regex_redux_links_and_executes_all_native_components() -> Result<(
             "model=regex-redux",
             "benchmark=\"synthetic/aot-runner/regex-redux-smoke\"",
             "component_count=15",
-            "boundary=complete-regex-redux-aot-precompiled",
+            "adapter=general-aot-native-regex-redux-reducer-v1",
+            "engine=NativeRegexReduxAotV1",
+            "aggregate_strategy=native-fixed-regex-redux-whole-operation-v1",
+            "reducer_symbol=fre_aot_regex_rebar_regex_redux_v1_",
+            "reducer_link_symbols=fre_aot_regex_search_v1_",
+            "semantic_runtime_symbols=",
+            "abi_version=1",
+            "request_bytes=72",
+            "receipt_bytes=144",
+            "report_bytes=1024",
+            "scratch_buffer_count=2",
+            "scratch_capacity_numerator=3",
+            "scratch_capacity_denominator=2",
+            "receipt_schema=u64-input-clean-variant9-substitution5-final-report-v1",
+            "report_schema=variant9-blank-input-clean-final-lines-v1",
+            "boundary=single-call-native-regex-redux-reducer",
         ] {
             if !provenance.contains(expected_field) {
                 return Err(format!(

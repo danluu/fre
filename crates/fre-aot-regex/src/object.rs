@@ -1094,6 +1094,13 @@ fn emit_macho(module: &CompiledModule, max_bytes: usize) -> Result<Vec<u8>, Obje
     let segment_file_bytes = file_cursor
         .checked_sub(content_start)
         .ok_or_else(|| overflow("Mach segment file size"))?;
+    // Section file offsets are aligned from the end of the load commands,
+    // while section virtual addresses are aligned from zero. A first-section
+    // alignment stricter than `content_start` can therefore add leading file
+    // padding that has no corresponding virtual-cursor advance. Mach-O still
+    // requires LC_SEGMENT_64 filesize <= vmsize; cover that file-only prefix
+    // without changing section addresses, offsets, or object-cap accounting.
+    let segment_virtual_bytes = virtual_cursor.max(segment_file_bytes);
 
     let symbols = build_mach_symbols(module, &sections)?;
     build_mach_relocations(module, &mut sections, &symbols.map)?;
@@ -1128,7 +1135,7 @@ fn emit_macho(module: &CompiledModule, max_bytes: usize) -> Result<Vec<u8>, Obje
         segment_command_bytes,
         content_start,
         segment_file_bytes,
-        virtual_cursor,
+        segment_virtual_bytes,
         &sections,
     )?;
     command_offset = checked_add(command_offset, segment_command_bytes, "Mach command offset")?;
@@ -2056,6 +2063,7 @@ fn write_i32_vec(bytes: &mut [u8], offset: usize, value: i32) -> Result<(), Obje
 )]
 mod tests {
     use super::*;
+    use crate::module::NATIVE_TEXT_LINK_ALIGNMENT_BYTES;
     use crate::{CompileMode, CompileRequest, Target, compile};
 
     const PATTERN: &str = r"(?:[A-Za-z_][A-Za-z0-9_]*::)+item";
@@ -2232,11 +2240,17 @@ mod tests {
         assert_eq!(headers + count * ELF_SECTION_HEADER_BYTES, bytes.len());
 
         let mut found = None;
+        let mut text_alignment = None;
         for index in 1..count {
             let header = headers + index * ELF_SECTION_HEADER_BYTES;
             let offset = usize::try_from(u64_at(bytes, header + 24)).unwrap();
             let size = usize::try_from(u64_at(bytes, header + 32)).unwrap();
             assert!(offset + size <= headers);
+            let flags = u64_at(bytes, header + 8);
+            if flags == (ELF_SHF_ALLOC | ELF_SHF_EXECINSTR) {
+                assert!(text_alignment.is_none(), "multiple executable sections");
+                text_alignment = Some((offset, u64_at(bytes, header + 48)));
+            }
             if u32_at(bytes, header + 4) == ELF_SHT_RELA {
                 assert_eq!(
                     u64_at(bytes, header + 56),
@@ -2254,6 +2268,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, relocation_types);
+        let (offset, alignment) = text_alignment.expect("ELF text section");
+        assert_eq!(alignment, NATIVE_TEXT_LINK_ALIGNMENT_BYTES);
+        assert!(offset.is_multiple_of(
+            usize::try_from(NATIVE_TEXT_LINK_ALIGNMENT_BYTES).unwrap()
+        ));
     }
 
     fn fixed_name(bytes: &[u8], offset: usize) -> &str {
@@ -2274,8 +2293,10 @@ mod tests {
         assert_eq!(u32_at(bytes, 16), 4);
         assert_eq!(u32_at(bytes, 32), MACH_LC_SEGMENT_64);
         assert_eq!(u32_at(bytes, 36), 232);
+        let virtual_size = usize::try_from(u64_at(bytes, 64)).unwrap();
         let file_offset = usize::try_from(u64_at(bytes, 72)).unwrap();
         let file_size = usize::try_from(u64_at(bytes, 80)).unwrap();
+        assert!(file_size <= virtual_size);
         assert!(file_offset + file_size <= bytes.len());
         assert_eq!(u32_at(bytes, 96), 2);
 
@@ -2290,6 +2311,13 @@ mod tests {
         assert!(text_offset + text_size <= bytes.len());
         assert!(data_offset + data_size <= bytes.len());
         assert!(text_offset + text_size <= data_offset);
+        assert_eq!(
+            u32_at(bytes, text + 52),
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES.trailing_zeros()
+        );
+        assert!(text_offset.is_multiple_of(
+            usize::try_from(NATIVE_TEXT_LINK_ALIGNMENT_BYTES).unwrap()
+        ));
 
         let relocation_offset = usize::try_from(u32_at(bytes, text + 56)).unwrap();
         let relocation_count = usize::try_from(u32_at(bytes, text + 60)).unwrap();
@@ -2378,9 +2406,122 @@ mod tests {
     }
 
     #[test]
+    fn native_text_sections_publish_cache_line_link_alignment() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::aarch64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_macos(),
+        ] {
+            let (module, object) = module_and_object(target, CompileMode::Fast);
+            let text = module
+                .sections()
+                .iter()
+                .find(|section| section.kind == SectionKind::Text)
+                .expect("native text section");
+            assert_eq!(text.alignment, NATIVE_TEXT_LINK_ALIGNMENT_BYTES);
+            match ObjectFormat::for_target(target) {
+                ObjectFormat::Elf64 => {
+                    validate_elf(
+                        &object,
+                        if target.architecture == Architecture::X86_64 {
+                            ELF_EM_X86_64
+                        } else {
+                            ELF_EM_AARCH64
+                        },
+                        &expected_elf_relocation_types(&module),
+                    );
+                }
+                ObjectFormat::MachO64 => {
+                    validate_macho(
+                        &object,
+                        if target.architecture == Architecture::X86_64 {
+                            MACH_CPU_TYPE_X86_64
+                        } else {
+                            MACH_CPU_TYPE_ARM64
+                        },
+                        &expected_mach_relocation_types(&module),
+                        &expected_mach_symbol_types(&module),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn aligned_macho_static_archive_is_accepted_by_rustc_llvm() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            Target::x86_64_macos()
+        } else {
+            Target::aarch64_macos()
+        };
+        let (_, object) = module_and_object(target, CompileMode::Fast);
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aligned-macho-archive-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir(&directory).expect("create aligned Mach-O archive directory");
+        let object_path = directory.join("aligned.o");
+        let archive_path = directory.join("libfre_alignment_fixture.a");
+        let source_path = directory.join("probe.rs");
+        let rlib_path = directory.join("libfre_alignment_probe.rlib");
+        fs::write(&object_path, object).expect("write aligned Mach-O object");
+        fs::write(&source_path, b"").expect("write empty Rust archive probe");
+
+        let archive = Command::new("ar")
+            .arg("crs")
+            .arg(&archive_path)
+            .arg(&object_path)
+            .output()
+            .expect("invoke archive writer for aligned Mach-O object");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let bundled = Command::new(&rustc)
+            .arg("--crate-name")
+            .arg("fre_alignment_probe")
+            .arg("--crate-type")
+            .arg("rlib")
+            .arg(&source_path)
+            .arg("-L")
+            .arg(format!("native={}", directory.display()))
+            .arg("-l")
+            .arg("static=fre_alignment_fixture")
+            .arg("-o")
+            .arg(&rlib_path)
+            .output()
+            .expect("invoke rustc LLVM archive writer");
+        fs::remove_dir_all(&directory).expect("remove aligned Mach-O archive directory");
+
+        assert!(
+            archive.status.success(),
+            "archive writer rejected aligned Mach-O object: {}{}",
+            String::from_utf8_lossy(&archive.stdout),
+            String::from_utf8_lossy(&archive.stderr),
+        );
+        assert!(
+            bundled.status.success(),
+            "rustc LLVM archive writer rejected aligned Mach-O object: {}{}",
+            String::from_utf8_lossy(&bundled.stdout),
+            String::from_utf8_lossy(&bundled.stderr),
+        );
+    }
+
+    #[test]
     fn exact_and_one_less_object_limits_are_enforced_before_emission() {
-        assert_exact_object_limit(Target::x86_64_linux(), ObjectFormat::Elf64);
-        assert_exact_object_limit(Target::x86_64_macos(), ObjectFormat::MachO64);
+        for target in [
+            Target::x86_64_linux(),
+            Target::aarch64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_macos(),
+        ] {
+            assert_exact_object_limit(target, ObjectFormat::for_target(target));
+        }
     }
 
     #[test]

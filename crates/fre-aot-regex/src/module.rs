@@ -172,12 +172,13 @@ use crate::{
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES,
         STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
+        NfaTerminalSuffixBarrierOutcome, nfa_terminal_suffix_barrier_outcome,
         nfa_terminal_suffix_is_barrier,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
-        SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
-        build_seeded_reverse_exact,
+        SeededReverseBuild, SeededReverseDeclineReason, SeededReverseDfa,
+        SeededReverseLimits, SeededReverseSeed, build_seeded_reverse_exact,
     },
 };
 
@@ -1575,13 +1576,13 @@ pub enum PreparedAggregateStrategy {
     /// runtime reducer while retaining the same exclusive prepared handle.
     RuntimeHelper,
     /// Count and `SpanSum` stay in one generated iterator frame and locally
-    /// call an artifact-specific native prepared target or self-contained
-    /// ordinary entry. `GrepCount` likewise owns LF/CRLF splitting when a
-    /// local ordinary target is available. No requested aggregate export uses
-    /// a runtime reducer.
+    /// call a self-contained ordinary entry. `GrepCount` likewise owns LF/CRLF
+    /// splitting when a local ordinary target is available. No requested
+    /// aggregate export or transitive search target uses a runtime helper.
     NativeFused,
-    /// Some requested reducers use generated native loops while another
-    /// requested export retains its authenticated runtime helper.
+    /// Some requested reducers use generated native loops while either their
+    /// prepared search target or another requested export retains an
+    /// authenticated runtime helper.
     NativeFusedWithRuntimeHelper,
     /// Count and `SpanSum` classify one prepared capability before any
     /// operation state is initialized. Exact V15 owners stay in the generated
@@ -1600,6 +1601,12 @@ pub(crate) enum PreparedOrderedNfaV15LoweringDisposition {
     Lowered(CompiledModule),
     Unsupported,
     DataLimit { required: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparedOrderedNfaV15Surface {
+    Compatibility,
+    ScalarOperationOnly,
 }
 
 /// Object-format-neutral native module.
@@ -1642,6 +1649,14 @@ pub struct CompiledModule {
     optimizing_fallbacks_may_continue: bool,
     bit_parallel_endpoint_oracle_lowered: bool,
     bit_parallel_exact_endpoint_lowered: bool,
+    /// Whether the ordinary complete-DFA text owns the additive
+    /// synchronizing-accept reverse prepass. This compiler-only bit drives a
+    /// same-route final-object retry and never enters frozen data.
+    synchronizing_accept_reverse_lowered: bool,
+    /// Whether the ordinary complete-DFA text owns the optional exact
+    /// correlated two-byte suffix scanner. This compiler-only bit drives an
+    /// exact-incumbent final-object retry and never enters frozen data.
+    exact_pair_suffix_lowered: bool,
     /// Whether this exact Ordered-NFA text specializes the canonical start
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
@@ -1662,6 +1677,11 @@ pub struct CompiledModule {
 
 const TEXT_SECTION: usize = 0;
 const PROGRAM_SECTION: usize = 1;
+/// Keep independently linked native entries on a source-independent
+/// instruction-cache boundary. External registries concatenate one text
+/// section per artifact, so a weaker alignment lets growth in one artifact
+/// perturb every later entry even when their code and data are unchanged.
+pub(crate) const NATIVE_TEXT_LINK_ALIGNMENT_BYTES: u64 = 64;
 const ENTRY_SYMBOL: usize = 0;
 const PROGRAM_SYMBOL: usize = 1;
 const RUNTIME_SYMBOL: usize = 2;
@@ -1905,6 +1925,14 @@ struct NativeLowering {
     needs_runtime: bool,
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
+    /// Compiler-only receipt for the additive synchronizing-accept reverse
+    /// prepass. This never enters frozen data and drives its exact
+    /// final-object retry.
+    synchronizing_accept_reverse_lowered: bool,
+    /// Compiler-only receipt for an exact correlated two-byte suffix scanner.
+    /// This drives a final-object retry to the exact pre-feature complete-DFA
+    /// portfolio and never enters frozen data.
+    exact_pair_suffix_lowered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2658,6 +2686,7 @@ enum PreparedEntryKind {
     reason = "independent compiler-text receipts preserve the exact final-object retry ladder"
 )]
 struct PreparedOrderedNfaEntryLayout {
+    operation_only: bool,
     object_abi_version: u32,
     terminal_exact_set_lowered: Option<[u64; 4]>,
     whole_window_width_gate_lowered: bool,
@@ -2850,6 +2879,81 @@ impl CompiledModule {
             true,
             max_native_data_bytes,
         )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA route while omitting only the
+    /// additive synchronizing-accept reverse prepass. A final object-size
+    /// retry uses this after the enabled text exceeds its byte ceiling; the
+    /// semantic graph, target policy, and native-data ceiling are unchanged.
+    pub(crate) fn lower_without_synchronizing_accept_reverse(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_ordinary_complete_dfa_with_suffix_policy(
+            program,
+            target,
+            max_native_data_bytes,
+            false,
+            true,
+        )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA portfolio while independently
+    /// selecting its two additive suffix accelerators. Final object-size
+    /// retries first remove the exact-pair scanner while preserving a selected
+    /// synchronizing reverse proof, then remove that proof if necessary.
+    pub(crate) fn lower_ordinary_complete_dfa_with_suffix_policy(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        allow_synchronizing_accept_reverse: bool,
+        allow_exact_pair: bool,
+    ) -> Result<Self, CompileError> {
+        target.validate()?;
+        let native = program.native_dfa_view().ok_or(CompileError::InternalInvariant(
+            "suffix-accelerator retry has no ordinary complete DFA",
+        ))?;
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+            native,
+            target,
+            NativeDfaEntryContract::Public,
+            max_native_data_bytes,
+            allow_synchronizing_accept_reverse,
+            allow_exact_pair,
+        )?
+        .ok_or(CompileError::InternalInvariant(
+            "suffix-accelerator retry did not restore its complete DFA",
+        ))?;
+        if !allow_synchronizing_accept_reverse && lowering.synchronizing_accept_reverse_lowered {
+            return Err(CompileError::InternalInvariant(
+                "synchronizing reverse retry retained the disabled prepass",
+            ));
+        }
+        if !allow_exact_pair && lowering.exact_pair_suffix_lowered {
+            return Err(CompileError::InternalInvariant(
+                "exact-pair retry retained the disabled scanner",
+            ));
+        }
+        Self::lower_serialized_with_prelowered(
+            program.serialize()?,
+            Some(lowering),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )
+        .map_err(CompileError::from)
     }
 
     /// Rebuild the ordinary portfolio while independently selecting the
@@ -4315,7 +4419,7 @@ impl CompiledModule {
         allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
-        match Self::lower_prepared_ordered_nfa_v15_reported(
+        Self::lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
             program,
             target,
             allow_ordered_edge_dispatch,
@@ -4325,6 +4429,68 @@ impl CompiledModule {
             allow_ordered_nfa_whole_window_width_gate,
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::Compatibility,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_scalar_operation_with_native_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    fn lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+        surface: PreparedOrderedNfaV15Surface,
+    ) -> Result<Self, CompileError> {
+        match Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            surface,
         )? {
             PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
             PreparedOrderedNfaV15LoweringDisposition::Unsupported => Err(
@@ -4360,6 +4526,67 @@ impl CompiledModule {
         allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
     ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::Compatibility,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_scalar_operation_reported(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    fn lower_prepared_ordered_nfa_v15_reported_with_surface(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+        surface: PreparedOrderedNfaV15Surface,
+    ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
         let Some(mut view) = program.native_ordered_nfa_view() else {
@@ -4390,6 +4617,7 @@ impl CompiledModule {
                 target,
                 max_native_data_bytes,
                 FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
+                surface,
             )? {
                 NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
                     (lowering, layout)
@@ -4419,13 +4647,25 @@ impl CompiledModule {
             None,
             target,
         )?;
-        if module.prepared_bulk_strategy() != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+        let surface_is_exact = match surface {
+            PreparedOrderedNfaV15Surface::Compatibility => {
+                module.prepared_bulk_strategy()
+                    == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                    && module.prepared_entry_symbol().is_some()
+                    && module.prepared_span_fill_symbol().is_some()
+            }
+            PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                module.prepared_bulk_strategy().is_none()
+                    && module.prepared_entry_symbol().is_some()
+                    && module.prepared_span_fill_symbol().is_none()
+                    && module.required_runtime_symbols().next().is_none()
+            }
+        };
+        if !surface_is_exact
             || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
-            || module.prepared_entry_symbol().is_none()
-            || module.prepared_span_fill_symbol().is_none()
         {
             return Err(CompileError::InternalInvariant(
-                "prepared Ordered-NFA-only lowering did not publish exact V15 SpanFill",
+                "prepared Ordered-NFA-only lowering did not publish its exact V15 surface",
             ));
         }
         Ok(PreparedOrderedNfaV15LoweringDisposition::Lowered(module))
@@ -4952,6 +5192,15 @@ impl CompiledModule {
             )?;
             (lowering, native_digest, Some(prepared_layout))
         };
+        let ordered_nfa_operation_only = matches!(
+            prepared_layout.map(|layout| layout.kind),
+            Some(PreparedEntryKind::OrderedNfa(
+                PreparedOrderedNfaEntryLayout {
+                    operation_only: true,
+                    ..
+                }
+            ))
+        );
         let prepared_bulk_layout = match prepared_layout {
             Some(prepared) => {
                 let output =
@@ -5027,9 +5276,25 @@ impl CompiledModule {
             ));
         }
         let slow_partial_table = lowering.slow_partial_table;
-        let entry_name = identity_symbol(ENTRY_SYMBOL_PREFIX, &native_digest)?;
+        let entry_name = if ordered_nfa_operation_only {
+            owned_string(
+                ".Lfre_aot_regex_ordered_nfa_operation_fragment_v1",
+                "Ordered-NFA operation-only fragment symbol",
+            )?
+        } else {
+            identity_symbol(ENTRY_SYMBOL_PREFIX, &native_digest)?
+        };
         let prepared_entry_name = prepared_layout
-            .map(|_| identity_symbol(PREPARED_ENTRY_SYMBOL_PREFIX, &native_digest))
+            .map(|_| {
+                if ordered_nfa_operation_only {
+                    owned_string(
+                        ".Lfre_aot_regex_ordered_nfa_operation_private_v1",
+                        "Ordered-NFA operation-only private symbol",
+                    )
+                } else {
+                    identity_symbol(PREPARED_ENTRY_SYMBOL_PREFIX, &native_digest)
+                }
+            })
             .transpose()?;
         let prepared_span_fill_name = prepared_bulk_layout
             .span_fill
@@ -5054,7 +5319,9 @@ impl CompiledModule {
         } else {
             data_size
         };
-        let entry_size = if let Some(prepared) = prepared_layout {
+        let entry_size = if ordered_nfa_operation_only {
+            code_size
+        } else if let Some(prepared) = prepared_layout {
             u64::try_from(prepared.ordinary_code_size)
                 .map_err(|_| ObjectError::ArithmeticOverflow("module entry code size"))?
         } else {
@@ -5097,10 +5364,7 @@ impl CompiledModule {
             ModuleSection {
                 name: ".text",
                 kind: SectionKind::Text,
-                alignment: match target.architecture {
-                    Architecture::X86_64 => 16,
-                    Architecture::Aarch64 => 4,
-                },
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
                 data: lowering.code.into_boxed_slice(),
             },
             ModuleSection {
@@ -5114,7 +5378,11 @@ impl CompiledModule {
         let mut symbols = vec![
             ModuleSymbol {
                 name: entry_name,
-                binding: SymbolBinding::Global,
+                binding: if ordered_nfa_operation_only {
+                    SymbolBinding::Local
+                } else {
+                    SymbolBinding::Global
+                },
                 kind: SymbolKind::Function,
                 section: Some(TEXT_SECTION),
                 offset: 0,
@@ -5157,6 +5425,39 @@ impl CompiledModule {
         } else {
             (None, None)
         };
+        if ordered_nfa_operation_only {
+            // Ordered-NFA relocation records and the public compatibility
+            // layout deliberately keep their established symbol ordinals.
+            // Fill the two runtime-only ordinals with defined local program
+            // aliases for the closed surface: this preserves every legacy
+            // ordinal without publishing a runtime symbol or dependency.
+            if symbols.len() != RUNTIME_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "operation-only Ordered-NFA symbol prefix is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_operation_program_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+            if symbols.len() != RUNTIME_PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "operation-only Ordered-NFA symbol padding is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_operation_identity_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+        }
         if let Some(table) = slow_partial_table {
             if symbols.len() != SLOW_PARTIAL_TABLE_SYMBOL {
                 return Err(ObjectError::InvalidModule(
@@ -5186,7 +5487,11 @@ impl CompiledModule {
                 name: prepared_entry_name.ok_or(ObjectError::InvalidModule(
                     "prepared entry identity was not constructed",
                 ))?,
-                binding: SymbolBinding::Global,
+                binding: if ordered_nfa_operation_only {
+                    SymbolBinding::Local
+                } else {
+                    SymbolBinding::Global
+                },
                 kind: SymbolKind::Function,
                 section: Some(TEXT_SECTION),
                 offset: u64::try_from(prepared.code_offset).map_err(|_| {
@@ -5290,6 +5595,10 @@ impl CompiledModule {
                             .bulk_gate_entry_offset
                             .checked_add(ordered.bulk_gate_entry_size)
                             != Some(public_end)
+                        || (ordered.operation_only
+                            && (lowering.needs_runtime
+                                || prepared_bulk_layout
+                                    != PreparedBulkEntryLayout::default()))
                     {
                         return Err(ObjectError::InvalidModule(
                             "Ordered-NFA prepared symbol geometry is inconsistent",
@@ -5369,34 +5678,36 @@ impl CompiledModule {
                             )
                         })?,
                     });
-                    if symbols.len() != ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL {
-                        return Err(ObjectError::InvalidModule(
-                            "Ordered-NFA search-fallback symbol order is inconsistent",
-                        ));
+                    if !ordered.operation_only {
+                        if symbols.len() != ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL {
+                            return Err(ObjectError::InvalidModule(
+                                "Ordered-NFA search-fallback symbol order is inconsistent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                        if prepared_bulk_layout.span_fill.is_none()
+                            || symbols.len() != ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+                        {
+                            return Err(ObjectError::InvalidModule(
+                                "Ordered-NFA Span-fill helper symbol is absent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
                     }
-                    symbols.push(ModuleSymbol {
-                        name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
-                        binding: SymbolBinding::Global,
-                        kind: SymbolKind::Function,
-                        section: None,
-                        offset: 0,
-                        size: 0,
-                    });
-                    if prepared_bulk_layout.span_fill.is_none()
-                        || symbols.len() != ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
-                    {
-                        return Err(ObjectError::InvalidModule(
-                            "Ordered-NFA Span-fill helper symbol is absent",
-                        ));
-                    }
-                    symbols.push(ModuleSymbol {
-                        name: PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.to_owned(),
-                        binding: SymbolBinding::Global,
-                        kind: SymbolKind::Function,
-                        section: None,
-                        offset: 0,
-                        size: 0,
-                    });
                 }
                 PreparedEntryKind::Native(prepared) => {
                     symbols.push(ModuleSymbol {
@@ -5870,6 +6181,9 @@ impl CompiledModule {
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered,
             bit_parallel_exact_endpoint_lowered,
+            synchronizing_accept_reverse_lowered: lowering
+                .synchronizing_accept_reverse_lowered,
+            exact_pair_suffix_lowered: lowering.exact_pair_suffix_lowered,
             ordered_nfa_start_closure_dispatch_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -6120,6 +6434,14 @@ impl CompiledModule {
 
     pub(crate) const fn optimizing_fallbacks_may_continue(&self) -> bool {
         self.optimizing_fallbacks_may_continue
+    }
+
+    pub(crate) const fn has_synchronizing_accept_reverse(&self) -> bool {
+        self.synchronizing_accept_reverse_lowered
+    }
+
+    pub(crate) const fn has_exact_pair_suffix(&self) -> bool {
+        self.exact_pair_suffix_lowered
     }
 
     /// Carry the selected scheduler transaction's fallback permission onto a
@@ -6490,22 +6812,63 @@ impl CompiledModule {
                 "prepared aggregate module has no program section",
             ));
         }
+        let ordered_nfa_operation_only_claim = self.required_prepare_capabilities
+            == PREPARED_CAPABILITY_ORDERED_NFA_V15
+            && self.prepared_bulk_strategy.is_none();
+        let ordered_nfa_operation_only = if ordered_nfa_operation_only_claim {
+            let prepared = self
+                .prepared_entry_symbol_index
+                .and_then(|index| self.symbols.get(index));
+            let entry = self.symbols.get(self.entry_symbol_index);
+            let exact_export = exports == PreparedAggregateExports::COUNT
+                || exports == PreparedAggregateExports::SPAN_SUM
+                || exports == PreparedAggregateExports::GREP_COUNT;
+            let exact_surface = exact_export
+                && self.prepared_span_fill_symbol_index.is_none()
+                && self.prepared_exists_batch_symbol_index.is_none()
+                && self.native_prepared_bulk_search_target.is_some()
+                && self.ordered_nfa_bulk_gate_target.is_some()
+                && self.runtime_symbol_index.is_none()
+                && self.required_runtime_symbols().next().is_none()
+                && prepared.is_some_and(|symbol| {
+                    symbol.binding == SymbolBinding::Local
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.section == Some(TEXT_SECTION)
+                        && symbol.size != 0
+                })
+                && entry.is_some_and(|symbol| {
+                    symbol.binding == SymbolBinding::Local
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.section == Some(TEXT_SECTION)
+                        && symbol.size != 0
+                });
+            if !exact_surface {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA scalar operation-only surface is not closed",
+                ));
+            }
+            true
+        } else {
+            false
+        };
         // A trusted-window Span fill has an explicit large-remainder branch
         // to the runtime bulk helper. A scalar reducer cannot take that edge
         // transactionally after partial accumulation, so it must retain the
         // whole-operation authenticated runtime reducer. Frozen sessions and
         // complete prepared loops have no such window ceiling.
         let prepared_span_target = span_reducers_requested
-            && matches!(
-                self.prepared_bulk_strategy,
-                Some(
-                    PreparedBulkStrategy::NativeFrozenLoop
-                        | PreparedBulkStrategy::NativePreparedLoop
-                        | PreparedBulkStrategy::NativeOrderedNfaLoop
-                )
-            );
+            && (ordered_nfa_operation_only
+                || matches!(
+                    self.prepared_bulk_strategy,
+                    Some(
+                        PreparedBulkStrategy::NativeFrozenLoop
+                            | PreparedBulkStrategy::NativePreparedLoop
+                            | PreparedBulkStrategy::NativeOrderedNfaLoop
+                    )
+                ));
         let prepared_grep_target = grep_reducer_requested
-            && self.prepared_bulk_strategy == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+            && (ordered_nfa_operation_only
+                || self.prepared_bulk_strategy == Some(PreparedBulkStrategy::NativeOrderedNfaLoop));
         let prepared_search_target = if prepared_span_target || prepared_grep_target
         {
             self.native_prepared_bulk_search_target
@@ -6533,20 +6896,28 @@ impl CompiledModule {
             let prepared_end = prepared_start.checked_add(prepared_size).ok_or(
                 ObjectError::ArithmeticOverflow("native prepared aggregate entry extent"),
             )?;
+            let prepared_surface_is_exact = if ordered_nfa_operation_only {
+                prepared.binding == SymbolBinding::Local
+                    && self.prepared_span_fill_symbol_index.is_none()
+                    && self.prepared_bulk_strategy.is_none()
+            } else {
+                prepared.binding == SymbolBinding::Global
+                    && self.prepared_span_fill_symbol_index.is_some()
+                    && matches!(
+                        self.prepared_bulk_strategy,
+                        Some(
+                            PreparedBulkStrategy::NativeFrozenLoop
+                                | PreparedBulkStrategy::NativePreparedLoop
+                                | PreparedBulkStrategy::NativeOrderedNfaLoop
+                        )
+                    )
+            };
             if prepared.section != Some(TEXT_SECTION)
                 || !(prepared_start..prepared_end).contains(&target)
-                || self.prepared_span_fill_symbol_index.is_none()
-                || !matches!(
-                    self.prepared_bulk_strategy,
-                    Some(
-                        PreparedBulkStrategy::NativeFrozenLoop
-                            | PreparedBulkStrategy::NativePreparedLoop
-                            | PreparedBulkStrategy::NativeOrderedNfaLoop
-                    )
-                )
+                || !prepared_surface_is_exact
             {
                 return Err(ObjectError::InvalidModule(
-                    "native prepared aggregate target disagrees with Span fill",
+                    "native prepared aggregate target disagrees with its entry surface",
                 ));
             }
         }
@@ -6679,12 +7050,23 @@ impl CompiledModule {
         let native_search_target = prepared_search_target.or(direct_search_target);
         let native_span_reducers = span_reducers_requested && native_search_target.is_some();
         let ordered_nfa_reducers = native_search_target.is_some()
-            && self.prepared_bulk_strategy
-                == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+            && (ordered_nfa_operation_only
+                || self.prepared_bulk_strategy
+                    == Some(PreparedBulkStrategy::NativeOrderedNfaLoop));
         let native_grep_reducer = grep_reducer_requested
             && (direct_search_target.is_some() || ordered_nfa_reducers);
+        // A prepared target is locally called but not self-contained: its
+        // public/private entry may transitively enter authenticated semantic
+        // preflight, recovery, retirement, or fallback helpers. Keep that
+        // distinct from a direct ordinary entry whose complete unresolved
+        // function surface was rejected above. `NativeFused` is therefore a
+        // closed helper-free operation claim, not merely a statement that the
+        // outer reduction loop happens to be generated text.
+        let prepared_scalar_target_retains_runtime =
+            prepared_search_target.is_some() && !ordered_nfa_reducers;
         let aggregate_runtime_helper = (grep_reducer_requested && !native_grep_reducer)
-            || (span_reducers_requested && !native_span_reducers);
+            || (span_reducers_requested && !native_span_reducers)
+            || prepared_scalar_target_retains_runtime;
         let any_native_reducer = native_span_reducers || native_grep_reducer;
         // Only exhaustive scalar reducers may spend unbounded work finding a
         // final candidate. A selected absolute-width gate already owns the
@@ -6732,32 +7114,53 @@ impl CompiledModule {
                     ObjectError::InvalidModule("direct Count reducer wrapper was not retained"),
                 )?,
                 NativeSpanReducerCallKind::PreparedPrivate => {
-                    match (self.target.architecture, ordered_nfa_reducers) {
-                        (Architecture::X86_64, true) => {
+                    match (
+                        self.target.architecture,
+                        ordered_nfa_reducers,
+                        ordered_nfa_operation_only,
+                    ) {
+                        (Architecture::X86_64, true, true) => {
+                            lower_x86_64_required_ordered_nfa_span_reduce(
+                                PreparedSpanSink::Count,
+                                ordered_nfa_terminal_exact_set,
+                            )?
+                        }
+                        (Architecture::Aarch64, true, true) => {
+                            lower_aarch64_required_ordered_nfa_span_reduce(
+                                PreparedSpanSink::Count,
+                                ordered_nfa_terminal_exact_set,
+                            )?
+                        }
+                        (Architecture::X86_64, true, false) => {
                             lower_x86_64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::Count,
                                 ordered_nfa_terminal_exact_set,
                             )?
                         }
-                        (Architecture::Aarch64, true) => {
+                        (Architecture::Aarch64, true, false) => {
                             lower_aarch64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::Count,
                                 ordered_nfa_terminal_exact_set,
                             )?
                         }
-                        (Architecture::X86_64, false) => {
+                        (Architecture::X86_64, false, false) => {
                             lower_x86_64_prepared_span_reduce(
                                 PreparedSpanSink::Count,
                                 NativeSpanReducerCallKind::PreparedPrivate,
                                 false,
                             )?
                         }
-                        (Architecture::Aarch64, false) => {
+                        (Architecture::Aarch64, false, false) => {
                             lower_aarch64_prepared_span_reduce(
                                 PreparedSpanSink::Count,
                                 NativeSpanReducerCallKind::PreparedPrivate,
                                 false,
                             )?
+                        }
+                        (_, false, true) => {
+                            return Err(ObjectError::InvalidModule(
+                                "operation-only Count reducer lost its Ordered-NFA route",
+                            ));
                         }
                     }
                 }
@@ -6775,32 +7178,53 @@ impl CompiledModule {
                     ),
                 )?,
                 NativeSpanReducerCallKind::PreparedPrivate => {
-                    match (self.target.architecture, ordered_nfa_reducers) {
-                        (Architecture::X86_64, true) => {
+                    match (
+                        self.target.architecture,
+                        ordered_nfa_reducers,
+                        ordered_nfa_operation_only,
+                    ) {
+                        (Architecture::X86_64, true, true) => {
+                            lower_x86_64_required_ordered_nfa_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                                ordered_nfa_terminal_exact_set,
+                            )?
+                        }
+                        (Architecture::Aarch64, true, true) => {
+                            lower_aarch64_required_ordered_nfa_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                                ordered_nfa_terminal_exact_set,
+                            )?
+                        }
+                        (Architecture::X86_64, true, false) => {
                             lower_x86_64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::SpanSum,
                                 ordered_nfa_terminal_exact_set,
                             )?
                         }
-                        (Architecture::Aarch64, true) => {
+                        (Architecture::Aarch64, true, false) => {
                             lower_aarch64_ordered_nfa_span_reduce(
                                 PreparedSpanSink::SpanSum,
                                 ordered_nfa_terminal_exact_set,
                             )?
                         }
-                        (Architecture::X86_64, false) => {
+                        (Architecture::X86_64, false, false) => {
                             lower_x86_64_prepared_span_reduce(
                                 PreparedSpanSink::SpanSum,
                                 NativeSpanReducerCallKind::PreparedPrivate,
                                 false,
                             )?
                         }
-                        (Architecture::Aarch64, false) => {
+                        (Architecture::Aarch64, false, false) => {
                             lower_aarch64_prepared_span_reduce(
                                 PreparedSpanSink::SpanSum,
                                 NativeSpanReducerCallKind::PreparedPrivate,
                                 false,
                             )?
+                        }
+                        (_, false, true) => {
+                            return Err(ObjectError::InvalidModule(
+                                "operation-only SpanSum reducer lost its Ordered-NFA route",
+                            ));
                         }
                     }
                 }
@@ -6905,7 +7329,9 @@ impl CompiledModule {
         let runtime_export_count = export_count.checked_sub(native_export_count).ok_or(
             ObjectError::ArithmeticOverflow("runtime prepared aggregate export count"),
         )?;
-        let ordered_native_export_count = if ordered_nfa_reducers {
+        let ordered_compatibility_export_count = if ordered_nfa_reducers
+            && !ordered_nfa_operation_only
+        {
             native_export_count
         } else {
             0
@@ -6976,7 +7402,7 @@ impl CompiledModule {
             .checked_add(1)
             .and_then(|value| value.checked_add(export_count))
             .and_then(|value| value.checked_add(runtime_export_count))
-            .and_then(|value| value.checked_add(ordered_native_export_count))
+            .and_then(|value| value.checked_add(ordered_compatibility_export_count))
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate symbol count",
             ))?;
@@ -6992,10 +7418,14 @@ impl CompiledModule {
             .and_then(|runtime| {
                 let native_relocations_per_export = match architecture {
                     Architecture::X86_64 => {
-                        1 + 2 * usize::from(ordered_nfa_reducers)
+                        1 + 2 * usize::from(
+                            ordered_nfa_reducers && !ordered_nfa_operation_only,
+                        )
                     }
                     Architecture::Aarch64 => {
-                        2 + 3 * usize::from(ordered_nfa_reducers)
+                        2 + 3 * usize::from(
+                            ordered_nfa_reducers && !ordered_nfa_operation_only,
+                        )
                     }
                 };
                 native_export_count
@@ -7511,7 +7941,8 @@ impl CompiledModule {
                     &mut symbols,
                     &mut relocations,
                     wrapper,
-                    ordered_nfa_reducers.then_some(PREPARED_COUNT_RUNTIME_SYMBOL_NAME),
+                    (ordered_nfa_reducers && !ordered_nfa_operation_only)
+                        .then_some(PREPARED_COUNT_RUNTIME_SYMBOL_NAME),
                     PREPARED_COUNT_SYMBOL_PREFIX,
                 )?
             } else {
@@ -7534,7 +7965,7 @@ impl CompiledModule {
                         &mut symbols,
                         &mut relocations,
                         wrapper,
-                        ordered_nfa_reducers
+                        (ordered_nfa_reducers && !ordered_nfa_operation_only)
                             .then_some(PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME),
                         PREPARED_SPAN_SUM_SYMBOL_PREFIX,
                     )?
@@ -7607,6 +8038,40 @@ impl CompiledModule {
                 symbol.name = identity_symbol(prefix, &module_identity)?;
             }
         }
+        let operation_entry_symbol_index = if ordered_nfa_operation_only {
+            let mut reducers = [
+                prepared_count_symbol_index,
+                prepared_span_sum_symbol_index,
+                prepared_grep_count_symbol_index,
+            ]
+            .into_iter()
+            .flatten();
+            let reducer = reducers.next().ok_or(ObjectError::InvalidModule(
+                "Ordered-NFA operation-only module has no scalar reducer",
+            ))?;
+            if reducers.next().is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA operation-only module has no unique scalar reducer",
+                ));
+            }
+            let mut global_functions = symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, symbol)| {
+                    symbol.binding == SymbolBinding::Global
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.section.is_some()
+                })
+                .map(|(index, _)| index);
+            if global_functions.next() != Some(reducer) || global_functions.next().is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA operation-only module exported another function",
+                ));
+            }
+            Some(reducer)
+        } else {
+            None
+        };
         sections[TEXT_SECTION].data = text.into_boxed_slice();
         sections[PROGRAM_SECTION].data = data.into_boxed_slice();
         self.sections = sections.into_boxed_slice();
@@ -7618,6 +8083,12 @@ impl CompiledModule {
         self.prepared_aggregate_exports = exports;
         self.prepared_aggregate_strategy = Some(aggregate_strategy);
         self.runtime_program_symbol_index = runtime_program_symbol_index;
+        if let Some(entry) = operation_entry_symbol_index {
+            self.entry_symbol_index = entry;
+            self.prepared_entry_symbol_index = None;
+            self.native_prepared_bulk_search_target = None;
+            self.ordered_nfa_bulk_gate_target = None;
+        }
         if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report.take() {
             module_exact_finite_selected_end_teddy::refresh_report_parts(
                 &mut report,
@@ -7682,6 +8153,21 @@ impl CompiledModule {
         let count = self.symbols.get(count_index).ok_or(
             ObjectError::InvalidModule("uniform capture Count symbol index is invalid"),
         )?;
+        let ordered = self.prepared_aggregate_strategy
+            == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+        let operation_only = ordered
+            && self.entry_symbol_index == count_index
+            && self.prepared_bulk_strategy.is_none();
+        if operation_only
+            && (self.prepared_entry_symbol_index.is_some()
+                || self.prepared_span_fill_symbol_index.is_some()
+                || self.required_runtime_symbols().next().is_some()
+                || self.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15)
+        {
+            return Err(ObjectError::InvalidModule(
+                "uniform capture operation-only Count child is not closed",
+            ));
+        }
         let count_offset = usize::try_from(count.offset).map_err(|_| {
             ObjectError::ArithmeticOverflow("uniform capture Count symbol offset")
         })?;
@@ -7990,6 +8476,9 @@ impl CompiledModule {
         }
         let ordered = self.prepared_aggregate_strategy
             == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
+        let operation_only = ordered
+            && count_name == self.entry_symbol()
+            && self.prepared_bulk_strategy.is_none();
         let external = self
             .relocations
             .iter()
@@ -8005,13 +8494,33 @@ impl CompiledModule {
                     .map(|symbol| symbol.name.as_str())
             })
             .collect::<Vec<_>>();
-        let expected_external = if ordered {
+        let expected_external = if ordered && !operation_only {
             vec![PREPARED_COUNT_RUNTIME_SYMBOL_NAME]
         } else {
             Vec::new()
         };
+        let operation_only_global_functions_are_exact = !operation_only
+            || {
+                let mut functions = self.symbols.iter().filter(|symbol| {
+                    symbol.binding == SymbolBinding::Global
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.section.is_some()
+                });
+                functions.next().map(|symbol| symbol.name.as_str()) == Some(count_name)
+                    && functions.next().map(|symbol| symbol.name.as_str()) == Some(reducer_name)
+                    && functions.next().is_none()
+            };
         if external != expected_external
+            || !operation_only_global_functions_are_exact
+            || (operation_only
+                && (self.prepared_entry_symbol_index.is_some()
+                    || self.prepared_span_fill_symbol_index.is_some()
+                    || self.required_runtime_symbols().next().is_some()
+                    || self.required_runtime_program().is_none()
+                    || self.required_prepare_capabilities
+                        != PREPARED_CAPABILITY_ORDERED_NFA_V15))
             || (ordered
+                && !operation_only
                 && (self.prepared_bulk_strategy
                     != Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
                     || self.required_prepare_capabilities
@@ -8054,6 +8563,291 @@ impl CompiledModule {
         if reducer_name != identity_symbol(domain.symbol_prefix(), &digest.finalize())? {
             return Err(ObjectError::InvalidModule(
                 "uniform capture reducer identity suffix disagrees",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append one helper-free whole-operation capture-participation reducer.
+    ///
+    /// The source closure is either the exact ordinary Span selector paired
+    /// with its object-local exact-span participation entry, or the complete
+    /// object-local `capture_next` iterator. All calls are patched directly to
+    /// defined text in this module. The only relocation a participation
+    /// wrapper may add resolves the already-authenticated bundle object used
+    /// to form its private replay request.
+    pub(crate) fn append_native_capture_reducer_v1(
+        mut self,
+        domain: NativeCaptureReducerDomainV1,
+        source: NativeCaptureReducerSourceV1<'_>,
+        source_artifact_identity: [u8; 32],
+    ) -> Result<(Self, String), ObjectError> {
+        if source_artifact_identity == [0; 32]
+            || self.required_runtime_symbols().next().is_some()
+            || self.required_runtime_program().is_some()
+            || self.prepared_entry_symbol_index.is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.required_prepare_capabilities != 0
+        {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer source is not one helper-free ordinary closure",
+            ));
+        }
+        let caller_scratch = source.caller_scratch_bytes() != 0;
+        let prefix = domain.symbol_prefix(caller_scratch);
+        if self
+            .symbols
+            .iter()
+            .any(|symbol| {
+                symbol.name.starts_with(domain.symbol_prefix(false))
+                    || symbol.name.starts_with(domain.symbol_prefix(true))
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer was appended more than once",
+            ));
+        }
+        let exact_symbol = |name: &str, kind: SymbolKind| {
+            let mut matches = self
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, symbol)| symbol.name == name);
+            let (index, symbol) = matches.next().ok_or(ObjectError::InvalidModule(
+                "capture reducer source symbol is absent",
+            ))?;
+            if matches.next().is_some()
+                || symbol.binding != SymbolBinding::Global
+                || symbol.kind != kind
+                || symbol.size == 0
+                || symbol.section
+                    != Some(match kind {
+                        SymbolKind::Function => TEXT_SECTION,
+                        SymbolKind::Object => PROGRAM_SECTION,
+                    })
+            {
+                return Err(ObjectError::InvalidModule(
+                    "capture reducer source symbol is not one canonical definition",
+                ));
+            }
+            Ok((index, symbol))
+        };
+        let source_targets = match source {
+            NativeCaptureReducerSourceV1::ExactSpanParticipation {
+                selector_symbol,
+                bundle_symbol,
+                participation_symbol,
+                group_count,
+                participation_scratch_bytes,
+                caller_scratch_bytes,
+            } => {
+                if group_count == 0
+                    || participation_scratch_bytes == 0
+                    || !participation_scratch_bytes
+                        .is_multiple_of(crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN)
+                    || (caller_scratch_bytes == 0
+                        && participation_scratch_bytes
+                            != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+                    || (caller_scratch_bytes != 0
+                        && caller_scratch_bytes != participation_scratch_bytes)
+                    || self.entry_symbol() != selector_symbol
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "capture reducer participation source identity disagrees",
+                    ));
+                }
+                let (_, selector) = exact_symbol(selector_symbol, SymbolKind::Function)?;
+                let (bundle_index, _) = exact_symbol(bundle_symbol, SymbolKind::Object)?;
+                let (_, participation) =
+                    exact_symbol(participation_symbol, SymbolKind::Function)?;
+                NativeCaptureReducerTargetsV1 {
+                    selector: Some(symbol_text_offset(
+                        selector,
+                        "capture reducer selector offset",
+                    )?),
+                    participation: Some(symbol_text_offset(
+                        participation,
+                        "capture reducer participation offset",
+                    )?),
+                    capture_next: None,
+                    bundle_symbol: Some(bundle_index),
+                }
+            }
+            NativeCaptureReducerSourceV1::CaptureNext {
+                capture_next_symbol,
+                group_count,
+            } => {
+                if group_count == 0 {
+                    return Err(ObjectError::InvalidModule(
+                        "capture reducer capture-next schema is empty",
+                    ));
+                }
+                let (_, capture_next) =
+                    exact_symbol(capture_next_symbol, SymbolKind::Function)?;
+                NativeCaptureReducerTargetsV1 {
+                    selector: None,
+                    participation: None,
+                    capture_next: Some(symbol_text_offset(
+                        capture_next,
+                        "capture reducer capture-next offset",
+                    )?),
+                    bundle_symbol: None,
+                }
+            }
+        };
+        let lowering = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_native_capture_reducer_v1(domain, source)?,
+            Architecture::Aarch64 => lower_aarch64_native_capture_reducer_v1(domain, source)?,
+        };
+        let architecture = self.target.architecture;
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        let alignment_mask = match architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let reducer_offset = text
+            .len()
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "capture reducer alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = reducer_offset.checked_add(lowering.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("capture reducer text extent"),
+        )?;
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("capture reducer text"))?;
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("capture reducer symbol"))?;
+        match architecture {
+            Architecture::X86_64 => text.resize(reducer_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < reducer_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &lowering.code)?;
+        for &(call, target) in lowering.local_calls.iter() {
+            let call = reducer_offset
+                .checked_add(call)
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer local call"))?;
+            let target = match target {
+                NativeCaptureReducerCallTargetV1::Selector => source_targets.selector,
+                NativeCaptureReducerCallTargetV1::Participation => {
+                    source_targets.participation
+                }
+                NativeCaptureReducerCallTargetV1::CaptureNext => source_targets.capture_next,
+                NativeCaptureReducerCallTargetV1::PrivateDomain(offset) => reducer_offset
+                    .checked_add(offset),
+            }
+            .ok_or(ObjectError::InvalidModule(
+                "capture reducer local call has no authenticated target",
+            ))?;
+            match architecture {
+                Architecture::X86_64 => patch_x86_64_local_call(&mut text, call, target)?,
+                Architecture::Aarch64 => patch_aarch64_local_call(&mut text, call, target)?,
+            }
+        }
+        if !lowering.bundle_relocations.is_empty() {
+            let bundle_symbol = source_targets.bundle_symbol.ok_or(
+                ObjectError::InvalidModule("capture reducer bundle relocation has no bundle"),
+            )?;
+            relocations
+                .try_reserve_exact(lowering.bundle_relocations.len())
+                .map_err(|_| ObjectError::Allocation("capture reducer relocations"))?;
+            for &(offset, kind, addend) in lowering.bundle_relocations.iter() {
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: offset_u64(
+                        reducer_offset.checked_add(offset).ok_or(
+                            ObjectError::ArithmeticOverflow("capture reducer relocation"),
+                        )?,
+                        "capture reducer relocation",
+                    )?,
+                    kind,
+                    symbol: bundle_symbol,
+                    addend,
+                });
+            }
+        }
+        let reducer_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(prefix, "capture reducer symbol prefix")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: offset_u64(reducer_offset, "capture reducer offset")?,
+            size: u64::try_from(lowering.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer size"))?,
+        });
+        let mut digest = Sha256::new();
+        digest.update(b"fre-aot-regex/native-capture-reducer-v1\0");
+        digest.update([domain.identity_tag(), source.identity_tag()]);
+        digest.update(
+            u64::try_from(source.group_count())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer group count"))?
+                .to_le_bytes(),
+        );
+        if caller_scratch {
+            digest.update(b"caller-scratch-v1\0");
+            digest.update(
+                u64::try_from(source.caller_scratch_bytes())
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow("capture reducer caller scratch")
+                    })?
+                    .to_le_bytes(),
+            );
+        }
+        digest.update(source_artifact_identity);
+        for name in source.symbol_names().into_iter().flatten() {
+            digest.update(
+                u64::try_from(name.len())
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow("capture reducer child symbol length")
+                    })?
+                    .to_le_bytes(),
+            );
+            digest.update(name.as_bytes());
+        }
+        digest.update(
+            u64::try_from(lowering.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer code length"))?
+                .to_le_bytes(),
+        );
+        digest.update(&lowering.code);
+        let reducer_symbol = identity_symbol(prefix, &digest.finalize())?;
+        symbols[reducer_index].name = reducer_symbol.clone();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        Ok((self, reducer_symbol))
+    }
+
+    /// Deterministically reconstruct an additive capture reducer from its
+    /// fully authenticated source module and compare the complete module and
+    /// strong symbol identity.
+    pub(crate) fn authenticate_native_capture_reducer_v1(
+        &self,
+        source_module: &Self,
+        domain: NativeCaptureReducerDomainV1,
+        source: NativeCaptureReducerSourceV1<'_>,
+        source_artifact_identity: [u8; 32],
+        reducer_symbol: &str,
+    ) -> Result<(), ObjectError> {
+        let (expected, expected_symbol) = source_module.clone().append_native_capture_reducer_v1(
+            domain,
+            source,
+            source_artifact_identity,
+        )?;
+        if expected_symbol != reducer_symbol || expected != *self {
+            return Err(ObjectError::InvalidModule(
+                "capture reducer is not the exact additive source closure",
             ));
         }
         Ok(())
@@ -8434,12 +9228,28 @@ impl CompiledModule {
             ));
         }
         let lowering = match (self.target.architecture, geometry) {
-            (Architecture::X86_64, Some(shape)) => NativeParticipationLowering::X86(
-                lower_x86_64_native_participation_v1(self.target, shape)?,
-            ),
-            (Architecture::Aarch64, Some(shape)) => NativeParticipationLowering::Aarch64(
-                lower_aarch64_native_participation_v1(self.target, shape)?,
-            ),
+            (Architecture::X86_64, Some(shape)) => {
+                let lowered = match shape.kind {
+                    crate::participation_aot::NativeParticipationPlanKindV1::Dfa => {
+                        lower_x86_64_native_participation_v1(self.target, shape)?
+                    }
+                    crate::participation_aot::NativeParticipationPlanKindV1::OrderedNfa => {
+                        lower_x86_64_ordered_nfa_participation_v1(self.target, shape)?
+                    }
+                };
+                NativeParticipationLowering::X86(lowered)
+            }
+            (Architecture::Aarch64, Some(shape)) => {
+                let lowered = match shape.kind {
+                    crate::participation_aot::NativeParticipationPlanKindV1::Dfa => {
+                        lower_aarch64_native_participation_v1(self.target, shape)?
+                    }
+                    crate::participation_aot::NativeParticipationPlanKindV1::OrderedNfa => {
+                        lower_aarch64_ordered_nfa_participation_v1(self.target, shape)?
+                    }
+                };
+                NativeParticipationLowering::Aarch64(lowered)
+            }
             (architecture, None) => {
                 NativeParticipationLowering::Negative(native_participation_negative(architecture)?)
             }
@@ -8844,6 +9654,123 @@ struct NativeUniformCaptureReducerWrapper {
     count_call_offsets: Box<[usize]>,
 }
 
+/// Exact byte domain owned by a helper-free capture reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCaptureReducerDomainV1 {
+    WholeHaystack,
+    ByteSliceLines,
+}
+
+impl NativeCaptureReducerDomainV1 {
+    const fn symbol_prefix(self, caller_scratch: bool) -> &'static str {
+        match (self, caller_scratch) {
+            (Self::WholeHaystack, false) => "fre_aot_regex_count_captures_v1_",
+            (Self::ByteSliceLines, false) => "fre_aot_regex_grep_captures_v1_",
+            (Self::WholeHaystack, true) => {
+                "fre_aot_regex_count_captures_scratch_v1_"
+            }
+            (Self::ByteSliceLines, true) => {
+                "fre_aot_regex_grep_captures_scratch_v1_"
+            }
+        }
+    }
+
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::WholeHaystack => 1,
+            Self::ByteSliceLines => 2,
+        }
+    }
+}
+
+/// Already-authenticated helper-free child closure consumed by one reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCaptureReducerSourceV1<'a> {
+    ExactSpanParticipation {
+        selector_symbol: &'a str,
+        bundle_symbol: &'a str,
+        participation_symbol: &'a str,
+        group_count: usize,
+        participation_scratch_bytes: usize,
+        caller_scratch_bytes: usize,
+    },
+    CaptureNext {
+        capture_next_symbol: &'a str,
+        group_count: usize,
+    },
+}
+
+impl<'a> NativeCaptureReducerSourceV1<'a> {
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::ExactSpanParticipation { .. } => 1,
+            Self::CaptureNext { .. } => 2,
+        }
+    }
+
+    const fn group_count(self) -> usize {
+        match self {
+            Self::ExactSpanParticipation { group_count, .. }
+            | Self::CaptureNext { group_count, .. } => group_count,
+        }
+    }
+
+    const fn caller_scratch_bytes(self) -> usize {
+        match self {
+            Self::ExactSpanParticipation {
+                caller_scratch_bytes,
+                ..
+            } => caller_scratch_bytes,
+            Self::CaptureNext { .. } => 0,
+        }
+    }
+
+    const fn symbol_names(self) -> [Option<&'a str>; 3] {
+        match self {
+            Self::ExactSpanParticipation {
+                selector_symbol,
+                bundle_symbol,
+                participation_symbol,
+                ..
+            } => [
+                Some(selector_symbol),
+                Some(bundle_symbol),
+                Some(participation_symbol),
+            ],
+            Self::CaptureNext {
+                capture_next_symbol,
+                ..
+            } => [Some(capture_next_symbol), None, None],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCaptureReducerCallTargetV1 {
+    Selector,
+    Participation,
+    CaptureNext,
+    PrivateDomain(usize),
+}
+
+struct NativeCaptureReducerLoweringV1 {
+    code: Vec<u8>,
+    local_calls: Box<[(usize, NativeCaptureReducerCallTargetV1)]>,
+    bundle_relocations: Box<[(usize, RelocationKind, i64)]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCaptureReducerTargetsV1 {
+    selector: Option<usize>,
+    participation: Option<usize>,
+    capture_next: Option<usize>,
+    bundle_symbol: Option<usize>,
+}
+
+fn symbol_text_offset(symbol: &ModuleSymbol, site: &'static str) -> Result<usize, ObjectError> {
+    usize::try_from(symbol.offset).map_err(|_| ObjectError::ArithmeticOverflow(site))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeSpanReducerTarget {
     PreparedPrivate(usize),
@@ -9113,6 +10040,15 @@ fn append_prepared_bulk_entry(
             "Ordered-NFA prepared entry has a non-Span output",
         ));
     }
+    if matches!(
+        prepared.kind,
+        PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+            operation_only: true,
+            ..
+        })
+    ) {
+        return Ok(PreparedBulkEntryLayout::default());
+    }
     let large_window_runtime_bulk = matches!(
         prepared.kind,
         PreparedEntryKind::Native(native)
@@ -9362,6 +10298,8 @@ fn lower_runtime_adapter(
             needs_runtime: true,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -9388,6 +10326,7 @@ fn lower_native_ordered_nfa_prepared(
         target,
         max_native_data_bytes,
         FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+        PreparedOrderedNfaV15Surface::Compatibility,
     )? {
         NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => Some((lowering, layout)),
         NativeOrderedNfaPreparedOutcome::Unsupported
@@ -9407,6 +10346,7 @@ fn lower_native_ordered_nfa_prepared_reported(
     target: Target,
     max_native_data_bytes: usize,
     max_descriptor_bytes: usize,
+    surface: PreparedOrderedNfaV15Surface,
 ) -> Result<NativeOrderedNfaPreparedOutcome, ObjectError> {
     let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
     if serialized_identity != view.artifact_identity {
@@ -9459,9 +10399,14 @@ fn lower_native_ordered_nfa_prepared_reported(
         });
     }
 
-    let (mut code, mut relocations) = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
-        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    let (mut code, mut relocations) = match (surface, target.architecture) {
+        (PreparedOrderedNfaV15Surface::Compatibility, Architecture::X86_64) => {
+            lower_x86_64_runtime_adapter()?
+        }
+        (PreparedOrderedNfaV15Surface::Compatibility, Architecture::Aarch64) => {
+            lower_aarch64_runtime_adapter()?
+        }
+        (PreparedOrderedNfaV15Surface::ScalarOperationOnly, _) => (Vec::new(), Vec::new()),
     };
     let ordinary_code_size = code.len();
     let code_alignment = match target.architecture {
@@ -9486,7 +10431,14 @@ fn lower_native_ordered_nfa_prepared_reported(
     let (entry_code, entry_relocations, private_relative, gate_relative) =
         match target.architecture {
             Architecture::X86_64 => {
-                let entry = ordered_nfa_codegen::lower_x86_64(&image)?;
+                let entry = match surface {
+                    PreparedOrderedNfaV15Surface::Compatibility => {
+                        ordered_nfa_codegen::lower_x86_64(&image)?
+                    }
+                    PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                        ordered_nfa_codegen::lower_x86_64_operation_only(&image)?
+                    }
+                };
                 (
                     entry.code,
                     entry.relocations,
@@ -9495,7 +10447,14 @@ fn lower_native_ordered_nfa_prepared_reported(
                 )
             }
             Architecture::Aarch64 => {
-                let entry = ordered_nfa_aarch64_codegen::lower_aarch64(&image)?;
+                let entry = match surface {
+                    PreparedOrderedNfaV15Surface::Compatibility => {
+                        ordered_nfa_aarch64_codegen::lower_aarch64(&image)?
+                    }
+                    PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only(&image)?
+                    }
+                };
                 (
                     entry.code,
                     entry.relocations,
@@ -9548,18 +10507,21 @@ fn lower_native_ordered_nfa_prepared_reported(
             data: program_bytes,
             relocations,
             slow_partial_table: None,
-            // The ordinary entry and optional prepared compatibility edges
-            // remain honest runtime dependencies. Required-V15 benchmark
-            // handles never invoke those edges.
-            needs_runtime: true,
+            // Compatibility retains its ordinary and prepared fallback edges.
+            // The operation-only fragment contains only local data references.
+            needs_runtime: surface == PreparedOrderedNfaV15Surface::Compatibility,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size,
             code_offset: public_entry_offset,
             code_size: public_entry_size,
             kind: PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                operation_only: surface
+                    == PreparedOrderedNfaV15Surface::ScalarOperationOnly,
                 object_abi_version: if image.layout.terminal_range.is_some() {
                     ORDERED_NFA_OBJECT_V3_ABI_VERSION
                 } else if image.layout.ordered_edge_dispatch.is_some() {
@@ -9979,6 +10941,8 @@ fn lower_native_endpoint_oracle_prepared(
             needs_runtime: true,
             start_accelerator: bit.start_accelerator,
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         composed_prepared,
         Some(mode),
@@ -10323,6 +11287,8 @@ fn lower_native_dynamic_rows_prepared(
             needs_runtime: true,
             start_accelerator,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -10542,6 +11508,8 @@ fn lower_native_slow_partial_with_data_limit(
         needs_runtime: true,
         start_accelerator: native.start_accelerator,
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
     }))
 }
 
@@ -11833,6 +12801,8 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             needs_runtime: true,
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -12585,6 +13555,8 @@ fn lower_native_partial_prepared(
             needs_runtime: true,
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -12705,6 +13677,7 @@ fn native_module_digest_with_runtime_symbol(
                 "Ordered-NFA digest identity extent",
             ))?;
         if ordinary_code_size != code_offset
+            || ordered.operation_only == lowering.needs_runtime
             || ordered.public_entry_offset != code_offset
             || ordered.public_entry_size != code_size
             || ordered.private_entry_offset < code_offset
@@ -13312,6 +14285,18 @@ const NO_DFA_STATE: u32 = u32::MAX;
 /// memory and emitted cold data proportional without consulting regex source.
 const MAX_NATIVE_SEEDED_REVERSE_CELLS: usize = 4 * 1024 * 1024;
 const MAX_NATIVE_SEEDED_REVERSE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Synchronizing reverse proofs are considered by a fixed representation
+/// portfolio, so one logical proof can be rebuilt several times while costs
+/// are ranked. Keep this newly admitted slice cache-sized and give the graph
+/// proof an allocation-free shape gate. These caps bound aggregate compiler
+/// work without changing the established optional reverse portfolio.
+const MAX_SYNCHRONIZING_REVERSE_GRAPH_STATES: usize = 4 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_GRAPH_EDGES: usize = 16 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_STATES: usize = 512;
+const MAX_SYNCHRONIZING_REVERSE_CELLS: usize = 8 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_WORK: u64 = 500_000;
+const MAX_SYNCHRONIZING_REVERSE_MEMORY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SYNCHRONIZING_REVERSE_ADDRESS_BYTES: usize = 64 * 1024;
 /// Storage for exact fragmented byte sets. The vector lowering has eight
 /// dedicated constant registers on x86-64 and an equivalent bounded ASIMD
 /// allocation. Non-exact inclusive ranges retain the former four-range cap
@@ -13351,6 +14336,7 @@ const VECTOR_FILTER_COST_BLOCK_BYTES: u64 = 64;
 /// replaying loads and can therefore tolerate more hits.
 const MAX_SPARSE_RESCAN_EXPECTED_HITS: u16 = 2;
 const MAX_ASIMD_BATCH_EXPECTED_HITS: u16 = 4;
+const AARCH64_ASIMD_VECTOR_BYTES: u16 = 16;
 const AARCH64_BATCH_BYTES: u16 = 64;
 /// A primary-only four-mask exact-product batch is profitable only while the
 /// scalar retry guard remains smaller than the target's bounded compare bank.
@@ -13399,6 +14385,10 @@ const MAX_X86_PREFIX_RELATION_CONSTANTS: u8 = 8;
 const MAX_AARCH64_PREFIX_RELATION_CONSTANTS: u8 = 6;
 const MAX_X86_PREFIX_RELATION_INSTRUCTION_UNITS: u16 = 32;
 const MAX_AARCH64_PREFIX_RELATION_INSTRUCTION_UNITS: u16 = 24;
+/// Exact depth-two mandatory factors stay inline. Eight pairs cover the
+/// direct-comparison/vector-rectangle sweet spot while bounding code size and
+/// scalar-tail work independently of the source expression.
+const MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS: usize = 8;
 const MAX_NATIVE_PREFIX_PREDICATES: usize = MAX_ANCHORED_PREFIX_BYTES;
 const ENABLE_NATIVE_PREFIX_FAST_FORWARD: bool = true;
 
@@ -17030,15 +18020,53 @@ fn require_native_start_scanner(
     Ok(lowering)
 }
 
-const fn is_optional_native_table_decline(error: &ObjectError) -> bool {
-    matches!(
-        error,
-        ObjectError::Allocation(_)
-            | ObjectError::Resource {
-                resource: crate::CompileResource::ProgramBytes,
-                ..
-            }
-    )
+const SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse construction";
+const SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse terminal barrier";
+const SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE: &str =
+    "synchronizing seeded reverse native table";
+
+fn is_optional_native_table_decline(error: &ObjectError) -> bool {
+    match error {
+        ObjectError::Allocation(site) => {
+            *site != SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE
+                && *site != SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+                && *site != SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE
+        }
+        ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Reserve the complete native image exactly once when a synchronizing
+/// accept proof is present. After that candidate's combined reservation has
+/// failed, rebuilding the ordinary table would perform a fresh allocation
+/// after an allocator failure. Established optional reverse sidecars retain
+/// their transactional baseline retry.
+fn reserve_native_dfa_table_with(
+    bytes: &mut Vec<u8>,
+    total: usize,
+    baseline_total: usize,
+    has_seeded_reverse: bool,
+    synchronizing_accept_reverse: bool,
+    mut reserve: impl FnMut(&mut Vec<u8>, usize) -> bool,
+) -> Result<bool, ObjectError> {
+    if reserve(bytes, total) {
+        return Ok(has_seeded_reverse);
+    }
+    if synchronizing_accept_reverse {
+        return Err(ObjectError::Allocation(
+            SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE,
+        ));
+    }
+    if !has_seeded_reverse || !reserve(bytes, baseline_total) {
+        return Err(ObjectError::Allocation("native DFA table"));
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -17238,6 +18266,8 @@ fn build_native_ordinal_retry(
     column_quotient: Option<&NativeColumnQuotientPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
     ranking_target: Option<Target>,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     if !is_optional_native_table_decline(dense_error) {
@@ -17264,6 +18294,8 @@ fn build_native_ordinal_retry(
             Some(plan),
             None,
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         )
         .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
         match retry {
@@ -17298,6 +18330,8 @@ fn build_native_ordinal_retry(
                 None,
                 None,
                 permit_asimd_candidate_mask,
+                permit_synchronizing_accept_reverse,
+                permit_exact_pair,
             )
             .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
             match retry {
@@ -17503,6 +18537,8 @@ fn build_native_dense_candidate(
     exact_rows: Option<&NativeExactRowInternPlan>,
     column_quotient: Option<&NativeColumnQuotientPlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     let force_class_mapped_applicable = || {
         let class_count = view.dfa.class_count;
@@ -17575,6 +18611,8 @@ fn build_native_dense_candidate(
             None,
             None,
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         )?;
     require_native_start_scanner(view, max_native_data_bytes, lowering).map(Some)
 }
@@ -18698,6 +19736,16 @@ struct NativeSuffixFilter {
     /// Extra aligned columns checked after a primary SIMD hit when their
     /// constants are too expensive to keep live in the vector loop.
     scalar_filter: Option<NativeVectorFilter>,
+    /// The exact literal projection on the retained scalar columns is a
+    /// strict subset of their Cartesian byte-set product. This bounded,
+    /// allocation-free proof is recorded only for an interior factor whose
+    /// independent product estimate could otherwise dominate a no-retry
+    /// terminal candidate.
+    scalar_projection_dependent: bool,
+    /// Exact correlation retained from a complete depth-two required-literal
+    /// set. When present, native suffix scanners use this relation instead of
+    /// the independent aligned-column projection above.
+    exact_pair_filter: Option<NativeExactPairFilter>,
     /// Correlated alternatives at this exact graph boundary. The portfolio is
     /// target-neutral and remains dormant unless target finalization installs
     /// one complete lookup-table plan beside the immutable DFA.
@@ -18873,6 +19921,25 @@ struct NativePrefixRelationVectorPlan {
     rectangle_count: u8,
     constant_count: u8,
     instruction_units: u16,
+}
+
+/// Complete graph-authenticated depth-two mandatory relation.
+///
+/// The vector form is admitted under the stricter budget shared by both
+/// native targets. The canonical little-endian pair list independently owns
+/// scalar tails, so no bitmap allocation or target data payload is required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactPairFilter {
+    vector_plan: NativePrefixRelationVectorPlan,
+    pairs: [u16; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS],
+    pair_count: u8,
+    candidate_frequency_upper_bound: u64,
+}
+
+impl NativeExactPairFilter {
+    fn pairs(&self) -> &[u16] {
+        &self.pairs[..usize::from(self.pair_count)]
+    }
 }
 
 const EMPTY_NATIVE_PREFIX_RELATION_PREDICATE: NativePrefixRelationPredicate =
@@ -19932,6 +20999,8 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             needs_runtime: false,
             start_accelerator: report.scanner,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         report,
     )))
@@ -20002,6 +21071,8 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             needs_runtime: false,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         },
         report,
     )))
@@ -20042,14 +21113,25 @@ fn lower_native_dfa_with_data_limit(
 
 /// A numeric native-data miss declines only the speculative Teddy composite.
 /// Allocator failure and every backend/invariant error remain terminal, so a
-/// decline may safely re-enter the established optimizer portfolio.
+/// decline may safely re-enter the established optimizer portfolio. This is
+/// also the one ordinary complete-DFA transaction shared by the finite/Teddy
+/// endpoint portfolio. Enabling the synchronizing reverse policy here is
+/// inert for Span and SelectedEnd because its deeper proof admits only Exists;
+/// every other ordinary lowering keeps the pre-feature policy disabled.
 fn lower_exact_finite_teddy_incumbent_with_data_limit(
     view: NativeProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     exact_finite_teddy_incumbent_outcome(
-        lower_native_dfa_with_data_limit(view, target, max_native_data_bytes),
+        lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+            view,
+            target,
+            NativeDfaEntryContract::Public,
+            max_native_data_bytes,
+            true,
+            true,
+        ),
         max_native_data_bytes,
     )
 }
@@ -20348,18 +21430,61 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
     entry_contract: NativeDfaEntryContract,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        false,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_and_sync_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        false,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
-    let (mut data, mut layout) = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
-        view,
-        target,
-        vector_cost_model,
-        relation_vector_owns_route,
-        maximum_native_data_bytes,
-    )?;
+    let (mut data, mut layout) =
+        build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+            view,
+            target,
+            vector_cost_model,
+            relation_vector_owns_route,
+            maximum_native_data_bytes,
+            allow_synchronizing_accept_reverse
+                && entry_contract == NativeDfaEntryContract::Public,
+            allow_exact_pair && entry_contract == NativeDfaEntryContract::Public,
+        )?;
+    let synchronizing_accept_reverse_lowered = layout.seeded_reverse.is_some()
+        && layout.suffix_filter.is_some_and(|suffix| {
+            matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+        });
     // An optional exact-set allocation may decline transactionally. A
     // mandatory retained program must never reach a backend with the
     // corresponding accelerated cell bits but no installed primary scanner.
@@ -20482,6 +21607,15 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
         sve_suffix_kind,
         emission.scanner,
     );
+    // Compute this compiler-only receipt after every target-specific scanner
+    // installation. A subsequently installed mandatory Teddy route supersedes
+    // the pair scanner even when the target-neutral suffix candidate carried
+    // both portfolios.
+    let exact_pair_suffix_lowered = entry_contract == NativeDfaEntryContract::Public
+        && layout.mandatory_teddy.is_none()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some());
     Ok(Some(NativeLowering {
         code: emission.code,
         data,
@@ -20492,6 +21626,8 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
         anchored_prefix_filter_bytes: layout
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
+        synchronizing_accept_reverse_lowered,
+        exact_pair_suffix_lowered,
     }))
 }
 
@@ -20962,7 +22098,8 @@ fn retained_suffix_scanner_is_preserved(
     let (Some(emission), Some(suffix)) = (emission, suffix) else {
         return false;
     };
-    emission.vectorized
+    suffix.exact_pair_filter.is_none()
+        && emission.vectorized
         && emission.scan_offset == requirement.scan_offset
         && emission.membership == requirement.membership
         && suffix.minimum_width == requirement.minimum_width
@@ -21175,7 +22312,10 @@ fn selected_aarch64_sve_suffix_kind_with_policy(
     let sve_route_supported = layout.seeded_reverse.is_none()
         && layout
             .suffix_filter
-            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter));
+            .is_some_and(|suffix| {
+                suffix.exact_pair_filter.is_none()
+                    && aarch64_base_sve_filter_supported(suffix.filter)
+            });
     let isa = aarch64_primary_scanner_isa_with_policy(
         operating_system,
         features,
@@ -21587,6 +22727,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         max_native_data_bytes,
         architecture == Architecture::Aarch64,
         None,
+        true,
+        true,
     )
 }
 
@@ -21603,6 +22745,44 @@ fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+        view,
+        target,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        true,
+    )
+}
+
+fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_sync_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+        view,
+        target,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        true,
+    )
+}
+
+fn build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         view,
         target.architecture,
@@ -21611,6 +22791,8 @@ fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
         max_native_data_bytes,
         target.features.has(CpuFeature::Aarch64Asimd),
         Some(target),
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
     )
 }
 
@@ -21622,7 +22804,25 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     max_native_data_bytes: usize,
     permit_asimd_candidate_mask: bool,
     ranking_target: Option<Target>,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    // Seeded reverse currently has scalar and ASIMD AArch64 scanners, but no
+    // SVE lowering. Preserve every pure or mixed SVE suffix incumbent until
+    // that route has an independently measured seeded implementation.
+    let permit_synchronizing_accept_reverse = allow_synchronizing_accept_reverse
+        && ranking_target.is_none_or(|target| {
+            target.architecture == Architecture::X86_64
+                || (target.features.has(CpuFeature::Aarch64Asimd)
+                    && !target.features.has(CpuFeature::Aarch64Sve))
+        });
+    let permit_exact_pair = allow_exact_pair
+        && view.output == OutputContract::Exists
+        && ranking_target.is_none_or(|target| {
+            target.architecture == Architecture::X86_64
+                || (target.features.has(CpuFeature::Aarch64Asimd)
+                    && !target.features.has(CpuFeature::Aarch64Sve))
+        });
     let exact_rows = native_exact_row_intern_candidate_plan(view, architecture);
     // Derivation retains only maps and representative class ordinals. The
     // selected candidate reads representative cells directly from the graph;
@@ -21648,6 +22848,8 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             exact_rows.as_ref(),
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         ) {
             Ok(Some(lowering)) => {
                 let cost = if let Some(target) = ranking_target {
@@ -21695,6 +22897,8 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             exact_rows.as_ref(),
             column_quotient.as_ref(),
             permit_asimd_candidate_mask,
+            permit_synchronizing_accept_reverse,
+            permit_exact_pair,
         ) {
             Ok(Some(lowering)) => return Ok(lowering),
             Ok(None) => {}
@@ -21729,6 +22933,8 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         column_quotient.as_ref(),
         comparison_plan,
         permit_asimd_candidate_mask,
+        permit_synchronizing_accept_reverse,
+        permit_exact_pair,
         ranking_target,
     )? {
         return Ok(lowering);
@@ -21760,6 +22966,8 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                     None,
                     None,
                     permit_asimd_candidate_mask,
+                    permit_synchronizing_accept_reverse,
+                    permit_exact_pair,
                 )
                 .and_then(|lowering| {
                     require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -21785,6 +22993,8 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                         None,
                         Some(plan),
                         permit_asimd_candidate_mask,
+                        permit_synchronizing_accept_reverse,
+                        permit_exact_pair,
                     )
                     .and_then(|lowering| {
                         require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -21894,6 +23104,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
         None,
         None,
         permit_asimd_candidate_mask,
+        true,
+        true,
     )
 }
 
@@ -21927,6 +23139,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         None,
         None,
         architecture == Architecture::Aarch64,
+        true,
+        true,
     )
 }
 
@@ -21948,6 +23162,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     ordinal_map: Option<NativeOrdinalMapPlan>,
     hybrid_sparse: Option<&NativeHybridSparsePlan>,
     permit_asimd_candidate_mask: bool,
+    permit_synchronizing_accept_reverse: bool,
+    permit_exact_pair: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if usize::from(default_exceptions.is_some())
@@ -22432,7 +23648,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         } else if let Some(requirement) = view.retained_suffix_requirement {
             derive_retained_terminal_suffix_filter(view, requirement)?
         } else {
-            derive_suffix_filter(view)?
+            derive_suffix_filter_with_exact_pair_policy(view, permit_exact_pair)?
         };
     let coalesced_start_filter = if view.retained_prefix_requirement.is_none()
         && ENABLE_NATIVE_COALESCED_INITIAL_FILTER
@@ -22707,11 +23923,23 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     seeded_limits.max_addressable_bytes = seeded_limits
         .max_addressable_bytes
         .min(remaining_sidecar_bytes);
-    let mut seeded_reverse_machine = suffix_filter.and_then(|suffix| {
-        (seeded_limits.max_cells != 0 && seeded_limits.max_memory_bytes != 0)
-            .then(|| build_native_seeded_reverse(view, suffix, seeded_limits))
+    let mut seeded_reverse_machine = if seeded_limits.max_cells != 0
+        && seeded_limits.max_memory_bytes != 0
+    {
+        suffix_filter
+            .map(|suffix| {
+                build_native_seeded_reverse_with_policy(
+                    view,
+                    suffix,
+                    seeded_limits,
+                    permit_synchronizing_accept_reverse,
+                )
+            })
+            .transpose()?
             .flatten()
-    });
+    } else {
+        None
+    };
     // Preserve the target- and output-independent graph fact even when this
     // output contract never requested the optional native reverse sidecar.
     let declined_redundant_root_reverse = suffix_filter.is_some_and(|suffix| {
@@ -22799,6 +24027,17 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         } else {
             (None, 0)
         };
+    let synchronizing_accept_reverse = permit_synchronizing_accept_reverse
+        && suffix_filter.is_some_and(|suffix| {
+            matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                && suffix.retry.is_none()
+                && seeded_reverse_machine.as_ref().is_some_and(|machine| {
+                    machine.proves_match
+                        && machine.first_endpoint_proves_no_earlier_match
+                        && machine.boundary_offset == suffix.minimum_width
+                })
+        });
     let mut total = auxiliary_total
         .checked_add(seeded_reverse_bytes)
         .ok_or(ObjectError::ArithmeticOverflow("native DFA data bytes"))?;
@@ -22818,20 +24057,21 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     }
 
     let mut bytes = Vec::new();
-    if bytes.try_reserve_exact(total).is_err() {
-        if seeded_reverse.is_some() {
-            // The sidecar is optional. Retry the exact baseline reservation
-            // transactionally instead of converting optimizer memory pressure
-            // into a compilation failure.
-            seeded_reverse_machine = None;
-            seeded_reverse = None;
-            total = auxiliary_total;
-            bytes
-                .try_reserve_exact(total)
-                .map_err(|_| ObjectError::Allocation("native DFA table"))?;
-        } else {
-            return Err(ObjectError::Allocation("native DFA table"));
-        }
+    let retained_seeded_reverse = reserve_native_dfa_table_with(
+        &mut bytes,
+        total,
+        auxiliary_total,
+        seeded_reverse.is_some(),
+        synchronizing_accept_reverse,
+        |bytes, bytes_to_reserve| bytes.try_reserve_exact(bytes_to_reserve).is_ok(),
+    )?;
+    if !retained_seeded_reverse && seeded_reverse.is_some() {
+        // Established optional sidecars retry the exact baseline reservation
+        // transactionally. The synchronizing accept candidate is terminal at
+        // this seam and can never reach this branch.
+        seeded_reverse_machine = None;
+        seeded_reverse = None;
+        total = auxiliary_total;
     }
     let table_byte_classes = column_quotient
         .map(|plan| plan.byte_to_quotient.as_slice())
@@ -23907,6 +25147,188 @@ fn derive_native_prefix_relation_vector(
     Some(plan)
 }
 
+/// Retain an exact two-byte relation from the already authenticated mandatory
+/// literal set. This derivation is allocation-free and all-or-nothing: any
+/// depth disagreement, pair/rectangle ceiling, target-common constant budget,
+/// or incomplete reconstruction declines to the pre-feature suffix layout.
+fn derive_native_exact_pair_filter(
+    literals: &RequiredLiteralSet,
+) -> Option<NativeExactPairFilter> {
+    if literals.depth() != 2 || literals.literals().len() < 2 {
+        return None;
+    }
+
+    let mut pairs = [0_u16; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut pair_count = 0_usize;
+    let mut first_words = [0_u64; 4];
+    let mut second_words = [0_u64; 4];
+    let mut candidate_frequency_upper_bound = 0_u64;
+    for literal in literals.literals() {
+        let [first, second] = literal.as_bytes() else {
+            return None;
+        };
+        let pair = u16::from(*first) | (u16::from(*second) << 8);
+        if pairs[..pair_count].contains(&pair) {
+            continue;
+        }
+        let slot = pairs.get_mut(pair_count)?;
+        *slot = pair;
+        pair_count = pair_count.checked_add(1)?;
+        let first_index = usize::from(*first);
+        let second_index = usize::from(*second);
+        first_words[first_index / 64] |= 1_u64 << (first_index % 64);
+        second_words[second_index / 64] |= 1_u64 << (second_index % 64);
+        candidate_frequency_upper_bound = candidate_frequency_upper_bound.checked_add(
+            u64::from(estimated_byte_frequency_units(*first))
+                .checked_mul(u64::from(estimated_byte_frequency_units(*second)))?,
+        )?;
+    }
+    if pair_count < 2 {
+        return None;
+    }
+    pairs[..pair_count].sort_unstable();
+
+    let first_cardinality = first_words.iter().map(|word| word.count_ones()).sum::<u32>();
+    let second_cardinality = second_words
+        .iter()
+        .map(|word| word.count_ones())
+        .sum::<u32>();
+    let independent_pairs = first_cardinality.checked_mul(second_cardinality)?;
+    let exact_pairs = u32::try_from(pair_count).ok()?;
+    if exact_pairs >= independent_pairs
+        || exact_pairs.checked_mul(4)? >= independent_pairs.checked_mul(3)?
+    {
+        return None;
+    }
+    let independent_first_frequency = (u8::MIN..=u8::MAX)
+        .filter(|byte| {
+            let index = usize::from(*byte);
+            first_words[index / 64] & (1_u64 << (index % 64)) != 0
+        })
+        .try_fold(0_u64, |sum, byte| {
+            sum.checked_add(u64::from(estimated_byte_frequency_units(byte)))
+        })?;
+    let independent_second_frequency = (u8::MIN..=u8::MAX)
+        .filter(|byte| {
+            let index = usize::from(*byte);
+            second_words[index / 64] & (1_u64 << (index % 64)) != 0
+        })
+        .try_fold(0_u64, |sum, byte| {
+            sum.checked_add(u64::from(estimated_byte_frequency_units(byte)))
+        })?;
+    let independent_frequency =
+        independent_first_frequency.checked_mul(independent_second_frequency)?;
+    if candidate_frequency_upper_bound.checked_mul(4)?
+        >= independent_frequency.checked_mul(3)?
+    {
+        return None;
+    }
+
+    // First build one exact second-byte row for every distinct first byte.
+    // Pair count bounds both fixed arrays, so this remains allocation-free.
+    let mut row_first = [0_u8; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut row_second = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut row_count = 0_usize;
+    for &pair in &pairs[..pair_count] {
+        let first = pair as u8;
+        let second = (pair >> 8) as u8;
+        let row = if let Some(index) = row_first[..row_count]
+            .iter()
+            .position(|candidate| *candidate == first)
+        {
+            index
+        } else {
+            let slot = row_first.get_mut(row_count)?;
+            *slot = first;
+            row_count = row_count.checked_add(1)?;
+            row_count.checked_sub(1)?
+        };
+        let second_index = usize::from(second);
+        row_second[row][second_index / 64] |= 1_u64 << (second_index % 64);
+    }
+
+    // Merge first-byte rows with identical second sets into disjoint exact
+    // rectangles, matching the canonical graph relation representation.
+    let mut group_first = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut group_second = [[0_u64; 4]; MAX_NATIVE_EXACT_PAIR_FILTER_PAIRS];
+    let mut group_count = 0_usize;
+    for row in 0..row_count {
+        let group = if let Some(index) = group_second[..group_count]
+            .iter()
+            .position(|candidate| *candidate == row_second[row])
+        {
+            index
+        } else {
+            let slot = group_second.get_mut(group_count)?;
+            *slot = row_second[row];
+            group_count = group_count.checked_add(1)?;
+            group_count.checked_sub(1)?
+        };
+        let first_index = usize::from(row_first[row]);
+        group_first[group][first_index / 64] |= 1_u64 << (first_index % 64);
+    }
+
+    let mut rectangles =
+        [EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE; MAX_NATIVE_PREFIX_RELATION_RECTANGLES];
+    let mut constant_count = 0_u8;
+    let mut instruction_units = 0_u16;
+    for index in 0..group_count {
+        let mut first = native_prefix_relation_predicate(
+            AnchoredByteSet::from_words(group_first[index]),
+            0,
+        )?;
+        let mut second = native_prefix_relation_predicate(
+            AnchoredByteSet::from_words(group_second[index]),
+            1,
+        )?;
+        for predicate in [&mut first, &mut second] {
+            if predicate.any {
+                continue;
+            }
+            predicate.first_constant = constant_count.checked_add(1)?;
+            constant_count = constant_count
+                .checked_add(u8::try_from(predicate.filter.constant_count()).ok()?)?;
+            instruction_units = instruction_units
+                .checked_add(vector_filter_instruction_units(predicate.filter))?
+                .checked_add(u16::from(predicate.negated))?;
+        }
+        if !first.any && !second.any {
+            instruction_units = instruction_units.checked_add(1)?;
+        }
+        if index != 0 {
+            instruction_units = instruction_units.checked_add(1)?;
+        }
+        rectangles[index] = NativePrefixRelationRectangle { first, second };
+    }
+    if constant_count > MAX_AARCH64_PREFIX_RELATION_CONSTANTS
+        || instruction_units > MAX_AARCH64_PREFIX_RELATION_INSTRUCTION_UNITS
+    {
+        return None;
+    }
+    let vector_plan = NativePrefixRelationVectorPlan {
+        rectangles,
+        rectangle_count: u8::try_from(group_count).ok()?,
+        constant_count,
+        instruction_units,
+    };
+    for first in u8::MIN..=u8::MAX {
+        for second in u8::MIN..=u8::MAX {
+            let pair = u16::from(first) | (u16::from(second) << 8);
+            if native_prefix_relation_vector_contains(vector_plan, first, second)
+                != pairs[..pair_count].binary_search(&pair).is_ok()
+            {
+                return None;
+            }
+        }
+    }
+    Some(NativeExactPairFilter {
+        vector_plan,
+        pairs,
+        pair_count: u8::try_from(pair_count).ok()?,
+        candidate_frequency_upper_bound,
+    })
+}
+
 fn append_native_prefix_relation(
     bytes: &mut Vec<u8>,
     relation: &PrefixRelation,
@@ -24331,13 +25753,22 @@ fn derive_start_filter(
 fn derive_suffix_filter(
     view: NativeProgramView<'_>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_suffix_filter_with_exact_pair_policy(view, true)
+}
+
+fn derive_suffix_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    permit_exact_pair: bool,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     if view.dfa.initial_pending {
         return Ok(None);
     }
-    let mut best = derive_terminal_suffix_filter(view)?;
+    let mut best = derive_terminal_suffix_filter_with_exact_pair_policy(view, permit_exact_pair)?;
     let mut best_is_terminal = best.is_some();
     for candidate in view.required_literals.interior().candidates() {
-        let Some(interior) = derive_interior_filter(view, candidate)? else {
+        let Some(interior) =
+            derive_interior_filter_with_exact_pair_policy(view, candidate, permit_exact_pair)?
+        else {
             continue;
         };
         let replace = best.is_none_or(|current| {
@@ -24414,6 +25845,7 @@ fn derive_retained_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        None,
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -24425,30 +25857,93 @@ fn derive_retained_terminal_suffix_filter(
 /// has the independent graph-barrier proof: after completely tracing the first
 /// verified endpoint, its minimum start is globally leftmost and the ordinary
 /// forward DFA remains authoritative for endpoint priority. A proven
-/// synchronizing restart remains on its cheaper bounded backward scan.
+/// synchronizing restart remains authoritative except for an `Exists`
+/// Accept seed whose terminal byte is a graph barrier: that complete reverse
+/// proof can return on its first accepting transition instead of rewinding and
+/// replaying a potentially long body-byte corridor through the forward DFA.
 fn build_native_seeded_reverse(
     view: NativeProgramView<'_>,
     suffix: NativeSuffixFilter,
     limits: SeededReverseLimits,
 ) -> Option<NativeSeededReverseMachine> {
+    build_native_seeded_reverse_with_policy(view, suffix, limits, true)
+        .ok()
+        .flatten()
+}
+
+fn build_native_seeded_reverse_with_policy(
+    view: NativeProgramView<'_>,
+    suffix: NativeSuffixFilter,
+    limits: SeededReverseLimits,
+    permit_synchronizing_accept_reverse: bool,
+) -> Result<Option<NativeSeededReverseMachine>, ObjectError> {
+    build_native_seeded_reverse_with_policy_and_barrier_proof(
+        view,
+        suffix,
+        limits,
+        permit_synchronizing_accept_reverse,
+        |terminal| nfa_terminal_suffix_barrier_outcome(view.raw, terminal),
+    )
+}
+
+fn synchronizing_terminal_barrier_outcome(
+    outcome: NfaTerminalSuffixBarrierOutcome,
+) -> Result<bool, ObjectError> {
+    match outcome {
+        NfaTerminalSuffixBarrierOutcome::Proven => Ok(true),
+        NfaTerminalSuffixBarrierOutcome::Declined => Ok(false),
+        NfaTerminalSuffixBarrierOutcome::Allocation => Err(ObjectError::Allocation(
+            SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE,
+        )),
+    }
+}
+
+fn build_native_seeded_reverse_with_policy_and_barrier_proof(
+    view: NativeProgramView<'_>,
+    suffix: NativeSuffixFilter,
+    limits: SeededReverseLimits,
+    permit_synchronizing_accept_reverse: bool,
+    mut barrier_proof: impl FnMut(AnchoredByteSet) -> NfaTerminalSuffixBarrierOutcome,
+) -> Result<Option<NativeSeededReverseMachine>, ObjectError> {
     if suffix.retry.is_some()
         || suffix.filter.candidate_bytes == 0
         || suffix.filter.ranges().is_empty()
-        || matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
     {
-        return None;
+        return Ok(None);
     }
+    let synchronizing = matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. });
+    let terminal_barrier = if synchronizing {
+        if !permit_synchronizing_accept_reverse
+            || view.output != OutputContract::Exists
+            || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+        {
+            return Ok(None);
+        }
+        if view.raw.roles.len() > MAX_SYNCHRONIZING_REVERSE_GRAPH_STATES
+            || view.raw.edge_kinds.len() > MAX_SYNCHRONIZING_REVERSE_GRAPH_EDGES
+        {
+            return Ok(None);
+        }
+        let Some(terminal) = view.anchored_suffix.sets().first().copied() else {
+            return Ok(None);
+        };
+        if !synchronizing_terminal_barrier_outcome(barrier_proof(terminal))? {
+            return Ok(None);
+        }
+        true
+    } else {
+        matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+            && view
+                .anchored_suffix
+                .sets()
+                .first()
+                .copied()
+                .is_some_and(|terminal| nfa_terminal_suffix_is_barrier(view.raw, terminal))
+    };
+    let synchronizing_accept_exists = synchronizing;
     let (seed, boundary_offset, proves_match, first_endpoint_proves_no_earlier_match) =
         match suffix.reverse_seed {
             NativeSuffixReverseSeed::AcceptBoundary => {
-                let terminal_barrier = view
-                    .anchored_suffix
-                    .sets()
-                    .first()
-                    .copied()
-                    .is_some_and(|terminal| {
-                        nfa_terminal_suffix_is_barrier(view.raw, terminal)
-                    });
                 (
                     SeededReverseSeed::AcceptStates,
                     suffix.minimum_width,
@@ -24460,22 +25955,62 @@ fn build_native_seeded_reverse(
                 (SeededReverseSeed::RootState(root), 0, false, false)
             }
         };
+    let limits = if synchronizing {
+        SeededReverseLimits {
+            max_states: limits.max_states.min(MAX_SYNCHRONIZING_REVERSE_STATES),
+            max_cells: limits.max_cells.min(MAX_SYNCHRONIZING_REVERSE_CELLS),
+            max_work: limits.max_work.min(MAX_SYNCHRONIZING_REVERSE_WORK),
+            max_memory_bytes: limits
+                .max_memory_bytes
+                .min(MAX_SYNCHRONIZING_REVERSE_MEMORY_BYTES),
+            max_addressable_bytes: limits
+                .max_addressable_bytes
+                .min(MAX_SYNCHRONIZING_REVERSE_ADDRESS_BYTES),
+        }
+    } else {
+        limits
+    };
     if view.output != OutputContract::Exists && !first_endpoint_proves_no_earlier_match {
-        return None;
+        return Ok(None);
     }
-    match build_seeded_reverse_exact(view.raw, seed, limits) {
-        SeededReverseBuild::Complete(dfa) => Some(NativeSeededReverseMachine {
+    let build = build_seeded_reverse_exact(view.raw, seed, limits);
+    seeded_reverse_build_outcome(build, synchronizing_accept_exists).map(|dfa| {
+        dfa.map(|dfa| NativeSeededReverseMachine {
             dfa,
             boundary_offset,
             proves_match,
             first_endpoint_proves_no_earlier_match,
-        }),
-        SeededReverseBuild::Declined(_) => None,
+        })
+    })
+}
+
+fn seeded_reverse_build_outcome(
+    build: SeededReverseBuild,
+    synchronizing_accept_exists: bool,
+) -> Result<Option<SeededReverseDfa>, ObjectError> {
+    match build {
+        SeededReverseBuild::Complete(dfa) => Ok(Some(dfa)),
+        SeededReverseBuild::Declined(decline)
+            if synchronizing_accept_exists
+                && matches!(decline.reason, SeededReverseDeclineReason::Allocation(_)) =>
+        {
+            Err(ObjectError::Allocation(
+                SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE,
+            ))
+        }
+        SeededReverseBuild::Declined(_) => Ok(None),
     }
 }
 
 fn derive_terminal_suffix_filter(
     view: NativeProgramView<'_>,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_terminal_suffix_filter_with_exact_pair_policy(view, true)
+}
+
+fn derive_terminal_suffix_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    permit_exact_pair: bool,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let suffix_sets = view.anchored_suffix.sets();
     if suffix_sets.is_empty() {
@@ -24500,6 +26035,9 @@ fn derive_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        permit_exact_pair
+            .then(|| matching_exact_pair_filter(view.required_literals.suffix(), minimum_width))
+            .flatten(),
         matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
@@ -24517,12 +26055,22 @@ fn matching_mandatory_teddy_portfolio(
         .flatten()
 }
 
+fn matching_exact_pair_filter(
+    literals: &RequiredLiteralSet,
+    minimum_width: u8,
+) -> Option<NativeExactPairFilter> {
+    (literals.depth() == usize::from(minimum_width))
+        .then(|| derive_native_exact_pair_filter(literals))
+        .flatten()
+}
+
 fn finish_terminal_suffix_filter(
     view: NativeProgramView<'_>,
     minimum_width: u8,
     filter: NativeStartFilter,
     vector_filter: Option<NativeVectorFilter>,
     scalar_filter: Option<NativeVectorFilter>,
+    exact_pair_filter: Option<NativeExactPairFilter>,
     teddy_portfolio: Option<MandatoryTeddyPortfolio>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let restart = if let Some(maximum_width) = view.max_match_width {
@@ -24569,6 +26117,8 @@ fn finish_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        scalar_projection_dependent: false,
+        exact_pair_filter,
         teddy_portfolio,
         minimum_width,
         restart,
@@ -24581,6 +26131,14 @@ fn finish_terminal_suffix_filter(
 fn derive_interior_filter(
     view: NativeProgramView<'_>,
     candidate: &RequiredInteriorCandidate,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    derive_interior_filter_with_exact_pair_policy(view, candidate, true)
+}
+
+fn derive_interior_filter_with_exact_pair_policy(
+    view: NativeProgramView<'_>,
+    candidate: &RequiredInteriorCandidate,
+    permit_exact_pair: bool,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let forward_sets = aligned_sets_from_required_literals(candidate.literal_set())?;
     let minimum_width = u8::try_from(forward_sets.len())
@@ -24624,10 +26182,19 @@ fn derive_interior_filter(
         ),
         _ => None,
     };
+    let scalar_projection_dependent = retry.is_none()
+        && vector_filter.is_none()
+        && scalar_filter.is_some_and(|scalar| {
+            exact_scalar_projection_is_dependent(candidate.literal_set(), scalar)
+        });
     Ok(Some(NativeSuffixFilter {
         filter,
         vector_filter,
         scalar_filter,
+        scalar_projection_dependent,
+        exact_pair_filter: permit_exact_pair
+            .then(|| matching_exact_pair_filter(candidate.literal_set(), minimum_width))
+            .flatten(),
         teddy_portfolio: matching_mandatory_teddy_portfolio(
             candidate.literal_set(),
             minimum_width,
@@ -24665,6 +26232,65 @@ fn aligned_sets_from_required_literals(
         }
     }
     Ok(words.into_iter().map(AnchoredByteSet::from_words).collect())
+}
+
+/// Prove that the exact literal tuples retained by `columns` do not fill the
+/// Cartesian product of their byte memberships. The literal analysis is
+/// bounded at 2,048 rows; an allocation-free quadratic walk is capped at the
+/// same abstract work ceiling and conservatively declines on exhaustion.
+fn exact_scalar_projection_is_dependent(
+    literals: &RequiredLiteralSet,
+    columns: NativeVectorFilter,
+) -> bool {
+    const MAX_PROJECTION_COMPARISONS: u64 = 2_000_000;
+
+    let columns = columns.columns();
+    if columns.len() < 2 || literals.literals().is_empty() {
+        return false;
+    }
+    let mut product = 1_usize;
+    for (index, column) in columns.iter().enumerate() {
+        let offset = usize::from(column.scan_offset);
+        if offset >= literals.depth()
+            || column.candidate_bytes == 0
+            || columns[..index]
+                .iter()
+                .any(|prior| prior.scan_offset == column.scan_offset)
+        {
+            return false;
+        }
+        product = match product.checked_mul(usize::from(column.candidate_bytes)) {
+            Some(product) => product,
+            None => return false,
+        };
+    }
+    if product > literals.literals().len() {
+        return true;
+    }
+
+    let mut distinct = 0_usize;
+    let mut comparisons = 0_u64;
+    'literal: for (index, literal) in literals.literals().iter().enumerate() {
+        let bytes = literal.as_bytes();
+        for prior in &literals.literals()[..index] {
+            comparisons = comparisons.saturating_add(1);
+            if comparisons > MAX_PROJECTION_COMPARISONS {
+                return false;
+            }
+            let prior = prior.as_bytes();
+            if columns.iter().all(|column| {
+                let offset = usize::from(column.scan_offset);
+                bytes.get(offset) == prior.get(offset)
+            }) {
+                continue 'literal;
+            }
+        }
+        distinct = distinct.saturating_add(1);
+        if distinct >= product {
+            return false;
+        }
+    }
+    distinct < product
 }
 
 #[allow(
@@ -24779,17 +26405,32 @@ fn derive_unbounded_mandatory_restart(
 fn mandatory_filter_selection_key(
     filter: NativeSuffixFilter,
 ) -> (u64, bool, u64, (u16, u16, u16, u8, u8)) {
-    let mut probability = 1_u64;
-    let refinement = filter.vector_filter.or(filter.scalar_filter);
-    let column_count = if let Some(vector) = refinement {
-        for &column in vector.columns() {
-            probability =
-                probability.saturating_mul(u64::from(estimated_filter_frequency_units(column)));
-        }
-        vector.columns().len()
+    let (mut probability, column_count) = if let Some(pair) = filter.exact_pair_filter {
+        (pair.candidate_frequency_upper_bound, 2)
     } else {
-        probability = u64::from(estimated_filter_frequency_units(filter.filter));
-        1
+        let mut probability = 1_u64;
+        // A retry-free interior factor whose exact retained tuples are
+        // dependent can make its scalar-column product look arbitrarily
+        // selective on repetitive input. Rank that proven shape by its
+        // primary hit rate so an independently safe terminal factor is not
+        // displaced by a false Cartesian estimate. Exact-pair, vector-refined
+        // and bounded-retry routes retain their established models.
+        let refinement = if filter.scalar_projection_dependent {
+            None
+        } else {
+            filter.vector_filter.or(filter.scalar_filter)
+        };
+        let column_count = if let Some(vector) = refinement {
+            for &column in vector.columns() {
+                probability = probability
+                    .saturating_mul(u64::from(estimated_filter_frequency_units(column)));
+            }
+            vector.columns().len()
+        } else {
+            probability = u64::from(estimated_filter_frequency_units(filter.filter));
+            1
+        };
+        (probability, column_count)
     };
     for _ in column_count..MAX_VECTOR_FILTER_COLUMNS {
         probability = probability.saturating_mul(u64::from(BYTE_FREQUENCY_DENOMINATOR));
@@ -26074,6 +27715,185 @@ fn pad_native_packed_row(
     Ok(())
 }
 
+const REGEX_REDUX_TEXT_SECTION: usize = 0;
+const REGEX_REDUX_DATA_SECTION: usize = 1;
+const REGEX_REDUX_ENTRY_SYMBOL: usize = 0;
+const REGEX_REDUX_DATA_SYMBOL: usize = 1;
+const REGEX_REDUX_COMPONENT_SYMBOL_BASE: usize = 2;
+
+#[derive(Clone, Debug)]
+struct NativeRegexReduxDataLayout {
+    bytes: Vec<u8>,
+    variant_prefixes: Vec<(usize, usize)>,
+    replacements: Vec<(usize, usize)>,
+}
+
+fn native_regex_redux_data_layout(
+    identity: [u8; 32],
+    variants: &[&str; 9],
+    substitutions: &[(&str, &[u8]); 5],
+) -> Result<NativeRegexReduxDataLayout, ObjectError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(1024)
+        .map_err(|_| ObjectError::Allocation("regex-redux native data"))?;
+    bytes.extend_from_slice(&identity);
+    let mut variant_prefixes = Vec::new();
+    variant_prefixes
+        .try_reserve_exact(variants.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux report prefixes"))?;
+    for variant in variants {
+        let offset = bytes.len();
+        bytes.extend_from_slice(variant.as_bytes());
+        bytes.push(b' ');
+        variant_prefixes.push((offset, bytes.len() - offset));
+    }
+    let mut replacements = Vec::new();
+    replacements
+        .try_reserve_exact(substitutions.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux replacements"))?;
+    for (_, replacement) in substitutions {
+        let offset = bytes.len();
+        bytes.extend_from_slice(replacement);
+        replacements.push((offset, replacement.len()));
+    }
+    Ok(NativeRegexReduxDataLayout {
+        bytes,
+        variant_prefixes,
+        replacements,
+    })
+}
+
+fn native_regex_redux_module(
+    target: Target,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    data: Vec<u8>,
+    component_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+) -> Result<CompiledModule, ObjectError> {
+    let entry_name = identity_symbol("fre_aot_regex_rebar_regex_redux_v1_", &identity)?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(REGEX_REDUX_COMPONENT_SYMBOL_BASE + component_entries.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: entry_name,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(REGEX_REDUX_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux text extent"))?,
+    });
+    symbols.push(ModuleSymbol {
+        name: ".Lfre_aot_regex_rebar_regex_redux_data_v1".to_owned(),
+        binding: SymbolBinding::Local,
+        kind: SymbolKind::Object,
+        section: Some(REGEX_REDUX_DATA_SECTION),
+        offset: 0,
+        size: u64::try_from(data.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux data extent"))?,
+    });
+    for entry in component_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-redux",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_REDUX_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+pub(crate) fn lower_native_regex_redux_operation_v1(
+    target: Target,
+    identity: [u8; 32],
+    component_entries: &[String],
+    variants: &[&str; 9],
+    substitutions: &[(&str, &[u8]); 5],
+) -> Result<CompiledModule, ObjectError> {
+    if component_entries.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux target or component closure",
+        ));
+    }
+    let data = native_regex_redux_data_layout(identity, variants, substitutions)?;
+    let (code, relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_regex_redux_v1(identity, &data)?,
+        Architecture::Aarch64 => lower_aarch64_native_regex_redux_v1(identity, &data)?,
+    };
+    native_regex_redux_module(
+        target,
+        identity,
+        code,
+        data.bytes,
+        component_entries,
+        relocations,
+    )
+}
+
 type X86Label = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -26245,6 +28065,11 @@ pub(crate) fn native_participation_feature_word_v1(
 fn validate_native_participation_geometry(
     geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
 ) -> Result<(), ObjectError> {
+    if geometry.kind != crate::participation_aot::NativeParticipationPlanKindV1::Dfa {
+        return Err(ObjectError::InvalidModule(
+            "native participation DFA geometry kind",
+        ));
+    }
     let expected_transitions = geometry
         .state_count
         .checked_mul(geometry.alphabet_len)
@@ -26312,6 +28137,130 @@ fn validate_native_participation_geometry(
     {
         return Err(ObjectError::InvalidModule(
             "native participation geometry does not close",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordered_nfa_participation_geometry(
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<(), ObjectError> {
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES, NativeParticipationPlanKindV1,
+    };
+    let frontier_bytes = geometry
+        .state_count
+        .checked_mul(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation frontier",
+        ))?;
+    let expected_next = frontier_bytes;
+    let expected_stack = expected_next.checked_add(frontier_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation stack"),
+    )?;
+    let expected_seen = expected_stack.checked_add(frontier_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation seen"),
+    )?;
+    let seen_bytes = geometry
+        .state_count
+        .checked_mul(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_SEEN_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation seen",
+        ))?;
+    let expected_scratch = expected_seen
+        .checked_add(seen_bytes)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation scratch",
+        ))?;
+    let expected_states = crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        .checked_add(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation states",
+        ))?;
+    let states_bytes = geometry
+        .state_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation states",
+        ))?;
+    let expected_ranges = expected_states
+        .checked_add(states_bytes)
+        .and_then(|bytes| bytes.checked_add(7))
+        .map(|bytes| bytes & !7)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation ranges",
+        ))?;
+    let ranges_bytes = geometry
+        .ordered_nfa_byte_range_count
+        .checked_mul(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-NFA participation ranges",
+        ))?;
+    let expected_total = expected_ranges.checked_add(ranges_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("ordered-NFA participation plan"),
+    )?;
+    let fallback_closes = matches!(
+        geometry.dfa_fallback_resource,
+        Some(
+            crate::NativeParticipationAotResourceV1::DfaStates
+                | crate::NativeParticipationAotResourceV1::BuildWork
+        )
+    ) && geometry.dfa_fallback_limit.checked_add(1)
+        == Some(geometry.dfa_fallback_required);
+    if geometry.kind != NativeParticipationPlanKindV1::OrderedNfa
+        || geometry.total_bytes != expected_total
+        || geometry.build_work == 0
+        || geometry.group_count == 0
+        || geometry.group_count > 64
+        || geometry.assertion_count > 2
+        || geometry.signature_count != 0
+        || geometry.alphabet_len != 0
+        || geometry.state_count == 0
+        || geometry.transition_count != 0
+        || usize::try_from(geometry.ordered_nfa_start_state)
+            .ok()
+            .is_none_or(|start| start >= geometry.state_count)
+        || geometry.ordered_nfa_metadata_offset
+            != crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES
+        || geometry.ordered_nfa_states_offset != expected_states
+        || geometry.ordered_nfa_byte_ranges_offset != expected_ranges
+        || geometry.replay_current_offset != 0
+        || geometry.replay_next_offset != expected_next
+        || geometry.replay_stack_offset != expected_stack
+        || geometry.replay_seen_offset != expected_seen
+        || geometry.replay_scratch_bytes != expected_scratch
+        || geometry.replay_scratch_bytes == 0
+        || !geometry.replay_scratch_bytes.is_multiple_of(8)
+        || !fallback_closes
+        || [
+            geometry.total_bytes,
+            geometry.build_work,
+            geometry.group_count,
+            geometry.assertion_count,
+            geometry.state_count,
+            geometry.ordered_nfa_byte_range_count,
+            geometry.ordered_nfa_metadata_offset,
+            geometry.ordered_nfa_states_offset,
+            geometry.ordered_nfa_byte_ranges_offset,
+            geometry.replay_current_offset,
+            geometry.replay_next_offset,
+            geometry.replay_stack_offset,
+            geometry.replay_seen_offset,
+            geometry.replay_scratch_bytes,
+            geometry.dfa_fallback_required,
+            geometry.dfa_fallback_limit,
+        ]
+        .iter()
+        .any(|&value| u32::try_from(value).is_err())
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA participation geometry does not close",
         ));
     }
     Ok(())
@@ -26686,6 +28635,1609 @@ fn lower_aarch64_native_participation_v1(
         (23, 24, 32),
         (25, 26, 48),
         (27, 28, 64),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        plan_page_relocation_offset,
+        plan_page_offset_relocation_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(Aarch64NativeParticipationLowering {
+        code,
+        plan_page_relocation_offset: relocation_offsets[0],
+        plan_page_offset_relocation_offset: relocation_offsets[1],
+    })
+}
+
+fn x86_ordered_nfa_compare_plan_u32(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: u32,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut instruction = vec![0x41, 0x81, 0x7f, offset];
+    instruction.extend_from_slice(&expected.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+fn x86_ordered_nfa_compare_plan_u64(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: usize,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut constant = vec![0x48, 0xb8];
+    constant.extend_from_slice(
+        &u64::try_from(expected)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan field"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&constant)?;
+    assembler.instruction(&[0x49, 0x39, 0x47, offset])?;
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+fn x86_ordered_nfa_compare_metadata_u64(
+    assembler: &mut X86Assembler,
+    offset: u8,
+    expected: u64,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut constant = vec![0x48, 0xb8];
+    constant.extend_from_slice(&expected.to_le_bytes());
+    assembler.instruction(&constant)?;
+    if offset == 0 {
+        assembler.instruction(&[0x49, 0x39, 0x02])?;
+    } else {
+        assembler.instruction(&[0x49, 0x39, 0x42, offset])?;
+    }
+    assembler.branch(&[0x0f, 0x85], failed)?;
+    Ok(())
+}
+
+/// Push `(eax, rdx, rcx)` onto the ordered-NFA closure stack. The internal
+/// closure keeps its stack cardinality in `r11`; only `r8/r9` are temporary.
+fn x86_ordered_nfa_push_thread(
+    assembler: &mut X86Assembler,
+    state_count: u32,
+    stack_pointer_offset: u8,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    let mut bound = vec![0x49, 0x81, 0xfb];
+    bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&bound)?;
+    assembler.branch(&[0x0f, 0x83], failed)?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc3, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, stack_pointer_offset])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc1])?;
+    assembler.instruction(&[0x41, 0x89, 0x01])?;
+    assembler.instruction(&[0x41, 0xc7, 0x41, 4, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0x89, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x89, 0x49, 16])?;
+    assembler.instruction(&[0x49, 0xff, 0xc3])?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated ordered-NFA request, closure, and exact-span replay are one helper-free leaf"
+)]
+fn lower_x86_64_ordered_nfa_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<X86NativeParticipationLowering, ObjectError> {
+    validate_ordered_nfa_participation_geometry(geometry)?;
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES,
+    };
+    const FRAME_BYTES: u32 = 104;
+    const SCRATCH_POINTER: u8 = 0;
+    const COUNT_POINTER: u8 = 8;
+    const CURRENT_POINTER: u8 = 16;
+    const NEXT_POINTER: u8 = 24;
+    const STACK_POINTER: u8 = 32;
+    const SEEN_POINTER: u8 = 40;
+    const CURRENT_COUNT: u8 = 48;
+    const NEXT_COUNT: u8 = 56;
+    const GENERATION: u8 = 64;
+    const STATES_POINTER: u8 = 72;
+    const RANGES_POINTER: u8 = 80;
+    const TARGET_PC: u8 = 88;
+    const SCRATCH_END: u8 = 96;
+    // A local `call` pushes one return address before the closure sees these.
+    const CLOSURE_STACK_POINTER: u8 = STACK_POINTER + 8;
+    const CLOSURE_SEEN_POINTER: u8 = SEEN_POINTER + 8;
+    const CLOSURE_GENERATION: u8 = GENERATION + 8;
+    const CLOSURE_STATES_POINTER: u8 = STATES_POINTER + 8;
+
+    let state_count = u32::try_from(geometry.state_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?;
+    let range_count = u32::try_from(geometry.ordered_nfa_byte_range_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?;
+    let group_count = u32::try_from(geometry.group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA groups"))?;
+    let slot_count = group_count
+        .checked_mul(2)
+        .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA slots"))?;
+    let fallback_resource = match geometry.dfa_fallback_resource {
+        Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u64,
+        Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u64,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA fallback resource",
+            ));
+        }
+    };
+
+    let mut assembler = X86Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let replay_loop = assembler.label()?;
+    let generation_ready = assembler.label()?;
+    let clear_seen = assembler.label()?;
+    let clear_seen_loop = assembler.label()?;
+    let thread_loop = assembler.label()?;
+    let next_thread = assembler.label()?;
+    let range_loop = assembler.label()?;
+    let range_next = assembler.label()?;
+    let byte_matched = assembler.label()?;
+    let swap_frontiers = assembler.label()?;
+    let accept_loop = assembler.label()?;
+    let accept_match = assembler.label()?;
+    let popcount_loop = assembler.label()?;
+    let popcount_done = assembler.label()?;
+    let closure = assembler.label()?;
+    let closure_loop = assembler.label()?;
+    let closure_append = assembler.label()?;
+    let closure_epsilon = assembler.label()?;
+    let closure_assert = assembler.label()?;
+    let closure_assert_start = assembler.label()?;
+    let closure_assert_end = assembler.label()?;
+    let closure_save = assembler.label()?;
+    let closure_save_close = assembler.label()?;
+    let closure_split = assembler.label()?;
+    let closure_done = assembler.label()?;
+    let closure_failure = assembler.label()?;
+    let scratch_haystack_disjoint = assembler.label()?;
+    let scratch_request_disjoint = assembler.label()?;
+    let scratch_count_disjoint = assembler.label()?;
+    let scratch_plan_disjoint = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_before_frame)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid_before_frame)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 64])?;
+    assembler.branch(&[0x0f, 0x82], invalid_before_frame)?;
+
+    for instruction in [
+        &[0x55][..],
+        &[0x53],
+        &[0x41, 0x54],
+        &[0x41, 0x55],
+        &[0x41, 0x56],
+        &[0x41, 0x57],
+    ] {
+        assembler.instruction(instruction)?;
+    }
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x4c, 0x8d, 0x3d])?;
+    let plan_relocation = assembler.label()?;
+    assembler.bind(plan_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x07])?;
+    assembler.instruction(&[0x4c, 0x39, 0xf8])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x8b, 0x5f, 8])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x67, 16])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x6f, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x77, 32])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x47, 40])?;
+    assembler.instruction(&[0x48, 0x8b, 0x47, 48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4f, 56])?;
+    assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, COUNT_POINTER])?;
+
+    assembler.instruction(&[0x48, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe6])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut scratch_bound = vec![0x48, 0x3d];
+    scratch_bound.extend_from_slice(
+        &u32::try_from(geometry.replay_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&scratch_bound)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 7])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    for (load, add) in [
+        (&[0x48, 0x89, 0xd9][..], &[0x4c, 0x01, 0xe1][..]),
+        (&[0x4c, 0x89, 0xc1][..], &[0x48, 0x01, 0xc1][..]),
+        (&[0x4c, 0x89, 0xc9][..], &[0x48, 0x83, 0xc1, 8][..]),
+    ] {
+        assembler.instruction(load)?;
+        assembler.instruction(add)?;
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+    }
+
+    assembler.instruction(&[0x4c, 0x89, 0xc1])?;
+    assembler.instruction(&[0x48, 0x01, 0xc1])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x4d, 0x85, 0xe4])?;
+    assembler.branch(&[0x0f, 0x84], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x89, 0xda])?;
+    assembler.instruction(&[0x4c, 0x01, 0xe2])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x48, 0x39, 0xcb])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x48, 0x8d, 0x57, 64])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_request_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x48, 0x39, 0xcf])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_request_disjoint)?;
+    assembler.instruction(&[0x49, 0x8d, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_count_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x49, 0x39, 0xc9])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_count_disjoint)?;
+    let mut plan_bytes = vec![0x48, 0xb9];
+    plan_bytes.extend_from_slice(
+        &u64::try_from(geometry.total_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan bytes"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&plan_bytes)?;
+    assembler.instruction(&[0x4c, 0x89, 0xfa])?;
+    assembler.instruction(&[0x48, 0x01, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x83], scratch_plan_disjoint)?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_END])?;
+    assembler.instruction(&[0x49, 0x39, 0xcf])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_plan_disjoint)?;
+
+    let mut magic = vec![0x48, 0xb8];
+    magic.extend_from_slice(
+        &u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC).to_le_bytes(),
+    );
+    assembler.instruction(&magic)?;
+    assembler.instruction(&[0x49, 0x39, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    let header_word = (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA header"))?
+        << 16)
+        | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION);
+    for (offset, expected) in [
+        (8, header_word),
+        (12, 7),
+        (32, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaX86_64 as u16),
+        ),
+        (
+            44,
+            u32::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+        (48, group_count),
+        (
+            52,
+            u32::try_from(geometry.assertion_count)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA assertions"))?,
+        ),
+        (56, 0),
+        (60, 0),
+        (64, state_count),
+        (68, range_count),
+    ] {
+        x86_ordered_nfa_compare_plan_u32(&mut assembler, offset, expected, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (16, geometry.total_bytes),
+        (
+            24,
+            usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seal"))?,
+        ),
+        (72, geometry.build_work),
+        (80, geometry.ordered_nfa_metadata_offset),
+        (88, geometry.ordered_nfa_states_offset),
+        (96, geometry.ordered_nfa_byte_ranges_offset),
+        (104, geometry.replay_current_offset),
+        (112, geometry.replay_next_offset),
+        (120, geometry.replay_stack_offset),
+    ] {
+        x86_ordered_nfa_compare_plan_u64(&mut assembler, offset, expected, runtime_failure)?;
+    }
+
+    let metadata_offset = i32::try_from(geometry.ordered_nfa_metadata_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?;
+    let mut metadata = vec![0x4d, 0x8d, 0x97];
+    metadata.extend_from_slice(&metadata_offset.to_le_bytes());
+    assembler.instruction(&metadata)?;
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        0,
+        u64::from_le_bytes(NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let metadata_shape = u64::from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?
+            << 16)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA state width"))?
+            << 32)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA range width"))?
+            << 48);
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        8,
+        metadata_shape,
+        runtime_failure,
+    )?;
+    x86_ordered_nfa_compare_metadata_u64(
+        &mut assembler,
+        16,
+        fallback_resource,
+        runtime_failure,
+    )?;
+    for (offset, expected) in [
+        (
+            24,
+            u64::try_from(geometry.dfa_fallback_required)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            32,
+            u64::try_from(geometry.dfa_fallback_limit)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            40,
+            u64::from(geometry.ordered_nfa_start_state) | (u64::from(state_count) << 32),
+        ),
+        (48, u64::from(range_count) | (u64::from(group_count) << 32)),
+        (
+            56,
+            u64::try_from(geometry.ordered_nfa_states_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?,
+        ),
+        (
+            64,
+            u64::try_from(geometry.ordered_nfa_byte_ranges_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?,
+        ),
+        (72, 0),
+        (
+            80,
+            u64::try_from(geometry.replay_next_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA next"))?,
+        ),
+        (
+            88,
+            u64::try_from(geometry.replay_stack_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA stack"))?,
+        ),
+        (
+            96,
+            u64::try_from(geometry.replay_seen_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seen"))?,
+        ),
+        (
+            104,
+            u64::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+    ] {
+        x86_ordered_nfa_compare_metadata_u64(
+            &mut assembler,
+            offset,
+            expected,
+            runtime_failure,
+        )?;
+    }
+
+    for (offset, displacement, site) in [
+        (
+            CURRENT_POINTER,
+            geometry.replay_current_offset,
+            "ordered-NFA current",
+        ),
+        (NEXT_POINTER, geometry.replay_next_offset, "ordered-NFA next"),
+        (
+            STACK_POINTER,
+            geometry.replay_stack_offset,
+            "ordered-NFA stack",
+        ),
+        (SEEN_POINTER, geometry.replay_seen_offset, "ordered-NFA seen"),
+    ] {
+        let mut address = vec![0x4d, 0x8d, 0x90];
+        address.extend_from_slice(
+            &i32::try_from(displacement)
+                .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&address)?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, offset])?;
+    }
+    for (offset, displacement, site) in [
+        (
+            STATES_POINTER,
+            geometry.ordered_nfa_states_offset,
+            "ordered-NFA states",
+        ),
+        (
+            RANGES_POINTER,
+            geometry.ordered_nfa_byte_ranges_offset,
+            "ordered-NFA ranges",
+        ),
+    ] {
+        let mut address = vec![0x4d, 0x8d, 0x97];
+        address.extend_from_slice(
+            &i32::try_from(displacement)
+                .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&address)?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, offset])?;
+    }
+
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, SEEN_POINTER])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    let mut seen_count = vec![0xb9];
+    seen_count.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&seen_count)?;
+    assembler.instruction(&[0xf3, 0xab])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, CURRENT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, NEXT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, GENERATION, 1, 0, 0, 0])?;
+    let mut start_pc = vec![0xb8];
+    start_pc.extend_from_slice(&geometry.ordered_nfa_start_state.to_le_bytes());
+    assembler.instruction(&start_pc)?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x31, 0xc9])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8d, 0x74, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0xe8], closure)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+
+    assembler.bind(replay_loop)?;
+    assembler.instruction(&[0x4d, 0x39, 0xf5])?;
+    assembler.branch(&[0x0f, 0x84], accept_loop)?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, NEXT_COUNT, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, GENERATION])?;
+    assembler.instruction(&[0x83, 0xc0, 1])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, GENERATION])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], generation_ready)?;
+    assembler.branch(&[0xe9], clear_seen)?;
+
+    assembler.bind(clear_seen)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, SEEN_POINTER])?;
+    let mut seen_count = vec![0xb9];
+    seen_count.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&seen_count)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.bind(clear_seen_loop)?;
+    assembler.instruction(&[0xf3, 0xab])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, GENERATION, 1, 0, 0, 0])?;
+    assembler.bind(generation_ready)?;
+    assembler.instruction(&[0x48, 0x31, 0xed])?;
+
+    assembler.bind(thread_loop)?;
+    assembler.instruction(&[0x48, 0x3b, 0x6c, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0x0f, 0x83], swap_frontiers)?;
+    assembler.instruction(&[0x4c, 0x6b, 0xc5, 24])?;
+    assembler.instruction(&[0x4c, 0x03, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x41, 0x8b, 0x00])?;
+    assembler.instruction(&[0x49, 0x8b, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 16])?;
+    let mut pc_bound = vec![0x3d];
+    pc_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&pc_bound)?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, STATES_POINTER])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe0, 4])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc2])?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x1a])?;
+    assembler.instruction(&[0x41, 0x83, 0xfb, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH])?;
+    assembler.branch(&[0x0f, 0x84], next_thread)?;
+    assembler.instruction(&[0x41, 0x83, 0xfb, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, TARGET_PC])?;
+    assembler.instruction(&[0x45, 0x8b, 0x42, 8])?;
+    assembler.instruction(&[0x45, 0x8b, 0x4a, 12])?;
+    assembler.instruction(&[0x45, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x45, 0x89, 0xcb])?;
+    assembler.instruction(&[0x45, 0x01, 0xc3])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    let mut range_bound = vec![0x41, 0x81, 0xfb];
+    range_bound.extend_from_slice(&range_count.to_le_bytes());
+    assembler.instruction(&range_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    assembler.bind(range_loop)?;
+    assembler.instruction(&[0x45, 0x39, 0xd8])?;
+    assembler.branch(&[0x0f, 0x83], next_thread)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc0])?;
+    assembler.instruction(&[0x48, 0x03, 0x44, 0x24, RANGES_POINTER])?;
+    assembler.instruction(&[0x46, 0x0f, 0xb6, 0x1c, 0x2b])?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x10])?;
+    assembler.instruction(&[0x45, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x82], range_next)?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x50, 1])?;
+    assembler.instruction(&[0x45, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x86], byte_matched)?;
+    assembler.bind(range_next)?;
+    assembler.instruction(&[0x41, 0x83, 0xc0, 1])?;
+    assembler.branch(&[0xe9], range_loop)?;
+
+    assembler.bind(byte_matched)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, TARGET_PC])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8d, 0x74, 0x24, NEXT_COUNT])?;
+    assembler.branch(&[0xe8], closure)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.bind(next_thread)?;
+    assembler.instruction(&[0x48, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0xe9], thread_loop)?;
+
+    assembler.bind(swap_frontiers)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, NEXT_POINTER])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, NEXT_COUNT])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, CURRENT_COUNT])?;
+    assembler.instruction(&[0x49, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], replay_loop)?;
+
+    assembler.bind(accept_loop)?;
+    assembler.instruction(&[0x48, 0x31, 0xed])?;
+    let accept_scan = assembler.label()?;
+    assembler.bind(accept_scan)?;
+    assembler.instruction(&[0x48, 0x3b, 0x6c, 0x24, CURRENT_COUNT])?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x6b, 0xc5, 24])?;
+    assembler.instruction(&[0x4c, 0x03, 0x44, 0x24, CURRENT_POINTER])?;
+    assembler.instruction(&[0x41, 0x8b, 0x00])?;
+    assembler.instruction(&[0x49, 0x8b, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 16])?;
+    assembler.instruction(&[0x3d])?;
+    push_bytes(&mut assembler.code, &state_count.to_le_bytes())?;
+    assembler.branch(&[0x0f, 0x83], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, STATES_POINTER])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe0, 4])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc2])?;
+    assembler.instruction(&[0x41, 0x80, 0x3a, NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH])?;
+    assembler.branch(&[0x0f, 0x84], accept_match)?;
+    assembler.instruction(&[0x48, 0x83, 0xc5, 1])?;
+    assembler.branch(&[0xe9], accept_scan)?;
+
+    assembler.bind(accept_match)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+    assembler.instruction(&[0xf6, 0xc1, 1])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.bind(popcount_loop)?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], popcount_done)?;
+    assembler.instruction(&[0x48, 0x8d, 0x48, 0xff])?;
+    assembler.instruction(&[0x48, 0x21, 0xc8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc2, 1])?;
+    assembler.branch(&[0xe9], popcount_loop)?;
+    assembler.bind(popcount_done)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    let mut group_bound = vec![0x48, 0x81, 0xfa];
+    group_bound.extend_from_slice(&group_count.to_le_bytes());
+    assembler.instruction(&group_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, COUNT_POINTER])?;
+    assembler.instruction(&[0x48, 0x89, 0x10])?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    // Internal ordered epsilon closure. `rdi/rsi` retain the selected output
+    // frontier and its count pointer; `r11` is the private LIFO count.
+    assembler.bind(closure)?;
+    assembler.instruction(&[0x4d, 0x31, 0xdb])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.bind(closure_loop)?;
+    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x84], closure_done)?;
+    assembler.instruction(&[0x49, 0xff, 0xcb])?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc3, 24])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_STACK_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc1])?;
+    assembler.instruction(&[0x41, 0x8b, 0x01])?;
+    assembler.instruction(&[0x49, 0x8b, 0x51, 8])?;
+    assembler.instruction(&[0x49, 0x8b, 0x49, 16])?;
+    let mut pc_bound = vec![0x3d];
+    pc_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&pc_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe2, 2])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_SEEN_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xca])?;
+    assembler.instruction(&[0x44, 0x8b, 0x44, 0x24, CLOSURE_GENERATION])?;
+    assembler.instruction(&[0x45, 0x39, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], closure_loop)?;
+    assembler.instruction(&[0x45, 0x89, 0x02])?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?;
+    assembler.instruction(&[0x49, 0xc1, 0xe2, 4])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, CLOSURE_STATES_POINTER])?;
+    assembler.instruction(&[0x4d, 0x01, 0xca])?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x02])?;
+    for (tag, destination) in [
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE, closure_append),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH, closure_append),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL, closure_loop),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+            closure_epsilon,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT, closure_assert),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE, closure_save),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT, closure_split),
+    ] {
+        assembler.instruction(&[0x41, 0x83, 0xf8, tag])?;
+        assembler.branch(&[0x0f, 0x84], destination)?;
+    }
+    assembler.branch(&[0xe9], closure_failure)?;
+
+    assembler.bind(closure_append)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0e])?;
+    let mut output_bound = vec![0x49, 0x81, 0xf9];
+    output_bound.extend_from_slice(&state_count.to_le_bytes());
+    assembler.instruction(&output_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x4d, 0x6b, 0xc1, 24])?;
+    assembler.instruction(&[0x49, 0x01, 0xf8])?;
+    assembler.instruction(&[0x41, 0x89, 0x00])?;
+    assembler.instruction(&[0x41, 0xc7, 0x40, 4, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0x89, 0x50, 8])?;
+    assembler.instruction(&[0x49, 0x89, 0x48, 16])?;
+    assembler.instruction(&[0x49, 0xff, 0xc1])?;
+    assembler.instruction(&[0x4c, 0x89, 0x0e])?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_epsilon)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_assert)?;
+    assembler.instruction(&[0x41, 0x80, 0x7a, 2, 0])?;
+    assembler.branch(&[0x0f, 0x85], closure_failure)?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x42, 1])?;
+    assembler.instruction(&[0x41, 0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], closure_assert_start)?;
+    assembler.instruction(&[0x41, 0x83, 0xf8, 2])?;
+    assembler.branch(&[0x0f, 0x84], closure_assert_end)?;
+    assembler.branch(&[0xe9], closure_failure)?;
+    assembler.bind(closure_assert_start)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x85], closure_loop)?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+    assembler.bind(closure_assert_end)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe5])?;
+    assembler.branch(&[0x0f, 0x85], closure_loop)?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+
+    assembler.bind(closure_save)?;
+    assembler.instruction(&[0x45, 0x0f, 0xb6, 0x42, 1])?;
+    let mut slot_bound = vec![0x41, 0x81, 0xf8];
+    slot_bound.extend_from_slice(&slot_count.to_le_bytes());
+    assembler.instruction(&slot_bound)?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x45, 0x89, 0xc1])?;
+    assembler.instruction(&[0x41, 0xd1, 0xe9])?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 1])?;
+    assembler.branch(&[0x0f, 0x85], closure_save_close)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xa3, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], closure_failure)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xab, 0xca])?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+    assembler.bind(closure_save_close)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xa3, 0xca])?;
+    assembler.branch(&[0x0f, 0x83], closure_failure)?;
+    assembler.instruction(&[0x4c, 0x0f, 0xb3, 0xca])?;
+    assembler.instruction(&[0x4c, 0x0f, 0xab, 0xc9])?;
+    assembler.branch(&[0xe9], closure_epsilon)?;
+
+    assembler.bind(closure_split)?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 8])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.instruction(&[0x41, 0x8b, 0x42, 4])?;
+    x86_ordered_nfa_push_thread(
+        &mut assembler,
+        state_count,
+        CLOSURE_STACK_POINTER,
+        closure_failure,
+    )?;
+    assembler.branch(&[0xe9], closure_loop)?;
+
+    assembler.bind(closure_done)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(closure_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&release)?;
+    for instruction in [
+        &[0x41, 0x5f][..],
+        &[0x41, 0x5e],
+        &[0x41, 0x5d],
+        &[0x41, 0x5c],
+        &[0x5b],
+        &[0x5d],
+        &[0xc3],
+    ] {
+        assembler.instruction(instruction)?;
+    }
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let plan_relocation_offset = finished.label_offset(plan_relocation)?;
+    Ok(X86NativeParticipationLowering {
+        code: finished.code,
+        plan_relocation_offset,
+    })
+}
+
+fn aarch64_ordered_nfa_compare_u32(
+    assembler: &mut Aarch64Assembler,
+    base: u8,
+    offset: u16,
+    expected: u32,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_w_imm(8, base, offset)?)?;
+    aarch64_load_u32_constant(assembler, 9, expected)?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, failed)?;
+    Ok(())
+}
+
+fn aarch64_ordered_nfa_compare_u64(
+    assembler: &mut Aarch64Assembler,
+    base: u8,
+    offset: u16,
+    expected: u64,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_x_imm(8, base, offset)?)?;
+    aarch64_load_u64_constant(assembler, 9, expected)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, failed)?;
+    Ok(())
+}
+
+/// Emit one bounded ordered-NFA stack push. The closure keeps its stack
+/// cardinality in `x5`; `(w0, x1, x2)` is the thread and `x25` is the
+/// authenticated caller-owned stack base. Only `x6/x7` are clobbered.
+fn aarch64_ordered_nfa_push_thread(
+    assembler: &mut Aarch64Assembler,
+    state_count: u32,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_load_u32_constant(assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, failed)?;
+    aarch64_load_u32_constant(
+        assembler,
+        6,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 5, 6, 25)?)?;
+    assembler.instruction(aarch64_store_w(0, 7, 0)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 4)?)?;
+    assembler.instruction(aarch64_store_x(1, 7, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 7, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated ordered-NFA request, closure, and exact-span replay are one helper-free leaf"
+)]
+fn lower_aarch64_ordered_nfa_participation_v1(
+    target: Target,
+    geometry: crate::participation_aot::NativeParticipationPlanGeometryV1,
+) -> Result<Aarch64NativeParticipationLowering, ObjectError> {
+    validate_ordered_nfa_participation_geometry(geometry)?;
+    use crate::participation_aot::{
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE,
+        NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES,
+        NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES,
+    };
+    const FRAME_BYTES: u16 = 160;
+    const COUNT_POINTER: u16 = 96;
+    const MATCH_END: u16 = 104;
+    const CURRENT_COUNT: u16 = 112;
+    const NEXT_COUNT: u16 = 120;
+    const GENERATION: u16 = 128;
+    const TARGET_PC: u16 = 132;
+    const CLOSURE_OUTPUT: u16 = 136;
+    const CLOSURE_COUNT: u16 = 144;
+    const SCRATCH_POINTER: u16 = 152;
+
+    let state_count = u32::try_from(geometry.state_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?;
+    let range_count = u32::try_from(geometry.ordered_nfa_byte_range_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?;
+    let group_count = u32::try_from(geometry.group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA groups"))?;
+    let slot_count = group_count
+        .checked_mul(2)
+        .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA slots"))?;
+    let fallback_resource = match geometry.dfa_fallback_resource {
+        Some(crate::NativeParticipationAotResourceV1::DfaStates) => 1_u64,
+        Some(crate::NativeParticipationAotResourceV1::BuildWork) => 2_u64,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA fallback resource",
+            ));
+        }
+    };
+
+    let mut assembler = Aarch64Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let clear_seen = assembler.label()?;
+    let clear_seen_loop = assembler.label()?;
+    let clear_seen_done = assembler.label()?;
+    let replay_loop = assembler.label()?;
+    let generation_ready = assembler.label()?;
+    let thread_loop = assembler.label()?;
+    let next_thread = assembler.label()?;
+    let range_loop = assembler.label()?;
+    let range_next = assembler.label()?;
+    let byte_matched = assembler.label()?;
+    let swap_frontiers = assembler.label()?;
+    let accept_loop = assembler.label()?;
+    let accept_scan = assembler.label()?;
+    let accept_match = assembler.label()?;
+    let popcount_loop = assembler.label()?;
+    let popcount_done = assembler.label()?;
+    let closure = assembler.label()?;
+    let closure_loop = assembler.label()?;
+    let closure_append = assembler.label()?;
+    let closure_epsilon = assembler.label()?;
+    let closure_assert = assembler.label()?;
+    let closure_assert_start = assembler.label()?;
+    let closure_assert_end = assembler.label()?;
+    let closure_save = assembler.label()?;
+    let closure_save_open = assembler.label()?;
+    let closure_save_close = assembler.label()?;
+    let closure_split = assembler.label()?;
+    let closure_done = assembler.label()?;
+    let closure_failure = assembler.label()?;
+
+    // Validate the complete request object before touching the stack.
+    assembler.branch_zero_x(0, invalid_before_frame)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(8, 0)?)?;
+    assembler.branch_nonzero_x(8, invalid_before_frame)?;
+    assembler.instruction(aarch64_add_x_imm(8, 0, 64)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_before_frame)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_mov_x(29, 0)?)?;
+    let plan_page_relocation_offset = assembler.instruction(0x9000_0016)?; // adrp x22, bundle
+    let plan_page_offset_relocation_offset =
+        assembler.instruction(aarch64_add_x_imm(22, 22, 0)?)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 29, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 22)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(19, 29, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(20, 29, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(21, 29, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 29, 32)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, MATCH_END)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 29, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 29, 40)?)?;
+    assembler.instruction(aarch64_store_x(9, 31, SCRATCH_POINTER)?)?;
+    assembler.instruction(aarch64_load_x_imm(11, 29, 56)?)?;
+
+    assembler.branch_zero_x(19, invalid)?;
+    assembler.instruction(aarch64_cmp_x(21, 8)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(8, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(9, invalid)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(12, 9)?)?;
+    assembler.branch_nonzero_x(12, invalid)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        12,
+        u64::try_from(geometry.replay_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(10, 12)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.branch_zero_x(11, invalid)?;
+    assembler.instruction(aarch64_native_participation_alignment_mask(12, 11)?)?;
+    assembler.branch_nonzero_x(12, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(12, 19, 20)?)?;
+    assembler.instruction(aarch64_cmp_x(12, 19)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(13, 9, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(13, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(14, 11, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(14, 11)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_store_x(11, 31, COUNT_POINTER)?)?;
+
+    // Scratch is written during replay, so it must be disjoint from every
+    // object that remains live for the call. Empty haystacks have no extent.
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.branch_zero_x(20, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(9, 12)?)?; // scratch >= haystack_end
+    assembler.branch_cond(AARCH64_HS, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(19, 13)?)?; // haystack < scratch_end
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_request_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(15, 29, 64)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 15)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_request_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(29, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_request_disjoint)?;
+    let scratch_count_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_cmp_x(9, 14)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_count_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(11, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_count_disjoint)?;
+    let scratch_plan_disjoint = assembler.label()?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        15,
+        u64::try_from(geometry.total_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan bytes"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(15, 22, 15)?)?;
+    assembler.instruction(aarch64_cmp_x(15, 22)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(9, 15)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_plan_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(22, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_plan_disjoint)?;
+
+    aarch64_ordered_nfa_compare_u64(
+        &mut assembler,
+        22,
+        0,
+        u64::from_le_bytes(crate::NATIVE_PARTICIPATION_AOT_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let header_word = (u32::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_HEADER_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA header"))?
+        << 16)
+        | u32::from(crate::NATIVE_PARTICIPATION_AOT_V1_ABI_VERSION);
+    for (offset, expected) in [
+        (8_u16, header_word),
+        (12, 7),
+        (32, native_participation_target_word(target)?),
+        (
+            36,
+            u32::try_from(target.features.bits())
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
+        ),
+        (
+            40,
+            u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaAarch64 as u16),
+        ),
+        (
+            44,
+            u32::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+        (48, group_count),
+        (
+            52,
+            u32::try_from(geometry.assertion_count)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA assertions"))?,
+        ),
+        (56, 0),
+        (60, 0),
+        (64, state_count),
+        (68, range_count),
+    ] {
+        aarch64_ordered_nfa_compare_u32(&mut assembler, 22, offset, expected, runtime_failure)?;
+    }
+    for (offset, expected) in [
+        (16_u16, geometry.total_bytes),
+        (
+            24,
+            usize::try_from(crate::NATIVE_PARTICIPATION_AOT_V1_READY_SEAL)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seal"))?,
+        ),
+        (72, geometry.build_work),
+        (80, geometry.ordered_nfa_metadata_offset),
+        (88, geometry.ordered_nfa_states_offset),
+        (96, geometry.ordered_nfa_byte_ranges_offset),
+        (104, geometry.replay_current_offset),
+        (112, geometry.replay_next_offset),
+        (120, geometry.replay_stack_offset),
+    ] {
+        aarch64_ordered_nfa_compare_u64(
+            &mut assembler,
+            22,
+            offset,
+            u64::try_from(expected)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA plan field"))?,
+            runtime_failure,
+        )?;
+    }
+
+    aarch64_load_u64_constant(
+        &mut assembler,
+        12,
+        u64::try_from(geometry.ordered_nfa_metadata_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?,
+    )?;
+    assembler.instruction(aarch64_add_x_reg(12, 22, 12)?)?;
+    aarch64_ordered_nfa_compare_u64(
+        &mut assembler,
+        12,
+        0,
+        u64::from_le_bytes(NATIVE_PARTICIPATION_ORDERED_NFA_V1_MAGIC),
+        runtime_failure,
+    )?;
+    let metadata_shape = u64::from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_VERSION)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_METADATA_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA metadata"))?
+            << 16)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_STATE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA state width"))?
+            << 32)
+        | (u64::try_from(NATIVE_PARTICIPATION_ORDERED_NFA_V1_RANGE_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA range width"))?
+            << 48);
+    for (offset, expected) in [
+        (8_u16, metadata_shape),
+        (16, fallback_resource),
+        (
+            24,
+            u64::try_from(geometry.dfa_fallback_required)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            32,
+            u64::try_from(geometry.dfa_fallback_limit)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA fallback"))?,
+        ),
+        (
+            40,
+            u64::from(geometry.ordered_nfa_start_state) | (u64::from(state_count) << 32),
+        ),
+        (48, u64::from(range_count) | (u64::from(group_count) << 32)),
+        (
+            56,
+            u64::try_from(geometry.ordered_nfa_states_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA states"))?,
+        ),
+        (
+            64,
+            u64::try_from(geometry.ordered_nfa_byte_ranges_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA ranges"))?,
+        ),
+        (72, 0),
+        (
+            80,
+            u64::try_from(geometry.replay_next_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA next"))?,
+        ),
+        (
+            88,
+            u64::try_from(geometry.replay_stack_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA stack"))?,
+        ),
+        (
+            96,
+            u64::try_from(geometry.replay_seen_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA seen"))?,
+        ),
+        (
+            104,
+            u64::try_from(geometry.replay_scratch_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA scratch"))?,
+        ),
+    ] {
+        aarch64_ordered_nfa_compare_u64(
+            &mut assembler,
+            12,
+            offset,
+            expected,
+            runtime_failure,
+        )?;
+    }
+
+    for (register, displacement, site) in [
+        (23, geometry.replay_current_offset, "ordered-NFA current"),
+        (24, geometry.replay_next_offset, "ordered-NFA next"),
+        (25, geometry.replay_stack_offset, "ordered-NFA stack"),
+        (26, geometry.replay_seen_offset, "ordered-NFA seen"),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(9, 31, SCRATCH_POINTER)?)?;
+        aarch64_load_u64_constant(
+            &mut assembler,
+            8,
+            u64::try_from(displacement).map_err(|_| ObjectError::ArithmeticOverflow(site))?,
+        )?;
+        assembler.instruction(aarch64_add_x_reg(register, 9, 8)?)?;
+    }
+    for (register, displacement, site) in [
+        (
+            27,
+            geometry.ordered_nfa_states_offset,
+            "ordered-NFA states",
+        ),
+        (
+            28,
+            geometry.ordered_nfa_byte_ranges_offset,
+            "ordered-NFA ranges",
+        ),
+    ] {
+        aarch64_load_u64_constant(
+            &mut assembler,
+            8,
+            u64::try_from(displacement).map_err(|_| ObjectError::ArithmeticOverflow(site))?,
+        )?;
+        assembler.instruction(aarch64_add_x_reg(register, 22, 8)?)?;
+    }
+
+    // Clear generation marks and seed the first prioritized closure.
+    assembler.bind(clear_seen)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.bind(clear_seen_loop)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, clear_seen_done)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 5, 2)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    assembler.branch(clear_seen_loop)?;
+    assembler.bind(clear_seen_done)?;
+    assembler.instruction(aarch64_store_x(31, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    aarch64_load_u32_constant(&mut assembler, 0, geometry.ordered_nfa_start_state)?;
+    assembler.instruction(aarch64_movz_x(1, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, CURRENT_COUNT)?)?;
+    assembler.call(closure)?;
+    assembler.branch_nonzero_w(0, runtime_failure)?;
+
+    assembler.bind(replay_loop)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, MATCH_END)?)?;
+    assembler.instruction(aarch64_cmp_x(21, 5)?)?;
+    assembler.branch_cond(AARCH64_EQ, accept_loop)?;
+    assembler.instruction(aarch64_store_x(31, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 31, GENERATION)?)?;
+    assembler.instruction(aarch64_movz_w(7, 1)?)?;
+    assembler.instruction(aarch64_add_w_reg(6, 6, 7)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    assembler.branch_nonzero_w(6, generation_ready)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    let generation_clear_loop = assembler.label()?;
+    let generation_clear_done = assembler.label()?;
+    assembler.bind(generation_clear_loop)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, generation_clear_done)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 5, 2)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(5, 5, 1)?)?;
+    assembler.branch(generation_clear_loop)?;
+    assembler.bind(generation_clear_done)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_store_w(6, 31, GENERATION)?)?;
+    assembler.bind(generation_ready)?;
+    assembler.instruction(aarch64_movz_x(29, 0, 0)?)?;
+
+    assembler.bind(thread_loop)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_cmp_x(29, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, swap_frontiers)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(8, 29, 7, 23)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 8, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 8, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(9, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, next_thread)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE),
+    )?)?;
+    assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+    assembler.instruction(aarch64_load_w_imm(11, 9, 4)?)?;
+    assembler.instruction(aarch64_store_w(11, 31, TARGET_PC)?)?;
+    assembler.instruction(aarch64_load_w_imm(12, 9, 8)?)?;
+    assembler.instruction(aarch64_load_w_imm(13, 9, 12)?)?;
+    assembler.branch_zero_w(13, runtime_failure)?;
+    assembler.instruction(aarch64_add_w_reg(14, 12, 13)?)?;
+    assembler.instruction(aarch64_cmp_w(14, 12)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    aarch64_load_u32_constant(&mut assembler, 10, range_count)?;
+    assembler.instruction(aarch64_cmp_w(14, 10)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_load_byte_reg(15, 19, 21)?)?;
+
+    assembler.bind(range_loop)?;
+    assembler.instruction(aarch64_cmp_w(12, 14)?)?;
+    assembler.branch_cond(AARCH64_HS, next_thread)?;
+    assembler.instruction(aarch64_add_x_uxtw(16, 28, 12, 1)?)?;
+    assembler.instruction(aarch64_load_byte_imm(17, 16, 0)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 16, 1)?)?;
+    assembler.instruction(aarch64_cmp_w(15, 17)?)?;
+    assembler.branch_cond(AARCH64_LO, range_next)?;
+    assembler.instruction(aarch64_cmp_w(15, 10)?)?;
+    assembler.branch_cond(AARCH64_LS, byte_matched)?;
+    assembler.bind(range_next)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
+    assembler.instruction(aarch64_add_w_reg(12, 12, 6)?)?;
+    assembler.branch(range_loop)?;
+
+    assembler.bind(byte_matched)?;
+    assembler.instruction(aarch64_load_w_imm(0, 31, TARGET_PC)?)?;
+    assembler.instruction(aarch64_mov_x(3, 24)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, NEXT_COUNT)?)?;
+    assembler.call(closure)?;
+    assembler.branch_nonzero_w(0, runtime_failure)?;
+    assembler.bind(next_thread)?;
+    assembler.instruction(aarch64_adds_x_imm(29, 29, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(thread_loop)?;
+
+    assembler.bind(swap_frontiers)?;
+    assembler.instruction(aarch64_mov_x(5, 23)?)?;
+    assembler.instruction(aarch64_mov_x(23, 24)?)?;
+    assembler.instruction(aarch64_mov_x(24, 5)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, NEXT_COUNT)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_adds_x_imm(21, 21, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(replay_loop)?;
+
+    assembler.bind(accept_loop)?;
+    assembler.instruction(aarch64_movz_x(29, 0, 0)?)?;
+    assembler.bind(accept_scan)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, CURRENT_COUNT)?)?;
+    assembler.instruction(aarch64_cmp_x(29, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(8, 29, 7, 23)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 8, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 8, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(9, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        10,
+        u16::from(NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, accept_match)?;
+    assembler.instruction(aarch64_adds_x_imm(29, 29, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(accept_scan)?;
+
+    assembler.bind(accept_match)?;
+    assembler.branch_nonzero_x(1, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(5, 1, 0)?)?;
+    assembler.instruction(aarch64_tst_x(2, 5)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+    assembler.bind(popcount_loop)?;
+    assembler.branch_zero_x(2, popcount_done)?;
+    assembler.instruction(aarch64_sub_x_imm(4, 2, 1)?)?;
+    assembler.instruction(aarch64_and_x(2, 2, 4)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 3, 1)?)?;
+    assembler.branch(popcount_loop)?;
+    assembler.bind(popcount_done)?;
+    assembler.branch_zero_x(3, runtime_failure)?;
+    aarch64_load_u32_constant(&mut assembler, 5, group_count)?;
+    assembler.instruction(aarch64_cmp_x(3, 5)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_POINTER)?)?;
+    assembler.instruction(aarch64_store_x(3, 5, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+
+    // Internal prioritized epsilon closure. It has no nested calls, so the
+    // main leaf's saved link register remains sufficient.
+    assembler.bind(closure)?;
+    assembler.instruction(aarch64_store_x(3, 31, CLOSURE_OUTPUT)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, CLOSURE_COUNT)?)?;
+    assembler.instruction(aarch64_movz_x(5, 0, 0)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.bind(closure_loop)?;
+    assembler.branch_zero_x(5, closure_done)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 5, 1)?)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        6,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 5, 6, 25)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 7, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 7, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 7, 16)?)?;
+    aarch64_load_u32_constant(&mut assembler, 6, state_count)?;
+    assembler.instruction(aarch64_cmp_w(0, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    assembler.instruction(aarch64_add_x_uxtw(7, 26, 0, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 7, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(9, 31, GENERATION)?)?;
+    assembler.instruction(aarch64_cmp_w(6, 9)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_loop)?;
+    assembler.instruction(aarch64_store_w(9, 7, 0)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(8, 27, 0, 4)?)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 0)?)?;
+    for (tag, destination) in [
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_BYTE, closure_append),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_MATCH,
+            closure_append,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_FAIL, closure_loop),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_EPSILON,
+            closure_epsilon,
+        ),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_ASSERT,
+            closure_assert,
+        ),
+        (NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SAVE, closure_save),
+        (
+            NATIVE_PARTICIPATION_ORDERED_NFA_STATE_SPLIT,
+            closure_split,
+        ),
+    ] {
+        assembler.instruction(aarch64_cmp_w_imm(9, u16::from(tag))?)?;
+        assembler.branch_cond(AARCH64_EQ, destination)?;
+    }
+    assembler.branch(closure_failure)?;
+
+    assembler.bind(closure_append)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, CLOSURE_OUTPUT)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, CLOSURE_COUNT)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 4, 0)?)?;
+    aarch64_load_u32_constant(&mut assembler, 7, state_count)?;
+    assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    aarch64_load_u32_constant(
+        &mut assembler,
+        7,
+        u32::try_from(fre_capture_lab::EXACT_SPAN_PARTICIPATION_NATIVE_V1_THREAD_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA thread width"))?,
+    )?;
+    assembler.instruction(aarch64_madd_x(7, 6, 7, 3)?)?;
+    assembler.instruction(aarch64_store_w(0, 7, 0)?)?;
+    assembler.instruction(aarch64_store_w(31, 7, 4)?)?;
+    assembler.instruction(aarch64_store_x(1, 7, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 7, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
+    assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_epsilon)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 4)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_assert)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 2)?)?;
+    assembler.branch_nonzero_w(9, closure_failure)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 1)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_assert_start)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 2)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_assert_end)?;
+    assembler.branch(closure_failure)?;
+    assembler.bind(closure_assert_start)?;
+    assembler.branch_nonzero_x(21, closure_loop)?;
+    assembler.branch(closure_epsilon)?;
+    assembler.bind(closure_assert_end)?;
+    assembler.instruction(aarch64_cmp_x(21, 20)?)?;
+    assembler.branch_cond(AARCH64_NE, closure_loop)?;
+    assembler.branch(closure_epsilon)?;
+
+    assembler.bind(closure_save)?;
+    assembler.instruction(aarch64_load_byte_imm(9, 8, 1)?)?;
+    aarch64_load_u32_constant(&mut assembler, 10, slot_count)?;
+    assembler.instruction(aarch64_cmp_w(9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, closure_failure)?;
+    assembler.instruction(aarch64_lsr_w_imm(10, 9, 1)?)?;
+    assembler.instruction(aarch64_movz_x(11, 1, 0)?)?;
+    assembler.instruction(aarch64_lslv_x(11, 11, 10)?)?;
+    assembler.branch_bit_clear_w(9, 0, closure_save_open)?;
+    assembler.branch(closure_save_close)?;
+    assembler.bind(closure_save_open)?;
+    assembler.instruction(aarch64_tst_x(1, 11)?)?;
+    assembler.branch_cond(AARCH64_NE, closure_failure)?;
+    assembler.instruction(aarch64_orr_x(1, 1, 11)?)?;
+    assembler.branch(closure_epsilon)?;
+    assembler.bind(closure_save_close)?;
+    assembler.instruction(aarch64_tst_x(1, 11)?)?;
+    assembler.branch_cond(AARCH64_EQ, closure_failure)?;
+    assembler.instruction(aarch64_bic_x(1, 1, 11)?)?;
+    assembler.instruction(aarch64_orr_x(2, 2, 11)?)?;
+    assembler.branch(closure_epsilon)?;
+
+    assembler.bind(closure_split)?;
+    assembler.instruction(aarch64_load_w_imm(9, 8, 4)?)?;
+    assembler.instruction(aarch64_load_w_imm(0, 8, 8)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.instruction(aarch64_add_w_reg(0, 9, 31)?)?;
+    aarch64_ordered_nfa_push_thread(&mut assembler, state_count, closure_failure)?;
+    assembler.branch(closure_loop)?;
+
+    assembler.bind(closure_done)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(closure_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
     ] {
         assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
     }
@@ -28653,6 +32205,1731 @@ impl X86Assembler {
     }
 }
 
+// The regex-redux entry has one public pointer argument. Its fixed request is
+// nine native words: haystack pointer/length, two scratch pointer/capacity
+// pairs, report pointer/capacity, and the receipt pointer. The frame keeps all
+// untrusted request words and stage scalars away from the 1 KiB private report
+// transaction. Six callee-saved pushes leave entry RSP at 8 (mod 16), so this
+// 8 (mod 16) frame aligns every ordinary Span call.
+const X86_REGEX_REDUX_FRAME_BYTES: u32 = 1_352;
+const X86_REGEX_REDUX_SPAN_OFFSET: usize = 0;
+const X86_REGEX_REDUX_HAYSTACK_OFFSET: usize = 32;
+const X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET: usize = 40;
+const X86_REGEX_REDUX_SCRATCH_A_OFFSET: usize = 48;
+const X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET: usize = 56;
+const X86_REGEX_REDUX_SCRATCH_B_OFFSET: usize = 64;
+const X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET: usize = 72;
+const X86_REGEX_REDUX_REPORT_OFFSET: usize = 80;
+const X86_REGEX_REDUX_REPORT_CAP_OFFSET: usize = 88;
+const X86_REGEX_REDUX_RECEIPT_OFFSET: usize = 96;
+const X86_REGEX_REDUX_START_OFFSET: usize = 104;
+const X86_REGEX_REDUX_COPIED_OFFSET: usize = 112;
+const X86_REGEX_REDUX_DEST_LEN_OFFSET: usize = 120;
+const X86_REGEX_REDUX_CLEAN_LEN_OFFSET: usize = 128;
+const X86_REGEX_REDUX_COUNTS_OFFSET: usize = 136;
+const X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET: usize = 208;
+const X86_REGEX_REDUX_REQUEST_OFFSET: usize = 248;
+const X86_REGEX_REDUX_REQUEST_END_OFFSET: usize = 256;
+const X86_REGEX_REDUX_HAYSTACK_END_OFFSET: usize = 264;
+const X86_REGEX_REDUX_SCRATCH_A_END_OFFSET: usize = 272;
+const X86_REGEX_REDUX_SCRATCH_B_END_OFFSET: usize = 280;
+const X86_REGEX_REDUX_REPORT_END_OFFSET: usize = 288;
+const X86_REGEX_REDUX_RECEIPT_END_OFFSET: usize = 296;
+const X86_REGEX_REDUX_REPORT_TEMP_OFFSET: usize = 320;
+
+fn x86_regex_redux_rsp_load(
+    assembler: &mut X86Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux stack load register",
+        ));
+    }
+    let offset = u32::try_from(offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack load"))?;
+    let mut instruction = vec![0x48, 0x8b, 0x84 | register << 3, 0x24];
+    instruction.extend_from_slice(&offset.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    Ok(())
+}
+
+fn x86_regex_redux_rsp_store(
+    assembler: &mut X86Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    if register > 7 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux stack store register",
+        ));
+    }
+    let offset = u32::try_from(offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack store"))?;
+    let mut instruction = vec![0x48, 0x89, 0x84 | register << 3, 0x24];
+    instruction.extend_from_slice(&offset.to_le_bytes());
+    assembler.instruction(&instruction)?;
+    Ok(())
+}
+
+fn x86_regex_redux_rsp_zero(
+    assembler: &mut X86Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(&[0x31, 0xc0])?;
+    x86_regex_redux_rsp_store(assembler, 0, offset)
+}
+
+fn x86_regex_redux_load_request_word(
+    assembler: &mut X86Assembler,
+    request_offset: u8,
+    stack_offset: usize,
+) -> Result<(), ObjectError> {
+    if request_offset == 0 {
+        assembler.instruction(&[0x48, 0x8b, 0x07])?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x47, request_offset])?;
+    }
+    x86_regex_redux_rsp_store(assembler, 0, stack_offset)
+}
+
+fn x86_regex_redux_pointer_end(
+    assembler: &mut X86Assembler,
+    base_offset: usize,
+    length_offset: usize,
+    end_offset: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, base_offset)?;
+    x86_regex_redux_rsp_load(assembler, 1, length_offset)?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?; // add rcx, rax
+    assembler.branch(&[0x0f, 0x82], invalid)?; // carry
+    x86_regex_redux_rsp_store(assembler, 0, end_offset)
+}
+
+fn x86_regex_redux_fixed_pointer_end(
+    assembler: &mut X86Assembler,
+    base_offset: usize,
+    bytes: u32,
+    end_offset: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, base_offset)?;
+    let mut add = vec![0x48, 0x05];
+    add.extend_from_slice(&bytes.to_le_bytes());
+    assembler.instruction(&add)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    x86_regex_redux_rsp_store(assembler, 0, end_offset)
+}
+
+/// Require two complete caller-declared ranges to be disjoint. Empty ranges
+/// naturally pass because either end is equal to its base.
+fn x86_regex_redux_disjoint(
+    assembler: &mut X86Assembler,
+    first_base: usize,
+    first_end: usize,
+    second_base: usize,
+    second_end: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    let disjoint = assembler.label()?;
+    x86_regex_redux_rsp_load(assembler, 0, first_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, first_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // first_end - first_base
+    assembler.branch(&[0x0f, 0x84], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, second_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, second_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // second_end - second_base
+    assembler.branch(&[0x0f, 0x84], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, first_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, second_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // first_end - second_base
+    assembler.branch(&[0x0f, 0x86], disjoint)?;
+    x86_regex_redux_rsp_load(assembler, 0, second_end)?;
+    x86_regex_redux_rsp_load(assembler, 1, first_base)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // second_end - first_base
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.bind(disjoint)
+}
+
+fn x86_regex_redux_component_call(
+    assembler: &mut X86Assembler,
+    component: usize,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    if component >= crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux component call index",
+        ));
+    }
+    assembler.instruction(&[0x4c, 0x89, 0xf7])?; // rdi = source
+    assembler.instruction(&[0x4c, 0x89, 0xfe])?; // rsi = source length
+    x86_regex_redux_rsp_load(assembler, 2, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(&[0x4c, 0x89, 0xf9])?; // rcx = source length
+    assembler.instruction(&[0x4c, 0x8d, 0x84, 0x24])?; // r8 = result
+    push_bytes(
+        &mut assembler.code,
+        &u32::try_from(X86_REGEX_REDUX_SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux result offset"))?
+            .to_le_bytes(),
+    )?;
+    assembler.instruction(&[0xe8])?;
+    let displacement = assembler.label()?;
+    assembler.bind(displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    call_displacements.push((component, displacement));
+    Ok(())
+}
+
+fn x86_regex_redux_validate_span(
+    assembler: &mut X86Assembler,
+    runtime_failure: X86Label,
+) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // start - requested start
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 2, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    assembler.instruction(&[0x48, 0x39, 0xc2])?; // end - start
+    assembler.branch(&[0x0f, 0x86], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x39, 0xfa])?; // end - source length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    Ok(())
+}
+
+fn x86_regex_redux_emit_count(
+    assembler: &mut X86Assembler,
+    component: usize,
+    output_offset: usize,
+    runtime_failure: X86Label,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    x86_regex_redux_component_call(assembler, component, call_displacements)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], runtime_failure)?;
+
+    assembler.bind(matched)?;
+    x86_regex_redux_validate_span(assembler, runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_START_OFFSET)?;
+    let mut increment = vec![0x48, 0xff, 0x84, 0x24];
+    increment.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_DEST_LEN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux count offset"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&increment)?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?; // u64 overflow wraps through zero
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    x86_regex_redux_rsp_store(assembler, 0, output_offset)
+}
+
+fn x86_regex_redux_emit_copy(
+    assembler: &mut X86Assembler,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    source_count_in_r9: bool,
+    replacement: Option<(usize, usize)>,
+    runtime_failure: X86Label,
+) -> Result<(), ObjectError> {
+    if !source_count_in_r9 {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux copy count register",
+        ));
+    }
+    let replacement_len = replacement.map_or(0, |(_, len)| len);
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc0])?; // r8 = old destination length
+    assembler.instruction(&[0x48, 0x89, 0xc3])?; // rbx = prospective length
+    assembler.instruction(&[0x4c, 0x01, 0xcb])?; // add unmatched bytes
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    if replacement_len != 0 {
+        let replacement_len = u8::try_from(replacement_len)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?;
+        assembler.instruction(&[0x48, 0x83, 0xc3, replacement_len])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    }
+    x86_regex_redux_rsp_load(assembler, 0, destination_capacity_offset)?;
+    assembler.instruction(&[0x48, 0x39, 0xc3])?; // prospective - capacity
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    x86_regex_redux_rsp_load(assembler, 7, destination_offset)?;
+    assembler.instruction(&[0x4c, 0x01, 0xc7])?; // destination += old length
+    assembler.instruction(&[0x4c, 0x89, 0xf6])?; // source = current sequence
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x48, 0x01, 0xce])?; // source += copied
+    assembler.instruction(&[0x4c, 0x89, 0xc9])?; // count = unmatched bytes
+    assembler.instruction(&[0xf3, 0xa4])?;
+
+    if let Some((replacement_offset, replacement_len)) = replacement
+        && replacement_len != 0
+    {
+        let replacement_offset = u32::try_from(replacement_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement offset"))?;
+        let mut address = vec![0x49, 0x8d, 0xb5]; // rsi = data + replacement offset
+        address.extend_from_slice(&replacement_offset.to_le_bytes());
+        assembler.instruction(&address)?;
+        let replacement_len = u32::try_from(replacement_len)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?;
+        let mut count = vec![0xb9];
+        count.extend_from_slice(&replacement_len.to_le_bytes());
+        assembler.instruction(&count)?;
+        assembler.instruction(&[0xf3, 0xa4])?;
+    }
+    x86_regex_redux_rsp_store(assembler, 3, X86_REGEX_REDUX_DEST_LEN_OFFSET)
+}
+
+fn x86_regex_redux_emit_replacement(
+    assembler: &mut X86Assembler,
+    component: usize,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    stage_length_offset: usize,
+    runtime_failure: X86Label,
+    call_displacements: &mut Vec<(usize, X86Label)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let tail = assembler.label()?;
+    let finished = assembler.label()?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    x86_regex_redux_rsp_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    x86_regex_redux_component_call(assembler, component, call_displacements)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], tail)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], runtime_failure)?;
+
+    assembler.bind(matched)?;
+    x86_regex_redux_validate_span(assembler, runtime_failure)?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?; // match start - copied
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x29, 0xc8])?; // unmatched length
+    assembler.instruction(&[0x49, 0x89, 0xc1])?; // r9 = unmatched length
+    x86_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        true,
+        replacement,
+        runtime_failure,
+    )?;
+    x86_regex_redux_rsp_load(assembler, 0, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    x86_regex_redux_rsp_store(assembler, 0, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(tail)?;
+    x86_regex_redux_rsp_load(assembler, 1, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(&[0x4c, 0x39, 0xf9])?; // copied - source length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x89, 0xf9])?; // r9 = source length
+    assembler.instruction(&[0x49, 0x29, 0xc9])?; // r9 -= copied
+    x86_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        true,
+        None,
+        runtime_failure,
+    )?;
+    assembler.bind(finished)?;
+    x86_regex_redux_rsp_load(assembler, 0, destination_offset)?;
+    assembler.instruction(&[0x49, 0x89, 0xc6])?; // r14 = new source
+    assembler.instruction(&[0x49, 0x89, 0xdf])?; // r15 = new length
+    x86_regex_redux_rsp_store(assembler, 3, stage_length_offset)
+}
+
+fn x86_regex_redux_report_byte(assembler: &mut X86Assembler, byte: u8) -> Result<(), ObjectError> {
+    let mut instruction = vec![0xc6, 0x84, 0x1c]; // [rsp + rbx + report temporary]
+    instruction.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    instruction.push(byte);
+    assembler.instruction(&instruction)?;
+    assembler.instruction(&[0x48, 0xff, 0xc3])?; // report length += 1
+    Ok(())
+}
+
+fn x86_regex_redux_report_prefix(
+    assembler: &mut X86Assembler,
+    data_offset: usize,
+    bytes: usize,
+) -> Result<(), ObjectError> {
+    let data_offset = u32::try_from(data_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix offset"))?;
+    let bytes = u32::try_from(bytes)
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix length"))?;
+    let mut source = vec![0x49, 0x8d, 0xb5]; // rsi = immutable data + offset
+    source.extend_from_slice(&data_offset.to_le_bytes());
+    assembler.instruction(&source)?;
+    let mut destination = vec![0x48, 0x8d, 0xbc, 0x1c]; // rdi = rsp + rbx + temporary
+    destination.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&destination)?;
+    let mut count = vec![0xb9];
+    count.extend_from_slice(&bytes.to_le_bytes());
+    assembler.instruction(&count)?;
+    assembler.instruction(&[0xf3, 0xa4])?;
+    if bytes <= u32::from(i8::MAX.cast_unsigned()) {
+        assembler.instruction(&[
+            0x48,
+            0x83,
+            0xc3,
+            u8::try_from(bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+        ])?;
+    } else {
+        let mut add = vec![0x48, 0x81, 0xc3];
+        add.extend_from_slice(&bytes.to_le_bytes());
+        assembler.instruction(&add)?;
+    }
+    Ok(())
+}
+
+/// Append the unsigned value in RAX to the private report transaction. At
+/// most twenty reversed digits occupy the 32-byte scratch prefix containing
+/// the now-dead Span result.
+fn x86_regex_redux_report_u64(assembler: &mut X86Assembler) -> Result<(), ObjectError> {
+    let nonzero = assembler.label()?;
+    let divide = assembler.label()?;
+    let reverse = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], nonzero)?;
+    x86_regex_redux_report_byte(assembler, b'0')?;
+    assembler.branch(&[0xe9], finished)?;
+
+    assembler.bind(nonzero)?;
+    assembler.instruction(&[0x45, 0x31, 0xd2])?; // r10 = digit count
+    assembler.bind(divide)?;
+    assembler.instruction(&[0x31, 0xd2])?; // high dividend = 0
+    assembler.instruction(&[0xb9, 10, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xf7, 0xf1])?; // div rcx
+    assembler.instruction(&[0x80, 0xc2, b'0'])?;
+    assembler.instruction(&[0x42, 0x88, 0x14, 0x14])?; // [rsp+r10] = digit
+    assembler.instruction(&[0x49, 0xff, 0xc2])?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], divide)?;
+
+    assembler.bind(reverse)?;
+    assembler.instruction(&[0x49, 0xff, 0xca])?;
+    assembler.instruction(&[0x42, 0x8a, 0x14, 0x14])?;
+    let mut store = vec![0x88, 0x94, 0x1c];
+    store.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&store)?;
+    assembler.instruction(&[0x48, 0xff, 0xc3])?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], reverse)?;
+    assembler.bind(finished)
+}
+
+fn x86_regex_redux_publish_receipt(assembler: &mut X86Assembler) -> Result<(), ObjectError> {
+    x86_regex_redux_rsp_load(assembler, 7, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    let sources = [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 8,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 16,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 24,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 32,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 40,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 48,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 56,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 64,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 8,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 16,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 24,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 32,
+    ];
+    for (word, source) in sources.into_iter().enumerate() {
+        x86_regex_redux_rsp_load(assembler, 0, source)?;
+        let offset = u32::try_from(
+            word.checked_mul(8)
+                .ok_or(ObjectError::ArithmeticOverflow("regex-redux receipt word"))?,
+        )
+        .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt offset"))?;
+        let mut store = vec![0x48, 0x89, 0x87];
+        store.extend_from_slice(&offset.to_le_bytes());
+        assembler.instruction(&store)?;
+    }
+    assembler.instruction(&[0x4c, 0x89, 0xf8])?; // final length
+    assembler.instruction(&[0x48, 0x89, 0x87, 0x80, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x89, 0x9f, 0x88, 0, 0, 0])?; // report length
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validated request, fifteen fixed semantic loops, canonical formatting, and transactional publication form one native operation"
+)]
+fn lower_x86_64_native_regex_redux_v1(
+    identity: [u8; 32],
+    data: &NativeRegexReduxDataLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    if data.bytes.get(..identity.len()) != Some(identity.as_slice())
+        || data.variant_prefixes.len() != 9
+        || data.replacements.len() != 5
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux immutable data layout",
+        ));
+    }
+    let mut maximum_report_bytes = 1_usize; // blank line before terminal lengths
+    for &(offset, bytes) in &data.variant_prefixes {
+        if bytes == 0
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux report prefix layout",
+            ));
+        }
+        maximum_report_bytes = maximum_report_bytes
+            .checked_add(bytes)
+            .and_then(|total| total.checked_add(21)) // u64 decimal and newline
+            .ok_or(ObjectError::ArithmeticOverflow("regex-redux report bound"))?;
+    }
+    maximum_report_bytes =
+        maximum_report_bytes
+            .checked_add(3 * 21)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux terminal report bound",
+            ))?;
+    if maximum_report_bytes > crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES {
+        return Err(ObjectError::InvalidModule("regex-redux report bound"));
+    }
+    for &(offset, bytes) in &data.replacements {
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule("regex-redux replacement layout"));
+        }
+    }
+
+    let mut assembler = X86Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let mut call_displacements = Vec::new();
+    call_displacements
+        .try_reserve_exact(crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS)
+        .map_err(|_| ObjectError::Allocation("regex-redux call relocations"))?;
+
+    // Authenticate the single-pointer request before changing RSP. The
+    // complete fixed request must be aligned and addressable.
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_before_frame)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid_before_frame)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 72])?;
+    assembler.branch(&[0x0f, 0x82], invalid_before_frame)?;
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&X86_REGEX_REDUX_FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    x86_regex_redux_rsp_store(&mut assembler, 7, X86_REGEX_REDUX_REQUEST_OFFSET)?;
+    for (request_offset, stack_offset) in [
+        (0, X86_REGEX_REDUX_HAYSTACK_OFFSET),
+        (8, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET),
+        (16, X86_REGEX_REDUX_SCRATCH_A_OFFSET),
+        (24, X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET),
+        (32, X86_REGEX_REDUX_SCRATCH_B_OFFSET),
+        (40, X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET),
+        (48, X86_REGEX_REDUX_REPORT_OFFSET),
+        (56, X86_REGEX_REDUX_REPORT_CAP_OFFSET),
+        (64, X86_REGEX_REDUX_RECEIPT_OFFSET),
+    ] {
+        x86_regex_redux_load_request_word(&mut assembler, request_offset, stack_offset)?;
+    }
+
+    assembler.instruction(&[0x4c, 0x8d, 0x2d])?; // r13 = immutable data
+    let data_displacement = assembler.label()?;
+    assembler.bind(data_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    for pointer_offset in [
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 0, pointer_offset)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+    }
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    assembler.instruction(&[0xa8, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    for length_offset in [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 0, length_offset)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x88], invalid)?;
+    }
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_REPORT_CAP_OFFSET)?;
+    let mut report_capacity = vec![0x48, 0x3d];
+    report_capacity.extend_from_slice(
+        &u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report capacity"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_capacity)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+
+    // The third substitution can expand every disjoint `BY` pair from two
+    // bytes to three. No other fixed stage expands, so n + floor(n/2) is an
+    // exact all-input capacity envelope for both ping-pong buffers.
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(&[0x48, 0x89, 0xc1])?;
+    assembler.instruction(&[0x48, 0xd1, 0xe9])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    for capacity_offset in [
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+    ] {
+        x86_regex_redux_rsp_load(&mut assembler, 2, capacity_offset)?;
+        assembler.instruction(&[0x48, 0x39, 0xc2])?;
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+    }
+
+    x86_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REQUEST_OFFSET,
+        u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+        X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_END_OFFSET,
+        invalid,
+    )?;
+    x86_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+        u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt extent"))?,
+        X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        invalid,
+    )?;
+    let ranges = [
+        (
+            X86_REGEX_REDUX_REQUEST_OFFSET,
+            X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_HAYSTACK_OFFSET,
+            X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_REPORT_OFFSET,
+            X86_REGEX_REDUX_REPORT_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_RECEIPT_OFFSET,
+            X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        ),
+    ];
+    for first in 0..ranges.len() {
+        for second in first + 1..ranges.len() {
+            x86_regex_redux_disjoint(
+                &mut assembler,
+                ranges[first].0,
+                ranges[first].1,
+                ranges[second].0,
+                ranges[second].1,
+                invalid,
+            )?;
+        }
+    }
+
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc6])?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(&[0x49, 0x89, 0xc7])?;
+
+    x86_regex_redux_emit_replacement(
+        &mut assembler,
+        0,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        None,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        runtime_failure,
+        &mut call_displacements,
+    )?;
+    for variant in 0..data.variant_prefixes.len() {
+        x86_regex_redux_emit_count(
+            &mut assembler,
+            variant + 1,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+            runtime_failure,
+            &mut call_displacements,
+        )?;
+    }
+    for substitution in 0..data.replacements.len() {
+        let destination_is_b = substitution.is_multiple_of(2);
+        x86_regex_redux_emit_replacement(
+            &mut assembler,
+            10 + substitution,
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_OFFSET
+            },
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET
+            },
+            Some(data.replacements[substitution]),
+            X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + substitution * 8,
+            runtime_failure,
+            &mut call_displacements,
+        )?;
+    }
+
+    // Format the exact Rebar report privately. No caller-visible report or
+    // receipt byte is touched until every semantic stage has succeeded.
+    assembler.instruction(&[0x31, 0xdb])?; // report length = 0
+    for (variant, &(offset, bytes)) in data.variant_prefixes.iter().enumerate() {
+        x86_regex_redux_report_prefix(&mut assembler, offset, bytes)?;
+        x86_regex_redux_rsp_load(
+            &mut assembler,
+            0,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+        )?;
+        x86_regex_redux_report_u64(&mut assembler)?;
+        x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    }
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    x86_regex_redux_rsp_load(&mut assembler, 0, X86_REGEX_REDUX_CLEAN_LEN_OFFSET)?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(&[0x4c, 0x89, 0xf8])?;
+    x86_regex_redux_report_u64(&mut assembler)?;
+    x86_regex_redux_report_byte(&mut assembler, b'\n')?;
+    let mut report_bound = vec![0x48, 0x81, 0xfb];
+    report_bound.extend_from_slice(
+        &u32::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report bound"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+
+    x86_regex_redux_rsp_load(&mut assembler, 7, X86_REGEX_REDUX_REPORT_OFFSET)?;
+    let mut report_source = vec![0x48, 0x8d, 0xb4, 0x24];
+    report_source.extend_from_slice(
+        &u32::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&report_source)?;
+    assembler.instruction(&[0x48, 0x89, 0xd9])?;
+    assembler.instruction(&[0xf3, 0xa4])?;
+    x86_regex_redux_publish_receipt(&mut assembler)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&X86_REGEX_REDUX_FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&release)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    if call_displacements.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || call_displacements
+            .iter()
+            .enumerate()
+            .any(|(expected, &(component, _))| component != expected)
+    {
+        return Err(ObjectError::InvalidModule("regex-redux call closure"));
+    }
+    let finished = assembler.finish_with_label_offsets()?;
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(1 + call_displacements.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux relocations"))?;
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(
+            finished.label_offset(data_displacement)?,
+            "regex-redux data relocation",
+        )?,
+        kind: RelocationKind::X86PcRelative32,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: -4,
+    });
+    for (component, displacement) in call_displacements {
+        relocations.push(ModuleRelocation {
+            section: REGEX_REDUX_TEXT_SECTION,
+            offset: offset_u64(
+                finished.label_offset(displacement)?,
+                "regex-redux component relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: REGEX_REDUX_COMPONENT_SYMBOL_BASE + component,
+            addend: -4,
+        });
+    }
+    Ok((finished.code, relocations))
+}
+
+// AAPCS64 keeps SP 16-byte aligned at every call. The semantic workspace uses
+// the same offsets as the x86-64 lowering; the extra tail preserves X19..X24,
+// FP, and LR without encroaching on the 1 KiB private report transaction.
+const AARCH64_REGEX_REDUX_FRAME_BYTES: u16 = 1_408;
+const AARCH64_REGEX_REDUX_SAVED_OFFSET: u16 = 1_344;
+
+fn aarch64_regex_redux_stack_load(
+    assembler: &mut Aarch64Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_x_imm(
+        register,
+        31,
+        u16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack load"))?,
+    )?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_stack_store(
+    assembler: &mut Aarch64Assembler,
+    register: u8,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_store_x(
+        register,
+        31,
+        u16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux stack store"))?,
+    )?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_stack_zero(
+    assembler: &mut Aarch64Assembler,
+    offset: usize,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    aarch64_regex_redux_stack_store(assembler, 9, offset)
+}
+
+fn aarch64_regex_redux_adds_x_reg(
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<u32, ObjectError> {
+    Ok(
+        0xab00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_regex_redux_store_byte_reg(source: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(0x3820_6800 | aarch64_reg(index, 16)? | aarch64_reg(base, 5)? | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_regex_redux_load_x_reg(
+    destination: u8,
+    base: u8,
+    index: u8,
+) -> Result<u32, ObjectError> {
+    Ok(
+        0xf860_6800
+            | aarch64_reg(index, 16)?
+            | aarch64_reg(base, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_regex_redux_store_x_reg(source: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(0xf820_6800 | aarch64_reg(index, 16)? | aarch64_reg(base, 5)? | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_regex_redux_pointer_end(
+    assembler: &mut Aarch64Assembler,
+    base_offset: usize,
+    length_offset: usize,
+    end_offset: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, base_offset)?;
+    aarch64_regex_redux_stack_load(assembler, 10, length_offset)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(9, 9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    aarch64_regex_redux_stack_store(assembler, 9, end_offset)
+}
+
+fn aarch64_regex_redux_fixed_pointer_end(
+    assembler: &mut Aarch64Assembler,
+    base_offset: usize,
+    bytes: u16,
+    end_offset: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, base_offset)?;
+    assembler.instruction(aarch64_adds_x_imm(9, 9, bytes)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    aarch64_regex_redux_stack_store(assembler, 9, end_offset)
+}
+
+fn aarch64_regex_redux_disjoint(
+    assembler: &mut Aarch64Assembler,
+    first_base: usize,
+    first_end: usize,
+    second_base: usize,
+    second_end: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let disjoint = assembler.label()?;
+    aarch64_regex_redux_stack_load(assembler, 9, first_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, first_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, second_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, second_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, first_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, second_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LS, disjoint)?;
+    aarch64_regex_redux_stack_load(assembler, 9, second_end)?;
+    aarch64_regex_redux_stack_load(assembler, 10, first_base)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.bind(disjoint)
+}
+
+fn aarch64_regex_redux_component_call(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    if component >= crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 component call index",
+        ));
+    }
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    aarch64_regex_redux_stack_load(assembler, 2, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        4,
+        31,
+        u16::try_from(X86_REGEX_REDUX_SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux Span result"))?,
+    )?)?;
+    let call = assembler.instruction(0x9400_0000)?;
+    call_offsets
+        .try_reserve(1)
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 calls"))?;
+    call_offsets.push((component, call));
+    Ok(())
+}
+
+fn aarch64_regex_redux_validate_span(
+    assembler: &mut Aarch64Assembler,
+    runtime_failure: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 11, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    assembler.instruction(aarch64_cmp_x(11, 9)?)?;
+    assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(11, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_emit_count(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    output_offset: usize,
+    runtime_failure: Aarch64Label,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    aarch64_regex_redux_component_call(assembler, component, call_offsets)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(runtime_failure)?;
+
+    assembler.bind(matched)?;
+    aarch64_regex_redux_validate_span(assembler, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(aarch64_adds_x_imm(9, 9, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 9, output_offset)
+}
+
+/// Append X9 bytes from `source + copied` to the selected destination and then
+/// append the fixed replacement, if any. The prospective length is committed
+/// only to the private frame until the complete operation succeeds.
+fn aarch64_regex_redux_emit_copy(
+    assembler: &mut Aarch64Assembler,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    runtime_failure: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let bulk_check = assembler.label()?;
+    let byte_check = assembler.label()?;
+    let byte_loop = assembler.label()?;
+    let copied = assembler.label()?;
+    let replacement_len = replacement.map_or(0, |(_, bytes)| bytes);
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(11, 10, 9)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    if replacement_len != 0 {
+        assembler.instruction(aarch64_adds_x_imm(
+            11,
+            11,
+            u16::try_from(replacement_len)
+                .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement length"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    }
+    aarch64_regex_redux_stack_load(assembler, 12, destination_capacity_offset)?;
+    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    aarch64_regex_redux_stack_store(assembler, 11, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    aarch64_regex_redux_stack_load(assembler, 12, destination_offset)?;
+    assembler.instruction(aarch64_add_x_reg(12, 12, 10)?)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_add_x_reg(11, 19, 10)?)?;
+    assembler.instruction(aarch64_movz_x(10, 0, 0)?)?;
+    assembler.bind(bulk_check)?;
+    assembler.instruction(aarch64_sub_x_reg(14, 9, 10)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(14, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, byte_check)?;
+    assembler.instruction(aarch64_regex_redux_load_x_reg(13, 11, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_x_reg(13, 12, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 8)?)?;
+    assembler.branch(bulk_check)?;
+    assembler.bind(byte_check)?;
+    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_HS, copied)?;
+    assembler.bind(byte_loop)?;
+    assembler.instruction(aarch64_load_byte_reg(13, 11, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 12, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, byte_loop)?;
+    assembler.bind(copied)?;
+
+    if let Some((replacement_offset, replacement_len)) = replacement {
+        assembler.instruction(aarch64_add_x_reg(12, 12, 9)?)?;
+        for byte in 0..replacement_len {
+            let source_offset = replacement_offset
+                .checked_add(byte)
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "regex-redux replacement offset",
+                ))?;
+            assembler.instruction(aarch64_load_byte_imm(13, 21, source_offset)?)?;
+            assembler.instruction(aarch64_store_byte(
+                13,
+                12,
+                u16::try_from(byte)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux replacement byte"))?,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_regex_redux_emit_replacement(
+    assembler: &mut Aarch64Assembler,
+    component: usize,
+    destination_offset: usize,
+    destination_capacity_offset: usize,
+    replacement: Option<(usize, usize)>,
+    stage_length_offset: usize,
+    runtime_failure: Aarch64Label,
+    call_offsets: &mut Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let tail = assembler.label()?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_START_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    aarch64_regex_redux_stack_zero(assembler, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+
+    assembler.bind(loop_head)?;
+    aarch64_regex_redux_component_call(assembler, component, call_offsets)?;
+    assembler.branch_zero_w(0, tail)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(runtime_failure)?;
+
+    assembler.bind(matched)?;
+    aarch64_regex_redux_validate_span(assembler, runtime_failure)?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_sub_x_reg(9, 9, 10)?)?;
+    aarch64_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        replacement,
+        runtime_failure,
+    )?;
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_SPAN_OFFSET + 8)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 9, X86_REGEX_REDUX_START_OFFSET)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(tail)?;
+    aarch64_regex_redux_stack_load(assembler, 10, X86_REGEX_REDUX_COPIED_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x(10, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_sub_x_reg(9, 20, 10)?)?;
+    aarch64_regex_redux_emit_copy(
+        assembler,
+        destination_offset,
+        destination_capacity_offset,
+        None,
+        runtime_failure,
+    )?;
+    aarch64_regex_redux_stack_load(assembler, 19, destination_offset)?;
+    aarch64_regex_redux_stack_load(assembler, 20, X86_REGEX_REDUX_DEST_LEN_OFFSET)?;
+    aarch64_regex_redux_stack_store(assembler, 20, stage_length_offset)
+}
+
+fn aarch64_regex_redux_report_byte(
+    assembler: &mut Aarch64Assembler,
+    byte: u8,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_movz_w(9, u16::from(byte))?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(9, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    Ok(())
+}
+
+fn aarch64_regex_redux_report_prefix(
+    assembler: &mut Aarch64Assembler,
+    data_offset: usize,
+    bytes: usize,
+) -> Result<(), ObjectError> {
+    let loop_head = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(
+        11,
+        21,
+        u16::try_from(data_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+    )?)?;
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        9,
+        u16::try_from(bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report prefix"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 11, 9)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(10, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(loop_head)?;
+    assembler.bind(finished)
+}
+
+/// Append the unsigned value in X9 to the private report. At most twenty
+/// reversed digits occupy the 32-byte scratch prefix at SP containing the
+/// now-dead Span result.
+fn aarch64_regex_redux_report_u64(assembler: &mut Aarch64Assembler) -> Result<(), ObjectError> {
+    let nonzero = assembler.label()?;
+    let divide = assembler.label()?;
+    let reverse = assembler.label()?;
+    let finished = assembler.label()?;
+    assembler.branch_nonzero_x(9, nonzero)?;
+    aarch64_regex_redux_report_byte(assembler, b'0')?;
+    assembler.branch(finished)?;
+
+    assembler.bind(nonzero)?;
+    assembler.instruction(aarch64_movz_x(10, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(12, 10, 0)?)?;
+    assembler.bind(divide)?;
+    assembler.instruction(aarch64_udiv_x(11, 9, 12)?)?;
+    assembler.instruction(aarch64_msub_x(13, 11, 12, 9)?)?;
+    assembler.instruction(aarch64_add_x_imm(13, 13, u16::from(b'0'))?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 31, 10)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_mov_x(9, 11)?)?;
+    assembler.branch_nonzero_x(9, divide)?;
+
+    assembler.bind(reverse)?;
+    assembler.instruction(aarch64_sub_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(13, 31, 10)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(13, 24, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch_nonzero_x(10, reverse)?;
+    assembler.bind(finished)
+}
+
+fn aarch64_regex_redux_publish_receipt(
+    assembler: &mut Aarch64Assembler,
+) -> Result<(), ObjectError> {
+    aarch64_regex_redux_stack_load(assembler, 9, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    let sources = [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 8,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 16,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 24,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 32,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 40,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 48,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 56,
+        X86_REGEX_REDUX_COUNTS_OFFSET + 64,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 8,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 16,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 24,
+        X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + 32,
+    ];
+    for (word, source) in sources.into_iter().enumerate() {
+        aarch64_regex_redux_stack_load(assembler, 10, source)?;
+        assembler.instruction(aarch64_store_x(
+            10,
+            9,
+            u16::try_from(
+                word.checked_mul(8)
+                    .ok_or(ObjectError::ArithmeticOverflow("regex-redux receipt word"))?,
+            )
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt offset"))?,
+        )?)?;
+    }
+    assembler.instruction(aarch64_store_x(20, 9, 128)?)?;
+    assembler.instruction(aarch64_store_x(23, 9, 136)?)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the AAPCS64 operation mirrors the complete validated x86-64 transaction"
+)]
+fn lower_aarch64_native_regex_redux_v1(
+    identity: [u8; 32],
+    data: &NativeRegexReduxDataLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    if data.bytes.get(..identity.len()) != Some(identity.as_slice())
+        || data.variant_prefixes.len() != 9
+        || data.replacements.len() != 5
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 immutable data layout",
+        ));
+    }
+    let mut maximum_report_bytes = 1_usize;
+    for &(offset, bytes) in &data.variant_prefixes {
+        if bytes == 0
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 report prefix layout",
+            ));
+        }
+        maximum_report_bytes = maximum_report_bytes
+            .checked_add(bytes)
+            .and_then(|total| total.checked_add(21))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux AArch64 report bound",
+            ))?;
+    }
+    maximum_report_bytes =
+        maximum_report_bytes
+            .checked_add(3 * 21)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "regex-redux AArch64 terminal report bound",
+            ))?;
+    if maximum_report_bytes > crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 report bound",
+        ));
+    }
+    for &(offset, bytes) in &data.replacements {
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > data.bytes.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 replacement layout",
+            ));
+        }
+    }
+
+    let mut assembler = Aarch64Assembler::new();
+    let invalid_before_frame = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS)
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 calls"))?;
+
+    assembler.branch_zero_x(0, invalid_before_frame)?;
+    assembler.instruction(aarch64_and_low_x(9, 0, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid_before_frame)?;
+    assembler.instruction(aarch64_adds_x_imm(
+        9,
+        0,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_HS, invalid_before_frame)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, AARCH64_REGEX_REDUX_FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 31, AARCH64_REGEX_REDUX_SAVED_OFFSET)?)?;
+    for (first, second, offset) in [(19, 20, 0), (21, 22, 16), (23, 24, 32), (29, 30, 48)] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 9, offset)?)?;
+    }
+    aarch64_regex_redux_stack_store(&mut assembler, 0, X86_REGEX_REDUX_REQUEST_OFFSET)?;
+    for (request_offset, stack_offset) in [
+        (0, X86_REGEX_REDUX_HAYSTACK_OFFSET),
+        (8, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET),
+        (16, X86_REGEX_REDUX_SCRATCH_A_OFFSET),
+        (24, X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET),
+        (32, X86_REGEX_REDUX_SCRATCH_B_OFFSET),
+        (40, X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET),
+        (48, X86_REGEX_REDUX_REPORT_OFFSET),
+        (56, X86_REGEX_REDUX_REPORT_CAP_OFFSET),
+        (64, X86_REGEX_REDUX_RECEIPT_OFFSET),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(9, 0, request_offset)?)?;
+        aarch64_regex_redux_stack_store(&mut assembler, 9, stack_offset)?;
+    }
+
+    let data_page = assembler.instruction(0x9000_0015)?; // adrp x21, immutable data
+    let data_page_offset = assembler.instruction(aarch64_add_x_imm(21, 21, 0)?)?;
+
+    for pointer_offset in [
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 9, pointer_offset)?;
+        assembler.branch_zero_x(9, invalid)?;
+    }
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_RECEIPT_OFFSET)?;
+    assembler.instruction(aarch64_and_low_x(9, 9, 3)?)?;
+    assembler.branch_nonzero_x(9, invalid)?;
+    for length_offset in [
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 9, length_offset)?;
+        assembler.branch_bit_set_x(9, 63, invalid)?;
+    }
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_REPORT_CAP_OFFSET)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        9,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report capacity"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    assembler.instruction(aarch64_lsr_x_imm(10, 9, 1)?)?;
+    assembler.instruction(aarch64_regex_redux_adds_x_reg(11, 9, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.branch_bit_set_x(11, 63, invalid)?;
+    for capacity_offset in [
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+    ] {
+        aarch64_regex_redux_stack_load(&mut assembler, 12, capacity_offset)?;
+        assembler.instruction(aarch64_cmp_x(12, 11)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid)?;
+    }
+
+    aarch64_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REQUEST_OFFSET,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REQUEST_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux request extent"))?,
+        X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_HAYSTACK_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET,
+        X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_REPORT_OFFSET,
+        X86_REGEX_REDUX_REPORT_CAP_OFFSET,
+        X86_REGEX_REDUX_REPORT_END_OFFSET,
+        invalid,
+    )?;
+    aarch64_regex_redux_fixed_pointer_end(
+        &mut assembler,
+        X86_REGEX_REDUX_RECEIPT_OFFSET,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_RECEIPT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux receipt extent"))?,
+        X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        invalid,
+    )?;
+    let ranges = [
+        (
+            X86_REGEX_REDUX_REQUEST_OFFSET,
+            X86_REGEX_REDUX_REQUEST_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_HAYSTACK_OFFSET,
+            X86_REGEX_REDUX_HAYSTACK_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_A_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_SCRATCH_B_OFFSET,
+            X86_REGEX_REDUX_SCRATCH_B_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_REPORT_OFFSET,
+            X86_REGEX_REDUX_REPORT_END_OFFSET,
+        ),
+        (
+            X86_REGEX_REDUX_RECEIPT_OFFSET,
+            X86_REGEX_REDUX_RECEIPT_END_OFFSET,
+        ),
+    ];
+    for first in 0..ranges.len() {
+        for second in first + 1..ranges.len() {
+            aarch64_regex_redux_disjoint(
+                &mut assembler,
+                ranges[first].0,
+                ranges[first].1,
+                ranges[second].0,
+                ranges[second].1,
+                invalid,
+            )?;
+        }
+    }
+
+    aarch64_regex_redux_stack_load(&mut assembler, 19, X86_REGEX_REDUX_HAYSTACK_OFFSET)?;
+    aarch64_regex_redux_stack_load(&mut assembler, 20, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    aarch64_regex_redux_emit_replacement(
+        &mut assembler,
+        0,
+        X86_REGEX_REDUX_SCRATCH_A_OFFSET,
+        X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET,
+        None,
+        X86_REGEX_REDUX_CLEAN_LEN_OFFSET,
+        runtime_failure,
+        &mut call_offsets,
+    )?;
+    for variant in 0..data.variant_prefixes.len() {
+        aarch64_regex_redux_emit_count(
+            &mut assembler,
+            variant + 1,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+            runtime_failure,
+            &mut call_offsets,
+        )?;
+    }
+    for substitution in 0..data.replacements.len() {
+        let destination_is_b = substitution.is_multiple_of(2);
+        aarch64_regex_redux_emit_replacement(
+            &mut assembler,
+            10 + substitution,
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_OFFSET
+            },
+            if destination_is_b {
+                X86_REGEX_REDUX_SCRATCH_B_CAP_OFFSET
+            } else {
+                X86_REGEX_REDUX_SCRATCH_A_CAP_OFFSET
+            },
+            Some(data.replacements[substitution]),
+            X86_REGEX_REDUX_SUBSTITUTION_LENGTHS_OFFSET + substitution * 8,
+            runtime_failure,
+            &mut call_offsets,
+        )?;
+    }
+
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        24,
+        31,
+        u16::try_from(X86_REGEX_REDUX_REPORT_TEMP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report temporary"))?,
+    )?)?;
+    for (variant, &(offset, bytes)) in data.variant_prefixes.iter().enumerate() {
+        aarch64_regex_redux_report_prefix(&mut assembler, offset, bytes)?;
+        aarch64_regex_redux_stack_load(
+            &mut assembler,
+            9,
+            X86_REGEX_REDUX_COUNTS_OFFSET + variant * 8,
+        )?;
+        aarch64_regex_redux_report_u64(&mut assembler)?;
+        aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    }
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_HAYSTACK_LEN_OFFSET)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    aarch64_regex_redux_stack_load(&mut assembler, 9, X86_REGEX_REDUX_CLEAN_LEN_OFFSET)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(aarch64_mov_x(9, 20)?)?;
+    aarch64_regex_redux_report_u64(&mut assembler)?;
+    aarch64_regex_redux_report_byte(&mut assembler, b'\n')?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        23,
+        u16::try_from(crate::NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("regex-redux report bound"))?,
+    )?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+
+    aarch64_regex_redux_stack_load(&mut assembler, 11, X86_REGEX_REDUX_REPORT_OFFSET)?;
+    assembler.instruction(aarch64_movz_x(9, 0, 0)?)?;
+    let report_copy = assembler.label()?;
+    let report_copied = assembler.label()?;
+    assembler.branch_zero_x(23, report_copied)?;
+    assembler.bind(report_copy)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 24, 9)?)?;
+    assembler.instruction(aarch64_regex_redux_store_byte_reg(10, 11, 9)?)?;
+    assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 23)?)?;
+    assembler.branch_cond(AARCH64_LO, report_copy)?;
+    assembler.bind(report_copied)?;
+    aarch64_regex_redux_publish_receipt(&mut assembler)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_add_x_imm(9, 31, AARCH64_REGEX_REDUX_SAVED_OFFSET)?)?;
+    for (first, second, offset) in [(19, 20, 0), (21, 22, 16), (23, 24, 32), (29, 30, 48)] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 9, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, AARCH64_REGEX_REDUX_FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_before_frame)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    if call_offsets.len() != crate::NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS
+        || call_offsets
+            .iter()
+            .enumerate()
+            .any(|(expected, &(component, _))| component != expected)
+    {
+        return Err(ObjectError::InvalidModule(
+            "regex-redux AArch64 call closure",
+        ));
+    }
+    let mut relocation_offsets = Vec::new();
+    relocation_offsets
+        .try_reserve_exact(2 + call_offsets.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 relocation offsets"))?;
+    relocation_offsets.extend([data_page, data_page_offset]);
+    relocation_offsets.extend(call_offsets.iter().map(|&(_, offset)| offset));
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(relocation_offsets.len())
+        .map_err(|_| ObjectError::Allocation("regex-redux AArch64 relocations"))?;
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(relocation_offsets[0], "regex-redux AArch64 data page")?,
+        kind: RelocationKind::Aarch64Page21,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: 0,
+    });
+    relocations.push(ModuleRelocation {
+        section: REGEX_REDUX_TEXT_SECTION,
+        offset: offset_u64(
+            relocation_offsets[1],
+            "regex-redux AArch64 data page offset",
+        )?,
+        kind: RelocationKind::Aarch64PageOff12,
+        symbol: REGEX_REDUX_DATA_SYMBOL,
+        addend: 0,
+    });
+    for (component, &(expected, _)) in call_offsets.iter().enumerate() {
+        if component != expected {
+            return Err(ObjectError::InvalidModule(
+                "regex-redux AArch64 relocation closure",
+            ));
+        }
+        relocations.push(ModuleRelocation {
+            section: REGEX_REDUX_TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[component + 2],
+                "regex-redux AArch64 component",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: REGEX_REDUX_COMPONENT_SYMBOL_BASE + component,
+            addend: 0,
+        });
+    }
+    Ok((code, relocations))
+}
+
 /// Emit Intel-recommended NOP encodings into unreachable post-return space.
 /// Nine-byte chunks keep the instruction audit explicit without bloating the
 /// compiler, and the exact remainder covers every power-of-two alignment.
@@ -30571,6 +35848,43 @@ fn x86_use_sparse_filter_mask_batch(filter: NativeStartFilter, kind: X86StartFil
     )
 }
 
+/// Select the incumbent sparse primary as a one-way front end for an exact
+/// two-byte relation. The relation is materialized only after the first false
+/// projected candidate; a true pair keeps the existing verifier contract.
+fn x86_exact_pair_primary_cold_filter(
+    suffix: NativeSuffixFilter,
+    _kind: X86StartFilterKind,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if suffix.minimum_width < 2 {
+        return Ok(None);
+    }
+    let Some(pair_filter) = suffix.exact_pair_filter else {
+        return Ok(None);
+    };
+    let filter = suffix.filter;
+    // Keep admission independent of the selected vector tier. The SSE2-sized
+    // four-vector group is the stable 64-byte density check; after admission,
+    // each tier still uses its incumbent batching decision below. In
+    // particular, this avoids making an otherwise identical language change
+    // routes merely because AVX2 or AVX-512 widened the primary scan.
+    if filter.scan_offset > 1
+        || !x86_use_sparse_filter_mask_batch(filter, X86StartFilterKind::Sse2)
+    {
+        return Ok(None);
+    }
+    let membership = start_filter_membership(filter)?;
+    let projection_is_covered = pair_filter.pairs().iter().all(|pair| {
+        let byte = if filter.scan_offset == 0 {
+            *pair as u8
+        } else {
+            (*pair >> 8) as u8
+        };
+        let index = usize::from(byte);
+        membership[index / 64] & (1_u64 << (index % 64)) != 0
+    });
+    Ok(projection_is_covered.then_some(filter))
+}
+
 fn x86_filter_constant_register(
     first_register: u8,
     logical_index: usize,
@@ -31970,20 +37284,79 @@ fn x86_emit_seeded_reverse_prepass(
             || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary));
     let endpoint_without_certificate = layout.output != OutputContract::Exists
         && (!reverse.proves_match || !reverse.first_endpoint_proves_no_earlier_match);
-    if malformed_certificate || endpoint_without_certificate {
+    let malformed_seed = match suffix.reverse_seed {
+        NativeSuffixReverseSeed::AcceptBoundary => {
+            reverse.boundary_offset != suffix.minimum_width || !reverse.proves_match
+        }
+        NativeSuffixReverseSeed::RootState(_) => {
+            reverse.boundary_offset != 0 || reverse.proves_match
+        }
+    };
+    let unsupported_synchronizing_reverse =
+        matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
+            && !(layout.output == OutputContract::Exists
+                && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                && reverse.proves_match
+                && reverse.first_endpoint_proves_no_earlier_match);
+    if malformed_certificate
+        || endpoint_without_certificate
+        || malformed_seed
+        || suffix.retry.is_some()
+        || unsupported_synchronizing_reverse
+    {
         return Err(ObjectError::InvalidModule(
-            "x86 endpoint seeded reverse has no terminal-barrier proof",
+            "x86 seeded reverse escaped its graph admission gate",
         ));
     }
 
-    let lazy_vector_filter = suffix.vector_filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_filter_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let exact_pair_filter = suffix.exact_pair_filter;
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_filter_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
-    let use_sparse_batch = x86_use_sparse_filter_mask_batch(filter, kind);
+    let use_sparse_batch =
+        exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
+    let exact_pair_primary_cold_filter = x86_exact_pair_primary_cold_filter(suffix, kind)?;
+    let exact_pair_primary_uses_sparse_batch = exact_pair_primary_cold_filter
+        .is_some_and(|primary| x86_use_sparse_filter_mask_batch(primary, kind));
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary phase escaped Exists admission",
+        ));
+    }
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(vector_filter) = lazy_vector_filter {
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            x86_emit_start_filter_constants(assembler, primary_filter, kind, 1)?;
+        } else if let Some(pair_filter) = exact_pair_filter {
+            x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
             for &column in vector_filter.columns() {
                 x86_emit_start_filter_constants(assembler, column, kind, first_register)?;
@@ -32018,15 +37391,115 @@ fn x86_emit_seeded_reverse_prepass(
         emit_constants(assembler)?;
     }
 
-    assembler.bind(vector)?;
-    assembler.instruction(&[0x48, 0x89, 0xc8])?;
-    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let unrolled_bytes = u32::from(kind.width())
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(u32::from(maximum_scan_offset)))
         .ok_or(ObjectError::ArithmeticOverflow(
             "x86 seeded reverse filter width",
         ))?;
+    let single_vector_bytes = kind
+        .width()
+        .checked_add(maximum_scan_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 seeded reverse filter width",
+        ))?;
+    if let Some(primary_filter) = exact_pair_primary_cold_filter {
+        let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary vector label is absent",
+        ))?;
+        let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+            ObjectError::InvalidModule(
+                "x86 seeded exact-pair primary single-vector label is absent",
+            ),
+        )?;
+        let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary scalar label is absent",
+        ))?;
+        let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary batch-hit label is absent"),
+        )?;
+        let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary single-hit label is absent"),
+        )?;
+        let primary_candidate = exact_pair_primary_candidate.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair primary candidate label is absent"),
+        )?;
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule("x86 seeded exact-pair activation label is absent"),
+        )?;
+        let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+            "x86 seeded exact-pair primary phase lost its relation",
+        ))?;
+        assembler.instruction(&[0x31, 0xdb])?; // relation phase = primary
+        assembler.bind(primary_vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        let mut compare_primary_unrolled = vec![0x48, 0x3d];
+        compare_primary_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
+        assembler.instruction(&compare_primary_unrolled)?;
+        assembler.branch(&[0x0f, 0x82], primary_single_vector)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_sparse_filter_mask_batch(assembler, primary_filter, kind)?;
+            assembler.branch(&[0x0f, 0x85], primary_batch_hit)?;
+        } else {
+            for _ in 0..X86_MASK_BATCH_VECTORS {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    primary_filter,
+                    kind,
+                    primary_single_hit,
+                )?;
+                assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+            }
+        }
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_batch_hit)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_rewind_sparse_filter_mask_batch(assembler, kind)?;
+        }
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_single_vector)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
+        assembler.branch(&[0x0f, 0x82], primary_scalar)?;
+        x86_emit_start_filter_vector_candidate(
+            assembler,
+            primary_filter,
+            kind,
+            primary_single_hit,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_single_hit)?;
+        x86_emit_first_candidate_lane(
+            assembler,
+            X86CandidateMask::for_filter(primary_filter, kind),
+        )?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?;
+        assembler.branch(&[0xe9], primary_candidate)?;
+
+        assembler.bind(primary_scalar)?;
+        x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, finalize)?;
+        x86_emit_start_filter_scalar_candidate(assembler, primary_filter, primary_candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_candidate)?;
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], relation_activate)?;
+
+        assembler.bind(relation_activate)?;
+        assembler.instruction(&[0xbb, 1, 0, 0, 0])?; // relation phase = active
+        x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0xe9], vector)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let mut compare_unrolled = vec![0x48, 0x3d];
     compare_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
     assembler.instruction(&compare_unrolled)?;
@@ -32041,7 +37514,21 @@ fn x86_emit_seeded_reverse_prepass(
         assembler.branch(&[0x0f, 0x85], sparse_batch_hit)?;
     } else {
         for _ in 0..X86_MASK_BATCH_VECTORS {
-            x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+            if let Some(pair_filter) = exact_pair_filter {
+                x86_emit_prefix_relation_vector_test(
+                    assembler,
+                    pair_filter.vector_plan,
+                    kind,
+                )?;
+                assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            } else {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    filter,
+                    kind,
+                    vector_candidate_hit,
+                )?;
+            }
             assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
         }
     }
@@ -32052,36 +37539,39 @@ fn x86_emit_seeded_reverse_prepass(
     assembler.branch(&[0xe9], scalar)?;
 
     assembler.bind(single_vector)?;
-    let single_vector_bytes =
-        kind.width()
-            .checked_add(maximum_scan_offset)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "x86 seeded reverse filter width",
-            ))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
-    x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0x0f, 0x85], vector_hit)?;
+    } else {
+        x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    }
     assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(scalar)?;
     x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, finalize)?;
-    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
     } else {
-        candidate
-    };
-    for range in filter.ranges() {
-        assembler.instruction(&[0x3c, range.start])?;
-        if range.start == range.end {
-            assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+        x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch(&[0x0f, 0x82], next_range)?;
-            assembler.instruction(&[0x3c, range.end])?;
-            assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
-            assembler.bind(next_range)?;
+            candidate
+        };
+        for range in filter.ranges() {
+            assembler.instruction(&[0x3c, range.start])?;
+            if range.start == range.end {
+                assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch(&[0x0f, 0x82], next_range)?;
+                assembler.instruction(&[0x3c, range.end])?;
+                assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -32117,7 +37607,7 @@ fn x86_emit_seeded_reverse_prepass(
     }
 
     assembler.bind(vector_hit)?;
-    let vector_hit_mask = if lazy_vector_filter.is_some() {
+    let vector_hit_mask = if exact_pair_filter.is_some() || lazy_vector_filter.is_some() {
         X86CandidateMask::for_intersection(kind)
     } else {
         X86CandidateMask::for_filter(filter, kind)
@@ -32199,6 +37689,15 @@ fn x86_emit_seeded_reverse_prepass(
         assembler.branch(&[0x0f, 0x85], global_minimum)?;
     }
     assembler.instruction(&[0x4c, 0x89, 0xf2])?; // position = next base
+    if exact_pair_primary_cold_filter.is_some() {
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule(
+                "x86 seeded exact-pair reverse retry lost its activation label",
+            ),
+        )?;
+        assembler.instruction(&[0x85, 0xdb])?; // relation phase active?
+        assembler.branch(&[0x0f, 0x84], relation_activate)?;
+    }
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(finalize)?;
@@ -32781,20 +38280,65 @@ fn x86_emit_suffix_prepass(
     // Every retained column is a graph-required aligned predicate. AVX-512
     // keeps their 64-lane intersection in k5, so the same proof used by the
     // SSE2/AVX2 lazy-secondary path applies without scalar refinement.
-    let lazy_vector_filter = suffix.vector_filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_scan_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
-    let use_sparse_batch = x86_use_sparse_filter_mask_batch(filter, kind);
-    // The initial suffix scan is exactly the baseline primary-only sparse
-    // batch. Only a witnessed scalar secondary rejection after such a hit
-    // changes CFG mode: subsequent complete groups use all retained columns.
-    // No runtime mode flag or additional live register is required.
+    let exact_pair_filter = suffix.exact_pair_filter;
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_scan_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
+    let use_sparse_batch =
+        exact_pair_filter.is_none() && x86_use_sparse_filter_mask_batch(filter, kind);
+    let exact_pair_primary_cold_filter = x86_exact_pair_primary_cold_filter(suffix, kind)?;
+    let exact_pair_primary_uses_sparse_batch = exact_pair_primary_cold_filter
+        .is_some_and(|primary| x86_use_sparse_filter_mask_batch(primary, kind));
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_retry_dispatch = exact_pair_primary_cold_filter
+        .filter(|_| suffix.retry.is_some())
+        .map(|_| assembler.label())
+        .transpose()?;
+    let retry_scan = exact_pair_retry_dispatch.unwrap_or(vector);
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-pair primary phase escaped Exists admission",
+        ));
+    }
+    // The initial suffix scan is exactly the incumbent primary-only scan:
+    // sparse four-vector batching where that tier admits it, otherwise the
+    // existing unrolled vectors. Only a witnessed scalar relation rejection
+    // changes CFG mode; subsequent complete groups use the exact relation.
     let adaptive_joint_filter = (layout.declined_redundant_root_reverse && use_sparse_batch)
         .then_some(lazy_vector_filter)
         .flatten();
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
-        if let Some(vector_filter) = lazy_vector_filter {
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            x86_emit_start_filter_constants(assembler, primary_filter, kind, 1)?;
+        } else if let Some(pair_filter) = exact_pair_filter {
+            x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        } else if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
             for &column in vector_filter.columns() {
                 x86_emit_start_filter_constants(assembler, column, kind, first_register)?;
@@ -32824,13 +38368,115 @@ fn x86_emit_suffix_prepass(
         emit_constants(assembler)?;
     }
 
-    assembler.bind(vector)?;
-    assembler.instruction(&[0x48, 0x89, 0xc8])?;
-    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let unrolled_bytes = u32::from(kind.width())
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(u32::from(maximum_scan_offset)))
         .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
+    let single_vector_bytes = kind
+        .width()
+        .checked_add(maximum_scan_offset)
+        .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
+    if exact_pair_retry_dispatch.is_some() {
+        assembler.instruction(&[0x31, 0xdb])?; // relation phase = primary
+    }
+    if let Some(primary_filter) = exact_pair_primary_cold_filter {
+        let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary vector label is absent",
+        ))?;
+        let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+            ObjectError::InvalidModule(
+                "x86 exact-pair primary single-vector label is absent",
+            ),
+        )?;
+        let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary scalar label is absent",
+        ))?;
+        let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary batch-hit label is absent"),
+        )?;
+        let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary single-hit label is absent"),
+        )?;
+        let primary_candidate = exact_pair_primary_candidate.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair primary candidate label is absent"),
+        )?;
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule("x86 exact-pair activation label is absent"),
+        )?;
+        let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+            "x86 exact-pair primary phase lost its relation",
+        ))?;
+        assembler.bind(primary_vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        let mut compare_primary_unrolled = vec![0x48, 0x3d];
+        compare_primary_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
+        assembler.instruction(&compare_primary_unrolled)?;
+        assembler.branch(&[0x0f, 0x82], primary_single_vector)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_sparse_filter_mask_batch(assembler, primary_filter, kind)?;
+            assembler.branch(&[0x0f, 0x85], primary_batch_hit)?;
+        } else {
+            for _ in 0..X86_MASK_BATCH_VECTORS {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    primary_filter,
+                    kind,
+                    primary_single_hit,
+                )?;
+                assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+            }
+        }
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_batch_hit)?;
+        if exact_pair_primary_uses_sparse_batch {
+            x86_emit_rewind_sparse_filter_mask_batch(assembler, kind)?;
+        }
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_single_vector)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
+        assembler.branch(&[0x0f, 0x82], primary_scalar)?;
+        x86_emit_start_filter_vector_candidate(
+            assembler,
+            primary_filter,
+            kind,
+            primary_single_hit,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], primary_vector)?;
+
+        assembler.bind(primary_single_hit)?;
+        x86_emit_first_candidate_lane(
+            assembler,
+            X86CandidateMask::for_filter(primary_filter, kind),
+        )?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?;
+        assembler.branch(&[0xe9], primary_candidate)?;
+
+        assembler.bind(primary_scalar)?;
+        x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
+        x86_emit_start_filter_scalar_candidate(assembler, primary_filter, primary_candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], primary_scalar)?;
+
+        assembler.bind(primary_candidate)?;
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], relation_activate)?;
+
+        assembler.bind(relation_activate)?;
+        if exact_pair_retry_dispatch.is_some() {
+            assembler.instruction(&[0xbb, 1, 0, 0, 0])?; // relation phase = active
+        }
+        x86_emit_prefix_relation_constants(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0xe9], vector)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
     let mut compare_unrolled = vec![0x48, 0x3d];
     compare_unrolled.extend_from_slice(&unrolled_bytes.to_le_bytes());
     assembler.instruction(&compare_unrolled)?;
@@ -32845,7 +38491,21 @@ fn x86_emit_suffix_prepass(
         assembler.branch(&[0x0f, 0x85], sparse_batch_hit)?;
     } else {
         for _ in 0..X86_MASK_BATCH_VECTORS {
-            x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+            if let Some(pair_filter) = exact_pair_filter {
+                x86_emit_prefix_relation_vector_test(
+                    assembler,
+                    pair_filter.vector_plan,
+                    kind,
+                )?;
+                assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            } else {
+                x86_emit_start_filter_vector_candidate(
+                    assembler,
+                    filter,
+                    kind,
+                    vector_candidate_hit,
+                )?;
+            }
             assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
         }
     }
@@ -32863,34 +38523,39 @@ fn x86_emit_suffix_prepass(
     )?;
 
     assembler.bind(single_vector)?;
-    let single_vector_bytes = kind
-        .width()
-        .checked_add(maximum_scan_offset)
-        .ok_or(ObjectError::ArithmeticOverflow("x86 suffix-filter width"))?;
     assembler.instruction(&[0x48, 0x83, 0xf8, single_vector_bytes])?;
     assembler.branch(&[0x0f, 0x82], scalar)?;
-    x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan, kind)?;
+        assembler.branch(&[0x0f, 0x85], vector_hit)?;
+    } else {
+        x86_emit_start_filter_vector_candidate(assembler, filter, kind, vector_candidate_hit)?;
+    }
     assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
     assembler.branch(&[0xe9], vector)?;
 
     assembler.bind(scalar)?;
     x86_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
-    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        x86_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
     } else {
-        apply
-    };
-    for range in filter.ranges() {
-        assembler.instruction(&[0x3c, range.start])?;
-        if range.start == range.end {
-            assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+        x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch(&[0x0f, 0x82], next_range)?;
-            assembler.instruction(&[0x3c, range.end])?;
-            assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
-            assembler.bind(next_range)?;
+            apply
+        };
+        for range in filter.ranges() {
+            assembler.instruction(&[0x3c, range.start])?;
+            if range.start == range.end {
+                assembler.branch(&[0x0f, 0x84], scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch(&[0x0f, 0x82], next_range)?;
+                assembler.instruction(&[0x3c, range.end])?;
+                assembler.branch(&[0x0f, 0x86], scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -32926,7 +38591,7 @@ fn x86_emit_suffix_prepass(
     }
 
     assembler.bind(vector_hit)?;
-    let vector_hit_mask = if lazy_vector_filter.is_some() {
+    let vector_hit_mask = if exact_pair_filter.is_some() || lazy_vector_filter.is_some() {
         X86CandidateMask::for_intersection(kind)
     } else {
         X86CandidateMask::for_filter(filter, kind)
@@ -32938,10 +38603,21 @@ fn x86_emit_suffix_prepass(
     assembler.bind(apply)?;
     if let Some(retry) = suffix.retry {
         module_suffix_retry::x86_emit_bounded_suffix_retry(
-            assembler, layout, retry, kind, vector, no_match, matched,
+            assembler, layout, retry, kind, retry_scan, no_match, matched,
         )?;
     } else {
         x86_emit_suffix_restart(assembler, suffix.restart)?;
+    }
+    if let Some(retry_dispatch) = exact_pair_retry_dispatch {
+        let relation_activate = exact_pair_relation_activate.ok_or(
+            ObjectError::InvalidModule(
+                "x86 exact-pair retry dispatch lost its activation label",
+            ),
+        )?;
+        assembler.bind(retry_dispatch)?;
+        assembler.instruction(&[0x85, 0xdb])?; // relation phase active?
+        assembler.branch(&[0x0f, 0x84], relation_activate)?;
+        assembler.branch(&[0xe9], vector)?;
     }
     assembler.bind(done)?;
     Ok(
@@ -33053,6 +38729,52 @@ fn x86_emit_prefix_relation(
     test.extend_from_slice(&relation.bitmap_offset.to_le_bytes());
     assembler.instruction(&test)?;
     assembler.branch(&[0x0f, 0x83], failed)?; // jnc
+    Ok(())
+}
+
+fn x86_emit_exact_pair_scalar_test(
+    assembler: &mut X86Assembler,
+    pair_filter: NativeExactPairFilter,
+    matched: X86Label,
+) -> Result<(), ObjectError> {
+    if pair_filter.pairs().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-pair scalar filter is empty",
+        ));
+    }
+    assembler.instruction(&[0x0f, 0xb7, 0x04, 0x17])?; // movzx eax, word [rdi+rdx]
+    for &pair in pair_filter.pairs() {
+        let [low, high] = pair.to_le_bytes();
+        let compare = [0x66, 0x3d, low, high]; // cmp ax, imm16
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x84], matched)?;
+    }
+    Ok(())
+}
+
+fn x86_emit_start_filter_scalar_candidate(
+    assembler: &mut X86Assembler,
+    filter: NativeStartFilter,
+    candidate: X86Label,
+) -> Result<(), ObjectError> {
+    if filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 scalar candidate filter is empty",
+        ));
+    }
+    x86_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+    for range in filter.ranges() {
+        assembler.instruction(&[0x3c, range.start])?;
+        if range.start == range.end {
+            assembler.branch(&[0x0f, 0x84], candidate)?;
+        } else {
+            let next_range = assembler.label()?;
+            assembler.branch(&[0x0f, 0x82], next_range)?;
+            assembler.instruction(&[0x3c, range.end])?;
+            assembler.branch(&[0x0f, 0x86], candidate)?;
+            assembler.bind(next_range)?;
+        }
+    }
     Ok(())
 }
 
@@ -33540,6 +39262,21 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     let uses_seeded_reverse = layout.seeded_reverse.is_some();
     let retains_teddy_candidates = layout.mandatory_teddy.is_some();
+    let uses_exact_pair_phase_register = if !fixed_candidate && layout.mandatory_teddy.is_none() {
+        if let Some(suffix) = layout.suffix_filter {
+            x86_exact_pair_primary_cold_filter(suffix, table_lookup_kind)?.is_some()
+                && (suffix.retry.is_some() || uses_seeded_reverse)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if uses_exact_pair_phase_register {
+        // RBX is otherwise unused by this lowering. Preserve the caller's
+        // value while it records the one-way primary-to-relation transition.
+        assembler.instruction(&[0x53])?; // push rbx
+    }
     if retain_vector_candidates || uses_seeded_reverse || retains_teddy_candidates {
         // R12/R13 are callee-saved under both supported x86-64 ABIs. Every
         // status exit converges on `done`, which restores them in reverse.
@@ -34385,6 +40122,9 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x5d])?; // pop r13
         assembler.instruction(&[0x41, 0x5c])?; // pop r12
     }
+    if uses_exact_pair_phase_register {
+        assembler.instruction(&[0x5b])?; // pop rbx
+    }
     if (filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
         && (!fixed_candidate || probe_exact_product && layout.prefix_block.is_some()))
         || table_lookup_needs_vzeroupper
@@ -34457,7 +40197,11 @@ fn lower_x86_64_dfa_with_entry_contract(
     // layout itself; accelerator accounting reads that receipt directly.
     // Retained fallback publication authenticates that correlated receipt
     // separately instead of fabricating a one-column scanner emission.
-    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+    let suffix_scanner = if layout.mandatory_teddy.is_some()
+        || layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
         None
     } else {
         layout
@@ -35869,6 +41613,7 @@ fn lower_x86_64_prepared_span_reduce(
         call_kind,
         ordered_nfa_gate,
         None,
+        false,
     )
 }
 
@@ -35881,6 +41626,7 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     call_kind: NativeSpanReducerCallKind,
     ordered_nfa_gate: bool,
     terminal_exact_set: Option<[u64; 4]>,
+    required_ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 64;
     const OUTPUT_OFFSET: u8 = 16;
@@ -35889,6 +41635,11 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     const TERMINAL_END_OFFSET: u8 = 40;
     const SESSION_OFFSET: u8 = 48;
 
+    if required_ordered_nfa_gate && !ordered_nfa_gate {
+        return Err(ObjectError::InvalidModule(
+            "required Ordered-NFA reducer gate was not selected",
+        ));
+    }
     if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA reducer has no private prepared target",
@@ -35940,8 +41691,11 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(&[0xf6, 0xc1, 0x07])?; // output alignment
     assembler.branch(&[0x0f, 0x85], invalid)?;
 
-    let ordered_gate_sites = ordered_nfa_gate
+    let ordered_gate_sites = (ordered_nfa_gate && !required_ordered_nfa_gate)
         .then(|| x86_emit_ordered_nfa_operation_gate(&mut assembler, true))
+        .transpose()?;
+    let required_gate_call = required_ordered_nfa_gate
+        .then(|| x86_emit_required_ordered_nfa_operation_gate(&mut assembler))
         .transpose()?;
 
     // A private prepared target and a self-contained ordinary entry both rely
@@ -36225,7 +41979,10 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
         prepared_call_offset: finished.label_offset(prepared_call)?,
         ordered_nfa_gate_call_offset: ordered_gate_sites
             .map(|(call, _, _)| finished.label_offset(call))
-            .transpose()?,
+            .transpose()?
+            .or(required_gate_call
+                .map(|call| finished.label_offset(call))
+                .transpose()?),
         bulk_runtime_fallback_offset: ordered_gate_sites
             .map(|(_, fallback, _)| finished.label_offset(fallback))
             .transpose()?,
@@ -36253,6 +42010,20 @@ fn lower_x86_64_ordered_nfa_span_reduce(
         NativeSpanReducerCallKind::PreparedPrivate,
         true,
         terminal_exact_set,
+        false,
+    )
+}
+
+fn lower_x86_64_required_ordered_nfa_span_reduce(
+    sink: PreparedSpanSink,
+    terminal_exact_set: Option<[u64; 4]>,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
+        sink,
+        NativeSpanReducerCallKind::PreparedPrivate,
+        true,
+        terminal_exact_set,
+        true,
     )
 }
 
@@ -36479,6 +42250,633 @@ fn lower_x86_64_prepared_grep_count(
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
+    })
+}
+
+fn x86_native_capture_reducer_boundary(
+    assembler: &mut X86Assembler,
+    caller_scratch_bytes: usize,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    assembler.instruction(&[0x48, 0x01, 0xf0])?; // complete haystack extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // scalar output
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+        assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+        assembler.branch(&[0x0f, 0x85], invalid)?;
+        assembler.instruction(&[0x48, 0x89, 0xd0])?;
+        assembler.instruction(&[0x48, 0x83, 0xc0, 8])?; // complete output extent
+        assembler.branch(&[0x0f, 0x82], invalid)?;
+        return Ok(());
+    }
+
+    assembler.instruction(&[0x49, 0x89, 0xc1])?; // retained haystack end
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // caller scratch
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_scratch = vec![0x48, 0xb8];
+    exact_scratch.extend_from_slice(
+        &u64::try_from(caller_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer scratch"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&exact_scratch)?;
+    assembler.instruction(&[0x48, 0x39, 0xc1])?; // exact scratch extent
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xd0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?; // complete scratch extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x49, 0x89, 0xc2])?; // retained scratch end
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x4c, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x83], scratch_haystack_disjoint)?;
+    assembler.instruction(&[0x4c, 0x39, 0xd7])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_output_disjoint = assembler.label()?;
+    assembler.instruction(&[0x4d, 0x8d, 0x58, 8])?;
+    assembler.instruction(&[0x4c, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x83], scratch_output_disjoint)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.bind(scratch_output_disjoint)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // scalar output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 8])?; // complete output extent
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    Ok(())
+}
+
+fn x86_native_capture_reducer_epilogue(
+    assembler: &mut X86Assembler,
+    frame_bytes: u32,
+) -> Result<(), ObjectError> {
+    let mut release = vec![0x48, 0x81, 0xc4];
+    release.extend_from_slice(&frame_bytes.to_le_bytes());
+    assembler.instruction(&release)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact selector progress, private replay request, and transactional reduction form one auditable native closure"
+)]
+fn lower_x86_64_native_participation_reducer_domain_v1(
+    group_count: usize,
+    participation_scratch_bytes: usize,
+    caller_scratch_bytes: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const FRAME_BYTES: u32 = 120;
+    const SPAN_OFFSET: u8 = 0;
+    const REQUEST_OFFSET: u8 = 16;
+    const SCRATCH_OFFSET: u8 = 80;
+    const COUNT_OFFSET: u8 = 96;
+    const FLAGS_OFFSET: u8 = 112;
+    if !(1..=64).contains(&group_count)
+        || participation_scratch_bytes == 0
+        || (caller_scratch_bytes == 0
+            && participation_scratch_bytes
+                != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+        || (caller_scratch_bytes != 0
+            && caller_scratch_bytes != participation_scratch_bytes)
+    {
+        return Err(ObjectError::InvalidModule(
+            "participation reducer group cardinality",
+        ));
+    }
+    let group_count = u32::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("participation reducer groups"))?;
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let participation_matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&FRAME_BYTES.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    } else {
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+    }
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // next start
+    assembler.instruction(&[0x48, 0x31, 0xed])?; // last end
+    assembler.instruction(&[0xc7, 0x44, 0x24, FLAGS_OFFSET, 0, 0, 0, 0])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], search)?;
+    assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?; // next == length
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x48, 0x89, 0xda])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe9])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x44, 0x24, SPAN_OFFSET])?;
+    assembler.instruction(&[0xe8])?;
+    let selector_call = assembler.label()?;
+    assembler.bind(selector_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, SPAN_OFFSET])?; // start
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, SPAN_OFFSET + 8])?; // end
+    assembler.instruction(&[0x49, 0x39, 0xd9])?; // start >= next
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xca])?; // end >= start
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xea])?; // end <= length
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?;
+    assembler.branch(&[0x0f, 0x85], nonempty)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], accepted_empty)?;
+    assembler.instruction(&[0x49, 0x39, 0xea])?; // end != last
+    assembler.branch(&[0x0f, 0x85], accepted_empty)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(accepted)?;
+    assembler.instruction(&[0x4c, 0x89, 0xd3])?; // next = end
+    assembler.instruction(&[0x4c, 0x89, 0xd5])?; // last = end
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?; // bundle(%rip)
+    let bundle_relocation = assembler.label()?;
+    assembler.bind(bundle_relocation)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET])?;
+    assembler.instruction(&[0x4c, 0x89, 0x64, 0x24, REQUEST_OFFSET + 8])?;
+    assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, REQUEST_OFFSET + 16])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, REQUEST_OFFSET + 24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, REQUEST_OFFSET + 32])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
+        let mut exact_scratch = vec![
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            REQUEST_OFFSET + 48,
+        ];
+        exact_scratch.extend_from_slice(
+            &u32::try_from(participation_scratch_bytes)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("participation reducer scratch")
+                })?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&exact_scratch)?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SCRATCH_OFFSET + 8])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 48])?;
+    }
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, COUNT_OFFSET])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, REQUEST_OFFSET + 56])?;
+    assembler.instruction(&[0x48, 0x8d, 0x7c, 0x24, REQUEST_OFFSET])?;
+    assembler.instruction(&[0xe8])?;
+    let participation_call = assembler.label()?;
+    assembler.bind(participation_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], participation_matched)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(participation_matched)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, COUNT_OFFSET])?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    let mut group_bound = vec![0x48, 0x3d];
+    group_bound.extend_from_slice(&group_count.to_le_bytes());
+    assembler.instruction(&group_bound)?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x49, 0x01, 0xc7])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    x86_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let selector_call = finished.label_offset(selector_call)?;
+    let participation_call = finished.label_offset(participation_call)?;
+    let bundle_relocation = finished.label_offset(bundle_relocation)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code: finished.code,
+        local_calls: vec![
+            (
+                selector_call,
+                NativeCaptureReducerCallTargetV1::Selector,
+            ),
+            (
+                participation_call,
+                NativeCaptureReducerCallTargetV1::Participation,
+            ),
+        ]
+        .into_boxed_slice(),
+        bundle_relocations: vec![(
+            bundle_relocation,
+            RelocationKind::X86PcRelative32,
+            -4,
+        )]
+        .into_boxed_slice(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "private iterator state, exact capture schema validation, and transactional reduction form one generated native closure"
+)]
+fn lower_x86_64_native_capture_next_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const STATE_BYTES: usize = 24;
+    if !(1..=16).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "capture-next reducer group cardinality",
+        ));
+    }
+    let slots_bytes = group_count
+        .checked_mul(16)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer slots"))?;
+    let frame_bytes = STATE_BYTES
+        .checked_add(slots_bytes)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .filter(|bytes| bytes % 16 == 8)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer frame"))?;
+    let group_count_u32 = u32::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("capture reducer groups"))?;
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let finished = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    let mut reserve = vec![0x48, 0x81, 0xec];
+    reserve.extend_from_slice(&frame_bytes.to_le_bytes());
+    assembler.instruction(&reserve)?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    assembler.instruction(&[0x4d, 0x31, 0xff])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 8])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 16])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x48, 0x89, 0xe2])?;
+    assembler.instruction(&[0x48, 0x8d, 0x4c, 0x24, STATE_BYTES as u8])?;
+    let mut exact_count = vec![0x41, 0xb8];
+    exact_count.extend_from_slice(&group_count_u32.to_le_bytes());
+    assembler.instruction(&exact_count)?;
+    assembler.instruction(&[0xe8])?;
+    let capture_next_call = assembler.label()?;
+    assembler.bind(capture_next_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    x86_capture_load_rsp_rax(&mut assembler, STATE_BYTES)?;
+    x86_capture_load_rsp_rdi(&mut assembler, STATE_BYTES + 8)?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x39, 0xf8])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0x4c, 0x39, 0xef])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+    assembler.instruction(&[0xbb, 1, 0, 0, 0])?;
+    for group in 1..group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        x86_capture_load_rsp_rax(&mut assembler, STATE_BYTES + group * 16)?;
+        x86_capture_load_rsp_rdi(&mut assembler, STATE_BYTES + group * 16 + 8)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x39, 0xf8])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, STATE_BYTES as u8])?;
+        assembler.instruction(&[0x4c, 0x39, 0xc0])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, (STATE_BYTES + 8) as u8])?;
+        assembler.instruction(&[0x4c, 0x39, 0xc7])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.branch(&[0xe9], valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(&[0x48, 0x83, 0xff, 0xff])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.bind(valid)?;
+    }
+    assembler.instruction(&[0x49, 0x01, 0xdf])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    x86_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let capture_next_call = finished.label_offset(capture_next_call)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code: finished.code,
+        local_calls: vec![(
+            capture_next_call,
+            NativeCaptureReducerCallTargetV1::CaptureNext,
+        )]
+        .into_boxed_slice(),
+        bundle_relocations: Box::new([]),
+    })
+}
+
+fn lower_x86_64_native_capture_grep_wrapper_v1(
+    caller_scratch_bytes: usize,
+) -> Result<(Vec<u8>, usize), ObjectError> {
+    const LINE_START_OFFSET: u8 = 8;
+    const SCRATCH_OFFSET: u8 = 16;
+    let frame_bytes = if caller_scratch_bytes == 0 { 16 } else { 32 };
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    } else {
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+    }
+    assembler.instruction(&[0x4d, 0x31, 0xff])?;
+    assembler.instruction(&[0x48, 0x31, 0xdb])?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x48, 0x89, 0x5c, 0x24, LINE_START_OFFSET])?;
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x1c, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x49, 0x89, 0xdb])?; // line end
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x48, 0x8b, 0x6c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x49, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x43, 0x80, 0x7c, 0x1c, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x49, 0x83, 0xeb, 1])?;
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x49, 0x89, 0xdb])?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x48, 0x8b, 0x6c, 0x24, LINE_START_OFFSET])?;
+    assembler.instruction(&[0x49, 0x29, 0xeb])?; // line length
+    assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?;
+    assembler.instruction(&[0x4c, 0x89, 0xde])?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(&[0x48, 0x8d, 0x14, 0x24])?;
+    } else {
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, SCRATCH_OFFSET])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, SCRATCH_OFFSET + 8])?;
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    }
+    assembler.instruction(&[0xe8])?;
+    let private_call = assembler.label()?;
+    assembler.bind(private_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    assembler.instruction(&[0x4c, 0x03, 0x3c, 0x24])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let private_call = finished.label_offset(private_call)?;
+    Ok((finished.code, private_call))
+}
+
+fn lower_x86_64_native_capture_reducer_v1(
+    domain: NativeCaptureReducerDomainV1,
+    source: NativeCaptureReducerSourceV1<'_>,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let caller_scratch_bytes = source.caller_scratch_bytes();
+    let lowered = match source {
+        NativeCaptureReducerSourceV1::ExactSpanParticipation {
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+            ..
+        } => lower_x86_64_native_participation_reducer_domain_v1(
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+        )?,
+        NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
+            lower_x86_64_native_capture_next_reducer_domain_v1(group_count)?
+        }
+    };
+    if domain == NativeCaptureReducerDomainV1::WholeHaystack {
+        return Ok(lowered);
+    }
+    let (mut code, private_call) =
+        lower_x86_64_native_capture_grep_wrapper_v1(caller_scratch_bytes)?;
+    let private_offset = code
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("capture reducer private alignment"))?
+        & !15;
+    code.try_reserve_exact(
+        private_offset
+            .checked_sub(code.len())
+            .and_then(|padding| padding.checked_add(lowered.code.len()))
+            .ok_or(ObjectError::ArithmeticOverflow("capture reducer private extent"))?,
+    )
+    .map_err(|_| ObjectError::Allocation("capture reducer private code"))?;
+    code.resize(private_offset, 0x90);
+    push_bytes(&mut code, &lowered.code)?;
+    let mut local_calls = Vec::new();
+    local_calls
+        .try_reserve_exact(
+            1_usize
+                .checked_add(lowered.local_calls.len())
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer calls"))?,
+        )
+        .map_err(|_| ObjectError::Allocation("capture reducer calls"))?;
+    local_calls.push((
+        private_call,
+        NativeCaptureReducerCallTargetV1::PrivateDomain(private_offset),
+    ));
+    for &(offset, target) in lowered.local_calls.iter() {
+        local_calls.push((
+            private_offset
+                .checked_add(offset)
+                .ok_or(ObjectError::ArithmeticOverflow("capture reducer child call"))?,
+            target,
+        ));
+    }
+    let mut bundle_relocations = Vec::new();
+    bundle_relocations
+        .try_reserve_exact(lowered.bundle_relocations.len())
+        .map_err(|_| ObjectError::Allocation("capture reducer bundle relocations"))?;
+    for &(offset, kind, addend) in lowered.bundle_relocations.iter() {
+        bundle_relocations.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("capture reducer bundle relocation"),
+            )?,
+            kind,
+            addend,
+        ));
+    }
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: local_calls.into_boxed_slice(),
+        bundle_relocations: bundle_relocations.into_boxed_slice(),
     })
 }
 
@@ -37222,6 +43620,7 @@ fn lower_aarch64_prepared_span_reduce(
         call_kind,
         ordered_nfa_gate,
         None,
+        false,
     )
 }
 
@@ -37234,6 +43633,7 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     call_kind: NativeSpanReducerCallKind,
     ordered_nfa_gate: bool,
     terminal_exact_set: Option<[u64; 4]>,
+    required_ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     const LEGACY_FRAME_BYTES: u16 = 112;
     const TERMINAL_FRAME_BYTES: u16 = 128;
@@ -37242,6 +43642,11 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     const SESSION_PAIR_OFFSET: i16 = 96;
     const TERMINAL_END_OFFSET: u16 = 112;
 
+    if required_ordered_nfa_gate && !ordered_nfa_gate {
+        return Err(ObjectError::InvalidModule(
+            "required AArch64 Ordered-NFA reducer gate was not selected",
+        ));
+    }
     if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA reducer has no private prepared target",
@@ -37294,8 +43699,11 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
     assembler.branch_nonzero_x(7, invalid)?;
 
-    let ordered_gate_sites = ordered_nfa_gate
+    let ordered_gate_sites = (ordered_nfa_gate && !required_ordered_nfa_gate)
         .then(|| aarch64_emit_ordered_nfa_operation_gate(&mut assembler, true))
+        .transpose()?;
+    let required_gate_call = required_ordered_nfa_gate
+        .then(|| aarch64_emit_required_ordered_nfa_operation_gate(&mut assembler))
         .transpose()?;
 
     // Authenticate the exact linked artifact before either local call shape
@@ -37532,12 +43940,18 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
         });
         (call_index, fallback_index, identity_indices)
     });
+    let required_gate_index = required_gate_call.map(|call| {
+        let index = offsets.len();
+        offsets.push(call);
+        index
+    });
     let code = assembler.finish_with_offsets(&mut offsets)?;
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
         ordered_nfa_gate_call_offset: ordered_gate_indices
-            .map(|(call, _, _)| offsets[call]),
+            .map(|(call, _, _)| offsets[call])
+            .or(required_gate_index.map(|index| offsets[index])),
         bulk_runtime_fallback_offset: ordered_gate_indices
             .map(|(_, fallback, _)| offsets[fallback]),
         compatibility_identity_relocation: ordered_gate_indices
@@ -37566,6 +43980,20 @@ fn lower_aarch64_ordered_nfa_span_reduce(
         NativeSpanReducerCallKind::PreparedPrivate,
         true,
         terminal_exact_set,
+        false,
+    )
+}
+
+fn lower_aarch64_required_ordered_nfa_span_reduce(
+    sink: PreparedSpanSink,
+    terminal_exact_set: Option<[u64; 4]>,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
+        sink,
+        NativeSpanReducerCallKind::PreparedPrivate,
+        true,
+        terminal_exact_set,
+        true,
     )
 }
 
@@ -37767,6 +44195,614 @@ fn lower_aarch64_prepared_grep_count(
                 page_offset: offsets[2],
             },
         ),
+    })
+}
+
+fn aarch64_native_capture_reducer_boundary(
+    assembler: &mut Aarch64Assembler,
+    caller_scratch_bytes: usize,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    if caller_scratch_bytes == 0 {
+        assembler.branch_zero_x(2, invalid)?;
+        assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
+        assembler.branch_nonzero_x(5, invalid)?;
+        assembler.instruction(aarch64_add_x_imm(5, 2, 8)?)?;
+        assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid)?;
+        return Ok(());
+    }
+
+    assembler.instruction(aarch64_mov_x(6, 5)?)?;
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 2, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    aarch64_load_u64_constant(
+        assembler,
+        5,
+        u64::try_from(caller_scratch_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reducer scratch"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(3, 5)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 2, 3)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.instruction(aarch64_mov_x(7, 5)?)?;
+    let scratch_haystack_disjoint = assembler.label()?;
+    assembler.branch_zero_x(1, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(2, 6)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_haystack_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(0, 7)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_haystack_disjoint)?;
+    let scratch_output_disjoint = assembler.label()?;
+    assembler.instruction(aarch64_add_x_imm(8, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(2, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, scratch_output_disjoint)?;
+    assembler.instruction(aarch64_cmp_x(4, 7)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.bind(scratch_output_disjoint)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 4)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    Ok(())
+}
+
+fn aarch64_native_capture_reducer_save(
+    assembler: &mut Aarch64Assembler,
+    frame_bytes: u16,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(first, second, 31, offset)?)?;
+    }
+    Ok(())
+}
+
+fn aarch64_native_capture_reducer_epilogue(
+    assembler: &mut Aarch64Assembler,
+    frame_bytes: u16,
+) -> Result<(), ObjectError> {
+    for (first, second, offset) in [
+        (19, 20, 0),
+        (21, 22, 16),
+        (23, 24, 32),
+        (25, 26, 48),
+        (27, 28, 64),
+        (29, 30, 80),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(first, second, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact selector progress, private replay request, and transactional reduction form one AAPCS64 closure"
+)]
+fn lower_aarch64_native_participation_reducer_domain_v1(
+    group_count: usize,
+    participation_scratch_bytes: usize,
+    caller_scratch_bytes: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const FRAME_BYTES: u16 = 208;
+    const SPAN_OFFSET: u16 = 96;
+    const REQUEST_OFFSET: u16 = 112;
+    const SCRATCH_OFFSET: u16 = 176;
+    const COUNT_OFFSET: u16 = 192;
+    if !(1..=64).contains(&group_count)
+        || participation_scratch_bytes == 0
+        || (caller_scratch_bytes == 0
+            && participation_scratch_bytes
+                != crate::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES)
+        || (caller_scratch_bytes != 0
+            && caller_scratch_bytes != participation_scratch_bytes)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 participation reducer group cardinality",
+        ));
+    }
+    let group_count = u16::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 participation groups"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted_empty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let participation_matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(
+        &mut assembler,
+        caller_scratch_bytes,
+        invalid,
+    )?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+        assembler.instruction(aarch64_store_x(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(3, 31, SCRATCH_OFFSET + 8)?)?;
+    }
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_w(25, 0)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.branch_bit_clear_w(25, 1, search)?;
+    assembler.instruction(aarch64_movz_w(5, 2)?)?;
+    assembler.instruction(aarch64_eor_w(25, 25, 5)?)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 23)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, SPAN_OFFSET)?)?;
+    let selector_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_pair_x(
+        5,
+        6,
+        31,
+        i16::try_from(SPAN_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reducer span"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(5, 23)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 5)?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_NE, nonempty)?;
+    assembler.branch_bit_clear_w(25, 0, accepted_empty)?;
+    assembler.instruction(aarch64_cmp_x(6, 24)?)?;
+    assembler.branch_cond(AARCH64_NE, accepted_empty)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(aarch64_movz_w(25, 1)?)?;
+    assembler.branch(accepted)?;
+    assembler.bind(accepted_empty)?;
+    assembler.instruction(aarch64_movz_w(25, 3)?)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(aarch64_mov_x(23, 6)?)?;
+    assembler.instruction(aarch64_mov_x(24, 6)?)?;
+
+    let bundle_page = assembler.instruction(0x9000_0007)?; // adrp x7, bundle
+    let bundle_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(19, 31, REQUEST_OFFSET + 8)?)?;
+    assembler.instruction(aarch64_store_x(20, 31, REQUEST_OFFSET + 16)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, REQUEST_OFFSET + 24)?)?;
+    assembler.instruction(aarch64_store_x(6, 31, REQUEST_OFFSET + 32)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_add_x_imm(7, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
+        assembler.instruction(aarch64_movz_x(
+            7,
+            u16::try_from(participation_scratch_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 participation reducer scratch")
+            })?,
+            0,
+        )?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    } else {
+        assembler.instruction(aarch64_load_x_imm(7, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 40)?)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, SCRATCH_OFFSET + 8)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 48)?)?;
+    }
+    assembler.instruction(aarch64_add_x_imm(7, 31, COUNT_OFFSET)?)?;
+    assembler.instruction(aarch64_store_x(7, 31, REQUEST_OFFSET + 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(0, 31, REQUEST_OFFSET)?)?;
+    let participation_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, participation_matched)?;
+    assembler.branch_zero_w(0, runtime_failure)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(participation_matched)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_OFFSET)?)?;
+    assembler.branch_zero_x(5, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x_imm(5, group_count)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 5)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [
+        selector_call,
+        participation_call,
+        bundle_page,
+        bundle_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: vec![
+            (offsets[0], NativeCaptureReducerCallTargetV1::Selector),
+            (
+                offsets[1],
+                NativeCaptureReducerCallTargetV1::Participation,
+            ),
+        ]
+        .into_boxed_slice(),
+        bundle_relocations: vec![
+            (offsets[2], RelocationKind::Aarch64Page21, 0),
+            (offsets[3], RelocationKind::Aarch64PageOff12, 0),
+        ]
+        .into_boxed_slice(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "private iterator state, exact capture schema validation, and transactional reduction form one generated AAPCS64 closure"
+)]
+fn lower_aarch64_native_capture_next_reducer_domain_v1(
+    group_count: usize,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    const STATE_OFFSET: u16 = 96;
+    const SLOT_OFFSET: u16 = 120;
+    if !(1..=16).contains(&group_count) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 capture-next reducer group cardinality",
+        ));
+    }
+    let frame_bytes = group_count
+        .checked_mul(16)
+        .and_then(|bytes| bytes.checked_add(128))
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .filter(|bytes| bytes.is_multiple_of(16))
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture reducer frame"))?;
+    let group_count_u64 = u64::try_from(group_count)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture reducer groups"))?;
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let matched = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        31,
+        31,
+        31,
+        i16::try_from(STATE_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture state"))?,
+    )?)?;
+    assembler.instruction(aarch64_store_x(31, 31, STATE_OFFSET + 16)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 31, STATE_OFFSET)?)?;
+    assembler.instruction(aarch64_add_x_imm(3, 31, SLOT_OFFSET)?)?;
+    aarch64_load_u64_constant(&mut assembler, 4, group_count_u64)?;
+    let capture_next_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    aarch64_load_u64_constant(&mut assembler, 7, u64::MAX)?;
+    assembler.instruction(aarch64_load_pair_x(
+        5,
+        6,
+        31,
+        i16::try_from(SLOT_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group zero"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+    assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_movz_x(23, 1, 0)?)?;
+    for group in 1..group_count {
+        let valid = assembler.label()?;
+        let unset = assembler.label()?;
+        let offset = SLOT_OFFSET
+            .checked_add(
+                u16::try_from(group * 16)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture slot"))?,
+            )
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture slot"))?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 capture slot"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, unset)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            8,
+            9,
+            31,
+            i16::try_from(SLOT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 group zero"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 8)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 9)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+        assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+        assembler.branch(valid)?;
+        assembler.bind(unset)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.bind(valid)?;
+    }
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 23)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [capture_next_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: vec![(
+            offsets[0],
+            NativeCaptureReducerCallTargetV1::CaptureNext,
+        )]
+        .into_boxed_slice(),
+        bundle_relocations: Box::new([]),
+    })
+}
+
+fn lower_aarch64_native_capture_grep_wrapper_v1(
+    caller_scratch_bytes: usize,
+) -> Result<(Vec<u8>, usize), ObjectError> {
+    const COUNT_OFFSET: u16 = 96;
+    const SCRATCH_OFFSET: u16 = 104;
+    let frame_bytes = if caller_scratch_bytes == 0 { 112 } else { 128 };
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_native_capture_reducer_boundary(
+        &mut assembler,
+        caller_scratch_bytes,
+        invalid,
+    )?;
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+        assembler.instruction(aarch64_store_x(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_store_x(3, 31, SCRATCH_OFFSET + 8)?)?;
+    }
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(24, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(5, 19, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(5, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_cmp_x(25, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 25, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 19, 5)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(6, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(25, 25, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
+    assembler.instruction(aarch64_sub_x_reg(1, 25, 24)?)?;
+    if caller_scratch_bytes == 0 {
+        assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    } else {
+        assembler.instruction(aarch64_load_x_imm(2, 31, SCRATCH_OFFSET)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, SCRATCH_OFFSET + 8)?)?;
+        assembler.instruction(aarch64_add_x_imm(4, 31, COUNT_OFFSET)?)?;
+    }
+    let private_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, COUNT_OFFSET)?)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 5)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [private_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok((code, offsets[0]))
+}
+
+fn lower_aarch64_native_capture_reducer_v1(
+    domain: NativeCaptureReducerDomainV1,
+    source: NativeCaptureReducerSourceV1<'_>,
+) -> Result<NativeCaptureReducerLoweringV1, ObjectError> {
+    let caller_scratch_bytes = source.caller_scratch_bytes();
+    let lowered = match source {
+        NativeCaptureReducerSourceV1::ExactSpanParticipation {
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+            ..
+        } => lower_aarch64_native_participation_reducer_domain_v1(
+            group_count,
+            participation_scratch_bytes,
+            caller_scratch_bytes,
+        )?,
+        NativeCaptureReducerSourceV1::CaptureNext { group_count, .. } => {
+            lower_aarch64_native_capture_next_reducer_domain_v1(group_count)?
+        }
+    };
+    if domain == NativeCaptureReducerDomainV1::WholeHaystack {
+        return Ok(lowered);
+    }
+    let (mut code, private_call) =
+        lower_aarch64_native_capture_grep_wrapper_v1(caller_scratch_bytes)?;
+    if !code.len().is_multiple_of(4) || !lowered.code.len().is_multiple_of(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 capture reducer instruction alignment",
+        ));
+    }
+    let private_offset = code.len();
+    push_bytes(&mut code, &lowered.code)?;
+    let mut local_calls = Vec::new();
+    local_calls
+        .try_reserve_exact(
+            1_usize
+                .checked_add(lowered.local_calls.len())
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 capture reducer calls"))?,
+        )
+        .map_err(|_| ObjectError::Allocation("AArch64 capture reducer calls"))?;
+    local_calls.push((
+        private_call,
+        NativeCaptureReducerCallTargetV1::PrivateDomain(private_offset),
+    ));
+    for &(offset, target) in lowered.local_calls.iter() {
+        local_calls.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 capture reducer child call"),
+            )?,
+            target,
+        ));
+    }
+    let mut bundle_relocations = Vec::new();
+    bundle_relocations
+        .try_reserve_exact(lowered.bundle_relocations.len())
+        .map_err(|_| ObjectError::Allocation("AArch64 capture reducer relocations"))?;
+    for &(offset, kind, addend) in lowered.bundle_relocations.iter() {
+        bundle_relocations.push((
+            private_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 capture reducer relocation"),
+            )?,
+            kind,
+            addend,
+        ));
+    }
+    Ok(NativeCaptureReducerLoweringV1 {
+        code,
+        local_calls: local_calls.into_boxed_slice(),
+        bundle_relocations: bundle_relocations.into_boxed_slice(),
     })
 }
 
@@ -47153,9 +54189,36 @@ fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
     )
 }
 
+fn aarch64_and_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x8a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_bic_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x8a20_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_orr_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x2a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xaa00_0000
             | aarch64_reg(right, 16)?
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
@@ -47174,6 +54237,10 @@ fn aarch64_eor_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
 #[cfg(test)]
 fn aarch64_tst_w(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0x6a00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
+}
+
+fn aarch64_tst_x(left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0xea00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
 fn aarch64_tst_w_all_but_bit(register: u8, bit: u8) -> Result<u32, ObjectError> {
@@ -47668,6 +54735,95 @@ fn aarch64_emit_scalar_filter_membership(
     assembler.branch(failed)?;
     assembler.bind(passed)?;
     Ok(())
+}
+
+/// Branch to `candidate` when the current base satisfies one exact projected
+/// column. Unlike [`aarch64_emit_scalar_filter_membership`], a miss falls
+/// through so a one-way cold switch can advance past the independently
+/// checked base before replacing the projected constant bank.
+fn aarch64_emit_start_filter_scalar_candidate(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 scalar candidate filter is empty",
+        ));
+    }
+    aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+    for range in filter.ranges() {
+        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+        if range.start == range.end {
+            assembler.branch_cond(AARCH64_EQ, candidate)?;
+        } else {
+            let next_range = assembler.label()?;
+            assembler.branch_cond(AARCH64_LO, next_range)?;
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
+            assembler.branch_cond(AARCH64_LS, candidate)?;
+            assembler.bind(next_range)?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_exact_pair_scalar_test(
+    assembler: &mut Aarch64Assembler,
+    pair_filter: NativeExactPairFilter,
+    matched: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if pair_filter.pairs().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair scalar filter is empty",
+        ));
+    }
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_load_halfword_imm(8, 12, 0)?)?;
+    for &pair in pair_filter.pairs() {
+        // X9 retains the immutable search-window start for OriginalStart and
+        // synchronizing suffix restarts. X12 is dead after the halfword load
+        // and is the ordinary scalar-filter scratch register.
+        assembler.instruction(aarch64_movz_w(12, pair)?)?;
+        assembler.instruction(aarch64_cmp_w(8, 12)?)?;
+        assembler.branch_cond(AARCH64_EQ, matched)?;
+    }
+    Ok(())
+}
+
+/// Select a cheap primary-only ASIMD phase ahead of the exact pair relation.
+///
+/// The phase is deliberately one-way. Its standalone candidate masks occupy
+/// V0..V3, overlapping the exact relation's V1..V6 constant bank, while the
+/// relation subsequently clobbers the standalone V16..V23 constant bank.
+/// Materializing relation constants only after the first primary hit keeps a
+/// projection-absent scan cheap and makes every later retry unambiguously
+/// relation-owned.
+fn aarch64_exact_pair_primary_cold_filter(
+    suffix: NativeSuffixFilter,
+    use_asimd: bool,
+    use_asimd_batch: bool,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if !use_asimd || !use_asimd_batch || suffix.minimum_width < 2 {
+        return Ok(None);
+    }
+    let Some(pair_filter) = suffix.exact_pair_filter else {
+        return Ok(None);
+    };
+    let filter = suffix.filter;
+    if filter.scan_offset > 1 {
+        return Ok(None);
+    }
+    let membership = start_filter_membership(filter)?;
+    let projection_is_covered = pair_filter.pairs().iter().all(|pair| {
+        let byte = if filter.scan_offset == 0 {
+            *pair as u8
+        } else {
+            (*pair >> 8) as u8
+        };
+        let index = usize::from(byte);
+        membership[index / 64] & (1_u64 << (index % 64)) != 0
+    });
+    Ok(projection_is_covered.then_some(filter))
 }
 
 /// `AArch64` counterpart of the exact-product probe at the untouched window
@@ -49978,6 +57134,10 @@ fn aarch64_ext_16b(
 const AARCH64_EXACT_FILTER_SCRATCH: u8 = 28;
 const AARCH64_VECTOR_FILTER_FIRST_CONSTANT: u8 = 1;
 const AARCH64_STANDALONE_FILTER_FIRST_CONSTANT: u8 = 16;
+// Optimizing+Exists exact-pair suffix retries do not retain the endpoint
+// minimum used by other output contracts. Keep their one-way relation phase
+// in caller-saved W13 across the bounded verifier.
+const AARCH64_SUFFIX_RELATION_PHASE: u8 = 13;
 
 const fn aarch64_caller_saved_simd(register: u8) -> bool {
     register <= 7 || register >= 16
@@ -52923,7 +60083,11 @@ fn aarch64_emit_suffix_prepass(
             matched,
         );
     }
-    let use_sve = sve_kind.is_some();
+    let exact_pair_filter = suffix.exact_pair_filter;
+    // The exact relation has an ASIMD lowering. Targets that also advertise
+    // SVE keep the complete ASIMD relation instead of reintroducing the
+    // independent-column projection in a second runtime branch.
+    let use_sve = sve_kind.is_some() && exact_pair_filter.is_none();
     let use_runtime_vl_dispatch = use_sve && use_asimd;
     if let Some(reverse) = layout.seeded_reverse {
         return module_seeded_reverse_aarch64::aarch64_emit_seeded_reverse_prepass(
@@ -52969,11 +60133,50 @@ fn aarch64_emit_suffix_prepass(
     } else {
         None
     };
-    let retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
+    let incumbent_retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
     let filter = suffix.filter;
-    let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
-    let maximum_scan_offset =
-        scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
+    let lazy_vector_filter = exact_pair_filter.is_none().then_some(suffix.vector_filter).flatten();
+    let scalar_filter = exact_pair_filter
+        .is_none()
+        .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+        .flatten();
+    let maximum_scan_offset = exact_pair_filter.map_or_else(
+        || scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
+        |_| 1,
+    );
+    let exact_pair_primary_cold_filter =
+        aarch64_exact_pair_primary_cold_filter(suffix, use_asimd, use_asimd_batch)?;
+    let exact_pair_primary_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_relation_activate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_vector = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_scalar = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_batch_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_single_hit = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_primary_candidate = exact_pair_primary_cold_filter
+        .map(|_| assembler.label())
+        .transpose()?;
+    let exact_pair_retry_dispatch = exact_pair_primary_cold_filter
+        .filter(|_| suffix.retry.is_some())
+        .map(|_| assembler.label())
+        .transpose()?;
+    let retry_scan = exact_pair_retry_dispatch.unwrap_or(incumbent_retry_scan);
+    if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair primary phase escaped Exists admission",
+        ));
+    }
     if suffix.minimum_width == 0 {
         return Err(ObjectError::InvalidModule(
             "AArch64 suffix filter has zero minimum width",
@@ -52982,7 +60185,15 @@ fn aarch64_emit_suffix_prepass(
     let mut batch_first_candidates = None;
     let emit_constants = |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
         if use_asimd {
-            if let Some(vector_filter) = suffix.vector_filter {
+            if let Some(primary_filter) = exact_pair_primary_cold_filter {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    primary_filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            } else if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            } else if let Some(vector_filter) = lazy_vector_filter {
                 let mut first_register = AARCH64_VECTOR_FILTER_FIRST_CONSTANT;
                 for &column in vector_filter.columns() {
                     aarch64_emit_start_filter_constants(assembler, column, first_register)?;
@@ -53009,6 +60220,9 @@ fn aarch64_emit_suffix_prepass(
     assembler.branch_cond(AARCH64_LO, done)?;
     if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS && !use_runtime_vl_dispatch {
         emit_constants(assembler)?;
+    }
+    if exact_pair_retry_dispatch.is_some() {
+        assembler.instruction(aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0)?)?;
     }
 
     if use_runtime_vl_dispatch {
@@ -53074,6 +60288,121 @@ fn aarch64_emit_suffix_prepass(
             assembler.bind(mixed_asimd_setup)?;
             emit_constants(assembler)?;
         }
+        if let Some(primary_filter) = exact_pair_primary_cold_filter {
+            let primary_vector = exact_pair_primary_vector.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary vector label is absent",
+            ))?;
+            let primary_single_vector = exact_pair_primary_single_vector.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 exact-pair primary single-vector label is absent",
+                ),
+            )?;
+            let primary_scalar = exact_pair_primary_scalar.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary scalar label is absent",
+            ))?;
+            let primary_batch_hit = exact_pair_primary_batch_hit.ok_or(
+                ObjectError::InvalidModule("AArch64 exact-pair primary batch-hit label is absent"),
+            )?;
+            let primary_single_hit = exact_pair_primary_single_hit.ok_or(
+                ObjectError::InvalidModule(
+                    "AArch64 exact-pair primary single-hit label is absent",
+                ),
+            )?;
+            let primary_candidate = exact_pair_primary_candidate.ok_or(
+                ObjectError::InvalidModule("AArch64 exact-pair primary candidate label is absent"),
+            )?;
+            let relation_activate =
+                exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                    "AArch64 exact-pair relation activation label is absent",
+                ))?;
+            let pair_filter = exact_pair_filter.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary phase lost its relation",
+            ))?;
+            assembler.bind(primary_vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let batch_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_BATCH_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-pair primary width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, primary_single_vector)?;
+            let primary_candidates = aarch64_emit_start_filter_batch_candidates(
+                assembler,
+                primary_filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
+            assembler.branch_cond(AARCH64_NE, primary_batch_hit)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(primary_batch_hit)?;
+            aarch64_emit_first_candidate_in_batch(assembler, primary_candidates)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_single_vector)?;
+            let vector_bytes = u16::from(maximum_scan_offset)
+                .checked_add(AARCH64_ASIMD_VECTOR_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-pair primary tail width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, primary_scalar)?;
+            aarch64_emit_start_filter_address(assembler, primary_filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
+            aarch64_emit_start_filter_vector_candidates(
+                assembler,
+                primary_filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(assembler, 24)?;
+            assembler.branch_cond(AARCH64_NE, primary_single_hit)?;
+            assembler.instruction(aarch64_add_x_imm(
+                2,
+                2,
+                AARCH64_ASIMD_VECTOR_BYTES,
+            )?)?;
+            assembler.branch(primary_vector)?;
+
+            assembler.bind(primary_single_hit)?;
+            aarch64_emit_first_candidate_lane(assembler, 24)?;
+            assembler.branch(primary_candidate)?;
+
+            assembler.bind(primary_scalar)?;
+            aarch64_emit_start_filter_scalar_bound(
+                assembler,
+                maximum_scan_offset,
+                no_match,
+            )?;
+            aarch64_emit_start_filter_scalar_candidate(
+                assembler,
+                primary_filter,
+                primary_candidate,
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(primary_scalar)?;
+
+            assembler.bind(primary_candidate)?;
+            // A projected byte is only a necessary condition. Authenticate
+            // the complete canonical pair before granting the graph-bound
+            // verifier its existing exact-factor candidate contract.
+            aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(relation_activate)?;
+
+            assembler.bind(relation_activate)?;
+            if exact_pair_retry_dispatch.is_some() {
+                assembler.instruction(aarch64_movz_w(
+                    AARCH64_SUFFIX_RELATION_PHASE,
+                    1,
+                )?)?;
+            }
+            aarch64_emit_prefix_relation_constants(assembler, pair_filter.vector_plan)?;
+            assembler.branch(vector)?;
+        }
         assembler.bind(vector)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         if use_asimd_batch {
@@ -53084,20 +60413,26 @@ fn aarch64_emit_suffix_prepass(
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
             assembler.branch_cond(AARCH64_LO, single_vector)?;
-            let first_register = if suffix.vector_filter.is_some() {
-                AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+            let first_candidates = if let Some(pair_filter) = exact_pair_filter {
+                aarch64_emit_prefix_relation_batch_candidates(
+                    assembler,
+                    pair_filter.vector_plan,
+                )?
             } else {
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                let first_register = if lazy_vector_filter.is_some() {
+                    AARCH64_VECTOR_FILTER_FIRST_CONSTANT
+                } else {
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                };
+                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?
             };
-            let first_candidates =
-                aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?;
             batch_first_candidates = Some(first_candidates);
             aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
-                if suffix.vector_filter.is_some() {
+                if lazy_vector_filter.is_some() {
                     batch_primary_hit
-                } else if use_exact_asimd_lane {
+                } else if use_exact_asimd_lane || exact_pair_filter.is_some() {
                     batch_hit
                 } else {
                     scalar
@@ -53113,9 +60448,12 @@ fn aarch64_emit_suffix_prepass(
         )?;
         assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, scalar)?;
-        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-        assembler.instruction(aarch64_load_q(0, 12)?)?;
-        if suffix.vector_filter.is_some() {
+        if let Some(pair_filter) = exact_pair_filter {
+            aarch64_emit_prefix_relation_vector_test(assembler, pair_filter.vector_plan)?;
+            assembler.branch_cond(AARCH64_NE, single_hit)?;
+        } else if lazy_vector_filter.is_some() {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             aarch64_emit_start_filter_vector_candidates(
                 assembler,
                 filter,
@@ -53126,6 +60464,8 @@ fn aarch64_emit_suffix_prepass(
             aarch64_emit_candidate_any(assembler, 24)?;
             assembler.branch_cond(AARCH64_NE, single_primary_hit)?;
         } else {
+            aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
             let first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT;
             aarch64_emit_start_filter_vector_candidates(assembler, filter, 0, 24, first_register)?;
             aarch64_emit_candidate_any(assembler, 24)?;
@@ -53141,7 +60481,7 @@ fn aarch64_emit_suffix_prepass(
         assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
         assembler.branch(vector)?;
 
-        if let Some(vector_filter) = suffix.vector_filter {
+        if let Some(vector_filter) = lazy_vector_filter {
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
                 aarch64_emit_vector_filter_secondary_batch(assembler, vector_filter)?;
@@ -53180,20 +60520,25 @@ fn aarch64_emit_suffix_prepass(
             assembler.branch(scalar)?;
         }
 
-        let selected = if suffix.vector_filter.is_some() || suffix.scalar_filter.is_none() {
+        let selected = if exact_pair_filter.is_some()
+            || lazy_vector_filter.is_some()
+            || suffix.scalar_filter.is_none()
+        {
             apply
         } else {
             scalar_columns
         };
         assembler.bind(batch_hit)?;
-        if use_exact_asimd_lane && let Some(first_candidates) = batch_first_candidates {
+        if (use_exact_asimd_lane || exact_pair_filter.is_some())
+            && let Some(first_candidates) = batch_first_candidates
+        {
             aarch64_emit_first_candidate_in_batch(assembler, first_candidates)?;
             assembler.branch(selected)?;
         } else {
             assembler.branch(scalar)?;
         }
         assembler.bind(single_hit)?;
-        if use_exact_asimd_lane {
+        if use_exact_asimd_lane || exact_pair_filter.is_some() {
             aarch64_emit_first_candidate_lane(assembler, 24)?;
             assembler.branch(selected)?;
         } else {
@@ -53230,22 +60575,26 @@ fn aarch64_emit_suffix_prepass(
 
     assembler.bind(scalar)?;
     aarch64_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
-    aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-    let scalar_candidate = if scalar_filter.is_some() {
-        scalar_columns
+    if let Some(pair_filter) = exact_pair_filter {
+        aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, apply)?;
     } else {
-        apply
-    };
-    for range in filter.ranges() {
-        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
-        if range.start == range.end {
-            assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+        aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
+        let scalar_candidate = if scalar_filter.is_some() {
+            scalar_columns
         } else {
-            let next_range = assembler.label()?;
-            assembler.branch_cond(AARCH64_LO, next_range)?;
-            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
-            assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
-            assembler.bind(next_range)?;
+            apply
+        };
+        for range in filter.ranges() {
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+            if range.start == range.end {
+                assembler.branch_cond(AARCH64_EQ, scalar_candidate)?;
+            } else {
+                let next_range = assembler.label()?;
+                assembler.branch_cond(AARCH64_LO, next_range)?;
+                assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.end))?)?;
+                assembler.branch_cond(AARCH64_LS, scalar_candidate)?;
+                assembler.bind(next_range)?;
+            }
         }
     }
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
@@ -53281,6 +60630,15 @@ fn aarch64_emit_suffix_prepass(
         )?;
     } else {
         aarch64_emit_suffix_restart(assembler, suffix.restart)?;
+    }
+    if let Some(retry_dispatch) = exact_pair_retry_dispatch {
+        let relation_activate =
+            exact_pair_relation_activate.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-pair retry dispatch lost its activation label",
+            ))?;
+        assembler.bind(retry_dispatch)?;
+        assembler.branch_zero_w(AARCH64_SUFFIX_RELATION_PHASE, relation_activate)?;
+        assembler.branch(vector)?;
     }
     assembler.bind(done)?;
     Ok(())
@@ -53381,6 +60739,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     if entry_contract.fixed_candidate() && layout.mandatory_teddy.is_some() {
         return Err(ObjectError::InvalidModule(
             "AArch64 fixed candidate retained a moving Teddy scanner",
+        ));
+    }
+    if sve_suffix_kind.is_some()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-pair suffix retained an SVE scanner receipt",
         ));
     }
     let mut assembler = Aarch64Assembler::new();
@@ -54639,7 +62006,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     // Correlated Teddy is authenticated separately against the exact suffix
     // portfolio. Its split-nibble projection may contain false-positive bytes
     // and therefore must not masquerade as an exact one-column receipt.
-    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+    let suffix_scanner = if layout.mandatory_teddy.is_some()
+        || layout
+            .suffix_filter
+            .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+    {
         None
     } else {
         layout
@@ -63324,6 +70695,112 @@ mod tests {
         compiled
     }
 
+    #[test]
+    fn scalar_only_correlated_no_retry_prefers_endpoint_provable_terminal() {
+        let targets = [
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+        for target in targets {
+          for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile(
+                CompileRequest::new("(?:yy|z){2,6}?Q", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            let terminal = derive_terminal_suffix_filter(view)
+                .unwrap()
+                .expect("terminal factor");
+            assert!(!terminal.scalar_projection_dependent);
+            let interior = view
+                .required_literals
+                .interior()
+                .candidates()
+                .iter()
+                .filter_map(|candidate| derive_interior_filter(view, candidate).unwrap())
+                .find(|filter| filter.scalar_projection_dependent)
+                .expect("dependent scalar-only interior factor");
+            assert!(interior.retry.is_none());
+            assert!(interior.vector_filter.is_none());
+            assert!(interior.scalar_filter.is_some());
+            assert!(matches!(
+                interior.reverse_seed,
+                NativeSuffixReverseSeed::RootState(_)
+            ));
+            let mut independent_product = interior;
+            independent_product.scalar_projection_dependent = false;
+            assert!(
+                mandatory_filter_selection_key(independent_product)
+                    < mandatory_filter_selection_key(terminal),
+                "the former independent-product score must prefer the interior",
+            );
+            assert!(
+                mandatory_filter_selection_key(terminal)
+                    < mandatory_filter_selection_key(interior),
+                "the exact dependency proof must preserve the terminal",
+            );
+            let (_, layout) =
+                build_native_dfa_table_for_architecture(view, target.architecture).unwrap();
+            let suffix = layout.suffix_filter.expect("selected terminal factor");
+            assert!(suffix.retry.is_none());
+            assert!(suffix.vector_filter.is_some());
+            assert!(suffix.scalar_filter.is_none());
+            assert_eq!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary);
+            let reverse = layout.seeded_reverse.expect("endpoint reverse proof");
+            assert!(reverse.proves_match);
+            assert!(reverse.first_endpoint_proves_no_earlier_match);
+          }
+
+          let compiled = compile(
+              CompileRequest::new("(?:yy|z){2,6}?Q", target)
+                  .mode(CompileMode::Optimizing)
+                  .output(OutputContract::Exists),
+          )
+          .unwrap();
+          let view = compiled.program().native_dfa_view().unwrap();
+          let retrying = view
+              .required_literals
+              .interior()
+              .candidates()
+              .iter()
+              .filter_map(|candidate| derive_interior_filter(view, candidate).unwrap())
+              .find(|filter| filter.retry.is_some() && filter.scalar_filter.is_some())
+              .expect("bounded Exists scalar retry");
+          assert!(!retrying.scalar_projection_dependent);
+        }
+    }
+
+    #[test]
+    fn full_cartesian_literal_projection_is_not_dependent() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new("(?:aa|ab|ba|bb)Q", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let literals = view.required_literals.suffix();
+        assert_eq!(literals.literals().len(), 4);
+        assert_eq!(literals.depth(), 3);
+        let sets = aligned_sets_from_required_literals(literals).unwrap();
+        let (primary, _, _) = derive_aligned_mandatory_filter(&sets)
+            .unwrap()
+            .expect("Cartesian mandatory filter");
+        let scalar = derive_scalar_aligned_filter(primary, &sets)
+            .unwrap()
+            .expect("Cartesian scalar columns");
+        assert!(!exact_scalar_projection_is_dependent(literals, scalar));
+    }
+
     fn lower_forced_runtime_adapter(output: OutputContract, target: Target) -> CompiledModule {
         let compiled = compile(
             CompileRequest::new("a+", target)
@@ -65065,6 +72542,37 @@ mod tests {
     }
 
     #[test]
+    fn required_ordered_nfa_scalar_gate_has_no_compatibility_edge_cross_isa() {
+        for sink in [PreparedSpanSink::Count, PreparedSpanSink::SpanSum] {
+            let x86 = lower_x86_64_required_ordered_nfa_span_reduce(sink, None)
+                .expect("x86 required Ordered-NFA scalar reducer");
+            assert!(x86.ordered_nfa_gate_call_offset.is_some());
+            assert_eq!(x86.bulk_runtime_fallback_offset, None);
+            assert_eq!(x86.compatibility_identity_relocation, None);
+            assert!(x86.identity_relocation.is_some());
+            assert!(x86.code.windows(6).any(|window| {
+                window == [0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]
+            }));
+
+            let aarch64 = lower_aarch64_required_ordered_nfa_span_reduce(sink, None)
+                .expect("AArch64 required Ordered-NFA scalar reducer");
+            assert!(aarch64.ordered_nfa_gate_call_offset.is_some());
+            assert_eq!(aarch64.bulk_runtime_fallback_offset, None);
+            assert_eq!(aarch64.compatibility_identity_relocation, None);
+            assert!(aarch64.identity_relocation.is_some());
+            let status_three = aarch64_movz_w(0, 3)
+                .expect("AArch64 status-three instruction")
+                .to_le_bytes();
+            assert!(
+                aarch64
+                    .code
+                    .windows(status_three.len())
+                    .any(|window| window == status_three),
+            );
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
@@ -65334,7 +72842,7 @@ mod tests {
     }
 
     #[test]
-    fn native_prepared_aggregates_authenticate_inline_before_the_span_fill_target() {
+    fn native_prepared_aggregates_are_transitively_helper_backed_and_authenticate_inline() {
         let exports = PreparedAggregateExports::COUNT
             .union(PreparedAggregateExports::SPAN_SUM);
         for target in [
@@ -65365,11 +72873,11 @@ mod tests {
             );
             assert_eq!(
                 module.prepared_aggregate_strategy(),
-                Some(PreparedAggregateStrategy::NativeFused),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
             );
             assert_eq!(
                 compiled.receipt().prepared_aggregate_strategy,
-                Some(PreparedAggregateStrategy::NativeFused),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
             );
             let fill_target = prepared_span_fill_local_target(module);
             assert_eq!(
@@ -65582,7 +73090,7 @@ mod tests {
                 target,
                 compiled.program().artifact_identity(),
                 exports,
-                PreparedAggregateStrategy::NativeFused,
+                PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
                 module.sections()[TEXT_SECTION].bytes(),
                 module.sections()[PROGRAM_SECTION].bytes(),
                 module.symbols(),
@@ -67018,6 +74526,8 @@ mod tests {
             None,
             Some(&plan),
             architecture == Architecture::Aarch64,
+            true,
+            true,
         )
     }
 
@@ -67099,6 +74609,8 @@ mod tests {
             anchored_prefix_filter_bytes: layout
                 .prefix_filter
                 .map_or(0, |filter| filter.guaranteed_bytes),
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         })
     }
 
@@ -67491,6 +75003,8 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -67740,6 +75254,8 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -67908,6 +75424,8 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -68060,6 +75578,8 @@ mod tests {
                 needs_runtime: false,
                 start_accelerator: StartAccelerator::Scalar,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -68555,6 +76075,8 @@ mod tests {
             Some(plan),
             None,
             architecture == Architecture::Aarch64,
+            true,
+            true,
         )
     }
 
@@ -68620,6 +76142,8 @@ mod tests {
             Some(plan),
             None,
             architecture == Architecture::Aarch64,
+            true,
+            true,
         )
     }
 
@@ -74493,8 +82017,22 @@ mod tests {
         assert_eq!(suffix.filter.scan_offset, scan_offset);
         assert_eq!(start_filter_membership(suffix.filter).unwrap(), membership);
         assert!(
-            lower_native_dfa(view, target).unwrap().is_some(),
-            "an exact emitted receipt should publish the carried terminal primary"
+            suffix.exact_pair_filter.is_none(),
+            "a retained one-column receipt must never acquire pair semantics"
+        );
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+            view,
+            target,
+            NativeDfaEntryContract::Public,
+            usize::MAX,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("an exact emitted receipt should publish the carried terminal primary");
+        assert!(
+            !lowering.exact_pair_suffix_lowered,
+            "retained publication must keep the generic scanner receipt truthful"
         );
     }
 
@@ -88539,6 +96077,8 @@ int main(void){{
                 needs_runtime: true,
                 start_accelerator: StartAccelerator::None,
                 anchored_prefix_filter_bytes: 0,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -92206,6 +99746,8 @@ int main(void){{
                 Some(plan),
                 None,
                 permit_asimd_candidate_mask,
+                true,
+                true,
             )
             .unwrap()
         };
@@ -92372,6 +99914,8 @@ int main(void){{
                     Some(plan),
                     None,
                     permit_asimd_candidate_mask,
+                    true,
+                    true,
                 )
                 .unwrap()
             };
@@ -92404,6 +99948,8 @@ int main(void){{
                 None,
                 None,
                 permit_asimd_candidate_mask,
+                true,
+                true,
             )
             .unwrap();
             let comparison = derive_native_default_exception_plan(
@@ -92426,6 +99972,8 @@ int main(void){{
                     None,
                     None,
                     permit_asimd_candidate_mask,
+                    true,
+                    true,
                 )
                 .ok()
             });
@@ -96203,6 +103751,8 @@ int main(void){{
             Some(&exact_rows),
             None,
             false,
+            false,
+            true,
         )
         .unwrap()
         .expect("direct exact-row candidate");
@@ -96216,6 +103766,8 @@ int main(void){{
             Some(&exact_rows),
             None,
             false,
+            false,
+            true,
         )
         .unwrap()
         .expect("mapped exact-row candidate");
@@ -97098,6 +104650,12 @@ int main(void){{
         assert!(is_optional_native_table_decline(&ObjectError::Allocation(
             "synthetic candidate allocation"
         )));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE)
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE)
+        ));
         assert!(is_optional_native_table_decline(&ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             limit: 1,
@@ -105464,6 +113022,8 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 optimizing_fallbacks_may_continue: true,
                 bit_parallel_endpoint_oracle_lowered: false,
                 bit_parallel_exact_endpoint_lowered: false,
+                synchronizing_accept_reverse_lowered: false,
+                exact_pair_suffix_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
                 ordered_nfa_terminal_exact_set_lowered: None,
@@ -105790,6 +113350,8 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered: false,
             bit_parallel_exact_endpoint_lowered: false,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
             ordered_nfa_terminal_exact_set_lowered: None,
@@ -114996,6 +122558,795 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn synchronizing_seeded_reverse_allocation_is_terminal() {
+        let allocation = || {
+            SeededReverseBuild::Declined(crate::seeded_reverse::SeededReverseDecline {
+                reason: SeededReverseDeclineReason::Allocation(
+                    crate::seeded_reverse::SeededReverseAllocation::States,
+                ),
+                stats: crate::seeded_reverse::SeededReverseStats::default(),
+            })
+        };
+        assert!(
+            seeded_reverse_build_outcome(allocation(), false)
+                .unwrap()
+                .is_none(),
+            "established optional reverse allocation remains a decline",
+        );
+        assert!(matches!(
+            seeded_reverse_build_outcome(allocation(), true),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE),
+        ));
+        assert_eq!(
+            synchronizing_terminal_barrier_outcome(
+                NfaTerminalSuffixBarrierOutcome::Declined,
+            )
+            .unwrap(),
+            false,
+        );
+        assert!(matches!(
+            synchronizing_terminal_barrier_outcome(
+                NfaTerminalSuffixBarrierOutcome::Allocation,
+            ),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+        ));
+        assert!(!is_optional_native_table_decline(
+            &ObjectError::Allocation(
+                SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE,
+            ),
+        ));
+
+        let compiled = compile(
+            CompileRequest::new("(?:ee|f)+?R", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let suffix = derive_suffix_filter(view)
+            .unwrap()
+            .expect("synchronizing suffix");
+        let mut barrier_calls = 0usize;
+        assert!(
+            build_native_seeded_reverse_with_policy_and_barrier_proof(
+                view,
+                suffix,
+                SeededReverseLimits::default(),
+                false,
+                |_| {
+                    barrier_calls += 1;
+                    NfaTerminalSuffixBarrierOutcome::Allocation
+                },
+            )
+            .unwrap()
+            .is_none(),
+        );
+        assert_eq!(
+            barrier_calls, 0,
+            "disabled/Fast policy must decline before the allocating proof",
+        );
+        assert!(matches!(
+            build_native_seeded_reverse_with_policy_and_barrier_proof(
+                view,
+                suffix,
+                SeededReverseLimits::default(),
+                true,
+                |_| NfaTerminalSuffixBarrierOutcome::Allocation,
+            ),
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
+        ));
+
+        let mut bytes = Vec::new();
+        let mut reservations = 0usize;
+        let result = reserve_native_dfa_table_with(
+            &mut bytes,
+            64,
+            32,
+            true,
+            true,
+            |_, _| {
+                reservations += 1;
+                false
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectError::Allocation(site))
+                if site == SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE
+        ));
+        assert_eq!(reservations, 1, "allocator failure must not be retried");
+
+        let mut legacy_bytes = Vec::new();
+        let mut legacy_reservations = 0usize;
+        let result = reserve_native_dfa_table_with(
+            &mut legacy_bytes,
+            64,
+            32,
+            true,
+            false,
+            |_, _| {
+                legacy_reservations += 1;
+                legacy_reservations == 2
+            },
+        );
+        assert_eq!(result.unwrap(), false);
+        assert_eq!(legacy_reservations, 2);
+    }
+
+    #[test]
+    fn synchronizing_accept_seeded_reverse_is_scoped_to_exists_on_both_isas() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), true),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                true,
+            ),
+            (Target::aarch64_linux(), false),
+            (
+                Target::aarch64_linux().with_features(asimd).unwrap(),
+                true,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                false,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        asimd
+                            .with(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                false,
+            ),
+        ];
+        for (target, target_admits_reverse) in targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new("(?:ee|f)+?R", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let suffix = derive_suffix_filter(view)
+                    .unwrap()
+                    .expect("synchronizing terminal suffix");
+                assert!(matches!(
+                    suffix.restart,
+                    NativeSuffixRestart::Synchronizing { .. }
+                ));
+                assert_eq!(
+                    build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                        .is_some_and(|reverse| reverse.proves_match),
+                    output == OutputContract::Exists,
+                );
+                let layout = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                    view,
+                    target,
+                    native_vector_filter_cost_model_for_target(target, true),
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                )
+                .unwrap()
+                .1;
+                assert_eq!(
+                    layout
+                        .seeded_reverse
+                        .is_some_and(|reverse| reverse.proves_match),
+                    output == OutputContract::Exists && target_admits_reverse,
+                    "synchronizing reverse scope changed for {target:?} {output:?}",
+                );
+            }
+        }
+
+        let target = Target::x86_64_linux();
+        let fast = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(!fast.module().has_synchronizing_accept_reverse());
+        let fast_baseline = CompiledModule::lower(fast.program(), target).unwrap();
+        let fast_baseline_object =
+            emit_object(&fast_baseline, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert_eq!(fast.object(), fast_baseline_object);
+
+        let optimizing = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(
+            optimizing.module().has_synchronizing_accept_reverse(),
+            "optimizing sync route: {:?}",
+            optimizing.receipt(),
+        );
+
+        let body_overlap = compile(
+            CompileRequest::new("(?:aa|Z)+?Z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let overlap_view = body_overlap.program().native_dfa_view().unwrap();
+        let overlap_suffix = derive_suffix_filter(overlap_view)
+            .unwrap()
+            .expect("body-overlap synchronizing suffix");
+        assert!(matches!(
+            overlap_suffix.restart,
+            NativeSuffixRestart::Synchronizing { .. }
+        ));
+        assert!(
+            build_native_seeded_reverse(
+                overlap_view,
+                overlap_suffix,
+                SeededReverseLimits::default(),
+            )
+            .is_none(),
+            "a productive terminal byte has no terminal-barrier certificate",
+        );
+        assert!(!body_overlap.module().has_synchronizing_accept_reverse());
+    }
+
+    #[test]
+    fn synchronizing_accept_reverse_backends_reauthenticate_every_layout_fact() {
+        let compiled = compile(
+            CompileRequest::new("(?:ee|f)+?R", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let valid = build_native_dfa_table_for_architecture(view, architecture)
+                .unwrap()
+                .1;
+            assert!(valid.seeded_reverse.is_some_and(|reverse| {
+                reverse.proves_match && reverse.first_endpoint_proves_no_earlier_match
+            }));
+            match architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa(valid, FeatureSet::EMPTY).unwrap();
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_dfa(valid, FeatureSet::EMPTY).unwrap();
+                }
+            }
+
+            let mut corruptions = Vec::new();
+
+            let mut missing_barrier = valid;
+            let mut reverse = missing_barrier.seeded_reverse.unwrap();
+            reverse.first_endpoint_proves_no_earlier_match = false;
+            missing_barrier.seeded_reverse = Some(reverse);
+            corruptions.push(missing_barrier);
+
+            let mut non_proving = valid;
+            let mut reverse = non_proving.seeded_reverse.unwrap();
+            reverse.proves_match = false;
+            non_proving.seeded_reverse = Some(reverse);
+            corruptions.push(non_proving);
+
+            let mut wrong_boundary = valid;
+            let mut reverse = wrong_boundary.seeded_reverse.unwrap();
+            reverse.boundary_offset = reverse.boundary_offset.saturating_add(1);
+            wrong_boundary.seeded_reverse = Some(reverse);
+            corruptions.push(wrong_boundary);
+
+            let mut wrong_seed = valid;
+            let mut suffix = wrong_seed.suffix_filter.unwrap();
+            suffix.reverse_seed = NativeSuffixReverseSeed::RootState(0);
+            wrong_seed.suffix_filter = Some(suffix);
+            corruptions.push(wrong_seed);
+
+            let mut retry = valid;
+            let mut suffix = retry.suffix_filter.unwrap();
+            suffix.retry = Some(
+                select_bounded_suffix_retry(
+                    OutputContract::Exists,
+                    false,
+                    2,
+                    Some(9),
+                    14,
+                )
+                .unwrap(),
+            );
+            retry.suffix_filter = Some(suffix);
+            corruptions.push(retry);
+
+            for corrupted in corruptions {
+                let result = match architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa(corrupted, FeatureSet::EMPTY).map(|_| ())
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa(corrupted, FeatureSet::EMPTY).map(|_| ())
+                    }
+                };
+                assert!(matches!(result, Err(ObjectError::InvalidModule(_))));
+            }
+        }
+    }
+
+    fn assert_synchronizing_accept_reverse_object_limit_restores_exact_incumbent(target: Target) {
+        let selected = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(
+            selected.module().has_synchronizing_accept_reverse(),
+            "selected sync route: {:?}",
+            selected.receipt(),
+        );
+        assert_eq!(
+            selected.module().sections()[TEXT_SECTION].alignment,
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        );
+        let incumbent = CompiledModule::lower_without_synchronizing_accept_reverse(
+            selected.program(),
+            target,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            incumbent.sections()[TEXT_SECTION].alignment,
+            NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+        );
+        let incumbent_object =
+            emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        if target.operating_system == OperatingSystem::Macos {
+            let mut packed_incumbent = incumbent.clone();
+            packed_incumbent.sections[TEXT_SECTION].alignment = 1;
+            let packed_object = emit_object(
+                &packed_incumbent,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(
+                packed_object.len() < incumbent_object.len(),
+                "Mach-O fixture must exercise leading text padding: {target:?}",
+            );
+        }
+        assert!(incumbent_object.len() < selected.object().len());
+        assert!(
+            selected.receipt().data_bytes <= incumbent_object.len(),
+            "the final-object ceiling must still admit the selected native data",
+        );
+
+        let initial = CompiledModule::lower_optimizing_with_limits(
+            selected.program(),
+            target,
+            SlowAotLimits::default(),
+        )
+        .unwrap();
+        assert!(initial.has_synchronizing_accept_reverse());
+        let direct_retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            initial,
+            ObjectFormat::for_target(target),
+            incumbent_object.len(),
+            |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    selected.program(),
+                    target,
+                    usize::MAX,
+                    allow_synchronizing_accept_reverse,
+                    allow_exact_pair,
+                )
+            },
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+        )
+        .unwrap();
+        let crate::FinalObjectAttempt::Fit {
+            module: direct_module,
+            object: direct_object,
+        } = direct_retry
+        else {
+            panic!("direct final-object retry did not restore the incumbent");
+        };
+        assert!(!direct_module.has_synchronizing_accept_reverse());
+        assert_eq!(direct_object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(
+            &incumbent,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let initial = CompiledModule::lower_optimizing_with_limits(
+            selected.program(),
+            target,
+            SlowAotLimits::default(),
+        )
+        .unwrap();
+        let direct_decline = crate::emit_with_ordered_nfa_accelerator_retries(
+            initial,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+            |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    selected.program(),
+                    target,
+                    usize::MAX,
+                    allow_synchronizing_accept_reverse,
+                    allow_exact_pair,
+                )
+            },
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+        )
+        .unwrap();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module: direct_module,
+            first_error,
+        } = direct_decline
+        else {
+            panic!("undersized final-object retry unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(
+                &direct_module,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap(),
+            incumbent_object,
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = incumbent_object.len();
+        let constrained = compile(
+            CompileRequest::new("(?:ee|f)+?R", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(!constrained.module().has_synchronizing_accept_reverse());
+        assert_eq!(constrained.object(), incumbent_object);
+        assert_eq!(
+            constrained.module().start_accelerator(),
+            selected.module().start_accelerator(),
+        );
+        assert_eq!(
+            constrained.module().required_runtime_symbols().count(),
+            selected.module().required_runtime_symbols().count(),
+        );
+    }
+
+    #[test]
+    fn synchronizing_accept_reverse_object_limit_restores_exact_incumbent() {
+        for target in [Target::x86_64_linux(), Target::x86_64_macos()] {
+            assert_synchronizing_accept_reverse_object_limit_restores_exact_incumbent(target);
+        }
+    }
+
+    #[test]
+    fn exact_pair_object_limit_restores_exact_incumbent() {
+        let target = Target::x86_64_linux();
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+        assert!(!selected.module().has_synchronizing_accept_reverse());
+
+        let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let incumbent_object =
+            emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert!(!incumbent.has_exact_pair_suffix());
+        assert!(incumbent_object.len() < selected.object().len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                ObjectFormat::for_target(target),
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(incumbent_object.len()) else {
+            panic!("exact incumbent object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert_eq!(object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(
+            &incumbent,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized exact-pair incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            incumbent_object
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = incumbent_object.len();
+        let constrained = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(!constrained.module().has_exact_pair_suffix());
+        assert_eq!(constrained.object(), incumbent_object);
+    }
+
+    #[test]
+    fn aarch64_exact_pair_object_limit_restores_exact_incumbent() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+
+        let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let object_format = ObjectFormat::for_target(target);
+        let incumbent_object = emit_object(&incumbent, object_format, usize::MAX).unwrap();
+        assert!(!incumbent.has_exact_pair_suffix());
+        assert!(incumbent_object.len() < selected.object().len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                object_format,
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(incumbent_object.len()) else {
+            panic!("AArch64 exact incumbent object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert_eq!(object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(&incumbent, object_format, undersized_cap).unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized AArch64 exact-pair incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, object_format, usize::MAX).unwrap(),
+            incumbent_object
+        );
+    }
+
+    #[test]
+    fn exact_pair_and_synchronizing_object_retries_are_compositional() {
+        let target = Target::x86_64_linux();
+        let pattern = r"(?:ee|f)*?(?:q!|a@|b#)";
+        let selected = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(selected.module().has_exact_pair_suffix());
+        assert!(selected.module().has_synchronizing_accept_reverse());
+
+        let pair_off = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            true,
+            false,
+        )
+        .unwrap();
+        let both_off = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            selected.program(),
+            target,
+            usize::MAX,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pair_off.has_exact_pair_suffix());
+        assert!(pair_off.has_synchronizing_accept_reverse());
+        assert!(!both_off.has_exact_pair_suffix());
+        assert!(!both_off.has_synchronizing_accept_reverse());
+        let pair_off_object =
+            emit_object(&pair_off, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        let both_off_object =
+            emit_object(&both_off, ObjectFormat::for_target(target), usize::MAX).unwrap();
+        assert!(pair_off_object.len() < selected.object().len());
+        assert!(both_off_object.len() < pair_off_object.len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_exact_pair_suffix());
+            assert!(initial.has_synchronizing_accept_reverse());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                ObjectFormat::for_target(target),
+                cap,
+                |allow_synchronizing_accept_reverse, allow_exact_pair| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                        selected.program(),
+                        target,
+                        usize::MAX,
+                        allow_synchronizing_accept_reverse,
+                        allow_exact_pair,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(pair_off_object.len()) else {
+            panic!("pair-off/sync-on object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert!(module.has_synchronizing_accept_reverse());
+        assert_eq!(object, pair_off_object);
+
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(both_off_object.len()) else {
+            panic!("pair-off/sync-off object did not fit its exact ceiling");
+        };
+        assert!(!module.has_exact_pair_suffix());
+        assert!(!module.has_synchronizing_accept_reverse());
+        assert_eq!(object, both_off_object);
+
+        let undersized_cap = both_off_object.len() - 1;
+        let incumbent_error = emit_object(
+            &both_off,
+            ObjectFormat::for_target(target),
+            undersized_cap,
+        )
+        .unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized pair/sync incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            both_off_object
+        );
+    }
+
+    #[test]
     fn terminal_barrier_admits_seeded_reverse_for_endpoint_contracts_on_both_isas() {
         const BARRIER: &str = r"(?-u:[^Z])+Z";
         const BODY_OVERLAP: &str = r"(?s:.+)Z";
@@ -116908,6 +125259,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             needs_runtime: false,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
+            synchronizing_accept_reverse_lowered: false,
+            exact_pair_suffix_lowered: false,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
@@ -121267,6 +129620,1405 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .is_some_and(|columns| columns.columns().len() >= 2),
             "expensive SIMD constants should retain a cold aligned scalar refinement"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact-pair receipt test owns graph correlation, target lowering, and resource invariants"
+    )]
+    fn exact_pair_suffix_filter_is_graph_exact_target_common_and_data_free() {
+        let terminal = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let interior = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)(?-u:[\x00-\xFF])*";
+        let expected = [
+            u16::from_le_bytes([b'q', b'!']),
+            u16::from_le_bytes([b'b', b'#']),
+            u16::from_le_bytes([b'a', b'@']),
+        ];
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+
+        for (pattern, terminal_factor) in [(terminal, true), (interior, false)] {
+            for target in targets {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Exists),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let lowering =
+                    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        usize::MAX,
+                        true,
+                        true,
+                    )
+                    .unwrap()
+                    .expect("exact-pair fixture must retain native lowering");
+                let (_, layout) = build_native_dfa_table_for_architecture(
+                    view,
+                    target.architecture,
+                )
+                .unwrap();
+                let suffix = layout.suffix_filter.expect("exact mandatory factor");
+                let pair = suffix
+                    .exact_pair_filter
+                    .expect("non-Cartesian depth-two factor");
+                assert_eq!(pair.pairs(), expected, "{pattern:?}/{target:?}");
+                assert_eq!(suffix.minimum_width, 2);
+                assert_eq!(suffix.teddy_portfolio, None);
+                let generic_suffix_scanner = match target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa_with_emission(layout, target.features)
+                            .unwrap()
+                            .suffix_scanner
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                            layout,
+                            target.features,
+                            target.operating_system,
+                            None,
+                            None,
+                            NativeDfaEntryContract::Public,
+                        )
+                        .unwrap()
+                        .suffix_scanner
+                    }
+                };
+                assert!(
+                    generic_suffix_scanner.is_none(),
+                    "the exact-pair route must not publish a one-column scanner receipt"
+                );
+                assert_eq!(
+                    matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary),
+                    terminal_factor,
+                    "candidate base must name the terminal or interior graph boundary"
+                );
+                for first in u8::MIN..=u8::MAX {
+                    for second in u8::MIN..=u8::MAX {
+                        let encoded = u16::from_le_bytes([first, second]);
+                        assert_eq!(
+                            native_prefix_relation_vector_contains(
+                                pair.vector_plan,
+                                first,
+                                second,
+                            ),
+                            expected.contains(&encoded),
+                            "relation byte order {first:#04x}/{second:#04x}"
+                        );
+                    }
+                }
+                let exactly_bounded =
+                    lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        lowering.data.len(),
+                        true,
+                        true,
+                    )
+                    .unwrap()
+                    .expect("the exact selected data cap remains sufficient");
+                assert_eq!(exactly_bounded.data, lowering.data);
+                assert!(
+                    lowering.exact_pair_suffix_lowered,
+                    "explicit pair fixture must publish the compiler-only receipt: {pattern:?}/{target:?}"
+                );
+                match target.architecture {
+                    Architecture::X86_64 => assert!(
+                        lowering
+                            .code
+                            .windows(4)
+                            .any(|bytes| bytes == [0x0f, 0xb7, 0x04, 0x17]),
+                        "x86 scalar tail must read the chronological pair at base+0/base+1"
+                    ),
+                    Architecture::Aarch64 => {
+                        let halfword = aarch64_load_halfword_imm(8, 12, 0)
+                            .unwrap()
+                            .to_le_bytes();
+                        assert!(
+                            lowering
+                                .code
+                                .chunks_exact(4)
+                                .any(|bytes| bytes == halfword),
+                            "AArch64 scalar tail must read the chronological pair at base+0/base+1"
+                        );
+                        let mut scalar = Aarch64Assembler::new();
+                        let matched = scalar.label().unwrap();
+                        aarch64_emit_exact_pair_scalar_test(&mut scalar, pair, matched).unwrap();
+                        scalar.bind(matched).unwrap();
+                        let scalar = scalar.finish().unwrap();
+                        for expected_pair in expected {
+                            let safe = aarch64_movz_w(12, expected_pair).unwrap().to_le_bytes();
+                            let clobber = aarch64_movz_w(9, expected_pair).unwrap().to_le_bytes();
+                            assert!(scalar.chunks_exact(4).any(|bytes| bytes == safe));
+                            assert!(
+                                !scalar.chunks_exact(4).any(|bytes| bytes == clobber),
+                                "pair immediates must not clobber the X9 original-start anchor"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for declined in [
+            r"(?-u:[\x00-\xFF])*(?:a!|a@|q!|q@)",
+            r"(?-u:[\x00-\xFF])*(?:a!|a@|q!)",
+        ] {
+            let compiled = compile(
+                CompileRequest::new(declined, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            assert_eq!(derive_native_exact_pair_filter(view.required_literals.suffix()), None);
+            assert!(
+                build_native_dfa_table(view)
+                    .unwrap()
+                    .1
+                    .suffix_filter
+                    .is_some_and(|suffix| suffix.exact_pair_filter.is_none()),
+                "full and three-of-four Cartesian projections must retain the incumbent route"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-tier test owns the x86 cold gate, phase register, and cursor model"
+    )]
+    fn x86_exact_pair_primary_cold_switch_is_authenticated_and_relation_owned() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                )
+                .unwrap(),
+        ];
+        let layout_for = |pattern, target| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                compiled.program().native_dfa_view().unwrap(),
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap()
+            .1
+        };
+
+        for target in targets {
+            let kind = x86_start_filter_kind(target.features);
+            let ordinary = layout_for(r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)", target);
+            assert!(ordinary.seeded_reverse.is_none(), "{target:?}");
+            let suffix = ordinary.suffix_filter.unwrap();
+            let pair = suffix.exact_pair_filter.unwrap();
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(suffix, kind),
+                Ok(Some(suffix.filter)),
+                "{target:?}"
+            );
+
+            let mut outside_pair = suffix;
+            outside_pair.filter.scan_offset = 2;
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(outside_pair, kind),
+                Ok(None),
+                "{target:?}"
+            );
+            let projected = |encoded: u16| {
+                if suffix.filter.scan_offset == 0 {
+                    encoded as u8
+                } else {
+                    (encoded >> 8) as u8
+                }
+            };
+            let uncovered = (u8::MIN..=u8::MAX)
+                .find(|byte| !pair.pairs().iter().any(|encoded| projected(*encoded) == *byte))
+                .unwrap();
+            let mut uncovered_projection = suffix;
+            uncovered_projection.filter = NativeStartFilter {
+                ranges: {
+                    let mut ranges = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+                    ranges[0] = NativeByteRange {
+                        start: uncovered,
+                        end: uncovered,
+                    };
+                    ranges
+                },
+                range_count: 1,
+                candidate_bytes: 1,
+                scan_offset: suffix.filter.scan_offset,
+                from_anchored_prefix: false,
+            };
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(uncovered_projection, kind),
+                Ok(None),
+                "{target:?}"
+            );
+
+            let common = layout_for(r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)", target);
+            let common_suffix = common.suffix_filter.unwrap();
+            assert!(common_suffix.exact_pair_filter.is_some(), "{target:?}");
+            assert_eq!(
+                x86_exact_pair_primary_cold_filter(common_suffix, kind),
+                Ok(None),
+                "a non-sparse primary must retain the direct relation: {target:?}"
+            );
+
+            let mut wrong_output = ordinary;
+            wrong_output.output = OutputContract::SelectedEnd;
+            let mut wrong_output_assembler = X86Assembler::new();
+            let wrong_output_no_match = wrong_output_assembler.label().unwrap();
+            let wrong_output_matched = wrong_output_assembler.label().unwrap();
+            assert!(matches!(
+                x86_emit_suffix_prepass(
+                    &mut wrong_output_assembler,
+                    wrong_output.suffix_filter.unwrap(),
+                    kind,
+                    wrong_output,
+                    wrong_output_no_match,
+                    wrong_output_matched,
+                ),
+                Err(ObjectError::InvalidModule(
+                    "x86 exact-pair primary phase escaped Exists admission"
+                ))
+            ));
+
+            let mut emission = X86Assembler::new();
+            let no_match = emission.label().unwrap();
+            let matched = emission.label().unwrap();
+            let relation_vector = emission.labels.len();
+            assert_eq!(
+                x86_emit_suffix_prepass(
+                    &mut emission,
+                    suffix,
+                    kind,
+                    ordinary,
+                    no_match,
+                    matched,
+                )
+                .unwrap(),
+                None
+            );
+            emission.bind(no_match).unwrap();
+            emission.bind(matched).unwrap();
+
+            let mut primary_constants = X86Assembler::new();
+            x86_emit_start_filter_constants(&mut primary_constants, suffix.filter, kind, 1)
+                .unwrap();
+            let mut primary_batch = X86Assembler::new();
+            x86_emit_sparse_filter_mask_batch(&mut primary_batch, suffix.filter, kind).unwrap();
+            let mut primary_candidates = X86Assembler::new();
+            x86_emit_start_filter_vector_candidates(
+                &mut primary_candidates,
+                suffix.filter,
+                kind,
+                1,
+            )
+            .unwrap();
+            let mut relation_constants = X86Assembler::new();
+            x86_emit_prefix_relation_constants(
+                &mut relation_constants,
+                pair.vector_plan,
+                kind,
+            )
+            .unwrap();
+            let locate = |needle: &[u8]| {
+                emission
+                    .code
+                    .windows(needle.len())
+                    .position(|bytes| bytes == needle)
+                    .unwrap()
+            };
+            let primary_constants_at = locate(&primary_constants.code);
+            let primary_scan_at = locate(&primary_candidates.code);
+            let pair_at = locate(&[0x0f, 0xb7, 0x04, 0x17]);
+            let relation_constants_at = locate(&relation_constants.code);
+            let relation_vector_at = emission.labels[relation_vector].unwrap();
+            assert!(primary_constants_at < primary_scan_at, "{target:?}");
+            assert!(primary_scan_at < pair_at, "{target:?}");
+            assert!(pair_at < relation_constants_at, "{target:?}");
+            assert!(relation_constants_at < relation_vector_at, "{target:?}");
+            let rewind = {
+                let mut assembler = X86Assembler::new();
+                x86_emit_rewind_sparse_filter_mask_batch(&mut assembler, kind).unwrap();
+                assembler.code
+            };
+            if x86_use_sparse_filter_mask_batch(suffix.filter, kind) {
+                let primary_batch_at = locate(&primary_batch.code);
+                assert!(primary_constants_at < primary_batch_at, "{target:?}");
+                assert!(primary_batch_at < pair_at, "{target:?}");
+                assert!(
+                    emission.code[primary_batch_at..pair_at]
+                        .windows(rewind.len())
+                        .any(|bytes| bytes == rewind.as_slice()),
+                    "a rare primary batch hit must replay from its exact group base: {target:?}"
+                );
+            } else {
+                assert!(
+                    emission.code[primary_scan_at..pair_at]
+                        .windows(primary_candidates.code.len())
+                        .filter(|bytes| *bytes == primary_candidates.code.as_slice())
+                        .count()
+                        >= usize::from(X86_MASK_BATCH_VECTORS),
+                    "the primary phase must retain four incumbent unrolled vectors: {target:?}"
+                );
+                assert!(
+                    !emission.code[primary_scan_at..pair_at]
+                        .windows(rewind.len())
+                        .any(|bytes| bytes == rewind.as_slice()),
+                    "a non-batched primary must not manufacture a batch rewind: {target:?}"
+                );
+            }
+            assert!(emission.fixups.iter().any(|fixup| {
+                emission.labels[fixup.label] == Some(relation_constants_at)
+                    && fixup.instruction >= 3
+                    && emission.code.get(fixup.instruction - 3..fixup.instruction)
+                        == Some(&[0x48, 0xff, 0xc2][..])
+            }));
+            assert!(!emission.code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+            assert!(!emission
+                .code
+                .windows(5)
+                .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+            assert_ne!(
+                lower_x86_64_dfa_with_emission(ordinary, target.features)
+                    .unwrap()
+                    .code
+                    .first(),
+                Some(&0x53),
+                "a no-retry exact pair must not borrow the phase register: {target:?}"
+            );
+        }
+
+        let target = targets[1];
+        let retry = layout_for(r"Z.{0,4}(?:q!|a@|b#)", target);
+        let retry_suffix = retry.suffix_filter.unwrap();
+        assert!(retry.seeded_reverse.is_none());
+        assert!(retry_suffix.retry.is_some());
+        let retry_code = lower_x86_64_dfa_with_emission(retry, target.features)
+            .unwrap()
+            .code;
+        assert_eq!(retry_code.first(), Some(&0x53), "the phase must preserve RBX");
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+        assert!(retry_code
+            .windows(5)
+            .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x85, 0xdb]));
+        assert!(retry_code.windows(2).any(|bytes| bytes == [0x5b, 0xc5]));
+
+        let seeded = layout_for(r"(?s:.+)(?:q!|a@|b#)(?s:.*)", target);
+        assert!(seeded.seeded_reverse.is_some());
+        let seeded_code = lower_x86_64_dfa_with_emission(seeded, target.features)
+            .unwrap()
+            .code;
+        assert!(seeded_code.starts_with(&[0x53, 0x41, 0x54, 0x41, 0x55]));
+        assert!(seeded_code.windows(2).any(|bytes| bytes == [0x31, 0xdb]));
+        assert!(seeded_code
+            .windows(5)
+            .any(|bytes| bytes == [0xbb, 1, 0, 0, 0]));
+        assert!(seeded_code.windows(2).any(|bytes| bytes == [0x85, 0xdb]));
+        assert!(seeded_code
+            .windows(4)
+            .any(|bytes| bytes == [0x41, 0x5c, 0x5b, 0xc5]));
+
+        let pairs = [
+            u16::from_le_bytes([b'q', b'!']),
+            u16::from_le_bytes([b'a', b'@']),
+            u16::from_le_bytes([b'b', b'#']),
+        ];
+        let alphabet = [b'q', b'!', b'a', b'@', b'b', b'#', b'x'];
+        let exact_first = |haystack: &[u8]| {
+            haystack
+                .windows(2)
+                .position(|bytes| pairs.contains(&u16::from_le_bytes([bytes[0], bytes[1]])))
+        };
+        for scan_offset in [0_usize, 1] {
+            for length in 0_usize..=6 {
+                let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+                for ordinal in 0..cases {
+                    let mut value = ordinal;
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    let mut base = 0_usize;
+                    let mut relation_active = false;
+                    let candidate_first = loop {
+                        if base.checked_add(1).is_none_or(|end| end >= haystack.len()) {
+                            break None;
+                        }
+                        let encoded = u16::from_le_bytes([haystack[base], haystack[base + 1]]);
+                        if relation_active {
+                            if pairs.contains(&encoded) {
+                                break Some(base);
+                            }
+                        } else {
+                            let projected = haystack[base + scan_offset];
+                            let projected_member = pairs.iter().any(|pair| {
+                                pair.to_le_bytes()[scan_offset] == projected
+                            });
+                            if projected_member {
+                                if pairs.contains(&encoded) {
+                                    break Some(base);
+                                }
+                                relation_active = true;
+                            }
+                        }
+                        base += 1;
+                    };
+                    assert_eq!(
+                        candidate_first,
+                        exact_first(&haystack),
+                        "scan_offset={scan_offset} haystack={haystack:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cold-switch test owns its authenticated gate, phase order, and continuation edges"
+    )]
+    fn aarch64_exact_pair_primary_cold_switch_is_authenticated_and_relation_owned() {
+        let features = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let layout_for = |pattern| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                compiled.program().native_dfa_view().unwrap(),
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap()
+            .1
+        };
+        let ordinary = layout_for(r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)");
+        assert!(ordinary.seeded_reverse.is_none());
+        let suffix = ordinary.suffix_filter.unwrap();
+        let pair = suffix.exact_pair_filter.unwrap();
+        assert!(use_aarch64_filter_batch(suffix.filter));
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, true, true),
+            Ok(Some(suffix.filter))
+        );
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, false, true),
+            Ok(None)
+        );
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(suffix, true, false),
+            Ok(None)
+        );
+
+        let mut outside_pair = suffix;
+        outside_pair.filter.scan_offset = 2;
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(outside_pair, true, true),
+            Ok(None)
+        );
+        let projected = |pair: u16| {
+            if suffix.filter.scan_offset == 0 {
+                pair as u8
+            } else {
+                (pair >> 8) as u8
+            }
+        };
+        let uncovered = (u8::MIN..=u8::MAX)
+            .find(|byte| !pair.pairs().iter().any(|pair| projected(*pair) == *byte))
+            .unwrap();
+        let mut uncovered_projection = suffix;
+        uncovered_projection.filter = NativeStartFilter {
+            ranges: {
+                let mut ranges = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+                ranges[0] = NativeByteRange {
+                    start: uncovered,
+                    end: uncovered,
+                };
+                ranges
+            },
+            range_count: 1,
+            candidate_bytes: 1,
+            scan_offset: suffix.filter.scan_offset,
+            from_anchored_prefix: false,
+        };
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(uncovered_projection, true, true),
+            Ok(None),
+            "a coverage mismatch must retain the direct relation"
+        );
+        let common_projection = layout_for(r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)");
+        let common_suffix = common_projection.suffix_filter.unwrap();
+        assert!(common_suffix.exact_pair_filter.is_some());
+        assert!(!use_aarch64_filter_batch(common_suffix.filter));
+        assert_eq!(
+            aarch64_exact_pair_primary_cold_filter(common_suffix, true, false),
+            Ok(None),
+            "a non-batched exact relation must retain the direct relation emitter"
+        );
+
+        let mut wrong_output = ordinary;
+        wrong_output.output = OutputContract::SelectedEnd;
+        let mut wrong_output_assembler = Aarch64Assembler::new();
+        let wrong_output_no_match = wrong_output_assembler.label().unwrap();
+        let wrong_output_matched = wrong_output_assembler.label().unwrap();
+        assert!(matches!(
+            aarch64_emit_suffix_prepass(
+                &mut wrong_output_assembler,
+                wrong_output.suffix_filter.unwrap(),
+                None,
+                true,
+                true,
+                true,
+                features,
+                OperatingSystem::Linux,
+                wrong_output,
+                wrong_output_no_match,
+                wrong_output_matched,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 exact-pair primary phase escaped Exists admission"
+            ))
+        ));
+
+        let emit = |layout: NativeDfaLayout| {
+            let suffix = layout.suffix_filter.unwrap();
+            let mut assembler = Aarch64Assembler::new();
+            let no_match = assembler.label().unwrap();
+            let matched = assembler.label().unwrap();
+            // The relation vector remains the first label allocated by the
+            // suffix emitter, even when a later optional primary phase exists.
+            let relation_vector = assembler.labels.len();
+            aarch64_emit_suffix_prepass(
+                &mut assembler,
+                suffix,
+                None,
+                true,
+                use_aarch64_filter_batch(suffix.filter),
+                true,
+                features,
+                OperatingSystem::Linux,
+                layout,
+                no_match,
+                matched,
+            )
+            .unwrap();
+            (assembler, relation_vector)
+        };
+        let (ordinary_emission, relation_vector) = emit(ordinary);
+        let words = ordinary_emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(suffix.filter.is_exact());
+        let primary_constant = aarch64_movi_16b(
+            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            suffix.filter.ranges()[0].start,
+        )
+        .unwrap();
+        let primary_candidates = aarch64_cmeq_16b(0, 24, 16).unwrap();
+        let first_relation_predicate = pair
+            .vector_plan
+            .rectangles()
+            .iter()
+            .flat_map(|rectangle| [rectangle.first, rectangle.second])
+            .find(|predicate| !predicate.any)
+            .unwrap();
+        let relation_constant = aarch64_movi_16b(
+            first_relation_predicate.first_constant,
+            first_relation_predicate.filter.ranges()[0].start,
+        )
+        .unwrap();
+        let primary_constant_at = words
+            .iter()
+            .position(|word| *word == primary_constant)
+            .unwrap();
+        let primary_candidates_at = words
+            .iter()
+            .position(|word| *word == primary_candidates)
+            .unwrap();
+        let relation_constant_at = words
+            .iter()
+            .position(|word| *word == relation_constant)
+            .unwrap();
+        let relation_batch_at = words
+            .iter()
+            .position(|word| *word == aarch64_ext_16b(16, 24, 25, 1).unwrap())
+            .unwrap();
+        let primary_first_candidate_at = words
+            .iter()
+            .position(|word| *word == aarch64_bsl_16b(0, 28, 31).unwrap())
+            .unwrap();
+        let primary_pair_at = words
+            .iter()
+            .position(|word| *word == aarch64_load_halfword_imm(8, 12, 0).unwrap())
+            .unwrap();
+        let primary_tail_bound_at = words
+            .iter()
+            .position(|word| {
+                *word
+                    == aarch64_cmp_x_imm(
+                        12,
+                        u16::from(1_u8) + AARCH64_ASIMD_VECTOR_BYTES,
+                    )
+                    .unwrap()
+            })
+            .unwrap();
+        let primary_tail_advance_at = words
+            .iter()
+            .position(|word| {
+                *word
+                    == aarch64_add_x_imm(2, 2, AARCH64_ASIMD_VECTOR_BYTES).unwrap()
+            })
+            .unwrap();
+        assert!(primary_constant_at < primary_candidates_at);
+        assert!(primary_candidates_at < primary_first_candidate_at);
+        assert!(primary_first_candidate_at < primary_tail_bound_at);
+        assert!(primary_tail_bound_at < primary_tail_advance_at);
+        assert!(primary_tail_advance_at < primary_pair_at);
+        assert!(primary_pair_at < relation_constant_at);
+        assert!(relation_constant_at < relation_batch_at);
+        let advance_batch = aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)
+            .unwrap()
+            .to_le_bytes();
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            fixup.label != relation_vector
+                && fixup.instruction < relation_constant_at * 4
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_batch[..])
+        }));
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            fixup.label == relation_vector
+                && fixup.instruction > relation_batch_at * 4
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_batch[..])
+        }));
+        let advance_one = aarch64_add_x_imm(2, 2, 1).unwrap().to_le_bytes();
+        assert!(ordinary_emission.fixups.iter().any(|fixup| {
+            ordinary_emission.labels[fixup.label] == Some(relation_constant_at * 4)
+                && fixup.instruction >= 4
+                && ordinary_emission
+                    .code
+                    .get(fixup.instruction - 4..fixup.instruction)
+                    == Some(&advance_one[..])
+        }));
+        assert!(!words.contains(
+            &aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0).unwrap()
+        ));
+        assert!(!words.contains(
+            &aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 1).unwrap()
+        ));
+        let rewind = aarch64_sub_x_imm(2, 2, AARCH64_BATCH_BYTES)
+            .unwrap()
+            .to_le_bytes();
+        assert!(
+            !ordinary_emission
+                .code
+                .chunks_exact(4)
+                .any(|word| word == rewind),
+            "candidate-first extraction must not rewind a completed primary batch"
+        );
+
+        let retry = layout_for(r"Z.{0,4}(?:q!|a@|b#)");
+        assert!(retry.seeded_reverse.is_none());
+        assert!(retry.suffix_filter.unwrap().retry.is_some());
+        let (retry_emission, retry_relation_vector) = emit(retry);
+        let retry_base = aarch64_mov_x(2, 7).unwrap().to_le_bytes();
+        let retry_restore = retry_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction >= 4
+                    && retry_emission
+                        .code
+                        .get(fixup.instruction - 4..fixup.instruction)
+                        == Some(&retry_base[..])
+            })
+            .unwrap();
+        assert_ne!(retry_restore.label, retry_relation_vector);
+        let retry_dispatch_at = retry_emission.labels[retry_restore.label].unwrap();
+        let retry_phase_edge = retry_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction == retry_dispatch_at
+                    && fixup.kind == Aarch64FixupKind::CompareBranch19
+            })
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                retry_emission.code[retry_dispatch_at..retry_dispatch_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x3400_0000 | u32::from(AARCH64_SUFFIX_RELATION_PHASE)
+        );
+        let retry_activation_at = retry_emission.labels[retry_phase_edge.label].unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                retry_emission.code[retry_activation_at..retry_activation_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 1).unwrap()
+        );
+        assert!(retry_emission.fixups.iter().any(|fixup| {
+            fixup.instruction == retry_dispatch_at + 4
+                && fixup.kind == Aarch64FixupKind::Branch26
+                && fixup.label == retry_relation_vector
+        }));
+        assert!(retry_emission
+            .code
+            .chunks_exact(4)
+            .any(|word| word
+                == aarch64_movz_w(AARCH64_SUFFIX_RELATION_PHASE, 0)
+                    .unwrap()
+                    .to_le_bytes()));
+
+        let seeded = layout_for(r"(?s:.+)(?:q!|a@|b#)(?s:.*)");
+        assert!(seeded.seeded_reverse.is_some());
+        assert!(seeded.suffix_filter.unwrap().exact_pair_filter.is_some());
+        let mut wrong_seeded_output = seeded;
+        wrong_seeded_output.output = OutputContract::SelectedEnd;
+        let mut wrong_seeded_assembler = Aarch64Assembler::new();
+        let wrong_seeded_no_match = wrong_seeded_assembler.label().unwrap();
+        let wrong_seeded_matched = wrong_seeded_assembler.label().unwrap();
+        assert!(matches!(
+            aarch64_emit_suffix_prepass(
+                &mut wrong_seeded_assembler,
+                wrong_seeded_output.suffix_filter.unwrap(),
+                None,
+                true,
+                true,
+                true,
+                features,
+                OperatingSystem::Linux,
+                wrong_seeded_output,
+                wrong_seeded_no_match,
+                wrong_seeded_matched,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
+        let (seeded_emission, seeded_relation_vector) = emit(seeded);
+        // X15 is the child emitter's audited REVERSE_NEXT_BASE register.
+        let seeded_next = aarch64_mov_x(2, 15).unwrap().to_le_bytes();
+        let seeded_phase_edge = seeded_emission
+            .fixups
+            .iter()
+            .find(|fixup| {
+                fixup.instruction >= 4
+                    && fixup.kind == Aarch64FixupKind::CompareBranch19
+                    && seeded_emission
+                        .code
+                        .get(fixup.instruction - 4..fixup.instruction)
+                        == Some(&seeded_next[..])
+            })
+            .unwrap();
+        let seeded_activation_at = seeded_emission.labels[seeded_phase_edge.label].unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                seeded_emission.code[seeded_activation_at..seeded_activation_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            aarch64_movz_w(
+                module_seeded_reverse_aarch64::REVERSE_RELATION_PHASE,
+                1
+            )
+            .unwrap()
+        );
+        assert!(seeded_emission.fixups.iter().any(|fixup| {
+            fixup.instruction == seeded_phase_edge.instruction + 4
+                && fixup.kind == Aarch64FixupKind::Branch26
+                && fixup.label == seeded_relation_vector
+        }));
+        assert!(seeded_emission
+            .code
+            .chunks_exact(4)
+            .any(|word| word
+                == aarch64_movz_w(
+                    module_seeded_reverse_aarch64::REVERSE_RELATION_PHASE,
+                    0
+                )
+                .unwrap()
+                .to_le_bytes()));
+    }
+
+    #[test]
+    fn exact_pair_policy_declines_preserve_incumbent_objects_and_sve_fails_closed() {
+        let pattern = r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)";
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let targets = [
+            Target::aarch64_linux(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux()
+                .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    asimd
+                        .with(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ];
+        for target in targets {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert!(
+                !compiled.module().has_exact_pair_suffix(),
+                "scheduler published a policy-disabled pair route: {target:?}"
+            );
+            let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap();
+            let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                compiled.program(),
+                target,
+                usize::MAX,
+                true,
+                false,
+            )
+            .unwrap();
+            assert!(!enabled.has_exact_pair_suffix(), "{target:?}");
+            assert_eq!(
+                emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                "SVE policy-off lowering must be the exact incumbent: {target:?}"
+            );
+            assert_eq!(enabled.start_accelerator(), incumbent.start_accelerator());
+            assert_eq!(
+                enabled.required_runtime_symbols().collect::<Vec<_>>(),
+                incumbent.required_runtime_symbols().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                enabled.required_prepare_capabilities(),
+                incumbent.required_prepare_capabilities()
+            );
+        }
+
+        let target = Target::x86_64_linux();
+        for target in [
+            target,
+            Target::aarch64_linux().with_features(asimd).unwrap(),
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        ] {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let enabled = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                    true,
+                    true,
+                )
+                .unwrap();
+                let incumbent = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                    true,
+                    false,
+                )
+                .unwrap();
+                assert!(!enabled.has_exact_pair_suffix(), "{target:?} {output:?}");
+                assert_eq!(
+                    emit_object(&enabled, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                    emit_object(&incumbent, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                    "non-Exists pair policy must be byte-inert: {target:?} {output:?}"
+                );
+            }
+        }
+
+        let fast = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert!(!fast.module().has_exact_pair_suffix());
+        let fast_incumbent = CompiledModule::lower(fast.program(), target).unwrap();
+        assert_eq!(
+            fast.object(),
+            emit_object(
+                &fast_incumbent,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap()
+        );
+
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let terminal = derive_terminal_suffix_filter(view)
+            .unwrap()
+            .expect("exact-pair terminal factor");
+        assert!(terminal.exact_pair_filter.is_some());
+        let requirement = NativeRetainedSuffixRequirement {
+            scan_offset: terminal.filter.scan_offset,
+            membership: start_filter_membership(terminal.filter).unwrap(),
+            minimum_width: terminal.minimum_width,
+        };
+        let retained_view = NativeProgramView {
+            retained_suffix_requirement: Some(requirement),
+            ..view
+        };
+        let (_, retained_layout) =
+            build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                retained_view,
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(
+            retained_layout
+                .suffix_filter
+                .is_some_and(|suffix| suffix.exact_pair_filter.is_none())
+        );
+        let retained_emission =
+            lower_x86_64_dfa_with_emission(retained_layout, target.features).unwrap();
+        assert!(retained_suffix_scanner_is_preserved(
+            retained_emission.suffix_scanner,
+            retained_layout.suffix_filter,
+            requirement,
+        ));
+        let retained_lowering =
+            lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+                retained_view,
+                target,
+                NativeDfaEntryContract::Public,
+                usize::MAX,
+                true,
+                true,
+            )
+            .unwrap()
+            .expect("retained exact scanner lowering");
+        assert!(!retained_lowering.exact_pair_suffix_lowered);
+
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::aarch64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let layout = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap()
+        .1;
+        assert!(
+            layout
+                .suffix_filter
+                .is_some_and(|suffix| suffix.exact_pair_filter.is_some())
+        );
+        assert!(matches!(
+            lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                sve,
+                OperatingSystem::Linux,
+                None,
+                Some(Aarch64SveFilterKind::Sve),
+                NativeDfaEntryContract::Public,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 exact-pair suffix retained an SVE scanner receipt"
+            ))
+        ));
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes exact terminal/interior pair scanners over every short window"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the host differential keeps machine-code objects, all short tails, and the portable oracle together"
+    )]
+    fn linked_host_exact_pair_suffix_all_short_windows_agrees_with_portable() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let base = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let target = if cfg!(target_arch = "x86_64") {
+            base.with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap()
+        } else {
+            base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
+        };
+        let patterns = [
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)(?-u:[\x00-\xFF])*",
+            r"(?:ee|f)*?(?:q!|a@|b#)",
+            r"Z.{0,4}(?:q!|a@|b#)",
+            r"(?s:.+)(?:q!|a@|b#)(?s:.*)",
+            r"(?-u:[\x00-\xFF])*(?:!q|@a|#b)",
+            r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@)",
+            r"(?-u:[\x00-\xFF])*(?:!q|@a)",
+        ];
+        let mut tail_15 = vec![b'x'; 15];
+        tail_15[13..].copy_from_slice(b"q@");
+        let mut tail_16 = vec![b'x'; 16];
+        tail_16[14..].copy_from_slice(b"q!");
+        let mut offset_0 = vec![b'x'; 17];
+        offset_0[..2].copy_from_slice(b"b#");
+        let mut offset_1 = vec![b'x'; 17];
+        offset_1[1..3].copy_from_slice(b"a@");
+        let mut late = vec![b'x'; 17];
+        late[15..].copy_from_slice(b"q!");
+        let mut false_cartesian = Vec::new();
+        while false_cartesian.len() < 17 {
+            false_cartesian.extend_from_slice(b"q@a!b@");
+        }
+        false_cartesian.truncate(17);
+        let mut single_vector_tail = vec![b'x'; 128];
+        single_vector_tail[95..97].copy_from_slice(b"a@");
+        let mut vector_end = vec![b'x'; 128];
+        vector_end[126..].copy_from_slice(b"q!");
+        let mut vector_boundary = vec![b'x'; 129];
+        for (offset, pair) in [(0, b"b#"), (15, b"a@"), (63, b"q!"), (127, b"a@")] {
+            vector_boundary[offset..offset + 2].copy_from_slice(pair);
+        }
+        let mut vector_decoys = Vec::new();
+        while vector_decoys.len() < 129 {
+            vector_decoys.extend_from_slice(b"q@a!b@");
+        }
+        vector_decoys.truncate(129);
+        let projection_absent = vec![b'x'; 257];
+        let mut late_batch_boundary = vec![b'x'; 257];
+        late_batch_boundary[255..].copy_from_slice(b"q!");
+        let mut false_then_late = vec![b'x'; 257];
+        false_then_late[7..9].copy_from_slice(b"q@");
+        false_then_late[191..193].copy_from_slice(b"a@");
+        let mut dense_false_then_match = Vec::new();
+        while dense_false_then_match.len() < 257 {
+            dense_false_then_match.extend_from_slice(b"q@a!b@");
+        }
+        dense_false_then_match.truncate(257);
+        dense_false_then_match[255..].copy_from_slice(b"b#");
+        let mut retry_reject_then_match = vec![b'x'; 257];
+        retry_reject_then_match[7..9].copy_from_slice(b"q!");
+        retry_reject_then_match[120] = b'Z';
+        retry_reject_then_match[123..125].copy_from_slice(b"a@");
+        let mut seeded_reject_then_match = vec![b'x'; 257];
+        seeded_reject_then_match[..2].copy_from_slice(b"q!");
+        seeded_reject_then_match[193..195].copy_from_slice(b"b#");
+        let mut reversed_boundary = vec![b'x'; 129];
+        reversed_boundary[63..65].copy_from_slice(b"!q");
+        reversed_boundary[127..129].copy_from_slice(b"@a");
+        let haystacks = [
+            b"q".to_vec(),
+            tail_15,
+            tail_16,
+            offset_0,
+            offset_1,
+            late,
+            false_cartesian,
+            single_vector_tail,
+            vector_end,
+            vector_boundary,
+            vector_decoys,
+            projection_absent,
+            late_batch_boundary,
+            false_then_late,
+            dense_false_then_match,
+            retry_reject_then_match,
+            seeded_reject_then_match,
+            reversed_boundary,
+        ];
+        assert_eq!(
+            haystacks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [
+                1, 15, 16, 17, 17, 17, 17, 128, 128, 129, 129, 257, 257, 257, 257, 257,
+                257, 129
+            ]
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-exact-pair-short-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") { "x86" } else { "arm" }
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut source =
+            String::from("#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n");
+        for (index, haystack) in haystacks.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{index}[]={{{bytes}}};").unwrap();
+        }
+        let mut objects = Vec::new();
+        let mut programs = Vec::new();
+        let mut symbols = Vec::new();
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            for (output_index, output) in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let compiled = compile(
+                    CompileRequest::new(*pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let layout = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().unwrap(),
+                    target.architecture,
+                )
+                .unwrap()
+                .1;
+                assert_eq!(
+                    layout
+                        .suffix_filter
+                        .is_some_and(|suffix| suffix.exact_pair_filter.is_some()),
+                    output == OutputContract::Exists,
+                );
+                assert_eq!(
+                    compiled.module().has_exact_pair_suffix(),
+                    output == OutputContract::Exists,
+                );
+                if pattern_index == 2 && output == OutputContract::Exists {
+                    assert!(
+                        layout.seeded_reverse.is_some(),
+                        "the third fixture must exercise the seeded-reverse continuation"
+                    );
+                }
+                if pattern_index == 3 && output == OutputContract::Exists {
+                    assert!(
+                        layout
+                            .suffix_filter
+                            .is_some_and(|suffix| suffix.retry.is_some()),
+                        "the fourth fixture must execute bounded verifier rejection"
+                    );
+                }
+                if pattern_index == 4 && output == OutputContract::Exists {
+                    assert!(
+                        layout
+                            .seeded_reverse
+                            .is_some_and(|reverse| !reverse.proves_match),
+                        "the fifth fixture must execute root-seeded reverse rejection"
+                    );
+                }
+                if pattern_index == 5 && output == OutputContract::Exists {
+                    assert_eq!(
+                        layout.suffix_filter.unwrap().filter.scan_offset,
+                        0,
+                        "the sixth fixture must exercise chronological pair-byte projection"
+                    );
+                }
+                if pattern_index == 6 && output == OutputContract::Exists {
+                    let suffix = layout.suffix_filter.unwrap();
+                    assert!(suffix.exact_pair_filter.is_some());
+                    assert!(
+                        !use_aarch64_filter_batch(suffix.filter),
+                        "the seventh fixture must retain the direct non-batched relation"
+                    );
+                }
+                if matches!(pattern_index, 7 | 8) && output == OutputContract::Exists {
+                    let suffix = layout.suffix_filter.unwrap();
+                    assert!(
+                        layout.seeded_reverse.is_none() && suffix.retry.is_none(),
+                        "the two-pair fixtures must execute the ordinary suffix scanner"
+                    );
+                    assert_eq!(
+                        suffix.exact_pair_filter.unwrap().pairs().len(),
+                        2,
+                        "the two-pair fixture must execute the exact relation route"
+                    );
+                    assert_eq!(
+                        suffix.filter.scan_offset,
+                        u8::from(pattern_index == 7),
+                        "the two-pair fixtures must execute both projection orientations"
+                    );
+                }
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                let symbol = compiled.module().entry_symbol().to_owned();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+                )
+                .unwrap();
+                let object = directory.join(format!("pair-{pattern_index}-{output_index}.o"));
+                fs::write(&object, compiled.object()).unwrap();
+                objects.push(object);
+                programs.push(compiled);
+                symbols.push(symbol);
+            }
+        }
+
+        source.push_str("int main(void){size_t r[2];uint32_t s;\n");
+        let mut failure = 10_usize;
+        for (program_index, (program, symbol)) in programs.iter().zip(&symbols).enumerate() {
+            for (haystack_index, haystack) in haystacks.iter().enumerate() {
+                let mut windows = Vec::new();
+                if haystack.len() <= 17 {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            windows.push((start, end));
+                        }
+                    }
+                } else {
+                    windows.extend([
+                        (0, haystack.len()),
+                        (0, 127.min(haystack.len())),
+                        (1, haystack.len()),
+                        (14, haystack.len()),
+                        (15, haystack.len()),
+                        (16, haystack.len()),
+                        (62, haystack.len()),
+                        (63, haystack.len()),
+                        (64, haystack.len()),
+                        (126, haystack.len()),
+                        (127, haystack.len()),
+                        (haystack.len(), haystack.len()),
+                    ]);
+                    windows.sort_unstable();
+                    windows.dedup();
+                }
+                for (start, end) in windows {
+                    let expected = program
+                        .search(haystack, SearchWindow::new(start, end))
+                        .unwrap();
+                    let (status, result_start, result_end) = match expected {
+                        MatchResult::Exists(found) => (u8::from(found), 0, 0),
+                        MatchResult::SelectedEnd(Some(end)) => (1, end, end),
+                        MatchResult::Span(Some((start, end))) => (1, start, end),
+                        MatchResult::SelectedEnd(None) | MatchResult::Span(None) => (0, 0, 0),
+                    };
+                    writeln!(
+                        source,
+                        "r[0]=99;r[1]=99;s={symbol}(h{haystack_index},{},{start},{end},r);if(s!={status}||r[0]!={result_start}||r[1]!={result_end}){{fprintf(stderr,\"failure={failure} program={program_index} haystack={haystack_index} window={start}..{end} expected=%u/%zu/%zu got=%u/%zu/%zu\\n\",(unsigned){status},(size_t){result_start},(size_t){result_end},(unsigned)s,r[0],r[1]);return 1;}}",
+                        haystack.len(),
+                    )
+                    .unwrap();
+                    failure += 1;
+                }
+            }
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("pair.c");
+        let executable = directory.join("pair");
+        fs::write(&c_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let output = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -126660,6 +136412,162 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes AArch64 and Rosetta synchronizing-accept Exists objects"]
+    fn linked_macos_synchronizing_accept_exists_agrees_with_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let targets = [
+            (asimd, "arm64", "aarch64-asimd"),
+            (Target::x86_64_macos(), "x86_64", "x86-sse2"),
+        ];
+
+        let mut mixed = vec![b'x'; 192];
+        mixed[0] = b'f';
+        mixed[1] = b'R';
+        for position in [16_usize, 32, 96, 128] {
+            mixed[position] = b'R';
+        }
+        mixed[62..65].copy_from_slice(b"eeR");
+        mixed[129..191].fill(b'f');
+        mixed[191] = b'R';
+        let absent = vec![b'f'; 192];
+        let mut dense_end = vec![b'f'; 192];
+        dense_end[191] = b'R';
+        let mut fixtures = vec![
+            Vec::new(),
+            b"R".to_vec(),
+            b"fR".to_vec(),
+            b"eeR".to_vec(),
+            b"eR".to_vec(),
+            b"fffR".to_vec(),
+        ];
+        for body in [14_usize, 15, 16, 17] {
+            let mut haystack = vec![b'f'; body];
+            haystack.push(b'R');
+            fixtures.push(haystack);
+        }
+        fixtures.extend([mixed, absent, dense_end]);
+
+        for (target_index, (target, architecture, tag)) in targets.into_iter().enumerate() {
+            let compiled = compile(
+                CompileRequest::new("(?:ee|f)+?R", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert!(compiled.module().has_synchronizing_accept_reverse());
+
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-sync-accept-exists-{}-{target_index}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let object = directory.join("case.o");
+            fs::write(&object, compiled.object()).unwrap();
+            let symbol = compiled.module().entry_symbol();
+            let mut source = format!(
+                "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\n"
+            );
+            let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+            let mut call_index = 0usize;
+
+            for (fixture, haystack) in fixtures.iter().enumerate() {
+                let bytes = if haystack.is_empty() {
+                    String::from("0")
+                } else {
+                    haystack
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const unsigned char h{fixture}[] = {{{bytes}}};"
+                )
+                .unwrap();
+                let mut windows = Vec::new();
+                if haystack.len() <= 18 {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            windows.push((start, end));
+                        }
+                    }
+                } else {
+                    let boundaries = [
+                        0_usize, 1, 2, 14, 15, 16, 17, 31, 32, 33, 62, 63, 64, 65, 95,
+                        96, 97, 127, 128, 129, 130, 159, 160, 191, 192,
+                    ];
+                    for &start in &boundaries {
+                        for &end in &boundaries {
+                            if start <= end && end <= haystack.len() {
+                                windows.push((start, end));
+                            }
+                        }
+                    }
+                }
+                windows.sort_unstable();
+                windows.dedup();
+                for (start, end) in windows {
+                    let MatchResult::Exists(expected) = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .unwrap()
+                    else {
+                        unreachable!("Exists fixture returned an endpoint result");
+                    };
+                    let failure = 10 + call_index % 200;
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(h{fixture},{},{start},{end},r);if(s!={}||r[0]!=0||r[1]!=0)return {failure};",
+                        haystack.len(),
+                        u8::from(expected),
+                    )
+                    .unwrap();
+                    call_index += 1;
+                }
+            }
+            calls.push_str("return 0;}\n");
+            source.push_str(&calls);
+            let c_path = directory.join("differential.c");
+            let executable = directory.join("differential");
+            fs::write(&c_path, source).unwrap();
+            let status = Command::new("clang")
+                .arg("-arch")
+                .arg(architecture)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .args((architecture == "x86_64").then_some("-Wl,-adhoc_codesign"))
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to link {tag}");
+            let output = if architecture == "x86_64" {
+                Command::new("arch")
+                    .arg("-x86_64")
+                    .arg(&executable)
+                    .output()
+                    .unwrap()
+            } else {
+                Command::new(&executable).output().unwrap()
+            };
+            assert!(
+                output.status.success(),
+                "{tag}: status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 

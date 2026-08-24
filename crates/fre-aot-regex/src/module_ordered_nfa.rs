@@ -124,6 +124,12 @@ pub(super) struct OrderedNfaNativeEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedNfaEntrySurface {
+    Compatibility,
+    OperationOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum R {
     Ax = 0,
@@ -2810,6 +2816,24 @@ fn emit_semantic_body(
 pub(super) fn lower_x86_64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<OrderedNfaNativeEntry, ObjectError> {
+    lower_x86_64_with_surface(image, OrderedNfaEntrySurface::Compatibility)
+}
+
+/// Emit only the private V15 search and its source-free capability gate.
+///
+/// Unlike [`lower_x86_64`], this fragment has no ordinary public adapter and
+/// no compatibility fallback relocation. It is therefore suitable for a
+/// whole-operation object whose sole global function is an enclosing reducer.
+pub(super) fn lower_x86_64_operation_only(
+    image: &NativeOrderedNfaObjectImage<'_>,
+) -> Result<OrderedNfaNativeEntry, ObjectError> {
+    lower_x86_64_with_surface(image, OrderedNfaEntrySurface::OperationOnly)
+}
+
+fn lower_x86_64_with_surface(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    surface: OrderedNfaEntrySurface,
+) -> Result<OrderedNfaNativeEntry, ObjectError> {
     // The fragmented terminal proof is aggregate-only. Revalidate it here so
     // a forged compiler-only receipt still fails closed, but do not let it
     // change the shared/public/private one-Span entry.
@@ -2849,20 +2873,23 @@ pub(super) fn lower_x86_64(
         None
     };
 
-    emit_prologue_and_raw_checks(
-        &mut asm,
-        public_table_displacement,
-        invalid_argument,
-        invalid_handle,
-    )?;
-    {
-        let mut x = X { asm: &mut asm };
-        emit_exact_object_auth(&mut x, layout, runtime_failure)?;
-        emit_common_header_identity_auth(&mut x, runtime_failure)?;
-        // A V15 claim is sticky: any one of the flag, ready seal, or format
-        // discriminator commits the call to exact native authentication. A
-        // revoked or malformed claimant returns status 3 and never deopts.
-        emit_v15_claim_classifier(&mut x, shared_auth, public_fallback)?;
+    if surface == OrderedNfaEntrySurface::Compatibility {
+        emit_prologue_and_raw_checks(
+            &mut asm,
+            public_table_displacement,
+            invalid_argument,
+            invalid_handle,
+        )?;
+        {
+            let mut x = X { asm: &mut asm };
+            emit_exact_object_auth(&mut x, layout, runtime_failure)?;
+            emit_common_header_identity_auth(&mut x, runtime_failure)?;
+            // A V15 claim is sticky: any one of the flag, ready seal, or
+            // format discriminator commits the call to exact native
+            // authentication. A revoked or malformed claimant returns status
+            // 3 and never deopts.
+            emit_v15_claim_classifier(&mut x, shared_auth, public_fallback)?;
+        }
     }
 
     asm.bind(private_entry)?;
@@ -2939,19 +2966,21 @@ pub(super) fn lower_x86_64(
         x.jump(after_generation_clear)?;
     }
 
-    asm.bind(public_fallback)?;
-    {
-        let mut x = X { asm: &mut asm };
-        x.load64(R::Di, R::Sp, L_HEADER)?;
-        x.mov64(R::Si, R::R12)?;
-        x.mov64(R::Dx, R::R13)?;
-        x.load64(R::Cx, R::Sp, L_POSITION)?;
-        x.mov64(R::R8, R::R14)?;
-        x.mov64(R::R9, R::R15)?;
-        emit_epilogue(&mut x)?;
-        x.op(&[0xe9])?;
-        x.asm.bind(public_fallback_displacement)?;
-        push_bytes(&mut x.asm.code, &[0; 4])?;
+    if surface == OrderedNfaEntrySurface::Compatibility {
+        asm.bind(public_fallback)?;
+        {
+            let mut x = X { asm: &mut asm };
+            x.load64(R::Di, R::Sp, L_HEADER)?;
+            x.mov64(R::Si, R::R12)?;
+            x.mov64(R::Dx, R::R13)?;
+            x.load64(R::Cx, R::Sp, L_POSITION)?;
+            x.mov64(R::R8, R::R14)?;
+            x.mov64(R::R9, R::R15)?;
+            emit_epilogue(&mut x)?;
+            x.op(&[0xe9])?;
+            x.asm.bind(public_fallback_displacement)?;
+            push_bytes(&mut x.asm.code, &[0; 4])?;
+        }
     }
     asm.bind(clear_generation)?;
     {
@@ -3061,52 +3090,64 @@ pub(super) fn lower_x86_64(
         emit_unicode_member(&mut asm, member, layout)?;
     }
     let finished = asm.finish_with_label_offsets()?;
-    let public_table_displacement = finished.label_offset(public_table_displacement)?;
+    let public_table_displacement = (surface == OrderedNfaEntrySurface::Compatibility)
+        .then(|| finished.label_offset(public_table_displacement))
+        .transpose()?;
     let private_table_displacement = finished.label_offset(private_table_displacement)?;
     let bulk_gate_table_displacement = finished.label_offset(bulk_gate_table_displacement)?;
-    let public_fallback_displacement = finished.label_offset(public_fallback_displacement)?;
+    let public_fallback_displacement = (surface == OrderedNfaEntrySurface::Compatibility)
+        .then(|| finished.label_offset(public_fallback_displacement))
+        .transpose()?;
     let private_entry_offset = finished.label_offset(private_entry)?;
     let bulk_gate_entry_offset = finished.label_offset(bulk_gate_entry)?;
+    let mut relocations = Vec::with_capacity(if surface == OrderedNfaEntrySurface::Compatibility {
+        4
+    } else {
+        2
+    });
+    if let Some(public_table_displacement) = public_table_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: u64::try_from(public_table_displacement).map_err(|_| {
+                ObjectError::ArithmeticOverflow("x86 Ordered-NFA public table relocation")
+            })?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_TABLE_SYMBOL,
+            addend: -4,
+        });
+    }
+    relocations.push(ModuleRelocation {
+        section: TEXT_SECTION,
+        offset: u64::try_from(private_table_displacement).map_err(|_| {
+            ObjectError::ArithmeticOverflow("x86 Ordered-NFA private table relocation")
+        })?,
+        kind: RelocationKind::X86PcRelative32,
+        symbol: PARTIAL_TABLE_SYMBOL,
+        addend: -4,
+    });
+    relocations.push(ModuleRelocation {
+        section: TEXT_SECTION,
+        offset: u64::try_from(bulk_gate_table_displacement).map_err(|_| {
+            ObjectError::ArithmeticOverflow("x86 Ordered-NFA bulk-gate table relocation")
+        })?,
+        kind: RelocationKind::X86PcRelative32,
+        symbol: PARTIAL_TABLE_SYMBOL,
+        addend: -4,
+    });
+    if let Some(public_fallback_displacement) = public_fallback_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: u64::try_from(public_fallback_displacement).map_err(|_| {
+                ObjectError::ArithmeticOverflow("x86 Ordered-NFA fallback relocation")
+            })?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        });
+    }
     Ok(OrderedNfaNativeEntry {
         code: finished.code,
-        relocations: vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: u64::try_from(public_table_displacement).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("x86 Ordered-NFA public table relocation")
-                })?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_TABLE_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: u64::try_from(private_table_displacement).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("x86 Ordered-NFA private table relocation")
-                })?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_TABLE_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: u64::try_from(bulk_gate_table_displacement).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("x86 Ordered-NFA bulk-gate table relocation")
-                })?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_TABLE_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: u64::try_from(public_fallback_displacement).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("x86 Ordered-NFA fallback relocation")
-                })?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-        ],
+        relocations,
         private_entry_offset,
         bulk_gate_entry_offset,
     })
@@ -3461,6 +3502,29 @@ mod tests {
         assert!(fallback >= 1);
         assert_eq!(entry.code[fallback - 1], 0xe9);
         assert_eq!(&entry.code[fallback..fallback + 4], &[0; 4]);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_operation_only_entry_has_closed_local_relocations() {
+        let compatibility = lower_x86_64(&minimal_image()).unwrap();
+        let operation = lower_x86_64_operation_only(&minimal_image()).unwrap();
+
+        assert!(!operation.code.is_empty());
+        assert!(operation.code.len() < compatibility.code.len());
+        assert_eq!(operation.private_entry_offset, 0);
+        assert!(operation.bulk_gate_entry_offset > operation.private_entry_offset);
+        assert!(operation.bulk_gate_entry_offset < operation.code.len());
+        assert_eq!(operation.relocations.len(), 2);
+        assert!(operation.relocations.iter().all(|relocation| {
+            relocation.section == TEXT_SECTION
+                && relocation.kind == RelocationKind::X86PcRelative32
+                && relocation.symbol == PARTIAL_TABLE_SYMBOL
+                && relocation.addend == -4
+        }));
+        assert!(operation
+            .relocations
+            .iter()
+            .all(|relocation| relocation.symbol != PREPARED_FALLBACK_RUNTIME_SYMBOL));
     }
 
     #[test]

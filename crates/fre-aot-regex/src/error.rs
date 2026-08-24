@@ -78,6 +78,9 @@ pub enum CompileError {
     PreparedAggregateRequiresSpan {
         actual: crate::OutputContract,
     },
+    PreparedScalarOperationRequiresSingleExport {
+        actual: crate::PreparedAggregateExports,
+    },
     InternalInvariant(&'static str),
 }
 
@@ -113,6 +116,10 @@ impl fmt::Display for CompileError {
                 formatter,
                 "prepared Count/SpanSum exports require Span output, got {actual:?}"
             ),
+            Self::PreparedScalarOperationRequiresSingleExport { actual } => write!(
+                formatter,
+                "prepared scalar operation requires exactly one Count, SpanSum, or GrepCount export, got {actual:?}"
+            ),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "compiler internal invariant failed: {detail}")
             }
@@ -132,6 +139,7 @@ impl std::error::Error for CompileError {
             | Self::StateExplosion { .. }
             | Self::InvalidWindow { .. }
             | Self::PreparedAggregateRequiresSpan { .. }
+            | Self::PreparedScalarOperationRequiresSingleExport { .. }
             | Self::InternalInvariant(_) => None,
         }
     }
