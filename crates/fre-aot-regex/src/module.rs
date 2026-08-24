@@ -130702,6 +130702,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             r"(?s:.+)(?:q!|a@|b#)(?s:.*)",
             r"(?-u:[\x00-\xFF])*(?:!q|@a|#b)",
             r"(?-u:[\x00-\xFF])*(?:ee|tt|aa)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@)",
+            r"(?-u:[\x00-\xFF])*(?:!q|@a)",
         ];
         let mut tail_15 = vec![b'x'; 15];
         tail_15[13..].copy_from_slice(b"q@");
@@ -130866,6 +130868,23 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     assert!(
                         !use_aarch64_filter_batch(suffix.filter),
                         "the seventh fixture must retain the direct non-batched relation"
+                    );
+                }
+                if matches!(pattern_index, 7 | 8) && output == OutputContract::Exists {
+                    let suffix = layout.suffix_filter.unwrap();
+                    assert!(
+                        layout.seeded_reverse.is_none() && suffix.retry.is_none(),
+                        "the two-pair fixtures must execute the ordinary suffix scanner"
+                    );
+                    assert_eq!(
+                        suffix.exact_pair_filter.unwrap().pairs().len(),
+                        2,
+                        "the two-pair fixture must execute the exact relation route"
+                    );
+                    assert_eq!(
+                        suffix.filter.scan_offset,
+                        u8::from(pattern_index == 7),
+                        "the two-pair fixtures must execute both projection orientations"
                     );
                 }
                 assert!(compiled.module().required_runtime_symbol().is_none());
