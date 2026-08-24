@@ -633,6 +633,14 @@ impl AotMatcher {
                 haystacks.len(),
             )
         };
+        if descriptors.len() > 1
+            && let Backend::Native {
+                exists_batch: Some(batch),
+                ..
+            } = &self.backend
+        {
+            return direct_native_is_match_descriptor_batch(*batch, descriptors, matched);
+        }
         self.is_match_descriptor_batch_validated(descriptors, matched)
     }
 
@@ -665,6 +673,19 @@ impl AotMatcher {
         // zero-copy descriptor batch path and its independently sized frame.
         if haystacks.len() == 1 && matched.len() == 1 {
             return self.is_match_descriptor_single(&haystacks[0], &mut matched[0]);
+        }
+        // Keep the authenticated direct-native batch route out of the large
+        // compatibility dispatcher. All request checks remain explicit here;
+        // malformed and non-direct requests enter the exact old path below.
+        if self.output == AotOutput::Exists
+            && haystacks.len() == matched.len()
+            && (2..=EXISTS_BATCH_CAPACITY).contains(&haystacks.len())
+            && let Backend::Native {
+                exists_batch: Some(batch),
+                ..
+            } = &self.backend
+        {
+            return direct_native_is_match_descriptor_batch(*batch, haystacks, matched);
         }
         self.is_match_descriptor_batch_non_single(haystacks, matched)
     }
@@ -1175,6 +1196,7 @@ fn prepared_native_search(
     unsafe_code,
     reason = "single checked call boundary for a compiler-produced direct Exists-batch entry"
 )]
+#[inline(never)]
 fn direct_native_is_match_descriptor_batch(
     batch: NativeExistsBatch,
     haystacks: &[AotHaystack<'_>],
@@ -1198,25 +1220,34 @@ fn direct_native_is_match_descriptor_batch(
             &raw mut processed,
         )
     };
-    if processed > haystacks.len() {
+    if status == 0 && processed == haystacks.len() {
+        Ok(())
+    } else {
+        direct_exists_batch_failure(status, processed, haystacks.len())
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn direct_exists_batch_failure(
+    status: u32,
+    processed: usize,
+    count: usize,
+) -> Result<(), String> {
+    if processed > count {
         return Err(format!(
-            "compiled Exists batch overreported its initialized prefix: {processed} > {}",
-            haystacks.len()
+            "compiled Exists batch overreported its initialized prefix: {processed} > {count}"
         ));
     }
     if status != 0 {
         return Err(format!(
-            "compiled Exists batch failed with status {status} after {processed}/{} haystacks",
-            haystacks.len()
+            "compiled Exists batch failed with status {status} after {processed}/{count} haystacks"
         ));
     }
-    if processed != haystacks.len() {
-        return Err(format!(
-            "compiled Exists batch returned success after {processed}/{} haystacks",
-            haystacks.len()
-        ));
-    }
-    Ok(())
+    debug_assert_ne!(processed, count);
+    Err(format!(
+        "compiled Exists batch returned success after {processed}/{count} haystacks"
+    ))
 }
 
 #[allow(
