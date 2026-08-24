@@ -2468,8 +2468,37 @@ fn ascii_word_run_exists(haystack: &[u8], minimum: usize) -> bool {
     if haystack.len() < minimum {
         return false;
     }
+    if minimum == 0 {
+        return haystack.iter().copied().any(is_ascii_word);
+    }
+    let mut prefix = 0_usize;
+    while prefix < minimum && is_ascii_word(haystack[prefix]) {
+        prefix += 1;
+    }
+    if prefix == minimum {
+        return true;
+    }
+    ascii_word_run_exists_after_first_reset(haystack, minimum)
+}
+
+#[inline(never)]
+fn ascii_word_run_exists_after_first_reset(haystack: &[u8], minimum: usize) -> bool {
+    // The caller found the first nonword before the construction-proved run
+    // minimum. Rediscover that reset outside the hot prefix probe, then
+    // range-skip only the following bytes proved nonword. Punctuation inside
+    // the conservative range deliberately stops the skip early.
+    let Some(first_reset) = haystack.iter().position(|&byte| !is_ascii_word(byte)) else {
+        return haystack.len() >= minimum;
+    };
+    let suffix = &haystack[first_reset + 1..];
+    if suffix.len() < minimum {
+        return false;
+    }
+    let Some(start) = find_byte_delta(b'0', b'z' - b'0', suffix) else {
+        return false;
+    };
     let mut run = 0_usize;
-    for &byte in haystack {
+    for &byte in &suffix[start..] {
         if is_ascii_word(byte) {
             run = run.saturating_add(1);
             if run >= minimum {
