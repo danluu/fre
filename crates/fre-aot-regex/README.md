@@ -64,6 +64,25 @@ each source row as an independent Exists program and transactionally fills an
 exact caller-owned bitset. It keeps all-matching-ID semantics separate from
 ordered-many priority and does not change the stable single-program wire.
 
+## Ordered-many finite-language AOT
+
+Optimizing ordered-many `Count` and `SpanSum` compilation analyzes the one
+canonical HIR composed from all source rows. An independently authenticated,
+nonempty, assertion-free exact finite language may compete as one helper-free
+native scan against the complete ordinary optimizer portfolio. Source order,
+nested alternation order, prefix priority, and duplicates remain part of the
+Span semantics; caller pattern IDs bind the source receipt but do not alter
+matching.
+
+Optional fact or representation limits retain the ordinary incumbent. An
+allocator, arithmetic, authentication, or invariant failure remains terminal
+instead of authorizing a fresh allocating fallback. The selected route is
+reported by `ordered_finite_language_aot`; a cost decline omits that report and
+keeps the incumbent object unchanged. Public generated integration coverage
+checks selected flat, nested, and ordered-prefix languages at multiple sizes,
+plus an eligible exact-finite cost-decline control, under the default compiler
+limits.
+
 ## Uniform capture participation
 
 `compile_uniform_capture_selector` accepts an already canonical

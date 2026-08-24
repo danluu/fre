@@ -1,12 +1,13 @@
 use fre_aot_regex::{
     CompileMode, DeterminizeLimits, EntryAbi, MatchResult, OrderedManyAotCompileDecline,
     OrderedManyAotCompileDisposition, OrderedManyAotCompileError, OrderedManyAotCompileLimits,
-    OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, SearchWindow, SlowAotLimits, Target,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15, compile_ordered_many_aot,
+    OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
+    SearchWindow, SlowAotLimits, Target, compile_ordered_many_aot,
     compile_ordered_many_aot_reported,
 };
 use regex_automata::meta::Regex as MetaRegex;
+use sha2::{Digest, Sha256};
 
 fn rows(patterns: &[&str], ids: &[u32]) -> Vec<OrderedManyRow> {
     assert_eq!(patterns.len(), ids.len());
@@ -269,6 +270,247 @@ fn optimizing_exact_rows_can_select_one_ordered_finite_native_scan() {
             .next()
             .is_none(),
     );
+}
+
+fn escaped_exact_pattern(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut pattern = String::from("(?-u:");
+    for byte in bytes {
+        write!(&mut pattern, "\\x{byte:02x}").expect("write escaped byte");
+    }
+    pattern.push(')');
+    pattern
+}
+
+fn escaped_exact_alternation(literals: &[Vec<u8>]) -> String {
+    use std::fmt::Write as _;
+
+    let mut pattern = String::from("(?-u:(?:");
+    for (index, literal) in literals.iter().enumerate() {
+        if index != 0 {
+            pattern.push('|');
+        }
+        for byte in literal {
+            write!(&mut pattern, "\\x{byte:02x}").expect("write escaped alternative byte");
+        }
+    }
+    pattern.push_str("))");
+    pattern
+}
+
+fn generated_outlier_run_literals(count: usize, width: usize, outliers: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|ordinal| {
+            let byte = u8::try_from((ordinal * 73 + 19) % 251).expect("outlier byte");
+            let extra = usize::from(ordinal >= count.saturating_sub(outliers));
+            vec![byte; width + extra]
+        })
+        .collect()
+}
+
+fn generated_radix_literals(count: usize, width: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|ordinal| {
+            let mut bytes = Vec::with_capacity(width);
+            bytes.push(u8::try_from(ordinal % 251).expect("radix low byte"));
+            bytes.push(u8::try_from((ordinal / 251) % 251).expect("radix high byte"));
+            let mut state = u64::try_from(ordinal)
+                .expect("radix ordinal")
+                .wrapping_add(0x6a09_e667_f3bc_c909);
+            while bytes.len() < width {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(state.to_le_bytes()[bytes.len() % 8]);
+            }
+            bytes
+        })
+        .collect()
+}
+
+fn one_pattern_per_literal(literals: &[Vec<u8>]) -> Vec<String> {
+    literals
+        .iter()
+        .map(|literal| escaped_exact_pattern(literal))
+        .collect()
+}
+
+struct GeneratedExactFixture {
+    name: &'static str,
+    patterns: Vec<String>,
+    literals: Vec<Vec<u8>>,
+    selects_finite: bool,
+}
+
+fn generated_semantic_haystacks(literals: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut haystacks = vec![Vec::new(), b"public unrelated control".to_vec()];
+    for index in [0, literals.len() / 2, literals.len() - 1] {
+        let literal = &literals[index];
+        let mut wrapped = vec![0xff, 0xfe];
+        wrapped.extend_from_slice(literal);
+        wrapped.extend_from_slice(&[0xfe, 0xff]);
+        haystacks.push(wrapped);
+
+        let mut near_miss = literal.clone();
+        let middle = near_miss.len() / 2;
+        near_miss[middle] ^= 0x80;
+        haystacks.push(near_miss);
+    }
+    let mut dense = Vec::new();
+    for literal in literals {
+        dense.extend_from_slice(literal);
+        dense.extend_from_slice(&[0xff, 0xfe]);
+    }
+    haystacks.push(dense);
+    haystacks
+}
+
+#[test]
+fn generated_exact_finite_diversity_preserves_route_object_and_semantics() {
+    let outlier33 = generated_outlier_run_literals(33, 8, 1);
+    let nested65 = generated_outlier_run_literals(65, 8, 1);
+    let priority_base = generated_outlier_run_literals(65, 8, 0);
+    let first_byte = priority_base[0][0];
+    let short = vec![first_byte; 8];
+    let long = vec![first_byte; 9];
+    let mut short_first_literals = vec![short.clone(), long.clone()];
+    short_first_literals.extend(priority_base.iter().skip(1).cloned());
+    let mut long_first_literals = vec![long, short];
+    long_first_literals.extend(priority_base.iter().skip(1).cloned());
+    let radix17 = generated_radix_literals(17, 13);
+    let fixtures = [
+        GeneratedExactFixture {
+            name: "flat-33",
+            patterns: one_pattern_per_literal(&outlier33),
+            literals: outlier33,
+            selects_finite: true,
+        },
+        GeneratedExactFixture {
+            name: "nested-13x5",
+            patterns: nested65
+                .chunks_exact(5)
+                .map(escaped_exact_alternation)
+                .collect(),
+            literals: nested65,
+            selects_finite: true,
+        },
+        GeneratedExactFixture {
+            name: "short-prefix-first",
+            patterns: std::iter::once(escaped_exact_alternation(&short_first_literals[..2]))
+                .chain(
+                    short_first_literals[2..]
+                        .iter()
+                        .map(|literal| escaped_exact_pattern(literal)),
+                )
+                .collect(),
+            literals: short_first_literals,
+            selects_finite: true,
+        },
+        GeneratedExactFixture {
+            name: "long-prefix-first",
+            patterns: std::iter::once(escaped_exact_alternation(&long_first_literals[..2]))
+                .chain(
+                    long_first_literals[2..]
+                        .iter()
+                        .map(|literal| escaped_exact_pattern(literal)),
+                )
+                .collect(),
+            literals: long_first_literals,
+            selects_finite: true,
+        },
+        GeneratedExactFixture {
+            name: "radix-17-incumbent-control",
+            patterns: one_pattern_per_literal(&radix17),
+            literals: radix17,
+            selects_finite: false,
+        },
+    ];
+    let mut short_first_hashes = None;
+    let mut long_first_hashes = None;
+    for fixture in fixtures {
+        let pattern_refs = fixture
+            .patterns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let source_rows = fixture
+            .patterns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, pattern)| {
+                let id = u32::try_from(ordinal)
+                    .expect("generated row ordinal")
+                    .checked_mul(17)
+                    .and_then(|id| id.checked_add(3))
+                    .expect("generated row ID");
+                OrderedManyRow::new(OrderedManyPatternId::new(id), pattern.clone())
+            })
+            .collect();
+        let artifact = compile_ordered_many_aot(
+            OrderedManyAotCompileRequest::new(source_rows, Target::aarch64_macos())
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::COUNT,
+            SlowAotLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("generated fixture {}: {error}", fixture.name));
+        let compiled = artifact.compiled();
+        assert_eq!(
+            PreparedAggregateStrategy::NativeFused,
+            artifact.receipt().aggregate_strategy,
+            "fixture {}",
+            fixture.name,
+        );
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(!compiled.object().is_empty());
+        let object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
+        assert_eq!(compiled.receipt().object_sha256, object_sha256);
+        assert_eq!(artifact.receipt().object_sha256, object_sha256);
+
+        let finite = compiled.receipt().ordered_finite_language_aot;
+        assert_eq!(
+            finite.is_some(),
+            fixture.selects_finite,
+            "fixture {} selected the wrong optimizer route",
+            fixture.name,
+        );
+        if let Some(report) = finite {
+            assert_eq!(
+                usize::try_from(report.source_count).expect("finite source count"),
+                fixture.literals.len(),
+            );
+            assert_eq!(
+                report.source_bytes,
+                fixture.literals.iter().map(Vec::len).sum::<usize>(),
+            );
+            assert_eq!(
+                usize::try_from(report.maximum_width).expect("finite maximum width"),
+                fixture.literals.iter().map(Vec::len).max().unwrap(),
+            );
+        }
+        for haystack in generated_semantic_haystacks(&fixture.literals) {
+            assert_eq!(
+                oracle(&pattern_refs, &haystack),
+                semantic_spans(&artifact, &haystack),
+                "fixture={} haystack={haystack:?}",
+                fixture.name,
+            );
+        }
+
+        let hashes = (compiled.receipt().program_sha256, object_sha256);
+        match fixture.name {
+            "short-prefix-first" => short_first_hashes = Some(hashes),
+            "long-prefix-first" => long_first_hashes = Some(hashes),
+            _ => {}
+        }
+    }
+    assert_ne!(short_first_hashes.unwrap(), long_first_hashes.unwrap());
 }
 
 #[test]
