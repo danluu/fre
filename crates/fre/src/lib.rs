@@ -10611,10 +10611,12 @@ impl PortableBuilder {
         } else {
             None
         };
-        // A second inline Exists proof covers a class-guarded literal
-        // corridor, optionally paired at the root with the exact class-
-        // delimiter predicate above. It is attempted only when the direct
-        // class-delimiter plan did not already close the whole language.
+        // A second inline proof covers a class-guarded literal corridor,
+        // optionally paired at the root with the exact class-delimiter
+        // predicate above. Its direct class-plus topology also proves bounded
+        // ordinary full-input existence and selected-span projections. It is
+        // attempted only when the direct class-delimiter plan did not already
+        // close the whole language.
         let uri_exists = if class_delimiter_exists.is_none()
             && self.selection == PlanSelection::Auto
             && fallback_planner_work < self.limits.max_planner_work
@@ -11453,8 +11455,9 @@ struct PortableK0Plan {
     // Inline exact-language proof for a small four-byte literal alternation
     // followed by one fixed-width byte-class tail.
     literal_prefix_class_exists: Option<k0_literal_prefix_class_exists::Plan>,
-    // Inline proof for a class-guarded literal corridor and its optional
-    // two-branch union with the class-delimiter language.
+    // Inline proof for a class-guarded literal corridor, its optional two-
+    // branch union with the class-delimiter language, and the direct class-
+    // plus ordinary projection.
     uri_exists: Option<k0_uri_exists::Plan>,
     lazy_delimited_repeat: Option<lazy_delimited_repeat::Plan>,
     greedy_class_literal_tail: Option<greedy_class_literal_tail::Plan>,
@@ -14240,6 +14243,11 @@ impl PortableRegex {
                 {
                     return Ok(matched);
                 }
+                if let Some(plan) = k0.uri_exists
+                    && let Some(matched) = plan.try_ordinary_is_match_full(haystack)
+                {
+                    return Ok(matched);
+                }
                 let window_bytes = haystack.len();
                 let compact_prepared = window_bytes
                     >= PREPARED_COMPACT_ORDINARY_EXISTS_MIN_WINDOW_BYTES
@@ -15955,6 +15963,11 @@ impl PortableRegex {
             PortablePlan::K0(k0) => {
                 if haystack.len() >= k0_line_token_loop_exists::MIN_INPUT_BYTES
                     && let Some(plan) = k0.exclusive.line()
+                    && let Some(matched) = plan.try_ordinary_find_full(haystack)
+                {
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+                if let Some(plan) = k0.uri_exists
                     && let Some(matched) = plan.try_ordinary_find_full(haystack)
                 {
                     return Ok(matched.map(|(start, end)| Match { start, end }));
@@ -28363,6 +28376,92 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
+    fn class_plus_literal_class_plus_ordinary_facades_are_exact_and_stateless() {
+        let regex = PortableBuilder::new(r"(?-u:[a-z]+MID[0-9]+)")
+            .unicode(false)
+            .build()
+            .expect("class-plus corridor builds automatically");
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(k0) = &regex.plan else {
+            panic!("class-plus corridor did not retain K0");
+        };
+        let plan = k0
+            .uri_exists
+            .expect("class-plus corridor retains its structural proof");
+        assert_eq!(
+            plan.identity().plan_id,
+            super::k0_uri_exists::CLASS_PLUS_PLAN_ID
+        );
+
+        let mut storage = vec![b'!'; 128];
+        let address = storage.as_ptr();
+        storage[108..126].copy_from_slice(b"alphabeticMID12345");
+        let late = Some(Match {
+            start: 108,
+            end: 126,
+        });
+        assert!(regex.is_match(&storage));
+        assert_eq!(regex.find(&storage), late);
+
+        storage.fill(b'!');
+        assert_eq!(storage.as_ptr(), address);
+        assert!(!regex.is_match(&storage));
+        assert_eq!(regex.find(&storage), None);
+
+        storage[1..14].copy_from_slice(b"lettersMID123");
+        let early = Some(Match { start: 1, end: 14 });
+        assert_eq!(storage.as_ptr(), address);
+        assert!(regex.is_match(&storage));
+        assert_eq!(regex.find(&storage), early);
+
+        let mut dense = Vec::new();
+        for _ in 0..8 {
+            dense.extend_from_slice(b"!MID!");
+        }
+        let dense_start = dense.len();
+        dense.extend_from_slice(b"lettersMID123");
+        let dense_expected = Some(Match {
+            start: dense_start,
+            end: dense.len(),
+        });
+        assert!(regex.is_match(&dense));
+        assert_eq!(regex.find(&dense), dense_expected);
+
+        let limits = SearchLimits::unlimited();
+        assert!(regex.is_match_value(&dense, limits).unwrap());
+        assert_eq!(regex.find_value(&dense, limits).unwrap(), dense_expected);
+        assert_eq!(
+            regex.is_match_accounted(&dense, limits).unwrap().0,
+            true
+        );
+        assert_eq!(
+            regex.find_accounted(&dense, limits).unwrap().0,
+            dense_expected
+        );
+
+        let mut checked = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("checked class-plus session constructs");
+        assert!(checked.is_match_value(&dense, limits).unwrap());
+        assert_eq!(checked.find_value(&dense, limits).unwrap(), dense_expected);
+
+        let mut ordinary = regex
+            .ordinary_session()
+            .expect("ordinary class-plus session constructs");
+        assert!(ordinary.is_match_at(&dense, 0).unwrap());
+        assert_eq!(ordinary.find_at(&dense, 0).unwrap(), dense_expected);
+
+        let two = b"aMID1!bbMID22";
+        assert_eq!(regex.find(two), Some(Match { start: 0, end: 5 }));
+        let second = SearchWindow::new(6, two.len());
+        assert_eq!(
+            regex.find_window_value(two, second, limits).unwrap(),
+            Some(Match { start: 6, end: 13 })
+        );
+        assert!(regex.is_match_window_value(two, second, limits).unwrap());
+    }
+
+    #[test]
     fn prefix_class_ordinary_facades_are_full_window_only() {
         let regex = PortableBuilder::new(r"(?:ab[0-9]+|cd[A-Z]+)")
             .unicode(false)
@@ -36550,6 +36649,87 @@ mod tests {
                 "the exact cold finite cap completes without publishing growth",
             );
         }
+    }
+
+    #[test]
+    fn class_plus_prepared_uri_token_respects_work_and_scratch_envelopes() {
+        const HAYSTACK: &[u8] = b"!alphabeticMID12345!";
+        let regex = PortableBuilder::new(r"(?-u:[a-z]+MID[0-9]+)")
+            .unicode(false)
+            .build()
+            .expect("prepared class-plus fixture builds automatically");
+        let mut exact = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("exact prepared class-plus session constructs");
+        let exact_scratch = exact
+            .workspace_setup_accounting()
+            .expect("class-plus fixture exposes K0 setup")
+            .retained_bytes();
+        assert!(exact_scratch > 0);
+        let exact_work = u64::try_from(HAYSTACK.len())
+            .unwrap()
+            .checked_mul(6)
+            .unwrap();
+        let exact_limits = SearchLimits {
+            max_work: exact_work,
+            max_scratch_bytes: exact_scratch,
+        };
+        let exact_token = exact.prepare_is_match_value_token(HAYSTACK.len(), exact_limits);
+        assert!(exact_token.uses_uri_like_route());
+        assert_eq!(
+            exact_token.maximum_warm_input_bytes(),
+            Some(HAYSTACK.len())
+        );
+        assert_eq!(
+            exact.is_match_value_prepared(HAYSTACK, exact_token),
+            Ok(true)
+        );
+
+        let one_below_work_limits = SearchLimits {
+            max_work: exact_work - 1,
+            max_scratch_bytes: exact_scratch,
+        };
+        let mut one_below_work = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below-work class-plus session constructs");
+        let one_below_work_token = one_below_work
+            .prepare_is_match_value_token(HAYSTACK.len(), one_below_work_limits);
+        assert!(one_below_work_token.uses_uri_like_route());
+        assert_eq!(
+            one_below_work_token.maximum_warm_input_bytes(),
+            Some(HAYSTACK.len() - 1)
+        );
+        let mut one_below_work_control = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below-work control session constructs");
+        let one_below_work_expected =
+            one_below_work_control.is_match_value(HAYSTACK, one_below_work_limits);
+        assert_eq!(
+            one_below_work.is_match_value_prepared(HAYSTACK, one_below_work_token),
+            one_below_work_expected,
+            "a source outside the direct envelope must replay the finite facade",
+        );
+
+        let one_below_scratch_limits = SearchLimits {
+            max_work: exact_work,
+            max_scratch_bytes: exact_scratch - 1,
+        };
+        let mut one_below_scratch = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below-scratch class-plus session constructs");
+        let one_below_scratch_token = one_below_scratch
+            .prepare_is_match_value_token(HAYSTACK.len(), one_below_scratch_limits);
+        assert!(!one_below_scratch_token.uses_uri_like_route());
+        let mut one_below_scratch_control = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("one-below-scratch control session constructs");
+        let one_below_scratch_expected =
+            one_below_scratch_control.is_match_value(HAYSTACK, one_below_scratch_limits);
+        assert_eq!(
+            one_below_scratch.is_match_value_prepared(HAYSTACK, one_below_scratch_token),
+            one_below_scratch_expected,
+            "declined direct scratch must preserve the finite facade result",
+        );
     }
 
     #[test]
