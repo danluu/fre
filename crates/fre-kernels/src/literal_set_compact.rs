@@ -24,13 +24,44 @@ const MIN_PATTERN_BYTES: usize = 128;
 const MIN_DENSE_BUILD_WORK: usize = 8 * 1024 * 1024;
 const MAX_DENSE_DEPTH: usize = 24;
 
+#[derive(Clone, Debug)]
+struct CompactEngine {
+    automaton: NFA,
+    width: usize,
+}
+
 /// Compact contiguous-NFA owner for one authenticated flat literal set.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct LiteralSetCompactPlan {
     canonical: LiteralSetPlan,
-    automaton: NFA,
+    engine: CompactEngine,
     build: LiteralSetBuildAccounting,
+}
+
+/// Ordinary-only compact owner for ripgrep's authenticated literal handoff.
+///
+/// This type deliberately exposes no checked or finite-search API. Those
+/// contracts remain on [`LiteralSetCompactPlan`] and its canonical DFA.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct LiteralSetCompactOrdinaryPlan {
+    engine: CompactEngine,
+    build: LiteralSetBuildAccounting,
+}
+
+/// Unpublished compact owner retaining its shared construction NFA.
+///
+/// The caller must resolve this value into either the ordinary-only owner or
+/// the canonical DFA. Keeping the shared NFA here lets an outer persistent-cap
+/// refusal fall back without rebuilding the trie or retaining both engines.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct LiteralSetCompactOrdinaryCandidate {
+    shared: noncontiguous::NFA,
+    ordinary: LiteralSetCompactOrdinaryPlan,
+    canonical_build: LiteralSetBuildAccounting,
+    limits: LiteralSetBuildLimits,
 }
 
 /// Result of attempting the optional compact literal-set construction.
@@ -46,11 +77,107 @@ pub enum LiteralSetCompactBuildOutcome {
     Compact(LiteralSetCompactPlan),
 }
 
-fn canonical_outcome(
+/// Result of attempting ordinary-only compact construction.
+///
+/// A candidate still owns the shared noncontiguous NFA so its caller can apply
+/// outer facade accounting before choosing one final owner. A canonical result
+/// has already reused that shared NFA whenever construction had reached it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum LiteralSetCompactOrdinaryBuildOutcome {
+    NotApplicable,
+    Canonical(LiteralSetPlan),
+    Candidate(LiteralSetCompactOrdinaryCandidate),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompactPreflight {
+    NotApplicable,
+    Canonical(LiteralSetBuildAccounting),
+    Eligible {
+        canonical_build: LiteralSetBuildAccounting,
+        compact_build: LiteralSetBuildAccounting,
+        width: usize,
+    },
+}
+
+fn compact_preflight(
+    patterns: &[&[u8]],
+    limits: LiteralSetBuildLimits,
+) -> Result<CompactPreflight, LiteralSetError> {
+    if !(MIN_PATTERNS..=MAX_PATTERNS).contains(&patterns.len()) {
+        return Ok(CompactPreflight::NotApplicable);
+    }
+    let canonical_build = preflight(patterns, limits, LiteralSetMatchSemantics::LeftmostFirst)?;
+    let width = canonical_build.minimum_pattern_bytes;
+    let uniform_positive = width >= MIN_PATTERN_BYTES
+        && width.checked_mul(canonical_build.patterns) == Some(canonical_build.pattern_bytes);
+    if !uniform_positive || canonical_build.build_work_upper_bound < MIN_DENSE_BUILD_WORK {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    }
+    // Contiguous conversion writes every encoded transition and then remaps
+    // every encoded state ID in a second pass. Charge two complete cell
+    // traversals plus state-map and pattern-vector setup. Together with the
+    // canonical receipt this also covers a complete compact attempt followed
+    // by same-shared-NFA canonical fallback.
+    let Some(compact_build_work) = canonical_build
+        .dfa_cells_upper_bound
+        .checked_mul(2)
+        .and_then(|work| work.checked_add(canonical_build.trie_states_upper_bound))
+        .and_then(|work| work.checked_add(canonical_build.patterns))
+        .and_then(|work| work.checked_add(canonical_build.build_work_upper_bound))
+    else {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    };
+    if compact_build_work > limits.max_build_work {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    }
+    // Retain the established three-owner envelope. It conservatively covers
+    // both the dual owner and the ordinary policy's pairwise construction:
+    // shared+compact followed, on refusal, by shared+canonical.
+    let Some(dense_states_upper_bound) = canonical_build
+        .patterns
+        .checked_mul(width.min(MAX_DENSE_DEPTH))
+        .and_then(|states| states.checked_add(1))
+        .map(|states| states.min(canonical_build.trie_states_upper_bound))
+    else {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    };
+    let Some(compact_build_bytes) = dense_states_upper_bound
+        .checked_mul(ALPHABET_LEN)
+        .and_then(|cells| cells.checked_mul(BYTES_PER_DFA_CELL_ENVELOPE))
+        .and_then(|dense_bytes| {
+            canonical_build
+                .trie_states_upper_bound
+                .checked_mul(BYTES_PER_TRIE_STATE_ENVELOPE)
+                .and_then(|trie_bytes| dense_bytes.checked_add(trie_bytes))
+        })
+        .and_then(|additional| {
+            canonical_build
+                .build_bytes_upper_bound
+                .checked_add(additional)
+        })
+    else {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    };
+    if compact_build_bytes > limits.max_build_bytes {
+        return Ok(CompactPreflight::Canonical(canonical_build));
+    }
+    let mut compact_build = canonical_build;
+    compact_build.build_work_upper_bound = compact_build_work;
+    compact_build.build_bytes_upper_bound = compact_build_bytes;
+    Ok(CompactPreflight::Eligible {
+        canonical_build,
+        compact_build,
+        width,
+    })
+}
+
+fn canonical_plan(
     patterns: &[&[u8]],
     build: LiteralSetBuildAccounting,
     limits: LiteralSetBuildLimits,
-) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
+) -> Result<LiteralSetPlan, LiteralSetError> {
     let uniform_positive = build.minimum_pattern_bytes > 0
         && build.minimum_pattern_bytes.checked_mul(build.patterns) == Some(build.pattern_bytes);
     let match_kind = if uniform_positive {
@@ -65,14 +192,61 @@ fn canonical_outcome(
             detail: error.to_string(),
         })?;
     LiteralSetPlan::from_preflight_dfa(build, automaton, limits)
-        .map(LiteralSetCompactBuildOutcome::Canonical)
+}
+
+fn canonical_outcome(
+    patterns: &[&[u8]],
+    build: LiteralSetBuildAccounting,
+    limits: LiteralSetBuildLimits,
+) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
+    canonical_plan(patterns, build, limits).map(LiteralSetCompactBuildOutcome::Canonical)
+}
+
+fn build_shared(patterns: &[&[u8]]) -> Result<noncontiguous::NFA, LiteralSetError> {
+    let mut builder = noncontiguous::Builder::new();
+    builder.match_kind(MatchKind::Standard);
+    builder
+        .build(patterns.iter().copied())
+        .map_err(|error| LiteralSetError::AutomatonBuild {
+            detail: error.to_string(),
+        })
+}
+
+fn canonical_from_shared(
+    shared: &noncontiguous::NFA,
+    build: LiteralSetBuildAccounting,
+    limits: LiteralSetBuildLimits,
+) -> Result<LiteralSetPlan, LiteralSetError> {
+    let automaton = DFA::builder()
+        .build_from_noncontiguous(shared)
+        .map_err(|error| LiteralSetError::AutomatonBuild {
+            detail: error.to_string(),
+        })?;
+    LiteralSetPlan::from_preflight_dfa(build, automaton, limits)
+}
+
+fn compact_engine(shared: &noncontiguous::NFA, width: usize) -> Option<CompactEngine> {
+    let mut builder = NFA::builder();
+    builder.dense_depth(width.min(MAX_DENSE_DEPTH));
+    let automaton = builder.build_from_noncontiguous(shared).ok()?;
+    debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
+    debug_assert_eq!(automaton.min_pattern_len(), width);
+    debug_assert_eq!(automaton.max_pattern_len(), width);
+    Some(CompactEngine { automaton, width })
+}
+
+impl CompactEngine {
+    #[inline]
+    fn memory_usage(&self) -> usize {
+        self.automaton.memory_usage()
+    }
 }
 
 /// Construction-bound ordinary access to the compact owner.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetCompactOrdinaryExecutor<'a> {
-    plan: &'a LiteralSetCompactPlan,
+    engine: &'a CompactEngine,
 }
 
 impl LiteralSetCompactPlan {
@@ -82,111 +256,51 @@ impl LiteralSetCompactPlan {
         patterns: &[&[u8]],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
-        if !(MIN_PATTERNS..=MAX_PATTERNS).contains(&patterns.len()) {
-            return Ok(LiteralSetCompactBuildOutcome::NotApplicable);
-        }
-        let mut build = preflight(patterns, limits, LiteralSetMatchSemantics::LeftmostFirst)?;
-        let width = build.minimum_pattern_bytes;
-        let uniform_positive = width >= MIN_PATTERN_BYTES
-            && width.checked_mul(build.patterns) == Some(build.pattern_bytes);
-        if !uniform_positive || build.build_work_upper_bound < MIN_DENSE_BUILD_WORK {
-            return canonical_outcome(patterns, build, limits);
-        }
-        // Contiguous conversion writes every encoded transition and then
-        // remaps every encoded state ID in a second pass. Charge two complete
-        // cell traversals plus state-map and pattern-vector setup.
-        let Some(compact_build_work) = build
-            .dfa_cells_upper_bound
-            .checked_mul(2)
-            .and_then(|work| work.checked_add(build.trie_states_upper_bound))
-            .and_then(|work| work.checked_add(build.patterns))
-            .and_then(|work| work.checked_add(build.build_work_upper_bound))
-        else {
-            return canonical_outcome(patterns, build, limits);
+        let (canonical_build, mut compact_build, width) = match compact_preflight(patterns, limits)?
+        {
+            CompactPreflight::NotApplicable => {
+                return Ok(LiteralSetCompactBuildOutcome::NotApplicable);
+            }
+            CompactPreflight::Canonical(build) => {
+                return canonical_outcome(patterns, build, limits);
+            }
+            CompactPreflight::Eligible {
+                canonical_build,
+                compact_build,
+                width,
+            } => (canonical_build, compact_build, width),
         };
-        if compact_build_work > limits.max_build_work {
-            return canonical_outcome(patterns, build, limits);
-        }
-        // The incumbent envelope already covers the shared trie and checked
-        // DFA. Charge one complete trie-state envelope plus every potentially
-        // dense row retained by the contiguous NFA while all three owners are
-        // simultaneously live. The DFA-cell factor deliberately overbounds
-        // aho-corasick's smaller contiguous state identifiers.
-        let Some(dense_states_upper_bound) = build
-            .patterns
-            .checked_mul(width.min(MAX_DENSE_DEPTH))
-            .and_then(|states| states.checked_add(1))
-            .map(|states| states.min(build.trie_states_upper_bound))
-        else {
-            return canonical_outcome(patterns, build, limits);
-        };
-        let Some(compact_build_bytes) = dense_states_upper_bound
-            .checked_mul(ALPHABET_LEN)
-            .and_then(|cells| cells.checked_mul(BYTES_PER_DFA_CELL_ENVELOPE))
-            .and_then(|dense_bytes| {
-                build
-                    .trie_states_upper_bound
-                    .checked_mul(BYTES_PER_TRIE_STATE_ENVELOPE)
-                    .and_then(|trie_bytes| dense_bytes.checked_add(trie_bytes))
-            })
-            .and_then(|additional| build.build_bytes_upper_bound.checked_add(additional))
-        else {
-            return canonical_outcome(patterns, build, limits);
-        };
-        if compact_build_bytes > limits.max_build_bytes {
-            return canonical_outcome(patterns, build, limits);
-        }
-
-        let mut shared_builder = noncontiguous::Builder::new();
-        shared_builder.match_kind(MatchKind::Standard);
-        let shared = shared_builder
-            .build(patterns.iter().copied())
-            .map_err(|error| LiteralSetError::AutomatonBuild {
-                detail: error.to_string(),
-            })?;
-        let canonical_automaton =
-            DFA::builder()
-                .build_from_noncontiguous(&shared)
-                .map_err(|error| LiteralSetError::AutomatonBuild {
-                    detail: error.to_string(),
-                })?;
+        let shared = build_shared(patterns)?;
         // Checked and explicit-session calls retain the exact established DFA
         // contract. The compact NFA is an additional ordinary-only engine.
-        let canonical = LiteralSetPlan::from_preflight_dfa(build, canonical_automaton, limits)?;
-        let mut compact_builder = NFA::builder();
-        compact_builder.dense_depth(width.min(MAX_DENSE_DEPTH));
-        let automaton = match compact_builder.build_from_noncontiguous(&shared) {
-            Ok(automaton) => automaton,
-            Err(_) => return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical)),
+        let canonical = canonical_from_shared(&shared, canonical_build, limits)?;
+        let engine = match compact_engine(&shared, width) {
+            Some(engine) => engine,
+            None => return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical)),
         };
-        debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
-        debug_assert_eq!(automaton.min_pattern_len(), width);
-        debug_assert_eq!(automaton.max_pattern_len(), width);
         debug_assert_eq!(
             canonical.build_accounting().match_semantics,
-            build.match_semantics
+            canonical_build.match_semantics
         );
         debug_assert_eq!(
             canonical.build_accounting().pattern_bytes,
-            build.pattern_bytes
+            canonical_build.pattern_bytes
         );
         let Some(persistent_bytes) = canonical
             .build_accounting()
             .persistent_bytes
-            .checked_add(automaton.memory_usage())
+            .checked_add(engine.memory_usage())
         else {
             return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical));
         };
-        build.build_work_upper_bound = compact_build_work;
-        build.build_bytes_upper_bound = compact_build_bytes;
-        build.persistent_bytes = persistent_bytes;
+        compact_build.persistent_bytes = persistent_bytes;
         if persistent_bytes > limits.max_persistent_bytes {
             return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical));
         }
         Ok(LiteralSetCompactBuildOutcome::Compact(Self {
             canonical,
-            automaton,
-            build,
+            engine,
+            build: compact_build,
         }))
     }
 
@@ -211,7 +325,9 @@ impl LiteralSetCompactPlan {
     /// Bind ordinary unmetered operations once to this owner.
     #[must_use]
     pub const fn ordinary_executor(&self) -> LiteralSetCompactOrdinaryExecutor<'_> {
-        LiteralSetCompactOrdinaryExecutor { plan: self }
+        LiteralSetCompactOrdinaryExecutor {
+            engine: &self.engine,
+        }
     }
 
     /// Find one selected span in a complete haystack with checked accounting.
@@ -232,7 +348,120 @@ impl LiteralSetCompactPlan {
     ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
         self.canonical.find_window(haystack, window, limits)
     }
+}
 
+impl LiteralSetCompactOrdinaryPlan {
+    /// Attempt ordinary-only construction for an authenticated ripgrep handoff.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn try_new_ripgrep_standard_borrowed(
+        patterns: &[&[u8]],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
+        let (canonical_build, mut compact_build, width) = match compact_preflight(patterns, limits)?
+        {
+            CompactPreflight::NotApplicable => {
+                return Ok(LiteralSetCompactOrdinaryBuildOutcome::NotApplicable);
+            }
+            CompactPreflight::Canonical(build) => {
+                return canonical_plan(patterns, build, limits)
+                    .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
+            }
+            CompactPreflight::Eligible {
+                canonical_build,
+                compact_build,
+                width,
+            } => (canonical_build, compact_build, width),
+        };
+        let shared = build_shared(patterns)?;
+        let Some(engine) = compact_engine(&shared, width) else {
+            return canonical_from_shared(&shared, canonical_build, limits)
+                .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
+        };
+        compact_build.persistent_bytes = engine.memory_usage();
+        if compact_build.persistent_bytes > limits.max_persistent_bytes {
+            // Drop the refused engine before allocating the same-shared DFA.
+            drop(engine);
+            return canonical_from_shared(&shared, canonical_build, limits)
+                .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
+        }
+        Ok(LiteralSetCompactOrdinaryBuildOutcome::Candidate(
+            LiteralSetCompactOrdinaryCandidate {
+                shared,
+                ordinary: Self {
+                    engine,
+                    build: compact_build,
+                },
+                canonical_build,
+                limits,
+            },
+        ))
+    }
+
+    /// Construction-selected implementation identity.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        "literal-set-compact-nfa"
+    }
+
+    /// Construction certificate and exact retained automaton payload.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn build_accounting(&self) -> LiteralSetBuildAccounting {
+        self.build
+    }
+
+    /// Bind ordinary unmetered operations once to this owner.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn ordinary_executor(&self) -> LiteralSetCompactOrdinaryExecutor<'_> {
+        LiteralSetCompactOrdinaryExecutor {
+            engine: &self.engine,
+        }
+    }
+}
+
+impl LiteralSetCompactOrdinaryCandidate {
+    /// Return the ordinary owner's receipt before resolving this candidate.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn build_accounting(&self) -> LiteralSetBuildAccounting {
+        self.ordinary.build_accounting()
+    }
+
+    /// Keep only the ordinary compact engine.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_ordinary(self) -> LiteralSetCompactOrdinaryPlan {
+        let Self {
+            shared,
+            ordinary,
+            canonical_build: _,
+            limits: _,
+        } = self;
+        drop(shared);
+        ordinary
+    }
+
+    /// Refuse the ordinary owner and build the canonical DFA from the same NFA.
+    #[doc(hidden)]
+    pub fn into_canonical(self) -> Result<LiteralSetPlan, LiteralSetError> {
+        let Self {
+            shared,
+            ordinary,
+            canonical_build,
+            limits,
+        } = self;
+        // Never retain both final engines. The shared construction NFA is the
+        // sole source used to build the canonical fallback.
+        drop(ordinary);
+        canonical_from_shared(&shared, canonical_build, limits)
+    }
+}
+
+impl CompactEngine {
     #[inline(never)]
     fn find_window_value(
         &self,
@@ -294,7 +523,7 @@ impl LiteralSetCompactPlan {
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
             }
-            if window.end() - matched.end() < self.build.minimum_pattern_bytes {
+            if window.end() - matched.end() < self.width {
                 return Ok(Ok(()));
             }
             input.set_start(matched.end());
@@ -324,7 +553,7 @@ impl LiteralSetCompactPlan {
             // Matches do not overlap and have positive width, so their count
             // is bounded by the validated window length.
             count += 1;
-            if window.end() - matched.end() < self.build.minimum_pattern_bytes {
+            if window.end() - matched.end() < self.width {
                 break;
             }
             input.set_start(matched.end());
@@ -367,7 +596,7 @@ impl LiteralSetCompactPlan {
 
     #[inline]
     fn window_is_too_short(&self, window: Window) -> bool {
-        window.end() - window.start() < self.build.minimum_pattern_bytes
+        window.end() - window.start() < self.width
     }
 
     #[inline]
@@ -376,7 +605,7 @@ impl LiteralSetCompactPlan {
         matched: aho_corasick::Match,
     ) -> Result<(usize, usize), LiteralSetError> {
         let end = matched.end();
-        let width = self.build.minimum_pattern_bytes;
+        let width = self.width;
         debug_assert_eq!(matched.start(), end - width);
         let start = end
             .checked_sub(width)
@@ -396,7 +625,7 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<bool, LiteralSetError> {
-        self.plan.exists_window_value(haystack, window)
+        self.engine.exists_window_value(haystack, window)
     }
 
     /// Return the first accepting endpoint without projecting a span start.
@@ -407,7 +636,7 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
-        self.plan.selected_end_window_value(haystack, window)
+        self.engine.selected_end_window_value(haystack, window)
     }
 
     /// Return the selected span, recovering its fixed-width start after hit.
@@ -418,7 +647,7 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
-        self.plan.find_window_value(haystack, window)
+        self.engine.find_window_value(haystack, window)
     }
 
     /// Visit non-overlapping spans through one pinned Aho iterator.
@@ -433,7 +662,7 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
-        self.plan
+        self.engine
             .try_visit_spans_window_value(haystack, window, visitor)
     }
 
@@ -445,16 +674,16 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<u64, LiteralSetError> {
-        self.plan.count_spans_window_value(haystack, window)
+        self.engine.count_spans_window_value(haystack, window)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use aho_corasick::automaton::Automaton;
-
     use super::{
-        LiteralSetCompactBuildOutcome, LiteralSetCompactPlan, MAX_PATTERNS, MIN_PATTERN_BYTES,
+        LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
+        LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
+        MAX_PATTERNS, MIN_PATTERN_BYTES,
     };
     use crate::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, Window,
@@ -488,6 +717,25 @@ mod tests {
             LiteralSetCompactBuildOutcome::Compact(plan) => Some(plan),
             LiteralSetCompactBuildOutcome::NotApplicable
             | LiteralSetCompactBuildOutcome::Canonical(_) => None,
+        })
+    }
+
+    fn ordinary_outcome(
+        patterns: &[Vec<u8>],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
+        let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        LiteralSetCompactOrdinaryPlan::try_new_ripgrep_standard_borrowed(&borrowed, limits)
+    }
+
+    fn ordinary_candidate(
+        patterns: &[Vec<u8>],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Option<LiteralSetCompactOrdinaryCandidate>, LiteralSetError> {
+        Ok(match ordinary_outcome(patterns, limits)? {
+            LiteralSetCompactOrdinaryBuildOutcome::Candidate(candidate) => Some(candidate),
+            LiteralSetCompactOrdinaryBuildOutcome::NotApplicable
+            | LiteralSetCompactOrdinaryBuildOutcome::Canonical(_) => None,
         })
     }
 
@@ -560,7 +808,11 @@ mod tests {
         let compact_plan = compact(&patterns, LiteralSetBuildLimits::default())
             .unwrap()
             .unwrap();
-        let ordinary = compact_plan.ordinary_executor();
+        let ordinary_plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the ordinary route admits the same compact shape")
+            .into_ordinary();
+        let ordinary = ordinary_plan.ordinary_executor();
 
         let mut haystack = vec![b'z'];
         haystack.extend(core::iter::repeat_n(b'a', 2 * MIN_PATTERN_BYTES));
@@ -624,6 +876,139 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(overlap_spans, [(1, 1 + MIN_PATTERN_BYTES)]);
+    }
+
+    #[test]
+    fn ordinary_candidate_resolves_one_exact_owner_or_same_shared_fallback() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let dual = compact(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap();
+        let canonical_build = dual.canonical.build_accounting();
+        let candidate = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap();
+        let ordinary_build = candidate.build_accounting();
+
+        assert_eq!(
+            ordinary_build.build_work_upper_bound,
+            dual.build_accounting().build_work_upper_bound,
+        );
+        assert_eq!(
+            ordinary_build.build_bytes_upper_bound,
+            dual.build_accounting().build_bytes_upper_bound,
+        );
+        assert_eq!(
+            dual.build_accounting().persistent_bytes,
+            canonical_build.persistent_bytes + ordinary_build.persistent_bytes,
+        );
+
+        let ordinary = candidate.into_ordinary();
+        assert_eq!(ordinary.build_accounting(), ordinary_build);
+        assert_eq!(
+            ordinary.build_accounting().persistent_bytes,
+            ordinary.engine.memory_usage(),
+        );
+        assert_eq!(
+            ordinary.runtime_implementation_id(),
+            dual.runtime_implementation_id(),
+        );
+
+        let fallback = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap()
+            .into_canonical()
+            .unwrap();
+        assert_eq!(fallback.build_accounting(), canonical_build);
+        let haystack = &patterns[7];
+        assert_eq!(
+            fallback
+                .find(haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap(),
+            dual.canonical
+                .find(haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap(),
+        );
+
+        assert!(
+            ordinary_candidate(
+                &patterns,
+                LiteralSetBuildLimits {
+                    max_persistent_bytes: ordinary_build.persistent_bytes,
+                    ..LiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .is_some(),
+        );
+        assert!(ordinary_build.persistent_bytes < canonical_build.persistent_bytes);
+        let limit = ordinary_build.persistent_bytes - 1;
+        assert!(matches!(
+            ordinary_outcome(
+                &patterns,
+                LiteralSetBuildLimits {
+                    max_persistent_bytes: limit,
+                    ..LiteralSetBuildLimits::default()
+                },
+            ),
+            Err(LiteralSetError::PersistentBytesLimit { needed, limit: actual })
+                if needed == canonical_build.persistent_bytes && actual == limit
+        ));
+    }
+
+    #[test]
+    fn ordinary_shape_and_construction_refusals_preserve_canonical_policy() {
+        assert!(matches!(
+            ordinary_outcome(&public_patterns(128, 254), LiteralSetBuildLimits::default()).unwrap(),
+            LiteralSetCompactOrdinaryBuildOutcome::NotApplicable,
+        ));
+
+        let below_work = public_patterns(129, 253);
+        assert!(matches!(
+            ordinary_outcome(&below_work, LiteralSetBuildLimits::default()).unwrap(),
+            LiteralSetCompactOrdinaryBuildOutcome::Canonical(_),
+        ));
+
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let admitted = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap()
+            .build_accounting();
+        assert!(matches!(
+            ordinary_outcome(
+                &patterns,
+                LiteralSetBuildLimits {
+                    max_build_work: admitted.build_work_upper_bound,
+                    max_build_bytes: admitted.build_bytes_upper_bound,
+                    ..LiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap(),
+            LiteralSetCompactOrdinaryBuildOutcome::Candidate(_),
+        ));
+        for limits in [
+            LiteralSetBuildLimits {
+                max_build_work: admitted.build_work_upper_bound - 1,
+                ..LiteralSetBuildLimits::default()
+            },
+            LiteralSetBuildLimits {
+                max_build_bytes: admitted.build_bytes_upper_bound - 1,
+                ..LiteralSetBuildLimits::default()
+            },
+        ] {
+            let LiteralSetCompactOrdinaryBuildOutcome::Canonical(canonical) =
+                ordinary_outcome(&patterns, limits).unwrap()
+            else {
+                panic!("a compact envelope refusal must keep canonical policy");
+            };
+            let accounting = canonical.build_accounting();
+            assert_eq!(accounting.patterns, patterns.len());
+            assert_eq!(
+                accounting.pattern_bytes,
+                patterns.iter().map(Vec::len).sum(),
+            );
+            assert!(accounting.build_work_upper_bound < admitted.build_work_upper_bound);
+        }
     }
 
     #[test]
@@ -694,7 +1079,7 @@ mod tests {
         let canonical_persistent = selected.canonical.build_accounting().persistent_bytes;
         assert_eq!(
             persistent,
-            canonical_persistent + selected.automaton.memory_usage(),
+            canonical_persistent + selected.engine.memory_usage(),
         );
         assert!(
             compact(
