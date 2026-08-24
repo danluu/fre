@@ -2,16 +2,14 @@
 
 use std::{alloc::System, hint::black_box};
 
-use fre::{
-    ASCII_WORD_RUN_PLAN_ID, PlanKind, PortableBuilder, UNICODE_WORD_RUN_PLAN_ID,
-};
+use fre::{ASCII_WORD_RUN_PLAN_ID, PlanKind, PortableBuilder, UNICODE_WORD_RUN_PLAN_ID};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 #[test]
-fn word_run_ordinary_find_allocates_nothing() {
+fn word_run_ordinary_values_allocate_nothing() {
     let ascii = PortableBuilder::new(r"\b\w{2,}\b")
         .unicode(false)
         .build()
@@ -37,6 +35,9 @@ fn word_run_ordinary_find_allocates_nothing() {
             Some((2, 5)),
         );
         assert_eq!(black_box(ascii.find(black_box(b"!!!!"))), None);
+        assert!(black_box(ascii.is_match(black_box(b"!!abc!!"))));
+        assert!(!black_box(ascii.is_match(black_box(b"!!!!"))));
+        assert!(black_box(ascii.is_match(black_box(b"abc!!"))));
         assert_eq!(
             black_box(unicode.find(black_box("!!αβ!!".as_bytes())))
                 .map(|matched| (matched.start(), matched.end())),
